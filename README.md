@@ -41,11 +41,11 @@ your backend API or MCP server
 
 There is no working quickstart yet because the repository is in pre-alpha and does not contain buildable gateway code.
 
-A working quickstart, including Docker Compose and `cargo build` instructions, is planned for the Phase 1 open-source-readiness milestone: [Phase 1 - Open-source ready](https://github.com/Greenhat-Security/GreenGateway/milestones).
+A working quickstart, including Docker Compose and `cargo build` instructions, is planned for the Phase 1 open-source-readiness milestone: [Phase 1 — Open-source ready](https://github.com/Greenhat-Security/GreenGateway/milestone/1).
 
 ## Contributing
 
-Contribution guidelines will live in [CONTRIBUTING.md](CONTRIBUTING.md). That file is expected to land in a follow-up PR for the same initial README and project setup work.
+Contribution guidelines will live in [CONTRIBUTING.md](CONTRIBUTING.md). CONTRIBUTING.md will land in a follow-up PR (PR 2 of #1).
 
 Until then, use the roadmap issue to understand project direction and open work: [Roadmap / project plan](https://github.com/Greenhat-Security/GreenGateway/issues/44).
 
