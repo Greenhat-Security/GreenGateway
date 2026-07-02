@@ -31,9 +31,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listen_addr =
         std::env::var("LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.to_owned());
+    let listen_addr: std::net::SocketAddr = match listen_addr.parse() {
+        Ok(listen_addr) => listen_addr,
+        Err(err) => {
+            eprintln!("invalid LISTEN_ADDR '{listen_addr}': {err}");
+            std::process::exit(1);
+        }
+    };
     let metrics_handle = install_metrics_recorder()?;
     let app = app(metrics_handle);
-    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
 
     tracing::info!(listen_addr = %listener.local_addr()?, "gateway listening");
     axum::serve(listener, app).await?;
