@@ -8,11 +8,14 @@ license = "GPL-3.0-only"
 
 [workspace.dependencies]
 axum = "0.8.9"
+http = "1.4.2"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread"] }
 tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.6.8", features = ["cors", "request-id", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+uuid = { version = "1.20.0", features = ["v4"] }

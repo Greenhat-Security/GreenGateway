@@ -9,3 +9,11 @@ The socket address the gateway binds to when it starts.
 Default: `0.0.0.0:8080`
 
 Format and validation: must parse as a Rust `SocketAddr`, such as `127.0.0.1:8080`, `0.0.0.0:8080`, or `[::1]:8080`. Non-Unicode values and invalid socket addresses are rejected during configuration loading.
+
+### CORS_ALLOW_ORIGINS
+
+Comma-separated list of exact origins allowed by CORS.
+
+Default: empty list. With the default, cross-origin browser requests receive no CORS allow-origin response header.
+
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a valid HTTP header value. Configure full origins such as `http://localhost:3000` or `https://app.example.test`.

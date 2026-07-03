@@ -7,16 +7,20 @@ use std::{
     sync::LazyLock,
 };
 
+use http::HeaderValue;
+
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
     DEFAULT_LISTEN_ADDR
         .parse()
         .expect("default listen address should be valid")
 });
+const CORS_ALLOW_ORIGINS: &str = "CORS_ALLOW_ORIGINS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub listen_addr: SocketAddr,
+    pub cors_allow_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,9 +46,17 @@ impl Config {
             "socket address",
             &mut problems,
         );
+        let cors_allow_origins = parse_comma_separated_origins(
+            CORS_ALLOW_ORIGINS,
+            get_var(CORS_ALLOW_ORIGINS),
+            &mut problems,
+        );
 
         if problems.is_empty() {
-            Ok(Self { listen_addr })
+            Ok(Self {
+                listen_addr,
+                cors_allow_origins,
+            })
         } else {
             Err(ConfigError { problems })
         }
@@ -94,6 +106,38 @@ where
     }
 }
 
+fn parse_comma_separated_origins(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Vec<String> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return Vec::new(),
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return Vec::new();
+        }
+    };
+
+    let mut origins = Vec::new();
+
+    for origin in value
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+    {
+        match origin.parse::<HeaderValue>() {
+            Ok(_) => origins.push(origin.to_owned()),
+            Err(err) => problems.push(format!(
+                "{name} entries must be valid HTTP header values, got '{origin}': {err}"
+            )),
+        }
+    }
+
+    origins
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +156,7 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("test address should parse")
         );
+        assert!(config.cors_allow_origins.is_empty());
     }
 
     #[test]
@@ -140,6 +185,42 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("default address should parse")
         );
+        assert!(config.cors_allow_origins.is_empty());
+    }
+
+    #[test]
+    fn cors_allow_origins_parses_comma_separated_list() {
+        let config = Config::from_env_vars(|name| match name {
+            "CORS_ALLOW_ORIGINS" => Ok(
+                " http://localhost:3000,https://app.example.test,, https://admin.example.test "
+                    .to_owned(),
+            ),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.cors_allow_origins,
+            vec![
+                "http://localhost:3000".to_owned(),
+                "https://app.example.test".to_owned(),
+                "https://admin.example.test".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_cors_allow_origin_is_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "CORS_ALLOW_ORIGINS" => Ok("https://app.example.test,bad\norigin".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid origin header values");
+
+        let message = error.to_string();
+        assert!(message.contains("CORS_ALLOW_ORIGINS entries must be valid HTTP header values"));
+        assert!(message.contains("bad\norigin"));
+        assert_eq!(error.problems.len(), 1);
     }
 
     #[test]
