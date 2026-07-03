@@ -109,7 +109,7 @@ fn string_consts(source: &str) -> BTreeMap<String, String> {
         };
         let equal = cursor + equal_offset;
 
-        if !source[cursor..equal].contains("&str") {
+        if !is_string_ref_type(source[cursor + 1..equal].trim()) {
             continue;
         }
 
@@ -128,6 +128,22 @@ fn env_var_calls(source: &str, consts: &BTreeMap<String, String>) -> BTreeSet<St
 
 fn get_var_calls(source: &str, consts: &BTreeMap<String, String>) -> BTreeSet<String> {
     scan_calls(source, consts, &["get_var"])
+}
+
+fn is_string_ref_type(type_text: &str) -> bool {
+    if type_text == "&str" {
+        return true;
+    }
+
+    let Some(lifetime_start) = type_text.strip_prefix("&'") else {
+        return false;
+    };
+    let Some((_, lifetime_end)) = parse_identifier(lifetime_start, 0) else {
+        return false;
+    };
+
+    let cursor = skip_whitespace(lifetime_start, lifetime_end);
+    cursor > lifetime_end && &lifetime_start[cursor..] == "str"
 }
 
 fn scan_calls(
@@ -289,4 +305,33 @@ fn format_vars(vars: &[String]) -> String {
     } else {
         vars.join(", ")
     }
+}
+
+#[test]
+fn lifetime_annotated_string_consts_resolve_in_env_reads() {
+    let source = r#"
+        const STATIC_KEY: &'static str = "STATIC_KEY";
+        const SHORT_KEY: &'a str = "SHORT_KEY";
+        const BARE_KEY: &str = "BARE_KEY";
+
+        fn read(get_var: impl Fn(&str)) {
+            let _ = env::var(STATIC_KEY);
+            get_var(SHORT_KEY);
+            let _ = env::var(BARE_KEY);
+        }
+    "#;
+    let consts = string_consts(source);
+
+    assert_eq!(consts.get("STATIC_KEY"), Some(&"STATIC_KEY".to_owned()));
+    assert_eq!(consts.get("SHORT_KEY"), Some(&"SHORT_KEY".to_owned()));
+    assert_eq!(consts.get("BARE_KEY"), Some(&"BARE_KEY".to_owned()));
+
+    assert_eq!(
+        env_var_calls(source, &consts),
+        BTreeSet::from(["BARE_KEY".to_owned(), "STATIC_KEY".to_owned()])
+    );
+    assert_eq!(
+        get_var_calls(source, &consts),
+        BTreeSet::from(["SHORT_KEY".to_owned()])
+    );
 }
