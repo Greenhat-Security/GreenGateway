@@ -124,6 +124,12 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            jwt_jwks_url: None,
+            jwt_issuer: None,
+            jwt_audience: None,
+            jwt_jwks_timeout_ms: 2000,
+            jwt_require_jti: false,
+            roles_claim: "roles".to_owned(),
             csrf_enabled: true,
             csrf_cookie_name: "csrf_token".to_owned(),
             csrf_header_name: "x-csrf-token".to_owned(),

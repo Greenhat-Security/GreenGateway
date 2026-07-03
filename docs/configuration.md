@@ -92,6 +92,54 @@ Default: `application/json`
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a valid HTTP header value. `POST`, `PUT`, and `PATCH` requests are accepted when their `Content-Type` starts with any configured entry, allowing values such as `application/json; charset=utf-8`.
 
+### JWT_JWKS_URL
+
+Optional JWKS endpoint used to validate RS256 bearer JWTs.
+
+Default: empty, which means no JWT validator is built.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode. The validator fetches public keys from this endpoint and caches them by `kid`.
+
+### JWT_ISSUER
+
+Optional expected JWT issuer.
+
+Default: empty, which disables issuer checking.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. When set, bearer JWTs must include a matching `iss` claim.
+
+### JWT_AUDIENCE
+
+Optional expected JWT audience.
+
+Default: empty, which disables audience checking.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. When set, bearer JWTs must include a matching `aud` claim.
+
+### JWT_JWKS_TIMEOUT_MS
+
+Timeout for JWKS HTTP fetches, in milliseconds.
+
+Default: `2000`
+
+Format and validation: must parse as a `u64` millisecond duration.
+
+### JWT_REQUIRE_JTI
+
+Whether bearer JWTs must include a non-empty `jti` claim.
+
+Default: `false`
+
+Format and validation: must parse as a Rust boolean, `true` or `false`. When enabled, tokens without a non-empty `jti` are rejected.
+
+### ROLES_CLAIM
+
+Flat JWT claim name used to read roles.
+
+Default: `roles`
+
+Format and validation: must be a non-empty Unicode string. The validator reads this claim as a flat JSON array of strings; missing claims and non-array values produce an empty role list.
+
 ### CSRF_ENABLED
 
 Enables double-submit-cookie CSRF checks for the gateway's own state-changing control-plane requests.
