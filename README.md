@@ -39,9 +39,51 @@ your backend API or MCP server
 
 ## Quick Start
 
-There is no working quickstart yet because the repository is in pre-alpha and does not contain buildable gateway code.
+GreenGateway currently includes a minimal gateway server with `GET /health`, `GET /version`, and `GET /metrics` endpoints. The broader gateway, auth, policy, and discovery capabilities described in Planned Scope are still pre-alpha roadmap work.
 
-A working quickstart, including Docker Compose and `cargo build` instructions, is planned for the Phase 1 open-source-readiness milestone: [Phase 1 — Open-source ready](https://github.com/Greenhat-Security/GreenGateway/milestone/1).
+For the full list of environment variables, see [docs/configuration.md](docs/configuration.md). As more variables land, that document and [.env.example](.env.example) are kept in sync with the code by an automated test.
+
+### Option 1: Cargo (for development)
+
+`.env.example` documents the available environment variables and defaults; to override one today, set it in the real shell/process environment rather than sourcing a `.env` file.
+
+```sh
+cargo build --workspace
+cargo run
+
+# Or, with a non-default listen address:
+LISTEN_ADDR=127.0.0.1:9090 cargo run
+```
+
+In another terminal:
+
+```sh
+curl http://localhost:8080/health
+```
+
+Expected response:
+
+```json
+{"status":"ok"}
+```
+
+### Option 2: Docker Compose
+
+```sh
+docker compose up --build
+```
+
+In another terminal:
+
+```sh
+curl http://localhost:8080/health
+```
+
+Expected response:
+
+```json
+{"status":"ok"}
+```
 
 ## Contributing
 
