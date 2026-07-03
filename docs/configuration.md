@@ -223,3 +223,51 @@ Comma-separated paths that bypass CSRF checks.
 Default: `/health,/version,/metrics`
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. Exempt paths return before CSRF cookie issuance, so the default probe routes do not receive a CSRF cookie today.
+
+### EGRESS_ALLOWED_HOSTS
+
+Comma-separated hostnames the egress HTTP client may call for gateway-originated outbound requests.
+
+Default: empty list, which denies all egress requests.
+
+Format and validation: split on commas, trim whitespace, ignore empty entries, lowercase entries, and require each entry to be an ASCII hostname without a port. Configure only hostnames, not URLs. The egress client still blocks private resolved IP ranges by default even when a hostname is allowlisted.
+
+### EGRESS_TIMEOUT_MS
+
+Total timeout for each egress HTTP request, in milliseconds.
+
+Default: `30000`
+
+Format and validation: must parse as a `u64` millisecond duration. The timeout applies to the whole request, including connection, sending, and response body streaming.
+
+### EGRESS_CONNECT_TIMEOUT_MS
+
+TCP/TLS connection timeout for each egress HTTP request, in milliseconds.
+
+Default: `10000`
+
+Format and validation: must parse as a `u64` millisecond duration.
+
+### EGRESS_MAX_RESPONSE_BYTES
+
+Maximum egress response body size, in bytes.
+
+Default: `5242880` (5 MiB)
+
+Format and validation: must parse as a non-negative byte count that fits in `usize`. The egress client streams response bodies and aborts once this cap is exceeded rather than buffering unbounded data.
+
+### EGRESS_MAX_REQUEST_BODY_BYTES
+
+Maximum egress request body size, in bytes.
+
+Default: `1048576` (1 MiB)
+
+Format and validation: must parse as a non-negative byte count that fits in `usize`. The egress client checks this cap before sending a request.
+
+### EGRESS_DENY_PRIVATE_IPS
+
+Whether the egress client blocks private and special-use resolved IP ranges.
+
+Default: `true`
+
+Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, the egress client blocks RFC1918 IPv4 ranges, CGNAT, loopback, link-local, IPv4 `0/8`, IPv6 loopback, IPv6 ULA, and IPv6 link-local addresses even when the hostname is allowlisted. If any resolved address for a hostname is private, the request is denied.

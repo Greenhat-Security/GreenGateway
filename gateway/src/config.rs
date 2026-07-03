@@ -31,6 +31,11 @@ const DEFAULT_CSRF_ENABLED: bool = true;
 const DEFAULT_CSRF_COOKIE_NAME: &str = "csrf_token";
 const DEFAULT_CSRF_HEADER_NAME: &str = "x-csrf-token";
 const DEFAULT_CSRF_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
+const DEFAULT_EGRESS_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_EGRESS_CONNECT_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_EGRESS_MAX_RESPONSE_BYTES: usize = 5_242_880;
+const DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
+const DEFAULT_EGRESS_DENY_PRIVATE_IPS: bool = true;
 const AUDIT_LOG_FILE: &str = "AUDIT_LOG_FILE";
 const AUTH_COOKIE_NAME: &str = "AUTH_COOKIE_NAME";
 const AUTH_ENABLED: &str = "AUTH_ENABLED";
@@ -41,6 +46,12 @@ const CSRF_COOKIE_NAME: &str = "CSRF_COOKIE_NAME";
 const CSRF_ENABLED: &str = "CSRF_ENABLED";
 const CSRF_EXEMPT_PATHS: &str = "CSRF_EXEMPT_PATHS";
 const CSRF_HEADER_NAME: &str = "CSRF_HEADER_NAME";
+const EGRESS_ALLOWED_HOSTS: &str = "EGRESS_ALLOWED_HOSTS";
+const EGRESS_CONNECT_TIMEOUT_MS: &str = "EGRESS_CONNECT_TIMEOUT_MS";
+const EGRESS_DENY_PRIVATE_IPS: &str = "EGRESS_DENY_PRIVATE_IPS";
+const EGRESS_MAX_REQUEST_BODY_BYTES: &str = "EGRESS_MAX_REQUEST_BODY_BYTES";
+const EGRESS_MAX_RESPONSE_BYTES: &str = "EGRESS_MAX_RESPONSE_BYTES";
+const EGRESS_TIMEOUT_MS: &str = "EGRESS_TIMEOUT_MS";
 const JWT_AUDIENCE: &str = "JWT_AUDIENCE";
 const JWT_ISSUER: &str = "JWT_ISSUER";
 const JWT_JWKS_TIMEOUT_MS: &str = "JWT_JWKS_TIMEOUT_MS";
@@ -87,6 +98,12 @@ pub struct Config {
     pub csrf_header_name: String,
     pub csrf_cookie_domain: Option<String>,
     pub csrf_exempt_paths: Vec<String>,
+    pub egress_allowed_hosts: Vec<String>,
+    pub egress_timeout_ms: u64,
+    pub egress_connect_timeout_ms: u64,
+    pub egress_max_response_bytes: usize,
+    pub egress_max_request_body_bytes: usize,
+    pub egress_deny_private_ips: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +283,46 @@ impl Config {
             DEFAULT_CSRF_EXEMPT_PATHS,
             &mut problems,
         );
+        let egress_allowed_hosts = parse_comma_separated_hostnames(
+            EGRESS_ALLOWED_HOSTS,
+            get_var(EGRESS_ALLOWED_HOSTS),
+            &mut problems,
+        );
+        let egress_timeout_ms = parse_var(
+            EGRESS_TIMEOUT_MS,
+            get_var(EGRESS_TIMEOUT_MS),
+            DEFAULT_EGRESS_TIMEOUT_MS,
+            "millisecond duration",
+            &mut problems,
+        );
+        let egress_connect_timeout_ms = parse_var(
+            EGRESS_CONNECT_TIMEOUT_MS,
+            get_var(EGRESS_CONNECT_TIMEOUT_MS),
+            DEFAULT_EGRESS_CONNECT_TIMEOUT_MS,
+            "millisecond duration",
+            &mut problems,
+        );
+        let egress_max_response_bytes = parse_var(
+            EGRESS_MAX_RESPONSE_BYTES,
+            get_var(EGRESS_MAX_RESPONSE_BYTES),
+            DEFAULT_EGRESS_MAX_RESPONSE_BYTES,
+            "byte size",
+            &mut problems,
+        );
+        let egress_max_request_body_bytes = parse_var(
+            EGRESS_MAX_REQUEST_BODY_BYTES,
+            get_var(EGRESS_MAX_REQUEST_BODY_BYTES),
+            DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES,
+            "byte size",
+            &mut problems,
+        );
+        let egress_deny_private_ips = parse_var(
+            EGRESS_DENY_PRIVATE_IPS,
+            get_var(EGRESS_DENY_PRIVATE_IPS),
+            DEFAULT_EGRESS_DENY_PRIVATE_IPS,
+            "boolean",
+            &mut problems,
+        );
 
         if problems.is_empty() {
             Ok(Self {
@@ -296,6 +353,12 @@ impl Config {
                 csrf_header_name,
                 csrf_cookie_domain,
                 csrf_exempt_paths,
+                egress_allowed_hosts,
+                egress_timeout_ms,
+                egress_connect_timeout_ms,
+                egress_max_response_bytes,
+                egress_max_request_body_bytes,
+                egress_deny_private_ips,
             })
         } else {
             Err(ConfigError { problems })
@@ -430,6 +493,41 @@ fn parse_comma_separated_header_values(
             Err(err) => problems.push(format!(
                 "{name} entries must be valid HTTP header values, got '{entry}': {err}"
             )),
+        }
+    }
+
+    values
+}
+
+fn parse_comma_separated_hostnames(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Vec<String> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return Vec::new(),
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return Vec::new();
+        }
+    };
+
+    let mut values = Vec::new();
+
+    for entry in value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let entry = entry.to_ascii_lowercase();
+
+        if is_valid_hostname_without_port(&entry) {
+            values.push(entry);
+        } else {
+            problems.push(format!(
+                "{name} entries must be hostnames without ports, got '{entry}'"
+            ));
         }
     }
 
@@ -582,6 +680,23 @@ fn is_valid_exempt_path(value: &str) -> bool {
             .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
 }
 
+fn is_valid_hostname_without_port(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && !value.contains(':')
+        && value.split('.').all(is_valid_hostname_label)
+}
+
+fn is_valid_hostname_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,6 +768,21 @@ mod tests {
                 "/metrics".to_owned(),
             ]
         );
+        assert!(config.egress_allowed_hosts.is_empty());
+        assert_eq!(config.egress_timeout_ms, DEFAULT_EGRESS_TIMEOUT_MS);
+        assert_eq!(
+            config.egress_connect_timeout_ms,
+            DEFAULT_EGRESS_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.egress_max_response_bytes,
+            DEFAULT_EGRESS_MAX_RESPONSE_BYTES
+        );
+        assert_eq!(
+            config.egress_max_request_body_bytes,
+            DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES
+        );
+        assert!(config.egress_deny_private_ips);
     }
 
     #[test]
@@ -734,6 +864,21 @@ mod tests {
                 "/metrics".to_owned(),
             ]
         );
+        assert!(config.egress_allowed_hosts.is_empty());
+        assert_eq!(config.egress_timeout_ms, DEFAULT_EGRESS_TIMEOUT_MS);
+        assert_eq!(
+            config.egress_connect_timeout_ms,
+            DEFAULT_EGRESS_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.egress_max_response_bytes,
+            DEFAULT_EGRESS_MAX_RESPONSE_BYTES
+        );
+        assert_eq!(
+            config.egress_max_request_body_bytes,
+            DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES
+        );
+        assert!(config.egress_deny_private_ips);
     }
 
     #[test]
@@ -1079,6 +1224,59 @@ mod tests {
         assert!(message.contains("CSRF_COOKIE_DOMAIN must be a valid cookie Domain attribute"));
         assert!(message.contains("CSRF_EXEMPT_PATHS entries must be URI paths"));
         assert_eq!(error.problems.len(), 5);
+    }
+
+    #[test]
+    fn egress_config_parses() {
+        let config = Config::from_env_vars(|name| match name {
+            "EGRESS_ALLOWED_HOSTS" => {
+                Ok(" API.EXAMPLE.TEST,upstream.example.test,,auth.example.test ".to_owned())
+            }
+            "EGRESS_TIMEOUT_MS" => Ok("15000".to_owned()),
+            "EGRESS_CONNECT_TIMEOUT_MS" => Ok("3000".to_owned()),
+            "EGRESS_MAX_RESPONSE_BYTES" => Ok("2097152".to_owned()),
+            "EGRESS_MAX_REQUEST_BODY_BYTES" => Ok("65536".to_owned()),
+            "EGRESS_DENY_PRIVATE_IPS" => Ok("false".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.egress_allowed_hosts,
+            vec![
+                "api.example.test".to_owned(),
+                "upstream.example.test".to_owned(),
+                "auth.example.test".to_owned(),
+            ]
+        );
+        assert_eq!(config.egress_timeout_ms, 15_000);
+        assert_eq!(config.egress_connect_timeout_ms, 3_000);
+        assert_eq!(config.egress_max_response_bytes, 2_097_152);
+        assert_eq!(config.egress_max_request_body_bytes, 65_536);
+        assert!(!config.egress_deny_private_ips);
+    }
+
+    #[test]
+    fn invalid_egress_config_values_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "EGRESS_ALLOWED_HOSTS" => Ok("api.example.test:443,bad_host".to_owned()),
+            "EGRESS_TIMEOUT_MS" => Ok("slow".to_owned()),
+            "EGRESS_CONNECT_TIMEOUT_MS" => Ok("slower".to_owned()),
+            "EGRESS_MAX_RESPONSE_BYTES" => Ok("large".to_owned()),
+            "EGRESS_MAX_REQUEST_BODY_BYTES" => Ok("larger".to_owned()),
+            "EGRESS_DENY_PRIVATE_IPS" => Ok("sometimes".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid egress settings");
+
+        let message = error.to_string();
+        assert!(message.contains("EGRESS_ALLOWED_HOSTS entries must be hostnames without ports"));
+        assert!(message.contains("EGRESS_TIMEOUT_MS must be a valid millisecond duration"));
+        assert!(message.contains("EGRESS_CONNECT_TIMEOUT_MS must be a valid millisecond duration"));
+        assert!(message.contains("EGRESS_MAX_RESPONSE_BYTES must be a valid byte size"));
+        assert!(message.contains("EGRESS_MAX_REQUEST_BODY_BYTES must be a valid byte size"));
+        assert!(message.contains("EGRESS_DENY_PRIVATE_IPS must be a valid boolean"));
+        assert_eq!(error.problems.len(), 7);
     }
 
     #[test]

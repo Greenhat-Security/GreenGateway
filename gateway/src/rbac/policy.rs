@@ -577,6 +577,12 @@ mod tests {
                 "/version".to_owned(),
                 "/metrics".to_owned(),
             ],
+            egress_allowed_hosts: Vec::new(),
+            egress_timeout_ms: 30_000,
+            egress_connect_timeout_ms: 10_000,
+            egress_max_response_bytes: 5_242_880,
+            egress_max_request_body_bytes: 1_048_576,
+            egress_deny_private_ips: true,
         }
     }
 
