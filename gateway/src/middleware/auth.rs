@@ -13,20 +13,19 @@ use axum::{
 };
 use http::{
     header::{COOKIE, USER_AGENT, WWW_AUTHENTICATE},
-    Extensions, HeaderMap, HeaderValue, StatusCode,
+    HeaderMap, HeaderValue, StatusCode,
 };
 use serde::Serialize;
 use serde_json::json;
-use tower_http::request_id::RequestId;
 
 use crate::{
     audit::{AuditEvent, AuditLog},
     auth::{actor_from_principal, AuthError, Principal, SessionCredential, SessionValidator},
-    client_ip::canonical_client_ip,
+    client_ip::{canonical_client_ip, request_id},
     config::Config,
 };
 
-use super::bearer::bearer_token;
+use super::{bearer::bearer_token, decision::AuthOutcome};
 
 const AUTH_SUCCESS: &str = "auth.success";
 const AUTH_FAILURE: &str = "auth.failure";
@@ -84,23 +83,27 @@ pub async fn auth_middleware(
 
     let audit = audit_context(&req, path, state.trust_proxy_headers);
     let Some(credential) = extract_credential(req.headers(), &state.cookie_name) else {
-        emit_failure(&state, &audit, "missing_credential");
-        return unauthorized();
+        let reason = "missing_credential";
+        emit_failure(&state, &audit, reason);
+        return unauthorized_with_auth_outcome(reason);
     };
 
     let Some(validator) = state.validator.as_ref().map(Arc::clone) else {
-        emit_failure(&state, &audit, "no_validator_configured");
-        return unauthorized();
+        let reason = "no_validator_configured";
+        emit_failure(&state, &audit, reason);
+        return unauthorized_with_auth_outcome(reason);
     };
 
     match &credential {
         SessionCredential::Cookie(_) if !validator.supports_cookie() => {
-            emit_failure(&state, &audit, "cookie_auth_unsupported");
-            return unauthorized();
+            let reason = "cookie_auth_unsupported";
+            emit_failure(&state, &audit, reason);
+            return unauthorized_with_auth_outcome(reason);
         }
         SessionCredential::Bearer(_) if !validator.supports_bearer() => {
-            emit_failure(&state, &audit, "bearer_auth_unsupported");
-            return unauthorized();
+            let reason = "bearer_auth_unsupported";
+            emit_failure(&state, &audit, reason);
+            return unauthorized_with_auth_outcome(reason);
         }
         _ => {}
     }
@@ -108,17 +111,23 @@ pub async fn auth_middleware(
     match validator.validate_session(&credential).await {
         Ok(principal) => {
             emit_success(&state, &audit, &credential, &principal);
-            req.extensions_mut().insert(principal);
-            next.run(req).await
+            req.extensions_mut().insert(principal.clone());
+            let mut response = next.run(req).await;
+            response.extensions_mut().insert(AuthOutcome {
+                principal: Some(principal),
+                authenticated: true,
+                reason: None,
+            });
+            response
         }
         Err(AuthError::InvalidSession(reason)) => {
             emit_failure(&state, &audit, &reason);
-            unauthorized()
+            unauthorized_with_auth_outcome(reason)
         }
         Err(AuthError::Upstream(reason)) => {
             let reason = format!("upstream_error: {reason}");
             emit_failure(&state, &audit, &reason);
-            unauthorized()
+            unauthorized_with_auth_outcome(reason)
         }
     }
 }
@@ -130,21 +139,6 @@ fn audit_context(req: &Request, path: String, trust_proxy_headers: bool) -> Audi
         user_agent: header_to_trimmed_string(req.headers().get(USER_AGENT)),
         path,
     }
-}
-
-fn request_id(headers: &HeaderMap, extensions: &Extensions) -> String {
-    headers
-        .get(crate::REQUEST_ID_HEADER)
-        .and_then(header_value_to_str)
-        .or_else(|| {
-            extensions
-                .get::<RequestId>()
-                .and_then(|request_id| request_id.header_value().to_str().ok())
-        })
-        .map(str::trim)
-        .filter(|request_id| !request_id.is_empty())
-        .unwrap_or("unknown")
-        .to_owned()
 }
 
 pub fn extract_credential(headers: &HeaderMap, cookie_name: &str) -> Option<SessionCredential> {
@@ -234,6 +228,16 @@ fn unauthorized() -> Response {
         }),
     )
         .into_response()
+}
+
+fn unauthorized_with_auth_outcome(reason: impl Into<String>) -> Response {
+    let mut response = unauthorized();
+    response.extensions_mut().insert(AuthOutcome {
+        principal: None,
+        authenticated: false,
+        reason: Some(reason.into()),
+    });
+    response
 }
 
 fn header_to_trimmed_string(value: Option<&HeaderValue>) -> Option<String> {
