@@ -1,7 +1,7 @@
 use std::{convert::Infallible, sync::Arc};
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -28,15 +28,23 @@ mod config;
 mod egress;
 mod metrics;
 mod middleware;
+mod path_match;
 mod rbac;
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
 const REQUEST_ID_HEADER: &str = "x-request-id";
+const ADMIN_UI_ROUTE: &str = "/admin";
+const ADMIN_UI_INDEX: &str = "index.html";
+const ADMIN_UI_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 const AUDIT_ADMIN_ROUTE: &str = "/v1/admin/audit";
 const AUDIT_EVENTS_STREAM_ROUTE: &str = "/v1/admin/events/stream";
 const AUDIT_ADMIN_ROLE: &str = "admin";
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
 const MAX_AUDIT_QUERY_LIMIT: usize = 500;
+
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../admin-ui/dist/"]
+struct AdminUiAssets;
 
 #[derive(Clone)]
 struct AppState {
@@ -196,6 +204,9 @@ fn app(
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/metrics", get(metrics_endpoint))
+        .route(ADMIN_UI_ROUTE, get(admin_ui_index))
+        .route("/admin/", get(admin_ui_index))
+        .route("/admin/{*path}", get(admin_ui_asset))
         .with_state(AppState { metrics_handle })
         .merge(
             Router::new()
@@ -348,6 +359,50 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
         )],
         state.metrics_handle.render(),
     )
+}
+
+async fn admin_ui_index() -> Response {
+    record_request(ADMIN_UI_ROUTE);
+    admin_ui_index_response()
+}
+
+async fn admin_ui_asset(Path(path): Path<String>) -> Response {
+    record_request(ADMIN_UI_ROUTE);
+
+    let asset_path = path.trim_start_matches('/');
+    if !asset_path.is_empty() {
+        if let Some(asset) = AdminUiAssets::get(asset_path) {
+            return embedded_asset_response(asset_path, asset);
+        }
+    }
+
+    admin_ui_index_response()
+}
+
+fn admin_ui_index_response() -> Response {
+    match AdminUiAssets::get(ADMIN_UI_INDEX) {
+        Some(asset) => embedded_asset_response(ADMIN_UI_INDEX, asset),
+        None => internal_server_error("admin UI index not embedded"),
+    }
+}
+
+fn embedded_asset_response(path: &str, asset: rust_embed::EmbeddedFile) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type_for_path(path)),
+            (
+                HeaderName::from_static("content-security-policy"),
+                HeaderValue::from_static(ADMIN_UI_CONTENT_SECURITY_POLICY),
+            ),
+        ],
+        asset.data.into_owned(),
+    )
+        .into_response()
+}
+
+fn content_type_for_path(path: &str) -> HeaderValue {
+    HeaderValue::from_str(mime_guess::from_path(path).first_or_octet_stream().as_ref())
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))
 }
 
 async fn audit_query_endpoint(
@@ -651,6 +706,7 @@ mod tests {
                 "/health".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
+                "/admin".to_owned(),
             ],
             session_cookie_name: String::new(),
             validation_allowed_content_types: vec!["application/json".to_owned()],
@@ -660,6 +716,7 @@ mod tests {
                 "/health".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
+                "/admin".to_owned(),
             ],
             jwt_jwks_url: None,
             jwt_issuer: None,
@@ -762,6 +819,133 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key(REQUEST_ID_HEADER));
+    }
+
+    #[tokio::test]
+    async fn admin_ui_shell_is_served_without_principal() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let response = app(
+            test_config(Vec::new()),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+        .oneshot(
+            Request::builder()
+                .uri("/admin")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_content_type_starts_with(response.headers(), "text/html");
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            ADMIN_UI_CONTENT_SECURITY_POLICY
+        );
+        let body = body_string(response).await;
+        assert!(body.contains(r#"<div id="root"></div>"#));
+    }
+
+    #[tokio::test]
+    async fn admin_ui_real_embedded_javascript_asset_is_served() {
+        let asset_path = AdminUiAssets::iter()
+            .find(|path| path.starts_with("assets/") && path.ends_with(".js"))
+            .expect("Vite build should embed a JavaScript asset")
+            .to_string();
+        let uri = format!("/admin/{asset_path}");
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let response = app(
+            test_config(Vec::new()),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .expect("content type should be present");
+        assert!(
+            content_type.starts_with("text/javascript")
+                || content_type.starts_with("application/javascript"),
+            "unexpected JavaScript content type: {content_type}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        assert!(!body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_ui_client_routes_fall_back_to_index() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let response = app(
+            test_config(Vec::new()),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+        .oneshot(
+            Request::builder()
+                .uri("/admin/logs")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_content_type_starts_with(response.headers(), "text/html");
+        let body = body_string(response).await;
+        assert!(body.contains(r#"<div id="root"></div>"#));
+    }
+
+    #[tokio::test]
+    async fn admin_ui_traversal_attempts_fall_back_to_index_only() {
+        for uri in [
+            "/admin/../../../etc/passwd",
+            "/admin/%2e%2e/%2e%2e/etc/passwd",
+        ] {
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let response = app(
+                test_config(Vec::new()),
+                recorder.handle(),
+                test_audit_log(),
+                test_audit_event_sender(),
+            )
+            .expect("app should build")
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_content_type_starts_with(response.headers(), "text/html");
+            let body = body_string(response).await;
+            assert!(body.contains(r#"<div id="root"></div>"#));
+            assert!(!body.contains("root:x:0:0"));
+        }
     }
 
     #[tokio::test]
@@ -1519,6 +1703,18 @@ mod tests {
                 .to_vec(),
         )
         .expect("body should be UTF-8")
+    }
+
+    fn assert_content_type_starts_with(headers: &http::HeaderMap, expected: &str) {
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .expect("content type should be present");
+
+        assert!(
+            content_type.starts_with(expected),
+            "expected content type to start with {expected}, got {content_type}"
+        );
     }
 
     fn test_principal(roles: &[&str]) -> auth::Principal {

@@ -23,6 +23,7 @@ use crate::{
     auth::{actor_from_principal, AuthError, Principal, SessionCredential, SessionValidator},
     client_ip::{canonical_client_ip, request_id},
     config::Config,
+    path_match::path_prefix_matches,
 };
 
 use super::{bearer::bearer_token, decision::AuthOutcome};
@@ -76,7 +77,7 @@ pub async fn auth_middleware(
     if state
         .exempt_paths
         .iter()
-        .any(|exempt_path| exempt_path == &path)
+        .any(|exempt_path| path_prefix_matches(&path, exempt_path))
     {
         return next.run(req).await;
     }
@@ -327,6 +328,12 @@ mod tests {
 
         Router::new()
             .route("/health", get(ok))
+            .route("/version", get(ok))
+            .route("/metrics", get(ok))
+            .route("/admin", get(ok))
+            .route("/admin/assets/app.js", get(ok))
+            .route("/administrator", get(ok))
+            .route("/admin-panel", get(ok))
             .route("/protected", get(principal).options(ok))
             .layer(from_fn_with_state(state, auth_middleware))
     }
@@ -339,7 +346,12 @@ mod tests {
             AuthState {
                 validator,
                 cookie_name: "session".to_owned(),
-                exempt_paths: vec!["/health".to_owned(), "/version".to_owned()],
+                exempt_paths: vec![
+                    "/health".to_owned(),
+                    "/version".to_owned(),
+                    "/metrics".to_owned(),
+                    "/admin".to_owned(),
+                ],
                 audit,
                 trust_proxy_headers: false,
             },
@@ -390,6 +402,63 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(capture.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_probe_exempt_paths_return_ok_without_credential() {
+        let (state, capture) = test_state(None);
+        let router = test_router(state);
+
+        for path in ["/health", "/version", "/metrics"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert!(capture.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_exempt_path_matches_subpaths_but_not_lookalikes() {
+        let (state, capture) = test_state(None);
+        let router = test_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/assets/app.js")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(capture.events().is_empty());
+
+        for path in ["/administrator", "/admin-panel"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 
     #[tokio::test]

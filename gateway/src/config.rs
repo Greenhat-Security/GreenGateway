@@ -23,8 +23,8 @@ const DEFAULT_RATE_LIMIT_WRITE_BURST: u32 = 20;
 const DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES: &[&str] = &["application/json"];
 const DEFAULT_AUTH_ENABLED: bool = true;
 const DEFAULT_AUTH_COOKIE_NAME: &str = "session";
-const DEFAULT_AUTH_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
-const DEFAULT_RBAC_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
+const DEFAULT_AUTH_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics", "/admin"];
+const DEFAULT_RBAC_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics", "/admin"];
 const DEFAULT_JWT_JWKS_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_ROLES_CLAIM: &str = "roles";
 const DEFAULT_CSRF_ENABLED: bool = true;
@@ -783,6 +783,7 @@ mod tests {
                 "/health".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
+                "/admin".to_owned(),
             ]
         );
         assert!(config.session_cookie_name.is_empty());
@@ -798,6 +799,7 @@ mod tests {
                 "/health".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
+                "/admin".to_owned(),
             ]
         );
         assert_eq!(config.jwt_jwks_url, None);
@@ -881,6 +883,7 @@ mod tests {
                 "/health".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
+                "/admin".to_owned(),
             ]
         );
         assert!(config.session_cookie_name.is_empty());
@@ -896,6 +899,7 @@ mod tests {
                 "/health".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
+                "/admin".to_owned(),
             ]
         );
         assert_eq!(config.jwt_jwks_url, None);

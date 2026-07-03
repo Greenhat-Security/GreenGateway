@@ -17,6 +17,7 @@ use crate::{
     auth::{self, actor_from_principal},
     client_ip::{canonical_client_ip, request_id},
     config::Config,
+    path_match::path_prefix_matches,
     rbac::{DefaultAction, Policy, PolicyEngine, RouteRule},
 };
 
@@ -86,7 +87,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     if state
         .exempt_paths
         .iter()
-        .any(|exempt_path| exempt_path == path)
+        .any(|exempt_path| path_prefix_matches(path, exempt_path))
     {
         return next.run(req).await;
     }
@@ -156,23 +157,6 @@ fn matching_route<'a>(
     routes.iter().find(|rule| {
         path_prefix_matches(path, &rule.path_prefix) && method_matches(&rule.methods, method)
     })
-}
-
-fn path_prefix_matches(path: &str, path_prefix: &str) -> bool {
-    if !path_prefix.starts_with('/') {
-        return false;
-    }
-
-    if path == path_prefix {
-        return true;
-    }
-
-    if path_prefix.ends_with('/') {
-        return path.starts_with(path_prefix);
-    }
-
-    path.strip_prefix(path_prefix)
-        .is_some_and(|remaining| remaining.starts_with('/'))
 }
 
 fn is_unsafe_request_path(path: &str) -> bool {
@@ -322,6 +306,52 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(capture.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_probe_exempt_paths_return_ok_without_authz_event() {
+        let (state, capture) = test_state(
+            test_policy(DefaultAction::Deny, &[], &[]),
+            &["/health", "/version", "/metrics"],
+        );
+        let router = test_router(state, None);
+
+        for path in ["/health", "/version", "/metrics"] {
+            let response = router
+                .clone()
+                .oneshot(request(Method::GET, path))
+                .await
+                .expect("request should complete");
+
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert!(capture.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_exempt_path_matches_subpaths_but_not_lookalikes() {
+        let (state, capture) = test_state(test_policy(DefaultAction::Deny, &[], &[]), &["/admin"]);
+        let router = test_router(state, None);
+
+        let response = router
+            .clone()
+            .oneshot(request(Method::GET, "/admin/assets/app.js"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(capture.events().is_empty());
+
+        for path in ["/administrator", "/admin-panel"] {
+            let response = router
+                .clone()
+                .oneshot(request(Method::GET, path))
+                .await
+                .expect("request should complete");
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
     }
 
     #[tokio::test]
