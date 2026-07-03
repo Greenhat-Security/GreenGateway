@@ -6,9 +6,21 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT"
 
 matches="$(
-    grep -RInE 'reqwest::Client|reqwest::get[[:space:]]*\(' gateway/src --include='*.rs' \
-        | grep -v '^gateway/src/egress\.rs:' \
-        || true
+    git ls-files '*.rs' |
+        while IFS= read -r file; do
+            if [ "$file" = "gateway/src/egress.rs" ]; then
+                continue
+            fi
+
+            if file_matches="$(grep -nE '\breqwest\b' "$file")"; then
+                printf '%s\n' "$file_matches" | awk -v file="$file" '{ print file ":" $0 }'
+            else
+                status=$?
+                if [ "$status" -ne 1 ]; then
+                    exit "$status"
+                fi
+            fi
+        done
 )"
 
 if [ -n "$matches" ]; then

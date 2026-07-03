@@ -752,7 +752,15 @@ mQIDAQAB
         });
         let mut cfg = default_cfg();
         cfg.jwks_url = format!("http://127.0.0.1:{}/.well-known/jwks.json", addr.port());
-        let egress_client = egress_client(HashSet::from(["127.0.0.1".to_owned()]), false);
+        let mut config = test_config(Some(&cfg.jwks_url));
+        config.egress_deny_private_ips = false;
+        let egress_config = EgressConfig::from_config(&config);
+
+        assert!(config.egress_allowed_hosts.is_empty());
+        assert!(egress_config.allowed_hosts.contains("127.0.0.1"));
+
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config).expect("test egress client should build"));
         let validator = JwtValidator::new(cfg, egress_client).expect("validator should build");
         let token = signed_token(base_claims(), TEST_PRIVATE_KEY);
 

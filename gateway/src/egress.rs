@@ -16,7 +16,6 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
-#[allow(dead_code)] // Introduced before gateway callers are rerouted through egress in PR 2.
 #[derive(Debug)]
 pub enum EgressError {
     HostNotAllowed(String),
@@ -70,7 +69,6 @@ impl From<reqwest::Error> for EgressError {
     }
 }
 
-#[allow(dead_code)] // Egress config is consumed when outbound callers are wired through this client.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EgressConfig {
     pub allowed_hosts: HashSet<String>,
@@ -95,7 +93,6 @@ impl Default for EgressConfig {
 }
 
 impl EgressConfig {
-    #[allow(dead_code)] // PR 2 wires Config-derived egress settings into outbound callers.
     pub fn from_config(config: &Config) -> Self {
         let mut allowed_hosts: HashSet<String> = config
             .egress_allowed_hosts
@@ -154,15 +151,14 @@ fn auto_seed_endpoint_host(
     }
 }
 
-#[allow(dead_code)] // Returned by the egress client once gateway callers start using it.
 #[derive(Debug)]
 pub struct EgressResponse {
     pub status: StatusCode,
+    #[allow(dead_code)] // Retained for callers that need upstream response headers.
     pub headers: HeaderMap,
     pub body: Vec<u8>,
 }
 
-#[allow(dead_code)] // Standalone client lands in this PR; request-path wiring follows in PR 2.
 #[derive(Clone)]
 pub struct EgressClient {
     config: EgressConfig,
@@ -172,7 +168,6 @@ pub struct EgressClient {
 }
 
 impl EgressClient {
-    #[allow(dead_code)] // Used when outbound gateway callers are rerouted through egress.
     pub fn new(config: EgressConfig) -> Result<Self, EgressError> {
         let base_client = base_client_builder(&config).build()?;
 
@@ -182,13 +177,11 @@ impl EgressClient {
         })
     }
 
-    #[allow(dead_code)] // Used by simple outbound calls that do not need custom headers or a body.
     pub async fn request(&self, method: Method, url: &str) -> Result<EgressResponse, EgressError> {
         self.request_with_headers(method, url, HeaderMap::new(), None)
             .await
     }
 
-    #[allow(dead_code)] // Main egress surface for future JWKS, proxy, and MCP tool-call wiring.
     pub async fn request_with_headers(
         &self,
         method: Method,
@@ -344,8 +337,10 @@ fn checked_host(url: &Url, allowed_hosts: &HashSet<String>) -> Result<String, Eg
         .ok_or_else(|| EgressError::InvalidUrl("missing host".to_owned()))?
         .to_ascii_lowercase();
 
-    // IPv6 literal URL hosts stay denied: bracketed literals do not get
-    // normalized into allowlist entries and fail closed before any request.
+    // IPv6 literal URL hosts may enter the allowlist through auto-seeded
+    // infrastructure endpoints. They still fail closed today because the
+    // resolver is given the bracketed form, so IPv6 literal JWKS and endpoint
+    // URLs remain unsupported for now.
     if allowed_hosts.contains(&host) {
         Ok(host)
     } else {
