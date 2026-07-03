@@ -12,7 +12,7 @@ export type AuditEvent = {
   event_id: string;
   event_type: string;
   timestamp: string;
-  schema_version: number;
+  schema_version: number | string;
   request_id: string;
   source_ip: string;
   user_agent?: string | null;

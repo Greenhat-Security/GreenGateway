@@ -12,6 +12,7 @@ import {
   getStoredToken,
   setStoredToken,
 } from './lib/auth';
+import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
 
 export function App() {
@@ -43,16 +44,7 @@ function AdminShell() {
       <Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/logs" element={<LogExplorer />} />
-        <Route
-          path="/live"
-          element={
-            <ComingSoonPage
-              eyebrow="Phase 2"
-              title="Live tail"
-              body="Streaming audit events will land in the next PR."
-            />
-          }
-        />
+        <Route path="/live" element={<LiveTail />} />
         <Route
           path="/status"
           element={
@@ -86,7 +78,7 @@ function Dashboard() {
           </Link>
           <Link to="/live">
             <span>Live tail</span>
-            <small>Coming soon</small>
+            <small>Streaming audit events</small>
           </Link>
           <Link to="/status">
             <span>Status</span>
