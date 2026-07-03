@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     error::Error,
     fmt,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
@@ -27,7 +27,6 @@ pub enum EgressError {
     RequestBodyTooLarge { size: usize, max: usize },
     ResponseTooLarge { max: usize },
     Http(reqwest::Error),
-    Io(std::io::Error),
 }
 
 impl fmt::Display for EgressError {
@@ -52,7 +51,6 @@ impl fmt::Display for EgressError {
                 write!(formatter, "egress response body exceeded {max} bytes")
             }
             Self::Http(err) => write!(formatter, "egress HTTP error: {err}"),
-            Self::Io(err) => write!(formatter, "egress IO error: {err}"),
         }
     }
 }
@@ -61,7 +59,6 @@ impl Error for EgressError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Http(err) => Some(err),
-            Self::Io(err) => Some(err),
             _ => None,
         }
     }
@@ -70,12 +67,6 @@ impl Error for EgressError {
 impl From<reqwest::Error> for EgressError {
     fn from(err: reqwest::Error) -> Self {
         Self::Http(err)
-    }
-}
-
-impl From<std::io::Error> for EgressError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
     }
 }
 
@@ -266,12 +257,35 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
                 || (ip & 0xffc0_0000) == 0x6440_0000
                 || (ip & 0xffff_0000) == 0xa9fe_0000
                 || (ip & 0xff00_0000) == 0x0000_0000
+                // 240.0.0.0/4 is reserved and includes 255.255.255.255 broadcast.
+                || (ip & 0xf000_0000) == 0xf000_0000
         }
         IpAddr::V6(ip) => {
-            ip == Ipv6Addr::LOCALHOST
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return is_private_ip(IpAddr::V4(v4));
+            }
+
+            if let Some(v4) = nat64_embedded_ipv4(ip) {
+                return is_private_ip(IpAddr::V4(v4));
+            }
+
+            ip.is_unspecified()
+                || ip == Ipv6Addr::LOCALHOST
                 || (ip.segments()[0] & 0xfe00) == 0xfc00
                 || (ip.segments()[0] & 0xffc0) == 0xfe80
         }
+    }
+}
+
+fn nat64_embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = ip.segments();
+
+    if segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+        Some(Ipv4Addr::from(
+            ((segments[6] as u32) << 16) | segments[7] as u32,
+        ))
+    } else {
+        None
     }
 }
 
@@ -288,6 +302,8 @@ fn checked_host(url: &Url, allowed_hosts: &HashSet<String>) -> Result<String, Eg
         .ok_or_else(|| EgressError::InvalidUrl("missing host".to_owned()))?
         .to_ascii_lowercase();
 
+    // IPv6 literal URL hosts stay denied: bracketed literals do not get
+    // normalized into allowlist entries and fail closed before any request.
     if allowed_hosts.contains(&host) {
         Ok(host)
     } else {
@@ -421,15 +437,36 @@ mod tests {
     }
 
     #[test]
+    fn private_ip_detects_ipv4_reserved_range_and_broadcast() {
+        assert!(is_private_ip(ip("240.0.0.1")));
+        assert!(is_private_ip(ip("255.255.255.255")));
+        assert!(!is_private_ip(ip("239.255.255.255")));
+    }
+
+    #[test]
     fn private_ip_allows_public_ipv4_examples() {
         assert!(!is_private_ip(ip("8.8.8.8")));
         assert!(!is_private_ip(ip("1.1.1.1")));
     }
 
     #[test]
+    fn private_ip_detects_ipv4_mapped_ipv6_private_addresses() {
+        assert!(is_private_ip(ip("::ffff:127.0.0.1")));
+        assert!(is_private_ip(ip("::ffff:169.254.169.254")));
+        assert!(is_private_ip(ip("::ffff:10.0.0.1")));
+        assert!(is_private_ip(ip("::ffff:192.168.1.1")));
+        assert!(!is_private_ip(ip("::ffff:8.8.8.8")));
+    }
+
+    #[test]
     fn private_ip_detects_ipv6_loopback() {
         assert!(is_private_ip(ip("::1")));
         assert!(!is_private_ip(ip("::2")));
+    }
+
+    #[test]
+    fn private_ip_detects_ipv6_unspecified() {
+        assert!(is_private_ip(ip("::")));
     }
 
     #[test]
@@ -446,6 +483,12 @@ mod tests {
         assert!(is_private_ip(ip("febf:ffff::1")));
         assert!(!is_private_ip(ip("fe7f:ffff::1")));
         assert!(!is_private_ip(ip("fec0::1")));
+    }
+
+    #[test]
+    fn private_ip_detects_nat64_embedded_private_addresses() {
+        assert!(is_private_ip(ip("64:ff9b::a9fe:a9fe")));
+        assert!(!is_private_ip(ip("64:ff9b::808:808")));
     }
 
     #[test]
@@ -498,6 +541,19 @@ mod tests {
             .expect_err("URL without host should be invalid");
 
         assert!(matches!(error, EgressError::InvalidUrl(_)));
+    }
+
+    #[tokio::test]
+    async fn ipv6_literal_url_is_denied() {
+        let config = EgressConfig {
+            allowed_hosts: HashSet::from(["[::1]".to_owned()]),
+            ..EgressConfig::default()
+        };
+        let client = EgressClient::new(config).expect("client should build");
+
+        let result = client.request(Method::GET, "http://[::1]/").await;
+
+        assert!(result.is_err(), "IPv6 literal URL should be denied");
     }
 
     #[test]
