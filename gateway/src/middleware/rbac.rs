@@ -61,6 +61,19 @@ impl RbacState {
 
 pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next: Next) -> Response {
     let path = req.uri().path();
+
+    // Conservative fail-closed guard for the current local-handler stage. When
+    // the Phase 3 reverse proxy lands, upgrade this to proper path
+    // normalization (percent-decode plus dot-segment resolution) before route
+    // matching so legitimate percent-encoded upstream paths can be supported.
+    // Until then, rejecting unsafe raw paths is the safe default.
+    if is_unsafe_request_path(path) {
+        let context = audit_context(&req, state.trust_proxy_headers);
+        let principal = req.extensions().get::<auth::Principal>().cloned();
+        emit_denied(&state, &context, principal.as_ref(), "unsafe_path", None);
+        return forbidden();
+    }
+
     if state
         .exempt_paths
         .iter()
@@ -82,13 +95,12 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
             return next.run(req).await;
         }
 
-        emit_denied(
-            &state,
-            &context,
-            principal.as_ref(),
-            "missing_permission",
-            Some(rule),
-        );
+        let reason = if principal.is_some() {
+            "missing_permission"
+        } else {
+            "missing_principal"
+        };
+        emit_denied(&state, &context, principal.as_ref(), reason, Some(rule));
         return forbidden();
     }
 
@@ -115,9 +127,33 @@ fn matching_route<'a>(
     method: &Method,
     path: &str,
 ) -> Option<&'a RouteRule> {
-    routes
-        .iter()
-        .find(|rule| path.starts_with(&rule.path_prefix) && method_matches(&rule.methods, method))
+    routes.iter().find(|rule| {
+        path_prefix_matches(path, &rule.path_prefix) && method_matches(&rule.methods, method)
+    })
+}
+
+fn path_prefix_matches(path: &str, path_prefix: &str) -> bool {
+    if !path_prefix.starts_with('/') {
+        return false;
+    }
+
+    if path == path_prefix {
+        return true;
+    }
+
+    if path_prefix.ends_with('/') {
+        return path.starts_with(path_prefix);
+    }
+
+    path.strip_prefix(path_prefix)
+        .is_some_and(|remaining| remaining.starts_with('/'))
+}
+
+fn is_unsafe_request_path(path: &str) -> bool {
+    path.contains('%')
+        || path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
 }
 
 fn method_matches(methods: &[String], method: &Method) -> bool {
@@ -353,8 +389,89 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let event = captured_event(&capture, AUTHZ_DENIED).await;
-        assert_eq!(event.payload["reason"], json!("missing_permission"));
+        assert_eq!(event.payload["reason"], json!("missing_principal"));
         assert!(event.actor.is_none());
+    }
+
+    #[test]
+    fn route_prefix_matches_only_at_segment_boundary() {
+        let routes = vec![
+            route(&[], "/data", "data:read"),
+            route(&[], "/database", "database:read"),
+            route(&[], "/data-export", "data:export"),
+        ];
+
+        let rule = matching_route(&routes, &Method::GET, "/data").expect("rule should match");
+        assert_eq!(rule.path_prefix, "/data");
+
+        let rule =
+            matching_route(&routes, &Method::GET, "/data/report").expect("rule should match");
+        assert_eq!(rule.path_prefix, "/data");
+
+        let rule = matching_route(&routes, &Method::GET, "/database").expect("rule should match");
+        assert_eq!(rule.path_prefix, "/database");
+
+        let rule =
+            matching_route(&routes, &Method::GET, "/data-export").expect("rule should match");
+        assert_eq!(rule.path_prefix, "/data-export");
+    }
+
+    #[tokio::test]
+    async fn unsafe_paths_fail_closed_with_unsafe_path_reason() {
+        for path in ["/data/../admin", "/%61dmin", "/a/./b"] {
+            let (state, capture) = test_state(
+                test_policy(
+                    DefaultAction::Allow,
+                    &[("reader", &["data:read"])],
+                    &[route(&[], "/data", "data:read")],
+                ),
+                &[],
+            );
+
+            let response = test_router(state, Some(test_principal(&["reader"])))
+                .oneshot(request(Method::GET, path))
+                .await
+                .expect("request should complete");
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let event = captured_event(&capture, AUTHZ_DENIED).await;
+            assert_eq!(event.payload["reason"], json!("unsafe_path"));
+            assert_eq!(event.payload["path"], json!(path));
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_paths_continue_to_normal_rule_evaluation() {
+        let (state, capture) = test_state(test_policy(DefaultAction::Deny, &[], &[]), &[]);
+
+        let response = test_router(state, None)
+            .oneshot(request(Method::GET, "/file.json"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let event = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(event.payload["reason"], json!("default_deny"));
+        assert_eq!(event.payload["path"], json!("/file.json"));
+
+        let (state, capture) = test_state(
+            test_policy(
+                DefaultAction::Deny,
+                &[("reader", &["data:read"])],
+                &[route(&[], "/data", "data:read")],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, "/data/report"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let event = captured_event(&capture, AUTHZ_ALLOWED).await;
+        assert_eq!(event.payload["path_prefix"], json!("/data"));
+        assert_eq!(event.payload["path"], json!("/data/report"));
     }
 
     #[tokio::test]

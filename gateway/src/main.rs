@@ -113,7 +113,7 @@ fn app(
             ))
         }
         None => {
-            tracing::info!("RBAC disabled: no policy file configured");
+            tracing::warn!("RBAC disabled: no policy file configured");
             None
         }
     };

@@ -62,7 +62,7 @@ pub struct RouteRule {
     /// HTTP methods this rule matches. Empty or ["*"] matches any method.
     #[serde(default)]
     pub methods: Vec<String>,
-    /// Path prefix this rule matches. Rules are evaluated in order with starts_with.
+    /// Absolute path prefix this rule matches. Rules are evaluated in order.
     pub path_prefix: String,
     /// Permission required to access a matching route.
     pub permission: String,
@@ -111,6 +111,7 @@ impl Policy {
             source,
         })?;
         policy.validate()?;
+        warn_unreachable_route_path_prefixes(&policy);
 
         Ok(policy)
     }
@@ -183,6 +184,25 @@ fn unknown_top_level_keys(value: &Value) -> Vec<String> {
         .keys()
         .filter(|key| !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()))
         .cloned()
+        .collect()
+}
+
+fn warn_unreachable_route_path_prefixes(policy: &Policy) {
+    let path_prefixes = unreachable_route_path_prefixes(&policy.routes);
+
+    if !path_prefixes.is_empty() {
+        tracing::warn!(
+            path_prefixes = ?path_prefixes,
+            "policy contains route path_prefix values that do not start with '/' and cannot match request paths"
+        );
+    }
+}
+
+fn unreachable_route_path_prefixes(routes: &[RouteRule]) -> Vec<String> {
+    routes
+        .iter()
+        .filter(|route| !route.path_prefix.starts_with('/'))
+        .map(|route| route.path_prefix.clone())
         .collect()
 }
 
@@ -359,6 +379,21 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_route_path_prefix_detection_names_non_absolute_prefixes() {
+        let routes = vec![
+            route("/data", "data:read"),
+            route("admin", "admin:read"),
+            route("", "empty:read"),
+            route("/reports", "reports:read"),
+        ];
+
+        assert_eq!(
+            unreachable_route_path_prefixes(&routes),
+            vec!["admin".to_owned(), String::new()]
+        );
+    }
+
+    #[test]
     fn from_config_returns_none_when_policy_file_unset() {
         let config = test_config(None);
 
@@ -488,6 +523,14 @@ mod tests {
     fn assert_schema_accepts(validator: &Validator, policy: &Value) {
         if let Err(error) = validator.validate(policy) {
             panic!("published schema should accept policy document: {error}");
+        }
+    }
+
+    fn route(path_prefix: &str, permission: &str) -> RouteRule {
+        RouteRule {
+            methods: Vec::new(),
+            path_prefix: path_prefix.to_owned(),
+            permission: permission.to_owned(),
         }
     }
 
