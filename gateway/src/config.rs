@@ -7,7 +7,7 @@ use std::{
     sync::LazyLock,
 };
 
-use http::HeaderValue;
+use http::{HeaderName, HeaderValue};
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
@@ -21,7 +21,16 @@ const DEFAULT_RATE_LIMIT_READ_BURST: u32 = 100;
 const DEFAULT_RATE_LIMIT_WRITE_RPS: f64 = 10.0;
 const DEFAULT_RATE_LIMIT_WRITE_BURST: u32 = 20;
 const DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES: &[&str] = &["application/json"];
+const DEFAULT_CSRF_ENABLED: bool = true;
+const DEFAULT_CSRF_COOKIE_NAME: &str = "csrf_token";
+const DEFAULT_CSRF_HEADER_NAME: &str = "x-csrf-token";
+const DEFAULT_CSRF_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const CORS_ALLOW_ORIGINS: &str = "CORS_ALLOW_ORIGINS";
+const CSRF_COOKIE_DOMAIN: &str = "CSRF_COOKIE_DOMAIN";
+const CSRF_COOKIE_NAME: &str = "CSRF_COOKIE_NAME";
+const CSRF_ENABLED: &str = "CSRF_ENABLED";
+const CSRF_EXEMPT_PATHS: &str = "CSRF_EXEMPT_PATHS";
+const CSRF_HEADER_NAME: &str = "CSRF_HEADER_NAME";
 const MAX_BODY_SIZE: &str = "MAX_BODY_SIZE";
 const RATE_LIMIT_READ_RPS: &str = "RATE_LIMIT_READ_RPS";
 const RATE_LIMIT_READ_BURST: &str = "RATE_LIMIT_READ_BURST";
@@ -43,6 +52,11 @@ pub struct Config {
     pub trust_proxy_headers: bool,
     pub session_cookie_name: String,
     pub validation_allowed_content_types: Vec<String>,
+    pub csrf_enabled: bool,
+    pub csrf_cookie_name: String,
+    pub csrf_header_name: String,
+    pub csrf_cookie_domain: Option<String>,
+    pub csrf_exempt_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +153,36 @@ impl Config {
             DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES,
             &mut problems,
         );
+        let csrf_enabled = parse_var(
+            CSRF_ENABLED,
+            get_var(CSRF_ENABLED),
+            DEFAULT_CSRF_ENABLED,
+            "boolean",
+            &mut problems,
+        );
+        let csrf_cookie_name = parse_cookie_name(
+            CSRF_COOKIE_NAME,
+            get_var(CSRF_COOKIE_NAME),
+            DEFAULT_CSRF_COOKIE_NAME,
+            &mut problems,
+        );
+        let csrf_header_name = parse_header_name_string(
+            CSRF_HEADER_NAME,
+            get_var(CSRF_HEADER_NAME),
+            DEFAULT_CSRF_HEADER_NAME,
+            &mut problems,
+        );
+        let csrf_cookie_domain = parse_optional_cookie_domain(
+            CSRF_COOKIE_DOMAIN,
+            get_var(CSRF_COOKIE_DOMAIN),
+            &mut problems,
+        );
+        let csrf_exempt_paths = parse_comma_separated_paths(
+            CSRF_EXEMPT_PATHS,
+            get_var(CSRF_EXEMPT_PATHS),
+            DEFAULT_CSRF_EXEMPT_PATHS,
+            &mut problems,
+        );
 
         if problems.is_empty() {
             Ok(Self {
@@ -152,6 +196,11 @@ impl Config {
                 trust_proxy_headers,
                 session_cookie_name,
                 validation_allowed_content_types,
+                csrf_enabled,
+                csrf_cookie_name,
+                csrf_header_name,
+                csrf_cookie_domain,
+                csrf_exempt_paths,
             })
         } else {
             Err(ConfigError { problems })
@@ -253,6 +302,152 @@ fn parse_comma_separated_header_values(
     values
 }
 
+fn parse_cookie_name(
+    name: &str,
+    value: Result<String, VarError>,
+    default: &str,
+    problems: &mut Vec<String>,
+) -> String {
+    let parsed = parse_var(name, value, default.to_owned(), "cookie name", problems);
+
+    if is_valid_cookie_name(&parsed) {
+        parsed
+    } else {
+        problems.push(format!(
+            "{name} must be a non-empty RFC 6265 cookie name, got '{parsed}'"
+        ));
+        default.to_owned()
+    }
+}
+
+fn parse_header_name_string(
+    name: &str,
+    value: Result<String, VarError>,
+    default: &str,
+    problems: &mut Vec<String>,
+) -> String {
+    let parsed = parse_var(
+        name,
+        value,
+        default.to_owned(),
+        "HTTP header name",
+        problems,
+    );
+
+    match HeaderName::from_bytes(parsed.as_bytes()) {
+        Ok(header_name) => header_name.as_str().to_owned(),
+        Err(err) => {
+            problems.push(format!(
+                "{name} must be a valid HTTP header name, got '{parsed}': {err}"
+            ));
+            default.to_owned()
+        }
+    }
+}
+
+fn parse_optional_cookie_domain(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Option<String> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return None,
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return None;
+        }
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if is_valid_cookie_domain(value) {
+        Some(value.to_owned())
+    } else {
+        problems.push(format!(
+            "{name} must be a valid cookie Domain attribute, got '{value}'"
+        ));
+        None
+    }
+}
+
+fn parse_comma_separated_paths(
+    name: &str,
+    value: Result<String, VarError>,
+    default: &[&str],
+    problems: &mut Vec<String>,
+) -> Vec<String> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => {
+            return default.iter().map(|value| (*value).to_owned()).collect()
+        }
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return default.iter().map(|value| (*value).to_owned()).collect();
+        }
+    };
+
+    let mut values = Vec::new();
+
+    for entry in value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        if is_valid_exempt_path(entry) {
+            values.push(entry.to_owned());
+        } else {
+            problems.push(format!(
+                "{name} entries must be URI paths starting with '/', got '{entry}'"
+            ));
+        }
+    }
+
+    values
+}
+
+fn is_valid_cookie_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn is_valid_cookie_domain(value: &str) -> bool {
+    value.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+}
+
+fn is_valid_exempt_path(value: &str) -> bool {
+    value.starts_with('/')
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +480,18 @@ mod tests {
         assert_eq!(
             config.validation_allowed_content_types,
             vec!["application/json".to_owned()]
+        );
+        assert!(config.csrf_enabled);
+        assert_eq!(config.csrf_cookie_name, "csrf_token");
+        assert_eq!(config.csrf_header_name, "x-csrf-token");
+        assert_eq!(config.csrf_cookie_domain, None);
+        assert_eq!(
+            config.csrf_exempt_paths,
+            vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ]
         );
     }
 
@@ -328,6 +535,18 @@ mod tests {
         assert_eq!(
             config.validation_allowed_content_types,
             vec!["application/json".to_owned()]
+        );
+        assert!(config.csrf_enabled);
+        assert_eq!(config.csrf_cookie_name, "csrf_token");
+        assert_eq!(config.csrf_header_name, "x-csrf-token");
+        assert_eq!(config.csrf_cookie_domain, None);
+        assert_eq!(
+            config.csrf_exempt_paths,
+            vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ]
         );
     }
 
@@ -461,6 +680,53 @@ mod tests {
             .contains("VALIDATION_ALLOWED_CONTENT_TYPES entries must be valid HTTP header values"));
         assert!(message.contains("bad\nvalue"));
         assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
+    fn csrf_config_parses() {
+        let config = Config::from_env_vars(|name| match name {
+            "CSRF_ENABLED" => Ok("false".to_owned()),
+            "CSRF_COOKIE_NAME" => Ok("custom_csrf".to_owned()),
+            "CSRF_HEADER_NAME" => Ok("X-Custom-CSRF".to_owned()),
+            "CSRF_COOKIE_DOMAIN" => Ok(".example.test".to_owned()),
+            "CSRF_EXEMPT_PATHS" => Ok(" /health, /ready ,, /metrics ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert!(!config.csrf_enabled);
+        assert_eq!(config.csrf_cookie_name, "custom_csrf");
+        assert_eq!(config.csrf_header_name, "x-custom-csrf");
+        assert_eq!(config.csrf_cookie_domain, Some(".example.test".to_owned()));
+        assert_eq!(
+            config.csrf_exempt_paths,
+            vec![
+                "/health".to_owned(),
+                "/ready".to_owned(),
+                "/metrics".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_csrf_config_values_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "CSRF_ENABLED" => Ok("maybe".to_owned()),
+            "CSRF_COOKIE_NAME" => Ok("csrf token".to_owned()),
+            "CSRF_HEADER_NAME" => Ok("bad header".to_owned()),
+            "CSRF_COOKIE_DOMAIN" => Ok("bad;domain".to_owned()),
+            "CSRF_EXEMPT_PATHS" => Ok("/health,admin".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid CSRF settings");
+
+        let message = error.to_string();
+        assert!(message.contains("CSRF_ENABLED must be a valid boolean"));
+        assert!(message.contains("CSRF_COOKIE_NAME must be a non-empty RFC 6265 cookie name"));
+        assert!(message.contains("CSRF_HEADER_NAME must be a valid HTTP header name"));
+        assert!(message.contains("CSRF_COOKIE_DOMAIN must be a valid cookie Domain attribute"));
+        assert!(message.contains("CSRF_EXEMPT_PATHS entries must be URI paths"));
+        assert_eq!(error.problems.len(), 5);
     }
 
     #[test]

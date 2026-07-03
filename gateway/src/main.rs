@@ -71,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn app(config: config::Config, metrics_handle: PrometheusHandle) -> Router {
     let request_id_header = request_id_header();
+    let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
     let rate_limit_state = middleware::rate_limit::RateLimitState::from_config(&config);
 
     Router::new()
@@ -78,6 +79,10 @@ fn app(config: config::Config, metrics_handle: PrometheusHandle) -> Router {
         .route("/version", get(version))
         .route("/metrics", get(metrics_endpoint))
         .with_state(AppState { metrics_handle })
+        .layer(axum::middleware::from_fn_with_state(
+            csrf_config,
+            middleware::csrf::csrf_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             config.clone(),
             middleware::validate::validate_request,
@@ -119,6 +124,17 @@ fn cors_layer(config: &config::Config) -> CorsLayer {
                 .expect("validated CORS origin should be a valid HTTP header value")
         })
         .collect();
+    let allowed_headers = vec![
+        header::CONTENT_TYPE,
+        header::AUTHORIZATION,
+        header::COOKIE,
+        header::ACCEPT,
+        config
+            .csrf_header_name
+            .parse::<HeaderName>()
+            .expect("validated CSRF header name should be a valid HTTP header name"),
+        request_id_header(),
+    ];
 
     CorsLayer::new()
         .allow_origin(allowed_origins)
@@ -130,14 +146,7 @@ fn cors_layer(config: &config::Config) -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([
-            header::CONTENT_TYPE,
-            header::AUTHORIZATION,
-            header::COOKIE,
-            header::ACCEPT,
-            HeaderName::from_static("x-csrf-token"),
-            request_id_header(),
-        ])
+        .allow_headers(allowed_headers)
         .allow_credentials(true)
 }
 
@@ -192,6 +201,15 @@ mod tests {
             trust_proxy_headers: false,
             session_cookie_name: String::new(),
             validation_allowed_content_types: vec!["application/json".to_owned()],
+            csrf_enabled: true,
+            csrf_cookie_name: "csrf_token".to_owned(),
+            csrf_header_name: "x-csrf-token".to_owned(),
+            csrf_cookie_domain: None,
+            csrf_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
         }
     }
 
@@ -269,5 +287,85 @@ mod tests {
         assert!(!response
             .headers()
             .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+    }
+
+    #[tokio::test]
+    async fn outer_layers_wrap_validation_rejections() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let response = app(test_config(Vec::new()), recorder.handle())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/health")
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from("hello"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert!(response.headers().contains_key(REQUEST_ID_HEADER));
+    }
+
+    #[tokio::test]
+    async fn validation_runs_before_csrf() {
+        let config = test_config(Vec::new());
+        assert!(config.csrf_enabled);
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let response = app(config, recorder.handle())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/does-not-exist")
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from("hello"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        // This proves ordering because CSRF is enabled and the path is not exempt.
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_runs_before_validation() {
+        let mut config = test_config(Vec::new());
+        config.max_body_size = 1;
+        config.rate_limit_read_rps = 0.0;
+        config.rate_limit_read_burst = 1;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(config, recorder.handle());
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/health")
+                    .header(header::CONTENT_LENGTH, "2")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }
