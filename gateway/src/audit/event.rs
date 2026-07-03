@@ -47,7 +47,6 @@ impl AuditEvent {
         }
     }
 
-    #[allow(dead_code)] // Request audit events will attach user agents when auth/request auditing lands.
     pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = Some(user_agent.into());
         self

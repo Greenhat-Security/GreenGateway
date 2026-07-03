@@ -92,6 +92,30 @@ Default: `application/json`
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a valid HTTP header value. `POST`, `PUT`, and `PATCH` requests are accepted when their `Content-Type` starts with any configured entry, allowing values such as `application/json; charset=utf-8`.
 
+### AUTH_ENABLED
+
+Enables global authentication middleware.
+
+Default: `true`
+
+Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, non-exempt requests must present a supported, valid credential or they are rejected with `401 Unauthorized`. When disabled, authentication is a no-op passthrough and no `Principal` is injected for downstream handlers. A future observe mode in Phase 3 will add a middle ground; today this setting is enabled or disabled.
+
+### AUTH_COOKIE_NAME
+
+Cookie name read as a session credential by authentication middleware.
+
+Default: `session`
+
+Format and validation: must be a non-empty RFC 6265 cookie name. The cookie value is treated as credential material and is never echoed in logs, audit payloads, or client responses.
+
+### AUTH_EXEMPT_PATHS
+
+Comma-separated paths that bypass authentication.
+
+Default: `/health,/version,/metrics`
+
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. Exempt paths are allowed through without credential extraction and do not emit auth audit events.
+
 ### JWT_JWKS_URL
 
 Optional JWKS endpoint used to validate RS256 bearer JWTs.

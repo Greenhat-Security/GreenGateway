@@ -18,7 +18,6 @@ const INVALID_TOKEN: &str = "invalid or expired token";
 const MIN_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// JWT bearer-token validator configuration.
-#[allow(dead_code)] // PR 3 auth middleware will build this from gateway Config.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JwtAuthConfig {
     /// JWKS endpoint containing RS256 public keys.
@@ -36,7 +35,6 @@ pub struct JwtAuthConfig {
 }
 
 impl JwtAuthConfig {
-    #[allow(dead_code)] // PR 3 auth middleware will call this during validator setup.
     pub fn from_config(config: &Config) -> Option<Self> {
         Some(Self {
             jwks_url: config.jwt_jwks_url.clone()?,
@@ -71,7 +69,6 @@ impl RevocationStore for NoopRevocationStore {
 }
 
 /// RS256 JWT bearer-token validator backed by a kid-indexed JWKS key cache.
-#[allow(dead_code)] // PR 3 auth middleware will hold this behind Arc<dyn SessionValidator>.
 pub struct JwtValidator {
     cfg: JwtAuthConfig,
     client: reqwest::Client,
@@ -94,7 +91,6 @@ impl fmt::Debug for JwtValidator {
 }
 
 impl JwtValidator {
-    #[allow(dead_code)] // PR 3 auth middleware will use this default constructor.
     pub fn new(cfg: JwtAuthConfig) -> Result<Self, AuthError> {
         Self::with_keys(cfg, Arc::new(NoopRevocationStore), HashMap::new())
     }
@@ -107,7 +103,6 @@ impl JwtValidator {
         Self::with_keys(cfg, revocation, HashMap::new())
     }
 
-    #[allow(dead_code)] // PR 3 auth middleware will call this only when JWT_JWKS_URL is set.
     pub fn from_config(config: &Config) -> Result<Option<Self>, AuthError> {
         JwtAuthConfig::from_config(config)
             .map(Self::new)
@@ -796,6 +791,13 @@ mQIDAQAB
             trust_proxy_headers: false,
             session_cookie_name: String::new(),
             validation_allowed_content_types: vec!["application/json".to_owned()],
+            auth_enabled: true,
+            auth_cookie_name: "session".to_owned(),
+            auth_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
             jwt_jwks_url: jwks_url.map(str::to_owned),
             jwt_issuer: None,
             jwt_audience: None,

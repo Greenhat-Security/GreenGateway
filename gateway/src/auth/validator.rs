@@ -3,8 +3,8 @@ use std::{error::Error, fmt};
 use super::Principal;
 
 /// Credential material extracted from an incoming request for validation.
-#[allow(dead_code)] // Auth middleware will pass credentials into validators when it lands.
 pub enum SessionCredential {
+    #[allow(dead_code)] // Cookie validators land after the bearer JWT path.
     Cookie(String),
     Bearer(String),
 }
@@ -19,7 +19,6 @@ impl fmt::Debug for SessionCredential {
 }
 
 /// Errors returned while validating session credentials.
-#[allow(dead_code)] // Concrete validators introduced later will produce these errors.
 #[derive(Debug)]
 pub enum AuthError {
     /// Credential is invalid, expired, or revoked.
@@ -41,7 +40,6 @@ impl fmt::Display for AuthError {
 
 impl Error for AuthError {}
 
-#[allow(dead_code)] // Auth middleware will store validators behind Arc<dyn SessionValidator>.
 #[async_trait::async_trait] // Keeps async validation object-safe for Arc<dyn SessionValidator>.
 pub trait SessionValidator: Send + Sync {
     async fn validate_session(

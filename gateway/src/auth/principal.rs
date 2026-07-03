@@ -16,18 +16,21 @@ impl AuthMethod {
 }
 
 /// Authenticated caller identity used for authorization and audit attribution.
-#[allow(dead_code)] // Session validators will return principals when concrete validators land.
 #[derive(Debug, Clone)]
 pub struct Principal {
     /// Canonical user identifier for authorization and ownership checks.
     pub user_id: String,
     /// User email address, normalized to lowercase when present.
+    #[allow(dead_code)] // RBAC and upstream policy rules will consume this identity field.
     pub email: Option<String>,
     /// Optional organization/tenant claim; per ADR-0002, org and role claims are rule-matching inputs, not isolation boundaries.
+    #[allow(dead_code)] // RBAC and upstream policy rules will consume this identity field.
     pub org_id: Option<String>,
     /// Role claims used by policy rules.
     pub roles: Vec<String>,
     /// Opaque session or credential identifier supplied by the validator.
+    #[allow(dead_code)]
+    // Request policy and audit enrichment will consume this identifier later.
     pub session_id: String,
     /// Authentication mechanism used for this principal.
     pub auth_method: AuthMethod,
@@ -37,7 +40,6 @@ pub struct Principal {
 ///
 /// Audit `auth_mode` values are neutral labels: `session_cookie` for cookie
 /// credentials and `bearer_token` for bearer credentials.
-#[allow(dead_code)] // Auth audit middleware will call this when it attaches actors to events.
 pub fn actor_from_principal(principal: &Principal) -> crate::audit::Actor {
     crate::audit::Actor {
         user_id: principal.user_id.clone(),

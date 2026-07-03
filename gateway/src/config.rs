@@ -21,6 +21,9 @@ const DEFAULT_RATE_LIMIT_READ_BURST: u32 = 100;
 const DEFAULT_RATE_LIMIT_WRITE_RPS: f64 = 10.0;
 const DEFAULT_RATE_LIMIT_WRITE_BURST: u32 = 20;
 const DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES: &[&str] = &["application/json"];
+const DEFAULT_AUTH_ENABLED: bool = true;
+const DEFAULT_AUTH_COOKIE_NAME: &str = "session";
+const DEFAULT_AUTH_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_JWT_JWKS_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_ROLES_CLAIM: &str = "roles";
 const DEFAULT_CSRF_ENABLED: bool = true;
@@ -28,6 +31,9 @@ const DEFAULT_CSRF_COOKIE_NAME: &str = "csrf_token";
 const DEFAULT_CSRF_HEADER_NAME: &str = "x-csrf-token";
 const DEFAULT_CSRF_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const AUDIT_LOG_FILE: &str = "AUDIT_LOG_FILE";
+const AUTH_COOKIE_NAME: &str = "AUTH_COOKIE_NAME";
+const AUTH_ENABLED: &str = "AUTH_ENABLED";
+const AUTH_EXEMPT_PATHS: &str = "AUTH_EXEMPT_PATHS";
 const CORS_ALLOW_ORIGINS: &str = "CORS_ALLOW_ORIGINS";
 const CSRF_COOKIE_DOMAIN: &str = "CSRF_COOKIE_DOMAIN";
 const CSRF_COOKIE_NAME: &str = "CSRF_COOKIE_NAME";
@@ -62,6 +68,9 @@ pub struct Config {
     pub trust_proxy_headers: bool,
     pub session_cookie_name: String,
     pub validation_allowed_content_types: Vec<String>,
+    pub auth_enabled: bool,
+    pub auth_cookie_name: String,
+    pub auth_exempt_paths: Vec<String>,
     pub jwt_jwks_url: Option<String>,
     pub jwt_issuer: Option<String>,
     pub jwt_audience: Option<String>,
@@ -171,6 +180,25 @@ impl Config {
             DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES,
             &mut problems,
         );
+        let auth_enabled = parse_var(
+            AUTH_ENABLED,
+            get_var(AUTH_ENABLED),
+            DEFAULT_AUTH_ENABLED,
+            "boolean",
+            &mut problems,
+        );
+        let auth_cookie_name = parse_cookie_name(
+            AUTH_COOKIE_NAME,
+            get_var(AUTH_COOKIE_NAME),
+            DEFAULT_AUTH_COOKIE_NAME,
+            &mut problems,
+        );
+        let auth_exempt_paths = parse_comma_separated_paths(
+            AUTH_EXEMPT_PATHS,
+            get_var(AUTH_EXEMPT_PATHS),
+            DEFAULT_AUTH_EXEMPT_PATHS,
+            &mut problems,
+        );
         let jwt_jwks_url =
             parse_optional_string(JWT_JWKS_URL, get_var(JWT_JWKS_URL), &mut problems);
         let jwt_issuer = parse_optional_string(JWT_ISSUER, get_var(JWT_ISSUER), &mut problems);
@@ -240,6 +268,9 @@ impl Config {
                 trust_proxy_headers,
                 session_cookie_name,
                 validation_allowed_content_types,
+                auth_enabled,
+                auth_cookie_name,
+                auth_exempt_paths,
                 jwt_jwks_url,
                 jwt_issuer,
                 jwt_audience,
@@ -571,6 +602,16 @@ mod tests {
             config.validation_allowed_content_types,
             vec!["application/json".to_owned()]
         );
+        assert!(config.auth_enabled);
+        assert_eq!(config.auth_cookie_name, "session");
+        assert_eq!(
+            config.auth_exempt_paths,
+            vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ]
+        );
         assert_eq!(config.jwt_jwks_url, None);
         assert_eq!(config.jwt_issuer, None);
         assert_eq!(config.jwt_audience, None);
@@ -632,6 +673,16 @@ mod tests {
         assert_eq!(
             config.validation_allowed_content_types,
             vec!["application/json".to_owned()]
+        );
+        assert!(config.auth_enabled);
+        assert_eq!(config.auth_cookie_name, "session");
+        assert_eq!(
+            config.auth_exempt_paths,
+            vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ]
         );
         assert_eq!(config.jwt_jwks_url, None);
         assert_eq!(config.jwt_issuer, None);
@@ -808,6 +859,45 @@ mod tests {
             .contains("VALIDATION_ALLOWED_CONTENT_TYPES entries must be valid HTTP header values"));
         assert!(message.contains("bad\nvalue"));
         assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
+    fn auth_config_parses() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUTH_ENABLED" => Ok("false".to_owned()),
+            "AUTH_COOKIE_NAME" => Ok("gateway_session".to_owned()),
+            "AUTH_EXEMPT_PATHS" => Ok(" /health, /ready ,, /metrics ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert!(!config.auth_enabled);
+        assert_eq!(config.auth_cookie_name, "gateway_session");
+        assert_eq!(
+            config.auth_exempt_paths,
+            vec![
+                "/health".to_owned(),
+                "/ready".to_owned(),
+                "/metrics".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_auth_config_values_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "AUTH_ENABLED" => Ok("maybe".to_owned()),
+            "AUTH_COOKIE_NAME" => Ok("session token".to_owned()),
+            "AUTH_EXEMPT_PATHS" => Ok("/health,admin".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid auth settings");
+
+        let message = error.to_string();
+        assert!(message.contains("AUTH_ENABLED must be a valid boolean"));
+        assert!(message.contains("AUTH_COOKIE_NAME must be a non-empty RFC 6265 cookie name"));
+        assert!(message.contains("AUTH_EXEMPT_PATHS entries must be URI paths"));
+        assert_eq!(error.problems.len(), 3);
     }
 
     #[test]
