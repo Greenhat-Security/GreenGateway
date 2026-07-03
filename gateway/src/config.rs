@@ -21,6 +21,8 @@ const DEFAULT_RATE_LIMIT_READ_BURST: u32 = 100;
 const DEFAULT_RATE_LIMIT_WRITE_RPS: f64 = 10.0;
 const DEFAULT_RATE_LIMIT_WRITE_BURST: u32 = 20;
 const DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES: &[&str] = &["application/json"];
+const DEFAULT_JWT_JWKS_TIMEOUT_MS: u64 = 2000;
+const DEFAULT_ROLES_CLAIM: &str = "roles";
 const DEFAULT_CSRF_ENABLED: bool = true;
 const DEFAULT_CSRF_COOKIE_NAME: &str = "csrf_token";
 const DEFAULT_CSRF_HEADER_NAME: &str = "x-csrf-token";
@@ -32,11 +34,17 @@ const CSRF_COOKIE_NAME: &str = "CSRF_COOKIE_NAME";
 const CSRF_ENABLED: &str = "CSRF_ENABLED";
 const CSRF_EXEMPT_PATHS: &str = "CSRF_EXEMPT_PATHS";
 const CSRF_HEADER_NAME: &str = "CSRF_HEADER_NAME";
+const JWT_AUDIENCE: &str = "JWT_AUDIENCE";
+const JWT_ISSUER: &str = "JWT_ISSUER";
+const JWT_JWKS_TIMEOUT_MS: &str = "JWT_JWKS_TIMEOUT_MS";
+const JWT_JWKS_URL: &str = "JWT_JWKS_URL";
+const JWT_REQUIRE_JTI: &str = "JWT_REQUIRE_JTI";
 const MAX_BODY_SIZE: &str = "MAX_BODY_SIZE";
 const RATE_LIMIT_READ_RPS: &str = "RATE_LIMIT_READ_RPS";
 const RATE_LIMIT_READ_BURST: &str = "RATE_LIMIT_READ_BURST";
 const RATE_LIMIT_WRITE_RPS: &str = "RATE_LIMIT_WRITE_RPS";
 const RATE_LIMIT_WRITE_BURST: &str = "RATE_LIMIT_WRITE_BURST";
+const ROLES_CLAIM: &str = "ROLES_CLAIM";
 const TRUST_PROXY_HEADERS: &str = "TRUST_PROXY_HEADERS";
 const SESSION_COOKIE_NAME: &str = "SESSION_COOKIE_NAME";
 const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES";
@@ -54,6 +62,12 @@ pub struct Config {
     pub trust_proxy_headers: bool,
     pub session_cookie_name: String,
     pub validation_allowed_content_types: Vec<String>,
+    pub jwt_jwks_url: Option<String>,
+    pub jwt_issuer: Option<String>,
+    pub jwt_audience: Option<String>,
+    pub jwt_jwks_timeout_ms: u64,
+    pub jwt_require_jti: bool,
+    pub roles_claim: String,
     pub csrf_enabled: bool,
     pub csrf_cookie_name: String,
     pub csrf_header_name: String,
@@ -157,6 +171,31 @@ impl Config {
             DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES,
             &mut problems,
         );
+        let jwt_jwks_url =
+            parse_optional_string(JWT_JWKS_URL, get_var(JWT_JWKS_URL), &mut problems);
+        let jwt_issuer = parse_optional_string(JWT_ISSUER, get_var(JWT_ISSUER), &mut problems);
+        let jwt_audience =
+            parse_optional_string(JWT_AUDIENCE, get_var(JWT_AUDIENCE), &mut problems);
+        let jwt_jwks_timeout_ms = parse_var(
+            JWT_JWKS_TIMEOUT_MS,
+            get_var(JWT_JWKS_TIMEOUT_MS),
+            DEFAULT_JWT_JWKS_TIMEOUT_MS,
+            "millisecond duration",
+            &mut problems,
+        );
+        let jwt_require_jti = parse_var(
+            JWT_REQUIRE_JTI,
+            get_var(JWT_REQUIRE_JTI),
+            false,
+            "boolean",
+            &mut problems,
+        );
+        let roles_claim = parse_non_empty_string(
+            ROLES_CLAIM,
+            get_var(ROLES_CLAIM),
+            DEFAULT_ROLES_CLAIM,
+            &mut problems,
+        );
         let csrf_enabled = parse_var(
             CSRF_ENABLED,
             get_var(CSRF_ENABLED),
@@ -201,6 +240,12 @@ impl Config {
                 trust_proxy_headers,
                 session_cookie_name,
                 validation_allowed_content_types,
+                jwt_jwks_url,
+                jwt_issuer,
+                jwt_audience,
+                jwt_jwks_timeout_ms,
+                jwt_require_jti,
+                roles_claim,
                 csrf_enabled,
                 csrf_cookie_name,
                 csrf_header_name,
@@ -291,6 +336,23 @@ fn parse_optional_string(
         None
     } else {
         Some(value.to_owned())
+    }
+}
+
+fn parse_non_empty_string(
+    name: &str,
+    value: Result<String, VarError>,
+    default: &str,
+    problems: &mut Vec<String>,
+) -> String {
+    let parsed = parse_var(name, value, default.to_owned(), "string", problems);
+    let parsed = parsed.trim();
+
+    if parsed.is_empty() {
+        problems.push(format!("{name} must be a non-empty string"));
+        default.to_owned()
+    } else {
+        parsed.to_owned()
     }
 }
 
@@ -509,6 +571,12 @@ mod tests {
             config.validation_allowed_content_types,
             vec!["application/json".to_owned()]
         );
+        assert_eq!(config.jwt_jwks_url, None);
+        assert_eq!(config.jwt_issuer, None);
+        assert_eq!(config.jwt_audience, None);
+        assert_eq!(config.jwt_jwks_timeout_ms, DEFAULT_JWT_JWKS_TIMEOUT_MS);
+        assert!(!config.jwt_require_jti);
+        assert_eq!(config.roles_claim, "roles");
         assert!(config.csrf_enabled);
         assert_eq!(config.csrf_cookie_name, "csrf_token");
         assert_eq!(config.csrf_header_name, "x-csrf-token");
@@ -565,6 +633,12 @@ mod tests {
             config.validation_allowed_content_types,
             vec!["application/json".to_owned()]
         );
+        assert_eq!(config.jwt_jwks_url, None);
+        assert_eq!(config.jwt_issuer, None);
+        assert_eq!(config.jwt_audience, None);
+        assert_eq!(config.jwt_jwks_timeout_ms, DEFAULT_JWT_JWKS_TIMEOUT_MS);
+        assert!(!config.jwt_require_jti);
+        assert_eq!(config.roles_claim, "roles");
         assert!(config.csrf_enabled);
         assert_eq!(config.csrf_cookie_name, "csrf_token");
         assert_eq!(config.csrf_header_name, "x-csrf-token");
@@ -734,6 +808,52 @@ mod tests {
             .contains("VALIDATION_ALLOWED_CONTENT_TYPES entries must be valid HTTP header values"));
         assert!(message.contains("bad\nvalue"));
         assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
+    fn jwt_config_parses() {
+        let config = Config::from_env_vars(|name| match name {
+            "JWT_JWKS_URL" => {
+                Ok("  https://issuer.example.test/.well-known/jwks.json  ".to_owned())
+            }
+            "JWT_ISSUER" => Ok("  https://issuer.example.test/  ".to_owned()),
+            "JWT_AUDIENCE" => Ok("  greengateway  ".to_owned()),
+            "JWT_JWKS_TIMEOUT_MS" => Ok("5000".to_owned()),
+            "JWT_REQUIRE_JTI" => Ok("true".to_owned()),
+            "ROLES_CLAIM" => Ok(" groups ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.jwt_jwks_url,
+            Some("https://issuer.example.test/.well-known/jwks.json".to_owned())
+        );
+        assert_eq!(
+            config.jwt_issuer,
+            Some("https://issuer.example.test/".to_owned())
+        );
+        assert_eq!(config.jwt_audience, Some("greengateway".to_owned()));
+        assert_eq!(config.jwt_jwks_timeout_ms, 5000);
+        assert!(config.jwt_require_jti);
+        assert_eq!(config.roles_claim, "groups");
+    }
+
+    #[test]
+    fn invalid_jwt_config_values_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "JWT_JWKS_TIMEOUT_MS" => Ok("slow".to_owned()),
+            "JWT_REQUIRE_JTI" => Ok("sometimes".to_owned()),
+            "ROLES_CLAIM" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid JWT settings");
+
+        let message = error.to_string();
+        assert!(message.contains("JWT_JWKS_TIMEOUT_MS must be a valid millisecond duration"));
+        assert!(message.contains("JWT_REQUIRE_JTI must be a valid boolean"));
+        assert!(message.contains("ROLES_CLAIM must be a non-empty string"));
+        assert_eq!(error.problems.len(), 3);
     }
 
     #[test]
