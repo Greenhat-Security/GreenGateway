@@ -27,6 +27,29 @@ fn env_example_matches_gateway_env_reads() {
     );
 }
 
+#[test]
+fn configuration_doc_matches_gateway_env_reads() {
+    let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = gateway_root
+        .parent()
+        .expect("gateway crate should live directly under the repo root");
+
+    let documented = configuration_doc_env_vars(&repo_root.join("docs/configuration.md"));
+    let code_reads = code_env_vars(&gateway_root.join("src"));
+
+    let missing_from_doc: Vec<_> = code_reads.difference(&documented).cloned().collect();
+    let missing_from_code: Vec<_> = documented.difference(&code_reads).cloned().collect();
+
+    assert!(
+        missing_from_doc.is_empty() && missing_from_code.is_empty(),
+        "docs/configuration.md drift detected.\n\
+         Read in gateway/src but missing from docs/configuration.md: {}\n\
+         Documented in docs/configuration.md but not read in gateway/src: {}",
+        format_vars(&missing_from_doc),
+        format_vars(&missing_from_code)
+    );
+}
+
 fn documented_env_vars(path: &Path) -> BTreeSet<String> {
     let contents = fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
@@ -43,6 +66,20 @@ fn documented_env_vars(path: &Path) -> BTreeSet<String> {
             let (key, _) = line.split_once('=')?;
             let key = key.trim();
             is_env_key(key).then(|| key.to_owned())
+        })
+        .collect()
+}
+
+fn configuration_doc_env_vars(path: &Path) -> BTreeSet<String> {
+    let contents = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+
+    contents
+        .lines()
+        .filter_map(|line| {
+            let heading = line.strip_prefix("### ")?;
+
+            is_env_key(heading).then(|| heading.to_owned())
         })
         .collect()
 }
