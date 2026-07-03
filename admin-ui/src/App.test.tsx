@@ -32,4 +32,19 @@ describe('AdminShell', () => {
       screen.getByRole('button', { name: 'Switch to light theme' }),
     ).toBeTruthy();
   });
+
+  it('rehydrates the selected color theme from localStorage on mount', () => {
+    window.localStorage.setItem('greengateway_admin_theme', 'dark');
+
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    expect(document.documentElement.dataset.theme).toBe('dark');
+    expect(
+      screen.getByRole('button', { name: 'Switch to light theme' }),
+    ).toBeTruthy();
+  });
 });

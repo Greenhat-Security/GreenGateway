@@ -119,6 +119,7 @@
   --gh-sys-info: var(--gh-ref-blue-600);
   --gh-sys-info-subtle: var(--gh-ref-blue-50);
   --gh-sys-warning: var(--gh-ref-amber-600);
+  --gh-sys-warning-text: #b45309;
   --gh-sys-warning-subtle: var(--gh-ref-amber-50);
   --gh-sys-danger: var(--gh-ref-red-600);
   --gh-sys-danger-subtle: var(--gh-ref-red-50);
@@ -139,6 +140,7 @@
   --gh-comp-table-row-hover: var(--gh-ref-green-50);
   --gh-comp-table-header-bg: var(--gh-ref-green-900);
   --gh-comp-table-header-fg: #ffffff;
+  --gh-comp-event-json-bg: var(--gh-ref-neutral-950);
 
   font-family: var(--gh-ref-font-body);
   color: var(--gh-sys-fg);
@@ -165,6 +167,7 @@
   --gh-sys-success-text: var(--gh-ref-green-400);
   --gh-sys-success-subtle: rgba(46, 154, 78, 0.14);
   --gh-sys-info-subtle: rgba(37, 99, 235, 0.16);
+  --gh-sys-warning-text: #fbbf24;
   --gh-sys-warning-subtle: rgba(217, 119, 6, 0.16);
   --gh-sys-danger-subtle: rgba(220, 38, 38, 0.16);
   --gh-sys-border: var(--gh-ref-neutral-700);
@@ -177,6 +180,9 @@
   --gh-sys-shadow-3: 0 4px 12px rgba(0, 0, 0, 0.5);
   --gh-sys-shadow-4: 0 8px 24px rgba(0, 0, 0, 0.55);
   --gh-sys-scrim: rgba(0, 0, 0, 0.6);
+
+  /* Tier 3: component */
+  --gh-comp-event-json-bg: #08110b;
 }
 
 * {
@@ -743,12 +749,8 @@ input:focus-visible {
 }
 
 .badge.warning {
-  color: #b45309;
+  color: var(--gh-sys-warning-text);
   background: var(--gh-sys-warning-subtle);
-}
-
-[data-theme="dark"] .badge.warning {
-  color: #fbbf24;
 }
 
 .badge.danger {
@@ -1028,11 +1030,7 @@ input:focus-visible {
 
 .event-json-row td {
   padding: 0;
-  background: var(--gh-ref-neutral-950);
-}
-
-[data-theme="dark"] .event-json-row td {
-  background: #08110b;
+  background: var(--gh-comp-event-json-bg);
 }
 
 .event-json-row pre {
