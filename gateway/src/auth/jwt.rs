@@ -1,15 +1,21 @@
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config::Config;
 
 use super::{AuthError, AuthMethod, Principal, SessionCredential, SessionValidator};
 
 const INVALID_TOKEN: &str = "invalid or expired token";
+const MIN_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// JWT bearer-token validator configuration.
 #[allow(dead_code)] // PR 3 auth middleware will build this from gateway Config.
@@ -70,6 +76,7 @@ pub struct JwtValidator {
     cfg: JwtAuthConfig,
     client: reqwest::Client,
     keys: Arc<RwLock<HashMap<String, DecodingKey>>>,
+    last_jwks_refresh: Arc<Mutex<Option<Instant>>>,
     revocation: Arc<dyn RevocationStore>,
 }
 
@@ -130,11 +137,28 @@ impl JwtValidator {
             cfg,
             client,
             keys: Arc::new(RwLock::new(initial_keys)),
+            last_jwks_refresh: Arc::new(Mutex::new(None)),
             revocation,
         })
     }
 
-    async fn refresh_jwks(&self) -> Result<(), AuthError> {
+    async fn refresh_jwks(&self) -> Result<bool, AuthError> {
+        let mut last_refresh = self.last_jwks_refresh.lock().await;
+        // Unknown kids are attacker-controlled, so avoid turning each miss into
+        // an IdP request while still allowing key rotation after the interval.
+        if last_refresh
+            .as_ref()
+            .is_some_and(|last_refresh| last_refresh.elapsed() < MIN_JWKS_REFRESH_INTERVAL)
+        {
+            return Ok(false);
+        }
+
+        let result = self.fetch_jwks().await;
+        *last_refresh = Some(Instant::now());
+        result.map(|()| true)
+    }
+
+    async fn fetch_jwks(&self) -> Result<(), AuthError> {
         let response = self
             .client
             .get(&self.cfg.jwks_url)
@@ -180,7 +204,9 @@ impl JwtValidator {
             return self.decode_with_key(token, &key);
         }
 
-        self.refresh_jwks().await?;
+        if !self.refresh_jwks().await? {
+            return Err(AuthError::InvalidSession("unknown kid".to_owned()));
+        }
 
         if let Some(key) = self.keys.read().await.get(&kid).cloned() {
             return self.decode_with_key(token, &key);
@@ -193,14 +219,19 @@ impl JwtValidator {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.validate_exp = true;
         validation.validate_aud = self.cfg.audience.is_some();
+        let mut required = vec!["exp"];
 
         if let Some(issuer) = &self.cfg.issuer {
             validation.set_issuer(&[issuer.as_str()]);
+            required.push("iss");
         }
 
         if let Some(audience) = &self.cfg.audience {
             validation.set_audience(&[audience.as_str()]);
+            required.push("aud");
         }
+
+        validation.set_required_spec_claims(&required);
 
         decode::<JwtClaims>(token, key, &validation)
             .map(|token_data| token_data.claims)
@@ -510,6 +541,53 @@ mQIDAQAB
             .expect_err("wrong audience should be rejected");
 
         assert_invalid_session(error, INVALID_TOKEN);
+    }
+
+    #[tokio::test]
+    async fn missing_audience_is_rejected_when_audience_is_configured() {
+        let mut cfg = default_cfg();
+        cfg.audience = Some("expected-audience".to_owned());
+        let validator = validator(cfg, Arc::new(NoopRevocationStore), TEST_PUBLIC_KEY);
+        let token = signed_token(base_claims(), TEST_PRIVATE_KEY);
+
+        let error = validator
+            .validate_session(&SessionCredential::Bearer(token))
+            .await
+            .expect_err("missing audience should be rejected when audience is configured");
+
+        assert_invalid_session(error, INVALID_TOKEN);
+    }
+
+    #[tokio::test]
+    async fn missing_issuer_is_rejected_when_issuer_is_configured() {
+        let mut cfg = default_cfg();
+        cfg.issuer = Some("https://expected.example.test/".to_owned());
+        let validator = validator(cfg, Arc::new(NoopRevocationStore), TEST_PUBLIC_KEY);
+        let token = signed_token(base_claims(), TEST_PRIVATE_KEY);
+
+        let error = validator
+            .validate_session(&SessionCredential::Bearer(token))
+            .await
+            .expect_err("missing issuer should be rejected when issuer is configured");
+
+        assert_invalid_session(error, INVALID_TOKEN);
+    }
+
+    #[tokio::test]
+    async fn missing_issuer_and_audience_are_allowed_when_not_configured() {
+        let validator = validator(
+            default_cfg(),
+            Arc::new(NoopRevocationStore),
+            TEST_PUBLIC_KEY,
+        );
+        let token = signed_token(base_claims(), TEST_PRIVATE_KEY);
+
+        let principal = validator
+            .validate_session(&SessionCredential::Bearer(token))
+            .await
+            .expect("missing issuer and audience should be allowed by default");
+
+        assert_eq!(principal.user_id, "user-123");
     }
 
     #[tokio::test]
