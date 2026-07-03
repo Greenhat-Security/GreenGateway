@@ -40,7 +40,7 @@ Optional RBAC policy JSON file path.
 
 Default: empty, which means no policy file is loaded.
 
-A copyable starter policy for real deployments is available at `docs/examples/policy.starter.json`.
+A copyable starter policy for real deployments is available at `docs/examples/policy.starter.json` — read [docs/examples/policy.starter.README.md](examples/policy.starter.README.md) first, since `default_action: "allow"` means unmatched routes pass through unauthenticated/unauthorized until you add `routes` rules.
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. The policy loader reads the file as JSON, validates that `schema_version` starts with `0.`, warns on unknown top-level keys, and rejects invalid policy documents.
 
