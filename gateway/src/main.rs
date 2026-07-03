@@ -176,12 +176,12 @@ fn app(
             rate_limit_state,
             middleware::rate_limit::rate_limit_request,
         ))
-        .layer(axum::middleware::from_fn(
-            middleware::headers::header_hardening_middleware,
-        ))
         .layer(axum::middleware::from_fn_with_state(
             observation_state,
             middleware::observation::observation_middleware,
+        ))
+        .layer(axum::middleware::from_fn(
+            middleware::headers::header_hardening_middleware,
         ))
         .layer(cors_layer(&config))
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
