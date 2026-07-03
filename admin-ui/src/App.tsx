@@ -14,6 +14,7 @@ import {
 } from './lib/auth';
 import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
+import { StatusPage } from './views/StatusPage';
 
 export function App() {
   return (
@@ -45,16 +46,7 @@ function AdminShell() {
         <Route path="/" element={<Dashboard />} />
         <Route path="/logs" element={<LogExplorer />} />
         <Route path="/live" element={<LiveTail />} />
-        <Route
-          path="/status"
-          element={
-            <ComingSoonPage
-              eyebrow="Phase 2"
-              title="Status"
-              body="Gateway health and version details will land in a follow-up PR."
-            />
-          }
-        />
+        <Route path="/status" element={<StatusPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Routes>
     </div>
@@ -82,7 +74,7 @@ function Dashboard() {
           </Link>
           <Link to="/status">
             <span>Status</span>
-            <small>Coming soon</small>
+            <small>Gateway runtime and config</small>
           </Link>
         </div>
       </section>
@@ -170,28 +162,6 @@ function TokenPanel() {
         </span>
       </div>
     </section>
-  );
-}
-
-function ComingSoonPage({
-  eyebrow,
-  title,
-  body,
-}: {
-  eyebrow: string;
-  title: string;
-  body: string;
-}) {
-  return (
-    <main className="single-page">
-      <section className="panel narrow-panel" aria-labelledby="coming-heading">
-        <div className="section-heading">
-          <p className="eyebrow">{eyebrow}</p>
-          <h2 id="coming-heading">{title}</h2>
-        </div>
-        <p className="body-copy">{body}</p>
-      </section>
-    </main>
   );
 }
 
