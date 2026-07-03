@@ -1,4 +1,4 @@
-use std::{convert::Infallible, sync::Arc};
+use std::{convert::Infallible, sync::Arc, time::Instant};
 
 use axum::{
     extract::{Path, Query, State},
@@ -38,6 +38,7 @@ const ADMIN_UI_INDEX: &str = "index.html";
 const ADMIN_UI_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 const AUDIT_ADMIN_ROUTE: &str = "/v1/admin/audit";
 const AUDIT_EVENTS_STREAM_ROUTE: &str = "/v1/admin/events/stream";
+const STATUS_ADMIN_ROUTE: &str = "/v1/admin/status";
 const AUDIT_ADMIN_ROLE: &str = "admin";
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
 const MAX_AUDIT_QUERY_LIMIT: usize = 500;
@@ -55,6 +56,13 @@ struct AppState {
 struct AuditAdminState {
     query_store: Option<Arc<audit::query::AuditQueryStore>>,
     event_sender: audit::AuditEventSender,
+}
+
+#[derive(Clone)]
+struct StatusAdminState {
+    config: config::Config,
+    rbac: RbacStatus,
+    process_started_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,6 +83,53 @@ struct HealthResponse {
 #[derive(Serialize)]
 struct VersionResponse {
     version: &'static str,
+}
+
+#[derive(Clone, Serialize)]
+struct RbacStatus {
+    policy_loaded: bool,
+    policy_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AuditSinksStatus {
+    stdout: bool,
+    file: bool,
+    sqlite: bool,
+    broadcast: bool,
+}
+
+#[derive(Serialize)]
+struct RateLimitStatus {
+    requests_per_second: f64,
+    burst: u32,
+}
+
+#[derive(Serialize)]
+struct RateLimitsStatus {
+    read: RateLimitStatus,
+    write: RateLimitStatus,
+}
+
+#[derive(Serialize)]
+struct EgressStatus {
+    allowed_hosts_count: usize,
+    deny_private_ips: bool,
+}
+
+#[derive(Serialize)]
+struct StatusResponse {
+    version: &'static str,
+    uptime_seconds: u64,
+    listen_addr: String,
+    auth_enabled: bool,
+    rbac: RbacStatus,
+    audit_sinks: AuditSinksStatus,
+    rate_limits: RateLimitsStatus,
+    cors_allow_origins: Vec<String>,
+    trust_proxy_headers: bool,
+    csrf_enabled: bool,
+    egress: EgressStatus,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +163,8 @@ struct ErrorResponse {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let process_started_at = Instant::now();
+
     tracing_subscriber::fmt()
         .with_target(false)
         .compact()
@@ -123,11 +180,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics_handle = install_metrics_recorder()?;
     let listen_addr = config.listen_addr;
     let (audit_log, audit_event_sender) = audit::AuditLog::from_config(&config)?;
-    let app = app(
+    let app = app_with_process_started_at(
         config,
         metrics_handle,
         audit_log.clone(),
         audit_event_sender,
+        process_started_at,
     )?;
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     let bound_addr = listener.local_addr()?;
@@ -153,11 +211,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(test)]
 fn app(
     config: config::Config,
     metrics_handle: PrometheusHandle,
     audit_log: audit::AuditLog,
     audit_event_sender: audit::AuditEventSender,
+) -> Result<Router, Box<dyn std::error::Error>> {
+    app_with_process_started_at(
+        config,
+        metrics_handle,
+        audit_log,
+        audit_event_sender,
+        Instant::now(),
+    )
+}
+
+fn app_with_process_started_at(
+    config: config::Config,
+    metrics_handle: PrometheusHandle,
+    audit_log: audit::AuditLog,
+    audit_event_sender: audit::AuditEventSender,
+    process_started_at: Instant,
 ) -> Result<Router, Box<dyn std::error::Error>> {
     let request_id_header = request_id_header();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
@@ -175,7 +250,12 @@ fn app(
     )?);
     let validator = auth::JwtValidator::from_config(&config, egress_client)?
         .map(|validator| Arc::new(validator) as Arc<dyn auth::SessionValidator>);
-    let rbac_state = match rbac::Policy::from_config(&config)? {
+    let loaded_policy = rbac::Policy::from_config(&config)?;
+    let rbac_status = RbacStatus {
+        policy_loaded: loaded_policy.is_some(),
+        policy_id: loaded_policy.as_ref().and_then(|policy| policy.id.clone()),
+    };
+    let rbac_state = match loaded_policy {
         Some(policy) => {
             tracing::info!(
                 policy_id = policy.id.as_deref().unwrap_or("unnamed"),
@@ -192,6 +272,11 @@ fn app(
             tracing::warn!("RBAC disabled: no policy file configured");
             None
         }
+    };
+    let status_state = StatusAdminState {
+        config: config.clone(),
+        rbac: rbac_status,
+        process_started_at,
     };
 
     if config.auth_enabled && validator.is_none() {
@@ -216,6 +301,11 @@ fn app(
                     query_store: audit_query_store,
                     event_sender: audit_event_sender,
                 }),
+        )
+        .merge(
+            Router::new()
+                .route(STATUS_ADMIN_ROUTE, get(status_endpoint))
+                .with_state(status_state),
         );
 
     #[cfg(test)]
@@ -361,6 +451,23 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+async fn status_endpoint(
+    State(state): State<StatusAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+) -> Response {
+    record_request(STATUS_ADMIN_ROUTE);
+
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+
+    if !principal.roles.iter().any(|role| role == AUDIT_ADMIN_ROLE) {
+        return forbidden();
+    }
+
+    Json(StatusResponse::from_state(&state)).into_response()
+}
+
 async fn admin_ui_index() -> Response {
     record_request(ADMIN_UI_ROUTE);
     admin_ui_index_response()
@@ -403,6 +510,43 @@ fn embedded_asset_response(path: &str, asset: rust_embed::EmbeddedFile) -> Respo
 fn content_type_for_path(path: &str) -> HeaderValue {
     HeaderValue::from_str(mime_guess::from_path(path).first_or_octet_stream().as_ref())
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))
+}
+
+impl StatusResponse {
+    fn from_state(state: &StatusAdminState) -> Self {
+        let config = &state.config;
+
+        Self {
+            version: env!("CARGO_PKG_VERSION"),
+            uptime_seconds: state.process_started_at.elapsed().as_secs(),
+            listen_addr: config.listen_addr.to_string(),
+            auth_enabled: config.auth_enabled,
+            rbac: state.rbac.clone(),
+            audit_sinks: AuditSinksStatus {
+                stdout: true,
+                file: config.audit_log_file.is_some(),
+                sqlite: config.audit_sqlite_path.is_some(),
+                broadcast: true,
+            },
+            rate_limits: RateLimitsStatus {
+                read: RateLimitStatus {
+                    requests_per_second: config.rate_limit_read_rps,
+                    burst: config.rate_limit_read_burst,
+                },
+                write: RateLimitStatus {
+                    requests_per_second: config.rate_limit_write_rps,
+                    burst: config.rate_limit_write_burst,
+                },
+            },
+            cors_allow_origins: config.cors_allow_origins.clone(),
+            trust_proxy_headers: config.trust_proxy_headers,
+            csrf_enabled: config.csrf_enabled,
+            egress: EgressStatus {
+                allowed_hosts_count: config.egress_allowed_hosts.len(),
+                deny_private_ips: config.egress_deny_private_ips,
+            },
+        }
+    }
 }
 
 async fn audit_query_endpoint(
@@ -1080,6 +1224,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_without_principal_returns_unauthorized() {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        let router = status_router(config, Instant::now());
+
+        let response = router
+            .oneshot(audit_query_request(STATUS_ADMIN_ROUTE, None))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_string(response).await, r#"{"error":"unauthorized"}"#);
+    }
+
+    #[tokio::test]
+    async fn status_non_admin_principal_returns_forbidden() {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        let router = status_router(config, Instant::now());
+
+        let response = router
+            .oneshot(audit_query_request(
+                STATUS_ADMIN_ROUTE,
+                Some(test_principal(&["reader"])),
+            ))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_string(response).await, r#"{"error":"forbidden"}"#);
+    }
+
+    #[tokio::test]
+    async fn status_admin_response_reflects_running_config_values() {
+        let sqlite_db = TempDb::new("status-sqlite");
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "id": "status-policy",
+                "default_action": "allow",
+                "roles": {
+                    "admin": { "permissions": ["*"] }
+                }
+            }"#,
+        );
+        let mut rich_config = test_config(vec!["https://example.test", "https://ops.example.test"]);
+        rich_config.listen_addr = "127.0.0.1:18181"
+            .parse()
+            .expect("listen address should parse");
+        rich_config.audit_log_file = Some("audit-a.jsonl".to_owned());
+        rich_config.audit_sqlite_path = Some(sqlite_db.path.to_string_lossy().into_owned());
+        rich_config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        rich_config.rate_limit_read_rps = 17.5;
+        rich_config.rate_limit_read_burst = 31;
+        rich_config.rate_limit_write_rps = 4.25;
+        rich_config.rate_limit_write_burst = 9;
+        rich_config.trust_proxy_headers = true;
+        rich_config.auth_enabled = true;
+        rich_config
+            .auth_exempt_paths
+            .push(STATUS_ADMIN_ROUTE.to_owned());
+        rich_config.csrf_enabled = false;
+        rich_config.egress_allowed_hosts = vec![
+            "api.example.test".to_owned(),
+            "tiles.example.test".to_owned(),
+        ];
+        rich_config.egress_deny_private_ips = false;
+
+        let rich = status_json(
+            status_router(rich_config, Instant::now() - Duration::from_secs(42)),
+            Some(test_principal(&["admin"])),
+        )
+        .await;
+
+        assert_eq!(rich["version"], env!("CARGO_PKG_VERSION"));
+        assert!(rich["uptime_seconds"].as_u64().unwrap_or_default() >= 42);
+        assert_eq!(rich["listen_addr"], "127.0.0.1:18181");
+        assert_eq!(rich["auth_enabled"], true);
+        assert_eq!(rich["rbac"]["policy_loaded"], true);
+        assert_eq!(rich["rbac"]["policy_id"], "status-policy");
+        assert_eq!(rich["audit_sinks"]["stdout"], true);
+        assert_eq!(rich["audit_sinks"]["file"], true);
+        assert_eq!(rich["audit_sinks"]["sqlite"], true);
+        assert_eq!(rich["audit_sinks"]["broadcast"], true);
+        assert_eq!(
+            rich["rate_limits"]["read"]["requests_per_second"].as_f64(),
+            Some(17.5)
+        );
+        assert_eq!(rich["rate_limits"]["read"]["burst"], 31);
+        assert_eq!(
+            rich["rate_limits"]["write"]["requests_per_second"].as_f64(),
+            Some(4.25)
+        );
+        assert_eq!(rich["rate_limits"]["write"]["burst"], 9);
+        assert_eq!(
+            rich["cors_allow_origins"],
+            json!(["https://example.test", "https://ops.example.test"])
+        );
+        assert_eq!(rich["trust_proxy_headers"], true);
+        assert_eq!(rich["csrf_enabled"], false);
+        assert_eq!(rich["egress"]["allowed_hosts_count"], 2);
+        assert_eq!(rich["egress"]["deny_private_ips"], false);
+
+        let mut minimal_config = test_config(Vec::new());
+        minimal_config.listen_addr = "127.0.0.1:18182"
+            .parse()
+            .expect("listen address should parse");
+        minimal_config.auth_enabled = false;
+        minimal_config.rate_limit_read_rps = 61.25;
+        minimal_config.rate_limit_read_burst = 77;
+        minimal_config.rate_limit_write_rps = 8.5;
+        minimal_config.rate_limit_write_burst = 12;
+
+        let minimal = status_json(
+            status_router(minimal_config, Instant::now() - Duration::from_secs(5)),
+            Some(test_principal(&["admin"])),
+        )
+        .await;
+
+        assert_eq!(minimal["listen_addr"], "127.0.0.1:18182");
+        assert_eq!(minimal["auth_enabled"], false);
+        assert_eq!(minimal["rbac"]["policy_loaded"], false);
+        assert!(minimal["rbac"]["policy_id"].is_null());
+        assert_eq!(minimal["audit_sinks"]["file"], false);
+        assert_eq!(minimal["audit_sinks"]["sqlite"], false);
+        assert_eq!(
+            minimal["rate_limits"]["read"]["requests_per_second"].as_f64(),
+            Some(61.25)
+        );
+        assert_eq!(minimal["rate_limits"]["read"]["burst"], 77);
+        assert_eq!(
+            minimal["rate_limits"]["write"]["requests_per_second"].as_f64(),
+            Some(8.5)
+        );
+        assert_eq!(minimal["rate_limits"]["write"]["burst"], 12);
+        assert_eq!(minimal["cors_allow_origins"], json!([]));
+        assert_eq!(minimal["egress"]["allowed_hosts_count"], 0);
+        assert_eq!(minimal["egress"]["deny_private_ips"], true);
+    }
+
+    #[tokio::test]
+    async fn status_uptime_increases_between_requests() {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        let router = status_router(config, Instant::now() - Duration::from_secs(30));
+
+        let first = status_json(router.clone(), Some(test_principal(&["admin"]))).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let second = status_json(router, Some(test_principal(&["admin"]))).await;
+
+        let first_uptime = first["uptime_seconds"]
+            .as_u64()
+            .expect("uptime should be an integer");
+        let second_uptime = second["uptime_seconds"]
+            .as_u64()
+            .expect("uptime should be an integer");
+
+        assert!(first_uptime >= 30);
+        assert!(
+            second_uptime > first_uptime,
+            "expected uptime to increase, got {first_uptime} then {second_uptime}"
+        );
+    }
+
+    #[tokio::test]
     async fn audit_events_stream_admin_principal_receives_emitted_event() {
         let (router, audit_log) = audit_events_router();
         let response = router
@@ -1595,6 +1904,18 @@ mod tests {
         (router, audit_log)
     }
 
+    fn status_router(config: config::Config, process_started_at: Instant) -> Router {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        app_with_process_started_at(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+            process_started_at,
+        )
+        .expect("app should build")
+    }
+
     fn audit_query_request(uri: &str, principal: Option<auth::Principal>) -> Request<Body> {
         let mut request = Request::builder()
             .uri(uri)
@@ -1605,6 +1926,16 @@ mod tests {
         }
 
         request
+    }
+
+    async fn status_json(router: Router, principal: Option<auth::Principal>) -> Value {
+        let response = router
+            .oneshot(audit_query_request(STATUS_ADMIN_ROUTE, principal))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await
     }
 
     async fn read_sse_until(body: Body, predicate: impl Fn(&str) -> bool) -> String {
