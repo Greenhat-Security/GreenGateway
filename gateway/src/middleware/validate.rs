@@ -123,6 +123,15 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            csrf_enabled: true,
+            csrf_cookie_name: "csrf_token".to_owned(),
+            csrf_header_name: "x-csrf-token".to_owned(),
+            csrf_cookie_domain: None,
+            csrf_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
         }
     }
 

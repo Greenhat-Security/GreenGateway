@@ -83,3 +83,43 @@ Comma-separated list of `Content-Type` prefixes accepted for mutating requests.
 Default: `application/json`
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a valid HTTP header value. `POST`, `PUT`, and `PATCH` requests are accepted when their `Content-Type` starts with any configured entry, allowing values such as `application/json; charset=utf-8`.
+
+### CSRF_ENABLED
+
+Enables double-submit-cookie CSRF checks for the gateway's own state-changing control-plane requests.
+
+Default: `true`
+
+Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, cookie-authenticated state-changing control-plane requests must include a valid CSRF cookie/header token pair. Bearer-authenticated requests bypass this check because CSRF is a browser cookie-auth concern. The current gateway routes are `GET` probes and are exempt, so this setting is dormant for current production traffic.
+
+### CSRF_COOKIE_NAME
+
+Cookie name used to store the CSRF token.
+
+Default: `csrf_token`
+
+Format and validation: must be a non-empty RFC 6265 cookie name. The CSRF cookie is intentionally not `HttpOnly`, because browser JavaScript must read it and echo the token into the configured CSRF request header.
+
+### CSRF_HEADER_NAME
+
+Request header that must echo the CSRF cookie token on protected state-changing requests.
+
+Default: `x-csrf-token`
+
+Format and validation: must be a valid HTTP header name. This header is also included in the gateway CORS allow-header list.
+
+### CSRF_COOKIE_DOMAIN
+
+Optional `Domain` attribute for the CSRF cookie.
+
+Default: empty, which omits the `Domain` attribute and leaves the cookie host-scoped.
+
+Format and validation: unset or empty values become `None`. Non-empty values must be valid cookie domain attribute text, such as `.example.test` or `admin.example.test`.
+
+### CSRF_EXEMPT_PATHS
+
+Comma-separated paths that bypass CSRF checks.
+
+Default: `/health,/version,/metrics`
+
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. Exempt paths return before CSRF cookie issuance, so the default probe routes do not receive a CSRF cookie today.
