@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+# Ignore only the known test-only RSA key used to sign JWTs in
+# gateway/src/auth/jwt.rs tests. All default gitleaks detection remains enabled.
+[allowlist]
+description = "Ignore only the known test-only RSA private key used to sign JWTs in gateway/src/auth/jwt.rs tests. All default gitleaks detection remains enabled."
+regexes = [
+  '''I5qOpk5XZ/QzJNC2ze0F2VsQ5RAGNdDG9vKHm5qeYHzgM1z9SOUMXsfPYOiXvdZP''',
+]
