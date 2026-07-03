@@ -9,15 +9,19 @@ use std::{
 use crate::{
     audit::{
         sqlite_sink::{SqliteSink, SqliteSinkConfig},
-        AuditEvent, AUDIT_EVENTS_DROPPED_TOTAL,
+        AuditEvent, AuditEventSender, AUDIT_EVENTS_DROPPED_TOTAL,
     },
     config::Config,
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
 };
 
+pub const AUDIT_BROADCAST_CAPACITY: usize = 512;
+
 pub trait AuditSink: Send + Sync {
     fn emit(&self, event: &AuditEvent);
 }
+
+pub type ConfiguredAuditSink = (Arc<dyn AuditSink>, AuditEventSender);
 
 #[derive(Debug, Default)]
 pub struct StdoutSink;
@@ -139,6 +143,25 @@ impl AuditSink for FileSink {
 }
 
 #[derive(Clone)]
+pub struct BroadcastSink {
+    sender: AuditEventSender,
+}
+
+impl BroadcastSink {
+    pub fn new(sender: AuditEventSender) -> Self {
+        Self { sender }
+    }
+}
+
+impl AuditSink for BroadcastSink {
+    fn emit(&self, event: &AuditEvent) {
+        if self.sender.send(event.clone()).is_err() {
+            tracing::trace!("no active audit event stream subscribers");
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct CompositeSink {
     sinks: Vec<Arc<dyn AuditSink>>,
 }
@@ -195,19 +218,30 @@ pub fn build_sink(
     Ok(sink)
 }
 
-pub fn build_sink_from_config(config: &Config) -> Result<Arc<dyn AuditSink>, Box<dyn Error>> {
-    build_sink(
+pub fn build_sink_from_config(config: &Config) -> Result<ConfiguredAuditSink, Box<dyn Error>> {
+    let (broadcast_sender, _) = tokio::sync::broadcast::channel(AUDIT_BROADCAST_CAPACITY);
+    let base_sink = build_sink(
         config.audit_log_file.as_deref(),
         config.audit_sqlite_path.as_deref(),
         config.audit_sqlite_retention_days,
-    )
+    )?;
+    let sink = Arc::new(CompositeSink::new(vec![
+        base_sink,
+        Arc::new(BroadcastSink::new(broadcast_sender.clone())) as Arc<dyn AuditSink>,
+    ])) as Arc<dyn AuditSink>;
+
+    Ok((sink, broadcast_sender))
 }
 
 #[cfg(test)]
 pub mod tests {
     use super::*;
     use serde_json::{json, Value};
-    use std::{fs, sync::MutexGuard};
+    use std::{
+        fs,
+        sync::MutexGuard,
+        time::{Duration, Instant},
+    };
 
     #[derive(Clone, Default)]
     pub struct CaptureSink {
@@ -275,6 +309,61 @@ pub mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(first.events()[0].event_type, "audit.composite");
         assert_eq!(second.events()[0].event_type, "audit.composite");
+    }
+
+    #[tokio::test]
+    async fn broadcast_sink_emits_to_subscribed_receiver() {
+        let (sender, _) = tokio::sync::broadcast::channel(4);
+        let sink = BroadcastSink::new(sender.clone());
+        let mut receiver = sender.subscribe();
+        let event = test_event("audit.broadcast");
+
+        sink.emit(&event);
+
+        let received = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("broadcast receive should not time out")
+            .expect("broadcast receive should succeed");
+        assert_eq!(received.event_id, event.event_id);
+        assert_eq!(received.event_type, "audit.broadcast");
+    }
+
+    #[test]
+    fn broadcast_sink_emit_with_zero_receivers_does_not_panic() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(4);
+        drop(receiver);
+        let sink = BroadcastSink::new(sender);
+
+        sink.emit(&test_event("audit.broadcast.no_receivers"));
+    }
+
+    #[tokio::test]
+    async fn broadcast_sink_lagging_receiver_misses_events_without_blocking_sender() {
+        let (sender, _) = tokio::sync::broadcast::channel(4);
+        let sink = BroadcastSink::new(sender.clone());
+        let mut receiver = sender.subscribe();
+        let event = test_event("audit.broadcast.lagged");
+
+        let started = Instant::now();
+        for _ in 0..128 {
+            sink.emit(&event);
+        }
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "broadcast sink emit burst took {:?}",
+            started.elapsed()
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("lagged receiver should complete promptly");
+        match result {
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                assert!(skipped > 0, "lagged count should be positive");
+            }
+            other => panic!("expected lagged receiver error, got {other:?}"),
+        }
     }
 
     #[test]

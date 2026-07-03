@@ -1,11 +1,15 @@
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc};
 
 use axum::{
     extract::{Query, State},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::get,
     Extension, Json, Router,
 };
+use futures_util::{stream, Stream};
 use http::{header, HeaderName, HeaderValue, Method, Request, StatusCode};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::{Deserialize, Serialize};
@@ -29,6 +33,7 @@ mod rbac;
 const REQUEST_COUNTER: &str = "gateway_http_requests";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const AUDIT_ADMIN_ROUTE: &str = "/v1/admin/audit";
+const AUDIT_EVENTS_STREAM_ROUTE: &str = "/v1/admin/events/stream";
 const AUDIT_ADMIN_ROLE: &str = "admin";
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
 const MAX_AUDIT_QUERY_LIMIT: usize = 500;
@@ -41,6 +46,7 @@ struct AppState {
 #[derive(Clone)]
 struct AuditAdminState {
     query_store: Option<Arc<audit::query::AuditQueryStore>>,
+    event_sender: audit::AuditEventSender,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,6 +81,12 @@ struct AuditQueryParams {
     before_id: Option<String>,
 }
 
+#[derive(Clone, Deserialize)]
+struct AuditEventStreamParams {
+    event_type: Option<String>,
+    path: Option<String>,
+}
+
 #[derive(Serialize)]
 struct AuditQueryResponse {
     events: Vec<audit::AuditEvent>,
@@ -102,8 +114,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let metrics_handle = install_metrics_recorder()?;
     let listen_addr = config.listen_addr;
-    let audit_log = audit::AuditLog::from_config(&config)?;
-    let app = app(config, metrics_handle, audit_log.clone())?;
+    let (audit_log, audit_event_sender) = audit::AuditLog::from_config(&config)?;
+    let app = app(
+        config,
+        metrics_handle,
+        audit_log.clone(),
+        audit_event_sender,
+    )?;
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     let bound_addr = listener.local_addr()?;
 
@@ -132,6 +149,7 @@ fn app(
     config: config::Config,
     metrics_handle: PrometheusHandle,
     audit_log: audit::AuditLog,
+    audit_event_sender: audit::AuditEventSender,
 ) -> Result<Router, Box<dyn std::error::Error>> {
     let request_id_header = request_id_header();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
@@ -182,8 +200,10 @@ fn app(
         .merge(
             Router::new()
                 .route(AUDIT_ADMIN_ROUTE, get(audit_query_endpoint))
+                .route(AUDIT_EVENTS_STREAM_ROUTE, get(audit_events_stream_endpoint))
                 .with_state(AuditAdminState {
                     query_store: audit_query_store,
+                    event_sender: audit_event_sender,
                 }),
         );
 
@@ -370,6 +390,71 @@ async fn audit_query_endpoint(
     }
 }
 
+async fn audit_events_stream_endpoint(
+    State(state): State<AuditAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+    Query(params): Query<AuditEventStreamParams>,
+) -> Response {
+    record_request(AUDIT_EVENTS_STREAM_ROUTE);
+
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+
+    if !principal.roles.iter().any(|role| role == AUDIT_ADMIN_ROLE) {
+        return forbidden();
+    }
+
+    Sse::new(audit_event_sse_stream(
+        state.event_sender.subscribe(),
+        params,
+    ))
+    .keep_alive(KeepAlive::default())
+    .into_response()
+}
+
+fn audit_event_sse_stream(
+    receiver: tokio::sync::broadcast::Receiver<audit::AuditEvent>,
+    params: AuditEventStreamParams,
+) -> impl Stream<Item = Result<Event, Infallible>> + Send + 'static {
+    stream::unfold((receiver, params), |(mut receiver, params)| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    if !params.matches(&event) {
+                        continue;
+                    }
+
+                    let event_type = event.event_type.clone();
+                    let data = match serde_json::to_string(&event) {
+                        Ok(data) => data,
+                        Err(err) => {
+                            tracing::error!(
+                                error = %err,
+                                "failed to serialize audit event for SSE stream"
+                            );
+                            continue;
+                        }
+                    };
+
+                    return Some((
+                        Ok(Event::default().event(event_type).data(data)),
+                        (receiver, params),
+                    ));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::debug!(
+                        skipped,
+                        "audit event stream receiver lagged; skipping missed events"
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+}
+
 impl AuditQueryParams {
     fn into_filters(self) -> Result<audit::query::AuditQueryFilters, &'static str> {
         let from = validate_rfc3339("from", self.from)?;
@@ -388,6 +473,24 @@ impl AuditQueryParams {
             limit,
             before_id,
         })
+    }
+}
+
+impl AuditEventStreamParams {
+    fn matches(&self, event: &audit::AuditEvent) -> bool {
+        if let Some(event_type) = self.event_type.as_deref() {
+            if event.event_type != event_type {
+                return false;
+            }
+        }
+
+        if let Some(path) = self.path.as_deref() {
+            if event.payload.get("path").and_then(|path| path.as_str()) != Some(path) {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -516,6 +619,7 @@ async fn principal_probe(
 mod tests {
     use super::*;
     use axum::{body::Body, http::StatusCode};
+    use futures_util::StreamExt;
     use rusqlite::{params, Connection};
     use serde_json::Value;
     use std::{
@@ -592,6 +696,20 @@ mod tests {
         audit::AuditLog::new(Arc::new(NoopSink))
     }
 
+    fn test_audit_event_sender() -> audit::AuditEventSender {
+        let (sender, _) = tokio::sync::broadcast::channel(16);
+        sender
+    }
+
+    fn test_audit_log_with_broadcast() -> (audit::AuditLog, audit::AuditEventSender) {
+        let (sender, _) = tokio::sync::broadcast::channel(16);
+        let audit_log =
+            audit::AuditLog::new(Arc::new(audit::sink::BroadcastSink::new(sender.clone()))
+                as Arc<dyn audit::AuditSink>);
+
+        (audit_log, sender)
+    }
+
     async fn preflight_response_to_path(
         config: config::Config,
         path: &str,
@@ -599,19 +717,24 @@ mod tests {
     ) -> axum::response::Response {
         let recorder = PrometheusBuilder::new().build_recorder();
 
-        app(config, recorder.handle(), test_audit_log())
-            .expect("app should build")
-            .oneshot(
-                Request::builder()
-                    .method(Method::OPTIONS)
-                    .uri(path)
-                    .header(header::ORIGIN, origin)
-                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("request should complete")
+        app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+        .oneshot(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri(path)
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete")
     }
 
     async fn preflight_response(config: config::Config, origin: &str) -> axum::response::Response {
@@ -621,16 +744,21 @@ mod tests {
     #[tokio::test]
     async fn health_returns_ok() {
         let recorder = PrometheusBuilder::new().build_recorder();
-        let response = app(test_config(Vec::new()), recorder.handle(), test_audit_log())
-            .expect("app should build")
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("request should complete");
+        let response = app(
+            test_config(Vec::new()),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key(REQUEST_ID_HEADER));
@@ -639,16 +767,21 @@ mod tests {
     #[tokio::test]
     async fn audit_log_extension_is_available_to_middleware() {
         let recorder = PrometheusBuilder::new().build_recorder();
-        let response = app(test_config(Vec::new()), recorder.handle(), test_audit_log())
-            .expect("app should build")
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("request should complete");
+        let response = app(
+            test_config(Vec::new()),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -662,16 +795,21 @@ mod tests {
             audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
         let recorder = PrometheusBuilder::new().build_recorder();
 
-        let response = app(config, recorder.handle(), audit_log)
-            .expect("app should build")
-            .oneshot(
-                Request::builder()
-                    .uri("/__test/principal")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("request should complete");
+        let response = app(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+        .oneshot(
+            Request::builder()
+                .uri("/__test/principal")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eventually(Duration::from_secs(1), || !capture.events().is_empty());
@@ -695,6 +833,7 @@ mod tests {
             audit_query_config(None),
             recorder.handle(),
             test_audit_log(),
+            test_audit_event_sender(),
         )
         .expect("app should build")
         .oneshot(audit_query_request(AUDIT_ADMIN_ROUTE, None))
@@ -712,6 +851,7 @@ mod tests {
             audit_query_config(None),
             recorder.handle(),
             test_audit_log(),
+            test_audit_event_sender(),
         )
         .expect("app should build")
         .oneshot(audit_query_request(
@@ -724,6 +864,155 @@ mod tests {
         let body = body_string(response).await;
         assert_eq!(body, r#"{"error":"forbidden"}"#);
         assert!(!body.contains("audit query store"));
+    }
+
+    #[tokio::test]
+    async fn audit_events_stream_without_principal_returns_unauthorized() {
+        let (router, _) = audit_events_router();
+
+        let response = router
+            .oneshot(audit_query_request(AUDIT_EVENTS_STREAM_ROUTE, None))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_string(response).await, r#"{"error":"unauthorized"}"#);
+    }
+
+    #[tokio::test]
+    async fn audit_events_stream_non_admin_principal_returns_forbidden() {
+        let (router, _) = audit_events_router();
+
+        let response = router
+            .oneshot(audit_query_request(
+                AUDIT_EVENTS_STREAM_ROUTE,
+                Some(test_principal(&["reader"])),
+            ))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_string(response).await, r#"{"error":"forbidden"}"#);
+    }
+
+    #[tokio::test]
+    async fn audit_events_stream_admin_principal_receives_emitted_event() {
+        let (router, audit_log) = audit_events_router();
+        let response = router
+            .oneshot(audit_query_request(
+                AUDIT_EVENTS_STREAM_ROUTE,
+                Some(test_principal(&["admin"])),
+            ))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let event = test_stream_event("audit.sse.direct", "/direct");
+        audit_log.emit(event.clone());
+
+        let body = read_sse_until(response.into_body(), |body| {
+            contains_event_id(body, &event.event_id)
+        })
+        .await;
+
+        assert!(body.contains("event: audit.sse.direct"));
+        assert!(body.contains(&format!(r#""path":"/direct""#)));
+    }
+
+    #[tokio::test]
+    async fn audit_events_stream_filters_by_event_type_and_path() {
+        let (router, audit_log) = audit_events_router();
+        let response = router
+            .oneshot(audit_query_request(
+                &format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type=audit.sse.match&path=/match"),
+                Some(test_principal(&["admin"])),
+            ))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let wrong_type = test_stream_event("audit.sse.skip", "/match");
+        let wrong_path = test_stream_event("audit.sse.match", "/skip");
+        let matching = test_stream_event("audit.sse.match", "/match");
+        audit_log.emit(wrong_type.clone());
+        audit_log.emit(wrong_path.clone());
+        audit_log.emit(matching.clone());
+
+        let body = read_sse_until(response.into_body(), |body| {
+            contains_event_id(body, &matching.event_id)
+        })
+        .await;
+
+        assert!(contains_event_id(&body, &matching.event_id));
+        assert!(!contains_event_id(&body, &wrong_type.event_id));
+        assert!(!contains_event_id(&body, &wrong_path.event_id));
+    }
+
+    #[tokio::test]
+    async fn audit_events_stream_delivers_request_event_within_latency_budget() {
+        let (router, _) = audit_events_router();
+        let response = router
+            .clone()
+            .oneshot(audit_query_request(
+                &format!(
+                    "{AUDIT_EVENTS_STREAM_ROUTE}?event_type=http.request_observed&path=/health"
+                ),
+                Some(test_principal(&["admin"])),
+            ))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let started = Instant::now();
+        let health_response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("health request should complete");
+        assert_eq!(health_response.status(), StatusCode::OK);
+
+        let body = read_sse_until(response.into_body(), |body| {
+            body.contains(r#""event_type":"http.request_observed""#)
+                && body.contains(r#""path":"/health""#)
+        })
+        .await;
+
+        assert!(body.contains(r#""status":200"#));
+        // The issue target is roughly 100ms; this keeps CI stable while still
+        // proving the audit writer and in-process broadcast do not add seconds
+        // of delay.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "streamed audit event arrived after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn stalled_sse_consumer_does_not_slow_audit_emit_burst() {
+        const BURST_EVENTS: usize = 20_000;
+
+        let event = test_stream_event("audit.sse.backpressure", "/burst");
+        let baseline_log = test_audit_log();
+        let baseline = emit_burst(&baseline_log, &event, BURST_EVENTS);
+
+        let (audit_log, sender) = test_audit_log_with_broadcast();
+        let _stalled_consumer = sender.subscribe();
+        let stalled = emit_burst(&audit_log, &event, BURST_EVENTS);
+
+        let allowed = baseline.mul_f64(20.0).max(Duration::from_millis(200));
+        assert!(
+            stalled < allowed,
+            "stalled subscriber burst took {stalled:?}, baseline was {baseline:?}, allowed {allowed:?}"
+        );
+        assert!(
+            stalled < Duration::from_secs(1),
+            "stalled subscriber burst took {stalled:?}"
+        );
     }
 
     #[tokio::test]
@@ -823,6 +1112,7 @@ mod tests {
             audit_query_config(None),
             recorder.handle(),
             test_audit_log(),
+            test_audit_event_sender(),
         )
         .expect("app should build")
         .oneshot(audit_query_request(
@@ -879,17 +1169,22 @@ mod tests {
         config.policy_file = Some(policy.path.to_string_lossy().into_owned());
         let recorder = PrometheusBuilder::new().build_recorder();
 
-        let response = app(config, recorder.handle(), test_audit_log())
-            .expect("app should build")
-            .oneshot(
-                Request::builder()
-                    .uri("/__test/principal")
-                    .header(header::AUTHORIZATION, "Bearer token-123")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("request should complete");
+        let response = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+        .oneshot(
+            Request::builder()
+                .uri("/__test/principal")
+                .header(header::AUTHORIZATION, "Bearer token-123")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
@@ -938,6 +1233,7 @@ mod tests {
             test_config(vec!["http://localhost:3000"]),
             recorder.handle(),
             test_audit_log(),
+            test_audit_event_sender(),
         )
         .expect("app should build")
         .oneshot(
@@ -986,18 +1282,23 @@ mod tests {
     #[tokio::test]
     async fn outer_layers_wrap_validation_rejections() {
         let recorder = PrometheusBuilder::new().build_recorder();
-        let response = app(test_config(Vec::new()), recorder.handle(), test_audit_log())
-            .expect("app should build")
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/health")
-                    .header(header::CONTENT_TYPE, "text/plain")
-                    .body(Body::from("hello"))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("request should complete");
+        let response = app(
+            test_config(Vec::new()),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/health")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("hello"))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
@@ -1010,18 +1311,23 @@ mod tests {
         assert!(config.csrf_enabled);
 
         let recorder = PrometheusBuilder::new().build_recorder();
-        let response = app(config, recorder.handle(), test_audit_log())
-            .expect("app should build")
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/does-not-exist")
-                    .header(header::CONTENT_TYPE, "text/plain")
-                    .body(Body::from("hello"))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("request should complete");
+        let response = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/does-not-exist")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("hello"))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
 
         // This proves ordering because CSRF is enabled and the path is not exempt.
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
@@ -1035,7 +1341,13 @@ mod tests {
         config.rate_limit_read_burst = 1;
 
         let recorder = PrometheusBuilder::new().build_recorder();
-        let router = app(config, recorder.handle(), test_audit_log()).expect("app should build");
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
 
         let response = router
             .clone()
@@ -1078,8 +1390,25 @@ mod tests {
             audit_query_config(sqlite_path),
             recorder.handle(),
             test_audit_log(),
+            test_audit_event_sender(),
         )
         .expect("app should build")
+    }
+
+    fn audit_events_router() -> (Router, audit::AuditLog) {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let (audit_log, audit_event_sender) = test_audit_log_with_broadcast();
+        let router = app(
+            config,
+            recorder.handle(),
+            audit_log.clone(),
+            audit_event_sender,
+        )
+        .expect("app should build");
+
+        (router, audit_log)
     }
 
     fn audit_query_request(uri: &str, principal: Option<auth::Principal>) -> Request<Body> {
@@ -1092,6 +1421,61 @@ mod tests {
         }
 
         request
+    }
+
+    async fn read_sse_until(body: Body, predicate: impl Fn(&str) -> bool) -> String {
+        let mut stream = body.into_data_stream();
+
+        tokio::time::timeout(Duration::from_secs(2), async move {
+            let mut body = String::new();
+
+            while body.len() < 65_536 {
+                let Some(chunk) = stream.next().await else {
+                    panic!("SSE stream ended before expected event arrived");
+                };
+                let chunk = chunk.expect("SSE chunk should read");
+                body.push_str(std::str::from_utf8(&chunk).expect("SSE chunk should be UTF-8"));
+
+                if predicate(&body) {
+                    return body;
+                }
+            }
+
+            panic!("SSE stream exceeded bounded read without expected event");
+        })
+        .await
+        .expect("SSE event should arrive before timeout")
+    }
+
+    fn contains_event_id(body: &str, event_id: &str) -> bool {
+        body.contains(&format!(r#""event_id":"{event_id}""#))
+    }
+
+    fn emit_burst(
+        audit_log: &audit::AuditLog,
+        event: &audit::AuditEvent,
+        count: usize,
+    ) -> Duration {
+        let started = Instant::now();
+
+        for _ in 0..count {
+            audit_log.emit(event.clone());
+        }
+
+        started.elapsed()
+    }
+
+    fn test_stream_event(event_type: &str, path: &str) -> audit::AuditEvent {
+        audit::AuditEvent::new(
+            event_type,
+            "request-sse",
+            "203.0.113.10",
+            None,
+            json!({
+                "path": path,
+                "status": 200
+            }),
+        )
     }
 
     async fn audit_event_ids(router: Router, uri: &str) -> Vec<String> {
