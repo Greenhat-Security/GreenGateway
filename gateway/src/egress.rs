@@ -97,18 +97,60 @@ impl Default for EgressConfig {
 impl EgressConfig {
     #[allow(dead_code)] // PR 2 wires Config-derived egress settings into outbound callers.
     pub fn from_config(config: &Config) -> Self {
+        let mut allowed_hosts: HashSet<String> = config
+            .egress_allowed_hosts
+            .iter()
+            .map(|host| host.to_ascii_lowercase())
+            .collect();
+        let mut auto_seeded_hosts = Vec::new();
+
+        auto_seed_endpoint_host(
+            config.jwt_jwks_url.as_deref(),
+            &mut allowed_hosts,
+            &mut auto_seeded_hosts,
+        );
+        auto_seed_endpoint_host(
+            config.jwt_issuer.as_deref(),
+            &mut allowed_hosts,
+            &mut auto_seeded_hosts,
+        );
+
+        if !auto_seeded_hosts.is_empty() {
+            tracing::debug!(
+                hosts = ?auto_seeded_hosts,
+                "auto-seeded egress allowlist from infrastructure endpoints"
+            );
+        }
+
         Self {
-            allowed_hosts: config
-                .egress_allowed_hosts
-                .iter()
-                .map(|host| host.to_ascii_lowercase())
-                .collect(),
+            allowed_hosts,
             timeout: Duration::from_millis(config.egress_timeout_ms),
             connect_timeout: Duration::from_millis(config.egress_connect_timeout_ms),
             max_response_bytes: config.egress_max_response_bytes,
             max_request_body_bytes: config.egress_max_request_body_bytes,
             deny_private_ips: config.egress_deny_private_ips,
         }
+    }
+}
+
+fn auto_seed_endpoint_host(
+    endpoint: Option<&str>,
+    allowed_hosts: &mut HashSet<String>,
+    auto_seeded_hosts: &mut Vec<String>,
+) {
+    let Some(endpoint) = endpoint else {
+        return;
+    };
+    let Ok(url) = Url::parse(endpoint) else {
+        return;
+    };
+    let Some(host) = url.host_str() else {
+        return;
+    };
+
+    let host = host.to_ascii_lowercase();
+    if allowed_hosts.insert(host.clone()) {
+        auto_seeded_hosts.push(host);
     }
 }
 
@@ -508,6 +550,16 @@ mod tests {
     }
 
     #[test]
+    fn from_config_auto_seeds_jwks_host_into_allowlist() {
+        let mut config = test_config();
+        config.jwt_jwks_url = Some("https://idp.example.test/.well-known/jwks.json".to_owned());
+
+        let egress = EgressConfig::from_config(&config);
+
+        assert!(egress.allowed_hosts.contains("idp.example.test"));
+    }
+
+    #[test]
     fn host_not_in_allowlist_is_denied() {
         let allowed_hosts = HashSet::from(["api.example.test".to_owned()]);
         let url = Url::parse("https://other.example.test/resource").expect("URL should parse");
@@ -738,5 +790,57 @@ mod tests {
 
     fn socket(value: &str) -> SocketAddr {
         value.parse().expect("test socket address should parse")
+    }
+
+    fn test_config() -> Config {
+        Config {
+            listen_addr: "127.0.0.1:0"
+                .parse()
+                .expect("test listen address should parse"),
+            audit_log_file: None,
+            policy_file: None,
+            cors_allow_origins: Vec::new(),
+            max_body_size: 1_048_576,
+            rate_limit_read_rps: 50.0,
+            rate_limit_read_burst: 100,
+            rate_limit_write_rps: 10.0,
+            rate_limit_write_burst: 20,
+            trust_proxy_headers: false,
+            rbac_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
+            session_cookie_name: String::new(),
+            validation_allowed_content_types: vec!["application/json".to_owned()],
+            auth_enabled: true,
+            auth_cookie_name: "session".to_owned(),
+            auth_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
+            jwt_jwks_url: None,
+            jwt_issuer: None,
+            jwt_audience: None,
+            jwt_jwks_timeout_ms: 2000,
+            jwt_require_jti: false,
+            roles_claim: "roles".to_owned(),
+            csrf_enabled: true,
+            csrf_cookie_name: "csrf_token".to_owned(),
+            csrf_header_name: "x-csrf-token".to_owned(),
+            csrf_cookie_domain: None,
+            csrf_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
+            egress_allowed_hosts: Vec::new(),
+            egress_timeout_ms: 30_000,
+            egress_connect_timeout_ms: 10_000,
+            egress_max_response_bytes: 5_242_880,
+            egress_max_request_body_bytes: 1_048_576,
+            egress_deny_private_ips: true,
+        }
     }
 }

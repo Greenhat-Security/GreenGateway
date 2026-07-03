@@ -98,7 +98,10 @@ fn app(
     let request_id_header = request_id_header();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
     let rate_limit_state = middleware::rate_limit::RateLimitState::from_config(&config);
-    let validator = auth::JwtValidator::from_config(&config)?
+    let egress_client = Arc::new(egress::EgressClient::new(
+        egress::EgressConfig::from_config(&config),
+    )?);
+    let validator = auth::JwtValidator::from_config(&config, egress_client)?
         .map(|validator| Arc::new(validator) as Arc<dyn auth::SessionValidator>);
     let rbac_state = match rbac::Policy::from_config(&config)? {
         Some(policy) => {
