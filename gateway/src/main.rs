@@ -8,6 +8,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+mod audit;
 mod client_ip;
 mod config;
 mod middleware;
