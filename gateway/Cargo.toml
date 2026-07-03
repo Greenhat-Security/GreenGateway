@@ -21,4 +21,5 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+jsonschema.workspace = true
 tower.workspace = true

@@ -9,6 +9,9 @@ pub fn hash_credential(token: &str) -> String {
     sha256_hex(token.as_bytes())
 }
 
+/// Hashes JSON using serde_json's default sorted object-key serialization.
+/// Enabling serde_json's `preserve_order` feature anywhere in the dependency
+/// tree would change hashes for logically identical JSON objects.
 pub fn hash_args(args: &serde_json::Value) -> String {
     let canonical = serde_json::to_string(args).expect("serde_json::Value should serialize");
     sha256_hex(canonical.as_bytes())

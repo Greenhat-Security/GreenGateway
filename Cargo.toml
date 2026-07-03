@@ -10,6 +10,7 @@ license = "GPL-3.0-only"
 axum = "0.8.9"
 hex = "0.4.3"
 http = "1.4.2"
+jsonschema = { version = "0.46.9", default-features = false }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }

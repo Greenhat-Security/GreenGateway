@@ -62,6 +62,9 @@ fn utc_timestamp_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, path::PathBuf};
+
+    use jsonschema::Validator;
     use serde_json::json;
 
     #[test]
@@ -92,41 +95,62 @@ mod tests {
     }
 
     #[test]
-    fn serialized_event_has_schema_required_fields() {
-        let event = AuditEvent::new(
+    fn serialized_events_validate_against_published_schema() {
+        let validator = audit_event_schema_validator();
+        let event_without_actor = serde_json::to_value(AuditEvent::new(
             "policy.deny",
             "request-456",
             "2001:db8::1",
             None,
             json!({ "resource": "/admin" }),
+        ))
+        .expect("audit event should serialize");
+        let event_with_actor = serde_json::to_value(
+            AuditEvent::new(
+                "auth.login",
+                "request-789",
+                "203.0.113.10",
+                Some(Actor {
+                    user_id: "user-123".to_owned(),
+                    roles: Some(vec!["admin".to_owned(), "reader".to_owned()]),
+                    auth_mode: "session".to_owned(),
+                }),
+                json!({ "outcome": "allow" }),
+            )
+            .with_user_agent("test-agent/1.0"),
+        )
+        .expect("audit event should serialize");
+
+        assert!(event_without_actor["actor"].is_null());
+        assert!(event_without_actor.get("user_agent").is_none());
+        assert_eq!(
+            event_with_actor["actor"]["roles"],
+            json!(["admin", "reader"])
         );
-        let serialized = serde_json::to_value(event).expect("audit event should serialize");
-        let object = serialized
-            .as_object()
-            .expect("audit event should serialize as an object");
+        assert_eq!(event_with_actor["user_agent"], json!("test-agent/1.0"));
 
-        for field in [
-            "event_id",
-            "event_type",
-            "timestamp",
-            "schema_version",
-            "request_id",
-            "source_ip",
-            "actor",
-            "payload",
-        ] {
-            assert!(object.contains_key(field), "missing field {field}");
-        }
+        assert_schema_accepts(&validator, &event_without_actor);
+        assert_schema_accepts(&validator, &event_with_actor);
 
-        assert!(object["event_id"].is_string());
-        assert!(object["event_type"].is_string());
-        assert!(object["timestamp"].is_string());
-        assert_eq!(object["schema_version"], json!(SCHEMA_VERSION));
-        assert!(object["request_id"].is_string());
-        assert!(object["source_ip"].is_string());
-        assert!(object["actor"].is_null());
-        assert!(object["payload"].is_object());
-        assert!(!object.contains_key("user_agent"));
+        let mut wrong_schema_version = event_without_actor.clone();
+        wrong_schema_version
+            .as_object_mut()
+            .expect("audit event should serialize as an object")
+            .insert("schema_version".to_owned(), json!("999.0.0"));
+        assert!(
+            !validator.is_valid(&wrong_schema_version),
+            "published schema should reject a wrong schema_version"
+        );
+
+        let mut invalid_event_type = event_with_actor;
+        invalid_event_type
+            .as_object_mut()
+            .expect("audit event should serialize as an object")
+            .insert("event_type".to_owned(), json!("PolicyDeny"));
+        assert!(
+            !validator.is_valid(&invalid_event_type),
+            "published schema should reject an event_type that violates the pattern"
+        );
     }
 
     #[test]
@@ -142,5 +166,26 @@ mod tests {
         assert_eq!(serialized["user_id"], json!("user-123"));
         assert_eq!(serialized["auth_mode"], json!("api_key"));
         assert!(serialized.get("roles").is_none());
+    }
+
+    fn audit_event_schema_validator() -> Validator {
+        let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = gateway_root
+            .parent()
+            .expect("gateway crate should live directly under the repo root");
+        let schema_path = repo_root.join("docs/schemas/audit_event.v0.schema.json");
+        let schema = fs::read_to_string(&schema_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", schema_path.display()));
+        let schema = serde_json::from_str(&schema)
+            .unwrap_or_else(|err| panic!("failed to parse {}: {err}", schema_path.display()));
+
+        jsonschema::validator_for(&schema)
+            .unwrap_or_else(|err| panic!("failed to compile {}: {err}", schema_path.display()))
+    }
+
+    fn assert_schema_accepts(validator: &Validator, event: &Value) {
+        if let Err(error) = validator.validate(event) {
+            panic!("published schema should accept serialized audit event: {error}");
+        }
     }
 }
