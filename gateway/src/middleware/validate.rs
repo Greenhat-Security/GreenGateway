@@ -111,6 +111,7 @@ mod tests {
             listen_addr: "127.0.0.1:0"
                 .parse()
                 .expect("test listen address should parse"),
+            audit_log_file: None,
             cors_allow_origins: Vec::new(),
             max_body_size,
             rate_limit_read_rps: 50.0,

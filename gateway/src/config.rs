@@ -25,6 +25,7 @@ const DEFAULT_CSRF_ENABLED: bool = true;
 const DEFAULT_CSRF_COOKIE_NAME: &str = "csrf_token";
 const DEFAULT_CSRF_HEADER_NAME: &str = "x-csrf-token";
 const DEFAULT_CSRF_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
+const AUDIT_LOG_FILE: &str = "AUDIT_LOG_FILE";
 const CORS_ALLOW_ORIGINS: &str = "CORS_ALLOW_ORIGINS";
 const CSRF_COOKIE_DOMAIN: &str = "CSRF_COOKIE_DOMAIN";
 const CSRF_COOKIE_NAME: &str = "CSRF_COOKIE_NAME";
@@ -43,6 +44,7 @@ const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub listen_addr: SocketAddr,
+    pub audit_log_file: Option<String>,
     pub cors_allow_origins: Vec<String>,
     pub max_body_size: usize,
     pub rate_limit_read_rps: f64,
@@ -82,6 +84,8 @@ impl Config {
             "socket address",
             &mut problems,
         );
+        let audit_log_file =
+            parse_optional_string(AUDIT_LOG_FILE, get_var(AUDIT_LOG_FILE), &mut problems);
         let cors_allow_origins = parse_comma_separated_header_values(
             CORS_ALLOW_ORIGINS,
             get_var(CORS_ALLOW_ORIGINS),
@@ -187,6 +191,7 @@ impl Config {
         if problems.is_empty() {
             Ok(Self {
                 listen_addr,
+                audit_log_file,
                 cors_allow_origins,
                 max_body_size,
                 rate_limit_read_rps,
@@ -264,6 +269,28 @@ where
             ));
             default
         }
+    }
+}
+
+fn parse_optional_string(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Option<String> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return None,
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return None;
+        }
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
     }
 }
 
@@ -466,6 +493,7 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("test address should parse")
         );
+        assert_eq!(config.audit_log_file, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
         assert_eq!(config.rate_limit_read_rps, DEFAULT_RATE_LIMIT_READ_RPS);
@@ -521,6 +549,7 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("default address should parse")
         );
+        assert_eq!(config.audit_log_file, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
         assert_eq!(config.rate_limit_read_rps, DEFAULT_RATE_LIMIT_READ_RPS);
@@ -569,6 +598,31 @@ mod tests {
                 "https://admin.example.test".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn audit_log_file_parses_optional_path() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUDIT_LOG_FILE" => Ok("  /var/log/greengateway/audit.jsonl  ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.audit_log_file,
+            Some("/var/log/greengateway/audit.jsonl".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_audit_log_file_is_none() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUDIT_LOG_FILE" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.audit_log_file, None);
     }
 
     #[test]
