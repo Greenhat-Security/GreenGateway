@@ -112,7 +112,10 @@ fn app(
         .with_state(AppState { metrics_handle });
 
     #[cfg(test)]
-    let router = router.route("/__test/principal", get(principal_probe));
+    let router = router.route(
+        "/__test/principal",
+        get(principal_probe).options(principal_probe),
+    );
 
     // Later axum layers run earlier at runtime. Attach auth before the CSRF
     // layer so requests flow through CSRF, then auth, then the route handler.
@@ -317,7 +320,11 @@ mod tests {
         audit::AuditLog::new(Arc::new(NoopSink))
     }
 
-    async fn preflight_response(config: config::Config, origin: &str) -> axum::response::Response {
+    async fn preflight_response_to_path(
+        config: config::Config,
+        path: &str,
+        origin: &str,
+    ) -> axum::response::Response {
         let recorder = PrometheusBuilder::new().build_recorder();
 
         app(config, recorder.handle(), test_audit_log())
@@ -325,7 +332,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::OPTIONS)
-                    .uri("/health")
+                    .uri(path)
                     .header(header::ORIGIN, origin)
                     .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
                     .body(Body::empty())
@@ -333,6 +340,10 @@ mod tests {
             )
             .await
             .expect("request should complete")
+    }
+
+    async fn preflight_response(config: config::Config, origin: &str) -> axum::response::Response {
+        preflight_response_to_path(config, "/health", origin).await
     }
 
     #[tokio::test]
@@ -412,6 +423,53 @@ mod tests {
                 .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
             Some(&HeaderValue::from_static("true"))
         );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_to_non_exempt_path_succeeds_without_credential() {
+        let response = preflight_response_to_path(
+            test_config(vec!["http://localhost:3000"]),
+            "/__test/principal",
+            "http://localhost:3000",
+        )
+        .await;
+
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("http://localhost:3000"))
+        );
+        assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
+    }
+
+    #[tokio::test]
+    async fn bare_options_without_origin_stops_at_cors_layer_before_handler() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let response = app(
+            test_config(vec!["http://localhost:3000"]),
+            recorder.handle(),
+            test_audit_log(),
+        )
+        .expect("app should build")
+        .oneshot(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/__test/principal")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+        // tower-http 0.6.8's CorsLayer handles bare OPTIONS requests before
+        // auth. If this reached the unauthenticated test handler, it would
+        // return 204; if CorsLayer passed it through to auth, auth would fail
+        // closed with 401 as proven by the auth middleware unit test.
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
     }
 
     #[tokio::test]

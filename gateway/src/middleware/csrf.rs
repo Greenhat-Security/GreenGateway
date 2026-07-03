@@ -15,12 +15,14 @@ use axum::{
     Json,
 };
 use http::{
-    header::{AUTHORIZATION, COOKIE, SET_COOKIE},
+    header::{COOKIE, SET_COOKIE},
     HeaderMap, HeaderValue, Method, StatusCode,
 };
 use serde::Serialize;
 
 use crate::config::Config;
+
+use super::bearer::bearer_token;
 
 #[derive(Clone, Debug)]
 pub struct CsrfConfig {
@@ -146,17 +148,7 @@ fn is_state_changing(method: &Method) -> bool {
 }
 
 fn bearer_auth_present(request: &Request) -> bool {
-    request
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(header_value_to_str)
-        .is_some_and(|value| {
-            let mut parts = value.trim_start().splitn(2, char::is_whitespace);
-            let scheme = parts.next().unwrap_or_default();
-            let token = parts.next().unwrap_or_default().trim();
-
-            scheme.eq_ignore_ascii_case("Bearer") && !token.is_empty()
-        })
+    bearer_token(request.headers()).is_some()
 }
 
 fn first_cookie_value(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
@@ -198,6 +190,7 @@ fn set_cookie_header_value(
 mod tests {
     use super::*;
     use axum::{body::Body, middleware::from_fn_with_state, routing::get, Router};
+    use http::header::AUTHORIZATION;
     use serde_json::Value;
     use tower::ServiceExt;
 

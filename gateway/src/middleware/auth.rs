@@ -12,8 +12,8 @@ use axum::{
     Json,
 };
 use http::{
-    header::{AUTHORIZATION, COOKIE, USER_AGENT},
-    Extensions, HeaderMap, HeaderValue, Method, StatusCode,
+    header::{COOKIE, USER_AGENT, WWW_AUTHENTICATE},
+    Extensions, HeaderMap, HeaderValue, StatusCode,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -25,6 +25,8 @@ use crate::{
     client_ip::canonical_client_ip,
     config::Config,
 };
+
+use super::bearer::bearer_token;
 
 const AUTH_SUCCESS: &str = "auth.success";
 const AUTH_FAILURE: &str = "auth.failure";
@@ -71,10 +73,6 @@ pub async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Response {
-    if req.method() == Method::OPTIONS {
-        return next.run(req).await;
-    }
-
     let path = req.uri().path().to_owned();
     if state
         .exempt_paths
@@ -158,15 +156,6 @@ pub fn extract_credential(headers: &HeaderMap, cookie_name: &str) -> Option<Sess
         })
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get(AUTHORIZATION).and_then(header_value_to_str)?;
-    let mut parts = value.trim_start().splitn(2, char::is_whitespace);
-    let scheme = parts.next().unwrap_or_default();
-    let token = parts.next().unwrap_or_default().trim();
-
-    (scheme.eq_ignore_ascii_case("Bearer") && !token.is_empty()).then_some(token)
-}
-
 fn session_cookie<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
     if cookie_name.is_empty() {
         return None;
@@ -239,6 +228,7 @@ fn with_optional_user_agent(event: AuditEvent, user_agent: Option<&str>) -> Audi
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
+        [(WWW_AUTHENTICATE, "Bearer")],
         Json(UnauthorizedBody {
             error: "unauthorized",
         }),
@@ -270,6 +260,10 @@ mod tests {
         middleware::from_fn_with_state,
         routing::get,
         Extension, Router,
+    };
+    use http::{
+        header::{AUTHORIZATION, WWW_AUTHENTICATE},
+        Method,
     };
     use serde_json::Value;
     use tower::ServiceExt;
@@ -395,7 +389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn options_to_non_exempt_path_passes_without_auth() {
+    async fn bare_options_to_non_exempt_path_requires_authentication() {
         let (state, capture) = test_state(None);
 
         let response = test_router(state)
@@ -409,8 +403,14 @@ mod tests {
             .await
             .expect("request should complete");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(capture.events().is_empty());
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(WWW_AUTHENTICATE),
+            Some(&HeaderValue::from_static("Bearer"))
+        );
+        let event = captured_event(&capture, AUTH_FAILURE).await;
+        assert_eq!(event.payload["reason"], json!("missing_credential"));
+        assert_eq!(event.payload["path"], json!("/protected"));
     }
 
     #[tokio::test]
@@ -429,6 +429,10 @@ mod tests {
             .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(WWW_AUTHENTICATE),
+            Some(&HeaderValue::from_static("Bearer"))
+        );
         let event = captured_event(&capture, AUTH_FAILURE).await;
         assert_eq!(event.payload["reason"], json!("missing_credential"));
         assert_eq!(event.payload["path"], json!("/protected"));
