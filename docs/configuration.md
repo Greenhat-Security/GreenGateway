@@ -100,6 +100,8 @@ Default: `csrf_token`
 
 Format and validation: must be a non-empty RFC 6265 cookie name. The CSRF cookie is intentionally not `HttpOnly`, because browser JavaScript must read it and echo the token into the configured CSRF request header.
 
+The CSRF cookie is issued with the `Secure` attribute, so browsers will not store it over plain `http://` except on `localhost`; deployments terminating TLS upstream are fine, but testing over non-localhost plain HTTP will not receive the cookie.
+
 ### CSRF_HEADER_NAME
 
 Request header that must echo the CSRF cookie token on protected state-changing requests.

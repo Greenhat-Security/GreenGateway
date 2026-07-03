@@ -94,7 +94,7 @@ pub async fn csrf_middleware(
 
     let mut response = next.run(request).await;
 
-    if !is_state_changing(&method) && existing.is_none() {
+    if !is_state_changing(&method) && existing.as_deref().is_none_or(str::is_empty) {
         let token = uuid::Uuid::new_v4().to_string();
         match set_cookie_header_value(&config, &token) {
             Ok(value) => {
@@ -340,6 +340,36 @@ mod tests {
         assert!(set_cookie.contains("csrf_token="));
         assert!(set_cookie.contains("SameSite=Lax"));
         assert!(set_cookie.contains("Secure"));
+    }
+
+    #[tokio::test]
+    async fn get_with_empty_existing_cookie_reissues_non_empty_csrf_cookie() {
+        let response = test_router(test_config(true))
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/")
+                    .header(COOKIE, "csrf_token=")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let set_cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("CSRF Set-Cookie header should be present");
+        let token = set_cookie
+            .strip_prefix("csrf_token=")
+            .and_then(|value| value.split_once(';'))
+            .map(|(token, _)| token)
+            .expect("CSRF Set-Cookie should include a token before attributes");
+
+        assert!(!token.is_empty());
     }
 
     #[tokio::test]

@@ -310,6 +310,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_runs_before_csrf() {
+        let config = test_config(Vec::new());
+        assert!(config.csrf_enabled);
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let response = app(config, recorder.handle())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/does-not-exist")
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from("hello"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        // This proves ordering because CSRF is enabled and the path is not exempt.
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
     async fn rate_limit_runs_before_validation() {
         let mut config = test_config(Vec::new());
         config.max_body_size = 1;
