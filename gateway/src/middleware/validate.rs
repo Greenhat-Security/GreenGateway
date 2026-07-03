@@ -124,6 +124,13 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            auth_enabled: true,
+            auth_cookie_name: "session".to_owned(),
+            auth_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
             jwt_jwks_url: None,
             jwt_issuer: None,
             jwt_audience: None,
