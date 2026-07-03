@@ -876,6 +876,8 @@ mQIDAQAB
                 .parse()
                 .expect("test listen address should parse"),
             audit_log_file: None,
+            audit_sqlite_path: None,
+            audit_sqlite_retention_days: None,
             policy_file: None,
             cors_allow_origins: Vec::new(),
             max_body_size: 1_048_576,

@@ -1,4 +1,5 @@
 use std::{
+    error::Error,
     fs::{File, OpenOptions},
     io::{self, Write},
     path::PathBuf,
@@ -6,7 +7,10 @@ use std::{
 };
 
 use crate::{
-    audit::{AuditEvent, AUDIT_EVENTS_DROPPED_TOTAL},
+    audit::{
+        sqlite_sink::{SqliteSink, SqliteSinkConfig},
+        AuditEvent, AUDIT_EVENTS_DROPPED_TOTAL,
+    },
     config::Config,
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
 };
@@ -153,7 +157,11 @@ impl AuditSink for CompositeSink {
     }
 }
 
-pub fn build_sink(audit_log_file: Option<&str>) -> Arc<dyn AuditSink> {
+pub fn build_sink(
+    audit_log_file: Option<&str>,
+    audit_sqlite_path: Option<&str>,
+    audit_sqlite_retention_days: Option<u32>,
+) -> Result<Arc<dyn AuditSink>, Box<dyn Error>> {
     let stdout: Arc<dyn AuditSink> = Arc::new(StdoutSink::new());
     let mut sinks = vec![stdout];
 
@@ -164,15 +172,35 @@ pub fn build_sink(audit_log_file: Option<&str>) -> Arc<dyn AuditSink> {
         sinks.push(Arc::new(FileSink::new(path)) as Arc<dyn AuditSink>);
     }
 
-    if sinks.len() == 1 {
+    if let Some(path) = audit_sqlite_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        sinks.push(Arc::new(SqliteSink::new(SqliteSinkConfig {
+            path: PathBuf::from(path),
+            retention_days: audit_sqlite_retention_days,
+        })?) as Arc<dyn AuditSink>);
+    } else if audit_sqlite_retention_days.is_some() {
+        tracing::warn!(
+            "AUDIT_SQLITE_RETENTION_DAYS is set but AUDIT_SQLITE_PATH is unset; SQLite retention is disabled"
+        );
+    }
+
+    let sink = if sinks.len() == 1 {
         Arc::clone(&sinks[0])
     } else {
         Arc::new(CompositeSink::new(sinks))
-    }
+    };
+
+    Ok(sink)
 }
 
-pub fn build_sink_from_config(config: &Config) -> Arc<dyn AuditSink> {
-    build_sink(config.audit_log_file.as_deref())
+pub fn build_sink_from_config(config: &Config) -> Result<Arc<dyn AuditSink>, Box<dyn Error>> {
+    build_sink(
+        config.audit_log_file.as_deref(),
+        config.audit_sqlite_path.as_deref(),
+        config.audit_sqlite_retention_days,
+    )
 }
 
 #[cfg(test)]

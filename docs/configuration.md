@@ -18,6 +18,22 @@ Default: empty, which disables the file sink. Audit events are always written to
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. The file sink opens lazily on first write, appends one JSON event per line, and logs write/open failures without stopping request handling.
 
+### AUDIT_SQLITE_PATH
+
+Optional SQLite audit event store path for queryable local audit history.
+
+Default: empty, which disables the SQLite sink.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. When set, the gateway opens or creates the database at startup, creates the audit event schema and indexes if needed, and fans audit events out to SQLite in addition to stdout and any JSONL file sink.
+
+### AUDIT_SQLITE_RETENTION_DAYS
+
+Optional SQLite audit event retention window, in days.
+
+Default: empty, which disables SQLite pruning.
+
+Format and validation: must parse as a `u32` day count when set. This value is only applied when `AUDIT_SQLITE_PATH` is also set; if the path is unset, the parsed retention value is accepted but has no effect.
+
 ### POLICY_FILE
 
 Optional RBAC policy JSON file path.
