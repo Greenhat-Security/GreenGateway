@@ -53,7 +53,7 @@ export function StatusPage() {
   return (
     <main className="logs-page status-page">
       <section
-        className="panel logs-panel status-panel"
+        className="logs-panel status-panel"
         aria-labelledby="status-heading"
       >
         <div className="section-heading logs-heading">
@@ -82,88 +82,102 @@ export function StatusPage() {
 
 function StatusSummary({ status }: { status: GatewayStatus }) {
   return (
-    <div className="status-sections">
-      <StatusSection title="Runtime">
-        <StatusItem label="Version" value={status.version} />
-        <StatusItem label="Uptime" value={formatUptime(status.uptime_seconds)} />
-        <StatusItem label="Listen address" value={status.listen_addr} />
-      </StatusSection>
+    <div className="status-summary">
+      <div className="status-stat-grid" aria-label="Runtime summary">
+        <StatCard label="Version" value={status.version} />
+        <StatCard label="Uptime" value={formatUptime(status.uptime_seconds)} />
+        <StatCard label="Listen address" value={status.listen_addr} />
+      </div>
 
-      <StatusSection title="Access control">
-        <StatusItem
-          label="Authentication"
-          value={enabledLabel(status.auth_enabled)}
-        />
-        <StatusItem label="CSRF" value={enabledLabel(status.csrf_enabled)} />
-        <StatusItem
-          label="Trust proxy headers"
-          value={enabledLabel(status.trust_proxy_headers)}
-        />
-        <StatusItem
-          label="RBAC policy"
-          value={status.rbac.policy_loaded ? 'Loaded' : 'Not loaded'}
-        />
-        <StatusItem
-          label="Policy ID"
-          value={status.rbac.policy_id ?? 'None'}
-        />
-      </StatusSection>
-
-      <StatusSection title="Audit sinks">
-        <StatusItem
-          label="Stdout"
-          value={enabledLabel(status.audit_sinks.stdout)}
-        />
-        <StatusItem label="File" value={enabledLabel(status.audit_sinks.file)} />
-        <StatusItem
-          label="SQLite"
-          value={enabledLabel(status.audit_sinks.sqlite)}
-        />
-        <StatusItem
-          label="Broadcast"
-          value={enabledLabel(status.audit_sinks.broadcast)}
-        />
-      </StatusSection>
-
-      <StatusSection title="Rate limits">
-        <StatusItem
-          label="Read"
-          value={formatRateLimit(status.rate_limits.read)}
-        />
-        <StatusItem
-          label="Write"
-          value={formatRateLimit(status.rate_limits.write)}
-        />
-      </StatusSection>
-
-      <StatusSection title="CORS">
-        <StatusItem
-          label="Allowed origins"
-          value={
-            status.cors_allow_origins.length > 0
-              ? `${status.cors_allow_origins.length} configured`
-              : 'None configured'
-          }
-        />
-        {status.cors_allow_origins.length > 0 ? (
-          <StatusListItem
-            label="Origins"
-            values={status.cors_allow_origins}
+      <div className="status-card-grid">
+        <StatusSection title="Access control">
+          <StatusItem
+            label="Authentication"
+            value={enabledLabel(status.auth_enabled)}
           />
-        ) : null}
-      </StatusSection>
+          <StatusItem label="CSRF" value={enabledLabel(status.csrf_enabled)} />
+          <StatusItem
+            label="Trust proxy headers"
+            value={enabledLabel(status.trust_proxy_headers)}
+          />
+          <StatusItem
+            label="RBAC policy"
+            value={status.rbac.policy_loaded ? 'Loaded' : 'Not loaded'}
+          />
+          <StatusItem
+            label="Policy ID"
+            value={status.rbac.policy_id ?? 'None'}
+          />
+        </StatusSection>
 
-      <StatusSection title="Egress">
-        <StatusItem
-          label="Allowed hosts"
-          value={String(status.egress.allowed_hosts_count)}
-        />
-        <StatusItem
-          label="Deny private IPs"
-          value={enabledLabel(status.egress.deny_private_ips)}
-        />
-      </StatusSection>
+        <StatusSection title="Audit sinks">
+          <StatusItem
+            label="Stdout"
+            value={enabledLabel(status.audit_sinks.stdout)}
+          />
+          <StatusItem
+            label="File"
+            value={enabledLabel(status.audit_sinks.file)}
+          />
+          <StatusItem
+            label="SQLite"
+            value={enabledLabel(status.audit_sinks.sqlite)}
+          />
+          <StatusItem
+            label="Broadcast"
+            value={enabledLabel(status.audit_sinks.broadcast)}
+          />
+        </StatusSection>
+
+        <StatusSection title="Rate limits">
+          <StatusItem
+            label="Read"
+            value={formatRateLimit(status.rate_limits.read)}
+          />
+          <StatusItem
+            label="Write"
+            value={formatRateLimit(status.rate_limits.write)}
+          />
+        </StatusSection>
+
+        <StatusSection title="CORS">
+          <StatusItem
+            label="Allowed origins"
+            value={
+              status.cors_allow_origins.length > 0
+                ? `${status.cors_allow_origins.length} configured`
+                : 'None configured'
+            }
+          />
+          {status.cors_allow_origins.length > 0 ? (
+            <StatusListItem
+              label="Origins"
+              values={status.cors_allow_origins}
+            />
+          ) : null}
+        </StatusSection>
+
+        <StatusSection title="Egress">
+          <StatusItem
+            label="Allowed hosts"
+            value={String(status.egress.allowed_hosts_count)}
+          />
+          <StatusItem
+            label="Deny private IPs"
+            value={enabledLabel(status.egress.deny_private_ips)}
+          />
+        </StatusSection>
+      </div>
     </div>
+  );
+}
+
+function StatCard({ label, value }: { label: string; value: string }) {
+  return (
+    <article className="panel stat-card">
+      <span className="stat-label">{label}</span>
+      <span className="stat-value">{value}</span>
+    </article>
   );
 }
 
@@ -175,7 +189,7 @@ function StatusSection({
   children: ReactNode;
 }) {
   return (
-    <section className="status-section" aria-label={title}>
+    <section className="panel status-section" aria-label={title}>
       <h3>{title}</h3>
       <dl className="status-grid">{children}</dl>
     </section>
@@ -184,9 +198,9 @@ function StatusSection({
 
 function StatusItem({ label, value }: { label: string; value: string }) {
   return (
-    <div className="status-item">
-      <dt>{label}</dt>
-      <dd>{value}</dd>
+    <div className="status-item spec-row">
+      <dt className="k">{label}</dt>
+      <dd className="v">{value}</dd>
     </div>
   );
 }
@@ -199,8 +213,8 @@ function StatusListItem({
   values: string[];
 }) {
   return (
-    <div className="status-item status-item-wide">
-      <dt>{label}</dt>
+    <div className="status-item status-item-wide spec-row stacked">
+      <dt className="k">{label}</dt>
       <dd>
         <div className="status-list" aria-label={label}>
           {values.map((value) => (
@@ -215,7 +229,7 @@ function StatusListItem({
 function StatusErrorMessage({ error }: { error: StatusLoadError }) {
   if (error.kind === 'unauthorized') {
     return (
-      <div className="error-panel" role="alert">
+      <div className="error-panel alert warning" role="alert">
         <h3>Bearer token required</h3>
         <p>
           Paste a bearer token before viewing gateway status. Open the{' '}
@@ -227,7 +241,7 @@ function StatusErrorMessage({ error }: { error: StatusLoadError }) {
 
   if (error.kind === 'forbidden') {
     return (
-      <div className="error-panel" role="alert">
+      <div className="error-panel alert error" role="alert">
         <h3>Admin role required</h3>
         <p>This token is valid but does not include the admin role.</p>
       </div>
@@ -235,7 +249,7 @@ function StatusErrorMessage({ error }: { error: StatusLoadError }) {
   }
 
   return (
-    <div className="error-panel" role="alert">
+    <div className="error-panel alert error" role="alert">
       <h3>Status request failed</h3>
       <p>{error.message}</p>
     </div>

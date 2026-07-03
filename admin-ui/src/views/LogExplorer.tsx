@@ -237,11 +237,13 @@ export function LogExplorer() {
                   </tr>
                 </thead>
                 <tbody>
-                  {events.map((event) => {
+                  {events.map((event, index) => {
                     const isExpanded = expandedEventIds.has(event.event_id);
                     return (
                       <Fragment key={event.event_id}>
-                        <tr className="event-row">
+                        <tr
+                          className={`event-row ${index % 2 === 1 ? 'is-even' : ''}`}
+                        >
                           <td>
                             <button
                               type="button"
@@ -300,7 +302,7 @@ export function LogExplorer() {
 function AuditErrorMessage({ error }: { error: AuditLoadError }) {
   if (error.kind === 'unauthorized') {
     return (
-      <div className="error-panel" role="alert">
+      <div className="error-panel alert warning" role="alert">
         <h3>Bearer token required</h3>
         <p>
           Paste a bearer token before querying audit logs. Open the{' '}
@@ -312,7 +314,7 @@ function AuditErrorMessage({ error }: { error: AuditLoadError }) {
 
   if (error.kind === 'forbidden') {
     return (
-      <div className="error-panel" role="alert">
+      <div className="error-panel alert error" role="alert">
         <h3>Admin role required</h3>
         <p>This token is valid but does not include the admin role.</p>
       </div>
@@ -321,7 +323,7 @@ function AuditErrorMessage({ error }: { error: AuditLoadError }) {
 
   if (error.kind === 'unavailable') {
     return (
-      <div className="error-panel" role="alert">
+      <div className="error-panel alert error" role="alert">
         <h3>Audit store unavailable</h3>
         <p>The SQLite audit store is not configured on this gateway.</p>
       </div>
@@ -329,7 +331,10 @@ function AuditErrorMessage({ error }: { error: AuditLoadError }) {
   }
 
   return (
-    <div className="error-panel" role="alert">
+    <div
+      className={`error-panel alert ${error.kind === 'bad-request' ? 'warning' : 'error'}`}
+      role="alert"
+    >
       <h3>{error.kind === 'bad-request' ? 'Invalid query' : 'Request failed'}</h3>
       <p>{error.message}</p>
     </div>
