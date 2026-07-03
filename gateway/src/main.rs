@@ -10,6 +10,7 @@ use tower_http::{
 };
 
 mod audit;
+mod auth;
 mod client_ip;
 mod config;
 mod metrics;
