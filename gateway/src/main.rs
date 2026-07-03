@@ -72,6 +72,10 @@ fn app(config: config::Config, metrics_handle: PrometheusHandle) -> Router {
         .route("/version", get(version))
         .route("/metrics", get(metrics_endpoint))
         .with_state(AppState { metrics_handle })
+        .layer(axum::middleware::from_fn_with_state(
+            config.clone(),
+            middleware::validate::validate_request,
+        ))
         .layer(axum::middleware::from_fn(
             middleware::headers::header_hardening_middleware,
         ))
@@ -166,6 +170,8 @@ mod tests {
                 .parse()
                 .expect("test listen address should parse"),
             cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
+            max_body_size: 1_048_576,
+            validation_allowed_content_types: vec!["application/json".to_owned()],
         }
     }
 
