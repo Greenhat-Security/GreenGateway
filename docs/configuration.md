@@ -10,6 +10,14 @@ Default: `0.0.0.0:8080`
 
 Format and validation: must parse as a Rust `SocketAddr`, such as `127.0.0.1:8080`, `0.0.0.0:8080`, or `[::1]:8080`. Non-Unicode values and invalid socket addresses are rejected during configuration loading.
 
+### AUDIT_LOG_FILE
+
+Optional JSON Lines audit log file path.
+
+Default: empty, which disables the file sink. Audit events are always written to stdout.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. The file sink opens lazily on first write, appends one JSON event per line, and logs write/open failures without stopping request handling.
+
 ### CORS_ALLOW_ORIGINS
 
 Comma-separated list of exact origins allowed by CORS.

@@ -19,9 +19,9 @@ use http::{
 };
 use serde::Serialize;
 
-use crate::{client_ip::canonical_client_ip, config::Config};
-
-pub const LOCK_POISON_RECOVERIES_TOTAL: &str = "lock_poison_recoveries_total";
+use crate::{
+    client_ip::canonical_client_ip, config::Config, metrics::LOCK_POISON_RECOVERIES_TOTAL,
+};
 
 #[derive(Clone)]
 pub struct RateLimitState {
@@ -83,7 +83,12 @@ impl RateLimiter {
         let mut buckets = match self.buckets.lock() {
             Ok(buckets) => buckets,
             Err(poisoned) => {
-                metrics::counter!(LOCK_POISON_RECOVERIES_TOTAL).increment(1);
+                ::metrics::counter!(
+                    LOCK_POISON_RECOVERIES_TOTAL,
+                    "component" => "rate_limit",
+                    "lock" => "buckets"
+                )
+                .increment(1);
                 tracing::error!("rate limiter bucket lock poisoned; recovering");
                 poisoned.into_inner()
             }

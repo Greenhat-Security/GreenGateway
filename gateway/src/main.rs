@@ -1,7 +1,8 @@
-use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
+use axum::{extract::State, response::IntoResponse, routing::get, Extension, Json, Router};
 use http::{header, HeaderName, HeaderValue, Method, Request};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::Serialize;
+use serde_json::json;
 use tower_http::{
     cors::CorsLayer,
     request_id::{MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
@@ -11,6 +12,7 @@ use tower_http::{
 mod audit;
 mod client_ip;
 mod config;
+mod metrics;
 mod middleware;
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
@@ -57,10 +59,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let metrics_handle = install_metrics_recorder()?;
     let listen_addr = config.listen_addr;
-    let app = app(config, metrics_handle);
+    let audit_log = audit::AuditLog::from_config(&config);
+    let app = app(config, metrics_handle, audit_log.clone());
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    let bound_addr = listener.local_addr()?;
 
-    tracing::info!(listen_addr = %listener.local_addr()?, "gateway listening");
+    audit_log.emit(audit::AuditEvent::new(
+        "gateway.startup",
+        "startup",
+        "internal",
+        None::<audit::Actor>,
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "listen_addr": bound_addr.to_string(),
+        }),
+    ));
+
+    tracing::info!(listen_addr = %bound_addr, "gateway listening");
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -70,16 +85,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn app(config: config::Config, metrics_handle: PrometheusHandle) -> Router {
+fn app(
+    config: config::Config,
+    metrics_handle: PrometheusHandle,
+    audit_log: audit::AuditLog,
+) -> Router {
     let request_id_header = request_id_header();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
     let rate_limit_state = middleware::rate_limit::RateLimitState::from_config(&config);
 
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/metrics", get(metrics_endpoint))
-        .with_state(AppState { metrics_handle })
+        .with_state(AppState { metrics_handle });
+
+    let router = router
         .layer(axum::middleware::from_fn_with_state(
             csrf_config,
             middleware::csrf::csrf_middleware,
@@ -98,7 +119,12 @@ fn app(config: config::Config, metrics_handle: PrometheusHandle) -> Router {
         .layer(cors_layer(&config))
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(TraceLayer::new_for_http())
-        .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
+        .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid));
+
+    #[cfg(test)]
+    let router = router.layer(axum::middleware::from_fn(audit_extension_probe_middleware));
+
+    router.layer(Extension(audit_log))
 }
 
 fn install_metrics_recorder() -> Result<PrometheusHandle, metrics_exporter_prometheus::BuildError> {
@@ -106,10 +132,14 @@ fn install_metrics_recorder() -> Result<PrometheusHandle, metrics_exporter_prome
         .with_recommended_naming(true)
         .install_recorder()?;
 
-    metrics::describe_counter!(REQUEST_COUNTER, "HTTP requests served by GreenGateway");
-    metrics::describe_counter!(
-        middleware::rate_limit::LOCK_POISON_RECOVERIES_TOTAL,
-        "Rate limiter lock poison recoveries"
+    ::metrics::describe_counter!(REQUEST_COUNTER, "HTTP requests served by GreenGateway");
+    ::metrics::describe_counter!(
+        audit::AUDIT_EVENTS_DROPPED_TOTAL,
+        "Audit events dropped by the bounded asynchronous audit channel"
+    );
+    ::metrics::describe_counter!(
+        metrics::LOCK_POISON_RECOVERIES_TOTAL,
+        "Lock poison recoveries by component and lock"
     );
 
     Ok(handle)
@@ -179,13 +209,26 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 fn record_request(route: &'static str) {
-    metrics::counter!(REQUEST_COUNTER, "route" => route).increment(1);
+    ::metrics::counter!(REQUEST_COUNTER, "route" => route).increment(1);
+}
+
+#[cfg(test)]
+async fn audit_extension_probe_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req.extensions().get::<audit::AuditLog>().is_none() {
+        return http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    next.run(req).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{body::Body, http::StatusCode};
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
@@ -193,6 +236,7 @@ mod tests {
             listen_addr: "127.0.0.1:0"
                 .parse()
                 .expect("test listen address should parse"),
+            audit_log_file: None,
             cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
             max_body_size: 1_048_576,
             rate_limit_read_rps: 50.0,
@@ -214,10 +258,21 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct NoopSink;
+
+    impl audit::AuditSink for NoopSink {
+        fn emit(&self, _event: &audit::AuditEvent) {}
+    }
+
+    fn test_audit_log() -> audit::AuditLog {
+        audit::AuditLog::new(Arc::new(NoopSink))
+    }
+
     async fn preflight_response(config: config::Config, origin: &str) -> axum::response::Response {
         let recorder = PrometheusBuilder::new().build_recorder();
 
-        app(config, recorder.handle())
+        app(config, recorder.handle(), test_audit_log())
             .oneshot(
                 Request::builder()
                     .method(Method::OPTIONS)
@@ -234,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn health_returns_ok() {
         let recorder = PrometheusBuilder::new().build_recorder();
-        let response = app(test_config(Vec::new()), recorder.handle())
+        let response = app(test_config(Vec::new()), recorder.handle(), test_audit_log())
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -246,6 +301,22 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key(REQUEST_ID_HEADER));
+    }
+
+    #[tokio::test]
+    async fn audit_log_extension_is_available_to_middleware() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let response = app(test_config(Vec::new()), recorder.handle(), test_audit_log())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -293,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn outer_layers_wrap_validation_rejections() {
         let recorder = PrometheusBuilder::new().build_recorder();
-        let response = app(test_config(Vec::new()), recorder.handle())
+        let response = app(test_config(Vec::new()), recorder.handle(), test_audit_log())
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -316,7 +387,7 @@ mod tests {
         assert!(config.csrf_enabled);
 
         let recorder = PrometheusBuilder::new().build_recorder();
-        let response = app(config, recorder.handle())
+        let response = app(config, recorder.handle(), test_audit_log())
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -340,7 +411,7 @@ mod tests {
         config.rate_limit_read_burst = 1;
 
         let recorder = PrometheusBuilder::new().build_recorder();
-        let router = app(config, recorder.handle());
+        let router = app(config, recorder.handle(), test_audit_log());
 
         let response = router
             .clone()

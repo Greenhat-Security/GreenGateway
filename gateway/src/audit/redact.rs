@@ -5,6 +5,7 @@ pub fn sha256_hex(input: &[u8]) -> String {
     format!("sha256:{}", hex::encode(digest))
 }
 
+#[allow(dead_code)] // Credential-bearing audit events are introduced with auth in issue #5.
 pub fn hash_credential(token: &str) -> String {
     sha256_hex(token.as_bytes())
 }
@@ -12,11 +13,13 @@ pub fn hash_credential(token: &str) -> String {
 /// Hashes JSON using serde_json's default sorted object-key serialization.
 /// Enabling serde_json's `preserve_order` feature anywhere in the dependency
 /// tree would change hashes for logically identical JSON objects.
+#[allow(dead_code)] // Tool/policy audit payload hashing is introduced in later MCP issues.
 pub fn hash_args(args: &serde_json::Value) -> String {
     let canonical = serde_json::to_string(args).expect("serde_json::Value should serialize");
     sha256_hex(canonical.as_bytes())
 }
 
+#[allow(dead_code)] // Request/auth audit payload redaction is wired when those events are added.
 pub fn redact_string(s: &str, keep_start: usize, keep_end: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= keep_start.saturating_add(keep_end) {
