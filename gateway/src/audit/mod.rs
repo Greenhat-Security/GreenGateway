@@ -19,6 +19,8 @@ pub mod sqlite_sink;
 pub use event::{Actor, AuditEvent};
 pub use sink::AuditSink;
 
+pub type AuditEventSender = tokio::sync::broadcast::Sender<AuditEvent>;
+
 pub const AUDIT_EVENTS_DROPPED_TOTAL: &str = "audit_events_dropped_total";
 pub const AUDIT_SQLITE_FLUSH_ERRORS_TOTAL: &str = "audit_sqlite_flush_errors_total";
 
@@ -51,8 +53,11 @@ impl AuditLog {
         Self { tx }
     }
 
-    pub fn from_config(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self::new(sink::build_sink_from_config(config)?))
+    pub fn from_config(
+        config: &Config,
+    ) -> Result<(Self, AuditEventSender), Box<dyn std::error::Error>> {
+        let (sink, broadcast_sender) = sink::build_sink_from_config(config)?;
+        Ok((Self::new(sink), broadcast_sender))
     }
 
     /// Queue an audit event for best-effort background emission.
