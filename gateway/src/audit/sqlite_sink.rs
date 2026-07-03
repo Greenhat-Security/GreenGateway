@@ -63,6 +63,11 @@ INSERT INTO audit_events (
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
 "#;
 
+const DELETE_RETAINED_EVENTS_SQL: &str = r#"
+DELETE FROM audit_events
+WHERE julianday(timestamp) < julianday(?1)
+"#;
+
 #[derive(Debug, Clone)]
 pub struct SqliteSinkConfig {
     pub path: PathBuf,
@@ -243,10 +248,7 @@ impl SqliteSinkShared {
         let cutoff = retention_cutoff(retention_days);
         let result = {
             let connection = self.connection_guard();
-            connection.execute(
-                "DELETE FROM audit_events WHERE timestamp < ?1",
-                params![cutoff],
-            )
+            prune_retained_events(&connection, &cutoff)
         };
 
         if let Err(err) = result {
@@ -416,6 +418,13 @@ fn retention_cutoff(retention_days: u32) -> String {
         .expect("UTC retention cutoff should format as RFC 3339")
 }
 
+fn prune_retained_events(connection: &Connection, cutoff: &str) -> rusqlite::Result<usize> {
+    // Audit timestamps and retention cutoffs are written by this codebase's
+    // RFC3339 formatter. SQLite returns NULL for malformed timestamps, so rows
+    // this sink did not write are not silently matched by the retention delete.
+    connection.execute(DELETE_RETAINED_EVENTS_SQL, params![cutoff])
+}
+
 fn payload_status(payload: &Value) -> Option<i64> {
     let status = payload.get("status")?;
     let number = status
@@ -523,6 +532,66 @@ mod tests {
         assert_eventually(StdDuration::from_secs(1), || {
             event_ids(&db.path) == vec!["new-event".to_owned()]
         });
+    }
+
+    #[test]
+    fn retention_pruning_compares_variable_precision_timestamps_chronologically() {
+        let db = TempDb::new("retention-subsecond");
+        drop(sqlite_sink(&db.path, None));
+
+        insert_raw_event(&db.path, "older-event", "2024-06-01T11:59:59.5Z");
+        insert_raw_event(&db.path, "cutoff-event", "2024-06-01T12:00:00Z");
+        insert_raw_event(
+            &db.path,
+            "fractionally-newer-event",
+            "2024-06-01T12:00:00.5Z",
+        );
+        insert_raw_event(&db.path, "later-event", "2024-06-01T12:00:01Z");
+
+        let connection = Connection::open(&db.path).expect("test database should open");
+        let deleted = prune_retained_events(&connection, "2024-06-01T12:00:00Z")
+            .expect("retention prune should run");
+
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            event_ids(&db.path),
+            vec![
+                "cutoff-event".to_owned(),
+                "fractionally-newer-event".to_owned(),
+                "later-event".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlite_julianday_parses_audit_timestamp_variants() {
+        let connection = Connection::open_in_memory().expect("in-memory database should open");
+        let cutoff = julianday(&connection, "2024-06-01T12:00:00Z");
+
+        for timestamp in [
+            "2024-06-01T12:00:00Z",
+            "2024-06-01T12:00:00.5Z",
+            "2024-06-01T12:00:00.123Z",
+            "2024-06-01T12:00:00.4438138Z",
+            "2024-06-01T12:00:00.123456789Z",
+        ] {
+            assert!(
+                julianday(&connection, timestamp).is_finite(),
+                "{timestamp} should parse as a SQLite julianday"
+            );
+        }
+
+        for timestamp in [
+            "2024-06-01T12:00:00.5Z",
+            "2024-06-01T12:00:00.123Z",
+            "2024-06-01T12:00:00.4438138Z",
+            "2024-06-01T12:00:00.123456789Z",
+        ] {
+            assert!(
+                julianday(&connection, timestamp) > cutoff,
+                "{timestamp} should compare newer than the whole-second cutoff"
+            );
+        }
     }
 
     #[test]
@@ -650,6 +719,15 @@ mod tests {
             .expect("event_id query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("event_id rows should read")
+    }
+
+    fn julianday(connection: &Connection, timestamp: &str) -> f64 {
+        connection
+            .query_row("SELECT julianday(?1)", params![timestamp], |row| {
+                row.get::<_, Option<f64>>(0)
+            })
+            .expect("julianday query should run")
+            .expect("timestamp should parse as a SQLite julianday")
     }
 
     fn query_payload_columns(
