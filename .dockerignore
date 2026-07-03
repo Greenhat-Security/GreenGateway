@@ -1,6 +1,8 @@
 .git/
 .github/
 target/
+admin-ui/node_modules/
+admin-ui/dist/
 
 Dockerfile
 docker-compose.yml

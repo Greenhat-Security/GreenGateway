@@ -48,9 +48,9 @@ Route rules in a policy's `routes` array are evaluated in document order. The fi
 
 Comma-separated paths that bypass RBAC authorization.
 
-Default: `/health,/version,/metrics`
+Default: `/health,/version,/metrics,/admin`
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. Exempt paths are allowed through without RBAC permission checks and do not emit authz audit events.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without RBAC permission checks and do not emit authz audit events.
 
 ### CORS_ALLOW_ORIGINS
 
@@ -146,9 +146,9 @@ Format and validation: must be a non-empty RFC 6265 cookie name. The cookie valu
 
 Comma-separated paths that bypass authentication.
 
-Default: `/health,/version,/metrics`
+Default: `/health,/version,/metrics,/admin`
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. Exempt paths are allowed through without credential extraction and do not emit auth audit events.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without credential extraction and do not emit auth audit events.
 
 ### JWT_JWKS_URL
 

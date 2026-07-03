@@ -1,6 +1,13 @@
 # syntax=docker/dockerfile:1
 
+FROM node:24-bookworm-slim AS node
+
 FROM rust:1.88-slim-bookworm AS builder
+
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/bin/npm /usr/local/bin/npm
+COPY --from=node /usr/local/bin/npx /usr/local/bin/npx
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 
 WORKDIR /app
 
@@ -12,6 +19,7 @@ RUN mkdir -p gateway/src \
     && cargo build --release -p gateway \
     && rm -rf gateway/src
 
+COPY admin-ui admin-ui
 COPY gateway gateway
 
 RUN cargo build --release -p gateway

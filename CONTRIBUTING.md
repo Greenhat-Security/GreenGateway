@@ -4,16 +4,30 @@ GreenGateway is a pre-alpha, open-source, self-hosted universal MCP and API gate
 
 ## Development Setup
 
-GreenGateway is a Rust workspace built with Cargo. As the codebase lands, the standard local workflow is expected to be:
+GreenGateway is a Rust workspace built with Cargo and now includes a separate Vite + React + TypeScript admin UI in `admin-ui/`. Local builds require Rust plus Node.js and npm on `PATH`; the admin UI scaffold was tested with Node.js `v24.15.0` and npm `11.12.1`.
+
+As the codebase lands, the standard local workflow is expected to be:
 
 ```sh
-cargo build
-cargo test
-cargo fmt
-cargo clippy
+cargo build --workspace
+cargo test --workspace
+cargo fmt --check
+cargo clippy --workspace -- -D warnings
 ```
 
-The actual workspace scaffold is landing in a parallel effort under Issue #3. Until that work is merged, contributors should expect this repository to be light on buildable code and heavier on documentation and scaffolding. That is expected for the current phase of the project.
+The Cargo build for `gateway` runs `npm ci` and `npm run build` in `admin-ui/` so the Rust binary embeds the production UI assets. For frontend hot reload, run two terminals:
+
+```sh
+cargo run
+```
+
+```sh
+cd admin-ui
+npm ci
+npm run dev
+```
+
+Open `http://127.0.0.1:5173/admin/`. The Vite dev server proxies `/v1/admin` requests to `http://127.0.0.1:8080` by default; set `GREENGATEWAY_BACKEND_URL` when the backend is listening elsewhere.
 
 ## Picking Up Work
 

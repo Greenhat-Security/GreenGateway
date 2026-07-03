@@ -39,11 +39,13 @@ your backend API or MCP server
 
 ## Quick Start
 
-GreenGateway currently includes a minimal gateway server with `GET /health`, `GET /version`, and `GET /metrics` endpoints. The broader gateway, auth, policy, and discovery capabilities described in Planned Scope are still pre-alpha roadmap work.
+GreenGateway currently includes a minimal gateway server with `GET /health`, `GET /version`, `GET /metrics`, and an embedded admin UI shell at `/admin`. The broader gateway, auth, policy, and discovery capabilities described in Planned Scope are still pre-alpha roadmap work.
 
 For the full list of environment variables, see [docs/configuration.md](docs/configuration.md). As more variables land, that document and [.env.example](.env.example) are kept in sync with the code by an automated test.
 
 ### Option 1: Cargo (for development)
+
+Local builds require Rust plus Node.js and npm on `PATH`, because `cargo build --workspace` builds and embeds the admin UI. This scaffold was tested with Node.js `v24.15.0` and npm `11.12.1`.
 
 `.env.example` documents the available environment variables and defaults; to override one today, set it in the real shell/process environment rather than sourcing a `.env` file.
 
@@ -67,6 +69,26 @@ Expected response:
 {"status":"ok"}
 ```
 
+The embedded admin UI shell is available at:
+
+```sh
+curl http://localhost:8080/admin
+```
+
+For frontend development with hot reload, run the backend and Vite dev server side by side:
+
+```sh
+cargo run
+```
+
+```sh
+cd admin-ui
+npm ci
+npm run dev
+```
+
+Then open `http://127.0.0.1:5173/admin/`. The Vite dev server proxies `/v1/admin` requests to `http://127.0.0.1:8080` by default; set `GREENGATEWAY_BACKEND_URL` before `npm run dev` to target a different backend.
+
 ### Option 2: Docker Compose
 
 ```sh
@@ -87,9 +109,9 @@ Expected response:
 
 ## Contributing
 
-Contribution guidelines will live in [CONTRIBUTING.md](CONTRIBUTING.md). CONTRIBUTING.md will land in a follow-up PR (PR 2 of #1).
+Contribution guidelines live in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Until then, use the roadmap issue to understand project direction and open work: [Roadmap / project plan](https://github.com/Greenhat-Security/GreenGateway/issues/44).
+Use the roadmap issue to understand project direction and open work: [Roadmap / project plan](https://github.com/Greenhat-Security/GreenGateway/issues/44).
 
 ## License
 
