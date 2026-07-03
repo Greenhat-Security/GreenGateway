@@ -20,6 +20,9 @@ the bare version tag. For example, pushing `v0.1.0` publishes:
 - `ghcr.io/<owner>/<repo>:v0.1.0`
 - `ghcr.io/<owner>/<repo>:0.1.0`
 
+A version-tag push does not update the GHCR `latest` image tag; `latest` only
+tracks the most recent push to `main`.
+
 The `v`-prefixed tag mirrors the git tag, while the bare version is convenient
 for consumers that expect container image tags without the prefix.
 
