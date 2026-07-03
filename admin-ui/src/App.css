@@ -318,6 +318,51 @@ h3 {
   white-space: nowrap;
 }
 
+.live-summary {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.stream-state {
+  border: 1px solid #cad2cc;
+  border-radius: 999px;
+  padding: 7px 11px;
+  color: #405148;
+  background: #f4f6f3;
+  font-size: 0.9rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.stream-state.connected {
+  border-color: #9bc3ad;
+  color: #155032;
+  background: #edf7f1;
+}
+
+.stream-state.paused,
+.stream-state.reconnecting {
+  border-color: #d4c48b;
+  color: #5b4811;
+  background: #fff9df;
+}
+
+.stream-state.error {
+  border-color: #e1b8ad;
+  color: #4c241b;
+  background: #fff7f4;
+}
+
+.live-filter-form {
+  gap: 14px;
+}
+
+.live-filter-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .loading-state,
 .empty-state,
 .error-panel {
