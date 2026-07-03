@@ -91,6 +91,54 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  dev-traffic-smoke:
+    name: dev-traffic-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Run dev traffic smoke test
+        shell: bash
+        run: |
+          set -eu
+
+          compose_files="-f docker-compose.yml -f docker-compose.dev.yml"
+
+          cleanup() {
+            docker compose $compose_files down -v || true
+          }
+          trap cleanup EXIT
+
+          docker compose $compose_files up -d --build
+
+          healthy=0
+          for attempt in {1..60}; do
+            if curl -fsS http://127.0.0.1:8080/health >/dev/null; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$healthy" -ne 1 ]; then
+            docker compose $compose_files logs gateway dev-jwks
+            exit 1
+          fi
+
+          set +e
+          node scripts/generate-traffic.mjs --smoke-test
+          smoke_status=$?
+          set -e
+
+          exit "$smoke_status"
+
   audit:
     name: audit
     runs-on: ubuntu-latest
