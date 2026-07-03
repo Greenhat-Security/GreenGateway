@@ -3,19 +3,16 @@ use crate::auth;
 use super::policy::Policy;
 
 /// Stateless role-to-permission policy evaluator.
-#[allow(dead_code)] // Authorization middleware in PR 2 will hold and call the engine.
 pub struct PolicyEngine {
     policy: Policy,
 }
 
 impl PolicyEngine {
-    #[allow(dead_code)] // Authorization middleware in PR 2 will construct the engine at startup.
     pub fn new(policy: Policy) -> Self {
         Self { policy }
     }
 
     /// True if any principal role grants `permission`; a role holding "*" grants everything.
-    #[allow(dead_code)] // Authorization middleware in PR 2 will call this for route permissions.
     pub fn principal_has_permission(&self, principal: &auth::Principal, permission: &str) -> bool {
         principal
             .roles
@@ -103,6 +100,7 @@ mod tests {
             id: Some("test-policy".to_owned()),
             default_action: DefaultAction::Deny,
             roles,
+            routes: Vec::new(),
         }
     }
 

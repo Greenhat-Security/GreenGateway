@@ -10,13 +10,10 @@ use serde_json::Value;
 
 use crate::config::Config;
 
-// `routes` is reserved for PR 2, so policy files authored with route mappings
-// do not warn before the route mapping loader lands.
 const KNOWN_TOP_LEVEL_KEYS: &[&str] =
     &["schema_version", "id", "default_action", "roles", "routes"];
 
 /// Action to apply when no route rule matches.
-#[allow(dead_code)] // Authorization middleware in PR 2 will enforce the default action.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DefaultAction {
@@ -32,7 +29,6 @@ impl Default for DefaultAction {
 }
 
 /// RBAC policy document.
-#[allow(dead_code)] // Authorization middleware in PR 2 will load and evaluate policies.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Policy {
     pub schema_version: String,
@@ -46,10 +42,12 @@ pub struct Policy {
     pub default_action: DefaultAction,
     #[serde(default)]
     pub roles: HashMap<String, RoleEntry>,
+    /// Ordered route-to-permission rules. First matching rule wins.
+    #[serde(default)]
+    pub routes: Vec<RouteRule>,
 }
 
 /// Permissions granted by one role.
-#[allow(dead_code)] // Authorization middleware in PR 2 will consume role permissions.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleEntry {
@@ -57,7 +55,19 @@ pub struct RoleEntry {
     pub permissions: Vec<String>,
 }
 
-#[allow(dead_code)] // Authorization startup wiring in PR 2 will surface policy loading errors.
+/// Permission required for requests matching a path prefix and optional method set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteRule {
+    /// HTTP methods this rule matches. Empty or ["*"] matches any method.
+    #[serde(default)]
+    pub methods: Vec<String>,
+    /// Path prefix this rule matches. Rules are evaluated in order with starts_with.
+    pub path_prefix: String,
+    /// Permission required to access a matching route.
+    pub permission: String,
+}
+
 #[derive(Debug)]
 pub enum PolicyError {
     Io {
@@ -72,7 +82,6 @@ pub enum PolicyError {
 }
 
 impl Policy {
-    #[allow(dead_code)] // Authorization startup wiring in PR 2 will load POLICY_FILE with this API.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, PolicyError> {
         let path = path.as_ref();
         let contents = fs::read_to_string(path).map_err(|source| PolicyError::Io {
@@ -87,7 +96,6 @@ impl Policy {
         Self::from_json_value(value, Some(path))
     }
 
-    #[allow(dead_code)] // Authorization startup wiring in PR 2 will call this after Config loads.
     pub fn from_config(config: &Config) -> Result<Option<Self>, PolicyError> {
         match config.policy_file.as_deref() {
             Some(path) => Self::from_file(path).map(Some),
@@ -213,6 +221,7 @@ mod tests {
             policy.roles["reader"].permissions,
             vec!["data:read".to_owned()]
         );
+        assert!(policy.routes.is_empty());
     }
 
     #[test]
@@ -323,22 +332,30 @@ mod tests {
     }
 
     #[test]
-    fn routes_top_level_key_is_reserved_and_allowed() {
+    fn routes_section_parses_as_ordered_rules() {
         let file = TempPolicyFile::new(
             r#"{
                 "schema_version": "0.1.0",
                 "roles": {
                     "reader": { "permissions": ["data:read"] }
                 },
-                "routes": {
-                    "/data": { "permission": "data:read" }
-                }
+                "routes": [
+                    { "methods": ["GET"], "path_prefix": "/data", "permission": "data:read" },
+                    { "path_prefix": "/admin", "permission": "admin:read" }
+                ]
             }"#,
         );
 
-        let policy = Policy::from_file(file.path()).expect("reserved routes key should parse");
+        let policy = Policy::from_file(file.path()).expect("routes section should parse");
 
         assert!(policy.roles.contains_key("reader"));
+        assert_eq!(policy.routes.len(), 2);
+        assert_eq!(policy.routes[0].methods, vec!["GET".to_owned()]);
+        assert_eq!(policy.routes[0].path_prefix, "/data");
+        assert_eq!(policy.routes[0].permission, "data:read");
+        assert!(policy.routes[1].methods.is_empty());
+        assert_eq!(policy.routes[1].path_prefix, "/admin");
+        assert_eq!(policy.routes[1].permission, "admin:read");
     }
 
     #[test]
@@ -382,9 +399,6 @@ mod tests {
             "roles": {
                 "admin": { "permissions": ["*"] },
                 "reader": { "permissions": ["data:read"] }
-            },
-            "routes": {
-                "/data": { "permission": "data:read" }
             }
         });
         let invalid_policy = json!({
@@ -399,6 +413,31 @@ mod tests {
             !validator.is_valid(&invalid_policy),
             "published schema should reject a policy with a bad schema_version"
         );
+    }
+
+    #[test]
+    fn published_schema_accepts_policy_with_routes() {
+        let validator = policy_schema_validator();
+        let policy = json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "roles": {
+                "reader": { "permissions": ["data:read"] }
+            },
+            "routes": [
+                {
+                    "methods": ["GET", "HEAD"],
+                    "path_prefix": "/data",
+                    "permission": "data:read"
+                },
+                {
+                    "path_prefix": "/admin",
+                    "permission": "admin:read"
+                }
+            ]
+        });
+
+        assert_schema_accepts(&validator, &policy);
     }
 
     #[test]
@@ -466,6 +505,11 @@ mod tests {
             rate_limit_write_rps: 10.0,
             rate_limit_write_burst: 20,
             trust_proxy_headers: false,
+            rbac_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
             session_cookie_name: String::new(),
             validation_allowed_content_types: vec!["application/json".to_owned()],
             auth_enabled: true,

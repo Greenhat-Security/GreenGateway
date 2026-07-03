@@ -29,7 +29,11 @@
       }
     },
     "routes": {
-      "type": "object"
+      "type": "array",
+      "description": "Ordered route-to-permission rules. Rules are evaluated in array order, and the first matching rule wins.",
+      "items": {
+        "$ref": "#/$defs/route_rule"
+      }
     }
   },
   "$defs": {
@@ -42,6 +46,31 @@
           "items": {
             "type": "string"
           }
+        }
+      }
+    },
+    "route_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path_prefix",
+        "permission"
+      ],
+      "properties": {
+        "methods": {
+          "type": "array",
+          "description": "HTTP methods this rule matches. Empty or [\"*\"] means any method.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "path_prefix": {
+          "type": "string",
+          "description": "Path prefix matched with starts_with, such as /admin or /v1/."
+        },
+        "permission": {
+          "type": "string",
+          "description": "Permission required to access a matching route."
         }
       }
     }
