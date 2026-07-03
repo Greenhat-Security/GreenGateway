@@ -61,7 +61,17 @@ fn is_allowed_content_type(headers: &HeaderMap, config: &Config) -> bool {
     config
         .validation_allowed_content_types
         .iter()
-        .any(|allowed| content_type.starts_with(allowed))
+        .any(|allowed| content_type_matches(content_type, allowed))
+}
+
+fn content_type_matches(content_type: &str, allowed: &str) -> bool {
+    content_type.strip_prefix(allowed).is_some_and(|remainder| {
+        remainder.is_empty()
+            || remainder
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| *byte == b';' || byte.is_ascii_whitespace())
+    })
 }
 
 fn payload_too_large(max_body_size: usize) -> Response {
@@ -167,6 +177,29 @@ mod tests {
             .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn enforces_content_type_token_boundary() {
+        for (content_type, expected_status) in [
+            ("application/json", StatusCode::OK),
+            ("application/json; charset=utf-8", StatusCode::OK),
+            ("application/jsonx", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ] {
+            let response = test_router(test_config(1024, vec!["application/json"]))
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/")
+                        .header(CONTENT_TYPE, content_type)
+                        .body(Body::from("{}"))
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+            assert_eq!(response.status(), expected_status);
+        }
     }
 
     #[tokio::test]
