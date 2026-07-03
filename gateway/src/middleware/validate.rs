@@ -112,6 +112,7 @@ mod tests {
                 .parse()
                 .expect("test listen address should parse"),
             audit_log_file: None,
+            policy_file: None,
             cors_allow_origins: Vec::new(),
             max_body_size,
             rate_limit_read_rps: 50.0,

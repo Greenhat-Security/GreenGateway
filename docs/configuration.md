@@ -18,6 +18,14 @@ Default: empty, which disables the file sink. Audit events are always written to
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. The file sink opens lazily on first write, appends one JSON event per line, and logs write/open failures without stopping request handling.
 
+### POLICY_FILE
+
+Optional RBAC policy JSON file path.
+
+Default: empty, which means no policy file is loaded.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. The policy loader reads the file as JSON, validates that `schema_version` starts with `0.`, warns on unknown top-level keys, and rejects invalid policy documents.
+
 ### CORS_ALLOW_ORIGINS
 
 Comma-separated list of exact origins allowed by CORS.

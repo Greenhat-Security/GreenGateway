@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/policy.v0.schema.json",
+  "title": "GreenGateway RBAC Policy",
+  "description": "Draft 2020-12 JSON Schema for the GreenGateway RBAC policy document. Unknown top-level keys are permitted for forward compatibility and will produce a startup warning.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^0\\."
+    },
+    "id": {
+      "type": "string"
+    },
+    "default_action": {
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    },
+    "roles": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/role_entry"
+      }
+    },
+    "routes": {
+      "type": "object"
+    }
+  },
+  "$defs": {
+    "role_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "permissions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
