@@ -93,12 +93,30 @@ fn app(
     config: config::Config,
     metrics_handle: PrometheusHandle,
     audit_log: audit::AuditLog,
-) -> Result<Router, auth::AuthError> {
+) -> Result<Router, Box<dyn std::error::Error>> {
     let request_id_header = request_id_header();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
     let rate_limit_state = middleware::rate_limit::RateLimitState::from_config(&config);
     let validator = auth::JwtValidator::from_config(&config)?
         .map(|validator| Arc::new(validator) as Arc<dyn auth::SessionValidator>);
+    let rbac_state = match rbac::Policy::from_config(&config)? {
+        Some(policy) => {
+            tracing::info!(
+                policy_id = policy.id.as_deref().unwrap_or("unnamed"),
+                route_rules = policy.routes.len(),
+                "RBAC enabled: policy file loaded"
+            );
+            Some(middleware::rbac::RbacState::from_policy(
+                policy,
+                &config,
+                audit_log.clone(),
+            ))
+        }
+        None => {
+            tracing::warn!("RBAC disabled: no policy file configured");
+            None
+        }
+    };
 
     if config.auth_enabled && validator.is_none() {
         tracing::warn!(
@@ -118,8 +136,18 @@ fn app(
         get(principal_probe).options(principal_probe),
     );
 
-    // Later axum layers run earlier at runtime. Attach auth before the CSRF
-    // layer so requests flow through CSRF, then auth, then the route handler.
+    // Later axum layers run earlier at runtime. Attach RBAC before auth, then
+    // auth before CSRF, so requests flow through CSRF, auth, RBAC, then the
+    // route handler.
+    let router = if let Some(rbac_state) = rbac_state {
+        router.layer(axum::middleware::from_fn_with_state(
+            rbac_state,
+            middleware::rbac::rbac_middleware,
+        ))
+    } else {
+        router
+    };
+
     let router = if config.auth_enabled {
         router.layer(axum::middleware::from_fn_with_state(
             middleware::auth::AuthState::from_config(&config, validator, audit_log.clone()),
@@ -267,7 +295,7 @@ async fn principal_probe(
 mod tests {
     use super::*;
     use axum::{body::Body, http::StatusCode};
-    use std::sync::Arc;
+    use std::{fs, path::PathBuf, sync::Arc};
     use tower::ServiceExt;
 
     fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
@@ -284,6 +312,11 @@ mod tests {
             rate_limit_write_rps: 10.0,
             rate_limit_write_burst: 20,
             trust_proxy_headers: false,
+            rbac_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
             session_cookie_name: String::new(),
             validation_allowed_content_types: vec!["application/json".to_owned()],
             auth_enabled: true,
@@ -405,6 +438,34 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(capture.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auth_runs_before_rbac_for_non_exempt_routes() {
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "deny",
+                "roles": {}
+            }"#,
+        );
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+
+        let response = app(config, recorder.handle(), test_audit_log())
+            .expect("app should build")
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .header(header::AUTHORIZATION, "Bearer token-123")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -576,5 +637,28 @@ mod tests {
             .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    struct TempPolicyFile {
+        path: PathBuf,
+    }
+
+    impl TempPolicyFile {
+        fn new(contents: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "greengateway-app-policy-test-{}.json",
+                uuid::Uuid::new_v4()
+            ));
+            fs::write(&path, contents)
+                .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
+
+            Self { path }
+        }
+    }
+
+    impl Drop for TempPolicyFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }

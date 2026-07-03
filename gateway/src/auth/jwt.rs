@@ -790,6 +790,11 @@ mQIDAQAB
             rate_limit_write_rps: 10.0,
             rate_limit_write_burst: 20,
             trust_proxy_headers: false,
+            rbac_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
             session_cookie_name: String::new(),
             validation_allowed_content_types: vec!["application/json".to_owned()],
             auth_enabled: true,

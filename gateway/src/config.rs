@@ -24,6 +24,7 @@ const DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES: &[&str] = &["application/json"];
 const DEFAULT_AUTH_ENABLED: bool = true;
 const DEFAULT_AUTH_COOKIE_NAME: &str = "session";
 const DEFAULT_AUTH_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
+const DEFAULT_RBAC_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_JWT_JWKS_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_ROLES_CLAIM: &str = "roles";
 const DEFAULT_CSRF_ENABLED: bool = true;
@@ -47,6 +48,7 @@ const JWT_JWKS_URL: &str = "JWT_JWKS_URL";
 const JWT_REQUIRE_JTI: &str = "JWT_REQUIRE_JTI";
 const MAX_BODY_SIZE: &str = "MAX_BODY_SIZE";
 const POLICY_FILE: &str = "POLICY_FILE";
+const RBAC_EXEMPT_PATHS: &str = "RBAC_EXEMPT_PATHS";
 const RATE_LIMIT_READ_RPS: &str = "RATE_LIMIT_READ_RPS";
 const RATE_LIMIT_READ_BURST: &str = "RATE_LIMIT_READ_BURST";
 const RATE_LIMIT_WRITE_RPS: &str = "RATE_LIMIT_WRITE_RPS";
@@ -68,6 +70,7 @@ pub struct Config {
     pub rate_limit_write_rps: f64,
     pub rate_limit_write_burst: u32,
     pub trust_proxy_headers: bool,
+    pub rbac_exempt_paths: Vec<String>,
     pub session_cookie_name: String,
     pub validation_allowed_content_types: Vec<String>,
     pub auth_enabled: bool,
@@ -170,6 +173,12 @@ impl Config {
             "boolean",
             &mut problems,
         );
+        let rbac_exempt_paths = parse_comma_separated_paths(
+            RBAC_EXEMPT_PATHS,
+            get_var(RBAC_EXEMPT_PATHS),
+            DEFAULT_RBAC_EXEMPT_PATHS,
+            &mut problems,
+        );
         let session_cookie_name = parse_var(
             SESSION_COOKIE_NAME,
             get_var(SESSION_COOKIE_NAME),
@@ -270,6 +279,7 @@ impl Config {
                 rate_limit_write_rps,
                 rate_limit_write_burst,
                 trust_proxy_headers,
+                rbac_exempt_paths,
                 session_cookie_name,
                 validation_allowed_content_types,
                 auth_enabled,
@@ -602,6 +612,14 @@ mod tests {
             DEFAULT_RATE_LIMIT_WRITE_BURST
         );
         assert!(!config.trust_proxy_headers);
+        assert_eq!(
+            config.rbac_exempt_paths,
+            vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ]
+        );
         assert!(config.session_cookie_name.is_empty());
         assert_eq!(
             config.validation_allowed_content_types,
@@ -675,6 +693,14 @@ mod tests {
             DEFAULT_RATE_LIMIT_WRITE_BURST
         );
         assert!(!config.trust_proxy_headers);
+        assert_eq!(
+            config.rbac_exempt_paths,
+            vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ]
+        );
         assert!(config.session_cookie_name.is_empty());
         assert_eq!(
             config.validation_allowed_content_types,
@@ -912,6 +938,37 @@ mod tests {
                 "/metrics".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn rbac_exempt_paths_parse_comma_separated_list() {
+        let config = Config::from_env_vars(|name| match name {
+            "RBAC_EXEMPT_PATHS" => Ok(" /health, /ready ,, /metrics ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.rbac_exempt_paths,
+            vec![
+                "/health".to_owned(),
+                "/ready".to_owned(),
+                "/metrics".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_rbac_exempt_paths_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "RBAC_EXEMPT_PATHS" => Ok("/health,admin".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid RBAC exempt paths");
+
+        let message = error.to_string();
+        assert!(message.contains("RBAC_EXEMPT_PATHS entries must be URI paths"));
+        assert_eq!(error.problems.len(), 1);
     }
 
     #[test]

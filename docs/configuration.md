@@ -26,6 +26,16 @@ Default: empty, which means no policy file is loaded.
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. The policy loader reads the file as JSON, validates that `schema_version` starts with `0.`, warns on unknown top-level keys, and rejects invalid policy documents.
 
+Route rules in a policy's `routes` array are evaluated in document order. The first rule whose `path_prefix` matches the request path and whose `methods` match the request method determines the required permission.
+
+### RBAC_EXEMPT_PATHS
+
+Comma-separated paths that bypass RBAC authorization.
+
+Default: `/health,/version,/metrics`
+
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. Exempt paths are allowed through without RBAC permission checks and do not emit authz audit events.
+
 ### CORS_ALLOW_ORIGINS
 
 Comma-separated list of exact origins allowed by CORS.
