@@ -1,0 +1,7 @@
+{
+  "schema_version": "0.1.0",
+  "id": "starter",
+  "default_action": "allow",
+  "roles": {},
+  "routes": []
+}

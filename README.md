@@ -191,6 +191,8 @@ GreenGateway reads all configuration from environment variables — no config fi
 - Egress firewall (`EGRESS_ALLOWED_HOSTS`, `EGRESS_DENY_PRIVATE_IPS`, ...)
 - Audit sinks (`AUDIT_LOG_FILE`, `AUDIT_SQLITE_PATH`, `AUDIT_SQLITE_RETENTION_DAYS`)
 
+For real deployments that want to enable RBAC without immediately blocking unmatched traffic, start from [docs/examples/policy.starter.json](docs/examples/policy.starter.json).
+
 `docs/configuration.md` and `.env.example` are kept in sync with the actual code by an automated CI drift test, so they should never silently fall out of date.
 
 ## Contributing
