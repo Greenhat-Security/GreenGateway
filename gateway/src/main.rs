@@ -17,6 +17,7 @@ mod client_ip;
 mod config;
 mod metrics;
 mod middleware;
+mod rbac;
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -275,6 +276,7 @@ mod tests {
                 .parse()
                 .expect("test listen address should parse"),
             audit_log_file: None,
+            policy_file: None,
             cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
             max_body_size: 1_048_576,
             rate_limit_read_rps: 50.0,

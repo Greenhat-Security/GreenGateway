@@ -46,6 +46,7 @@ const JWT_JWKS_TIMEOUT_MS: &str = "JWT_JWKS_TIMEOUT_MS";
 const JWT_JWKS_URL: &str = "JWT_JWKS_URL";
 const JWT_REQUIRE_JTI: &str = "JWT_REQUIRE_JTI";
 const MAX_BODY_SIZE: &str = "MAX_BODY_SIZE";
+const POLICY_FILE: &str = "POLICY_FILE";
 const RATE_LIMIT_READ_RPS: &str = "RATE_LIMIT_READ_RPS";
 const RATE_LIMIT_READ_BURST: &str = "RATE_LIMIT_READ_BURST";
 const RATE_LIMIT_WRITE_RPS: &str = "RATE_LIMIT_WRITE_RPS";
@@ -59,6 +60,7 @@ const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES
 pub struct Config {
     pub listen_addr: SocketAddr,
     pub audit_log_file: Option<String>,
+    pub policy_file: Option<String>,
     pub cors_allow_origins: Vec<String>,
     pub max_body_size: usize,
     pub rate_limit_read_rps: f64,
@@ -109,6 +111,7 @@ impl Config {
         );
         let audit_log_file =
             parse_optional_string(AUDIT_LOG_FILE, get_var(AUDIT_LOG_FILE), &mut problems);
+        let policy_file = parse_optional_string(POLICY_FILE, get_var(POLICY_FILE), &mut problems);
         let cors_allow_origins = parse_comma_separated_header_values(
             CORS_ALLOW_ORIGINS,
             get_var(CORS_ALLOW_ORIGINS),
@@ -259,6 +262,7 @@ impl Config {
             Ok(Self {
                 listen_addr,
                 audit_log_file,
+                policy_file,
                 cors_allow_origins,
                 max_body_size,
                 rate_limit_read_rps,
@@ -587,6 +591,7 @@ mod tests {
                 .expect("test address should parse")
         );
         assert_eq!(config.audit_log_file, None);
+        assert_eq!(config.policy_file, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
         assert_eq!(config.rate_limit_read_rps, DEFAULT_RATE_LIMIT_READ_RPS);
@@ -659,6 +664,7 @@ mod tests {
                 .expect("default address should parse")
         );
         assert_eq!(config.audit_log_file, None);
+        assert_eq!(config.policy_file, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
         assert_eq!(config.rate_limit_read_rps, DEFAULT_RATE_LIMIT_READ_RPS);
@@ -748,6 +754,31 @@ mod tests {
         .expect("config should parse");
 
         assert_eq!(config.audit_log_file, None);
+    }
+
+    #[test]
+    fn policy_file_parses_optional_path() {
+        let config = Config::from_env_vars(|name| match name {
+            "POLICY_FILE" => Ok("  /etc/greengateway/policy.json  ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.policy_file,
+            Some("/etc/greengateway/policy.json".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_policy_file_is_none() {
+        let config = Config::from_env_vars(|name| match name {
+            "POLICY_FILE" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.policy_file, None);
     }
 
     #[test]
