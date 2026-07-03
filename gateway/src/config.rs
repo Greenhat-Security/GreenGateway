@@ -37,6 +37,8 @@ const DEFAULT_EGRESS_MAX_RESPONSE_BYTES: usize = 5_242_880;
 const DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_EGRESS_DENY_PRIVATE_IPS: bool = true;
 const AUDIT_LOG_FILE: &str = "AUDIT_LOG_FILE";
+const AUDIT_SQLITE_PATH: &str = "AUDIT_SQLITE_PATH";
+const AUDIT_SQLITE_RETENTION_DAYS: &str = "AUDIT_SQLITE_RETENTION_DAYS";
 const AUTH_COOKIE_NAME: &str = "AUTH_COOKIE_NAME";
 const AUTH_ENABLED: &str = "AUTH_ENABLED";
 const AUTH_EXEMPT_PATHS: &str = "AUTH_EXEMPT_PATHS";
@@ -73,6 +75,8 @@ const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES
 pub struct Config {
     pub listen_addr: SocketAddr,
     pub audit_log_file: Option<String>,
+    pub audit_sqlite_path: Option<String>,
+    pub audit_sqlite_retention_days: Option<u32>,
     pub policy_file: Option<String>,
     pub cors_allow_origins: Vec<String>,
     pub max_body_size: usize,
@@ -131,6 +135,14 @@ impl Config {
         );
         let audit_log_file =
             parse_optional_string(AUDIT_LOG_FILE, get_var(AUDIT_LOG_FILE), &mut problems);
+        let audit_sqlite_path =
+            parse_optional_string(AUDIT_SQLITE_PATH, get_var(AUDIT_SQLITE_PATH), &mut problems);
+        let audit_sqlite_retention_days = parse_optional_var(
+            AUDIT_SQLITE_RETENTION_DAYS,
+            get_var(AUDIT_SQLITE_RETENTION_DAYS),
+            "day count",
+            &mut problems,
+        );
         let policy_file = parse_optional_string(POLICY_FILE, get_var(POLICY_FILE), &mut problems);
         let cors_allow_origins = parse_comma_separated_header_values(
             CORS_ALLOW_ORIGINS,
@@ -328,6 +340,8 @@ impl Config {
             Ok(Self {
                 listen_addr,
                 audit_log_file,
+                audit_sqlite_path,
+                audit_sqlite_retention_days,
                 policy_file,
                 cors_allow_origins,
                 max_body_size,
@@ -444,6 +458,40 @@ fn parse_optional_string(
         None
     } else {
         Some(value.to_owned())
+    }
+}
+
+fn parse_optional_var<T>(
+    name: &str,
+    value: Result<String, VarError>,
+    expected: &str,
+    problems: &mut Vec<String>,
+) -> Option<T>
+where
+    T: Default + FromStr,
+    T::Err: fmt::Display,
+{
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return None,
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return None;
+        }
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let problem_count = problems.len();
+    let parsed = parse_var(name, Ok(value.to_owned()), T::default(), expected, problems);
+
+    if problems.len() == problem_count {
+        Some(parsed)
+    } else {
+        None
     }
 }
 
@@ -716,6 +764,8 @@ mod tests {
                 .expect("test address should parse")
         );
         assert_eq!(config.audit_log_file, None);
+        assert_eq!(config.audit_sqlite_path, None);
+        assert_eq!(config.audit_sqlite_retention_days, None);
         assert_eq!(config.policy_file, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
@@ -812,6 +862,8 @@ mod tests {
                 .expect("default address should parse")
         );
         assert_eq!(config.audit_log_file, None);
+        assert_eq!(config.audit_sqlite_path, None);
+        assert_eq!(config.audit_sqlite_retention_days, None);
         assert_eq!(config.policy_file, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
@@ -925,6 +977,71 @@ mod tests {
         .expect("config should parse");
 
         assert_eq!(config.audit_log_file, None);
+    }
+
+    #[test]
+    fn audit_sqlite_config_parses_optional_path_and_retention() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUDIT_SQLITE_PATH" => Ok("  /var/lib/greengateway/audit.sqlite  ".to_owned()),
+            "AUDIT_SQLITE_RETENTION_DAYS" => Ok("30".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.audit_sqlite_path,
+            Some("/var/lib/greengateway/audit.sqlite".to_owned())
+        );
+        assert_eq!(config.audit_sqlite_retention_days, Some(30));
+    }
+
+    #[test]
+    fn empty_audit_sqlite_path_is_none() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUDIT_SQLITE_PATH" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.audit_sqlite_path, None);
+    }
+
+    #[test]
+    fn audit_sqlite_retention_without_path_is_allowed() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUDIT_SQLITE_RETENTION_DAYS" => Ok("7".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.audit_sqlite_path, None);
+        assert_eq!(config.audit_sqlite_retention_days, Some(7));
+    }
+
+    #[test]
+    fn empty_audit_sqlite_retention_is_none() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUDIT_SQLITE_RETENTION_DAYS" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.audit_sqlite_retention_days, None);
+    }
+
+    #[test]
+    fn invalid_audit_sqlite_retention_is_collected_with_other_problems() {
+        let error = Config::from_env_vars(|name| match name {
+            "AUDIT_SQLITE_RETENTION_DAYS" => Ok("forever".to_owned()),
+            "MAX_BODY_SIZE" => Ok("large".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid SQLite retention");
+
+        let message = error.to_string();
+        assert!(message.contains("AUDIT_SQLITE_RETENTION_DAYS must be a valid day count"));
+        assert!(message.contains("MAX_BODY_SIZE must be a valid byte size"));
+        assert_eq!(error.problems.len(), 2);
     }
 
     #[test]

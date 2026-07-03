@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let metrics_handle = install_metrics_recorder()?;
     let listen_addr = config.listen_addr;
-    let audit_log = audit::AuditLog::from_config(&config);
+    let audit_log = audit::AuditLog::from_config(&config)?;
     let app = app(config, metrics_handle, audit_log.clone())?;
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     let bound_addr = listener.local_addr()?;
@@ -205,6 +205,10 @@ fn install_metrics_recorder() -> Result<PrometheusHandle, metrics_exporter_prome
         "Audit events dropped by the bounded asynchronous audit channel"
     );
     ::metrics::describe_counter!(
+        audit::AUDIT_SQLITE_FLUSH_ERRORS_TOTAL,
+        "SQLite audit sink flush or retention prune errors"
+    );
+    ::metrics::describe_counter!(
         metrics::LOCK_POISON_RECOVERIES_TOTAL,
         "Lock poison recoveries by component and lock"
     );
@@ -319,6 +323,8 @@ mod tests {
                 .parse()
                 .expect("test listen address should parse"),
             audit_log_file: None,
+            audit_sqlite_path: None,
+            audit_sqlite_retention_days: None,
             policy_file: None,
             cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
             max_body_size: 1_048_576,

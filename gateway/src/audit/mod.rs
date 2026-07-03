@@ -13,11 +13,13 @@ use crate::config::Config;
 pub mod event;
 pub mod redact;
 pub mod sink;
+pub mod sqlite_sink;
 
 pub use event::{Actor, AuditEvent};
 pub use sink::AuditSink;
 
 pub const AUDIT_EVENTS_DROPPED_TOTAL: &str = "audit_events_dropped_total";
+pub const AUDIT_SQLITE_FLUSH_ERRORS_TOTAL: &str = "audit_sqlite_flush_errors_total";
 
 const AUDIT_CHANNEL_CAPACITY: usize = 8192;
 
@@ -48,8 +50,8 @@ impl AuditLog {
         Self { tx }
     }
 
-    pub fn from_config(config: &Config) -> Self {
-        Self::new(sink::build_sink_from_config(config))
+    pub fn from_config(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self::new(sink::build_sink_from_config(config)?))
     }
 
     /// Queue an audit event for best-effort background emission.
