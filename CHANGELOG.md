@@ -34,6 +34,26 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   private-IP blocking including IPv4-mapped-IPv6/NAT64, pinned-IP resolution),
   with all gateway-originated HTTP routed through it and enforced by CI.
 
-Later phases (dev-visibility UI, the universal reverse proxy, traffic discovery,
-the visual rule builder, MCP support, and identity integrations) are tracked in
-the roadmap.
+### Added — Phase 2 (dev visibility)
+
+- Observation events: a `http.request_observed` event emitted for every request
+  (method, path, status, latency, auth outcome, matched policy decision),
+  positioned to wrap rate-limiting, validation, CSRF, auth, and RBAC so it
+  fires even for rejected requests.
+- A SQLite audit sink (batched writes, retention pruning, durable across
+  restarts) and an admin-role-gated query API (`GET /v1/admin/audit`) with
+  time-range/event-type/actor/path/status filters and keyset pagination.
+- A live SSE event feed (`GET /v1/admin/events/stream`) backed by an in-process
+  broadcast sink, with backpressure handling so a stalled consumer never
+  blocks request processing.
+- An embedded admin UI (Vite + React + TypeScript, built into the binary and
+  served at `/admin`): a log explorer over the query API, a live tail over the
+  SSE feed, and a status page reporting real running-config values (version,
+  uptime, RBAC/audit-sink/rate-limit state) — never hardcoded.
+- A local dev harness: a checked-in JWKS fixture and seeded RBAC policy, a
+  `docker-compose.dev.yml` profile bringing up a fully authenticated gateway
+  in one command, and a traffic generator doubling as a CI smoke test that
+  asserts real observation/auth/authz events appear for a varied request mix.
+
+Later phases (the universal reverse proxy, traffic discovery, the visual rule
+builder, MCP support, and identity integrations) are tracked in the roadmap.
