@@ -451,6 +451,24 @@ mod tests {
     }
 
     #[test]
+    fn starter_policy_file_parses_and_matches_published_schema() {
+        let path = repo_root().join("docs/examples/policy.starter.json");
+        let policy = Policy::from_file(&path)
+            .unwrap_or_else(|err| panic!("starter policy should parse: {err}"));
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let value: Value = serde_json::from_str(&contents)
+            .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()));
+
+        assert_eq!(policy.schema_version, "0.1.0");
+        assert_eq!(policy.id.as_deref(), Some("starter"));
+        assert_eq!(policy.default_action, DefaultAction::Allow);
+        assert!(policy.roles.is_empty());
+        assert!(policy.routes.is_empty());
+        assert_schema_accepts(&policy_schema_validator(), &value);
+    }
+
+    #[test]
     fn published_schema_accepts_policy_with_routes() {
         let validator = policy_schema_validator();
         let policy = json!({
@@ -506,10 +524,7 @@ mod tests {
     }
 
     fn policy_schema_validator() -> Validator {
-        let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let repo_root = gateway_root
-            .parent()
-            .expect("gateway crate should live directly under the repo root");
+        let repo_root = repo_root();
         let schema_path = repo_root.join("docs/schemas/policy.v0.schema.json");
         let schema = fs::read_to_string(&schema_path)
             .unwrap_or_else(|err| panic!("failed to read {}: {err}", schema_path.display()));
@@ -518,6 +533,13 @@ mod tests {
 
         jsonschema::validator_for(&schema)
             .unwrap_or_else(|err| panic!("failed to compile {}: {err}", schema_path.display()))
+    }
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("gateway crate should live directly under the repo root")
+            .to_owned()
     }
 
     fn assert_schema_accepts(validator: &Validator, policy: &Value) {

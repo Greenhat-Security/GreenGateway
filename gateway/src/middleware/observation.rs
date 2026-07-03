@@ -359,6 +359,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observation_correlates_with_real_default_allow_decision() {
+        let (audit, capture) = test_audit_log();
+        let router = auth_rbac_observation_router(
+            audit,
+            validator(Ok(test_principal(&["reader"]))),
+            test_policy(DefaultAction::Allow, &[], &[]),
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/data/items")
+                    .header(crate::REQUEST_ID_HEADER, "request-real-default-allow")
+                    .header(AUTHORIZATION, "Bearer token-123")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eventually(Duration::from_secs(1), || capture.events().len() >= 3);
+        let events = capture.events();
+        let authz = events
+            .iter()
+            .find(|event| event.event_type == "authz.allowed")
+            .expect("authz allowed event should be captured");
+        assert_eq!(authz.payload["reason"], json!("default_allow"));
+        assert_eq!(authz.request_id, "request-real-default-allow");
+
+        let observed = events
+            .iter()
+            .find(|event| event.event_type == HTTP_REQUEST_OBSERVED)
+            .expect("observation event should be captured");
+        assert_eq!(observed.payload["auth_outcome"], json!("authenticated"));
+        assert_eq!(observed.payload["policy_decision"], json!("allowed"));
+        assert_eq!(observed.payload["policy_reason"], json!("default_allow"));
+        assert!(observed.payload.get("permission").is_none());
+        assert_eq!(
+            observed.actor.as_ref().map(|actor| actor.user_id.as_str()),
+            Some("user-123")
+        );
+    }
+
+    #[tokio::test]
     async fn observation_correlates_with_real_auth_failure_event() {
         let (audit, capture) = test_audit_log();
         let router = auth_rbac_observation_router(
