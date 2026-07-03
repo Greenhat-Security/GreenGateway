@@ -8,11 +8,15 @@ license = "GPL-3.0-only"
 
 [workspace.dependencies]
 axum = "0.8.9"
+hex = "0.4.3"
 http = "1.4.2"
+jsonschema = { version = "0.46.9", default-features = false }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+sha2 = "0.10.9"
+time = { version = "0.3.53", features = ["formatting"] }
 tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.6.8", features = ["cors", "request-id", "trace"] }

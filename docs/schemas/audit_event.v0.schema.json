@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/audit_event.v0.schema.json",
+  "title": "GreenGateway Audit Event",
+  "description": "Draft 2020-12 JSON Schema for the GreenGateway audit event envelope.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "timestamp",
+    "schema_version",
+    "request_id",
+    "source_ip",
+    "actor",
+    "payload"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "event_type": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "schema_version": {
+      "const": "0.1.0"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "source_ip": {
+      "type": "string"
+    },
+    "user_agent": {
+      "type": "string"
+    },
+    "actor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/actor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "payload": true
+  },
+  "$defs": {
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "user_id",
+        "auth_mode"
+      ],
+      "properties": {
+        "user_id": {
+          "type": "string"
+        },
+        "roles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "auth_mode": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
