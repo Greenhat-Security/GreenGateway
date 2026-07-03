@@ -1,10 +1,16 @@
 use std::sync::Arc;
 
-use axum::{extract::State, response::IntoResponse, routing::get, Extension, Json, Router};
-use http::{header, HeaderName, HeaderValue, Method, Request};
+use axum::{
+    extract::{Query, State},
+    response::{IntoResponse, Response},
+    routing::get,
+    Extension, Json, Router,
+};
+use http::{header, HeaderName, HeaderValue, Method, Request, StatusCode};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tower_http::{
     cors::CorsLayer,
     request_id::{MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
@@ -22,10 +28,19 @@ mod rbac;
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
 const REQUEST_ID_HEADER: &str = "x-request-id";
+const AUDIT_ADMIN_ROUTE: &str = "/v1/admin/audit";
+const AUDIT_ADMIN_ROLE: &str = "admin";
+const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
+const MAX_AUDIT_QUERY_LIMIT: usize = 500;
 
 #[derive(Clone)]
 struct AppState {
     metrics_handle: PrometheusHandle,
+}
+
+#[derive(Clone)]
+struct AuditAdminState {
+    query_store: Option<Arc<audit::query::AuditQueryStore>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -46,6 +61,29 @@ struct HealthResponse {
 #[derive(Serialize)]
 struct VersionResponse {
     version: &'static str,
+}
+
+#[derive(Deserialize)]
+struct AuditQueryParams {
+    from: Option<String>,
+    to: Option<String>,
+    event_type: Option<String>,
+    actor: Option<String>,
+    path: Option<String>,
+    status: Option<String>,
+    limit: Option<String>,
+    before_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AuditQueryResponse {
+    events: Vec<audit::AuditEvent>,
+    next_cursor: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
 }
 
 #[tokio::main]
@@ -100,6 +138,12 @@ fn app(
     let rate_limit_state = middleware::rate_limit::RateLimitState::from_config(&config);
     let observation_state =
         middleware::observation::ObservationState::from_config(&config, audit_log.clone());
+    let audit_query_store = config
+        .audit_sqlite_path
+        .as_deref()
+        .map(audit::query::AuditQueryStore::open)
+        .transpose()?
+        .map(Arc::new);
     let egress_client = Arc::new(egress::EgressClient::new(
         egress::EgressConfig::from_config(&config),
     )?);
@@ -134,7 +178,14 @@ fn app(
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/metrics", get(metrics_endpoint))
-        .with_state(AppState { metrics_handle });
+        .with_state(AppState { metrics_handle })
+        .merge(
+            Router::new()
+                .route(AUDIT_ADMIN_ROUTE, get(audit_query_endpoint))
+                .with_state(AuditAdminState {
+                    query_store: audit_query_store,
+                }),
+        );
 
     #[cfg(test)]
     let router = router.route(
@@ -279,6 +330,162 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+async fn audit_query_endpoint(
+    State(state): State<AuditAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+    Query(params): Query<AuditQueryParams>,
+) -> Response {
+    record_request(AUDIT_ADMIN_ROUTE);
+
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+
+    if !principal.roles.iter().any(|role| role == AUDIT_ADMIN_ROLE) {
+        return forbidden();
+    }
+
+    let Some(query_store) = state.query_store.as_ref() else {
+        return service_unavailable("audit query store not configured");
+    };
+
+    let filters = match params.into_filters() {
+        Ok(filters) => filters,
+        Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
+    };
+
+    match query_store.query(&filters) {
+        Ok(page) => (
+            StatusCode::OK,
+            Json(AuditQueryResponse {
+                events: page.events,
+                next_cursor: page.next_cursor,
+            }),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to query audit events");
+            internal_server_error("audit query failed")
+        }
+    }
+}
+
+impl AuditQueryParams {
+    fn into_filters(self) -> Result<audit::query::AuditQueryFilters, &'static str> {
+        let from = validate_rfc3339("from", self.from)?;
+        let to = validate_rfc3339("to", self.to)?;
+        let status = parse_optional_i64("status", self.status)?;
+        let limit = parse_limit(self.limit)?;
+        let before_id = parse_before_id(self.before_id)?;
+
+        Ok(audit::query::AuditQueryFilters {
+            from,
+            to,
+            event_type: self.event_type,
+            actor: self.actor,
+            path: self.path,
+            status,
+            limit,
+            before_id,
+        })
+    }
+}
+
+fn validate_rfc3339(
+    parameter: &'static str,
+    value: Option<String>,
+) -> Result<Option<String>, &'static str> {
+    if let Some(value) = value.as_deref() {
+        OffsetDateTime::parse(value, &Rfc3339).map_err(|_| parameter)?;
+    }
+
+    Ok(value)
+}
+
+fn parse_optional_i64(
+    parameter: &'static str,
+    value: Option<String>,
+) -> Result<Option<i64>, &'static str> {
+    value
+        .map(|value| value.parse::<i64>().map_err(|_| parameter))
+        .transpose()
+}
+
+fn parse_limit(value: Option<String>) -> Result<usize, &'static str> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_AUDIT_QUERY_LIMIT);
+    };
+    let limit = value.parse::<usize>().map_err(|_| "limit")?;
+    if limit == 0 {
+        return Err("limit");
+    }
+
+    Ok(limit.min(MAX_AUDIT_QUERY_LIMIT))
+}
+
+fn parse_before_id(value: Option<String>) -> Result<Option<i64>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let before_id = value.parse::<i64>().map_err(|_| "before_id")?;
+    if before_id < 0 {
+        return Err("before_id");
+    }
+
+    Ok(Some(before_id))
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        Json(ErrorResponse {
+            error: "unauthorized".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            error: "forbidden".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn bad_request(error: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: error.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn service_unavailable(error: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: error.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn internal_server_error(error: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: error.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
 fn record_request(route: &'static str) {
     ::metrics::counter!(REQUEST_COUNTER, "route" => route).increment(1);
 }
@@ -309,7 +516,10 @@ async fn principal_probe(
 mod tests {
     use super::*;
     use axum::{body::Body, http::StatusCode};
+    use rusqlite::{params, Connection};
+    use serde_json::Value;
     use std::{
+        collections::HashSet,
         fs,
         path::PathBuf,
         sync::Arc,
@@ -476,6 +686,184 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| event.event_type.starts_with("auth.")));
+    }
+
+    #[tokio::test]
+    async fn audit_query_without_principal_returns_unauthorized() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let response = app(
+            audit_query_config(None),
+            recorder.handle(),
+            test_audit_log(),
+        )
+        .expect("app should build")
+        .oneshot(audit_query_request(AUDIT_ADMIN_ROUTE, None))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_string(response).await, r#"{"error":"unauthorized"}"#);
+    }
+
+    #[tokio::test]
+    async fn audit_query_non_admin_principal_returns_forbidden_without_store_leak() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let response = app(
+            audit_query_config(None),
+            recorder.handle(),
+            test_audit_log(),
+        )
+        .expect("app should build")
+        .oneshot(audit_query_request(
+            AUDIT_ADMIN_ROUTE,
+            Some(test_principal(&["reader"])),
+        ))
+        .await
+        .expect("request should complete");
+
+        let body = body_string(response).await;
+        assert_eq!(body, r#"{"error":"forbidden"}"#);
+        assert!(!body.contains("audit query store"));
+    }
+
+    #[tokio::test]
+    async fn audit_query_admin_principal_filters_events() {
+        let db = TempDb::new("audit-query-filters");
+        create_audit_schema(&db.path);
+        seed_filter_events(&db.path);
+        let router = audit_query_router(Some(&db.path));
+
+        assert_eq!(
+            audit_event_ids(router.clone(), "/v1/admin/audit?event_type=audit.policy").await,
+            vec!["fractionally-newer-event".to_owned()]
+        );
+        assert_eq!(
+            audit_event_ids(router.clone(), "/v1/admin/audit?actor=bob").await,
+            vec!["fractionally-newer-event".to_owned()]
+        );
+        assert_eq!(
+            audit_event_ids(router.clone(), "/v1/admin/audit?path=/admin").await,
+            vec!["fractionally-newer-event".to_owned()]
+        );
+        assert_eq!(
+            audit_event_ids(router.clone(), "/v1/admin/audit?status=403").await,
+            vec!["fractionally-newer-event".to_owned()]
+        );
+        assert_eq!(
+            audit_event_ids(
+                router,
+                "/v1/admin/audit?from=2024-06-01T12:00:00Z&to=2024-06-01T12:00:00.5Z",
+            )
+            .await,
+            vec![
+                "fractionally-newer-event".to_owned(),
+                "cutoff-event".to_owned()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_query_paginates_with_keyset_cursor_without_gaps() {
+        let db = TempDb::new("audit-query-pagination");
+        create_audit_schema(&db.path);
+        for index in 0..25 {
+            insert_audit_event(
+                &db.path,
+                SeedAuditEvent {
+                    event_id: &format!("page-event-{index:02}"),
+                    event_type: "audit.page",
+                    timestamp: "2024-06-01T12:00:00Z",
+                    actor_user_id: "admin-user",
+                    path: "/page",
+                    status: 200,
+                },
+            );
+        }
+        let router = audit_query_router(Some(&db.path));
+        let mut next_cursor = None;
+        let mut returned = Vec::new();
+        let mut seen = HashSet::new();
+
+        loop {
+            let uri = match next_cursor {
+                Some(cursor) => format!("/v1/admin/audit?limit=10&before_id={cursor}"),
+                None => "/v1/admin/audit?limit=10".to_owned(),
+            };
+            let response = router
+                .clone()
+                .oneshot(audit_query_request(&uri, Some(test_principal(&["admin"]))))
+                .await
+                .expect("request should complete");
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let body = json_body(response).await;
+            let ids = event_ids_from_body(&body);
+            for id in ids {
+                assert!(seen.insert(id.clone()), "duplicate event id {id}");
+                returned.push(id);
+            }
+
+            next_cursor = body["next_cursor"].as_i64();
+            if next_cursor.is_none() {
+                break;
+            }
+        }
+
+        let expected = (0..25)
+            .rev()
+            .map(|index| format!("page-event-{index:02}"))
+            .collect::<Vec<_>>();
+        assert_eq!(returned, expected);
+    }
+
+    #[tokio::test]
+    async fn audit_query_admin_principal_without_store_returns_service_unavailable() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let response = app(
+            audit_query_config(None),
+            recorder.handle(),
+            test_audit_log(),
+        )
+        .expect("app should build")
+        .oneshot(audit_query_request(
+            AUDIT_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+        ))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"audit query store not configured"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_query_malformed_params_return_bad_request() {
+        let db = TempDb::new("audit-query-malformed");
+        create_audit_schema(&db.path);
+        let router = audit_query_router(Some(&db.path));
+
+        for (uri, parameter) in [
+            ("/v1/admin/audit?status=not-a-number", "status"),
+            ("/v1/admin/audit?from=not-a-date", "from"),
+            ("/v1/admin/audit?before_id=-1", "before_id"),
+            ("/v1/admin/audit?before_id=not-a-number", "before_id"),
+            ("/v1/admin/audit?limit=0", "limit"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(audit_query_request(uri, Some(test_principal(&["admin"]))))
+                .await
+                .expect("request should complete");
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                body_string(response).await,
+                format!(r#"{{"error":"invalid query parameter: {parameter}"}}"#)
+            );
+        }
     }
 
     #[tokio::test]
@@ -675,6 +1063,224 @@ mod tests {
             .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    fn audit_query_config(sqlite_path: Option<&PathBuf>) -> config::Config {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.audit_sqlite_path = sqlite_path.map(|path| path.to_string_lossy().into_owned());
+        config
+    }
+
+    fn audit_query_router(sqlite_path: Option<&PathBuf>) -> Router {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        app(
+            audit_query_config(sqlite_path),
+            recorder.handle(),
+            test_audit_log(),
+        )
+        .expect("app should build")
+    }
+
+    fn audit_query_request(uri: &str, principal: Option<auth::Principal>) -> Request<Body> {
+        let mut request = Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request should build");
+        if let Some(principal) = principal {
+            request.extensions_mut().insert(principal);
+        }
+
+        request
+    }
+
+    async fn audit_event_ids(router: Router, uri: &str) -> Vec<String> {
+        let response = router
+            .oneshot(audit_query_request(uri, Some(test_principal(&["admin"]))))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        event_ids_from_body(&json_body(response).await)
+    }
+
+    fn event_ids_from_body(body: &Value) -> Vec<String> {
+        body["events"]
+            .as_array()
+            .expect("events should be an array")
+            .iter()
+            .map(|event| {
+                event["event_id"]
+                    .as_str()
+                    .expect("event_id should be a string")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    async fn json_body(response: axum::response::Response) -> Value {
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should read"),
+        )
+        .expect("body should be JSON")
+    }
+
+    async fn body_string(response: axum::response::Response) -> String {
+        String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should read")
+                .to_vec(),
+        )
+        .expect("body should be UTF-8")
+    }
+
+    fn test_principal(roles: &[&str]) -> auth::Principal {
+        auth::Principal {
+            user_id: "user-123".to_owned(),
+            email: Some("user@example.com".to_owned()),
+            org_id: Some("org-456".to_owned()),
+            roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+            session_id: "session-789".to_owned(),
+            auth_method: auth::AuthMethod::Bearer,
+        }
+    }
+
+    fn create_audit_schema(path: &PathBuf) {
+        drop(
+            audit::sqlite_sink::SqliteSink::new(audit::sqlite_sink::SqliteSinkConfig {
+                path: path.clone(),
+                retention_days: None,
+            })
+            .expect("SQLite sink should create audit schema"),
+        );
+    }
+
+    fn seed_filter_events(path: &PathBuf) {
+        insert_audit_event(
+            path,
+            SeedAuditEvent {
+                event_id: "older-event",
+                event_type: "audit.auth",
+                timestamp: "2024-06-01T11:59:59.5Z",
+                actor_user_id: "alice",
+                path: "/login",
+                status: 200,
+            },
+        );
+        insert_audit_event(
+            path,
+            SeedAuditEvent {
+                event_id: "cutoff-event",
+                event_type: "audit.auth",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: "alice",
+                path: "/login",
+                status: 200,
+            },
+        );
+        insert_audit_event(
+            path,
+            SeedAuditEvent {
+                event_id: "fractionally-newer-event",
+                event_type: "audit.policy",
+                timestamp: "2024-06-01T12:00:00.5Z",
+                actor_user_id: "bob",
+                path: "/admin",
+                status: 403,
+            },
+        );
+        insert_audit_event(
+            path,
+            SeedAuditEvent {
+                event_id: "later-event",
+                event_type: "audit.egress",
+                timestamp: "2024-06-01T12:00:01Z",
+                actor_user_id: "carol",
+                path: "/upstream",
+                status: 502,
+            },
+        );
+    }
+
+    struct SeedAuditEvent<'a> {
+        event_id: &'a str,
+        event_type: &'a str,
+        timestamp: &'a str,
+        actor_user_id: &'a str,
+        path: &'a str,
+        status: i64,
+    }
+
+    fn insert_audit_event(path: &PathBuf, event: SeedAuditEvent<'_>) {
+        let connection = Connection::open(path).expect("test database should open");
+        let actor_json = json!({
+            "user_id": event.actor_user_id,
+            "roles": ["admin"],
+            "auth_mode": "bearer_token"
+        })
+        .to_string();
+        let payload_json = json!({
+            "path": event.path,
+            "status": event.status
+        })
+        .to_string();
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO audit_events (
+                    event_id,
+                    event_type,
+                    timestamp,
+                    schema_version,
+                    request_id,
+                    source_ip,
+                    actor_user_id,
+                    actor_json,
+                    payload_path,
+                    payload_status,
+                    payload_json
+                ) VALUES (?1, ?2, ?3, '0.1.0', 'request-test', '203.0.113.10', ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    event.event_id,
+                    event.event_type,
+                    event.timestamp,
+                    event.actor_user_id,
+                    actor_json,
+                    event.path,
+                    event.status,
+                    payload_json
+                ],
+            )
+            .expect("event should insert");
+    }
+
+    struct TempDb {
+        path: PathBuf,
+    }
+
+    impl TempDb {
+        fn new(test_name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "greengateway-main-{test_name}-{}.sqlite",
+                uuid::Uuid::new_v4()
+            ));
+
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let path = PathBuf::from(format!("{}{}", self.path.display(), suffix));
+                let _ = fs::remove_file(path);
+            }
+        }
     }
 
     struct TempPolicyFile {
