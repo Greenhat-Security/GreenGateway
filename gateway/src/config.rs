@@ -15,12 +15,18 @@ static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
         .parse()
         .expect("default listen address should be valid")
 });
+const DEFAULT_MAX_BODY_SIZE: usize = 1_048_576;
+const DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES: &[&str] = &["application/json"];
 const CORS_ALLOW_ORIGINS: &str = "CORS_ALLOW_ORIGINS";
+const MAX_BODY_SIZE: &str = "MAX_BODY_SIZE";
+const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub listen_addr: SocketAddr,
     pub cors_allow_origins: Vec<String>,
+    pub max_body_size: usize,
+    pub validation_allowed_content_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,9 +52,23 @@ impl Config {
             "socket address",
             &mut problems,
         );
-        let cors_allow_origins = parse_comma_separated_origins(
+        let cors_allow_origins = parse_comma_separated_header_values(
             CORS_ALLOW_ORIGINS,
             get_var(CORS_ALLOW_ORIGINS),
+            &[],
+            &mut problems,
+        );
+        let max_body_size = parse_var(
+            MAX_BODY_SIZE,
+            get_var(MAX_BODY_SIZE),
+            DEFAULT_MAX_BODY_SIZE,
+            "byte size",
+            &mut problems,
+        );
+        let validation_allowed_content_types = parse_comma_separated_header_values(
+            VALIDATION_ALLOWED_CONTENT_TYPES,
+            get_var(VALIDATION_ALLOWED_CONTENT_TYPES),
+            DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES,
             &mut problems,
         );
 
@@ -56,6 +76,8 @@ impl Config {
             Ok(Self {
                 listen_addr,
                 cors_allow_origins,
+                max_body_size,
+                validation_allowed_content_types,
             })
         } else {
             Err(ConfigError { problems })
@@ -106,36 +128,39 @@ where
     }
 }
 
-fn parse_comma_separated_origins(
+fn parse_comma_separated_header_values(
     name: &str,
     value: Result<String, VarError>,
+    default: &[&str],
     problems: &mut Vec<String>,
 ) -> Vec<String> {
     let value = match value {
         Ok(value) => value,
-        Err(VarError::NotPresent) => return Vec::new(),
+        Err(VarError::NotPresent) => {
+            return default.iter().map(|value| (*value).to_owned()).collect()
+        }
         Err(VarError::NotUnicode(value)) => {
             problems.push(format!("{name} must be valid Unicode, got {value:?}"));
-            return Vec::new();
+            return default.iter().map(|value| (*value).to_owned()).collect();
         }
     };
 
-    let mut origins = Vec::new();
+    let mut values = Vec::new();
 
-    for origin in value
+    for entry in value
         .split(',')
         .map(str::trim)
-        .filter(|origin| !origin.is_empty())
+        .filter(|entry| !entry.is_empty())
     {
-        match origin.parse::<HeaderValue>() {
-            Ok(_) => origins.push(origin.to_owned()),
+        match entry.parse::<HeaderValue>() {
+            Ok(_) => values.push(entry.to_owned()),
             Err(err) => problems.push(format!(
-                "{name} entries must be valid HTTP header values, got '{origin}': {err}"
+                "{name} entries must be valid HTTP header values, got '{entry}': {err}"
             )),
         }
     }
 
-    origins
+    values
 }
 
 #[cfg(test)]
@@ -157,6 +182,11 @@ mod tests {
                 .expect("test address should parse")
         );
         assert!(config.cors_allow_origins.is_empty());
+        assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
+        assert_eq!(
+            config.validation_allowed_content_types,
+            vec!["application/json".to_owned()]
+        );
     }
 
     #[test]
@@ -186,6 +216,11 @@ mod tests {
                 .expect("default address should parse")
         );
         assert!(config.cors_allow_origins.is_empty());
+        assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
+        assert_eq!(
+            config.validation_allowed_content_types,
+            vec!["application/json".to_owned()]
+        );
     }
 
     #[test]
@@ -207,6 +242,77 @@ mod tests {
                 "https://admin.example.test".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn max_body_size_parses() {
+        let config = Config::from_env_vars(|name| match name {
+            "MAX_BODY_SIZE" => Ok("2097152".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.max_body_size, 2_097_152);
+    }
+
+    #[test]
+    fn invalid_max_body_size_is_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "MAX_BODY_SIZE" => Ok("not-a-size".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid body sizes");
+
+        let message = error.to_string();
+        assert!(message.contains("MAX_BODY_SIZE must be a valid byte size"));
+        assert!(message.contains("not-a-size"));
+        assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
+    fn validation_allowed_content_types_defaults_to_json() {
+        let config =
+            Config::from_env_vars(|_| Err(VarError::NotPresent)).expect("config should parse");
+
+        assert_eq!(
+            config.validation_allowed_content_types,
+            vec!["application/json".to_owned()]
+        );
+    }
+
+    #[test]
+    fn validation_allowed_content_types_parses_comma_separated_list() {
+        let config = Config::from_env_vars(|name| match name {
+            "VALIDATION_ALLOWED_CONTENT_TYPES" => {
+                Ok(" application/json,multipart/form-data,, application/x-ndjson ".to_owned())
+            }
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.validation_allowed_content_types,
+            vec![
+                "application/json".to_owned(),
+                "multipart/form-data".to_owned(),
+                "application/x-ndjson".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_validation_allowed_content_type_is_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "VALIDATION_ALLOWED_CONTENT_TYPES" => Ok("application/json,bad\nvalue".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid content type header values");
+
+        let message = error.to_string();
+        assert!(message
+            .contains("VALIDATION_ALLOWED_CONTENT_TYPES entries must be valid HTTP header values"));
+        assert!(message.contains("bad\nvalue"));
+        assert_eq!(error.problems.len(), 1);
     }
 
     #[test]
