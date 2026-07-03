@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security reports
+    url: https://github.com/Greenhat-Security/GreenGateway/blob/main/SECURITY.md
+    about: Report vulnerabilities through SECURITY.md instead of public issues.
+  - name: Roadmap discussion
+    url: https://github.com/Greenhat-Security/GreenGateway/issues/44
+    about: Use the roadmap issue for general direction questions and project discussion.

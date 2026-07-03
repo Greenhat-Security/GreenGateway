@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest an improvement or new capability for GreenGateway.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What problem should this solve, and who is affected?
+      placeholder: Describe the current limitation or need.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+      description: What change would address the problem?
+      placeholder: Describe the behavior, interface, or workflow you would like.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other approaches did you consider?
+    validations:
+      required: false
+  - type: input
+    id: roadmap-phase
+    attributes:
+      label: Roadmap phase or issue
+      description: If this relates to a specific roadmap phase, mention it here. See roadmap issue #44 for project direction.
+      placeholder: "Example: Phase 1, Phase 2, or #44"
+    validations:
+      required: false

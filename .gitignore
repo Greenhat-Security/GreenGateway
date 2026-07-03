@@ -1,0 +1,28 @@
+# Rust / Cargo
+/target/
+!Cargo.lock
+
+# Node / TypeScript
+node_modules/
+dist/
+build/
+.next/
+.vercel/
+coverage/
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
