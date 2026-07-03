@@ -74,6 +74,8 @@ Default: empty string
 
 Format and validation: any valid Unicode string is accepted. When empty, rate limiting falls back to the canonical client IP. When set and the request includes a matching cookie, the bucket key uses a non-cryptographic hash of that cookie value instead of the client IP.
 
+Security note: leave this unset (the default) unless a trusted upstream/auth layer validates the session cookie before it reaches the gateway. Otherwise, because the cookie value is client-controlled and not yet validated, a client can rotate it to evade rate limiting. Key on the canonical client IP, which is the default behavior when unset, until sessions are validated.
+
 ### VALIDATION_ALLOWED_CONTENT_TYPES
 
 Comma-separated list of `Content-Type` prefixes accepted for mutating requests.

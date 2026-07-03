@@ -33,6 +33,10 @@ pub struct RateLimitState {
 
 #[derive(Clone)]
 pub struct RateLimiter {
+    // Known limitation: buckets are never evicted, so this HashMap can grow
+    // one entry per unique key for the lifetime of the process. Future work
+    // should add TTL sweeping or an LRU/size cap. This is acceptable for now
+    // with default IP keying and the current single-node scope.
     buckets: Arc<Mutex<HashMap<String, TokenBucket>>>,
     rps: f64,
     burst: f64,
@@ -133,6 +137,12 @@ fn rate_limit_key(headers: &HeaderMap, session_cookie_name: &str, client_ip: &st
     // Auth lands in issue #5. Principal extension keying should be checked here
     // before falling back to session-cookie keying.
     if let Some(session) = session_cookie(headers, session_cookie_name) {
+        // Security footgun: this keys on an unvalidated, client-controlled
+        // cookie value. Enabling SESSION_COOKIE_NAME before an upstream auth
+        // layer validates the session cookie lets a client mint unlimited
+        // buckets and bypass rate limiting. Only enable session keying once
+        // sessions are validated; auth lands in issue #5, and cookie-session
+        // validation lands in a later issue.
         // DefaultHasher is sufficient for a non-cryptographic rate-limit fingerprint.
         return format!("session:{:016x}", hash_str(session));
     }

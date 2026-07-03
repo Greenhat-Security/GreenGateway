@@ -13,6 +13,11 @@ const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 /// Forwarded proxy headers are honored only when `trust_proxy_headers` is true.
 /// With the default false setting, caller-supplied proxy headers are ignored and
 /// the connection peer address is used instead.
+///
+/// When proxy headers are trusted, the deploying operator must ensure the
+/// trusted proxy strips or replaces any client-supplied `X-Forwarded-For`
+/// header. If the proxy appends to inbound values, a client can still inject
+/// the leftmost entry used here.
 pub fn canonical_client_ip(
     headers: &HeaderMap,
     extensions: &Extensions,
