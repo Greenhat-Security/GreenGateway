@@ -1,0 +1,30 @@
+{
+  "schema_version": "0.1.0",
+  "id": "dev-control-plane",
+  "default_action": "deny",
+  "roles": {
+    "admin": {
+      "permissions": ["*"]
+    },
+    "reader": {
+      "permissions": ["admin:status:read"]
+    }
+  },
+  "routes": [
+    {
+      "methods": ["GET"],
+      "path_prefix": "/v1/admin/audit",
+      "permission": "admin:audit:read"
+    },
+    {
+      "methods": ["GET"],
+      "path_prefix": "/v1/admin/events/stream",
+      "permission": "admin:audit:stream"
+    },
+    {
+      "methods": ["GET"],
+      "path_prefix": "/v1/admin/status",
+      "permission": "admin:status:read"
+    }
+  ]
+}

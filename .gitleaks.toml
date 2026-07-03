@@ -3,8 +3,13 @@ useDefault = true
 
 # Ignore only the known test-only RSA key used to sign JWTs in
 # gateway/src/auth/jwt.rs tests. All default gitleaks detection remains enabled.
+#
+# Also ignore only the known dev-only RSA signing key fixture used by the
+# compose dev profile. This is intentionally checked in under dev/jwks for
+# local token minting; the allowlist stays content-specific, not path-based.
 [allowlist]
-description = "Ignore only the known test-only RSA private key used to sign JWTs in gateway/src/auth/jwt.rs tests. All default gitleaks detection remains enabled."
+description = "Ignore only the known JWT test RSA private key and the dev-only compose signing fixture. All default gitleaks detection remains enabled."
 regexes = [
   '''I5qOpk5XZ/QzJNC2ze0F2VsQ5RAGNdDG9vKHm5qeYHzgM1z9SOUMXsfPYOiXvdZP''',
+  '''NdOKX5FSS9nOh0RNNdwn5b/QdCaMnt64T5f8FXI3giO4AIVCAUE8o7w5bH/1XdXd''',
 ]

@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "kid": "greengateway-dev-jwks-2026-07-03",
+      "use": "sig",
+      "alg": "RS256",
+      "n": "nZz3xMSjSyuvBiVU_kM7Bs_xpDc2gLgguzFbLwW2iN2Lhs_pCB6r5-Xi5xyMlbZARlq-uUfm6O7RvYhhjIdHS6BjcsfSDwTZi3FzB1JYs0jP2y0sbmwf9VS1mYD65GyPuMArMY930-htQTXTil-RUkvZzodETTXcJ-W_0HQmjJ7euE-X_BVyN4IjuACFQgFBPKO8OWx_9V3V3e0nzWtUTYX4zErCuyrqslhgDRQNFTS7oL5AT3cY3fkQJNbbtrPR30rC2_fI9yHFpfc3Hi8GBLnogdNrGJYX58ibn4uZiQQ6jcIG-glY_1v6pNI1TDuArQeMc1cEXomzk_cWjp0u5Q",
+      "e": "AQAB"
+    }
+  ]
+}
