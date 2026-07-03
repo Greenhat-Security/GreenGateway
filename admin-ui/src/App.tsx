@@ -1,10 +1,11 @@
-import { FormEvent, useMemo, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useState } from 'react';
 import {
   BrowserRouter,
   Link,
   NavLink,
   Route,
   Routes,
+  useLocation,
 } from 'react-router-dom';
 
 import {
@@ -16,6 +17,10 @@ import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
 import { StatusPage } from './views/StatusPage';
 
+const THEME_STORAGE_KEY = 'greengateway_admin_theme';
+
+type ThemeName = 'light' | 'dark';
+
 export function App() {
   return (
     <BrowserRouter basename="/admin">
@@ -24,38 +29,84 @@ export function App() {
   );
 }
 
-function AdminShell() {
+export function AdminShell() {
+  const location = useLocation();
+  const [theme, setTheme] = useState<ThemeName>(() => readStoredTheme());
+  const pageTitle = pageTitleForPath(location.pathname);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorageOrNull()?.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
+
+  function toggleTheme() {
+    setTheme((current) => (current === 'dark' ? 'light' : 'dark'));
+  }
+
   return (
     <div className="admin-shell">
-      <header className="app-header">
-        <div className="brand-block">
-          <p className="eyebrow">GreenGateway</p>
-          <h1>Admin</h1>
+      <aside className="sidebar" aria-label="Admin navigation">
+        <div className="logo" aria-label="GreenGateway admin">
+          <span className="logo-mark" aria-hidden="true">
+            GG
+          </span>
+          <span className="logo-word">GreenGateway</span>
+          <span className="logo-badge">GG</span>
         </div>
-        <nav className="top-nav" aria-label="Admin sections">
-          <NavLink to="/" end>
-            Token
-          </NavLink>
-          <NavLink to="/logs">Logs</NavLink>
-          <NavLink to="/live">Live</NavLink>
-          <NavLink to="/status">Status</NavLink>
-        </nav>
-      </header>
 
-      <Routes>
-        <Route path="/" element={<Dashboard />} />
-        <Route path="/logs" element={<LogExplorer />} />
-        <Route path="/live" element={<LiveTail />} />
-        <Route path="/status" element={<StatusPage />} />
-        <Route path="*" element={<NotFoundPage />} />
-      </Routes>
+        <nav className="nav-section" aria-label="Admin sections">
+          <p className="nav-label">Admin</p>
+          <NavLink to="/" end className={navItemClassName}>
+            Token/Dashboard
+          </NavLink>
+          <NavLink to="/logs" className={navItemClassName}>
+            Logs
+          </NavLink>
+          <NavLink to="/live" className={navItemClassName}>
+            Live
+          </NavLink>
+          <NavLink to="/status" className={navItemClassName}>
+            Status
+          </NavLink>
+        </nav>
+
+        <div className="sidebar-foot">
+          <button
+            type="button"
+            className="theme-toggle"
+            aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+            aria-pressed={theme === 'dark'}
+            onClick={toggleTheme}
+          >
+            <span>Theme</span>
+            <span className="theme-toggle-pill">
+              {theme === 'dark' ? 'Dark' : 'Light'}
+            </span>
+          </button>
+        </div>
+      </aside>
+
+      <div className="main">
+        <header className="topbar">
+          <p className="eyebrow">Admin</p>
+          <h1>{pageTitle}</h1>
+        </header>
+
+        <Routes>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/logs" element={<LogExplorer />} />
+          <Route path="/live" element={<LiveTail />} />
+          <Route path="/status" element={<StatusPage />} />
+          <Route path="*" element={<NotFoundPage />} />
+        </Routes>
+      </div>
     </div>
   );
 }
 
 function Dashboard() {
   return (
-    <main className="content-grid">
+    <main className="content-grid page-content">
       <TokenPanel />
 
       <section className="panel" aria-labelledby="views-heading">
@@ -116,7 +167,7 @@ function TokenPanel() {
   }
 
   return (
-    <section className="panel" aria-labelledby="token-heading">
+    <section className="panel token-panel" aria-labelledby="token-heading">
       <div className="section-heading">
         <p className="eyebrow">Authentication</p>
         <h2 id="token-heading">Bearer token</h2>
@@ -127,7 +178,9 @@ function TokenPanel() {
       </p>
 
       <form className="token-form" onSubmit={saveToken}>
-        <label htmlFor="admin-token">Token</label>
+        <label htmlFor="admin-token" className="field-label">
+          Token
+        </label>
         <div className="token-row">
           <input
             id="admin-token"
@@ -167,14 +220,52 @@ function TokenPanel() {
 
 function NotFoundPage() {
   return (
-    <main className="single-page">
+    <main className="single-page page-content">
       <section className="panel narrow-panel" aria-labelledby="missing-heading">
         <div className="section-heading">
           <p className="eyebrow">Not found</p>
           <h2 id="missing-heading">Admin route not found</h2>
         </div>
-        <p className="body-copy">Choose an admin view from the header.</p>
+        <p className="body-copy">Choose an admin view from the sidebar.</p>
       </section>
     </main>
   );
+}
+
+function navItemClassName({ isActive }: { isActive: boolean }): string {
+  return isActive ? 'nav-item active' : 'nav-item';
+}
+
+function pageTitleForPath(pathname: string): string {
+  if (pathname === '/logs') {
+    return 'Log explorer';
+  }
+  if (pathname === '/live') {
+    return 'Live tail';
+  }
+  if (pathname === '/status') {
+    return 'Status';
+  }
+  if (pathname === '/') {
+    return 'Token dashboard';
+  }
+
+  return 'Not found';
+}
+
+function readStoredTheme(): ThemeName {
+  const storedTheme = localStorageOrNull()?.getItem(THEME_STORAGE_KEY);
+  return storedTheme === 'dark' ? 'dark' : 'light';
+}
+
+function localStorageOrNull(): Storage | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
 }

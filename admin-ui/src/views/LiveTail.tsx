@@ -174,7 +174,9 @@ export function LiveTail() {
             <h2 id="live-heading">Live tail</h2>
           </div>
           <div className="live-summary">
-            <span className={`stream-state ${visibleConnectionState}`}>
+            <span
+              className={`stream-state badge ${connectionBadgeClass(visibleConnectionState)} ${visibleConnectionState}`}
+            >
               {connectionLabel(visibleConnectionState)}
             </span>
             <span className="result-count">{events.length} events</span>
@@ -249,11 +251,13 @@ export function LiveTail() {
                 </tr>
               </thead>
               <tbody>
-                {events.map((event) => {
+                {events.map((event, index) => {
                   const isExpanded = expandedEventIds.has(event.event_id);
                   return (
                     <Fragment key={event.event_id}>
-                      <tr className="event-row">
+                      <tr
+                        className={`event-row ${index % 2 === 1 ? 'is-even' : ''}`}
+                      >
                         <td>
                           <button
                             type="button"
@@ -296,7 +300,7 @@ export function LiveTail() {
 function LiveTailErrorMessage({ error }: { error: LiveTailError }) {
   if (error.kind === 'unauthorized') {
     return (
-      <div className="error-panel" role="alert">
+      <div className="error-panel alert warning" role="alert">
         <h3>Bearer token required</h3>
         <p>
           Paste a bearer token before opening the live tail. Open the{' '}
@@ -308,7 +312,7 @@ function LiveTailErrorMessage({ error }: { error: LiveTailError }) {
 
   if (error.kind === 'forbidden') {
     return (
-      <div className="error-panel" role="alert">
+      <div className="error-panel alert error" role="alert">
         <h3>Admin role required</h3>
         <p>This token is valid but does not include the admin role.</p>
       </div>
@@ -316,7 +320,7 @@ function LiveTailErrorMessage({ error }: { error: LiveTailError }) {
   }
 
   return (
-    <div className="error-panel" role="alert">
+    <div className="error-panel alert error" role="alert">
       <h3>Stream disconnected</h3>
       <p>{error.message}</p>
     </div>
@@ -357,6 +361,20 @@ function connectionLabel(state: ConnectionState | 'paused'): string {
       return 'Reconnecting';
     case 'error':
       return 'Disconnected';
+  }
+}
+
+function connectionBadgeClass(state: ConnectionState | 'paused'): string {
+  switch (state) {
+    case 'connected':
+      return 'success';
+    case 'reconnecting':
+    case 'connecting':
+      return 'warning';
+    case 'paused':
+      return 'neutral';
+    case 'error':
+      return 'danger';
   }
 }
 
