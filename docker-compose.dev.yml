@@ -1,0 +1,46 @@
+services:
+  dev-jwks:
+    image: python:3-slim
+    command:
+      - python
+      - -m
+      - http.server
+      - "8080"
+      - --bind
+      - 0.0.0.0
+      - --directory
+      - /srv/jwks
+    volumes:
+      - ./dev/jwks:/srv/jwks:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/jwks.json', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  gateway:
+    depends_on:
+      dev-jwks:
+        condition: service_healthy
+    environment:
+      LISTEN_ADDR: 0.0.0.0:8080
+      AUTH_ENABLED: "true"
+      AUTH_EXEMPT_PATHS: /health,/version,/metrics,/admin
+      RBAC_EXEMPT_PATHS: /health,/version,/metrics,/admin
+      JWT_JWKS_URL: http://dev-jwks:8080/jwks.json
+      JWT_ISSUER: https://greengateway.dev.local
+      JWT_AUDIENCE: greengateway-dev
+      JWT_REQUIRE_JTI: "true"
+      ROLES_CLAIM: roles
+      POLICY_FILE: /tmp/greengateway-dev-policy.json
+      AUDIT_SQLITE_PATH: /tmp/greengateway-dev-audit.sqlite
+      AUDIT_SQLITE_RETENTION_DAYS: "7"
+      CORS_ALLOW_ORIGINS: http://localhost:8080,http://127.0.0.1:8080,http://localhost:5173,http://127.0.0.1:5173
+      EGRESS_ALLOWED_HOSTS: dev-jwks
+      EGRESS_DENY_PRIVATE_IPS: "false"
+    volumes:
+      - ./dev/policy.json:/tmp/greengateway-dev-policy.json:ro

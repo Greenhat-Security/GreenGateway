@@ -107,6 +107,14 @@ Expected response:
 {"status":"ok"}
 ```
 
+For a seeded local development stack with JWT auth, RBAC, a JWKS sidecar, the embedded admin UI, and queryable SQLite audit storage, run:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+```
+
+This dev stack serves the checked-in local JWKS fixture from `dev/jwks/`, loads `dev/policy.json`, and writes queryable audit events to an ephemeral SQLite database inside the gateway container. The admin UI shell remains available without a token at `http://localhost:8080/admin`; protected admin APIs require a dev JWT signed with `dev/jwks/dev-signing-key.pem`.
+
 ## Contributing
 
 Contribution guidelines live in [CONTRIBUTING.md](CONTRIBUTING.md).
