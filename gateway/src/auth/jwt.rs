@@ -915,6 +915,7 @@ mQIDAQAB
                 "/version".to_owned(),
                 "/metrics".to_owned(),
             ],
+            upstream_url: None,
             egress_allowed_hosts: Vec::new(),
             egress_timeout_ms: 30_000,
             egress_connect_timeout_ms: 10_000,

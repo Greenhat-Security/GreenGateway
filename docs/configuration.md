@@ -244,6 +244,14 @@ Default: `/health,/version,/metrics`
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. Exempt paths return before CSRF cookie issuance, so the default probe routes do not receive a CSRF cookie today.
 
+### UPSTREAM_URL
+
+Optional `http` or `https` upstream origin for the catch-all reverse proxy fallback.
+
+Default: empty, which disables proxying and leaves unmatched paths on axum's default `404`.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be a valid `http` or `https` URL with a host. The proxy uses only the configured scheme, host, and port; each incoming request's path and query are forwarded unchanged. The upstream host must still be present in `EGRESS_ALLOWED_HOSTS` for the egress client to allow the outbound request.
+
 ### EGRESS_ALLOWED_HOSTS
 
 Comma-separated hostnames the egress HTTP client may call for gateway-originated outbound requests.

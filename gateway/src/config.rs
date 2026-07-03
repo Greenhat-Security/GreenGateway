@@ -69,6 +69,7 @@ const RATE_LIMIT_WRITE_BURST: &str = "RATE_LIMIT_WRITE_BURST";
 const ROLES_CLAIM: &str = "ROLES_CLAIM";
 const TRUST_PROXY_HEADERS: &str = "TRUST_PROXY_HEADERS";
 const SESSION_COOKIE_NAME: &str = "SESSION_COOKIE_NAME";
+const UPSTREAM_URL: &str = "UPSTREAM_URL";
 const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,6 +103,7 @@ pub struct Config {
     pub csrf_header_name: String,
     pub csrf_cookie_domain: Option<String>,
     pub csrf_exempt_paths: Vec<String>,
+    pub upstream_url: Option<String>,
     pub egress_allowed_hosts: Vec<String>,
     pub egress_timeout_ms: u64,
     pub egress_connect_timeout_ms: u64,
@@ -295,6 +297,8 @@ impl Config {
             DEFAULT_CSRF_EXEMPT_PATHS,
             &mut problems,
         );
+        let upstream_url =
+            parse_optional_upstream_url(UPSTREAM_URL, get_var(UPSTREAM_URL), &mut problems);
         let egress_allowed_hosts = parse_comma_separated_hostnames(
             EGRESS_ALLOWED_HOSTS,
             get_var(EGRESS_ALLOWED_HOSTS),
@@ -367,6 +371,7 @@ impl Config {
                 csrf_header_name,
                 csrf_cookie_domain,
                 csrf_exempt_paths,
+                upstream_url,
                 egress_allowed_hosts,
                 egress_timeout_ms,
                 egress_connect_timeout_ms,
@@ -654,6 +659,53 @@ fn parse_optional_cookie_domain(
     }
 }
 
+fn parse_optional_upstream_url(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Option<String> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return None,
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return None;
+        }
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let parsed = match url::Url::parse(value) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            problems.push(format!(
+                "{name} must be a valid http or https URL, got '{value}': {err}"
+            ));
+            return None;
+        }
+    };
+
+    if parsed.host_str().is_none() {
+        problems.push(format!(
+            "{name} must be a valid http or https URL with a host, got '{value}'"
+        ));
+        return None;
+    }
+
+    match parsed.scheme() {
+        "http" | "https" => Some(value.to_owned()),
+        scheme => {
+            problems.push(format!(
+                "{name} must use http or https, got scheme '{scheme}'"
+            ));
+            None
+        }
+    }
+}
+
 fn parse_comma_separated_paths(
     name: &str,
     value: Result<String, VarError>,
@@ -820,6 +872,7 @@ mod tests {
                 "/metrics".to_owned(),
             ]
         );
+        assert_eq!(config.upstream_url, None);
         assert!(config.egress_allowed_hosts.is_empty());
         assert_eq!(config.egress_timeout_ms, DEFAULT_EGRESS_TIMEOUT_MS);
         assert_eq!(
@@ -920,6 +973,7 @@ mod tests {
                 "/metrics".to_owned(),
             ]
         );
+        assert_eq!(config.upstream_url, None);
         assert!(config.egress_allowed_hosts.is_empty());
         assert_eq!(config.egress_timeout_ms, DEFAULT_EGRESS_TIMEOUT_MS);
         assert_eq!(
@@ -1375,6 +1429,59 @@ mod tests {
         assert_eq!(config.egress_max_response_bytes, 2_097_152);
         assert_eq!(config.egress_max_request_body_bytes, 65_536);
         assert!(!config.egress_deny_private_ips);
+    }
+
+    #[test]
+    fn upstream_url_parses_optional_http_origin() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_URL" => Ok("  https://upstream.example.test:8443/base/path  ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.upstream_url,
+            Some("https://upstream.example.test:8443/base/path".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_upstream_url_is_none() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_URL" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.upstream_url, None);
+    }
+
+    #[test]
+    fn invalid_upstream_url_values_are_rejected() {
+        for (value, expected) in [
+            (
+                "not a url",
+                "UPSTREAM_URL must be a valid http or https URL",
+            ),
+            (
+                "mailto:ops@example.test",
+                "UPSTREAM_URL must be a valid http or https URL with a host",
+            ),
+            (
+                "ftp://upstream.example.test",
+                "UPSTREAM_URL must use http or https",
+            ),
+        ] {
+            let error = Config::from_env_vars(|name| match name {
+                "UPSTREAM_URL" => Ok(value.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect_err("config should reject invalid upstream URL");
+
+            let message = error.to_string();
+            assert!(message.contains(expected), "{message}");
+            assert_eq!(error.problems.len(), 1);
+        }
     }
 
     #[test]

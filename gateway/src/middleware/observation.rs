@@ -16,7 +16,7 @@ use crate::{
     config::Config,
 };
 
-use super::decision::{AuthOutcome, PolicyDecision};
+use super::decision::{AuthOutcome, PolicyDecision, UpstreamOutcome};
 
 const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
 
@@ -51,6 +51,7 @@ pub async fn observation_middleware(
     let latency_ms = duration_millis(start.elapsed());
     let auth_outcome = response.extensions().get::<AuthOutcome>();
     let policy_decision = response.extensions().get::<PolicyDecision>();
+    let upstream_outcome = response.extensions().get::<UpstreamOutcome>();
     let actor = auth_outcome
         .and_then(|outcome| outcome.principal.as_ref())
         .map(actor_from_principal);
@@ -67,6 +68,7 @@ pub async fn observation_middleware(
             latency_ms,
             auth_outcome,
             policy_decision,
+            upstream_outcome,
         ),
     ));
 
@@ -80,6 +82,7 @@ fn observation_payload(
     latency_ms: u64,
     auth_outcome: Option<&AuthOutcome>,
     policy_decision: Option<&PolicyDecision>,
+    upstream_outcome: Option<&UpstreamOutcome>,
 ) -> Value {
     let mut payload = Map::new();
     payload.insert("method".to_owned(), json!(method));
@@ -116,6 +119,14 @@ fn observation_payload(
         }
     }
 
+    if let Some(outcome) = upstream_outcome {
+        payload.insert("upstream_latency_ms".to_owned(), json!(outcome.latency_ms));
+
+        if let Some(status) = outcome.status {
+            payload.insert("upstream_status".to_owned(), json!(status));
+        }
+    }
+
     Value::Object(payload)
 }
 
@@ -148,7 +159,11 @@ mod tests {
     };
 
     use axum::{
-        body::Body, middleware::from_fn_with_state, response::IntoResponse, routing::get, Router,
+        body::Body,
+        middleware::{from_fn, from_fn_with_state},
+        response::IntoResponse,
+        routing::get,
+        Router,
     };
     use http::{header::AUTHORIZATION, Method, Request, StatusCode};
     use serde_json::json;
@@ -234,6 +249,23 @@ mod tests {
             event.actor.as_ref().map(|actor| actor.user_id.as_str()),
             Some("user-123")
         );
+    }
+
+    #[tokio::test]
+    async fn observed_upstream_marker_is_reported() {
+        let (state, capture) = test_observation_state();
+
+        let response = base_router()
+            .layer(from_fn(fake_upstream_layer))
+            .layer(from_fn_with_state(state, observation_middleware))
+            .oneshot(request(Method::GET, "/", "request-upstream"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let event = one_observation_event(&capture).await;
+        assert_eq!(event.payload["upstream_latency_ms"], json!(42));
+        assert_eq!(event.payload["upstream_status"], json!(201));
     }
 
     #[tokio::test]
@@ -474,6 +506,17 @@ mod tests {
                 response
             }
         }
+    }
+
+    async fn fake_upstream_layer(req: Request<Body>, next: Next) -> Response {
+        let mut response = next.run(req).await;
+        response
+            .extensions_mut()
+            .insert(crate::middleware::decision::UpstreamOutcome {
+                latency_ms: 42,
+                status: Some(201),
+            });
+        response
     }
 
     fn auth_rbac_observation_router(
