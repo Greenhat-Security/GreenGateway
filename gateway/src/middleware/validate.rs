@@ -113,6 +113,12 @@ mod tests {
                 .expect("test listen address should parse"),
             cors_allow_origins: Vec::new(),
             max_body_size,
+            rate_limit_read_rps: 50.0,
+            rate_limit_read_burst: 100,
+            rate_limit_write_rps: 10.0,
+            rate_limit_write_burst: 20,
+            trust_proxy_headers: false,
+            session_cookie_name: String::new(),
             validation_allowed_content_types: validation_allowed_content_types
                 .into_iter()
                 .map(str::to_owned)

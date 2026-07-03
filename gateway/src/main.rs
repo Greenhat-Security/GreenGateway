@@ -8,6 +8,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+mod client_ip;
 mod config;
 mod middleware;
 
@@ -59,13 +60,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
 
     tracing::info!(listen_addr = %listener.local_addr()?, "gateway listening");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
 
 fn app(config: config::Config, metrics_handle: PrometheusHandle) -> Router {
     let request_id_header = request_id_header();
+    let rate_limit_state = middleware::rate_limit::RateLimitState::from_config(&config);
 
     Router::new()
         .route("/health", get(health))
@@ -75,6 +81,10 @@ fn app(config: config::Config, metrics_handle: PrometheusHandle) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             config.clone(),
             middleware::validate::validate_request,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            rate_limit_state,
+            middleware::rate_limit::rate_limit_request,
         ))
         .layer(axum::middleware::from_fn(
             middleware::headers::header_hardening_middleware,
@@ -91,6 +101,10 @@ fn install_metrics_recorder() -> Result<PrometheusHandle, metrics_exporter_prome
         .install_recorder()?;
 
     metrics::describe_counter!(REQUEST_COUNTER, "HTTP requests served by GreenGateway");
+    metrics::describe_counter!(
+        middleware::rate_limit::LOCK_POISON_RECOVERIES_TOTAL,
+        "Rate limiter lock poison recoveries"
+    );
 
     Ok(handle)
 }
@@ -171,6 +185,12 @@ mod tests {
                 .expect("test listen address should parse"),
             cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
             max_body_size: 1_048_576,
+            rate_limit_read_rps: 50.0,
+            rate_limit_read_burst: 100,
+            rate_limit_write_rps: 10.0,
+            rate_limit_write_burst: 20,
+            trust_proxy_headers: false,
+            session_cookie_name: String::new(),
             validation_allowed_content_types: vec!["application/json".to_owned()],
         }
     }

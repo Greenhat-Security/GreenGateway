@@ -26,6 +26,54 @@ Default: `1048576` (1 MiB)
 
 Format and validation: must parse as a non-negative byte count that fits in `usize`. Requests with a `Content-Length` larger than this value are rejected with `413 Payload Too Large`.
 
+### RATE_LIMIT_READ_RPS
+
+Read-lane token refill rate for `GET` and `HEAD` requests, in requests per second.
+
+Default: `50.0`
+
+Format and validation: must parse as a finite non-negative `f64`. The read lane uses a separate token bucket from mutating methods.
+
+### RATE_LIMIT_READ_BURST
+
+Read-lane token bucket burst size for `GET` and `HEAD` requests.
+
+Default: `100`
+
+Format and validation: must parse as a `u32`. A fresh read-lane bucket starts full.
+
+### RATE_LIMIT_WRITE_RPS
+
+Write-lane token refill rate for every method other than `GET` and `HEAD`, in requests per second.
+
+Default: `10.0`
+
+Format and validation: must parse as a finite non-negative `f64`. The write lane uses a separate token bucket from `GET` and `HEAD`.
+
+### RATE_LIMIT_WRITE_BURST
+
+Write-lane token bucket burst size for every method other than `GET` and `HEAD`.
+
+Default: `20`
+
+Format and validation: must parse as a `u32`. A fresh write-lane bucket starts full.
+
+### TRUST_PROXY_HEADERS
+
+Whether to trust `X-Forwarded-For` and `X-Real-IP` as canonical client IP inputs.
+
+Default: `false`
+
+Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, forwarded proxy headers are ignored and the connection peer IP is used. Enable this only when GreenGateway is deployed behind a trusted proxy boundary that sanitizes these headers.
+
+### SESSION_COOKIE_NAME
+
+Optional cookie name used for session-based rate-limit keying.
+
+Default: empty string
+
+Format and validation: any valid Unicode string is accepted. When empty, rate limiting falls back to the canonical client IP. When set and the request includes a matching cookie, the bucket key uses a non-cryptographic hash of that cookie value instead of the client IP.
+
 ### VALIDATION_ALLOWED_CONTENT_TYPES
 
 Comma-separated list of `Content-Type` prefixes accepted for mutating requests.

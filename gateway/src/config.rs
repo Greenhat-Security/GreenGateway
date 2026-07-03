@@ -16,16 +16,32 @@ static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
         .expect("default listen address should be valid")
 });
 const DEFAULT_MAX_BODY_SIZE: usize = 1_048_576;
+const DEFAULT_RATE_LIMIT_READ_RPS: f64 = 50.0;
+const DEFAULT_RATE_LIMIT_READ_BURST: u32 = 100;
+const DEFAULT_RATE_LIMIT_WRITE_RPS: f64 = 10.0;
+const DEFAULT_RATE_LIMIT_WRITE_BURST: u32 = 20;
 const DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES: &[&str] = &["application/json"];
 const CORS_ALLOW_ORIGINS: &str = "CORS_ALLOW_ORIGINS";
 const MAX_BODY_SIZE: &str = "MAX_BODY_SIZE";
+const RATE_LIMIT_READ_RPS: &str = "RATE_LIMIT_READ_RPS";
+const RATE_LIMIT_READ_BURST: &str = "RATE_LIMIT_READ_BURST";
+const RATE_LIMIT_WRITE_RPS: &str = "RATE_LIMIT_WRITE_RPS";
+const RATE_LIMIT_WRITE_BURST: &str = "RATE_LIMIT_WRITE_BURST";
+const TRUST_PROXY_HEADERS: &str = "TRUST_PROXY_HEADERS";
+const SESSION_COOKIE_NAME: &str = "SESSION_COOKIE_NAME";
 const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub listen_addr: SocketAddr,
     pub cors_allow_origins: Vec<String>,
     pub max_body_size: usize,
+    pub rate_limit_read_rps: f64,
+    pub rate_limit_read_burst: u32,
+    pub rate_limit_write_rps: f64,
+    pub rate_limit_write_burst: u32,
+    pub trust_proxy_headers: bool,
+    pub session_cookie_name: String,
     pub validation_allowed_content_types: Vec<String>,
 }
 
@@ -65,6 +81,58 @@ impl Config {
             "byte size",
             &mut problems,
         );
+        let rate_limit_read_rps = validate_finite_non_negative(
+            RATE_LIMIT_READ_RPS,
+            parse_var(
+                RATE_LIMIT_READ_RPS,
+                get_var(RATE_LIMIT_READ_RPS),
+                DEFAULT_RATE_LIMIT_READ_RPS,
+                "requests-per-second number",
+                &mut problems,
+            ),
+            DEFAULT_RATE_LIMIT_READ_RPS,
+            &mut problems,
+        );
+        let rate_limit_read_burst = parse_var(
+            RATE_LIMIT_READ_BURST,
+            get_var(RATE_LIMIT_READ_BURST),
+            DEFAULT_RATE_LIMIT_READ_BURST,
+            "request burst size",
+            &mut problems,
+        );
+        let rate_limit_write_rps = validate_finite_non_negative(
+            RATE_LIMIT_WRITE_RPS,
+            parse_var(
+                RATE_LIMIT_WRITE_RPS,
+                get_var(RATE_LIMIT_WRITE_RPS),
+                DEFAULT_RATE_LIMIT_WRITE_RPS,
+                "requests-per-second number",
+                &mut problems,
+            ),
+            DEFAULT_RATE_LIMIT_WRITE_RPS,
+            &mut problems,
+        );
+        let rate_limit_write_burst = parse_var(
+            RATE_LIMIT_WRITE_BURST,
+            get_var(RATE_LIMIT_WRITE_BURST),
+            DEFAULT_RATE_LIMIT_WRITE_BURST,
+            "request burst size",
+            &mut problems,
+        );
+        let trust_proxy_headers = parse_var(
+            TRUST_PROXY_HEADERS,
+            get_var(TRUST_PROXY_HEADERS),
+            false,
+            "boolean",
+            &mut problems,
+        );
+        let session_cookie_name = parse_var(
+            SESSION_COOKIE_NAME,
+            get_var(SESSION_COOKIE_NAME),
+            String::new(),
+            "string",
+            &mut problems,
+        );
         let validation_allowed_content_types = parse_comma_separated_header_values(
             VALIDATION_ALLOWED_CONTENT_TYPES,
             get_var(VALIDATION_ALLOWED_CONTENT_TYPES),
@@ -77,6 +145,12 @@ impl Config {
                 listen_addr,
                 cors_allow_origins,
                 max_body_size,
+                rate_limit_read_rps,
+                rate_limit_read_burst,
+                rate_limit_write_rps,
+                rate_limit_write_burst,
+                trust_proxy_headers,
+                session_cookie_name,
                 validation_allowed_content_types,
             })
         } else {
@@ -96,6 +170,22 @@ impl fmt::Display for ConfigError {
 }
 
 impl Error for ConfigError {}
+
+fn validate_finite_non_negative(
+    name: &str,
+    value: f64,
+    default: f64,
+    problems: &mut Vec<String>,
+) -> f64 {
+    if value.is_finite() && value >= 0.0 {
+        value
+    } else {
+        problems.push(format!(
+            "{name} must be a finite non-negative requests-per-second value, got '{value}'"
+        ));
+        default
+    }
+}
 
 fn parse_var<T>(
     name: &str,
@@ -183,6 +273,15 @@ mod tests {
         );
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
+        assert_eq!(config.rate_limit_read_rps, DEFAULT_RATE_LIMIT_READ_RPS);
+        assert_eq!(config.rate_limit_read_burst, DEFAULT_RATE_LIMIT_READ_BURST);
+        assert_eq!(config.rate_limit_write_rps, DEFAULT_RATE_LIMIT_WRITE_RPS);
+        assert_eq!(
+            config.rate_limit_write_burst,
+            DEFAULT_RATE_LIMIT_WRITE_BURST
+        );
+        assert!(!config.trust_proxy_headers);
+        assert!(config.session_cookie_name.is_empty());
         assert_eq!(
             config.validation_allowed_content_types,
             vec!["application/json".to_owned()]
@@ -217,6 +316,15 @@ mod tests {
         );
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
+        assert_eq!(config.rate_limit_read_rps, DEFAULT_RATE_LIMIT_READ_RPS);
+        assert_eq!(config.rate_limit_read_burst, DEFAULT_RATE_LIMIT_READ_BURST);
+        assert_eq!(config.rate_limit_write_rps, DEFAULT_RATE_LIMIT_WRITE_RPS);
+        assert_eq!(
+            config.rate_limit_write_burst,
+            DEFAULT_RATE_LIMIT_WRITE_BURST
+        );
+        assert!(!config.trust_proxy_headers);
+        assert!(config.session_cookie_name.is_empty());
         assert_eq!(
             config.validation_allowed_content_types,
             vec!["application/json".to_owned()]
@@ -253,6 +361,46 @@ mod tests {
         .expect("config should parse");
 
         assert_eq!(config.max_body_size, 2_097_152);
+    }
+
+    #[test]
+    fn rate_limit_config_parses() {
+        let config = Config::from_env_vars(|name| match name {
+            "RATE_LIMIT_READ_RPS" => Ok("25.5".to_owned()),
+            "RATE_LIMIT_READ_BURST" => Ok("50".to_owned()),
+            "RATE_LIMIT_WRITE_RPS" => Ok("5.25".to_owned()),
+            "RATE_LIMIT_WRITE_BURST" => Ok("10".to_owned()),
+            "TRUST_PROXY_HEADERS" => Ok("true".to_owned()),
+            "SESSION_COOKIE_NAME" => Ok("gateway_session".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.rate_limit_read_rps, 25.5);
+        assert_eq!(config.rate_limit_read_burst, 50);
+        assert_eq!(config.rate_limit_write_rps, 5.25);
+        assert_eq!(config.rate_limit_write_burst, 10);
+        assert!(config.trust_proxy_headers);
+        assert_eq!(config.session_cookie_name, "gateway_session");
+    }
+
+    #[test]
+    fn invalid_rate_limit_values_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "RATE_LIMIT_READ_RPS" => Ok("NaN".to_owned()),
+            "RATE_LIMIT_READ_BURST" => Ok("not-a-burst".to_owned()),
+            "RATE_LIMIT_WRITE_RPS" => Ok("-1".to_owned()),
+            "TRUST_PROXY_HEADERS" => Ok("maybe".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid rate-limit settings");
+
+        let message = error.to_string();
+        assert!(message.contains("RATE_LIMIT_READ_RPS must be a finite non-negative"));
+        assert!(message.contains("RATE_LIMIT_READ_BURST must be a valid request burst size"));
+        assert!(message.contains("RATE_LIMIT_WRITE_RPS must be a finite non-negative"));
+        assert!(message.contains("TRUST_PROXY_HEADERS must be a valid boolean"));
+        assert_eq!(error.problems.len(), 4);
     }
 
     #[test]
