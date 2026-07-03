@@ -142,6 +142,8 @@ Default: empty, which means no JWT validator is built.
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode. The validator fetches public keys from this endpoint and caches them by `kid`.
 
+Egress trust: when this value is a URL with a host, that host is automatically trusted for gateway-originated egress. Operators do not need to duplicate the JWKS host in `EGRESS_ALLOWED_HOSTS`.
+
 ### JWT_ISSUER
 
 Optional expected JWT issuer.
@@ -149,6 +151,8 @@ Optional expected JWT issuer.
 Default: empty, which disables issuer checking.
 
 Format and validation: unset, empty, or whitespace-only values become `None`. When set, bearer JWTs must include a matching `iss` claim.
+
+Egress trust: if this value is a URL with a host, that host is automatically trusted for gateway-originated egress because some deployments use the issuer URL as an identity-provider discovery base. Non-URL issuer identifiers are ignored for egress trust.
 
 ### JWT_AUDIENCE
 
@@ -231,6 +235,8 @@ Comma-separated hostnames the egress HTTP client may call for gateway-originated
 Default: empty list, which denies all egress requests.
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, lowercase entries, and require each entry to be an ASCII hostname without a port. Configure only hostnames, not URLs. The egress client still blocks private resolved IP ranges by default even when a hostname is allowlisted.
+
+Infrastructure endpoint hosts configured elsewhere, including `JWT_JWKS_URL` and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows a JWKS-only deployment to validate tokens without duplicating the identity-provider host here.
 
 ### EGRESS_TIMEOUT_MS
 

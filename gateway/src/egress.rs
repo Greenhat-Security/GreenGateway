@@ -16,7 +16,6 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
-#[allow(dead_code)] // Introduced before gateway callers are rerouted through egress in PR 2.
 #[derive(Debug)]
 pub enum EgressError {
     HostNotAllowed(String),
@@ -70,7 +69,6 @@ impl From<reqwest::Error> for EgressError {
     }
 }
 
-#[allow(dead_code)] // Egress config is consumed when outbound callers are wired through this client.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EgressConfig {
     pub allowed_hosts: HashSet<String>,
@@ -95,14 +93,34 @@ impl Default for EgressConfig {
 }
 
 impl EgressConfig {
-    #[allow(dead_code)] // PR 2 wires Config-derived egress settings into outbound callers.
     pub fn from_config(config: &Config) -> Self {
+        let mut allowed_hosts: HashSet<String> = config
+            .egress_allowed_hosts
+            .iter()
+            .map(|host| host.to_ascii_lowercase())
+            .collect();
+        let mut auto_seeded_hosts = Vec::new();
+
+        auto_seed_endpoint_host(
+            config.jwt_jwks_url.as_deref(),
+            &mut allowed_hosts,
+            &mut auto_seeded_hosts,
+        );
+        auto_seed_endpoint_host(
+            config.jwt_issuer.as_deref(),
+            &mut allowed_hosts,
+            &mut auto_seeded_hosts,
+        );
+
+        if !auto_seeded_hosts.is_empty() {
+            tracing::debug!(
+                hosts = ?auto_seeded_hosts,
+                "auto-seeded egress allowlist from infrastructure endpoints"
+            );
+        }
+
         Self {
-            allowed_hosts: config
-                .egress_allowed_hosts
-                .iter()
-                .map(|host| host.to_ascii_lowercase())
-                .collect(),
+            allowed_hosts,
             timeout: Duration::from_millis(config.egress_timeout_ms),
             connect_timeout: Duration::from_millis(config.egress_connect_timeout_ms),
             max_response_bytes: config.egress_max_response_bytes,
@@ -112,15 +130,35 @@ impl EgressConfig {
     }
 }
 
-#[allow(dead_code)] // Returned by the egress client once gateway callers start using it.
+fn auto_seed_endpoint_host(
+    endpoint: Option<&str>,
+    allowed_hosts: &mut HashSet<String>,
+    auto_seeded_hosts: &mut Vec<String>,
+) {
+    let Some(endpoint) = endpoint else {
+        return;
+    };
+    let Ok(url) = Url::parse(endpoint) else {
+        return;
+    };
+    let Some(host) = url.host_str() else {
+        return;
+    };
+
+    let host = host.to_ascii_lowercase();
+    if allowed_hosts.insert(host.clone()) {
+        auto_seeded_hosts.push(host);
+    }
+}
+
 #[derive(Debug)]
 pub struct EgressResponse {
     pub status: StatusCode,
+    #[allow(dead_code)] // Retained for callers that need upstream response headers.
     pub headers: HeaderMap,
     pub body: Vec<u8>,
 }
 
-#[allow(dead_code)] // Standalone client lands in this PR; request-path wiring follows in PR 2.
 #[derive(Clone)]
 pub struct EgressClient {
     config: EgressConfig,
@@ -130,7 +168,6 @@ pub struct EgressClient {
 }
 
 impl EgressClient {
-    #[allow(dead_code)] // Used when outbound gateway callers are rerouted through egress.
     pub fn new(config: EgressConfig) -> Result<Self, EgressError> {
         let base_client = base_client_builder(&config).build()?;
 
@@ -140,13 +177,11 @@ impl EgressClient {
         })
     }
 
-    #[allow(dead_code)] // Used by simple outbound calls that do not need custom headers or a body.
     pub async fn request(&self, method: Method, url: &str) -> Result<EgressResponse, EgressError> {
         self.request_with_headers(method, url, HeaderMap::new(), None)
             .await
     }
 
-    #[allow(dead_code)] // Main egress surface for future JWKS, proxy, and MCP tool-call wiring.
     pub async fn request_with_headers(
         &self,
         method: Method,
@@ -302,8 +337,10 @@ fn checked_host(url: &Url, allowed_hosts: &HashSet<String>) -> Result<String, Eg
         .ok_or_else(|| EgressError::InvalidUrl("missing host".to_owned()))?
         .to_ascii_lowercase();
 
-    // IPv6 literal URL hosts stay denied: bracketed literals do not get
-    // normalized into allowlist entries and fail closed before any request.
+    // IPv6 literal URL hosts may enter the allowlist through auto-seeded
+    // infrastructure endpoints. They still fail closed today because the
+    // resolver is given the bracketed form, so IPv6 literal JWKS and endpoint
+    // URLs remain unsupported for now.
     if allowed_hosts.contains(&host) {
         Ok(host)
     } else {
@@ -505,6 +542,16 @@ mod tests {
             error,
             EgressError::HostNotAllowed(host) if host == "api.example.test"
         ));
+    }
+
+    #[test]
+    fn from_config_auto_seeds_jwks_host_into_allowlist() {
+        let mut config = test_config();
+        config.jwt_jwks_url = Some("https://idp.example.test/.well-known/jwks.json".to_owned());
+
+        let egress = EgressConfig::from_config(&config);
+
+        assert!(egress.allowed_hosts.contains("idp.example.test"));
     }
 
     #[test]
@@ -738,5 +785,57 @@ mod tests {
 
     fn socket(value: &str) -> SocketAddr {
         value.parse().expect("test socket address should parse")
+    }
+
+    fn test_config() -> Config {
+        Config {
+            listen_addr: "127.0.0.1:0"
+                .parse()
+                .expect("test listen address should parse"),
+            audit_log_file: None,
+            policy_file: None,
+            cors_allow_origins: Vec::new(),
+            max_body_size: 1_048_576,
+            rate_limit_read_rps: 50.0,
+            rate_limit_read_burst: 100,
+            rate_limit_write_rps: 10.0,
+            rate_limit_write_burst: 20,
+            trust_proxy_headers: false,
+            rbac_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
+            session_cookie_name: String::new(),
+            validation_allowed_content_types: vec!["application/json".to_owned()],
+            auth_enabled: true,
+            auth_cookie_name: "session".to_owned(),
+            auth_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
+            jwt_jwks_url: None,
+            jwt_issuer: None,
+            jwt_audience: None,
+            jwt_jwks_timeout_ms: 2000,
+            jwt_require_jti: false,
+            roles_claim: "roles".to_owned(),
+            csrf_enabled: true,
+            csrf_cookie_name: "csrf_token".to_owned(),
+            csrf_header_name: "x-csrf-token".to_owned(),
+            csrf_cookie_domain: None,
+            csrf_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
+            egress_allowed_hosts: Vec::new(),
+            egress_timeout_ms: 30_000,
+            egress_connect_timeout_ms: 10_000,
+            egress_max_response_bytes: 5_242_880,
+            egress_max_request_body_bytes: 1_048_576,
+            egress_deny_private_ips: true,
+        }
     }
 }

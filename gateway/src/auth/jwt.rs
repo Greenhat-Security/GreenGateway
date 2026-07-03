@@ -5,12 +5,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use http::Method;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, RwLock};
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::timeout,
+};
 
-use crate::config::Config;
+use crate::{config::Config, egress::EgressClient};
 
 use super::{AuthError, AuthMethod, Principal, SessionCredential, SessionValidator};
 
@@ -71,7 +75,7 @@ impl RevocationStore for NoopRevocationStore {
 /// RS256 JWT bearer-token validator backed by a kid-indexed JWKS key cache.
 pub struct JwtValidator {
     cfg: JwtAuthConfig,
-    client: reqwest::Client,
+    egress_client: Arc<EgressClient>,
     keys: Arc<RwLock<HashMap<String, DecodingKey>>>,
     last_jwks_refresh: Arc<Mutex<Option<Instant>>>,
     revocation: Arc<dyn RevocationStore>,
@@ -91,46 +95,52 @@ impl fmt::Debug for JwtValidator {
 }
 
 impl JwtValidator {
-    pub fn new(cfg: JwtAuthConfig) -> Result<Self, AuthError> {
-        Self::with_keys(cfg, Arc::new(NoopRevocationStore), HashMap::new())
+    pub fn new(cfg: JwtAuthConfig, egress_client: Arc<EgressClient>) -> Result<Self, AuthError> {
+        Self::with_keys(
+            cfg,
+            egress_client,
+            Arc::new(NoopRevocationStore),
+            HashMap::new(),
+        )
     }
 
     #[allow(dead_code)] // Future wiring can supply a real jti revocation store.
     pub fn new_with_revocation(
         cfg: JwtAuthConfig,
+        egress_client: Arc<EgressClient>,
         revocation: Arc<dyn RevocationStore>,
     ) -> Result<Self, AuthError> {
-        Self::with_keys(cfg, revocation, HashMap::new())
+        Self::with_keys(cfg, egress_client, revocation, HashMap::new())
     }
 
-    pub fn from_config(config: &Config) -> Result<Option<Self>, AuthError> {
+    pub fn from_config(
+        config: &Config,
+        egress_client: Arc<EgressClient>,
+    ) -> Result<Option<Self>, AuthError> {
         JwtAuthConfig::from_config(config)
-            .map(Self::new)
+            .map(|cfg| Self::new(cfg, egress_client))
             .transpose()
     }
 
     #[cfg(test)]
     pub(crate) fn new_with_keys(
         cfg: JwtAuthConfig,
+        egress_client: Arc<EgressClient>,
         revocation: Arc<dyn RevocationStore>,
         initial_keys: HashMap<String, DecodingKey>,
     ) -> Result<Self, AuthError> {
-        Self::with_keys(cfg, revocation, initial_keys)
+        Self::with_keys(cfg, egress_client, revocation, initial_keys)
     }
 
     fn with_keys(
         cfg: JwtAuthConfig,
+        egress_client: Arc<EgressClient>,
         revocation: Arc<dyn RevocationStore>,
         initial_keys: HashMap<String, DecodingKey>,
     ) -> Result<Self, AuthError> {
-        let client = reqwest::Client::builder()
-            .timeout(cfg.http_timeout)
-            .build()
-            .map_err(|_| AuthError::Upstream("failed to build JWKS HTTP client".to_owned()))?;
-
         Ok(Self {
             cfg,
-            client,
+            egress_client,
             keys: Arc::new(RwLock::new(initial_keys)),
             last_jwks_refresh: Arc::new(Mutex::new(None)),
             revocation,
@@ -154,20 +164,22 @@ impl JwtValidator {
     }
 
     async fn fetch_jwks(&self) -> Result<(), AuthError> {
-        let response = self
-            .client
-            .get(&self.cfg.jwks_url)
-            .send()
-            .await
-            .map_err(|_| AuthError::Upstream("JWKS fetch failed".to_owned()))?;
+        let response = timeout(
+            self.cfg.http_timeout,
+            self.egress_client.request(Method::GET, &self.cfg.jwks_url),
+        )
+        .await
+        .map_err(|_| AuthError::Upstream("JWKS fetch failed".to_owned()))?
+        .map_err(|err| {
+            tracing::warn!(error = %err, "JWKS fetch through egress failed");
+            AuthError::Upstream("JWKS fetch failed".to_owned())
+        })?;
 
-        if !response.status().is_success() {
+        if !response.status.is_success() {
             return Err(AuthError::Upstream("JWKS fetch failed".to_owned()));
         }
 
-        let jwks = response
-            .json::<JwksResponse>()
-            .await
+        let jwks = serde_json::from_slice::<JwksResponse>(&response.body)
             .map_err(|_| AuthError::Upstream("invalid JWKS response".to_owned()))?;
         let mut refreshed = HashMap::new();
 
@@ -345,12 +357,16 @@ fn invalid_token() -> AuthError {
 mod tests {
     use std::{
         collections::{HashMap, HashSet},
+        io::ErrorKind,
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde_json::json;
+    use tokio::net::{TcpListener, TcpStream};
+
+    use crate::egress::{EgressClient, EgressConfig};
 
     use super::*;
 
@@ -392,6 +408,8 @@ wJrfVl4ApusNTEQCHmSenEzYUOXMdCQVWUcXjUXFQ6V8fiFukAvh1k3G6xsRqTcw
 tQGmPauu1clf5y8qWixdpuEsiq2G5H+Ws6Mh+85Kb6W+poCT43WJYTuTPHVR72wf
 NQIDAQAB
 -----END PUBLIC KEY-----"#;
+    const TEST_PUBLIC_KEY_N: &str = "p4V3Y_cZsEtcYNBUpM_ws3oM27O8edvy4zXlaGirChYomYdl-k33jb_RQR5amj-HKzdzjTrrWo4NqI1cti6jpZl9KFjrLu7PcdUmaMtfDeY7TsP5J0rGA3OMuoq_9B_1jUX_qjGV6P2RlHg1NAtnzjVNF12hlg98qWkHqgpZ0iJzCCI6SdIAE8hjyVTblYJnXmHZDQXZpTiq13bEYO1IwJrfVl4ApusNTEQCHmSenEzYUOXMdCQVWUcXjUXFQ6V8fiFukAvh1k3G6xsRqTcwtQGmPauu1clf5y8qWixdpuEsiq2G5H-Ws6Mh-85Kb6W-poCT43WJYTuTPHVR72wfNQ";
+    const TEST_PUBLIC_KEY_E: &str = "AQAB";
     const OTHER_PUBLIC_KEY: &str = r#"-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAw/aUzeUUmwEI8FZH92NP
 GVGZMV+rP6qUJSiRXlRvaNzj6Pr0vn6NrZtyiAwixyGRkzzVeoCNVek1U1eBOliJ
@@ -700,12 +718,68 @@ mQIDAQAB
         assert_eq!(principal.auth_method, AuthMethod::Bearer);
     }
 
+    #[tokio::test]
+    async fn unknown_kid_fetches_jwks_through_egress_and_validates_token() {
+        let jwks = json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": KID,
+                "use": "sig",
+                "alg": "RS256",
+                "n": TEST_PUBLIC_KEY_N,
+                "e": TEST_PUBLIC_KEY_E
+            }]
+        })
+        .to_string();
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("JWKS test server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("JWKS test server address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("JWKS test server should accept one request");
+            read_one_request(&stream).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                jwks.len(),
+                jwks
+            );
+            write_all(&stream, response.as_bytes()).await;
+        });
+        let mut cfg = default_cfg();
+        cfg.jwks_url = format!("http://127.0.0.1:{}/.well-known/jwks.json", addr.port());
+        let mut config = test_config(Some(&cfg.jwks_url));
+        config.egress_deny_private_ips = false;
+        let egress_config = EgressConfig::from_config(&config);
+
+        assert!(config.egress_allowed_hosts.is_empty());
+        assert!(egress_config.allowed_hosts.contains("127.0.0.1"));
+
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config).expect("test egress client should build"));
+        let validator = JwtValidator::new(cfg, egress_client).expect("validator should build");
+        let token = signed_token(base_claims(), TEST_PRIVATE_KEY);
+
+        let principal = validator
+            .validate_session(&SessionCredential::Bearer(token))
+            .await
+            .expect("JWKS-fetched key should validate the token");
+
+        assert_eq!(principal.user_id, "user-123");
+        assert_eq!(principal.email, Some("user@example.com".to_owned()));
+        server.await.expect("JWKS test server task should finish");
+    }
+
     #[test]
     fn from_config_returns_none_without_jwks_url() {
         let config = test_config(None);
 
-        let validator =
-            JwtValidator::from_config(&config).expect("validator construction should not fail");
+        let validator = JwtValidator::from_config(&config, test_egress_client())
+            .expect("validator construction should not fail");
 
         assert!(validator.is_none());
     }
@@ -714,8 +788,8 @@ mQIDAQAB
     fn from_config_builds_validator_when_jwks_url_is_set() {
         let config = test_config(Some("https://issuer.example.test/jwks.json"));
 
-        let validator =
-            JwtValidator::from_config(&config).expect("validator construction should not fail");
+        let validator = JwtValidator::from_config(&config, test_egress_client())
+            .expect("validator construction should not fail");
 
         assert!(validator.is_some());
     }
@@ -725,8 +799,28 @@ mQIDAQAB
         revocation: Arc<dyn RevocationStore>,
         public_key: &str,
     ) -> JwtValidator {
-        JwtValidator::new_with_keys(cfg, revocation, decoding_keys(public_key))
-            .expect("validator should build")
+        JwtValidator::new_with_keys(
+            cfg,
+            test_egress_client(),
+            revocation,
+            decoding_keys(public_key),
+        )
+        .expect("validator should build")
+    }
+
+    fn test_egress_client() -> Arc<EgressClient> {
+        egress_client(HashSet::from(["issuer.example.test".to_owned()]), false)
+    }
+
+    fn egress_client(allowed_hosts: HashSet<String>, deny_private_ips: bool) -> Arc<EgressClient> {
+        Arc::new(
+            EgressClient::new(EgressConfig {
+                allowed_hosts,
+                deny_private_ips,
+                ..EgressConfig::default()
+            })
+            .expect("test egress client should build"),
+        )
     }
 
     fn decoding_keys(public_key: &str) -> HashMap<String, DecodingKey> {
@@ -848,6 +942,41 @@ mQIDAQAB
             AuthError::InvalidSession(message) => assert_eq!(message, expected),
             AuthError::Upstream(message) => {
                 panic!("expected invalid session, got upstream error: {message}")
+            }
+        }
+    }
+
+    async fn read_one_request(stream: &TcpStream) {
+        let mut buffer = [0; 1024];
+
+        loop {
+            stream
+                .readable()
+                .await
+                .expect("test stream should become readable");
+
+            match stream.try_read(&mut buffer) {
+                Ok(_) => return,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => continue,
+                Err(err) => panic!("failed to read test request: {err}"),
+            }
+        }
+    }
+
+    async fn write_all(stream: &TcpStream, bytes: &[u8]) {
+        let mut written = 0;
+
+        while written < bytes.len() {
+            stream
+                .writable()
+                .await
+                .expect("test stream should become writable");
+
+            match stream.try_write(&bytes[written..]) {
+                Ok(0) => panic!("test stream closed before response was written"),
+                Ok(count) => written += count,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => continue,
+                Err(err) => panic!("failed to write test response: {err}"),
             }
         }
     }
