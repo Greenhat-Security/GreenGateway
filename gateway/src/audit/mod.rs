@@ -11,6 +11,7 @@ use std::{
 use crate::config::Config;
 
 pub mod event;
+pub mod query;
 pub mod redact;
 pub mod sink;
 pub mod sqlite_sink;
