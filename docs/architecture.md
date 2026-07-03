@@ -18,13 +18,14 @@ Every inbound request is expected to pass through the gateway in this order:
 | 2 | Tracing | #4 | Start structured request tracing around the full request lifecycle. |
 | 3 | CORS | #4 | Enforce config-driven allowed origins with a neutral default. |
 | 4 | Security headers | #4 | Strip spoofable identity headers on ingress and add hardening headers on responses. |
-| 5 | Rate limiting | #4 | Apply token-bucket limits with separate read and write lanes, keyed by principal, then session, then client IP, using the trusted-proxy setting to determine the canonical client IP. |
-| 6 | Request validation | #4 | Enforce body size caps and content-type requirements before handlers consume request bodies. |
-| 7 | CSRF | #4 | Enforce a double-submit cookie on the gateway's own control-plane endpoints, with bearer-token requests bypassing CSRF checks. |
-| 8 | Authentication | #5 | Run pluggable validators, starting with JWT/JWKS, with cookie sessions and additional identity providers deferred to Phase 7; fail closed with `401` on any non-exempt route. |
-| 9 | Authorization / RBAC | #6 | Evaluate deny-by-default role permissions, starting at route level, with tool-level checks and full rules-as-data deferred to later phases. |
-| 10 | Route handling / proxy | Later phase | Execute the actual handler or proxy behavior; in Phase 1 this remains a placeholder because proxying lands in Phase 3. |
-| 11 | Audit | #8 | Emit structured, versioned audit events for every security-relevant decision made by the layers above. |
+| 5 | Observation | #10 | Emit one `http.request_observed` audit event per request with method, path, status, latency, and the auth/authz outcome from any inner layer that reached a decision for end-to-end request observability. |
+| 6 | Rate limiting | #4 | Apply token-bucket limits with separate read and write lanes, keyed by principal, then session, then client IP, using the trusted-proxy setting to determine the canonical client IP. |
+| 7 | Request validation | #4 | Enforce body size caps and content-type requirements before handlers consume request bodies. |
+| 8 | CSRF | #4 | Enforce a double-submit cookie on the gateway's own control-plane endpoints, with bearer-token requests bypassing CSRF checks. |
+| 9 | Authentication | #5 | Run pluggable validators, starting with JWT/JWKS, with cookie sessions and additional identity providers deferred to Phase 7; fail closed with `401` on any non-exempt route. |
+| 10 | Authorization / RBAC | #6 | Evaluate deny-by-default role permissions, starting at route level, with tool-level checks and full rules-as-data deferred to later phases. |
+| 11 | Route handling / proxy | Later phase | Execute the actual handler or proxy behavior; in Phase 1 this remains a placeholder because proxying lands in Phase 3. |
+| 12 | Audit | #8 | Emit structured, versioned audit events for every security-relevant decision made by the layers above. |
 
 Audit is listed last to show that every decision has a durable security record,
 but it is cross-cutting rather than a single final handler. Each layer that
@@ -37,6 +38,7 @@ request
   -> tracing
   -> CORS
   -> security headers
+  -> observation
   -> rate limiting
   -> request validation
   -> CSRF
@@ -74,12 +76,13 @@ there.
 | Tracing | 2 | #4 |
 | CORS | 3 | #4 |
 | Security headers | 4 | #4 |
-| Rate limiting | 5 | #4 |
-| Request validation | 6 | #4 |
-| CSRF | 7 | #4 |
-| Authentication | 8 | #5 |
-| Authorization / RBAC | 9 | #6 |
-| Route handling / proxy | 10 | Later phase |
+| Observation | 5 | #10 |
+| Rate limiting | 6 | #4 |
+| Request validation | 7 | #4 |
+| CSRF | 8 | #4 |
+| Authentication | 9 | #5 |
+| Authorization / RBAC | 10 | #6 |
+| Route handling / proxy | 11 | Later phase |
 | Audit | Cross-cutting across all positions | #8 |
 | Egress firewall | Applies when outbound proxy behavior exists | #7 |
 | Configuration | Supplies settings consumed by the layers above | #9 |
@@ -94,4 +97,6 @@ for security-sensitive code.
 Audit events from every layer share one versioned envelope format, defined by
 issue #8. The request ID from the first layer must be included so downstream
 audit consumers can reconstruct the security decisions made for a request from
-ingress through final handling.
+ingress through final handling. Observation adds one `http.request_observed`
+summary event per request and relies on the same request ID to correlate with
+the more specific auth, authz, and other security decision events.

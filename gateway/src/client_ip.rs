@@ -3,7 +3,8 @@
 use std::net::SocketAddr;
 
 use axum::extract::ConnectInfo;
-use http::{header::HeaderName, Extensions, HeaderMap};
+use http::{header::HeaderName, Extensions, HeaderMap, HeaderValue};
+use tower_http::request_id::RequestId;
 
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
@@ -36,6 +37,21 @@ pub fn canonical_client_ip(
     peer_ip(extensions).unwrap_or_else(|| "unknown".to_owned())
 }
 
+pub fn request_id(headers: &HeaderMap, extensions: &Extensions) -> String {
+    headers
+        .get(crate::REQUEST_ID_HEADER)
+        .and_then(header_value_to_str)
+        .or_else(|| {
+            extensions
+                .get::<RequestId>()
+                .and_then(|request_id| request_id.header_value().to_str().ok())
+        })
+        .map(str::trim)
+        .filter(|request_id| !request_id.is_empty())
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
 fn forwarded_for(headers: &HeaderMap) -> Option<&str> {
     let value = header_value(headers, &X_FORWARDED_FOR)?;
     value
@@ -47,9 +63,13 @@ fn forwarded_for(headers: &HeaderMap) -> Option<&str> {
 fn header_value<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&'a str> {
     headers
         .get(name)
-        .and_then(|value| value.to_str().ok())
+        .and_then(header_value_to_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn header_value_to_str(value: &HeaderValue) -> Option<&str> {
+    value.to_str().ok()
 }
 
 fn peer_ip(extensions: &Extensions) -> Option<String> {
@@ -118,5 +138,22 @@ mod tests {
         let extensions = Extensions::new();
 
         assert_eq!(canonical_client_ip(&headers, &extensions, false), "unknown");
+    }
+
+    #[test]
+    fn request_id_prefers_non_empty_header_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(crate::REQUEST_ID_HEADER, " request-123 ".parse().unwrap());
+        let extensions = Extensions::new();
+
+        assert_eq!(request_id(&headers, &extensions), "request-123");
+    }
+
+    #[test]
+    fn request_id_returns_unknown_when_absent() {
+        let headers = HeaderMap::new();
+        let extensions = Extensions::new();
+
+        assert_eq!(request_id(&headers, &extensions), "unknown");
     }
 }

@@ -8,18 +8,19 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use http::{Extensions, HeaderMap, Method, StatusCode};
+use http::{Method, StatusCode};
 use serde::Serialize;
 use serde_json::json;
-use tower_http::request_id::RequestId;
 
 use crate::{
     audit::{AuditEvent, AuditLog},
     auth::{self, actor_from_principal},
-    client_ip::canonical_client_ip,
+    client_ip::{canonical_client_ip, request_id},
     config::Config,
     rbac::{DefaultAction, Policy, PolicyEngine, RouteRule},
 };
+
+use super::decision::PolicyDecision;
 
 const AUTHZ_ALLOWED: &str = "authz.allowed";
 const AUTHZ_DENIED: &str = "authz.denied";
@@ -71,7 +72,15 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         let context = audit_context(&req, state.trust_proxy_headers);
         let principal = req.extensions().get::<auth::Principal>().cloned();
         emit_denied(&state, &context, principal.as_ref(), "unsafe_path", None);
-        return forbidden();
+        return with_policy_decision(
+            forbidden(),
+            PolicyDecision {
+                allowed: false,
+                reason: "unsafe_path",
+                permission: None,
+                path_prefix: None,
+            },
+        );
     }
 
     if state
@@ -92,7 +101,9 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 .principal_has_permission(principal, &rule.permission)
         }) {
             emit_allowed(&state, &context, principal.as_ref(), Some(rule), None);
-            return next.run(req).await;
+            let decision = decision_for_rule(true, "matched_rule", rule);
+            let response = next.run(req).await;
+            return with_policy_decision(response, decision);
         }
 
         let reason = if principal.is_some() {
@@ -101,11 +112,17 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
             "missing_principal"
         };
         emit_denied(&state, &context, principal.as_ref(), reason, Some(rule));
-        return forbidden();
+        return with_policy_decision(forbidden(), decision_for_rule(false, reason, rule));
     }
 
     match state.default_action {
         DefaultAction::Allow => {
+            let decision = PolicyDecision {
+                allowed: true,
+                reason: "default_allow",
+                permission: None,
+                path_prefix: None,
+            };
             emit_allowed(
                 &state,
                 &context,
@@ -113,11 +130,20 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 None,
                 Some("default_allow"),
             );
-            next.run(req).await
+            let response = next.run(req).await;
+            with_policy_decision(response, decision)
         }
         DefaultAction::Deny => {
             emit_denied(&state, &context, principal.as_ref(), "default_deny", None);
-            forbidden()
+            with_policy_decision(
+                forbidden(),
+                PolicyDecision {
+                    allowed: false,
+                    reason: "default_deny",
+                    permission: None,
+                    path_prefix: None,
+                },
+            )
         }
     }
 }
@@ -171,21 +197,6 @@ fn audit_context(req: &Request, trust_proxy_headers: bool) -> AuditContext {
         path: req.uri().path().to_owned(),
         method: req.method().as_str().to_owned(),
     }
-}
-
-fn request_id(headers: &HeaderMap, extensions: &Extensions) -> String {
-    headers
-        .get(crate::REQUEST_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .or_else(|| {
-            extensions
-                .get::<RequestId>()
-                .and_then(|request_id| request_id.header_value().to_str().ok())
-        })
-        .map(str::trim)
-        .filter(|request_id| !request_id.is_empty())
-        .unwrap_or("unknown")
-        .to_owned()
 }
 
 fn emit_allowed(
@@ -258,6 +269,20 @@ fn forbidden() -> Response {
         Json(ForbiddenBody { error: "forbidden" }),
     )
         .into_response()
+}
+
+fn decision_for_rule(allowed: bool, reason: &'static str, rule: &RouteRule) -> PolicyDecision {
+    PolicyDecision {
+        allowed,
+        reason,
+        permission: Some(rule.permission.clone()),
+        path_prefix: Some(rule.path_prefix.clone()),
+    }
+}
+
+fn with_policy_decision(mut response: Response, decision: PolicyDecision) -> Response {
+    response.extensions_mut().insert(decision);
+    response
 }
 
 #[cfg(test)]

@@ -1,7 +1,9 @@
 pub mod auth;
 pub(crate) mod bearer;
 pub mod csrf;
+pub mod decision;
 pub mod headers;
+pub mod observation;
 pub mod rate_limit;
 pub mod rbac;
 pub mod validate;

@@ -98,6 +98,8 @@ fn app(
     let request_id_header = request_id_header();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
     let rate_limit_state = middleware::rate_limit::RateLimitState::from_config(&config);
+    let observation_state =
+        middleware::observation::ObservationState::from_config(&config, audit_log.clone());
     let egress_client = Arc::new(egress::EgressClient::new(
         egress::EgressConfig::from_config(&config),
     )?);
@@ -173,6 +175,10 @@ fn app(
         .layer(axum::middleware::from_fn_with_state(
             rate_limit_state,
             middleware::rate_limit::rate_limit_request,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            observation_state,
+            middleware::observation::observation_middleware,
         ))
         .layer(axum::middleware::from_fn(
             middleware::headers::header_hardening_middleware,
@@ -299,7 +305,12 @@ async fn principal_probe(
 mod tests {
     use super::*;
     use axum::{body::Body, http::StatusCode};
-    use std::{fs, path::PathBuf, sync::Arc};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
     use tower::ServiceExt;
 
     fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
@@ -447,7 +458,18 @@ mod tests {
             .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert!(capture.events().is_empty());
+        assert_eventually(Duration::from_secs(1), || !capture.events().is_empty());
+        let events = capture.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "http.request_observed")
+                .count(),
+            1
+        );
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type.starts_with("auth.")));
     }
 
     #[tokio::test]
@@ -670,5 +692,21 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
         }
+    }
+
+    fn assert_eventually(timeout: Duration, condition: impl Fn() -> bool) {
+        let started = Instant::now();
+
+        while started.elapsed() < timeout {
+            if condition() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            condition(),
+            "condition did not become true within {timeout:?}"
+        );
     }
 }
