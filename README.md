@@ -45,10 +45,14 @@ For the full list of environment variables, see [docs/configuration.md](docs/con
 
 ### Option 1: Cargo (for development)
 
+`.env.example` documents the available environment variables and defaults; to override one today, set it in the real shell/process environment rather than sourcing a `.env` file.
+
 ```sh
-cp .env.example .env
 cargo build --workspace
 cargo run
+
+# Or, with a non-default listen address:
+LISTEN_ADDR=127.0.0.1:9090 cargo run
 ```
 
 In another terminal:
