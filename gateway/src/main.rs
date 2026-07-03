@@ -12,6 +12,7 @@ use tower_http::{
 mod audit;
 mod client_ip;
 mod config;
+mod metrics;
 mod middleware;
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
@@ -93,12 +94,13 @@ fn app(
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
     let rate_limit_state = middleware::rate_limit::RateLimitState::from_config(&config);
 
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/metrics", get(metrics_endpoint))
-        .with_state(AppState { metrics_handle })
-        .layer(Extension(audit_log))
+        .with_state(AppState { metrics_handle });
+
+    let router = router
         .layer(axum::middleware::from_fn_with_state(
             csrf_config,
             middleware::csrf::csrf_middleware,
@@ -117,7 +119,12 @@ fn app(
         .layer(cors_layer(&config))
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(TraceLayer::new_for_http())
-        .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
+        .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid));
+
+    #[cfg(test)]
+    let router = router.layer(axum::middleware::from_fn(audit_extension_probe_middleware));
+
+    router.layer(Extension(audit_log))
 }
 
 fn install_metrics_recorder() -> Result<PrometheusHandle, metrics_exporter_prometheus::BuildError> {
@@ -125,13 +132,13 @@ fn install_metrics_recorder() -> Result<PrometheusHandle, metrics_exporter_prome
         .with_recommended_naming(true)
         .install_recorder()?;
 
-    metrics::describe_counter!(REQUEST_COUNTER, "HTTP requests served by GreenGateway");
-    metrics::describe_counter!(
+    ::metrics::describe_counter!(REQUEST_COUNTER, "HTTP requests served by GreenGateway");
+    ::metrics::describe_counter!(
         audit::AUDIT_EVENTS_DROPPED_TOTAL,
         "Audit events dropped by the bounded asynchronous audit channel"
     );
-    metrics::describe_counter!(
-        middleware::rate_limit::LOCK_POISON_RECOVERIES_TOTAL,
+    ::metrics::describe_counter!(
+        metrics::LOCK_POISON_RECOVERIES_TOTAL,
         "Lock poison recoveries by component and lock"
     );
 
@@ -202,7 +209,19 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 fn record_request(route: &'static str) {
-    metrics::counter!(REQUEST_COUNTER, "route" => route).increment(1);
+    ::metrics::counter!(REQUEST_COUNTER, "route" => route).increment(1);
+}
+
+#[cfg(test)]
+async fn audit_extension_probe_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req.extensions().get::<audit::AuditLog>().is_none() {
+        return http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    next.run(req).await
 }
 
 #[cfg(test)]
@@ -282,6 +301,22 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key(REQUEST_ID_HEADER));
+    }
+
+    #[tokio::test]
+    async fn audit_log_extension_is_available_to_middleware() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let response = app(test_config(Vec::new()), recorder.handle(), test_audit_log())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

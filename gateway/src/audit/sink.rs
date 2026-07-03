@@ -5,9 +5,11 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use crate::{audit::AuditEvent, config::Config};
-
-pub const LOCK_POISON_RECOVERIES_TOTAL: &str = "lock_poison_recoveries_total";
+use crate::{
+    audit::{AuditEvent, AUDIT_EVENTS_DROPPED_TOTAL},
+    config::Config,
+    metrics::LOCK_POISON_RECOVERIES_TOTAL,
+};
 
 pub trait AuditSink: Send + Sync {
     fn emit(&self, event: &AuditEvent);
@@ -63,7 +65,7 @@ impl FileSink {
         match self.file.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
-                metrics::counter!(
+                ::metrics::counter!(
                     LOCK_POISON_RECOVERIES_TOTAL,
                     "component" => "audit",
                     "lock" => "file_sink"
@@ -117,6 +119,11 @@ impl AuditSink for FileSink {
             *file = None;
 
             if let Err(err) = self.write_locked(&mut file, &line) {
+                ::metrics::counter!(
+                    AUDIT_EVENTS_DROPPED_TOTAL,
+                    "reason" => "sink_error"
+                )
+                .increment(1);
                 tracing::error!(
                     path = %self.path.display(),
                     error = %err,
@@ -166,17 +173,6 @@ pub fn build_sink(audit_log_file: Option<&str>) -> Arc<dyn AuditSink> {
 
 pub fn build_sink_from_config(config: &Config) -> Arc<dyn AuditSink> {
     build_sink(config.audit_log_file.as_deref())
-}
-
-#[allow(dead_code)] // Kept for direct sink construction in future entry points; main validates Config first.
-pub fn build_sink_from_env() -> Arc<dyn AuditSink> {
-    match Config::from_env() {
-        Ok(config) => build_sink_from_config(&config),
-        Err(err) => {
-            tracing::error!(error = %err, "failed to load config for audit sink; using stdout only");
-            build_sink(None)
-        }
-    }
 }
 
 #[cfg(test)]

@@ -30,6 +30,7 @@ impl AuditLog {
     pub fn new(sink: Arc<dyn AuditSink>) -> Self {
         let (tx, rx) = mpsc::sync_channel::<AuditEvent>(AUDIT_CHANNEL_CAPACITY);
 
+        // TODO: Add graceful shutdown so queued audit events drain before process exit.
         if let Err(err) = thread::Builder::new()
             .name("audit-log-writer".to_owned())
             .spawn(move || {
@@ -62,10 +63,10 @@ impl AuditLog {
         match self.tx.try_send(event) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
-                metrics::counter!(AUDIT_EVENTS_DROPPED_TOTAL, "reason" => "full").increment(1);
+                ::metrics::counter!(AUDIT_EVENTS_DROPPED_TOTAL, "reason" => "full").increment(1);
             }
             Err(TrySendError::Disconnected(_)) => {
-                metrics::counter!(AUDIT_EVENTS_DROPPED_TOTAL, "reason" => "disconnected")
+                ::metrics::counter!(AUDIT_EVENTS_DROPPED_TOTAL, "reason" => "disconnected")
                     .increment(1);
             }
         }
