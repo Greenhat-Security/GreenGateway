@@ -11,7 +11,9 @@ use axum::{extract::Request, middleware::Next, response::Response};
 
 /// Request headers that must never be trusted from untrusted clients.
 ///
-/// These are stripped to prevent privilege escalation via header spoofing.
+/// These are stripped to prevent privilege escalation via header spoofing,
+/// including identity, authorization, proxy-auth, and method/URL override
+/// metadata.
 ///
 /// Note: `x-forwarded-for` and `x-real-ip` are intentionally preserved because
 /// they are common reverse proxy inputs. Callers should still treat them as
@@ -20,9 +22,11 @@ use axum::{extract::Request, middleware::Next, response::Response};
 /// `x-forwarded-host` and `x-forwarded-proto` are stripped because spoofed
 /// values can poison URL generation, auth redirects, and cookie domains.
 const SPOOFABLE_REQUEST_HEADERS: &[&str] = &[
+    // Forwarded routing metadata that can influence URL generation.
     "x-forwarded-host",
     "x-forwarded-proto",
     "forwarded",
+    // User and organization identity claims injected by auth gateways.
     "x-user-id",
     "x-user",
     "x-user-email",
@@ -39,6 +43,25 @@ const SPOOFABLE_REQUEST_HEADERS: &[&str] = &[
     "x-forwarded-user",
     "x-forwarded-email",
     "x-forwarded-roles",
+    // Reverse-proxy, SSO, OAuth2 Proxy, and mTLS identity assertions.
+    "x-remote-user",
+    "x-authenticated-user",
+    "x-auth-request-user",
+    "x-auth-request-email",
+    "x-auth-request-groups",
+    "x-forwarded-client-cert",
+    "x-ssl-client-cert",
+    // Authorization scopes, groups, and tenant claims.
+    "x-groups",
+    "x-group",
+    "x-scope",
+    "x-scopes",
+    "x-tenant-id",
+    // Method and URL overrides that can bypass scoped authorization.
+    "x-http-method-override",
+    "x-original-url",
+    "x-rewrite-url",
+    // Upstream proxy credentials.
     "proxy-authorization",
 ];
 
@@ -94,9 +117,19 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
-    async fn strips_spoofed_identity_header_before_handler() {
+    async fn strips_spoofed_headers_before_handler() {
         async fn echo_header(headers: http::HeaderMap) -> &'static str {
-            if headers.contains_key("x-user-id") {
+            let spoofed_headers = [
+                "x-user-id",
+                "x-remote-user",
+                "x-tenant-id",
+                "x-original-url",
+            ];
+
+            if spoofed_headers
+                .iter()
+                .any(|header| headers.contains_key(*header))
+            {
                 "present"
             } else {
                 "missing"
@@ -110,6 +143,9 @@ mod tests {
                 Request::builder()
                     .uri("/")
                     .header("x-user-id", "attacker")
+                    .header("x-remote-user", "attacker")
+                    .header("x-tenant-id", "attacker")
+                    .header("x-original-url", "/admin")
                     .body(Body::empty())
                     .expect("request should build"),
             )
