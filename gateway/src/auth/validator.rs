@@ -4,10 +4,18 @@ use super::Principal;
 
 /// Credential material extracted from an incoming request for validation.
 #[allow(dead_code)] // Auth middleware will pass credentials into validators when it lands.
-#[derive(Debug)]
 pub enum SessionCredential {
     Cookie(String),
     Bearer(String),
+}
+
+impl fmt::Debug for SessionCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cookie(_) => formatter.write_str("Cookie(<redacted>)"),
+            Self::Bearer(_) => formatter.write_str("Bearer(<redacted>)"),
+        }
+    }
 }
 
 /// Errors returned while validating session credentials.
@@ -41,10 +49,16 @@ pub trait SessionValidator: Send + Sync {
         credential: &SessionCredential,
     ) -> Result<Principal, AuthError>;
 
+    /// Routing hint for whether this validator should receive cookie credentials.
+    /// This is not an authorization decision: every offered credential must still pass
+    /// `validate_session`, so the default only opts into receiving this channel.
     fn supports_cookie(&self) -> bool {
         true
     }
 
+    /// Routing hint for whether this validator should receive bearer credentials.
+    /// This is not an authorization decision: every offered credential must still pass
+    /// `validate_session`, so the default only opts into receiving this channel.
     fn supports_bearer(&self) -> bool {
         true
     }
@@ -124,6 +138,23 @@ mod tests {
 
         assert!(validator.supports_cookie());
         assert!(validator.supports_bearer());
+    }
+
+    #[test]
+    fn session_credential_debug_redacts_secret_values() {
+        let bearer_secret = "super-secret-token-value";
+        let bearer = SessionCredential::Bearer(bearer_secret.to_owned());
+        let bearer_output = format!("{bearer:?}");
+
+        assert!(!bearer_output.contains(bearer_secret));
+        assert!(bearer_output.contains("<redacted>"));
+
+        let cookie_secret = "super-secret-cookie-value";
+        let cookie = SessionCredential::Cookie(cookie_secret.to_owned());
+        let cookie_output = format!("{cookie:?}");
+
+        assert!(!cookie_output.contains(cookie_secret));
+        assert!(cookie_output.contains("<redacted>"));
     }
 
     fn test_principal() -> Principal {
