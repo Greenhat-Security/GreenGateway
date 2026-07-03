@@ -12,7 +12,24 @@ use crate::config::Config;
 
 // `routes` is reserved for PR 2, so policy files authored with route mappings
 // do not warn before the route mapping loader lands.
-const KNOWN_TOP_LEVEL_KEYS: &[&str] = &["schema_version", "id", "roles", "routes"];
+const KNOWN_TOP_LEVEL_KEYS: &[&str] =
+    &["schema_version", "id", "default_action", "roles", "routes"];
+
+/// Action to apply when no route rule matches.
+#[allow(dead_code)] // Authorization middleware in PR 2 will enforce the default action.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultAction {
+    Allow,
+    Deny,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for DefaultAction {
+    fn default() -> Self {
+        Self::Deny
+    }
+}
 
 /// RBAC policy document.
 #[allow(dead_code)] // Authorization middleware in PR 2 will load and evaluate policies.
@@ -21,6 +38,12 @@ pub struct Policy {
     pub schema_version: String,
     #[serde(default)]
     pub id: Option<String>,
+    /// Governs routes not matched by any rule.
+    ///
+    /// Enforcement happens in the RBAC middleware in PR 2; the pure engine
+    /// kernel only stores this value.
+    #[serde(default)]
+    pub default_action: DefaultAction,
     #[serde(default)]
     pub roles: HashMap<String, RoleEntry>,
 }
@@ -28,6 +51,7 @@ pub struct Policy {
 /// Permissions granted by one role.
 #[allow(dead_code)] // Authorization middleware in PR 2 will consume role permissions.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoleEntry {
     #[serde(default)]
     pub permissions: Vec<String>,
@@ -132,15 +156,7 @@ impl Error for PolicyError {
 }
 
 fn warn_unknown_top_level_keys(value: &Value) {
-    let Some(object) = value.as_object() else {
-        return;
-    };
-
-    let unknown_keys = object
-        .keys()
-        .filter(|key| !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()))
-        .map(String::as_str)
-        .collect::<Vec<_>>();
+    let unknown_keys = unknown_top_level_keys(value);
 
     if !unknown_keys.is_empty() {
         tracing::warn!(
@@ -148,6 +164,18 @@ fn warn_unknown_top_level_keys(value: &Value) {
             "policy document contains unknown top-level keys"
         );
     }
+}
+
+fn unknown_top_level_keys(value: &Value) -> Vec<String> {
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+
+    object
+        .keys()
+        .filter(|key| !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -188,6 +216,36 @@ mod tests {
     }
 
     #[test]
+    fn default_action_parses_allow_and_defaults_to_deny() {
+        let file = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "roles": {
+                    "reader": { "permissions": ["data:read"] }
+                }
+            }"#,
+        );
+
+        let policy = Policy::from_file(file.path()).expect("default_action should parse");
+
+        assert_eq!(policy.default_action, DefaultAction::Allow);
+
+        let file = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "roles": {
+                    "reader": { "permissions": ["data:read"] }
+                }
+            }"#,
+        );
+
+        let policy = Policy::from_file(file.path()).expect("missing default_action should parse");
+
+        assert_eq!(policy.default_action, DefaultAction::Deny);
+    }
+
+    #[test]
     fn bad_schema_version_is_rejected() {
         for schema_version in ["1.0.0", "nope"] {
             let file = TempPolicyFile::new(&format!(
@@ -205,6 +263,43 @@ mod tests {
                 "unexpected error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn misspelled_role_entry_field_is_rejected() {
+        let file = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "roles": {
+                    "reader": { "permission": ["data:read"] }
+                }
+            }"#,
+        );
+
+        let error = Policy::from_file(file.path()).expect_err("role entry typo should fail loudly");
+
+        assert!(matches!(error, PolicyError::Parse { .. }));
+        assert!(
+            error.to_string().contains("unknown field `permission`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_key_detection_names_offending_key() {
+        let value = json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "roles": {
+                "reader": { "permissions": ["data:read"] }
+            },
+            "unexpected_section": { "ignored": true }
+        });
+
+        assert_eq!(
+            unknown_top_level_keys(&value),
+            vec!["unexpected_section".to_owned()]
+        );
     }
 
     #[test]
@@ -283,6 +378,7 @@ mod tests {
         let valid_policy = json!({
             "schema_version": "0.1.0",
             "id": "local",
+            "default_action": "allow",
             "roles": {
                 "admin": { "permissions": ["*"] },
                 "reader": { "permissions": ["data:read"] }
@@ -302,6 +398,36 @@ mod tests {
         assert!(
             !validator.is_valid(&invalid_policy),
             "published schema should reject a policy with a bad schema_version"
+        );
+    }
+
+    #[test]
+    fn published_schema_accepts_extra_top_level_keys() {
+        let validator = policy_schema_validator();
+        let policy = json!({
+            "schema_version": "0.1.0",
+            "roles": {
+                "reader": { "permissions": ["data:read"] }
+            },
+            "future_subsystem": { "enabled": true }
+        });
+
+        assert_schema_accepts(&validator, &policy);
+    }
+
+    #[test]
+    fn published_schema_rejects_unknown_role_entry_fields() {
+        let validator = policy_schema_validator();
+        let policy = json!({
+            "schema_version": "0.1.0",
+            "roles": {
+                "reader": { "permission": ["data:read"] }
+            }
+        });
+
+        assert!(
+            !validator.is_valid(&policy),
+            "published schema should reject unknown role entry fields"
         );
     }
 
