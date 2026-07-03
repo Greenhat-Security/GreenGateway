@@ -7,7 +7,7 @@
       "permissions": ["*"]
     },
     "reader": {
-      "permissions": ["admin:status:read"]
+      "permissions": []
     }
   },
   "routes": [

@@ -8,4 +8,8 @@ It is intentionally small because Phase 2 has no reverse proxy target yet. The r
 - `/v1/admin/events/stream`
 - `/v1/admin/status`
 
-The `admin` role grants `"*"` for local demos. The `reader` role is intentionally limited so follow-up traffic tests can demonstrate denied requests. Health, version, metrics, and `/admin` remain exempt through the compose environment, matching the gateway defaults.
+The `admin` role grants `"*"` for local demos. The `reader` role intentionally has no seeded permissions so follow-up traffic tests can demonstrate denied requests without implying working control-plane access.
+
+The RBAC policy rules for these routes are still evaluated before the handlers and can emit `authz.allowed` or `authz.denied` audit events. The three `/v1/admin/*` handlers also enforce a separate hardcoded gate: the authenticated `Principal.roles` must contain the literal `"admin"` role. As a result, only an `admin`-role token can actually reach `/v1/admin/audit`, `/v1/admin/events/stream`, or `/v1/admin/status` today. A `reader`-role token receives `403 Forbidden` for all three routes, regardless of any RBAC permission that might be added to `policy.json`.
+
+Health, version, metrics, and `/admin` remain exempt through the compose environment, matching the gateway defaults.
