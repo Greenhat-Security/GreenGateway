@@ -25,6 +25,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "roles",
     "routes",
     "rules",
+    "egress",
 ];
 #[allow(dead_code)]
 const TEMP_FILE_CREATE_ATTEMPTS: u8 = 16;
@@ -80,6 +81,10 @@ pub struct Policy {
     /// Ordered direct firewall rules. First matching rule wins.
     #[serde(default)]
     pub rules: Vec<Rule>,
+    /// Policy-driven outbound egress rules layered on top of env-var defaults.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "EgressPolicy::is_empty")]
+    pub egress: EgressPolicy,
 }
 
 /// Permissions granted by one role.
@@ -105,6 +110,33 @@ pub struct RouteRule {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enforcement_mode: Option<EnforcementMode>,
+}
+
+/// Policy-driven outbound egress rules.
+///
+/// `hosts` are case-insensitive hostname patterns. A pattern without `*`
+/// matches exactly. A wildcard is only valid as the entire leftmost label in
+/// a `*.` prefix, such as `*.example.com`; it matches any non-empty DNS label
+/// prefix ending in `.example.com`, including `foo.example.com` and
+/// `bar.baz.example.com`, but not `example.com`.
+///
+/// These rules are additive to `EGRESS_ALLOWED_HOSTS` and auto-seeded
+/// infrastructure endpoint hosts. `cidrs` explicitly permit matching private
+/// resolved IPs through `EGRESS_DENY_PRIVATE_IPS=true`; private IPs outside
+/// these CIDRs still fail closed. If `ports` is non-empty, the destination port
+/// must be listed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressPolicy {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cidrs: Vec<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<u16>,
 }
 
 #[derive(Debug)]
@@ -198,7 +230,7 @@ impl Policy {
 
         validate_rules(&self.rules)?;
 
-        Ok(())
+        self.egress.validate()
     }
 }
 
@@ -223,6 +255,38 @@ fn validate_rules(rules: &[Rule]) -> Result<(), PolicyError> {
     }
 
     Ok(())
+}
+
+impl EgressPolicy {
+    fn is_empty(&self) -> bool {
+        self.hosts.is_empty() && self.cidrs.is_empty() && self.ports.is_empty()
+    }
+
+    fn validate(&self) -> Result<(), PolicyError> {
+        for host in &self.hosts {
+            if !is_valid_egress_host_pattern(host) {
+                return Err(PolicyError::Invalid(format!(
+                    "egress host pattern must be an ASCII hostname or wildcard prefix like \"*.example.com\", got '{host}'"
+                )));
+            }
+        }
+
+        for cidr in &self.cidrs {
+            cidr.parse::<ipnet::IpNet>().map_err(|err| {
+                PolicyError::Invalid(format!("egress CIDR '{cidr}' is invalid: {err}"))
+            })?;
+        }
+
+        for port in &self.ports {
+            if *port == 0 {
+                return Err(PolicyError::Invalid(
+                    "egress ports must be in the range 1..=65535".to_owned(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl fmt::Display for PolicyError {
@@ -435,6 +499,35 @@ fn unreachable_route_path_prefixes(routes: &[RouteRule]) -> Vec<String> {
         .filter(|route| !route.path_prefix.starts_with('/'))
         .map(|route| route.path_prefix.clone())
         .collect()
+}
+
+fn is_valid_egress_host_pattern(value: &str) -> bool {
+    if value.trim() != value {
+        return false;
+    }
+
+    if let Some(suffix) = value.strip_prefix("*.") {
+        is_valid_hostname_without_port(suffix)
+    } else {
+        !value.contains('*') && is_valid_hostname_without_port(value)
+    }
+}
+
+fn is_valid_hostname_without_port(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && !value.contains(':')
+        && value.split('.').all(is_valid_hostname_label)
+}
+
+fn is_valid_hostname_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 #[cfg(test)]
@@ -828,6 +921,97 @@ mod tests {
     }
 
     #[test]
+    fn egress_section_parses_and_defaults_to_empty() {
+        let file = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "egress": {
+                    "hosts": ["api.example.test", "*.svc.example.test"],
+                    "cidrs": ["10.0.0.0/8", "2001:db8::/32"],
+                    "ports": [443, 8443]
+                }
+            }"#,
+        );
+
+        let policy = Policy::from_file(file.path()).expect("egress section should parse");
+
+        assert_eq!(
+            policy.egress.hosts,
+            vec![
+                "api.example.test".to_owned(),
+                "*.svc.example.test".to_owned()
+            ]
+        );
+        assert_eq!(
+            policy.egress.cidrs,
+            vec!["10.0.0.0/8".to_owned(), "2001:db8::/32".to_owned()]
+        );
+        assert_eq!(policy.egress.ports, vec![443, 8443]);
+
+        let file = TempPolicyFile::new(r#"{ "schema_version": "0.1.0" }"#);
+        let policy = Policy::from_file(file.path()).expect("missing egress section should parse");
+
+        assert!(policy.egress.is_empty());
+    }
+
+    #[test]
+    fn malformed_egress_entries_are_rejected_by_rust_parser() {
+        for (name, document, expected) in [
+            (
+                "bad host glob",
+                r#"{
+                    "schema_version": "0.1.0",
+                    "egress": { "hosts": ["api.*.example.test"] }
+                }"#,
+                "egress host pattern",
+            ),
+            (
+                "bad CIDR",
+                r#"{
+                    "schema_version": "0.1.0",
+                    "egress": { "cidrs": ["10.0.0.0/33"] }
+                }"#,
+                "egress CIDR",
+            ),
+            (
+                "zero port",
+                r#"{
+                    "schema_version": "0.1.0",
+                    "egress": { "ports": [0] }
+                }"#,
+                "egress ports",
+            ),
+            (
+                "out-of-range port",
+                r#"{
+                    "schema_version": "0.1.0",
+                    "egress": { "ports": [70000] }
+                }"#,
+                "invalid value",
+            ),
+            (
+                "unknown egress field",
+                r#"{
+                    "schema_version": "0.1.0",
+                    "egress": { "hostz": ["api.example.test"] }
+                }"#,
+                "unknown field",
+            ),
+        ] {
+            let file = TempPolicyFile::new(document);
+            let error = match Policy::from_file(file.path()) {
+                Ok(_) => panic!("{name} should be rejected"),
+                Err(error) => error,
+            };
+
+            assert!(
+                error.to_string().contains(expected),
+                "{name} produced unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_rule_auth_method_is_rejected_by_parser_and_schema() {
         let value = json!({
             "schema_version": "0.1.0",
@@ -1125,6 +1309,67 @@ mod tests {
     }
 
     #[test]
+    fn published_schema_accepts_valid_egress_section() {
+        let validator = policy_schema_validator();
+        let policy = json!({
+            "schema_version": "0.1.0",
+            "egress": {
+                "hosts": ["api.example.test", "*.svc.example.test"],
+                "cidrs": ["10.0.0.0/8", "2001:db8::/32"],
+                "ports": [443, 8443]
+            }
+        });
+
+        assert_schema_accepts(&validator, &policy);
+        Policy::from_json_value(policy, None).expect("schema-valid egress policy should parse");
+    }
+
+    #[test]
+    fn published_schema_rejects_malformed_egress_entries() {
+        let validator = policy_schema_validator();
+
+        for (name, policy) in [
+            (
+                "bad host glob",
+                json!({
+                    "schema_version": "0.1.0",
+                    "egress": { "hosts": ["api.*.example.test"] }
+                }),
+            ),
+            (
+                "bad CIDR",
+                json!({
+                    "schema_version": "0.1.0",
+                    "egress": { "cidrs": ["10.0.0.0/33"] }
+                }),
+            ),
+            (
+                "out-of-range port",
+                json!({
+                    "schema_version": "0.1.0",
+                    "egress": { "ports": [70000] }
+                }),
+            ),
+            (
+                "unknown egress field",
+                json!({
+                    "schema_version": "0.1.0",
+                    "egress": { "hostz": ["api.example.test"] }
+                }),
+            ),
+        ] {
+            assert!(
+                !validator.is_valid(&policy),
+                "published schema should reject {name}"
+            );
+            assert!(
+                Policy::from_json_value(policy, None).is_err(),
+                "Rust parser should reject {name}"
+            );
+        }
+    }
+
+    #[test]
     fn published_schema_rejects_bad_enforcement_mode_values() {
         let validator = policy_schema_validator();
         let top_level_policy = json!({
@@ -1251,6 +1496,7 @@ mod tests {
                 },
             ],
             rules: Vec::new(),
+            egress: EgressPolicy::default(),
         }
     }
 
