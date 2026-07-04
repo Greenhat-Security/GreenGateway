@@ -32,14 +32,14 @@
       "permission": "admin:policy:read"
     },
     {
-      "methods": ["PUT"],
-      "path_prefix": "/v1/admin/policy",
-      "permission": "admin:policy:write"
-    },
-    {
       "methods": ["POST"],
       "path_prefix": "/v1/admin/policy/validate",
       "permission": "admin:policy:read"
+    },
+    {
+      "methods": ["PUT", "POST", "PATCH", "DELETE"],
+      "path_prefix": "/v1/admin/policy",
+      "permission": "admin:policy:write"
     },
     {
       "methods": ["POST"],
