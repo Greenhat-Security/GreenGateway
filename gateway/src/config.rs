@@ -63,6 +63,7 @@ const AUTH_COOKIE_NAME: &str = "AUTH_COOKIE_NAME";
 const AUTH_ENABLED: &str = "AUTH_ENABLED";
 const AUTH_EXEMPT_PATHS: &str = "AUTH_EXEMPT_PATHS";
 const AUTH_MODE: &str = "AUTH_MODE";
+const AUTH_PROVIDERS: &str = "AUTH_PROVIDERS";
 const CORS_ALLOW_ORIGINS: &str = "CORS_ALLOW_ORIGINS";
 const CSRF_COOKIE_DOMAIN: &str = "CSRF_COOKIE_DOMAIN";
 const CSRF_COOKIE_NAME: &str = "CSRF_COOKIE_NAME";
@@ -143,6 +144,7 @@ pub struct Config {
     pub auth_mode: AuthMode,
     pub auth_cookie_name: String,
     pub auth_exempt_paths: Vec<String>,
+    pub auth_providers: Vec<AuthProviderConfig>,
     pub jwt_jwks_url: Option<String>,
     pub jwt_issuer: Option<String>,
     pub jwt_audience: Option<String>,
@@ -190,6 +192,42 @@ pub struct UpstreamRouteConfig {
     pub tls_ca_bundle_path: Option<PathBuf>,
     #[serde(default)]
     pub openapi_spec_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthProviderConfig {
+    pub name: String,
+    pub provider_type: AuthProviderType,
+    pub jwks_url: String,
+    pub issuer: Option<String>,
+    pub audience: Option<String>,
+    pub jwks_timeout_ms: u64,
+    pub require_jti: bool,
+    pub roles_claim: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthProviderType {
+    Jwt,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuthProviderConfig {
+    name: String,
+    #[serde(rename = "type")]
+    provider_type: String,
+    jwks_url: String,
+    #[serde(default)]
+    issuer: Option<String>,
+    #[serde(default)]
+    audience: Option<String>,
+    #[serde(default)]
+    jwks_timeout_ms: Option<u64>,
+    #[serde(default)]
+    require_jti: bool,
+    #[serde(default)]
+    roles_claim: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +523,18 @@ impl Config {
             DEFAULT_ROLES_CLAIM,
             &mut problems,
         );
+        let auth_providers =
+            parse_auth_providers(AUTH_PROVIDERS, get_var(AUTH_PROVIDERS), &mut problems)
+                .unwrap_or_else(|| {
+                    legacy_auth_providers(
+                        jwt_jwks_url.as_deref(),
+                        jwt_issuer.as_deref(),
+                        jwt_audience.as_deref(),
+                        jwt_jwks_timeout_ms,
+                        jwt_require_jti,
+                        &roles_claim,
+                    )
+                });
         let csrf_enabled = parse_var(
             CSRF_ENABLED,
             get_var(CSRF_ENABLED),
@@ -623,6 +673,7 @@ impl Config {
                 auth_mode,
                 auth_cookie_name,
                 auth_exempt_paths,
+                auth_providers,
                 jwt_jwks_url,
                 jwt_issuer,
                 jwt_audience,
@@ -821,6 +872,138 @@ fn parse_optional_string(
     } else {
         Some(value.to_owned())
     }
+}
+
+fn parse_auth_providers(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Option<Vec<AuthProviderConfig>> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return None,
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return Some(Vec::new());
+        }
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let providers = match serde_json::from_str::<Vec<RawAuthProviderConfig>>(value) {
+        Ok(providers) => providers,
+        Err(err) => {
+            problems.push(format!(
+                "{name} must be a JSON array of auth provider objects with name, type, jwks_url, and optional issuer, audience, jwks_timeout_ms, require_jti, and roles_claim: {err}"
+            ));
+            return Some(Vec::new());
+        }
+    };
+
+    Some(validate_auth_providers(name, providers, problems))
+}
+
+fn validate_auth_providers(
+    name: &str,
+    providers: Vec<RawAuthProviderConfig>,
+    problems: &mut Vec<String>,
+) -> Vec<AuthProviderConfig> {
+    let mut validated = Vec::with_capacity(providers.len());
+    let mut seen_names = HashMap::<String, usize>::new();
+
+    for (index, provider) in providers.into_iter().enumerate() {
+        let provider_name = format!("{name}[{index}]");
+        let normalized_name = provider.name.trim().to_owned();
+        if normalized_name.is_empty() {
+            problems.push(format!("{provider_name}.name must be a non-empty string"));
+        } else if let Some(previous_index) = seen_names.insert(normalized_name.clone(), index) {
+            problems.push(format!(
+                "{provider_name}.name duplicates {name}[{previous_index}].name"
+            ));
+        }
+
+        let provider_type = match provider.provider_type.trim() {
+            "jwt" => AuthProviderType::Jwt,
+            value => {
+                problems.push(format!("{provider_name}.type must be 'jwt', got '{value}'"));
+                AuthProviderType::Jwt
+            }
+        };
+        let jwks_url = provider.jwks_url.trim().to_owned();
+        if jwks_url.is_empty() {
+            problems.push(format!(
+                "{provider_name}.jwks_url must be a non-empty string"
+            ));
+        }
+        let roles_claim = normalize_auth_provider_roles_claim(
+            &format!("{provider_name}.roles_claim"),
+            provider.roles_claim,
+            problems,
+        );
+
+        validated.push(AuthProviderConfig {
+            name: normalized_name,
+            provider_type,
+            jwks_url,
+            issuer: normalize_optional_config_string(provider.issuer),
+            audience: normalize_optional_config_string(provider.audience),
+            jwks_timeout_ms: provider
+                .jwks_timeout_ms
+                .unwrap_or(DEFAULT_JWT_JWKS_TIMEOUT_MS),
+            require_jti: provider.require_jti,
+            roles_claim,
+        });
+    }
+
+    validated
+}
+
+fn normalize_optional_config_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_auth_provider_roles_claim(
+    name: &str,
+    value: Option<String>,
+    problems: &mut Vec<String>,
+) -> String {
+    match value.map(|value| value.trim().to_owned()) {
+        Some(value) if value.is_empty() => {
+            problems.push(format!("{name} must be a non-empty string"));
+            DEFAULT_ROLES_CLAIM.to_owned()
+        }
+        Some(value) => value,
+        None => DEFAULT_ROLES_CLAIM.to_owned(),
+    }
+}
+
+fn legacy_auth_providers(
+    jwt_jwks_url: Option<&str>,
+    jwt_issuer: Option<&str>,
+    jwt_audience: Option<&str>,
+    jwt_jwks_timeout_ms: u64,
+    jwt_require_jti: bool,
+    roles_claim: &str,
+) -> Vec<AuthProviderConfig> {
+    let Some(jwks_url) = jwt_jwks_url else {
+        return Vec::new();
+    };
+
+    vec![AuthProviderConfig {
+        name: "legacy".to_owned(),
+        provider_type: AuthProviderType::Jwt,
+        jwks_url: jwks_url.to_owned(),
+        issuer: jwt_issuer.map(str::to_owned),
+        audience: jwt_audience.map(str::to_owned),
+        jwks_timeout_ms: jwt_jwks_timeout_ms,
+        require_jti: jwt_require_jti,
+        roles_claim: roles_claim.to_owned(),
+    }]
 }
 
 fn parse_optional_path(
@@ -2467,6 +2650,185 @@ mod tests {
         assert_eq!(config.jwt_jwks_timeout_ms, 5000);
         assert!(config.jwt_require_jti);
         assert_eq!(config.roles_claim, "groups");
+    }
+
+    #[test]
+    fn auth_providers_parse_ordered_jwt_list() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(r#"[
+                    {
+                        "name": " primary ",
+                        "type": "jwt",
+                        "jwks_url": " https://primary.example.test/.well-known/jwks.json ",
+                        "issuer": " https://primary.example.test/ ",
+                        "audience": " greengateway ",
+                        "jwks_timeout_ms": 7000,
+                        "require_jti": true,
+                        "roles_claim": " groups "
+                    },
+                    {
+                        "name": "secondary",
+                        "type": "jwt",
+                        "jwks_url": "https://secondary.example.test/.well-known/jwks.json"
+                    }
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.auth_providers,
+            vec![
+                AuthProviderConfig {
+                    name: "primary".to_owned(),
+                    provider_type: AuthProviderType::Jwt,
+                    jwks_url: "https://primary.example.test/.well-known/jwks.json".to_owned(),
+                    issuer: Some("https://primary.example.test/".to_owned()),
+                    audience: Some("greengateway".to_owned()),
+                    jwks_timeout_ms: 7000,
+                    require_jti: true,
+                    roles_claim: "groups".to_owned(),
+                },
+                AuthProviderConfig {
+                    name: "secondary".to_owned(),
+                    provider_type: AuthProviderType::Jwt,
+                    jwks_url: "https://secondary.example.test/.well-known/jwks.json".to_owned(),
+                    issuer: None,
+                    audience: None,
+                    jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
+                    require_jti: false,
+                    roles_claim: DEFAULT_ROLES_CLAIM.to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_auth_providers_json_is_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok("not-json".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject malformed AUTH_PROVIDERS JSON");
+
+        let message = error.to_string();
+        assert!(message.contains("AUTH_PROVIDERS must be a JSON array of auth provider objects"));
+        assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_auth_provider_names_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(r#"[
+                    {
+                        "name": "primary",
+                        "type": "jwt",
+                        "jwks_url": "https://primary.example.test/.well-known/jwks.json"
+                    },
+                    {
+                        "name": " primary ",
+                        "type": "jwt",
+                        "jwks_url": "https://secondary.example.test/.well-known/jwks.json"
+                    }
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject duplicate auth provider names");
+
+        let message = error.to_string();
+        assert!(message.contains("AUTH_PROVIDERS[1].name duplicates AUTH_PROVIDERS[0].name"));
+        assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
+    fn unrecognized_auth_provider_type_is_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(r#"[
+                    {
+                        "name": "primary",
+                        "type": "saml",
+                        "jwks_url": "https://primary.example.test/.well-known/jwks.json"
+                    }
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject unrecognized auth provider types");
+
+        let message = error.to_string();
+        assert!(message.contains("AUTH_PROVIDERS[0].type must be 'jwt'"));
+        assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
+    fn legacy_jwt_settings_create_implicit_auth_provider_when_auth_providers_unset() {
+        let config = Config::from_env_vars(|name| match name {
+            "JWT_JWKS_URL" => Ok("https://legacy.example.test/.well-known/jwks.json".to_owned()),
+            "JWT_ISSUER" => Ok("https://legacy.example.test/".to_owned()),
+            "JWT_AUDIENCE" => Ok("greengateway".to_owned()),
+            "JWT_JWKS_TIMEOUT_MS" => Ok("6000".to_owned()),
+            "JWT_REQUIRE_JTI" => Ok("true".to_owned()),
+            "ROLES_CLAIM" => Ok("groups".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("legacy JWT config should parse");
+
+        assert_eq!(
+            config.auth_providers,
+            vec![AuthProviderConfig {
+                name: "legacy".to_owned(),
+                provider_type: AuthProviderType::Jwt,
+                jwks_url: "https://legacy.example.test/.well-known/jwks.json".to_owned(),
+                issuer: Some("https://legacy.example.test/".to_owned()),
+                audience: Some("greengateway".to_owned()),
+                jwks_timeout_ms: 6000,
+                require_jti: true,
+                roles_claim: "groups".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn auth_providers_take_precedence_over_legacy_jwt_settings() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(r#"[
+                    {
+                        "name": "declared",
+                        "type": "jwt",
+                        "jwks_url": "https://declared.example.test/.well-known/jwks.json",
+                        "issuer": "https://declared.example.test/",
+                        "audience": "declared-audience",
+                        "jwks_timeout_ms": 8000,
+                        "require_jti": false,
+                        "roles_claim": "declared_roles"
+                    }
+                ]"#
+            .to_owned()),
+            "JWT_JWKS_URL" => Ok("https://legacy.example.test/.well-known/jwks.json".to_owned()),
+            "JWT_ISSUER" => Ok("https://legacy.example.test/".to_owned()),
+            "JWT_AUDIENCE" => Ok("legacy-audience".to_owned()),
+            "JWT_JWKS_TIMEOUT_MS" => Ok("6000".to_owned()),
+            "JWT_REQUIRE_JTI" => Ok("true".to_owned()),
+            "ROLES_CLAIM" => Ok("legacy_roles".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.auth_providers,
+            vec![AuthProviderConfig {
+                name: "declared".to_owned(),
+                provider_type: AuthProviderType::Jwt,
+                jwks_url: "https://declared.example.test/.well-known/jwks.json".to_owned(),
+                issuer: Some("https://declared.example.test/".to_owned()),
+                audience: Some("declared-audience".to_owned()),
+                jwks_timeout_ms: 8000,
+                require_jti: false,
+                roles_claim: "declared_roles".to_owned(),
+            }]
+        );
     }
 
     #[test]

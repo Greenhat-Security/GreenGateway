@@ -941,8 +941,7 @@ fn gateway_app_with_process_started_at(
         proxy.spawn_upstream_health_checks();
     }
     let routes = GatewayRoutes::from_config(&config);
-    let validator = auth::JwtValidator::from_config(&config, egress_client)?
-        .map(|validator| Arc::new(validator) as Arc<dyn auth::SessionValidator>);
+    let validator = auth_validator_from_config(&config, egress_client)?;
     let rbac_status = RbacStatus {
         policy_loaded: loaded_policy.is_some(),
         policy_id: loaded_policy.as_ref().and_then(|policy| policy.id.clone()),
@@ -1066,6 +1065,32 @@ fn gateway_app_with_process_started_at(
             &middleware_stack,
         )))
     }
+}
+
+fn auth_validator_from_config(
+    config: &config::Config,
+    egress_client: Arc<egress::EgressClient>,
+) -> Result<Option<Arc<dyn auth::SessionValidator>>, auth::AuthError> {
+    if config.auth_providers.is_empty() {
+        return Ok(None);
+    }
+
+    let mut validators = Vec::with_capacity(config.auth_providers.len());
+    for provider in &config.auth_providers {
+        match provider.provider_type {
+            config::AuthProviderType::Jwt => {
+                let jwt_config = auth::JwtAuthConfig::from_provider_config(provider);
+                validators.push(Arc::new(auth::JwtValidator::new(
+                    jwt_config,
+                    Arc::clone(&egress_client),
+                )?) as Arc<dyn auth::SessionValidator>);
+            }
+        }
+    }
+
+    Ok(Some(
+        Arc::new(auth::ChainValidator::new(validators)) as Arc<dyn auth::SessionValidator>
+    ))
 }
 
 fn policy_history_sqlite_path(config: &config::Config) -> Option<PathBuf> {
@@ -5462,6 +5487,7 @@ mod tests {
                 "/metrics".to_owned(),
                 "/admin".to_owned(),
             ],
+            auth_providers: Vec::new(),
             jwt_jwks_url: None,
             jwt_issuer: None,
             jwt_audience: None,
@@ -6611,7 +6637,7 @@ mod tests {
         ));
         config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
         config.egress_deny_private_ips = false;
-        config.jwt_jwks_url = Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
+        configure_test_jwt_provider(&mut config, jwks_addr);
         let token = signed_admin_token();
         let (data_addr, admin_addr, data_server, admin_server) = spawn_split_gateway(config).await;
 
@@ -6700,7 +6726,7 @@ mod tests {
         );
         let mut config = split_config();
         config.policy_file = Some(policy.path.to_string_lossy().into_owned());
-        config.jwt_jwks_url = Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
+        configure_test_jwt_provider(&mut config, jwks_addr);
         config.egress_deny_private_ips = false;
         let token = signed_admin_token();
         let (_data_addr, admin_addr, data_server, admin_server) = spawn_split_gateway(config).await;
@@ -7955,7 +7981,7 @@ mod tests {
         ];
         config.rbac_exempt_paths = config.auth_exempt_paths.clone();
         config.audit_sqlite_path = Some(db.path.to_string_lossy().into_owned());
-        config.jwt_jwks_url = Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
+        configure_test_jwt_provider(&mut config, jwks_addr);
         config.egress_deny_private_ips = false;
         let routes = GatewayRoutes::from_config(&config);
         assert_eq!(routes.admin.api_prefix, "/v1/ops");
@@ -13754,7 +13780,7 @@ paths:
         );
         let mut config = test_config(Vec::new());
         config.policy_file = Some(policy.path.to_string_lossy().into_owned());
-        config.jwt_jwks_url = Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
+        configure_test_jwt_provider(&mut config, jwks_addr);
         config.egress_deny_private_ips = false;
         let recorder = PrometheusBuilder::new().build_recorder();
         let router = app(
@@ -13805,7 +13831,7 @@ paths:
         config.policy_file = Some(policy.path.to_string_lossy().into_owned());
         config.rate_limit_read_rps = 0.0;
         config.rate_limit_read_burst = 1;
-        config.jwt_jwks_url = Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
+        configure_test_jwt_provider(&mut config, jwks_addr);
         config.egress_deny_private_ips = false;
         let recorder = PrometheusBuilder::new().build_recorder();
         let router = app(
@@ -15436,6 +15462,21 @@ O2gecI9QwDJNpm29J9wJB2F8
             }),
         ))
         .await
+    }
+
+    fn configure_test_jwt_provider(config: &mut config::Config, jwks_addr: std::net::SocketAddr) {
+        let jwks_url = format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port());
+        config.jwt_jwks_url = Some(jwks_url.clone());
+        config.auth_providers = vec![config::AuthProviderConfig {
+            name: "legacy".to_owned(),
+            provider_type: config::AuthProviderType::Jwt,
+            jwks_url,
+            issuer: None,
+            audience: None,
+            jwks_timeout_ms: config.jwt_jwks_timeout_ms,
+            require_jti: config.jwt_require_jti,
+            roles_claim: config.roles_claim.clone(),
+        }];
     }
 
     fn signed_admin_token() -> String {

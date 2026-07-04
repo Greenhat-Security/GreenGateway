@@ -1,7 +1,10 @@
+pub mod chain;
 pub mod jwt;
 pub mod principal;
 pub mod validator;
 
+#[allow(unused_imports)] // Public chain API is used by gateway startup wiring.
+pub use chain::ChainValidator;
 #[allow(unused_imports)] // Public JWT API re-export reserved for PR 3 auth middleware.
 pub use jwt::{JwtAuthConfig, JwtValidator, NoopRevocationStore, RevocationStore};
 #[allow(unused_imports)] // Public auth API re-export reserved for later identity integration.
