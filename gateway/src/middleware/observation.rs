@@ -670,15 +670,7 @@ mod tests {
         Router::new()
             .route("/data/items", get(ok))
             .layer(from_fn_with_state(
-                rbac::RbacState {
-                    default_action: policy.default_action.clone(),
-                    enforcement_mode: policy.enforcement_mode,
-                    routes: Arc::new(policy.routes.clone()),
-                    engine: Arc::new(crate::rbac::PolicyEngine::new(policy)),
-                    exempt_paths: Vec::new(),
-                    trust_proxy_headers: false,
-                    audit: audit.clone(),
-                },
+                rbac::RbacState::new(policy, Vec::new(), false, audit.clone()),
                 rbac::rbac_middleware,
             ))
             .layer(from_fn_with_state(
