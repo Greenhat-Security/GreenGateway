@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS discovery_endpoint_aggregates (
     first_seen TEXT NOT NULL,
     last_seen TEXT NOT NULL,
     call_count INTEGER NOT NULL,
+    schema_mismatch_count INTEGER NOT NULL DEFAULT 0,
     latency_count INTEGER NOT NULL,
     latency_p50_ms INTEGER NOT NULL,
     latency_p95_ms INTEGER NOT NULL,
@@ -123,6 +124,7 @@ INSERT INTO discovery_endpoint_aggregates (
     first_seen,
     last_seen,
     call_count,
+    schema_mismatch_count,
     latency_count,
     latency_p50_ms,
     latency_p95_ms,
@@ -130,11 +132,12 @@ INSERT INTO discovery_endpoint_aggregates (
     latency_samples_json,
     distinct_principal_count,
     updated_at
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
 ON CONFLICT(method, endpoint_template) DO UPDATE SET
     first_seen = excluded.first_seen,
     last_seen = excluded.last_seen,
     call_count = excluded.call_count,
+    schema_mismatch_count = excluded.schema_mismatch_count,
     latency_count = excluded.latency_count,
     latency_p50_ms = excluded.latency_p50_ms,
     latency_p95_ms = excluded.latency_p95_ms,
@@ -495,6 +498,7 @@ struct EndpointAggregate {
     first_seen: String,
     last_seen: String,
     call_count: u64,
+    schema_mismatch_count: u64,
     status_counts: BTreeMap<u16, u64>,
     latency_count: u64,
     latency_samples: Vec<u64>,
@@ -516,6 +520,7 @@ impl EndpointAggregate {
             first_seen: timestamp.to_owned(),
             last_seen: timestamp.to_owned(),
             call_count: 0,
+            schema_mismatch_count: 0,
             status_counts: BTreeMap::new(),
             latency_count: 0,
             latency_samples: Vec::new(),
@@ -534,6 +539,9 @@ impl EndpointAggregate {
         }
 
         self.call_count = self.call_count.saturating_add(1);
+        if observation.schema_mismatch {
+            self.schema_mismatch_count = self.schema_mismatch_count.saturating_add(1);
+        }
         *self.status_counts.entry(observation.status).or_insert(0) += 1;
         self.record_latency(observation.latency_ms);
         if let Some(payload_shape) = observation.payload_shape.as_ref() {
@@ -571,6 +579,9 @@ impl EndpointAggregate {
         }
 
         self.call_count = self.call_count.saturating_add(other.call_count);
+        self.schema_mismatch_count = self
+            .schema_mismatch_count
+            .saturating_add(other.schema_mismatch_count);
         for (status, count) in other.status_counts {
             *self.status_counts.entry(status).or_insert(0) += count;
         }
@@ -727,6 +738,7 @@ impl AggregatorState {
                     first_seen: row.first_seen,
                     last_seen: row.last_seen,
                     call_count: non_negative_i64_to_u64(row.call_count),
+                    schema_mismatch_count: non_negative_i64_to_u64(row.schema_mismatch_count),
                     status_counts: BTreeMap::new(),
                     latency_count: non_negative_i64_to_u64(row.latency_count),
                     latency_samples,
@@ -929,6 +941,7 @@ struct ObservedRequest {
     timestamp: String,
     user_id: Option<String>,
     payload_shape: Option<Value>,
+    schema_mismatch: bool,
 }
 
 impl ObservedRequest {
@@ -954,6 +967,11 @@ impl ObservedRequest {
             timestamp: event.timestamp.clone(),
             user_id: event.actor.as_ref().map(|actor| actor.user_id.clone()),
             payload_shape: event.payload.get("payload_shape").cloned(),
+            schema_mismatch: event
+                .payload
+                .get("schema_mismatch")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 }
@@ -965,6 +983,7 @@ struct AggregateRow {
     first_seen: String,
     last_seen: String,
     call_count: i64,
+    schema_mismatch_count: i64,
     latency_count: i64,
     latency_samples_json: String,
 }
@@ -1044,7 +1063,43 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
         "#,
     )?;
     connection.execute_batch(CREATE_SCHEMA_SQL)?;
+    ensure_discovery_endpoint_aggregate_column(
+        connection,
+        "schema_mismatch_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     signals::configure_connection(connection)
+}
+
+fn ensure_discovery_endpoint_aggregate_column(
+    connection: &Connection,
+    column_name: &str,
+    column_type: &str,
+) -> rusqlite::Result<()> {
+    if discovery_endpoint_aggregates_has_column(connection, column_name)? {
+        return Ok(());
+    }
+
+    let sql =
+        format!("ALTER TABLE discovery_endpoint_aggregates ADD COLUMN {column_name} {column_type}");
+    connection.execute(&sql, [])?;
+    Ok(())
+}
+
+fn discovery_endpoint_aggregates_has_column(
+    connection: &Connection,
+    column_name: &str,
+) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare("PRAGMA table_info(discovery_endpoint_aggregates)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+
+    for column in columns {
+        if column? == column_name {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn configure_payload_capture_connection(connection: &Connection) -> rusqlite::Result<()> {
@@ -1062,6 +1117,7 @@ fn load_aggregate_rows(
             first_seen,
             last_seen,
             call_count,
+            schema_mismatch_count,
             latency_count,
             latency_samples_json
         FROM discovery_endpoint_aggregates
@@ -1076,8 +1132,9 @@ fn load_aggregate_rows(
                 first_seen: row.get(2)?,
                 last_seen: row.get(3)?,
                 call_count: row.get(4)?,
-                latency_count: row.get(5)?,
-                latency_samples_json: row.get(6)?,
+                schema_mismatch_count: row.get(5)?,
+                latency_count: row.get(6)?,
+                latency_samples_json: row.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
@@ -1269,6 +1326,7 @@ fn upsert_aggregate(
             aggregate.first_seen.as_str(),
             aggregate.last_seen.as_str(),
             i64_from_u64(aggregate.call_count),
+            i64_from_u64(aggregate.schema_mismatch_count),
             i64_from_u64(aggregate.latency_count),
             i64_from_u64(percentiles.p50_ms),
             i64_from_u64(percentiles.p95_ms),
@@ -1726,6 +1784,44 @@ mod tests {
     }
 
     #[test]
+    fn schema_mismatch_true_events_roll_up_per_endpoint() {
+        let db = TempDb::new("schema-mismatch-rollup");
+        let sink = aggregator_sink(&db.path);
+
+        sink.emit(&observed_event_with_schema_mismatch(
+            "GET",
+            "/reports/123",
+            200,
+            10,
+            Some("user-1"),
+            "2024-06-01T12:00:00Z",
+            true,
+        ));
+        sink.emit(&observed_event_with_schema_mismatch(
+            "GET",
+            "/reports/456",
+            200,
+            12,
+            Some("user-1"),
+            "2024-06-01T12:00:01Z",
+            false,
+        ));
+        sink.emit(&observed_event(
+            "GET",
+            "/reports/789",
+            200,
+            14,
+            Some("user-1"),
+            "2024-06-01T12:00:02Z",
+        ));
+        sink.flush_for_test();
+
+        let aggregate = aggregate_snapshot(&db.path, "GET", "/reports/{id}");
+        assert_eq!(aggregate.call_count, 3);
+        assert_eq!(aggregate.schema_mismatch_count, 1);
+    }
+
+    #[test]
     fn distinct_principals_are_tracked_exactly_and_ignore_unauthenticated_requests() {
         let db = TempDb::new("principals");
         let sink = aggregator_sink(&db.path);
@@ -2172,6 +2268,20 @@ mod tests {
         event
     }
 
+    fn observed_event_with_schema_mismatch(
+        method: &str,
+        path: &str,
+        status: u16,
+        latency_ms: u64,
+        user_id: Option<&str>,
+        timestamp: impl Into<String>,
+        schema_mismatch: bool,
+    ) -> AuditEvent {
+        let mut event = observed_event(method, path, status, latency_ms, user_id, timestamp);
+        event.payload["schema_mismatch"] = json!(schema_mismatch);
+        event
+    }
+
     fn timestamp(index: usize) -> String {
         format!("2024-06-01T12:00:{:02}Z", index % 60)
     }
@@ -2220,6 +2330,7 @@ mod tests {
         first_seen: String,
         last_seen: String,
         call_count: i64,
+        schema_mismatch_count: i64,
         latency_p50_ms: i64,
         latency_p95_ms: i64,
         latency_p99_ms: i64,
@@ -2235,6 +2346,7 @@ mod tests {
                     first_seen,
                     last_seen,
                     call_count,
+                    schema_mismatch_count,
                     latency_p50_ms,
                     latency_p95_ms,
                     latency_p99_ms,
@@ -2248,10 +2360,11 @@ mod tests {
                         first_seen: row.get(0)?,
                         last_seen: row.get(1)?,
                         call_count: row.get(2)?,
-                        latency_p50_ms: row.get(3)?,
-                        latency_p95_ms: row.get(4)?,
-                        latency_p99_ms: row.get(5)?,
-                        distinct_principal_count: row.get(6)?,
+                        schema_mismatch_count: row.get(3)?,
+                        latency_p50_ms: row.get(4)?,
+                        latency_p95_ms: row.get(5)?,
+                        latency_p99_ms: row.get(6)?,
+                        distinct_principal_count: row.get(7)?,
                     })
                 },
             )

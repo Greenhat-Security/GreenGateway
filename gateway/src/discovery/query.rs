@@ -7,6 +7,9 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -40,6 +43,15 @@ CREATE TABLE IF NOT EXISTS discovery_endpoint_reviews (
 pub struct DiscoveryQueryStore {
     path: PathBuf,
     connection: std::sync::Arc<Mutex<Connection>>,
+    #[cfg(test)]
+    query_counts: std::sync::Arc<DiscoveryQueryCounts>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct DiscoveryQueryCounts {
+    observed_endpoints: AtomicU64,
+    inferred_request_schema: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +97,7 @@ pub struct EndpointSummary {
     pub first_seen: String,
     pub last_seen: String,
     pub call_count: u64,
+    pub schema_mismatch_count: u64,
     pub distinct_principal_count: u64,
     pub is_new: bool,
     pub reviewed: bool,
@@ -102,6 +115,7 @@ pub struct EndpointAggregateDetail {
     pub first_seen: String,
     pub last_seen: String,
     pub call_count: u64,
+    pub schema_mismatch_count: u64,
     pub distinct_principal_count: u64,
     pub is_new: bool,
     pub reviewed: bool,
@@ -279,10 +293,17 @@ impl DiscoveryQueryStore {
         Ok(Self {
             path,
             connection: std::sync::Arc::new(Mutex::new(connection)),
+            #[cfg(test)]
+            query_counts: std::sync::Arc::new(DiscoveryQueryCounts::default()),
         })
     }
 
     pub fn observed_endpoints(&self) -> Result<Vec<ObservedEndpoint>, DiscoveryQueryError> {
+        #[cfg(test)]
+        self.query_counts
+            .observed_endpoints
+            .fetch_add(1, AtomicOrdering::Relaxed);
+
         let connection = self.connection_guard();
         let mut statement = match connection.prepare(
             r#"
@@ -415,6 +436,7 @@ impl DiscoveryQueryStore {
                     first_seen,
                     last_seen,
                     call_count,
+                    schema_mismatch_count,
                     latency_count,
                     latency_p50_ms,
                     latency_p95_ms,
@@ -459,38 +481,46 @@ impl DiscoveryQueryStore {
         method: &str,
         endpoint_template: &str,
     ) -> Result<Option<InferredRequestSchema>, DiscoveryQueryError> {
-        let connection = self.connection_guard();
-        let mut statement = match connection.prepare(
-            r#"
-            SELECT shape_json
-            FROM discovery_payload_shape_samples
-            WHERE method = ?1 AND endpoint_template = ?2
-            ORDER BY sample_slot
-            "#,
-        ) {
-            Ok(statement) => statement,
-            Err(source) if is_missing_payload_shape_sample_table(&source) => return Ok(None),
-            Err(source) => {
-                return Err(DiscoveryQueryError::Sqlite {
+        #[cfg(test)]
+        self.query_counts
+            .inferred_request_schema
+            .fetch_add(1, AtomicOrdering::Relaxed);
+
+        let shape_jsons = {
+            let connection = self.connection_guard();
+            let mut statement = match connection.prepare(
+                r#"
+                SELECT shape_json
+                FROM discovery_payload_shape_samples
+                WHERE method = ?1 AND endpoint_template = ?2
+                ORDER BY sample_slot
+                "#,
+            ) {
+                Ok(statement) => statement,
+                Err(source) if is_missing_payload_shape_sample_table(&source) => return Ok(None),
+                Err(source) => {
+                    return Err(DiscoveryQueryError::Sqlite {
+                        path: self.path.clone(),
+                        source,
+                    })
+                }
+            };
+
+            let rows = statement
+                .query_map(params![method, endpoint_template], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|source| DiscoveryQueryError::Sqlite {
                     path: self.path.clone(),
                     source,
-                })
-            }
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| DiscoveryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            rows
         };
-
-        let shape_jsons = statement
-            .query_map(params![method, endpoint_template], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|source| DiscoveryQueryError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| DiscoveryQueryError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
 
         if shape_jsons.is_empty() {
             return Ok(None);
@@ -513,6 +543,18 @@ impl DiscoveryQueryStore {
             endpoint_template,
             &shapes,
         )))
+    }
+
+    #[cfg(test)]
+    pub fn query_counts_for_test(&self) -> (u64, u64) {
+        (
+            self.query_counts
+                .observed_endpoints
+                .load(AtomicOrdering::Relaxed),
+            self.query_counts
+                .inferred_request_schema
+                .load(AtomicOrdering::Relaxed),
+        )
     }
 
     pub fn set_endpoint_review(
@@ -782,6 +824,7 @@ struct RawEndpointAggregate {
     first_seen: String,
     last_seen: String,
     call_count: i64,
+    schema_mismatch_count: i64,
     latency_count: i64,
     latency_p50_ms: i64,
     latency_p95_ms: i64,
@@ -1024,15 +1067,16 @@ impl RawEndpointAggregate {
             first_seen: row.get(2)?,
             last_seen: row.get(3)?,
             call_count: row.get(4)?,
-            latency_count: row.get(5)?,
-            latency_p50_ms: row.get(6)?,
-            latency_p95_ms: row.get(7)?,
-            latency_p99_ms: row.get(8)?,
-            latency_samples_json: row.get(9)?,
-            distinct_principal_count: row.get(10)?,
-            updated_at: row.get(11)?,
-            reviewed_at: row.get(12)?,
-            reviewed_by: row.get(13)?,
+            schema_mismatch_count: row.get(5)?,
+            latency_count: row.get(6)?,
+            latency_p50_ms: row.get(7)?,
+            latency_p95_ms: row.get(8)?,
+            latency_p99_ms: row.get(9)?,
+            latency_samples_json: row.get(10)?,
+            distinct_principal_count: row.get(11)?,
+            updated_at: row.get(12)?,
+            reviewed_at: row.get(13)?,
+            reviewed_by: row.get(14)?,
         })
     }
 
@@ -1061,6 +1105,7 @@ impl RawEndpointAggregate {
             first_seen: self.first_seen,
             last_seen: self.last_seen,
             call_count: non_negative_i64_to_u64(self.call_count),
+            schema_mismatch_count: non_negative_i64_to_u64(self.schema_mismatch_count),
             distinct_principal_count: non_negative_i64_to_u64(self.distinct_principal_count),
             reviewed: review.reviewed,
             reviewed_at: review.reviewed_at,
@@ -1100,6 +1145,7 @@ impl RawEndpointAggregate {
             first_seen: self.first_seen,
             last_seen: self.last_seen,
             call_count: non_negative_i64_to_u64(self.call_count),
+            schema_mismatch_count: non_negative_i64_to_u64(self.schema_mismatch_count),
             distinct_principal_count: non_negative_i64_to_u64(self.distinct_principal_count),
             reviewed: review.reviewed,
             reviewed_at: review.reviewed_at,
@@ -1199,6 +1245,7 @@ fn build_endpoint_list_query(
             a.first_seen,
             a.last_seen,
             a.call_count,
+            a.schema_mismatch_count,
             a.latency_count,
             a.latency_p50_ms,
             a.latency_p95_ms,
@@ -1582,7 +1629,36 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
         "#,
     )?;
     connection.execute_batch(CREATE_REVIEW_SCHEMA_SQL)?;
+    ensure_discovery_endpoint_aggregate_column(
+        connection,
+        "schema_mismatch_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     signals::configure_connection(connection)
+}
+
+fn ensure_discovery_endpoint_aggregate_column(
+    connection: &Connection,
+    column_name: &str,
+    column_type: &str,
+) -> rusqlite::Result<()> {
+    let columns = discovery_endpoint_aggregate_columns(connection)?;
+    if columns.is_empty() || columns.iter().any(|column| column == column_name) {
+        return Ok(());
+    }
+
+    let sql =
+        format!("ALTER TABLE discovery_endpoint_aggregates ADD COLUMN {column_name} {column_type}");
+    connection.execute(&sql, [])?;
+    Ok(())
+}
+
+fn discovery_endpoint_aggregate_columns(connection: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut statement = connection.prepare("PRAGMA table_info(discovery_endpoint_aggregates)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(columns)
 }
 
 fn new_since_cutoff(new_since_hours: u64) -> String {
