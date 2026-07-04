@@ -62,12 +62,13 @@ This is what's actually built, working, and covered by CI as of Phases 1-2 and t
 | **Gateway server** | Rust/axum binary exposing `GET /health`, `GET /version`, `GET /metrics` (Prometheus) |
 | **Security middleware** | Request-ID + tracing, config-driven CORS, security-header hardening, token-bucket rate limiting, body-size/content-type validation, double-submit CSRF — in an asserted, fixed order |
 | **Authentication** | A `Principal` model with pluggable session validators, plus a JWKS-backed JWT validator (RS256, configurable roles claim, issuer/audience enforcement); fails closed by default, with an `AUTH_MODE=observe` option to authenticate without blocking while rolling out credentials |
-| **Authorization** | A deny-by-default RBAC policy engine with config-driven route-to-permission rules, segment-aware path matching, an `enforcement_mode: shadow` per-rule override that logs would-be denials without blocking, and hot reload (file-watch + `SIGHUP`) with validate-before-swap so an invalid edit never takes down the last-known-good policy |
+| **Authorization** | A deny-by-default RBAC policy engine with config-driven route-to-permission rules, direct firewall-style rules, segment-aware path matching, an `enforcement_mode: shadow` per-rule override that logs would-be denials without blocking, and hot reload (file-watch + `SIGHUP`) with validate-before-swap so an invalid edit never takes down the last-known-good policy |
 | **Reverse proxy** | A catch-all proxy to a configured `UPSTREAM_URL` — all HTTP verbs, streamed responses and binary bodies, hop-by-hop header stripping, request-id propagation, a 502/504 error taxonomy, and upstream latency recorded on every observation event. Gateway-owned routes (health/version/metrics, the admin UI and its API) always take precedence over the proxy, and the admin surface's own path is remappable via `ADMIN_PREFIX` |
 | **Egress firewall** | An SSRF-hardened outbound HTTP client: host allowlisting, private/special-use IP blocking (including IPv4-mapped-IPv6/NAT64), pinned-IP resolution |
 | **Audit pipeline** | A versioned audit-event envelope with SHA-256 redaction, delivered asynchronously off the request hot path |
 | **Queryable audit store** | A SQLite audit sink (batched writes, retention pruning) with an admin API — `GET /v1/admin/audit` — supporting time-range, event-type, actor, path, and status filters with keyset pagination |
 | **Live event feed** | Server-Sent Events at `GET /v1/admin/events/stream`, backed by an in-process broadcast sink with backpressure handling |
+| **Policy administration** | Read, replace, validate, preview candidate direct rules against audit history, and fetch per-rule hit counts through protected `/v1/admin/policy*` APIs |
 | **Admin UI** | An embedded Vite + React + TypeScript app, built into the binary and served at `/admin` (or `ADMIN_PREFIX`): a log explorer, a live tail, and a status page reporting real running-config values |
 | **Local dev harness** | Checked-in JWKS/RBAC fixtures, a `docker-compose.dev.yml` profile that brings up a fully authenticated gateway in one command, and a traffic-generator/CI smoke test |
 
@@ -79,7 +80,7 @@ Everything below is roadmap and vision beyond what's listed in [What's Real Toda
 
 | Phase | Capability | Status |
 | --- | --- | --- |
-| 3 | **Universal HTTP reverse proxy** — place GG in front of any HTTP backend, starting default-allow for discovery, then tightening through policy over time | In progress — the catch-all proxy, reserved-prefix protection, and policy modes (default-allow/shadow/observe) are done; multi-upstream routing, rules-as-data, a policy CRUD API, and upstream health checks are still pending |
+| 3 | **Universal HTTP reverse proxy** — place GG in front of any HTTP backend, starting default-allow for discovery, then tightening through policy over time | In progress — the catch-all proxy, reserved-prefix protection, policy modes (default-allow/shadow/observe), direct rules, policy CRUD, rule preview, and hit counts are done; remaining multi-upstream routing and upstream health work is landing incrementally |
 | 4 | **Traffic discovery** — automatic endpoint inventory, schema conformance checks against observed traffic, anomaly signals | Not started |
 | 5 | **Visual firewall-style rule builder** — inspect discovered traffic, create rules in one click, review policy in shadow mode, roll back through versioned policy history | Not started |
 | 6 | **Native MCP support** — speak the real MCP protocol instead of a bespoke REST facade, with a dynamic tool registry, JSON Schema validation, and OpenAPI-to-tools generation | Not started |
