@@ -82,4 +82,72 @@ describe('AdminShell', () => {
       }),
     ).toBeTruthy();
   });
+
+  it('registers the traffic endpoint detail route', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            endpoint: {
+              method: 'GET',
+              endpoint_template: '/users/{id}',
+              first_seen: '2026-07-04T08:00:00Z',
+              last_seen: '2026-07-04T10:00:00Z',
+              call_count: 10,
+              distinct_principal_count: 1,
+              is_new: false,
+              reviewed: false,
+              reviewed_at: null,
+              reviewed_by: null,
+              covered_by_rule: true,
+              latency: {
+                count: 10,
+                p50_ms: 8,
+                p95_ms: 15,
+                p99_ms: 20,
+                sample_count: 10,
+              },
+              status_counts: [{ status: 200, count: 10 }],
+              updated_at: '2026-07-04T10:01:00Z',
+            },
+            principals: {
+              principals: [],
+              next_cursor: null,
+            },
+            audit: {
+              available: false,
+              match_strategy: 'stateless_path_template',
+              match_limitations:
+                'Matches literal paths and immediate well-known identifier templates; statefully learned slug templates are not reverse-mapped.',
+              omitted_reason: 'AUDIT_SQLITE_PATH not configured',
+            },
+          }),
+          {
+            status: 200,
+            headers: {
+              'Content-Type': 'application/json',
+            },
+          },
+        ),
+      ),
+    );
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          '/traffic/detail?method=GET&endpoint_template=%2Fusers%2F%7Bid%7D',
+        ]}
+      >
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByRole('heading', {
+        level: 2,
+        name: 'GET /users/{id}',
+      }),
+    ).toBeTruthy();
+  });
 });

@@ -17,6 +17,7 @@ import { adminBasePath } from './lib/config';
 import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
 import { StatusPage } from './views/StatusPage';
+import { TrafficEndpointDetail } from './views/TrafficEndpointDetail';
 import { TrafficInventory } from './views/TrafficInventory';
 
 const THEME_STORAGE_KEY = 'greengateway_admin_theme';
@@ -101,6 +102,7 @@ export function AdminShell() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/logs" element={<LogExplorer />} />
           <Route path="/traffic" element={<TrafficInventory />} />
+          <Route path="/traffic/detail" element={<TrafficEndpointDetail />} />
           <Route path="/live" element={<LiveTail />} />
           <Route path="/status" element={<StatusPage />} />
           <Route path="*" element={<NotFoundPage />} />
@@ -252,6 +254,9 @@ function pageTitleForPath(pathname: string): string {
   }
   if (pathname === '/traffic') {
     return 'Traffic inventory';
+  }
+  if (pathname === '/traffic/detail') {
+    return 'Traffic detail';
   }
   if (pathname === '/live') {
     return 'Live tail';

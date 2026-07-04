@@ -2,14 +2,21 @@ import { adminFetchJson } from './api';
 import { adminApiUrl } from './config';
 
 export const TRAFFIC_ENDPOINT_PAGE_LIMIT = 50;
+export const TRAFFIC_ENDPOINT_PRINCIPAL_PAGE_LIMIT = 50;
+export const TRAFFIC_ENDPOINT_RECENT_EVENTS_LIMIT = 20;
 
 export type TrafficEndpointSort = 'last_seen' | 'call_count' | 'first_seen';
+export type TrafficEndpointAuditBucket = 'hour' | 'day';
 
 export type TrafficEndpointLatency = {
   count: number;
   p50_ms: number;
   p95_ms: number;
   p99_ms: number;
+};
+
+export type TrafficEndpointLatencyDetail = TrafficEndpointLatency & {
+  sample_count: number;
 };
 
 export type TrafficStatusCount = {
@@ -33,6 +40,56 @@ export type TrafficEndpoint = {
   status_counts: TrafficStatusCount[];
 };
 
+export type TrafficEndpointDetail = Omit<TrafficEndpoint, 'latency'> & {
+  latency: TrafficEndpointLatencyDetail;
+  updated_at: string;
+};
+
+export type TrafficEndpointPrincipal = {
+  user_id: string;
+  first_seen: string;
+  last_seen: string;
+};
+
+export type TrafficEndpointPrincipalPage = {
+  principals: TrafficEndpointPrincipal[];
+  next_cursor: string | null;
+};
+
+export type TrafficEndpointTimeSeriesPoint = {
+  bucket_start: string;
+  count: number;
+};
+
+export type TrafficEndpointRecentEvent = {
+  id: number;
+  event_id: string;
+  request_id: string;
+  timestamp: string;
+  method: string;
+  path: string;
+  status: number | null;
+  actor: string | null;
+};
+
+export type TrafficEndpointAuditEnrichment = {
+  available: boolean;
+  match_strategy: string;
+  match_limitations: string;
+  omitted_reason?: string;
+  time_series_truncated?: boolean;
+  time_series?: TrafficEndpointTimeSeriesPoint[];
+  recent_events?: TrafficEndpointRecentEvent[];
+  recent_events_next_cursor?: number | null;
+  recent_events_scan_truncated?: boolean;
+};
+
+export type TrafficEndpointDetailResponse = {
+  endpoint: TrafficEndpointDetail;
+  principals: TrafficEndpointPrincipalPage;
+  audit: TrafficEndpointAuditEnrichment;
+};
+
 export type TrafficEndpointListResponse = {
   endpoints: TrafficEndpoint[];
   next_cursor: string | null;
@@ -51,6 +108,13 @@ export type TrafficEndpointReviewRequest = {
   method: string;
   endpoint_template: string;
   reviewed: boolean;
+};
+
+export type TrafficEndpointDetailRequest = {
+  method: string;
+  endpointTemplate: string;
+  principalCursor?: string | null;
+  bucket?: TrafficEndpointAuditBucket;
 };
 
 export type TrafficEndpointReviewResponse = {
@@ -105,6 +169,37 @@ export function fetchTrafficEndpoints(
 
   return adminFetchJson<TrafficEndpointListResponse>(
     adminApiUrl(`/traffic/endpoints?${params.toString()}`),
+  );
+}
+
+export function buildTrafficEndpointDetailQueryParams(
+  request: TrafficEndpointDetailRequest,
+): URLSearchParams {
+  const params = new URLSearchParams();
+
+  appendTrimmed(params, 'method', request.method);
+  appendTrimmed(params, 'endpoint_template', request.endpointTemplate);
+  params.set(
+    'principal_limit',
+    String(TRAFFIC_ENDPOINT_PRINCIPAL_PAGE_LIMIT),
+  );
+  params.set('events_limit', String(TRAFFIC_ENDPOINT_RECENT_EVENTS_LIMIT));
+  params.set('bucket', request.bucket ?? 'hour');
+
+  if (request.principalCursor) {
+    params.set('principal_cursor', request.principalCursor);
+  }
+
+  return params;
+}
+
+export function fetchTrafficEndpointDetail(
+  request: TrafficEndpointDetailRequest,
+): Promise<TrafficEndpointDetailResponse> {
+  const params = buildTrafficEndpointDetailQueryParams(request);
+
+  return adminFetchJson<TrafficEndpointDetailResponse>(
+    adminApiUrl(`/traffic/endpoint?${params.toString()}`),
   );
 }
 
