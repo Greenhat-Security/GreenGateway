@@ -1500,7 +1500,7 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant},
     };
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
     fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
@@ -1712,15 +1712,178 @@ mod tests {
         config
     }
 
-    fn http_client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .expect("test HTTP client should build")
+    #[derive(Debug)]
+    struct TestHttpResponse {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: String,
     }
 
-    fn http_url(addr: std::net::SocketAddr, path: &str) -> String {
-        format!("http://{addr}{path}")
+    impl TestHttpResponse {
+        fn status(&self) -> StatusCode {
+            self.status
+        }
+
+        fn headers(&self) -> &HeaderMap {
+            &self.headers
+        }
+    }
+
+    async fn test_http_request(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        bearer: Option<&str>,
+    ) -> TestHttpResponse {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .unwrap_or_else(|err| panic!("test HTTP client should connect to {addr}: {err}"));
+            let mut request =
+                format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+            if let Some(token) = bearer {
+                request.push_str("Authorization: Bearer ");
+                request.push_str(token);
+                request.push_str("\r\n");
+            }
+            request.push_str("\r\n");
+
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .unwrap_or_else(|err| panic!("test HTTP client should write request: {err}"));
+            stream
+                .flush()
+                .await
+                .unwrap_or_else(|err| panic!("test HTTP client should flush request: {err}"));
+
+            let mut raw_response = Vec::new();
+            stream
+                .read_to_end(&mut raw_response)
+                .await
+                .unwrap_or_else(|err| panic!("test HTTP client should read response: {err}"));
+
+            parse_test_http_response(&raw_response)
+        })
+        .await
+        .unwrap_or_else(|_| panic!("test HTTP request timed out: {method} {path}"))
+    }
+
+    fn parse_test_http_response(raw_response: &[u8]) -> TestHttpResponse {
+        let header_end = raw_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("test HTTP response should contain headers");
+        let raw_headers = std::str::from_utf8(&raw_response[..header_end])
+            .expect("test HTTP response headers should be UTF-8");
+        let raw_body = &raw_response[header_end + 4..];
+
+        let mut lines = raw_headers.split("\r\n");
+        let status_line = lines
+            .next()
+            .expect("test HTTP response should include a status line");
+        let mut status_parts = status_line.splitn(3, ' ');
+        let version = status_parts
+            .next()
+            .expect("test HTTP response should include a version");
+        assert!(
+            version.starts_with("HTTP/"),
+            "test HTTP response should use HTTP, got {version}"
+        );
+        let status = status_parts
+            .next()
+            .expect("test HTTP response should include a status code")
+            .parse::<u16>()
+            .expect("test HTTP response status should be numeric");
+        let status =
+            StatusCode::from_u16(status).expect("test HTTP response status should be valid");
+
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            let (name, value) = line
+                .split_once(':')
+                .unwrap_or_else(|| panic!("test HTTP response header should contain ':': {line}"));
+            let name = HeaderName::from_bytes(name.trim().as_bytes())
+                .expect("test HTTP response header name should be valid");
+            let value = HeaderValue::from_str(value.trim())
+                .expect("test HTTP response header value should be valid");
+            headers.append(name, value);
+        }
+
+        let body = if response_is_chunked(&headers) {
+            decode_chunked_body(raw_body)
+        } else if let Some(content_length) = headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("test HTTP response Content-Length should be numeric")
+            })
+        {
+            assert!(
+                raw_body.len() >= content_length,
+                "test HTTP response body should contain Content-Length bytes"
+            );
+            raw_body[..content_length].to_vec()
+        } else {
+            raw_body.to_vec()
+        };
+
+        TestHttpResponse {
+            status,
+            headers,
+            body: String::from_utf8(body).expect("test HTTP response body should be UTF-8"),
+        }
+    }
+
+    fn response_is_chunked(headers: &HeaderMap) -> bool {
+        headers
+            .get(header::TRANSFER_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
+            })
+    }
+
+    fn decode_chunked_body(mut encoded: &[u8]) -> Vec<u8> {
+        let mut decoded = Vec::new();
+
+        loop {
+            let line_end = encoded
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .expect("test HTTP chunk should include a size line");
+            let size_line = std::str::from_utf8(&encoded[..line_end])
+                .expect("test HTTP chunk size should be UTF-8");
+            let size_text = size_line
+                .split_once(';')
+                .map_or(size_line, |(size, _extension)| size)
+                .trim();
+            let size = usize::from_str_radix(size_text, 16)
+                .expect("test HTTP chunk size should be hexadecimal");
+            encoded = &encoded[line_end + 2..];
+
+            if size == 0 {
+                break;
+            }
+
+            assert!(
+                encoded.len() >= size + 2,
+                "test HTTP chunk should contain declared bytes and trailing CRLF"
+            );
+            decoded.extend_from_slice(&encoded[..size]);
+            assert_eq!(
+                &encoded[size..size + 2],
+                b"\r\n",
+                "test HTTP chunk should end with CRLF"
+            );
+            encoded = &encoded[size + 2..];
+        }
+
+        decoded
     }
 
     async fn capture_upstream(
@@ -2091,21 +2254,12 @@ mod tests {
         config.jwt_jwks_url = Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
         let token = signed_admin_token();
         let (data_addr, admin_addr, data_server, admin_server) = spawn_split_gateway(config).await;
-        let client = http_client();
 
-        let data_admin_response = client
-            .get(http_url(data_addr, "/admin"))
-            .send()
-            .await
-            .expect("data listener admin UI request should complete");
+        let data_admin_response = test_http_request(data_addr, "GET", "/admin", None).await;
         assert_eq!(data_admin_response.status(), StatusCode::NOT_FOUND);
 
-        let data_admin_api_response = client
-            .get(http_url(data_addr, STATUS_ADMIN_ROUTE))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .expect("data listener admin API request should complete");
+        let data_admin_api_response =
+            test_http_request(data_addr, "GET", STATUS_ADMIN_ROUTE, Some(&token)).await;
         assert_eq!(data_admin_api_response.status(), StatusCode::NOT_FOUND);
         assert_upstream_receives_no_request(
             &mut captured,
@@ -2113,72 +2267,36 @@ mod tests {
         )
         .await;
 
-        let admin_ui_response = client
-            .get(http_url(admin_addr, "/admin"))
-            .send()
-            .await
-            .expect("admin listener UI request should complete");
+        let admin_ui_response = test_http_request(admin_addr, "GET", "/admin", None).await;
         assert_eq!(admin_ui_response.status(), StatusCode::OK);
-        assert!(admin_ui_response
-            .text()
-            .await
-            .expect("admin UI body should read")
-            .contains(r#"<div id="root"></div>"#));
+        assert!(admin_ui_response.body.contains(r#"<div id="root"></div>"#));
 
-        let admin_status_response = client
-            .get(http_url(admin_addr, STATUS_ADMIN_ROUTE))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .expect("admin listener status request should complete");
+        let admin_status_response =
+            test_http_request(admin_addr, "GET", STATUS_ADMIN_ROUTE, Some(&token)).await;
         assert_eq!(admin_status_response.status(), StatusCode::OK);
-        let admin_status: Value = admin_status_response
-            .json()
-            .await
+        let admin_status: Value = serde_json::from_str(&admin_status_response.body)
             .expect("admin status body should be JSON");
         assert_eq!(admin_status["version"], json!(env!("CARGO_PKG_VERSION")));
 
         for path in ["/health", "/version", "/metrics"] {
-            let data_response = client
-                .get(http_url(data_addr, path))
-                .send()
-                .await
-                .unwrap_or_else(|err| panic!("data listener {path} request failed: {err}"));
+            let data_response = test_http_request(data_addr, "GET", path, None).await;
             assert_eq!(data_response.status(), StatusCode::OK, "{path}");
 
-            let admin_response = client
-                .get(http_url(admin_addr, path))
-                .send()
-                .await
-                .unwrap_or_else(|err| panic!("admin listener {path} request failed: {err}"));
+            let admin_response = test_http_request(admin_addr, "GET", path, None).await;
             assert_eq!(admin_response.status(), StatusCode::NOT_FOUND, "{path}");
         }
 
-        let proxied_response = client
-            .get(http_url(data_addr, "/proxied?x=1"))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .expect("data listener proxy request should complete");
+        let proxied_response =
+            test_http_request(data_addr, "GET", "/proxied?x=1", Some(&token)).await;
         assert_eq!(proxied_response.status(), StatusCode::CREATED);
-        assert_eq!(
-            proxied_response
-                .text()
-                .await
-                .expect("proxied body should read"),
-            "upstream GET /proxied?x=1"
-        );
+        assert_eq!(proxied_response.body, "upstream GET /proxied?x=1");
         let proxied_request =
             next_proxied_request(&mut captured, "data listener should proxy unmatched paths").await;
         assert_eq!(proxied_request.method, Method::GET);
         assert_eq!(proxied_request.path_and_query, "/proxied?x=1");
 
-        let admin_proxy_response = client
-            .get(http_url(admin_addr, "/proxied?x=1"))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .expect("admin listener proxy request should complete");
+        let admin_proxy_response =
+            test_http_request(admin_addr, "GET", "/proxied?x=1", Some(&token)).await;
         assert_eq!(admin_proxy_response.status(), StatusCode::NOT_FOUND);
         assert_upstream_receives_no_request(
             &mut captured,
@@ -2194,15 +2312,12 @@ mod tests {
     async fn split_listeners_handle_concurrent_requests() {
         let (data_addr, admin_addr, data_server, admin_server) =
             spawn_split_gateway(split_config()).await;
-        let client = http_client();
 
         let (data_response, admin_response) = tokio::join!(
-            client.get(http_url(data_addr, "/health")).send(),
-            client.get(http_url(admin_addr, "/admin")).send(),
+            test_http_request(data_addr, "GET", "/health", None),
+            test_http_request(admin_addr, "GET", "/admin", None),
         );
 
-        let data_response = data_response.expect("data listener request should complete");
-        let admin_response = admin_response.expect("admin listener request should complete");
         assert_eq!(data_response.status(), StatusCode::OK);
         assert_eq!(admin_response.status(), StatusCode::OK);
 
@@ -2229,13 +2344,8 @@ mod tests {
         config.egress_deny_private_ips = false;
         let token = signed_admin_token();
         let (_data_addr, admin_addr, data_server, admin_server) = spawn_split_gateway(config).await;
-        let client = http_client();
 
-        let unauthenticated = client
-            .get(http_url(admin_addr, STATUS_ADMIN_ROUTE))
-            .send()
-            .await
-            .expect("unauthenticated admin status request should complete");
+        let unauthenticated = test_http_request(admin_addr, "GET", STATUS_ADMIN_ROUTE, None).await;
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
             unauthenticated
@@ -2244,28 +2354,12 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer")
         );
-        assert_eq!(
-            unauthenticated
-                .text()
-                .await
-                .expect("unauthenticated body should read"),
-            r#"{"error":"unauthorized"}"#
-        );
+        assert_eq!(unauthenticated.body, r#"{"error":"unauthorized"}"#);
 
-        let rbac_denied = client
-            .get(http_url(admin_addr, STATUS_ADMIN_ROUTE))
-            .bearer_auth(token)
-            .send()
-            .await
-            .expect("authenticated admin status request should complete");
+        let rbac_denied =
+            test_http_request(admin_addr, "GET", STATUS_ADMIN_ROUTE, Some(&token)).await;
         assert_eq!(rbac_denied.status(), StatusCode::FORBIDDEN);
-        assert_eq!(
-            rbac_denied
-                .text()
-                .await
-                .expect("RBAC denial body should read"),
-            r#"{"error":"forbidden"}"#
-        );
+        assert_eq!(rbac_denied.body, r#"{"error":"forbidden"}"#);
 
         data_server.abort();
         admin_server.abort();

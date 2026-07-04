@@ -162,6 +162,7 @@ impl Config {
         let mut problems = Vec::new();
         const LISTEN_ADDR: &str = "LISTEN_ADDR";
 
+        let listener_problem_count = problems.len();
         let listen_addr = parse_var(
             LISTEN_ADDR,
             get_var(LISTEN_ADDR),
@@ -174,6 +175,11 @@ impl Config {
             get_var(ADMIN_LISTEN_ADDR),
             &mut problems,
         );
+        if problems.len() == listener_problem_count && admin_listen_addr == Some(listen_addr) {
+            problems.push(format!(
+                "{ADMIN_LISTEN_ADDR} must not be the same address as {LISTEN_ADDR} (both resolved to {listen_addr}); choose a different port for the admin listener or leave {ADMIN_LISTEN_ADDR} unset"
+            ));
+        }
         let admin_prefix = parse_admin_prefix(
             ADMIN_PREFIX,
             get_var(ADMIN_PREFIX),
@@ -1061,6 +1067,44 @@ mod tests {
             DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES
         );
         assert!(config.egress_deny_private_ips);
+    }
+
+    #[test]
+    fn admin_listen_addr_must_differ_from_listen_addr() {
+        let error = Config::from_env_vars(|name| match name {
+            "LISTEN_ADDR" | "ADMIN_LISTEN_ADDR" => Ok("127.0.0.1:9090".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject duplicate listener addresses");
+
+        let message = error.to_string();
+        assert!(message.contains("configuration is invalid:"));
+        assert!(message.contains("ADMIN_LISTEN_ADDR must not be the same address as LISTEN_ADDR"));
+        assert!(message.contains("both resolved to 127.0.0.1:9090"));
+        assert!(message.contains("choose a different port for the admin listener"));
+        assert_eq!(error.problems.len(), 1);
+
+        let split_config = Config::from_env_vars(|name| match name {
+            "LISTEN_ADDR" => Ok("127.0.0.1:9090".to_owned()),
+            "ADMIN_LISTEN_ADDR" => Ok("127.0.0.1:9091".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should allow different listener addresses");
+        assert_eq!(
+            split_config.admin_listen_addr,
+            Some(
+                "127.0.0.1:9091"
+                    .parse::<SocketAddr>()
+                    .expect("test admin address should parse")
+            )
+        );
+
+        let unified_config = Config::from_env_vars(|name| match name {
+            "LISTEN_ADDR" => Ok("127.0.0.1:9090".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should allow ADMIN_LISTEN_ADDR to be unset");
+        assert_eq!(unified_config.admin_listen_addr, None);
     }
 
     #[test]
