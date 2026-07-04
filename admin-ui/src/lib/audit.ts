@@ -1,4 +1,5 @@
 import { adminFetchJson } from './api';
+import { adminApiUrl } from './config';
 
 export type JsonObject = Record<string, unknown>;
 
@@ -77,9 +78,9 @@ export function fetchAuditEvents(
 ): Promise<AuditQueryResponse> {
   const params = buildAuditQueryParams(filters, beforeId);
   const query = params.toString();
-  const path = query.length > 0 ? `/v1/admin/audit?${query}` : '/v1/admin/audit';
+  const path = query.length > 0 ? `/audit?${query}` : '/audit';
 
-  return adminFetchJson<AuditQueryResponse>(path);
+  return adminFetchJson<AuditQueryResponse>(adminApiUrl(path));
 }
 
 function appendTrimmed(

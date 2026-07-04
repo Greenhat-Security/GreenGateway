@@ -1,4 +1,5 @@
 import { adminFetchJson } from './api';
+import { adminApiUrl } from './config';
 
 export type GatewayStatus = {
   version: string;
@@ -34,5 +35,5 @@ export type RateLimitStatus = {
 };
 
 export function fetchGatewayStatus(): Promise<GatewayStatus> {
-  return adminFetchJson<GatewayStatus>('/v1/admin/status');
+  return adminFetchJson<GatewayStatus>(adminApiUrl('/status'));
 }

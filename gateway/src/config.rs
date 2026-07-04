@@ -24,8 +24,8 @@ const DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES: &[&str] = &["application/json"];
 const DEFAULT_AUTH_ENABLED: bool = true;
 const DEFAULT_AUTH_MODE: AuthMode = AuthMode::Required;
 const DEFAULT_AUTH_COOKIE_NAME: &str = "session";
-const DEFAULT_AUTH_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics", "/admin"];
-const DEFAULT_RBAC_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics", "/admin"];
+pub const DEFAULT_ADMIN_PREFIX: &str = "/admin";
+const DEFAULT_EXEMPT_PROBE_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_JWT_JWKS_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_ROLES_CLAIM: &str = "roles";
 const DEFAULT_CSRF_ENABLED: bool = true;
@@ -38,6 +38,7 @@ const DEFAULT_EGRESS_CONNECT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_EGRESS_MAX_RESPONSE_BYTES: usize = 5_242_880;
 const DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_EGRESS_DENY_PRIVATE_IPS: bool = true;
+const ADMIN_PREFIX: &str = "ADMIN_PREFIX";
 const AUDIT_LOG_FILE: &str = "AUDIT_LOG_FILE";
 const AUDIT_SQLITE_PATH: &str = "AUDIT_SQLITE_PATH";
 const AUDIT_SQLITE_RETENTION_DAYS: &str = "AUDIT_SQLITE_RETENTION_DAYS";
@@ -79,6 +80,7 @@ const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub listen_addr: SocketAddr,
+    pub admin_prefix: String,
     pub audit_log_file: Option<String>,
     pub audit_sqlite_path: Option<String>,
     pub audit_sqlite_retention_days: Option<u32>,
@@ -159,6 +161,12 @@ impl Config {
             "socket address",
             &mut problems,
         );
+        let admin_prefix = parse_admin_prefix(
+            ADMIN_PREFIX,
+            get_var(ADMIN_PREFIX),
+            DEFAULT_ADMIN_PREFIX,
+            &mut problems,
+        );
         let audit_log_file =
             parse_optional_string(AUDIT_LOG_FILE, get_var(AUDIT_LOG_FILE), &mut problems);
         let audit_sqlite_path =
@@ -231,7 +239,7 @@ impl Config {
         let rbac_exempt_paths = parse_comma_separated_paths(
             RBAC_EXEMPT_PATHS,
             get_var(RBAC_EXEMPT_PATHS),
-            DEFAULT_RBAC_EXEMPT_PATHS,
+            &default_admin_exempt_paths(&admin_prefix),
             &mut problems,
         );
         let session_cookie_name = parse_var(
@@ -270,7 +278,7 @@ impl Config {
         let auth_exempt_paths = parse_comma_separated_paths(
             AUTH_EXEMPT_PATHS,
             get_var(AUTH_EXEMPT_PATHS),
-            DEFAULT_AUTH_EXEMPT_PATHS,
+            &default_admin_exempt_paths(&admin_prefix),
             &mut problems,
         );
         let jwt_jwks_url =
@@ -325,7 +333,7 @@ impl Config {
         let csrf_exempt_paths = parse_comma_separated_paths(
             CSRF_EXEMPT_PATHS,
             get_var(CSRF_EXEMPT_PATHS),
-            DEFAULT_CSRF_EXEMPT_PATHS,
+            &default_paths(DEFAULT_CSRF_EXEMPT_PATHS),
             &mut problems,
         );
         let upstream_url =
@@ -381,6 +389,7 @@ impl Config {
         if problems.is_empty() {
             Ok(Self {
                 listen_addr,
+                admin_prefix,
                 audit_log_file,
                 audit_sqlite_path,
                 audit_sqlite_retention_days,
@@ -554,6 +563,25 @@ fn parse_non_empty_string(
         default.to_owned()
     } else {
         parsed.to_owned()
+    }
+}
+
+fn parse_admin_prefix(
+    name: &str,
+    value: Result<String, VarError>,
+    default: &str,
+    problems: &mut Vec<String>,
+) -> String {
+    let parsed = parse_var(name, value, default.to_owned(), "URI path prefix", problems);
+    let parsed = parsed.trim();
+
+    if is_valid_admin_prefix(parsed) {
+        parsed.to_owned()
+    } else {
+        problems.push(format!(
+            "{name} must be a non-root URI path prefix starting with '/' and containing only path segments made of ASCII letters, digits, '.', '-', '_', or '~', got '{parsed}'"
+        ));
+        default.to_owned()
     }
 }
 
@@ -749,17 +777,15 @@ fn parse_optional_upstream_url(
 fn parse_comma_separated_paths(
     name: &str,
     value: Result<String, VarError>,
-    default: &[&str],
+    default: &[String],
     problems: &mut Vec<String>,
 ) -> Vec<String> {
     let value = match value {
         Ok(value) => value,
-        Err(VarError::NotPresent) => {
-            return default.iter().map(|value| (*value).to_owned()).collect()
-        }
+        Err(VarError::NotPresent) => return default.to_owned(),
         Err(VarError::NotUnicode(value)) => {
             problems.push(format!("{name} must be valid Unicode, got {value:?}"));
-            return default.iter().map(|value| (*value).to_owned()).collect();
+            return default.to_owned();
         }
     };
 
@@ -780,6 +806,16 @@ fn parse_comma_separated_paths(
     }
 
     values
+}
+
+fn default_admin_exempt_paths(admin_prefix: &str) -> Vec<String> {
+    let mut paths = default_paths(DEFAULT_EXEMPT_PROBE_PATHS);
+    paths.push(admin_prefix.to_owned());
+    paths
+}
+
+fn default_paths(paths: &[&str]) -> Vec<String> {
+    paths.iter().map(|value| (*value).to_owned()).collect()
 }
 
 fn is_valid_cookie_name(value: &str) -> bool {
@@ -820,6 +856,20 @@ fn is_valid_exempt_path(value: &str) -> bool {
             .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
 }
 
+fn is_valid_admin_prefix(value: &str) -> bool {
+    value.starts_with('/')
+        && value != "/"
+        && !value.ends_with('/')
+        && value
+            .split('/')
+            .skip(1)
+            .all(|segment| !segment.is_empty() && segment.bytes().all(is_valid_admin_path_byte))
+}
+
+fn is_valid_admin_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'~')
+}
+
 fn is_valid_hostname_without_port(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 253
@@ -855,6 +905,7 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("test address should parse")
         );
+        assert_eq!(config.admin_prefix, DEFAULT_ADMIN_PREFIX);
         assert_eq!(config.audit_log_file, None);
         assert_eq!(config.audit_sqlite_path, None);
         assert_eq!(config.audit_sqlite_retention_days, None);
@@ -961,6 +1012,7 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("default address should parse")
         );
+        assert_eq!(config.admin_prefix, DEFAULT_ADMIN_PREFIX);
         assert_eq!(config.audit_log_file, None);
         assert_eq!(config.audit_sqlite_path, None);
         assert_eq!(config.audit_sqlite_retention_days, None);
@@ -1085,6 +1137,61 @@ mod tests {
         .expect("config should parse");
 
         assert_eq!(config.audit_log_file, None);
+    }
+
+    #[test]
+    fn admin_prefix_parses_optional_path_prefix() {
+        let config = Config::from_env_vars(|name| match name {
+            "ADMIN_PREFIX" => Ok("  /ops/admin  ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.admin_prefix, "/ops/admin");
+        assert_eq!(
+            config.rbac_exempt_paths,
+            vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+                "/ops/admin".to_owned(),
+            ]
+        );
+        assert_eq!(
+            config.auth_exempt_paths,
+            vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+                "/ops/admin".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_admin_prefix_values_are_rejected() {
+        for value in [
+            "",
+            "   ",
+            "admin",
+            "/",
+            "/admin/",
+            "/admin//ops",
+            "/admin/{id}",
+        ] {
+            let error = Config::from_env_vars(|name| match name {
+                "ADMIN_PREFIX" => Ok(value.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect_err("config should reject invalid admin prefix");
+
+            let message = error.to_string();
+            assert!(
+                message.contains("ADMIN_PREFIX must be a non-root URI path prefix"),
+                "{message}"
+            );
+            assert_eq!(error.problems.len(), 1);
+        }
     }
 
     #[test]

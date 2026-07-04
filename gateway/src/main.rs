@@ -43,11 +43,13 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 const ADMIN_UI_ROUTE: &str = "/admin";
 const ADMIN_UI_INDEX: &str = "index.html";
 const ADMIN_UI_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+const DEFAULT_ADMIN_API_PREFIX: &str = "/v1/admin";
 const AUDIT_ADMIN_ROUTE: &str = "/v1/admin/audit";
 const AUDIT_EVENTS_STREAM_ROUTE: &str = "/v1/admin/events/stream";
 const STATUS_ADMIN_ROUTE: &str = "/v1/admin/status";
 const AUDIT_ADMIN_ROLE: &str = "admin";
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
+const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
 const MAX_AUDIT_QUERY_LIMIT: usize = 500;
 
@@ -59,6 +61,7 @@ struct AdminUiAssets;
 struct AppState {
     metrics_handle: PrometheusHandle,
     proxy: Option<ProxyState>,
+    routes: GatewayRoutes,
 }
 
 #[derive(Clone)]
@@ -66,6 +69,72 @@ struct ProxyState {
     upstream_origin: String,
     egress_client: Arc<egress::EgressClient>,
     max_request_body_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+struct GatewayRoutes {
+    admin: AdminRoutes,
+    exact_owned_paths: Vec<String>,
+    prefix_owned_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct AdminRoutes {
+    ui_prefix: String,
+    ui_slash_route: String,
+    ui_asset_route: String,
+    api_prefix: String,
+    audit_route: String,
+    events_stream_route: String,
+    status_route: String,
+}
+
+impl GatewayRoutes {
+    fn from_config(config: &config::Config) -> Self {
+        let admin = AdminRoutes::from_prefix(&config.admin_prefix);
+        let exact_owned_paths = GATEWAY_OWNED_EXACT_PATHS
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect();
+        let mut prefix_owned_paths = vec![admin.ui_prefix.clone(), admin.api_prefix.clone()];
+        prefix_owned_paths.sort();
+        prefix_owned_paths.dedup();
+        // Add the future /mcp control-plane prefix here when the Phase 6 route
+        // lands; do not reserve it with a fabricated route before then.
+
+        Self {
+            admin,
+            exact_owned_paths,
+            prefix_owned_paths,
+        }
+    }
+
+    fn is_gateway_owned_path(&self, path: &str) -> bool {
+        self.exact_owned_paths.iter().any(|owned| path == owned)
+            || self
+                .prefix_owned_paths
+                .iter()
+                .any(|owned| path_match::path_prefix_matches(path, owned))
+    }
+}
+
+impl AdminRoutes {
+    fn from_prefix(admin_prefix: &str) -> Self {
+        let api_prefix = format!("/v1{admin_prefix}");
+        debug_assert!(
+            admin_prefix != config::DEFAULT_ADMIN_PREFIX || api_prefix == DEFAULT_ADMIN_API_PREFIX
+        );
+
+        Self {
+            ui_prefix: admin_prefix.to_owned(),
+            ui_slash_route: format!("{admin_prefix}/"),
+            ui_asset_route: format!("{admin_prefix}/{{*path}}"),
+            audit_route: format!("{api_prefix}/audit"),
+            events_stream_route: format!("{api_prefix}/events/stream"),
+            status_route: format!("{api_prefix}/status"),
+            api_prefix,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -265,6 +334,7 @@ fn app_with_process_started_at(
         egress::EgressConfig::from_config(&config),
     )?);
     let proxy_state = ProxyState::from_config(&config, Arc::clone(&egress_client));
+    let routes = GatewayRoutes::from_config(&config);
     let validator = auth::JwtValidator::from_config(&config, egress_client)?
         .map(|validator| Arc::new(validator) as Arc<dyn auth::SessionValidator>);
     let loaded_policy = rbac::Policy::from_config(&config)?;
@@ -311,9 +381,9 @@ fn app_with_process_started_at(
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/metrics", get(metrics_endpoint))
-        .route(ADMIN_UI_ROUTE, get(admin_ui_index))
-        .route("/admin/", get(admin_ui_index))
-        .route("/admin/{*path}", get(admin_ui_asset));
+        .route(routes.admin.ui_prefix.as_str(), get(admin_ui_index))
+        .route(routes.admin.ui_slash_route.as_str(), get(admin_ui_index))
+        .route(routes.admin.ui_asset_route.as_str(), get(admin_ui_asset));
 
     let router = if proxy_state.is_some() {
         router.fallback(any(proxy_fallback))
@@ -325,11 +395,15 @@ fn app_with_process_started_at(
         .with_state(AppState {
             metrics_handle,
             proxy: proxy_state,
+            routes: routes.clone(),
         })
         .merge(
             Router::new()
-                .route(AUDIT_ADMIN_ROUTE, get(audit_query_endpoint))
-                .route(AUDIT_EVENTS_STREAM_ROUTE, get(audit_events_stream_endpoint))
+                .route(routes.admin.audit_route.as_str(), get(audit_query_endpoint))
+                .route(
+                    routes.admin.events_stream_route.as_str(),
+                    get(audit_events_stream_endpoint),
+                )
                 .with_state(AuditAdminState {
                     query_store: audit_query_store,
                     event_sender: audit_event_sender,
@@ -337,7 +411,7 @@ fn app_with_process_started_at(
         )
         .merge(
             Router::new()
-                .route(STATUS_ADMIN_ROUTE, get(status_endpoint))
+                .route(routes.admin.status_route.as_str(), get(status_endpoint))
                 .with_state(status_state),
         );
 
@@ -503,6 +577,10 @@ impl ProxyState {
 
 async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -> Response {
     record_request(PROXY_FALLBACK_ROUTE);
+
+    if state.routes.is_gateway_owned_path(request.uri().path()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
 
     let Some(proxy) = state.proxy.as_ref() else {
         return StatusCode::NOT_FOUND.into_response();
@@ -691,12 +769,12 @@ async fn status_endpoint(
     Json(StatusResponse::from_state(&state)).into_response()
 }
 
-async fn admin_ui_index() -> Response {
+async fn admin_ui_index(State(state): State<AppState>) -> Response {
     record_request(ADMIN_UI_ROUTE);
-    admin_ui_index_response()
+    admin_ui_index_response(&state.routes.admin)
 }
 
-async fn admin_ui_asset(Path(path): Path<String>) -> Response {
+async fn admin_ui_asset(State(state): State<AppState>, Path(path): Path<String>) -> Response {
     record_request(ADMIN_UI_ROUTE);
 
     let asset_path = path.trim_start_matches('/');
@@ -706,14 +784,58 @@ async fn admin_ui_asset(Path(path): Path<String>) -> Response {
         }
     }
 
-    admin_ui_index_response()
+    admin_ui_index_response(&state.routes.admin)
 }
 
-fn admin_ui_index_response() -> Response {
+fn admin_ui_index_response(routes: &AdminRoutes) -> Response {
     match AdminUiAssets::get(ADMIN_UI_INDEX) {
-        Some(asset) => embedded_asset_response(ADMIN_UI_INDEX, asset),
+        Some(asset) => admin_ui_html_response(routes, asset),
         None => internal_server_error("admin UI index not embedded"),
     }
+}
+
+fn admin_ui_html_response(routes: &AdminRoutes, asset: rust_embed::EmbeddedFile) -> Response {
+    let html = match std::str::from_utf8(asset.data.as_ref()) {
+        Ok(html) => rewrite_admin_ui_index(html, routes),
+        Err(err) => {
+            tracing::error!(error = %err, "embedded admin UI index is not UTF-8");
+            return internal_server_error("admin UI index is not valid UTF-8");
+        }
+    };
+
+    (
+        [
+            (header::CONTENT_TYPE, content_type_for_path(ADMIN_UI_INDEX)),
+            (
+                HeaderName::from_static("content-security-policy"),
+                HeaderValue::from_static(ADMIN_UI_CONTENT_SECURITY_POLICY),
+            ),
+        ],
+        html,
+    )
+        .into_response()
+}
+
+fn rewrite_admin_ui_index(html: &str, routes: &AdminRoutes) -> String {
+    let admin_base_with_slash = format!("{}/", routes.ui_prefix);
+    let html = html.replace("/admin/", &admin_base_with_slash);
+    let config_meta = format!(
+        r#"    <meta name="greengateway-admin-base" content="{}" />
+    <meta name="greengateway-admin-api-base" content="{}" />
+"#,
+        html_attribute_value(&routes.ui_prefix),
+        html_attribute_value(&routes.api_prefix),
+    );
+
+    html.replacen("  </head>", &format!("{config_meta}  </head>"), 1)
+}
+
+fn html_attribute_value(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn embedded_asset_response(path: &str, asset: rust_embed::EmbeddedFile) -> Response {
@@ -1046,6 +1168,7 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::StatusCode};
     use futures_util::StreamExt;
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use rusqlite::{params, Connection};
     use serde_json::Value;
     use std::{
@@ -1063,6 +1186,7 @@ mod tests {
             listen_addr: "127.0.0.1:0"
                 .parse()
                 .expect("test listen address should parse"),
+            admin_prefix: config::DEFAULT_ADMIN_PREFIX.to_owned(),
             audit_log_file: None,
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,
@@ -1248,6 +1372,18 @@ mod tests {
         response
     }
 
+    async fn assert_upstream_receives_no_request(
+        captured: &mut tokio::sync::mpsc::Receiver<CapturedRequest>,
+        context: &str,
+    ) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), captured.recv())
+                .await
+                .is_err(),
+            "{context}"
+        );
+    }
+
     async fn delayed_stream_upstream() -> Response {
         let chunks = futures_util::stream::unfold(0, |index| async move {
             match index {
@@ -1349,6 +1485,25 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key(REQUEST_ID_HEADER));
+    }
+
+    #[test]
+    fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
+        let default_routes = AdminRoutes::from_prefix(config::DEFAULT_ADMIN_PREFIX);
+        assert_eq!(default_routes.api_prefix, DEFAULT_ADMIN_API_PREFIX);
+        assert_eq!(default_routes.audit_route, AUDIT_ADMIN_ROUTE);
+        assert_eq!(
+            default_routes.events_stream_route,
+            AUDIT_EVENTS_STREAM_ROUTE
+        );
+        assert_eq!(default_routes.status_route, STATUS_ADMIN_ROUTE);
+
+        let custom_routes = AdminRoutes::from_prefix("/ops");
+        assert_eq!(custom_routes.ui_prefix, "/ops");
+        assert_eq!(custom_routes.api_prefix, "/v1/ops");
+        assert_eq!(custom_routes.audit_route, "/v1/ops/audit");
+        assert_eq!(custom_routes.events_stream_route, "/v1/ops/events/stream");
+        assert_eq!(custom_routes.status_route, "/v1/ops/status");
     }
 
     #[tokio::test]
@@ -1928,12 +2083,269 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_string(response).await, r#"{"status":"ok"}"#);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), captured.recv())
-                .await
-                .is_err(),
-            "health route should not be proxied"
+        assert_upstream_receives_no_request(&mut captured, "health route should not be proxied")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reserved_gateway_paths_never_reach_proxy_upstream() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let config = proxy_config(upstream_addr);
+        let routes = GatewayRoutes::from_config(&config);
+        let router = proxy_router(config, test_audit_log());
+
+        let admin_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(routes.admin.ui_prefix.as_str())
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("admin UI request should complete");
+
+        assert_eq!(admin_response.status(), StatusCode::OK);
+        assert!(body_string(admin_response)
+            .await
+            .contains(r#"<div id="root"></div>"#));
+
+        let audit_response = router
+            .oneshot(audit_query_request(&routes.admin.audit_route, None))
+            .await
+            .expect("audit request should complete");
+
+        assert_eq!(audit_response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body_string(audit_response).await,
+            r#"{"error":"unauthorized"}"#
         );
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "reserved admin UI and audit API paths should not be proxied",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn custom_admin_prefix_moves_admin_surface_and_frees_default_admin_path() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut config = proxy_config(upstream_addr);
+        config.admin_prefix = "/ops".to_owned();
+        config.auth_exempt_paths = vec![
+            "/health".to_owned(),
+            "/version".to_owned(),
+            "/metrics".to_owned(),
+            "/ops".to_owned(),
+        ];
+        config.rbac_exempt_paths = config.auth_exempt_paths.clone();
+        let routes = GatewayRoutes::from_config(&config);
+        let router = proxy_router(config, test_audit_log());
+
+        let admin_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ops")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("custom admin UI request should complete");
+
+        assert_eq!(admin_response.status(), StatusCode::OK);
+        let admin_body = body_string(admin_response).await;
+        assert!(admin_body.contains(r#"<div id="root"></div>"#));
+        assert!(admin_body.contains(r#"greengateway-admin-base" content="/ops""#));
+        assert!(admin_body.contains(r#"greengateway-admin-api-base" content="/v1/ops""#));
+        assert!(admin_body.contains(r#"/ops/assets/"#));
+
+        let status_response = router
+            .clone()
+            .oneshot(audit_query_request(
+                &routes.admin.status_route,
+                Some(test_principal(&["admin"])),
+            ))
+            .await
+            .expect("custom admin status request should complete");
+
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = json_body(status_response).await;
+        assert_eq!(status_body["version"], json!(env!("CARGO_PKG_VERSION")));
+
+        let old_admin_response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("old admin path request should complete");
+
+        assert_eq!(old_admin_response.status(), StatusCode::CREATED);
+        assert_eq!(body_string(old_admin_response).await, "upstream GET /admin");
+        let upstream = captured
+            .recv()
+            .await
+            .expect("old admin path should fall through to upstream");
+        assert_eq!(upstream.method, Method::GET);
+        assert_eq!(upstream.path_and_query, "/admin");
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "custom admin UI and API paths should not be proxied",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn custom_admin_prefix_api_requires_and_accepts_real_bearer_auth() {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let db = TempDb::new("custom-admin-real-auth");
+        create_audit_schema(&db.path);
+        let mut config = test_config(Vec::new());
+        config.admin_prefix = "/ops".to_owned();
+        config.auth_exempt_paths = vec![
+            "/health".to_owned(),
+            "/version".to_owned(),
+            "/metrics".to_owned(),
+            "/ops".to_owned(),
+        ];
+        config.rbac_exempt_paths = config.auth_exempt_paths.clone();
+        config.audit_sqlite_path = Some(db.path.to_string_lossy().into_owned());
+        config.jwt_jwks_url = Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
+        config.egress_deny_private_ips = false;
+        let routes = GatewayRoutes::from_config(&config);
+        assert_eq!(routes.admin.api_prefix, "/v1/ops");
+        assert_eq!(routes.admin.audit_route, "/v1/ops/audit");
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let ui_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ops")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("custom admin UI request should complete");
+        assert_eq!(ui_response.status(), StatusCode::OK);
+
+        let missing_token_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(routes.admin.audit_route.as_str())
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("unauthenticated custom audit request should complete");
+        assert_eq!(missing_token_response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body_string(missing_token_response).await,
+            r#"{"error":"unauthorized"}"#
+        );
+
+        let token = signed_admin_token();
+        let authenticated_response = router
+            .oneshot(
+                Request::builder()
+                    .uri(routes.admin.audit_route.as_str())
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("authenticated custom audit request should complete");
+        assert_eq!(authenticated_response.status(), StatusCode::OK);
+        assert_eq!(json_body(authenticated_response).await["events"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn custom_admin_prefix_is_reserved_from_proxy_collisions() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut config = proxy_config(upstream_addr);
+        config.admin_prefix = "/ops".to_owned();
+        config.auth_exempt_paths = vec![
+            "/health".to_owned(),
+            "/version".to_owned(),
+            "/metrics".to_owned(),
+            "/ops".to_owned(),
+        ];
+        config.rbac_exempt_paths = config.auth_exempt_paths.clone();
+        let routes = GatewayRoutes::from_config(&config);
+        let router = proxy_router(config, test_audit_log());
+        assert_eq!(routes.admin.api_prefix, "/v1/ops");
+        assert!(routes.is_gateway_owned_path("/ops/assets/app.js"));
+        assert!(routes.is_gateway_owned_path("/v1/ops/audit"));
+        assert!(!routes.is_gateway_owned_path("/ops-api/audit"));
+
+        let admin_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(routes.admin.ui_prefix.as_str())
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("custom admin UI request should complete");
+
+        assert_eq!(admin_response.status(), StatusCode::OK);
+
+        let audit_response = router
+            .oneshot(audit_query_request(&routes.admin.audit_route, None))
+            .await
+            .expect("custom audit request should complete");
+
+        assert_eq!(audit_response.status(), StatusCode::UNAUTHORIZED);
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "custom admin prefix collision should not reach upstream",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fixed_probe_routes_win_over_proxy_with_custom_admin_prefix() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut config = proxy_config(upstream_addr);
+        config.admin_prefix = "/ops".to_owned();
+        let router = proxy_router(config, test_audit_log());
+
+        for (uri, expected_status) in [
+            ("/health", StatusCode::OK),
+            ("/version", StatusCode::OK),
+            ("/metrics", StatusCode::OK),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("probe route request should complete");
+
+            assert_eq!(response.status(), expected_status, "{uri}");
+        }
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "fixed probe routes should not be proxied with custom admin prefix",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3005,6 +3417,80 @@ mod tests {
             session_id: "session-789".to_owned(),
             auth_method: auth::AuthMethod::Bearer,
         }
+    }
+
+    const TEST_JWT_KID: &str = "test-kid";
+    const TEST_JWT_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCnhXdj9xmwS1xg
+0FSkz/Czegzbs7x52/LjNeVoaKsKFiiZh2X6TfeNv9FBHlqaP4crN3ONOutajg2o
+jVy2LqOlmX0oWOsu7s9x1SZoy18N5jtOw/knSsYDc4y6ir/0H/WNRf+qMZXo/ZGU
+eDU0C2fONU0XXaGWD3ypaQeqClnSInMIIjpJ0gATyGPJVNuVgmdeYdkNBdmlOKrX
+dsRg7UjAmt9WXgCm6w1MRAIeZJ6cTNhQ5cx0JBVZRxeNRcVDpXx+IW6QC+HWTcbr
+GxGpNzC1AaY9q67VyV/nLypaLF2m4SyKrYbkf5azoyH7zkpvpb6mgJPjdYlhO5M8
+dVHvbB81AgMBAAECggEAByEJ7KomYLdETiZvg7gJsUmfZHYorjLrCjpP8fqKVNqO
+jcISV+2bfF/OYuwMxQWxFei9NSRtwaPL9wFVEbe4ZSK8DcyC7bNiBqEgilMlT20d
+1wNGBiMLfDgdpA6ljpkRlRqGf9KuY4Tu/heDhBx8JW1lQ3pLlxw/nOIIXnckTWny
+I5qOpk5XZ/QzJNC2ze0F2VsQ5RAGNdDG9vKHm5qeYHzgM1z9SOUMXsfPYOiXvdZP
+BPa59BdP7cmXDVCuh12ZhpVnDErYtA9iPXqmoAah14JP4xKju5QIvavsQt9S8gB5
+cxhAu4LmT9p1iOsKaDsG44gxUzmHS0bcuoIgFzDh4QKBgQDp3q9If/ZfZuu3+NPr
+F/o36JvUY5SPnbYf1p5hSyBkVhTzKyGiYq7W0Lxs/RcOhw8YlfNfzqRNnhjmZhlE
+FXpUCSXVSAtdC3MpCx2XimZltJ+TdIzajeWmh2Wx6SpJJek10UL2n6ht2BBALWyz
+Dt2s709dVlxfYwHnZWBe4xxJTQKBgQC3X4prVHXcIKTyNyMS8cC/iMgbOu+Q58CF
+VnBuRWsL96vzrHUgUcoYNTPbMOjm98Wzrk2roW+fnDMp0Y8ZusceKOVraihDifN2
+yQ2H053ctC8YEvZeOE6JlDq+llAGnRv+113pmfZ51qNeVFcwdR5ujhAunnW7UC28
++IGqI3H5iQKBgQDik2iUP8zsbqTuLrb5K9iyM7xND1DNtsjMnbwBnKw8KR3Q3LeQ
+QDUNT1tN6AFfhL++XQBVkLijrgiHpuDRklFaeyZZNJw1v7MJT4iS2XYNEOoNDLyt
+vQ2BwelnbPMXvQ/soNlUYCfoi4xq8Nc/vqZLNepZDiMeEqi0iwXLyBIOfQKBgQCv
+wF1to2TXF16gXCI8vQKNUO7h0mncS5Mk+QUHW3dO4BGpmegkkt+Mtik+czE2ddHB
+9lSxJChVJSOQeC6cbXz8thu1COkQWn7Doc1bGoLaDsR4YWxKP9NeX3iyRGTtAdXc
+OdTj2VH30rV/6nwqkIYbVgPCetPCNQWxccjtJc3OaQKBgHGijhVSMmlnGeAIiPmq
+0hj0A9bv7QQz5M2TS+yuhQjHDJWa4Asic+AkgfOu5belhSDd13QCou1r8CcUc9uv
+mu96vvRxLhwFLatFo4mL0WnOwBvMrR+5YwboH7Er4PBhmVJ2UKiQn8bNX3qdhVTp
+O2gecI9QwDJNpm29J9wJB2F8
+-----END PRIVATE KEY-----"#;
+    const TEST_JWT_PUBLIC_KEY_N: &str = "p4V3Y_cZsEtcYNBUpM_ws3oM27O8edvy4zXlaGirChYomYdl-k33jb_RQR5amj-HKzdzjTrrWo4NqI1cti6jpZl9KFjrLu7PcdUmaMtfDeY7TsP5J0rGA3OMuoq_9B_1jUX_qjGV6P2RlHg1NAtnzjVNF12hlg98qWkHqgpZ0iJzCCI6SdIAE8hjyVTblYJnXmHZDQXZpTiq13bEYO1IwJrfVl4ApusNTEQCHmSenEzYUOXMdCQVWUcXjUXFQ6V8fiFukAvh1k3G6xsRqTcwtQGmPauu1clf5y8qWixdpuEsiq2G5H-Ws6Mh-85Kb6W-poCT43WJYTuTPHVR72wfNQ";
+    const TEST_JWT_PUBLIC_KEY_E: &str = "AQAB";
+
+    async fn spawn_test_jwks_server() -> std::net::SocketAddr {
+        let jwks = json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": TEST_JWT_KID,
+                "use": "sig",
+                "alg": "RS256",
+                "n": TEST_JWT_PUBLIC_KEY_N,
+                "e": TEST_JWT_PUBLIC_KEY_E
+            }]
+        });
+
+        spawn_router(Router::new().route(
+            "/jwks.json",
+            get(move || {
+                let jwks = jwks.clone();
+                async move { Json(jwks) }
+            }),
+        ))
+        .await
+    }
+
+    fn signed_admin_token() -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(TEST_JWT_KID.to_owned());
+        let claims = json!({
+            "sub": "user-123",
+            "email": "User@Example.COM",
+            "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+            "jti": "session-123",
+            "roles": ["admin"]
+        });
+
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_JWT_PRIVATE_KEY.as_bytes())
+                .expect("test RSA private key should parse"),
+        )
+        .expect("test token should sign")
     }
 
     fn create_audit_schema(path: &PathBuf) {

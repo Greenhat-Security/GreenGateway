@@ -13,6 +13,7 @@ import {
   getStoredToken,
   setStoredToken,
 } from './lib/auth';
+import { adminBasePath } from './lib/config';
 import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
 import { StatusPage } from './views/StatusPage';
@@ -23,7 +24,7 @@ type ThemeName = 'light' | 'dark';
 
 export function App() {
   return (
-    <BrowserRouter basename="/admin">
+    <BrowserRouter basename={adminBasePath()}>
       <AdminShell />
     </BrowserRouter>
   );

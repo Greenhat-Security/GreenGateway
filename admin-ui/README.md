@@ -1,6 +1,6 @@
 # GreenGateway Admin UI
 
-This is the Vite + React + TypeScript admin UI scaffold. It is built as a separate npm project and embedded into the Rust gateway binary for production serving at `/admin`.
+This is the Vite + React + TypeScript admin UI scaffold. It is built as a separate npm project and embedded into the Rust gateway binary for production serving at the configured admin prefix, which defaults to `/admin`.
 
 ## Development
 
@@ -16,7 +16,7 @@ npm ci
 npm run dev
 ```
 
-Open the Vite URL at `http://127.0.0.1:5173/admin/`. The Vite dev server proxies `/v1/admin` API calls to `http://127.0.0.1:8080` by default.
+Open the Vite URL at `http://127.0.0.1:5173/admin/`. The Vite dev server proxies the default `/v1/admin` API calls to `http://127.0.0.1:8080`.
 
 To point the dev proxy at another backend:
 
