@@ -11,12 +11,12 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { AdminApiError } from '../lib/api';
 import {
   AuthMethodName,
-  Policy,
+  PolicyDocument,
+  PolicyRule,
+  PolicyRuleAction,
   PolicyRulePreviewResponse,
   PolicyRulePreviewSample,
   PrincipalMatcher,
-  Rule,
-  RuleAction,
   createPolicyRule,
   fetchPolicy,
   patchPolicyRule,
@@ -49,7 +49,7 @@ const AUTH_METHOD_OPTIONS: Array<{
   { value: 'session_cookie', label: 'Session cookie' },
 ];
 const ACTION_OPTIONS: Array<{
-  value: RuleAction;
+  value: PolicyRuleAction;
   label: string;
   description: string;
 }> = [
@@ -78,7 +78,7 @@ type RuleFormState = {
   authMethods: AuthMethodName[];
   principalIds: string[];
   principalIdDraft: string;
-  action: RuleAction;
+  action: PolicyRuleAction;
 };
 
 type FormErrors = {
@@ -319,7 +319,7 @@ export function RuleEditor() {
     setSaveState({ kind: 'idle' });
   }
 
-  function updateAction(action: RuleAction) {
+  function updateAction(action: PolicyRuleAction) {
     setForm((current) => ({ ...current, action }));
     setSaveState({ kind: 'idle' });
   }
@@ -393,7 +393,7 @@ export function RuleEditor() {
       const response =
         requestedRuleId === null
           ? await createPolicyRule(rule, policyEtag)
-          : await patchPolicyRule(requestedRuleId, rulePatchFromRule(rule), policyEtag);
+          : await patchPolicyRule(requestedRuleId, policyEtag, rulePatchFromRule(rule));
       setPolicyEtag(response.etag ?? policyEtag);
       setSaveState({ kind: 'saved', message: 'Rule saved.' });
     } catch (error) {
@@ -882,20 +882,20 @@ function emptyRuleForm(): RuleFormState {
   };
 }
 
-function formFromRule(rule: Rule): RuleFormState {
+function formFromRule(rule: PolicyRule): RuleFormState {
   return {
-    methods: normalizeMethods(rule.methods),
+    methods: normalizeMethods(rule.methods ?? []),
     path: rule.path,
-    roles: normalizeStrings(rule.principal.roles),
+    roles: normalizeStrings(rule.principal?.roles ?? []),
     roleDraft: '',
-    authMethods: normalizeAuthMethods(rule.principal.auth_methods),
-    principalIds: normalizeStrings(rule.principal.principal_ids),
+    authMethods: normalizeAuthMethods(rule.principal?.auth_methods ?? []),
+    principalIds: normalizeStrings(rule.principal?.principal_ids ?? []),
     principalIdDraft: '',
     action: rule.action,
   };
 }
 
-function ruleFromForm(form: RuleFormState): Rule {
+function ruleFromForm(form: RuleFormState): PolicyRule {
   return {
     methods: normalizeMethods(form.methods),
     path: form.path.trim(),
@@ -904,7 +904,7 @@ function ruleFromForm(form: RuleFormState): Rule {
   };
 }
 
-function rulePatchFromRule(rule: Rule) {
+function rulePatchFromRule(rule: PolicyRule) {
   return {
     methods: rule.methods,
     path: rule.path,
@@ -982,8 +982,8 @@ function addUnique(values: string[], value: string): string[] {
   return normalizeStrings([...values, value]);
 }
 
-function policyRoleNames(policy: Policy): string[] {
-  return Object.keys(policy.roles).sort((left, right) =>
+function policyRoleNames(policy: PolicyDocument): string[] {
+  return Object.keys(policy.roles ?? {}).sort((left, right) =>
     left.localeCompare(right),
   );
 }
@@ -1157,7 +1157,7 @@ function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError';
 }
 
-function actionBadgeClass(action: RuleAction): string {
+function actionBadgeClass(action: PolicyRuleAction): string {
   switch (action) {
     case 'allow':
       return 'success';

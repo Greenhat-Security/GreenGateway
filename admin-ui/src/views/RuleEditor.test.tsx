@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { Policy, Rule } from '../lib/policy';
+import type { PolicyDocument, PolicyRule } from '../lib/policy';
 import { RULE_PREVIEW_DEBOUNCE_MS, RuleEditor } from './RuleEditor';
 
 afterEach(() => {
@@ -164,7 +164,7 @@ describe('RuleEditor', () => {
   });
 
   it('creates a rule with the current policy ETag', async () => {
-    const createdRule: Rule = {
+    const createdRule: PolicyRule = {
       id: 'rule-generated-1',
       methods: [],
       path: '/reports/**',
@@ -209,7 +209,7 @@ describe('RuleEditor', () => {
   });
 
   it('edits an existing rule with PATCH and the current policy ETag', async () => {
-    const existingRule: Rule = {
+    const existingRule: PolicyRule = {
       id: 'support-read',
       methods: ['GET'],
       path: '/api/users/{id}',
@@ -355,15 +355,15 @@ type PolicyBackedFetchOptions = {
   ) => Promise<Response>;
   previewStatus?: number;
   previewBody?: unknown;
-  createRule?: Rule;
+  createRule?: PolicyRule;
   createStatus?: number;
   createBody?: unknown;
-  patchRule?: Rule;
+  patchRule?: PolicyRule;
   mutationEtag?: string;
 };
 
 function policyBackedFetch(
-  policy: Policy,
+  policy: PolicyDocument,
   policyEtag: string,
   options: PolicyBackedFetchOptions = {},
 ) {
@@ -516,7 +516,7 @@ function previewResponseFixture(matchCount: number, path: string) {
   };
 }
 
-function policyFixture(overrides: Partial<Policy> = {}): Policy {
+function policyFixture(overrides: Partial<PolicyDocument> = {}): PolicyDocument {
   return {
     schema_version: '0.1.0',
     default_action: 'deny',

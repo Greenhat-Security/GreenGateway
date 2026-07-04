@@ -1,54 +1,53 @@
-import { adminFetchJson, adminFetchJsonResponse } from './api';
+import { AdminApiError, adminFetchJson } from './api';
+import { authHeaders } from './auth';
 import { adminApiUrl } from './config';
 
-export type RuleAction = 'allow' | 'deny' | 'shadow';
+export type PolicyDefaultAction = 'allow' | 'deny';
+export type PolicyRuleAction = 'allow' | 'deny' | 'shadow';
 export type AuthMethodName = 'bearer_token' | 'session_cookie';
 
 export type PrincipalMatcher = {
-  roles: string[];
-  auth_methods: AuthMethodName[];
-  principal_ids: string[];
+  roles?: string[];
+  auth_methods?: string[];
+  principal_ids?: string[];
 };
 
-export type Rule = {
-  id?: string;
-  methods: string[];
+export type PolicyRule = {
+  id?: string | null;
+  enabled?: boolean;
+  methods?: string[];
   path: string;
-  principal: PrincipalMatcher;
-  action: RuleAction;
+  principal?: PrincipalMatcher;
+  action: PolicyRuleAction;
 };
 
-export type RoleEntry = {
-  permissions: string[];
-};
-
-export type Policy = {
+export type PolicyDocument = {
   schema_version: string;
-  id?: string;
-  default_action?: 'allow' | 'deny';
+  id?: string | null;
+  default_action: PolicyDefaultAction;
   enforcement_mode?: 'enforce' | 'shadow';
-  roles: Record<string, RoleEntry>;
-  routes: unknown[];
-  rules: Rule[];
-  egress?: unknown;
-  rate_limits?: unknown[];
+  roles?: Record<string, unknown>;
+  routes?: unknown[];
+  rules: PolicyRule[];
+  [key: string]: unknown;
 };
 
-export type PolicyFetchResponse = {
-  policy: Policy;
+export type PolicyReadResult = {
+  policy: PolicyDocument;
+  etag: string | null;
+};
+
+export type PolicyMutationResult<T> = {
+  value: T;
   etag: string | null;
 };
 
 export type PolicyRulePatch = {
+  enabled?: boolean;
   methods?: string[];
   path?: string;
   principal?: PrincipalMatcher;
-  action?: RuleAction;
-};
-
-export type PolicyRuleMutationResponse = {
-  rule: Rule;
-  etag: string | null;
+  action?: PolicyRuleAction;
 };
 
 export type PolicyRulePreviewSample = {
@@ -70,7 +69,7 @@ export type PolicyRulePreviewSample = {
 };
 
 export type PolicyRulePreviewRequest = {
-  rule: Rule;
+  rule: PolicyRule;
   from?: string;
   to?: string;
   sample_limit?: number;
@@ -83,12 +82,27 @@ export type PolicyRulePreviewResponse = {
   samples: PolicyRulePreviewSample[];
 };
 
-export async function fetchPolicy(): Promise<PolicyFetchResponse> {
-  const response = await adminFetchJsonResponse<Policy>(adminApiUrl('/policy'));
+type PolicyRuleHitsResponse =
+  | {
+      rules: Array<{
+        rule_id: string;
+        hits: number;
+      }>;
+    }
+  | Record<string, number>;
+
+type AdminFetchWithMetaOptions = Omit<RequestInit, 'headers'> & {
+  headers?: Record<string, string>;
+};
+
+export async function fetchPolicy(): Promise<PolicyReadResult> {
+  const response = await adminFetchJsonWithEtag<PolicyDocument>(
+    adminApiUrl('/policy'),
+  );
 
   return {
-    policy: response.body,
-    etag: response.headers.get('ETag'),
+    policy: normalizePolicy(response.value),
+    etag: response.etag,
   };
 }
 
@@ -110,33 +124,25 @@ export async function previewPolicyRule(
 }
 
 export async function createPolicyRule(
-  rule: Rule,
+  rule: PolicyRule,
   etag: string,
-): Promise<PolicyRuleMutationResponse> {
-  const response = await adminFetchJsonResponse<Rule>(
-    adminApiUrl('/policy/rules'),
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'If-Match': etag,
-      },
-      body: JSON.stringify(rule),
+): Promise<PolicyMutationResult<PolicyRule>> {
+  return adminFetchJsonWithEtag<PolicyRule>(adminApiUrl('/policy/rules'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'If-Match': etag,
     },
-  );
-
-  return {
-    rule: response.body,
-    etag: response.headers.get('ETag'),
-  };
+    body: JSON.stringify(rule),
+  });
 }
 
 export async function patchPolicyRule(
   ruleId: string,
-  patch: PolicyRulePatch,
   etag: string,
-): Promise<PolicyRuleMutationResponse> {
-  const response = await adminFetchJsonResponse<Rule>(
+  patch: PolicyRulePatch,
+): Promise<PolicyMutationResult<PolicyRule>> {
+  return adminFetchJsonWithEtag<PolicyRule>(
     adminApiUrl(`/policy/rules/${encodeURIComponent(ruleId)}`),
     {
       method: 'PATCH',
@@ -147,9 +153,128 @@ export async function patchPolicyRule(
       body: JSON.stringify(patch),
     },
   );
+}
+
+export async function deletePolicyRule(
+  ruleId: string,
+  etag: string,
+): Promise<PolicyMutationResult<{ deleted_rule_id: string }>> {
+  return adminFetchJsonWithEtag<{ deleted_rule_id: string }>(
+    adminApiUrl(`/policy/rules/${encodeURIComponent(ruleId)}`),
+    {
+      method: 'DELETE',
+      headers: {
+        'If-Match': etag,
+      },
+    },
+  );
+}
+
+export async function reorderPolicyRules(
+  order: string[],
+  etag: string,
+): Promise<PolicyMutationResult<{ order: string[] }>> {
+  return adminFetchJsonWithEtag<{ order: string[] }>(
+    adminApiUrl('/policy/rules/order'),
+    {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'If-Match': etag,
+      },
+      body: JSON.stringify(order),
+    },
+  );
+}
+
+export async function fetchPolicyRuleHits(): Promise<Record<string, number>> {
+  const response = await adminFetchJson<PolicyRuleHitsResponse>(
+    adminApiUrl('/policy/rules/hits'),
+  );
+
+  if (isPolicyRuleHitsListResponse(response)) {
+    return Object.fromEntries(
+      response.rules.map((rule) => [rule.rule_id, rule.hits]),
+    );
+  }
+
+  return response;
+}
+
+export function policyRuleId(rule: PolicyRule, index: number): string {
+  return rule.id ?? String(index);
+}
+
+export function isPolicyRuleEnabled(rule: PolicyRule): boolean {
+  return rule.enabled !== false;
+}
+
+function normalizePolicy(policy: PolicyDocument): PolicyDocument {
+  return {
+    ...policy,
+    rules: policy.rules ?? [],
+  };
+}
+
+function isPolicyRuleHitsListResponse(
+  response: PolicyRuleHitsResponse,
+): response is {
+  rules: Array<{
+    rule_id: string;
+    hits: number;
+  }>;
+} {
+  return Array.isArray((response as { rules?: unknown }).rules);
+}
+
+async function adminFetchJsonWithEtag<T>(
+  input: string,
+  options: AdminFetchWithMetaOptions = {},
+): Promise<PolicyMutationResult<T>> {
+  const headers = {
+    Accept: 'application/json',
+    ...authHeaders(),
+    ...options.headers,
+  };
+  const response = await fetch(input, { ...options, headers });
+  const body = await parseJsonBody(response);
+
+  if (!response.ok) {
+    throw new AdminApiError(response.status, errorMessage(body, response));
+  }
 
   return {
-    rule: response.body,
-    etag: response.headers.get('ETag'),
+    value: body as T,
+    etag: response.headers.get('etag'),
   };
+}
+
+async function parseJsonBody(response: Response): Promise<unknown> {
+  const text = await response.text();
+  if (text.trim().length === 0) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
+}
+
+function errorMessage(body: unknown, response: Response): string {
+  if (
+    body &&
+    typeof body === 'object' &&
+    'error' in body &&
+    typeof body.error === 'string'
+  ) {
+    return body.error;
+  }
+
+  if (typeof body === 'string' && body.trim().length > 0) {
+    return body;
+  }
+
+  return response.statusText || `Request failed with status ${response.status}`;
 }

@@ -417,6 +417,8 @@ h3 {
 .nav-item:focus-visible,
 .primary-button:focus-visible,
 .secondary-button:focus-visible,
+.rule-danger-button:focus-visible,
+.rule-toggle:focus-visible,
 .expand-button:focus-visible,
 .endpoint-detail-link:focus-visible,
 .filter-toggle:focus-visible,
@@ -1553,6 +1555,12 @@ select:focus-visible {
   background: var(--gh-sys-warning-subtle);
 }
 
+.alert.success {
+  border-color: color-mix(in srgb, var(--gh-sys-success) 30%, transparent);
+  border-inline-start-color: var(--gh-sys-success);
+  background: var(--gh-sys-success-subtle);
+}
+
 .alert.error {
   border-color: color-mix(in srgb, var(--gh-sys-danger) 28%, transparent);
   border-inline-start-color: var(--gh-sys-danger);
@@ -1627,6 +1635,131 @@ select:focus-visible {
 [data-theme="dark"] .event-row:hover td,
 [data-theme="dark"] .event-row.is-even:hover td {
   background: var(--gh-sys-primary-subtle);
+}
+
+.rule-default-banner {
+  align-items: center;
+  gap: var(--gh-ref-space-3);
+  margin-bottom: 0;
+}
+
+.rule-table {
+  min-width: 1040px;
+}
+
+.rule-row.is-dragging td {
+  background: var(--gh-sys-primary-subtle);
+}
+
+.rule-drag-cell {
+  width: 44px;
+  color: var(--gh-sys-fg-subtle);
+}
+
+.rule-drag-handle {
+  display: inline-grid;
+  width: 22px;
+  height: 28px;
+  place-content: center;
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-ref-radius-sm);
+  color: var(--gh-sys-fg-muted);
+  background: var(--gh-sys-bg-raised);
+  font-family: var(--gh-ref-font-mono);
+  font-size: var(--gh-type-caption);
+  line-height: 1;
+}
+
+.rule-method-list,
+.rule-delete-confirmation {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gh-ref-space-2);
+}
+
+.rule-path {
+  display: inline-block;
+  max-width: 300px;
+}
+
+.rule-toggle {
+  display: inline-flex;
+  min-height: var(--gh-ref-space-8);
+  align-items: center;
+  gap: var(--gh-ref-space-2);
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-comp-button-radius);
+  padding: 0 var(--gh-ref-space-3);
+  color: var(--gh-sys-fg-muted);
+  background: var(--gh-sys-bg-canvas);
+  font-size: var(--gh-type-caption);
+  font-weight: 650;
+  line-height: 1;
+  transition:
+    border-color var(--gh-ref-duration-base) var(--gh-ref-ease-standard),
+    background var(--gh-ref-duration-base) var(--gh-ref-ease-standard),
+    color var(--gh-ref-duration-base) var(--gh-ref-ease-standard);
+}
+
+.rule-toggle:hover:not(:disabled) {
+  border-color: var(--gh-sys-border-hover);
+  color: var(--gh-sys-fg);
+}
+
+.rule-toggle.is-on {
+  border-color: color-mix(in srgb, var(--gh-sys-success) 36%, transparent);
+  color: var(--gh-sys-success-text);
+  background: var(--gh-sys-success-subtle);
+}
+
+.rule-toggle-track {
+  position: relative;
+  width: 30px;
+  height: 16px;
+  border-radius: var(--gh-ref-radius-full);
+  background: var(--gh-sys-border);
+}
+
+.rule-toggle-thumb {
+  position: absolute;
+  inset-block-start: 2px;
+  inset-inline-start: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--gh-sys-bg-canvas);
+  box-shadow: var(--gh-sys-shadow-1);
+  transition: transform var(--gh-ref-duration-base) var(--gh-ref-ease-standard);
+}
+
+.rule-toggle.is-on .rule-toggle-track {
+  background: var(--gh-sys-success);
+}
+
+.rule-toggle.is-on .rule-toggle-thumb {
+  transform: translateX(14px);
+}
+
+.rule-danger-button {
+  display: inline-flex;
+  height: var(--gh-ref-space-8);
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid var(--gh-sys-danger);
+  border-radius: var(--gh-comp-button-radius);
+  padding: 0 var(--gh-ref-space-3);
+  color: var(--gh-sys-danger);
+  background: var(--gh-sys-bg-canvas);
+  font-family: var(--gh-ref-font-body);
+  font-size: var(--gh-type-caption);
+  font-weight: 650;
+  line-height: 1;
+}
+
+.rule-danger-button:hover:not(:disabled) {
+  background: var(--gh-sys-danger-subtle);
 }
 
 .expand-button {
