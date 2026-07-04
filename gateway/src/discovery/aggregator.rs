@@ -36,7 +36,7 @@ use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
-    audit::{AuditEvent, AuditSink},
+    audit::{redact::hash_args, AuditEvent, AuditSink},
     discovery::path_template::{template_stateless, PathTemplateLearner},
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
 };
@@ -45,6 +45,7 @@ const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
 const AGGREGATOR_BATCH_SIZE: usize = 200;
 const AGGREGATOR_FLUSH_INTERVAL: StdDuration = StdDuration::from_millis(250);
 const LATENCY_SAMPLE_LIMIT: usize = 1024;
+const PAYLOAD_SHAPE_SAMPLE_LIMIT: usize = 128;
 const ID_PLACEHOLDER: &str = "{id}";
 const PARAM_PLACEHOLDER: &str = "{param}";
 
@@ -89,6 +90,29 @@ CREATE INDEX IF NOT EXISTS idx_discovery_endpoint_template
 ON discovery_endpoint_aggregates(endpoint_template);
 "#;
 
+const CREATE_PAYLOAD_CAPTURE_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS discovery_payload_shape_stats (
+    method TEXT NOT NULL,
+    endpoint_template TEXT NOT NULL,
+    shape_observation_count INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (method, endpoint_template)
+);
+
+CREATE TABLE IF NOT EXISTS discovery_payload_shape_samples (
+    method TEXT NOT NULL,
+    endpoint_template TEXT NOT NULL,
+    sample_slot INTEGER NOT NULL,
+    observed_at TEXT NOT NULL,
+    shape_hash TEXT NOT NULL,
+    shape_json TEXT NOT NULL,
+    PRIMARY KEY (method, endpoint_template, sample_slot)
+);
+
+CREATE INDEX IF NOT EXISTS idx_discovery_payload_shape_template
+ON discovery_payload_shape_samples(endpoint_template);
+"#;
+
 const UPSERT_AGGREGATE_SQL: &str = r#"
 INSERT INTO discovery_endpoint_aggregates (
     method,
@@ -120,6 +144,7 @@ ON CONFLICT(method, endpoint_template) DO UPDATE SET
 #[derive(Debug, Clone)]
 pub struct EndpointAggregatorSinkConfig {
     pub path: PathBuf,
+    pub payload_capture_enabled: bool,
 }
 
 pub struct EndpointAggregatorSink {
@@ -273,12 +298,20 @@ impl EndpointAggregatorSink {
             path: config.path.clone(),
             source,
         })?;
-        let state = AggregatorState::load(&connection).map_err(|source| {
-            EndpointAggregatorSinkError::Load {
+        if config.payload_capture_enabled {
+            configure_payload_capture_connection(&connection).map_err(|source| {
+                EndpointAggregatorSinkError::Setup {
+                    path: config.path.clone(),
+                    source,
+                }
+            })?;
+        }
+        let state = AggregatorState::load(&connection, config.payload_capture_enabled).map_err(
+            |source| EndpointAggregatorSinkError::Load {
                 path: config.path.clone(),
                 source,
-            }
-        })?;
+            },
+        )?;
 
         let shared = Arc::new(EndpointAggregatorShared {
             path: config.path,
@@ -361,10 +394,16 @@ impl EndpointAggregatorShared {
             .iter()
             .filter_map(|key| state.aggregates.get(key).cloned())
             .collect::<Vec<_>>();
+        let payload_capture_enabled = state.payload_capture_enabled;
 
         let result = {
             let mut connection = self.connection_guard();
-            write_flush(&mut connection, &deleted_keys, &dirty_aggregates)
+            write_flush(
+                &mut connection,
+                &deleted_keys,
+                &dirty_aggregates,
+                payload_capture_enabled,
+            )
         };
 
         match result {
@@ -444,6 +483,8 @@ struct EndpointAggregate {
     status_counts: BTreeMap<u16, u64>,
     latency_count: u64,
     latency_samples: Vec<u64>,
+    payload_shape_observation_count: u64,
+    payload_shape_samples: Vec<PayloadShapeSample>,
     /// Known limitation: exact principal entries are never capped or evicted.
     /// This map grows one entry per distinct `actor.user_id` seen for this
     /// endpoint for the lifetime of the process, and the matching
@@ -463,6 +504,8 @@ impl EndpointAggregate {
             status_counts: BTreeMap::new(),
             latency_count: 0,
             latency_samples: Vec::new(),
+            payload_shape_observation_count: 0,
+            payload_shape_samples: Vec::new(),
             principals: HashMap::new(),
         }
     }
@@ -478,6 +521,9 @@ impl EndpointAggregate {
         self.call_count = self.call_count.saturating_add(1);
         *self.status_counts.entry(observation.status).or_insert(0) += 1;
         self.record_latency(observation.latency_ms);
+        if let Some(payload_shape) = observation.payload_shape.as_ref() {
+            self.record_payload_shape(&observation.timestamp, payload_shape.clone());
+        }
 
         if let Some(user_id) = observation.user_id.as_deref() {
             if user_id.is_empty() {
@@ -514,6 +560,10 @@ impl EndpointAggregate {
             *self.status_counts.entry(status).or_insert(0) += count;
         }
         self.merge_latency(other.latency_count, other.latency_samples);
+        self.merge_payload_shapes(
+            other.payload_shape_observation_count,
+            other.payload_shape_samples,
+        );
 
         for (user_id, other_seen) in other.principals {
             self.principals
@@ -555,8 +605,61 @@ impl EndpointAggregate {
         }
     }
 
+    fn record_payload_shape(&mut self, observed_at: &str, shape: Value) {
+        self.payload_shape_observation_count =
+            self.payload_shape_observation_count.saturating_add(1);
+        offer_payload_shape_sample(
+            self.payload_shape_observation_count,
+            PayloadShapeSample::new(observed_at, shape),
+            &mut self.payload_shape_samples,
+            PAYLOAD_SHAPE_SAMPLE_LIMIT,
+        );
+    }
+
+    fn merge_payload_shapes(&mut self, other_count: u64, other_samples: Vec<PayloadShapeSample>) {
+        let original_count = self.payload_shape_observation_count;
+        self.payload_shape_observation_count = self
+            .payload_shape_observation_count
+            .saturating_add(other_count);
+
+        if self.payload_shape_samples.len() + other_samples.len() <= PAYLOAD_SHAPE_SAMPLE_LIMIT {
+            self.payload_shape_samples.extend(other_samples);
+            return;
+        }
+
+        for (index, sample) in other_samples.into_iter().enumerate() {
+            let synthetic_count = original_count
+                .saturating_add(u64::try_from(index).unwrap_or(u64::MAX))
+                .saturating_add(1);
+            offer_payload_shape_sample(
+                synthetic_count,
+                sample,
+                &mut self.payload_shape_samples,
+                PAYLOAD_SHAPE_SAMPLE_LIMIT,
+            );
+        }
+    }
+
     fn latency_percentiles(&self) -> LatencyPercentiles {
         LatencyPercentiles::from_samples(&self.latency_samples)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PayloadShapeSample {
+    observed_at: String,
+    shape_hash: String,
+    shape: Value,
+}
+
+impl PayloadShapeSample {
+    fn new(observed_at: &str, shape: Value) -> Self {
+        let shape_hash = hash_args(&shape);
+        Self {
+            observed_at: observed_at.to_owned(),
+            shape_hash,
+            shape,
+        }
     }
 }
 
@@ -579,6 +682,7 @@ impl PrincipalSeen {
 
 #[derive(Debug, Default)]
 struct AggregatorState {
+    payload_capture_enabled: bool,
     learner: PathTemplateLearner,
     aggregates: HashMap<EndpointKey, EndpointAggregate>,
     dirty_keys: HashSet<EndpointKey>,
@@ -587,8 +691,14 @@ struct AggregatorState {
 }
 
 impl AggregatorState {
-    fn load(connection: &Connection) -> Result<Self, EndpointAggregatorLoadError> {
-        let mut state = Self::default();
+    fn load(
+        connection: &Connection,
+        payload_capture_enabled: bool,
+    ) -> Result<Self, EndpointAggregatorLoadError> {
+        let mut state = Self {
+            payload_capture_enabled,
+            ..Self::default()
+        };
 
         for row in load_aggregate_rows(connection)? {
             let key = EndpointKey::new(row.method, row.endpoint_template);
@@ -603,6 +713,8 @@ impl AggregatorState {
                     status_counts: BTreeMap::new(),
                     latency_count: non_negative_i64_to_u64(row.latency_count),
                     latency_samples,
+                    payload_shape_observation_count: 0,
+                    payload_shape_samples: Vec::new(),
                     principals: HashMap::new(),
                 },
             );
@@ -633,6 +745,30 @@ impl AggregatorState {
                     last_seen: row.last_seen,
                 },
             );
+        }
+
+        if payload_capture_enabled {
+            for row in load_payload_shape_stat_rows(connection)? {
+                let key = EndpointKey::new(row.method, row.endpoint_template);
+                let Some(aggregate) = state.aggregates.get_mut(&key) else {
+                    continue;
+                };
+                aggregate.payload_shape_observation_count =
+                    non_negative_i64_to_u64(row.shape_observation_count);
+            }
+
+            for row in load_payload_shape_sample_rows(connection)? {
+                let key = EndpointKey::new(row.method, row.endpoint_template);
+                let Some(aggregate) = state.aggregates.get_mut(&key) else {
+                    continue;
+                };
+                let shape = serde_json::from_str::<Value>(&row.shape_json)?;
+                aggregate.payload_shape_samples.push(PayloadShapeSample {
+                    observed_at: row.observed_at,
+                    shape_hash: row.shape_hash,
+                    shape,
+                });
+            }
         }
 
         Ok(state)
@@ -751,6 +887,7 @@ struct ObservedRequest {
     latency_ms: u64,
     timestamp: String,
     user_id: Option<String>,
+    payload_shape: Option<Value>,
 }
 
 impl ObservedRequest {
@@ -775,6 +912,7 @@ impl ObservedRequest {
             latency_ms,
             timestamp: event.timestamp.clone(),
             user_id: event.actor.as_ref().map(|actor| actor.user_id.clone()),
+            payload_shape: event.payload.get("payload_shape").cloned(),
         })
     }
 }
@@ -805,6 +943,22 @@ struct PrincipalRow {
     user_id: String,
     first_seen: String,
     last_seen: String,
+}
+
+#[derive(Debug)]
+struct PayloadShapeStatRow {
+    method: String,
+    endpoint_template: String,
+    shape_observation_count: i64,
+}
+
+#[derive(Debug)]
+struct PayloadShapeSampleRow {
+    method: String,
+    endpoint_template: String,
+    observed_at: String,
+    shape_hash: String,
+    shape_json: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -849,6 +1003,10 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
         "#,
     )?;
     connection.execute_batch(CREATE_SCHEMA_SQL)
+}
+
+fn configure_payload_capture_connection(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(CREATE_PAYLOAD_CAPTURE_SCHEMA_SQL)
 }
 
 fn load_aggregate_rows(
@@ -934,26 +1092,97 @@ fn load_principal_rows(
     Ok(rows)
 }
 
+fn load_payload_shape_stat_rows(
+    connection: &Connection,
+) -> Result<Vec<PayloadShapeStatRow>, EndpointAggregatorLoadError> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT method, endpoint_template, shape_observation_count
+        FROM discovery_payload_shape_stats
+        "#,
+    )?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(PayloadShapeStatRow {
+                method: row.get(0)?,
+                endpoint_template: row.get(1)?,
+                shape_observation_count: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(EndpointAggregatorLoadError::from)?;
+    Ok(rows)
+}
+
+fn load_payload_shape_sample_rows(
+    connection: &Connection,
+) -> Result<Vec<PayloadShapeSampleRow>, EndpointAggregatorLoadError> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT method, endpoint_template, observed_at, shape_hash, shape_json
+        FROM discovery_payload_shape_samples
+        ORDER BY method, endpoint_template, sample_slot
+        "#,
+    )?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(PayloadShapeSampleRow {
+                method: row.get(0)?,
+                endpoint_template: row.get(1)?,
+                observed_at: row.get(2)?,
+                shape_hash: row.get(3)?,
+                shape_json: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(EndpointAggregatorLoadError::from)?;
+    Ok(rows)
+}
+
 fn write_flush(
     connection: &mut Connection,
     deleted_keys: &[EndpointKey],
     dirty_aggregates: &[EndpointAggregate],
+    payload_capture_enabled: bool,
 ) -> Result<(), EndpointAggregatorFlushError> {
     let transaction = connection.transaction()?;
 
     for key in deleted_keys {
-        delete_key(&transaction, key)?;
+        delete_key(&transaction, key, payload_capture_enabled)?;
     }
 
     for aggregate in dirty_aggregates {
-        upsert_aggregate(&transaction, aggregate)?;
+        upsert_aggregate(&transaction, aggregate, payload_capture_enabled)?;
     }
 
     transaction.commit()?;
     Ok(())
 }
 
-fn delete_key(connection: &Connection, key: &EndpointKey) -> rusqlite::Result<()> {
+fn delete_key(
+    connection: &Connection,
+    key: &EndpointKey,
+    payload_capture_enabled: bool,
+) -> rusqlite::Result<()> {
+    if payload_capture_enabled {
+        connection.execute(
+            r#"
+            DELETE FROM discovery_payload_shape_samples
+            WHERE method = ?1 AND endpoint_template = ?2
+            "#,
+            params![key.method.as_str(), key.endpoint_template.as_str()],
+        )?;
+        connection.execute(
+            r#"
+            DELETE FROM discovery_payload_shape_stats
+            WHERE method = ?1 AND endpoint_template = ?2
+            "#,
+            params![key.method.as_str(), key.endpoint_template.as_str()],
+        )?;
+    }
+
     connection.execute(
         r#"
         DELETE FROM discovery_endpoint_status_counts
@@ -981,6 +1210,7 @@ fn delete_key(connection: &Connection, key: &EndpointKey) -> rusqlite::Result<()
 fn upsert_aggregate(
     connection: &Connection,
     aggregate: &EndpointAggregate,
+    payload_capture_enabled: bool,
 ) -> Result<(), EndpointAggregatorFlushError> {
     let percentiles = aggregate.latency_percentiles();
     let latency_samples_json = serde_json::to_string(&aggregate.latency_samples)?;
@@ -1053,6 +1283,84 @@ fn upsert_aggregate(
                 user_id,
                 seen.first_seen.as_str(),
                 seen.last_seen.as_str(),
+            ],
+        )?;
+    }
+
+    if payload_capture_enabled {
+        upsert_payload_shape_samples(connection, aggregate)?;
+    }
+
+    Ok(())
+}
+
+fn upsert_payload_shape_samples(
+    connection: &Connection,
+    aggregate: &EndpointAggregate,
+) -> Result<(), EndpointAggregatorFlushError> {
+    connection.execute(
+        r#"
+        DELETE FROM discovery_payload_shape_samples
+        WHERE method = ?1 AND endpoint_template = ?2
+        "#,
+        params![
+            aggregate.key.method.as_str(),
+            aggregate.key.endpoint_template.as_str()
+        ],
+    )?;
+
+    for (slot, sample) in aggregate.payload_shape_samples.iter().enumerate() {
+        connection.execute(
+            r#"
+            INSERT INTO discovery_payload_shape_samples (
+                method,
+                endpoint_template,
+                sample_slot,
+                observed_at,
+                shape_hash,
+                shape_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                aggregate.key.method.as_str(),
+                aggregate.key.endpoint_template.as_str(),
+                i64_from_usize(slot),
+                sample.observed_at.as_str(),
+                sample.shape_hash.as_str(),
+                serde_json::to_string(&sample.shape)?,
+            ],
+        )?;
+    }
+
+    if aggregate.payload_shape_observation_count > 0 {
+        connection.execute(
+            r#"
+            INSERT INTO discovery_payload_shape_stats (
+                method,
+                endpoint_template,
+                shape_observation_count,
+                updated_at
+            ) VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(method, endpoint_template) DO UPDATE SET
+                shape_observation_count = excluded.shape_observation_count,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                aggregate.key.method.as_str(),
+                aggregate.key.endpoint_template.as_str(),
+                i64_from_u64(aggregate.payload_shape_observation_count),
+                utc_timestamp_rfc3339(),
+            ],
+        )?;
+    } else {
+        connection.execute(
+            r#"
+            DELETE FROM discovery_payload_shape_stats
+            WHERE method = ?1 AND endpoint_template = ?2
+            "#,
+            params![
+                aggregate.key.method.as_str(),
+                aggregate.key.endpoint_template.as_str()
             ],
         )?;
     }
@@ -1210,12 +1518,38 @@ fn offer_latency_sample(
     }
 }
 
-fn deterministic_sample_slot(observation_count: u64, latency_ms: u64) -> u64 {
-    let mut value = observation_count ^ latency_ms.rotate_left(13);
+fn offer_payload_shape_sample(
+    observation_count: u64,
+    sample: PayloadShapeSample,
+    samples: &mut Vec<PayloadShapeSample>,
+    sample_limit: usize,
+) {
+    if samples.len() < sample_limit {
+        samples.push(sample);
+        return;
+    }
+
+    let slot = deterministic_sample_slot(
+        observation_count,
+        hash_prefix_u64(&sample.shape_hash).rotate_left(17),
+    ) % observation_count.max(1);
+    if slot < sample_limit as u64 {
+        samples[slot as usize] = sample;
+    }
+}
+
+fn deterministic_sample_slot(observation_count: u64, sample_seed: u64) -> u64 {
+    let mut value = observation_count ^ sample_seed.rotate_left(13);
     value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
     value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     value ^ (value >> 31)
+}
+
+fn hash_prefix_u64(hash: &str) -> u64 {
+    let hex = hash.strip_prefix("sha256:").unwrap_or(hash);
+    let prefix = hex.get(..16).unwrap_or(hex);
+    u64::from_str_radix(prefix, 16).unwrap_or(0)
 }
 
 fn percentile(sorted_samples: &[u64], percentile: usize) -> u64 {
@@ -1467,6 +1801,143 @@ mod tests {
     }
 
     #[test]
+    fn payload_capture_disabled_does_not_create_capture_tables() {
+        let db = TempDb::new("payload-disabled");
+        let sink = aggregator_sink(&db.path);
+
+        sink.emit(&observed_event_with_payload_shape(
+            "POST",
+            "/widgets/123",
+            200,
+            10,
+            Some("user-1"),
+            "2024-06-01T12:00:00Z",
+            json!({
+                "query_params": [{"name": "debug", "redacted": false, "value_type": "string"}],
+                "json_body": {"top_level_keys": [{"name": "name", "redacted": false}]}
+            }),
+        ));
+        sink.flush_for_test();
+
+        assert!(!table_exists(&db.path, "discovery_payload_shape_samples"));
+        assert!(!table_exists(&db.path, "discovery_payload_shape_stats"));
+    }
+
+    #[test]
+    fn payload_capture_enabled_persists_shapes_by_method_and_endpoint_template() {
+        let db = TempDb::new("payload-enabled");
+        let sink = aggregator_sink_with_payload_capture(&db.path);
+
+        sink.emit(&observed_event_with_payload_shape(
+            "POST",
+            "/widgets/123?debug=true",
+            201,
+            15,
+            Some("user-1"),
+            "2024-06-01T12:00:00Z",
+            json!({
+                "query_params": [{"name": "debug", "redacted": false, "value_type": "string"}],
+                "json_body": {"top_level_keys": [{"name": "name", "redacted": false}]}
+            }),
+        ));
+        sink.flush_for_test();
+
+        let rows = payload_shape_rows(&db.path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].method, "POST");
+        assert_eq!(rows[0].endpoint_template, "/widgets/{id}");
+        assert_eq!(rows[0].sample_slot, 0);
+        assert_eq!(rows[0].observed_at, "2024-06-01T12:00:00Z");
+        assert!(rows[0].shape_hash.starts_with("sha256:"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&rows[0].shape_json).expect("shape JSON should parse"),
+            json!({
+                "query_params": [{"name": "debug", "redacted": false, "value_type": "string"}],
+                "json_body": {"top_level_keys": [{"name": "name", "redacted": false}]}
+            })
+        );
+    }
+
+    #[test]
+    fn payload_capture_persisted_shape_does_not_include_values_or_sensitive_key_names() {
+        let db = TempDb::new("payload-shape-only");
+        let sink = aggregator_sink_with_payload_capture(&db.path);
+        let shape = crate::middleware::observation::captured_payload_shape(
+            Some("token=fake-token-value&account=4111111111111111"),
+            Some("application/json"),
+            Some(br#"{"password":"hunter2","name":"Alice","ssn":"123-45-6789"}"#),
+        )
+        .expect("shape should be captured");
+
+        sink.emit(&observed_event_with_payload_shape(
+            "POST",
+            "/payments/123",
+            200,
+            10,
+            Some("user-1"),
+            "2024-06-01T12:00:00Z",
+            serde_json::to_value(shape).expect("shape should serialize"),
+        ));
+        sink.flush_for_test();
+
+        let stored = payload_shape_rows(&db.path)
+            .into_iter()
+            .map(|row| row.shape_json)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(stored.contains(r#""name":"account""#));
+        assert!(stored.contains(r#""name":"name""#));
+        assert!(stored.contains(r#""redacted":true"#));
+        for forbidden in [
+            "fake-token-value",
+            "4111111111111111",
+            "hunter2",
+            "Alice",
+            "123-45-6789",
+            "token",
+            "password",
+            "ssn",
+        ] {
+            assert!(
+                !stored.contains(forbidden),
+                "captured payload shape leaked forbidden text {forbidden}: {stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_capture_reservoir_stays_bounded_per_endpoint() {
+        let db = TempDb::new("payload-reservoir");
+        let sink = aggregator_sink_with_payload_capture(&db.path);
+        let total = PAYLOAD_SHAPE_SAMPLE_LIMIT + 75;
+
+        for index in 0..total {
+            sink.emit(&observed_event_with_payload_shape(
+                "POST",
+                &format!("/bounded/{index}"),
+                200,
+                10,
+                Some("user-1"),
+                timestamp(index),
+                json!({
+                    "query_params": [{"name": "sample", "redacted": false, "value_type": "number"}],
+                    "json_body": {"top_level_keys": [{"name": format!("field_{index}"), "redacted": false}]}
+                }),
+            ));
+        }
+        sink.flush_for_test();
+
+        assert_eq!(
+            payload_shape_rows(&db.path).len(),
+            PAYLOAD_SHAPE_SAMPLE_LIMIT
+        );
+        assert_eq!(
+            payload_shape_observation_count(&db.path, "POST", "/bounded/{id}"),
+            total as i64
+        );
+    }
+
+    #[test]
     fn audit_log_emit_latency_gross_regression_guard_for_aggregator_sink() {
         const EVENT_COUNT: usize = 5_000;
         let events = (0..EVENT_COUNT)
@@ -1530,8 +2001,20 @@ mod tests {
         EndpointAggregatorSink::new_with_flush_interval(
             EndpointAggregatorSinkConfig {
                 path: path.to_owned(),
+                payload_capture_enabled: false,
             },
             flush_interval,
+        )
+        .expect("aggregator sink should build")
+    }
+
+    fn aggregator_sink_with_payload_capture(path: &Path) -> EndpointAggregatorSink {
+        EndpointAggregatorSink::new_with_flush_interval(
+            EndpointAggregatorSinkConfig {
+                path: path.to_owned(),
+                payload_capture_enabled: true,
+            },
+            StdDuration::from_secs(60),
         )
         .expect("aggregator sink should build")
     }
@@ -1562,6 +2045,20 @@ mod tests {
             }),
         );
         event.timestamp = timestamp.into();
+        event
+    }
+
+    fn observed_event_with_payload_shape(
+        method: &str,
+        path: &str,
+        status: u16,
+        latency_ms: u64,
+        user_id: Option<&str>,
+        timestamp: impl Into<String>,
+        payload_shape: Value,
+    ) -> AuditEvent {
+        let mut event = observed_event(method, path, status, latency_ms, user_id, timestamp);
+        event.payload["payload_shape"] = payload_shape;
         event
     }
 
@@ -1710,6 +2207,77 @@ mod tests {
             .expect("principal query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("principal rows should read")
+    }
+
+    #[derive(Debug)]
+    struct PayloadShapeRow {
+        method: String,
+        endpoint_template: String,
+        sample_slot: i64,
+        observed_at: String,
+        shape_json: String,
+        shape_hash: String,
+    }
+
+    fn payload_shape_rows(path: &Path) -> Vec<PayloadShapeRow> {
+        let connection = Connection::open(path).expect("test database should open");
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT method, endpoint_template, sample_slot, observed_at, shape_json, shape_hash
+                FROM discovery_payload_shape_samples
+                ORDER BY method, endpoint_template, sample_slot
+                "#,
+            )
+            .expect("payload shape query should prepare");
+
+        statement
+            .query_map([], |row| {
+                Ok(PayloadShapeRow {
+                    method: row.get(0)?,
+                    endpoint_template: row.get(1)?,
+                    sample_slot: row.get(2)?,
+                    observed_at: row.get(3)?,
+                    shape_json: row.get(4)?,
+                    shape_hash: row.get(5)?,
+                })
+            })
+            .expect("payload shape query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("payload shape rows should read")
+    }
+
+    fn payload_shape_observation_count(path: &Path, method: &str, endpoint_template: &str) -> i64 {
+        let connection = Connection::open(path).expect("test database should open");
+        connection
+            .query_row(
+                r#"
+                SELECT shape_observation_count
+                FROM discovery_payload_shape_stats
+                WHERE method = ?1 AND endpoint_template = ?2
+                "#,
+                params![method, endpoint_template],
+                |row| row.get(0),
+            )
+            .expect("payload shape count should query")
+    }
+
+    fn table_exists(path: &Path, table: &str) -> bool {
+        let connection = Connection::open(path).expect("test database should open");
+        connection
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM sqlite_master
+                    WHERE type = 'table' AND name = ?1
+                )
+                "#,
+                params![table],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("table existence should query")
+            == 1
     }
 
     struct TempDb {

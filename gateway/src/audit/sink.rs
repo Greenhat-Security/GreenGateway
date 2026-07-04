@@ -186,12 +186,14 @@ pub fn build_sink(
     audit_sqlite_path: Option<&str>,
     audit_sqlite_retention_days: Option<u32>,
     discovery_sqlite_path: Option<&str>,
+    payload_capture_enabled: bool,
 ) -> Result<Arc<dyn AuditSink>, Box<dyn Error>> {
     let sinks = build_sink_members(
         audit_log_file,
         audit_sqlite_path,
         audit_sqlite_retention_days,
         discovery_sqlite_path,
+        payload_capture_enabled,
     )?;
 
     let sink = if sinks.len() == 1 {
@@ -208,6 +210,7 @@ fn build_sink_members(
     audit_sqlite_path: Option<&str>,
     audit_sqlite_retention_days: Option<u32>,
     discovery_sqlite_path: Option<&str>,
+    payload_capture_enabled: bool,
 ) -> Result<Vec<Arc<dyn AuditSink>>, Box<dyn Error>> {
     let stdout: Arc<dyn AuditSink> = Arc::new(StdoutSink::new());
     let mut sinks = vec![stdout];
@@ -240,8 +243,11 @@ fn build_sink_members(
         sinks.push(
             Arc::new(EndpointAggregatorSink::new(EndpointAggregatorSinkConfig {
                 path: PathBuf::from(path),
+                payload_capture_enabled,
             })?) as Arc<dyn AuditSink>,
         );
+    } else if payload_capture_enabled {
+        return Err("PAYLOAD_CAPTURE_ENABLED=true requires DISCOVERY_SQLITE_PATH to be set".into());
     }
 
     Ok(sinks)
@@ -254,6 +260,7 @@ pub fn build_sink_from_config(config: &Config) -> Result<ConfiguredAuditSink, Bo
         config.audit_sqlite_path.as_deref(),
         config.audit_sqlite_retention_days,
         config.discovery_sqlite_path.as_deref(),
+        config.payload_capture_enabled,
     )?;
     let sink = Arc::new(CompositeSink::new(vec![
         base_sink,
@@ -423,11 +430,11 @@ pub mod tests {
     #[test]
     fn discovery_aggregator_member_is_only_added_when_path_is_configured() {
         let without_path =
-            build_sink_members(None, None, None, None).expect("sink members should build");
+            build_sink_members(None, None, None, None, false).expect("sink members should build");
         assert_eq!(without_path.len(), 1);
 
-        let blank_path =
-            build_sink_members(None, None, None, Some("   ")).expect("sink members should build");
+        let blank_path = build_sink_members(None, None, None, Some("   "), false)
+            .expect("sink members should build");
         assert_eq!(blank_path.len(), 1);
 
         let path = std::env::temp_dir().join(format!(
@@ -439,6 +446,7 @@ pub mod tests {
             None,
             None,
             Some(path.to_str().expect("test path should be valid UTF-8")),
+            false,
         )
         .expect("sink members should build");
         assert_eq!(with_path.len(), 2);

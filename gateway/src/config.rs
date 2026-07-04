@@ -25,6 +25,7 @@ const DEFAULT_RATE_LIMIT_WRITE_RPS: f64 = 10.0;
 const DEFAULT_RATE_LIMIT_WRITE_BURST: u32 = 20;
 const DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES: &[&str] = &["application/json"];
 const DEFAULT_AUTH_ENABLED: bool = true;
+pub const DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE: f64 = 0.10;
 const DEFAULT_AUTH_MODE: AuthMode = AuthMode::Required;
 const DEFAULT_AUTH_COOKIE_NAME: &str = "session";
 pub const DEFAULT_ADMIN_PREFIX: &str = "/admin";
@@ -71,6 +72,8 @@ const JWT_JWKS_URL: &str = "JWT_JWKS_URL";
 const JWT_REQUIRE_JTI: &str = "JWT_REQUIRE_JTI";
 const MAX_BODY_SIZE: &str = "MAX_BODY_SIZE";
 const OPENAPI_SPEC_PATH: &str = "OPENAPI_SPEC_PATH";
+const PAYLOAD_CAPTURE_ENABLED: &str = "PAYLOAD_CAPTURE_ENABLED";
+const PAYLOAD_CAPTURE_SAMPLE_RATE: &str = "PAYLOAD_CAPTURE_SAMPLE_RATE";
 const POLICY_FILE: &str = "POLICY_FILE";
 const RBAC_EXEMPT_PATHS: &str = "RBAC_EXEMPT_PATHS";
 const RATE_LIMIT_READ_RPS: &str = "RATE_LIMIT_READ_RPS";
@@ -97,6 +100,8 @@ pub struct Config {
     pub audit_sqlite_path: Option<String>,
     pub audit_sqlite_retention_days: Option<u32>,
     pub discovery_sqlite_path: Option<String>,
+    pub payload_capture_enabled: bool,
+    pub payload_capture_sample_rate: f64,
     pub openapi_spec_path: Option<PathBuf>,
     pub policy_file: Option<String>,
     pub cors_allow_origins: Vec<String>,
@@ -235,6 +240,30 @@ impl Config {
             get_var(DISCOVERY_SQLITE_PATH),
             &mut problems,
         );
+        let payload_capture_enabled = parse_var(
+            PAYLOAD_CAPTURE_ENABLED,
+            get_var(PAYLOAD_CAPTURE_ENABLED),
+            false,
+            "boolean",
+            &mut problems,
+        );
+        let payload_capture_sample_rate = validate_payload_capture_sample_rate(
+            PAYLOAD_CAPTURE_SAMPLE_RATE,
+            parse_var(
+                PAYLOAD_CAPTURE_SAMPLE_RATE,
+                get_var(PAYLOAD_CAPTURE_SAMPLE_RATE),
+                DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
+                "sample rate",
+                &mut problems,
+            ),
+            DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
+            &mut problems,
+        );
+        if payload_capture_enabled && discovery_sqlite_path.is_none() {
+            problems.push(format!(
+                "{PAYLOAD_CAPTURE_ENABLED}=true requires {DISCOVERY_SQLITE_PATH} to be set so captured request shapes have an explicit SQLite storage destination"
+            ));
+        }
         let openapi_spec_path =
             parse_optional_path(OPENAPI_SPEC_PATH, get_var(OPENAPI_SPEC_PATH), &mut problems);
         let policy_file = parse_optional_string(POLICY_FILE, get_var(POLICY_FILE), &mut problems);
@@ -480,6 +509,8 @@ impl Config {
                 audit_sqlite_path,
                 audit_sqlite_retention_days,
                 discovery_sqlite_path,
+                payload_capture_enabled,
+                payload_capture_sample_rate,
                 openapi_spec_path,
                 policy_file,
                 cors_allow_origins,
@@ -549,6 +580,22 @@ fn validate_finite_non_negative(
     } else {
         problems.push(format!(
             "{name} must be a finite non-negative requests-per-second value, got '{value}'"
+        ));
+        default
+    }
+}
+
+fn validate_payload_capture_sample_rate(
+    name: &str,
+    value: f64,
+    default: f64,
+    problems: &mut Vec<String>,
+) -> f64 {
+    if value.is_finite() && (0.0..1.0).contains(&value) {
+        value
+    } else {
+        problems.push(format!(
+            "{name} must be a finite number greater than or equal to 0.0 and less than 1.0, got '{value}'"
         ));
         default
     }
@@ -1519,6 +1566,11 @@ mod tests {
         assert_eq!(config.audit_sqlite_path, None);
         assert_eq!(config.audit_sqlite_retention_days, None);
         assert_eq!(config.discovery_sqlite_path, None);
+        assert!(!config.payload_capture_enabled);
+        assert_eq!(
+            config.payload_capture_sample_rate,
+            DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE
+        );
         assert_eq!(config.policy_file, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
@@ -1799,6 +1851,56 @@ mod tests {
         .expect("config should parse");
 
         assert_eq!(config.discovery_sqlite_path, None);
+    }
+
+    #[test]
+    fn payload_capture_config_parses_explicit_opt_in() {
+        let config = Config::from_env_vars(|name| match name {
+            "DISCOVERY_SQLITE_PATH" => Ok("  /var/lib/greengateway/discovery.sqlite  ".to_owned()),
+            "PAYLOAD_CAPTURE_ENABLED" => Ok("true".to_owned()),
+            "PAYLOAD_CAPTURE_SAMPLE_RATE" => Ok("0.25".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("payload capture config should parse");
+
+        assert!(config.payload_capture_enabled);
+        assert_eq!(config.payload_capture_sample_rate, 0.25);
+    }
+
+    #[test]
+    fn payload_capture_enabled_requires_discovery_sqlite_path() {
+        let error = Config::from_env_vars(|name| match name {
+            "PAYLOAD_CAPTURE_ENABLED" => Ok("true".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("payload capture should fail closed without discovery storage");
+
+        let message = error.to_string();
+        assert!(message
+            .contains("PAYLOAD_CAPTURE_ENABLED=true requires DISCOVERY_SQLITE_PATH to be set"));
+        assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
+    fn invalid_payload_capture_sample_rate_is_rejected() {
+        for value in ["1.0", "-0.01", "NaN", "inf"] {
+            let error = Config::from_env_vars(|name| match name {
+                "DISCOVERY_SQLITE_PATH" => Ok("/tmp/greengateway-discovery.sqlite".to_owned()),
+                "PAYLOAD_CAPTURE_ENABLED" => Ok("true".to_owned()),
+                "PAYLOAD_CAPTURE_SAMPLE_RATE" => Ok(value.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect_err("invalid sample rate should be rejected");
+
+            let message = error.to_string();
+            assert!(
+                message.contains(
+                    "PAYLOAD_CAPTURE_SAMPLE_RATE must be a finite number greater than or equal to 0.0 and less than 1.0"
+                ),
+                "{message}"
+            );
+            assert_eq!(error.problems.len(), 1);
+        }
     }
 
     #[test]

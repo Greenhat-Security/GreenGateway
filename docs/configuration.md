@@ -68,6 +68,73 @@ This uses a separate config surface from `AUDIT_SQLITE_PATH` because audit histo
 
 Capacity caveat: distinct principal tracking is exact and currently has no cap, eviction, or retention setting. The `discovery_endpoint_principals` table stores one row per distinct authenticated `actor.user_id` per `(method, endpoint_template)` for the lifetime of the database, and the aggregator mirrors that set in memory while running. In long-running or high-cardinality deployments, size grows proportionally to distinct authenticated users multiplied by distinct endpoint templates; plan database and memory capacity accordingly before enabling this setting. Unauthenticated calls contribute to aggregate call counts but not to distinct principal rows.
 
+### PAYLOAD_CAPTURE_ENABLED
+
+Explicit opt-in for sampled request-shape capture into the discovery SQLite database.
+
+Default: `false`, which disables payload-shape capture. With the default, the request path does not create payload capture handles, observation events do not include `payload_shape`, and fresh discovery databases do not create the payload capture tables.
+
+Format and validation: must parse as a boolean. When set to `true`, `DISCOVERY_SQLITE_PATH` must also be set; otherwise startup fails closed with a clear configuration error because this feature has no output destination without the discovery database.
+
+When enabled and sampled, GreenGateway captures request shape only:
+
+- Query string parameters: parameter names and a coarse `value_type` of `number` or `string`. Query parameter values are read only for this in-memory type guess and are never stored.
+- JSON request bodies for proxied requests: top-level object keys only, after the proxy has already buffered the request body for upstream forwarding. Nested object keys, array contents, and scalar values are not captured.
+
+The capture output is attached to the existing `http.request_observed` audit event as `payload_shape` and is consumed by the existing SQLite discovery aggregator on the audit writer thread. SQLite writes and reservoir maintenance are not performed in the request handler.
+
+The on-disk tables are created only when payload capture is enabled:
+
+- `discovery_payload_shape_stats(method, endpoint_template, shape_observation_count, updated_at)`
+- `discovery_payload_shape_samples(method, endpoint_template, sample_slot, observed_at, shape_hash, shape_json)`
+
+Rows are keyed by the same `(method, endpoint_template)` concept used by `discovery_endpoint_aggregates`. Each endpoint keeps at most 128 `discovery_payload_shape_samples` rows in a deterministic reservoir. `shape_observation_count` is the number of sampled shapes offered to that endpoint reservoir, which can exceed the stored row count.
+
+`shape_json` has this shape:
+
+```json
+{
+  "query_params": [
+    {
+      "name": "page",
+      "redacted": false,
+      "value_type": "number"
+    },
+    {
+      "name_hash": "sha256:...",
+      "redacted": true,
+      "value_type": "string"
+    }
+  ],
+  "json_body": {
+    "top_level_keys": [
+      {
+        "name": "name",
+        "redacted": false
+      },
+      {
+        "name_hash": "sha256:...",
+        "redacted": true
+      }
+    ]
+  }
+}
+```
+
+Sensitive-looking query parameter names and JSON top-level key names are not stored verbatim. A name is treated as sensitive when its normalized ASCII-alphanumeric form contains one of these markers: `password`, `passwd`, `pwd`, `ssn`, `socialsecurity`, `token`, `secret`, `apikey`, `credential`, `creditcard`, `cardnumber`, `authorization`, `jwt`, or `bearer`. For those names, GreenGateway stores `redacted: true` and `name_hash`, a `sha256:` hash of the normalized name. It omits `name`.
+
+Under every configuration, payload capture never stores query parameter values, JSON values, full request bodies, response bodies, non-JSON body bytes, nested JSON structure, array contents, headers, cookies, credentials, or authorization decisions beyond the existing observation event fields.
+
+### PAYLOAD_CAPTURE_SAMPLE_RATE
+
+Deterministic per-request sample rate for payload-shape capture.
+
+Default: `0.10`.
+
+Format and validation: must parse as a finite `f64` greater than or equal to `0.0` and less than `1.0`. Values of `1.0`, negative numbers, `NaN`, and infinity are rejected. The upper bound is intentionally exclusive so enabling payload capture cannot become exhaustive.
+
+Sampling uses a canonical JSON SHA-256 hash of the request id, method, and path, then compares that hash to the configured rate. Query parameter values and body bytes are not part of the sampling seed. A rate of `0.0` creates no payload shape samples even when `PAYLOAD_CAPTURE_ENABLED=true`.
+
 ### OPENAPI_SPEC_PATH
 
 Optional local OpenAPI 3.x JSON or YAML document path for schema coverage in the legacy single `UPSTREAM_URL` mode.
