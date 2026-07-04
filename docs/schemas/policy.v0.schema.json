@@ -51,7 +51,7 @@
     },
     "rate_limits": {
       "type": "array",
-      "description": "Ordered rate-limit override rules. Rules are evaluated in array order, and the first matching rule wins. When no rule matches, the gateway falls back to RATE_LIMIT_READ_* or RATE_LIMIT_WRITE_* lanes.",
+      "description": "Ordered rate-limit override rules. Rules are evaluated in array order, and the first matching rule wins. This is an additional constraint layered on top of the always-enforced, pre-authentication RATE_LIMIT_READ_*/RATE_LIMIT_WRITE_* lanes, not a replacement for them: a matching rule applies only to authenticated requests with a validated principal, and the global lanes still apply to every request regardless of whether a rule matches.",
       "items": {
         "$ref": "#/$defs/rate_limit_rule"
       }
