@@ -34,4 +34,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 jsonschema.workspace = true
+proptest.workspace = true
 tower.workspace = true
