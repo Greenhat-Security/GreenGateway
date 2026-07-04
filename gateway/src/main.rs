@@ -1618,9 +1618,18 @@ async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -
     }
     apply_route_request_header_policy(&mut headers, &upstream.request_header_policy);
     let request_id = parts.headers.get(REQUEST_ID_HEADER).cloned();
+    let payload_capture = parts
+        .extensions
+        .get::<middleware::observation::PayloadCaptureHandle>()
+        .cloned();
     let body = match axum::body::to_bytes(body, proxy.max_request_body_bytes).await {
         Ok(body) if body.is_empty() => None,
-        Ok(body) => Some(body.to_vec()),
+        Ok(body) => {
+            if let Some(payload_capture) = payload_capture.as_ref() {
+                payload_capture.capture_json_body(&parts.headers, &body);
+            }
+            Some(body.to_vec())
+        }
         Err(err) => {
             tracing::warn!(
                 error = %err,
@@ -3915,6 +3924,8 @@ mod tests {
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,
             discovery_sqlite_path: None,
+            payload_capture_enabled: false,
+            payload_capture_sample_rate: config::DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
             openapi_spec_path: None,
             policy_file: None,
             cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
@@ -10669,7 +10680,10 @@ O2gecI9QwDJNpm29J9wJB2F8
     fn create_discovery_schema(path: &PathBuf) {
         drop(
             discovery::aggregator::EndpointAggregatorSink::new(
-                discovery::aggregator::EndpointAggregatorSinkConfig { path: path.clone() },
+                discovery::aggregator::EndpointAggregatorSinkConfig {
+                    path: path.clone(),
+                    payload_capture_enabled: false,
+                },
             )
             .expect("discovery aggregator should create schema"),
         );
@@ -10842,6 +10856,7 @@ O2gecI9QwDJNpm29J9wJB2F8
         let discovery_sink = discovery::aggregator::EndpointAggregatorSink::new(
             discovery::aggregator::EndpointAggregatorSinkConfig {
                 path: discovery_path.clone(),
+                payload_capture_enabled: false,
             },
         )
         .expect("discovery aggregator should build");

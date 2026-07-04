@@ -1,16 +1,25 @@
 //! Per-request observation audit event middleware.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::{Request, State},
     middleware::Next,
     response::Response,
 };
+use http::{header::CONTENT_TYPE, HeaderMap};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::{
-    audit::{AuditEvent, AuditLog},
+    audit::{
+        redact::{hash_args, sha256_hex},
+        AuditEvent, AuditLog,
+    },
     auth::actor_from_principal,
     client_ip::{canonical_client_ip, request_id},
     config::Config,
@@ -24,6 +33,7 @@ const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
 pub struct ObservationState {
     pub audit: AuditLog,
     pub trust_proxy_headers: bool,
+    payload_capture: Option<PayloadCaptureConfig>,
 }
 
 impl ObservationState {
@@ -31,13 +41,53 @@ impl ObservationState {
         Self {
             audit,
             trust_proxy_headers: config.trust_proxy_headers,
+            payload_capture: PayloadCaptureConfig::from_config(config),
         }
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PayloadCaptureConfig {
+    sample_rate: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PayloadCaptureHandle {
+    shape: Arc<Mutex<CapturedPayloadShape>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct CapturedPayloadShape {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    query_params: Vec<CapturedQueryParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    json_body: Option<CapturedJsonBodyShape>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct CapturedQueryParam {
+    #[serde(flatten)]
+    name: CapturedFieldName,
+    value_type: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct CapturedJsonBodyShape {
+    top_level_keys: Vec<CapturedFieldName>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct CapturedFieldName {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name_hash: Option<String>,
+    redacted: bool,
+}
+
 pub async fn observation_middleware(
     State(state): State<ObservationState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let start = Instant::now();
@@ -45,6 +95,15 @@ pub async fn observation_middleware(
     let path = req.uri().path().to_owned();
     let request_id = request_id(req.headers(), req.extensions());
     let source_ip = canonical_client_ip(req.headers(), req.extensions(), state.trust_proxy_headers);
+    let payload_capture = if let Some(config) = state.payload_capture.as_ref() {
+        let query = req.uri().query().map(str::to_owned);
+        payload_capture_handle(config, &method, &path, &request_id, query.as_deref())
+    } else {
+        None
+    };
+    if let Some(handle) = payload_capture.as_ref() {
+        req.extensions_mut().insert(handle.clone());
+    }
 
     let response = next.run(req).await;
     let status = response.status().as_u16();
@@ -55,46 +114,53 @@ pub async fn observation_middleware(
     let actor = auth_outcome
         .and_then(|outcome| outcome.principal.as_ref())
         .map(actor_from_principal);
+    let payload_shape = payload_capture
+        .as_ref()
+        .and_then(PayloadCaptureHandle::snapshot);
 
     state.audit.emit(AuditEvent::new(
         HTTP_REQUEST_OBSERVED,
         &request_id,
         &source_ip,
         actor,
-        observation_payload(
-            &method,
-            &path,
+        observation_payload(ObservationPayloadInput {
+            method: &method,
+            path: &path,
             status,
             latency_ms,
             auth_outcome,
             policy_decision,
             upstream_outcome,
-        ),
+            payload_shape: payload_shape.as_ref(),
+        }),
     ));
 
     response
 }
 
-fn observation_payload(
-    method: &str,
-    path: &str,
+struct ObservationPayloadInput<'a> {
+    method: &'a str,
+    path: &'a str,
     status: u16,
     latency_ms: u64,
-    auth_outcome: Option<&AuthOutcome>,
-    policy_decision: Option<&PolicyDecision>,
-    upstream_outcome: Option<&UpstreamOutcome>,
-) -> Value {
+    auth_outcome: Option<&'a AuthOutcome>,
+    policy_decision: Option<&'a PolicyDecision>,
+    upstream_outcome: Option<&'a UpstreamOutcome>,
+    payload_shape: Option<&'a CapturedPayloadShape>,
+}
+
+fn observation_payload(input: ObservationPayloadInput<'_>) -> Value {
     let mut payload = Map::new();
-    payload.insert("method".to_owned(), json!(method));
-    payload.insert("path".to_owned(), json!(path));
-    payload.insert("status".to_owned(), json!(status));
-    payload.insert("latency_ms".to_owned(), json!(latency_ms));
+    payload.insert("method".to_owned(), json!(input.method));
+    payload.insert("path".to_owned(), json!(input.path));
+    payload.insert("status".to_owned(), json!(input.status));
+    payload.insert("latency_ms".to_owned(), json!(input.latency_ms));
     payload.insert(
         "auth_outcome".to_owned(),
-        json!(auth_outcome_label(auth_outcome)),
+        json!(auth_outcome_label(input.auth_outcome)),
     );
 
-    if let Some(outcome) = auth_outcome {
+    if let Some(outcome) = input.auth_outcome {
         if !outcome.authenticated {
             if let Some(reason) = outcome.reason.as_deref() {
                 payload.insert("auth_reason".to_owned(), json!(reason));
@@ -104,10 +170,10 @@ fn observation_payload(
 
     payload.insert(
         "policy_decision".to_owned(),
-        json!(policy_decision_label(policy_decision)),
+        json!(policy_decision_label(input.policy_decision)),
     );
 
-    if let Some(decision) = policy_decision {
+    if let Some(decision) = input.policy_decision {
         payload.insert("policy_reason".to_owned(), json!(decision.reason));
 
         if let Some(permission) = decision.permission.as_deref() {
@@ -123,7 +189,7 @@ fn observation_payload(
         }
     }
 
-    if let Some(outcome) = upstream_outcome {
+    if let Some(outcome) = input.upstream_outcome {
         payload.insert("upstream_latency_ms".to_owned(), json!(outcome.latency_ms));
 
         if let Some(status) = outcome.status {
@@ -131,7 +197,236 @@ fn observation_payload(
         }
     }
 
+    if let Some(payload_shape) = input.payload_shape {
+        payload.insert(
+            "payload_shape".to_owned(),
+            serde_json::to_value(payload_shape).expect("captured payload shape should serialize"),
+        );
+    }
+
     Value::Object(payload)
+}
+
+impl PayloadCaptureConfig {
+    fn from_config(config: &Config) -> Option<Self> {
+        config.payload_capture_enabled.then_some(Self {
+            sample_rate: config.payload_capture_sample_rate,
+        })
+    }
+}
+
+impl PayloadCaptureHandle {
+    fn new(shape: CapturedPayloadShape) -> Self {
+        Self {
+            shape: Arc::new(Mutex::new(shape)),
+        }
+    }
+
+    pub fn capture_json_body(&self, headers: &HeaderMap, body: &[u8]) {
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        let Some(json_body) = captured_json_body_shape(content_type, body) else {
+            return;
+        };
+
+        let mut shape = match self.shape.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        shape.json_body = Some(json_body);
+    }
+
+    fn snapshot(&self) -> Option<CapturedPayloadShape> {
+        let shape = match self.shape.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        shape.has_captured_data().then_some(shape)
+    }
+}
+
+impl CapturedPayloadShape {
+    fn from_query(query: Option<&str>) -> Self {
+        Self {
+            query_params: captured_query_params(query),
+            json_body: None,
+        }
+    }
+
+    fn has_captured_data(&self) -> bool {
+        !self.query_params.is_empty() || self.json_body.is_some()
+    }
+}
+
+fn payload_capture_handle(
+    config: &PayloadCaptureConfig,
+    method: &str,
+    path: &str,
+    request_id: &str,
+    query: Option<&str>,
+) -> Option<PayloadCaptureHandle> {
+    should_sample_payload_capture(config, method, path, request_id)
+        .then(|| PayloadCaptureHandle::new(CapturedPayloadShape::from_query(query)))
+}
+
+fn should_sample_payload_capture(
+    config: &PayloadCaptureConfig,
+    method: &str,
+    path: &str,
+    request_id: &str,
+) -> bool {
+    if config.sample_rate <= 0.0 {
+        return false;
+    }
+
+    let seed = json!({
+        "method": method,
+        "path": path,
+        "request_id": request_id,
+    });
+    hash_fraction(&hash_args(&seed)) < config.sample_rate
+}
+
+#[cfg(test)]
+pub(crate) fn captured_payload_shape(
+    query: Option<&str>,
+    content_type: Option<&str>,
+    body: Option<&[u8]>,
+) -> Option<CapturedPayloadShape> {
+    let mut shape = CapturedPayloadShape::from_query(query);
+    if let Some(body) = body {
+        shape.json_body = captured_json_body_shape(content_type, body);
+    }
+
+    shape.has_captured_data().then_some(shape)
+}
+
+fn captured_query_params(query: Option<&str>) -> Vec<CapturedQueryParam> {
+    let Some(query) = query else {
+        return Vec::new();
+    };
+    let mut params = BTreeMap::<String, &'static str>::new();
+
+    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let value_type = query_value_type(value.trim());
+        params
+            .entry(name.to_owned())
+            .and_modify(|existing| *existing = merge_query_value_type(existing, value_type))
+            .or_insert(value_type);
+    }
+
+    params
+        .into_iter()
+        .map(|(name, value_type)| CapturedQueryParam {
+            name: captured_field_name(&name),
+            value_type: value_type.to_owned(),
+        })
+        .collect()
+}
+
+fn captured_json_body_shape(
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Option<CapturedJsonBodyShape> {
+    if !is_json_content_type(content_type?) {
+        return None;
+    }
+
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let Value::Object(object) = value else {
+        return None;
+    };
+
+    let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+    keys.sort_unstable();
+    Some(CapturedJsonBodyShape {
+        top_level_keys: keys
+            .into_iter()
+            .map(captured_field_name)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn is_json_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .is_some_and(|media_type| media_type.eq_ignore_ascii_case("application/json"))
+}
+
+fn captured_field_name(name: &str) -> CapturedFieldName {
+    if is_sensitive_field_name(name) {
+        let normalized = normalized_field_name(name);
+        CapturedFieldName {
+            name: None,
+            name_hash: Some(sha256_hex(normalized.as_bytes())),
+            redacted: true,
+        }
+    } else {
+        CapturedFieldName {
+            name: Some(name.to_owned()),
+            name_hash: None,
+            redacted: false,
+        }
+    }
+}
+
+fn is_sensitive_field_name(name: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "password",
+        "passwd",
+        "pwd",
+        "ssn",
+        "socialsecurity",
+        "token",
+        "secret",
+        "apikey",
+        "credential",
+        "creditcard",
+        "cardnumber",
+        "authorization",
+        "jwt",
+        "bearer",
+    ];
+
+    let normalized = normalized_field_name(name);
+    MARKERS.iter().any(|marker| normalized.contains(marker))
+}
+
+fn normalized_field_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn query_value_type(value: &str) -> &'static str {
+    if value.parse::<f64>().is_ok_and(f64::is_finite) {
+        "number"
+    } else {
+        "string"
+    }
+}
+
+fn merge_query_value_type(left: &'static str, right: &'static str) -> &'static str {
+    if left == right {
+        left
+    } else {
+        "string"
+    }
+}
+
+fn hash_fraction(hash: &str) -> f64 {
+    let hex = hash.strip_prefix("sha256:").unwrap_or(hash);
+    let prefix = hex.get(..16).unwrap_or(hex);
+    let value = u64::from_str_radix(prefix, 16).unwrap_or(0);
+    value as f64 / u64::MAX as f64
 }
 
 fn auth_outcome_label(auth_outcome: Option<&AuthOutcome>) -> &'static str {
@@ -172,7 +467,10 @@ mod tests {
         routing::get,
         Router,
     };
-    use http::{header::AUTHORIZATION, Method, Request, StatusCode};
+    use http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        Method, Request, StatusCode,
+    };
     use serde_json::json;
     use tower::ServiceExt;
 
@@ -237,6 +535,119 @@ mod tests {
         assert_eq!(event.payload["auth_outcome"], json!("not_evaluated"));
         assert_eq!(event.payload["policy_decision"], json!("not_evaluated"));
         assert!(event.actor.is_none());
+    }
+
+    #[tokio::test]
+    async fn payload_capture_disabled_by_default_omits_shape_from_observation_events() {
+        let (state, capture) = test_observation_state();
+
+        let response = observation_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/?token=fake-token-value")
+                    .header(crate::REQUEST_ID_HEADER, "request-payload-disabled")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"password":"correct horse battery staple","name":"Alice"}"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let event = one_observation_event(&capture).await;
+        assert!(event.payload.get("payload_shape").is_none());
+    }
+
+    #[test]
+    fn payload_capture_sampling_rate_less_than_one_does_not_sample_every_request() {
+        let config = PayloadCaptureConfig { sample_rate: 0.5 };
+        let sampled = (0..200)
+            .filter(|index| {
+                should_sample_payload_capture(
+                    &config,
+                    "POST",
+                    "/widgets",
+                    &format!("request-{index}"),
+                )
+            })
+            .count();
+
+        assert!(sampled > 0, "sample rate should accept some requests");
+        assert!(
+            sampled < 200,
+            "sample rate below 1.0 must not accept every request"
+        );
+    }
+
+    #[test]
+    fn payload_capture_shape_never_includes_query_or_json_values() {
+        let shape = captured_payload_shape(
+            Some("page=123&filter=Alice&card=4111111111111111"),
+            Some("application/json"),
+            Some(
+                br#"{
+                    "name": "Alice",
+                    "address": { "city": "Portland" },
+                    "ssn": "123-45-6789"
+                }"#,
+            ),
+        )
+        .expect("shape should be captured");
+
+        let serialized = serde_json::to_string(&shape).expect("shape should serialize");
+
+        assert!(serialized.contains(r#""name":"page""#));
+        assert!(serialized.contains(r#""value_type":"number""#));
+        assert!(serialized.contains(r#""name":"filter""#));
+        assert!(serialized.contains(r#""name":"address""#));
+        for forbidden in ["123-45-6789", "4111111111111111", "Alice", "Portland"] {
+            assert!(
+                !serialized.contains(forbidden),
+                "captured shape leaked value {forbidden}: {serialized}"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_capture_redacts_sensitive_query_and_body_key_names() {
+        let shape = captured_payload_shape(
+            Some("token=fake-token&safe=visible"),
+            Some("application/json"),
+            Some(br#"{"password":"secret","ssn":"123-45-6789","name":"Alice"}"#),
+        )
+        .expect("shape should be captured");
+
+        let serialized = serde_json::to_string(&shape).expect("shape should serialize");
+
+        assert!(serialized.contains(r#""name":"safe""#));
+        assert!(serialized.contains(r#""name":"name""#));
+        assert!(serialized.contains(r#""redacted":true"#));
+        assert!(serialized.contains(r#""name_hash":"sha256:"#));
+        for forbidden in ["token", "password", "ssn"] {
+            assert!(
+                !serialized.contains(forbidden),
+                "sensitive key name leaked verbatim: {serialized}"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_capture_skips_non_json_bodies() {
+        assert_eq!(
+            captured_payload_shape(None, Some("text/plain"), Some(b"hello=world")),
+            None
+        );
+        assert_eq!(
+            captured_payload_shape(
+                None,
+                Some("application/json"),
+                Some(br#"["array contents are not captured"]"#)
+            ),
+            None
+        );
     }
 
     #[tokio::test]
@@ -762,6 +1173,7 @@ mod tests {
                 ObservationState {
                     audit,
                     trust_proxy_headers: false,
+                    payload_capture: None,
                 },
                 observation_middleware,
             ))
@@ -773,6 +1185,7 @@ mod tests {
             ObservationState {
                 audit,
                 trust_proxy_headers: false,
+                payload_capture: None,
             },
             capture,
         )
