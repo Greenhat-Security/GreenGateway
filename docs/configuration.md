@@ -18,7 +18,7 @@ Default: `/admin`
 
 Format and validation: must be a non-root URI path prefix that starts with `/`, has no trailing slash, and contains only non-empty path segments made of ASCII letters, digits, `.`, `-`, `_`, or `~`. Invalid prefixes are rejected during configuration loading.
 
-With the default, the admin UI remains at `/admin` and the existing admin APIs remain at `/v1/admin/audit`, `/v1/admin/events/stream`, and `/v1/admin/status` for compatibility. When `ADMIN_PREFIX` is changed, the whole admin surface moves under the new prefix: for example, `ADMIN_PREFIX=/ops` serves the UI at `/ops` and admin APIs at `/ops/api/audit`, `/ops/api/events/stream`, and `/ops/api/status`. The default `/admin` path and default `/v1/admin/*` API paths are no longer intercepted in that mode, so they can fall through to the reverse proxy when `UPSTREAM_URL` is configured.
+With the default, the admin UI remains at `/admin` and the existing admin APIs remain at `/v1/admin/audit`, `/v1/admin/events/stream`, and `/v1/admin/status` for compatibility. When `ADMIN_PREFIX` is changed, the admin UI moves to the new prefix and the admin APIs move to the corresponding `/v1{ADMIN_PREFIX}` prefix: for example, `ADMIN_PREFIX=/ops` serves the UI at `/ops` and admin APIs at `/v1/ops/audit`, `/v1/ops/events/stream`, and `/v1/ops/status`. The default `/admin` path and default `/v1/admin/*` API paths are no longer intercepted in that mode, so they can fall through to the reverse proxy when `UPSTREAM_URL` is configured.
 
 The default `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` include the effective `ADMIN_PREFIX` so the static admin UI shell can load before an operator pastes a token. Admin APIs remain protected by their admin-role checks.
 
@@ -284,7 +284,7 @@ The current gateway-owned paths are:
 - `/version`
 - `/metrics`
 - The effective `ADMIN_PREFIX` UI path and its subpaths, defaulting to `/admin`
-- The effective admin API prefix. With the default admin prefix this is `/v1/admin`; with `ADMIN_PREFIX=/ops` this is `/ops/api`
+- The effective admin API prefix. With the default admin prefix this is `/v1/admin`; with `ADMIN_PREFIX=/ops` this is `/v1/ops`
 
 The `/mcp` surface is reserved by the roadmap for Phase 6, but this codebase does not serve an `/mcp` route yet. When it lands, it should be added to the same gateway-owned path list rather than handled by scattered proxy checks.
 

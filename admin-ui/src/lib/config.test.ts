@@ -16,10 +16,10 @@ describe('admin runtime config', () => {
 
   it('uses gateway-injected admin path meta tags', () => {
     appendMeta('greengateway-admin-base', '/ops');
-    appendMeta('greengateway-admin-api-base', '/ops/api');
+    appendMeta('greengateway-admin-api-base', '/v1/ops');
 
     expect(adminBasePath()).toBe('/ops');
-    expect(adminApiUrl('audit')).toBe('/ops/api/audit');
+    expect(adminApiUrl('audit')).toBe('/v1/ops/audit');
   });
 
   it('ignores malformed admin path meta tags', () => {
