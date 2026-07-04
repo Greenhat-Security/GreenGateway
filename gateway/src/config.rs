@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env::{self, VarError},
     error::Error,
     fmt,
@@ -8,6 +9,7 @@ use std::{
 };
 
 use http::{HeaderName, HeaderValue};
+use serde::Deserialize;
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
@@ -77,6 +79,7 @@ const TRUST_PROXY_HEADERS: &str = "TRUST_PROXY_HEADERS";
 const SESSION_COOKIE_NAME: &str = "SESSION_COOKIE_NAME";
 const UPSTREAM_CONNECT_TIMEOUT_MS: &str = "UPSTREAM_CONNECT_TIMEOUT_MS";
 const UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS: &str = "UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS";
+const UPSTREAM_ROUTES: &str = "UPSTREAM_ROUTES";
 const UPSTREAM_TIMEOUT_MS: &str = "UPSTREAM_TIMEOUT_MS";
 const UPSTREAM_URL: &str = "UPSTREAM_URL";
 const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES";
@@ -116,6 +119,7 @@ pub struct Config {
     pub csrf_cookie_domain: Option<String>,
     pub csrf_exempt_paths: Vec<String>,
     pub upstream_url: Option<String>,
+    pub upstream_routes: Vec<UpstreamRouteConfig>,
     pub upstream_timeout_ms: Option<u64>,
     pub upstream_response_idle_timeout_ms: Option<u64>,
     pub upstream_connect_timeout_ms: Option<u64>,
@@ -126,6 +130,16 @@ pub struct Config {
     pub egress_max_response_bytes: usize,
     pub egress_max_request_body_bytes: usize,
     pub egress_deny_private_ips: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamRouteConfig {
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    pub upstream_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,6 +371,13 @@ impl Config {
         );
         let upstream_url =
             parse_optional_upstream_url(UPSTREAM_URL, get_var(UPSTREAM_URL), &mut problems);
+        let upstream_routes =
+            parse_upstream_routes(UPSTREAM_ROUTES, get_var(UPSTREAM_ROUTES), &mut problems);
+        if upstream_url.is_some() && !upstream_routes.is_empty() {
+            problems.push(format!(
+                "{UPSTREAM_URL} and {UPSTREAM_ROUTES} are mutually exclusive; set one proxy routing source"
+            ));
+        }
         let upstream_timeout_ms = parse_optional_var(
             UPSTREAM_TIMEOUT_MS,
             get_var(UPSTREAM_TIMEOUT_MS),
@@ -458,6 +479,7 @@ impl Config {
                 csrf_cookie_domain,
                 csrf_exempt_paths,
                 upstream_url,
+                upstream_routes,
                 upstream_timeout_ms,
                 upstream_response_idle_timeout_ms,
                 upstream_connect_timeout_ms,
@@ -817,6 +839,144 @@ fn parse_optional_upstream_url(
         return None;
     }
 
+    validate_upstream_url(name, value, problems)
+}
+
+fn parse_upstream_routes(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Vec<UpstreamRouteConfig> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return Vec::new(),
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return Vec::new();
+        }
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        return Vec::new();
+    }
+
+    let routes = match serde_json::from_str::<Vec<UpstreamRouteConfig>>(value) {
+        Ok(routes) => routes,
+        Err(err) => {
+            problems.push(format!(
+                "{name} must be a JSON array of route objects with optional path_prefix, optional host, and required upstream_url: {err}"
+            ));
+            return Vec::new();
+        }
+    };
+
+    validate_upstream_routes(name, routes, problems)
+}
+
+fn validate_upstream_routes(
+    name: &str,
+    routes: Vec<UpstreamRouteConfig>,
+    problems: &mut Vec<String>,
+) -> Vec<UpstreamRouteConfig> {
+    let mut validated = Vec::with_capacity(routes.len());
+    let mut seen_matchers = HashMap::<(Option<String>, Option<String>), usize>::new();
+
+    for (index, route) in routes.into_iter().enumerate() {
+        let route_name = format!("{name}[{index}]");
+        let path_prefix = normalize_route_path_prefix(
+            &format!("{route_name}.path_prefix"),
+            route.path_prefix,
+            problems,
+        );
+        let host = normalize_route_host(&format!("{route_name}.host"), route.host, problems);
+        let upstream_url = validate_upstream_url(
+            &format!("{route_name}.upstream_url"),
+            &route.upstream_url,
+            problems,
+        )
+        .unwrap_or_else(|| route.upstream_url.trim().to_owned());
+
+        if path_prefix.is_none() && host.is_none() {
+            problems.push(format!(
+                "{route_name} must set at least one of path_prefix or host"
+            ));
+        }
+        if host.is_none() && path_prefix.as_deref() == Some("/") {
+            problems.push(format!(
+                "{route_name}.path_prefix must not be '/' without host because it matches every request; use {UPSTREAM_URL} for the legacy catch-all proxy or add a host"
+            ));
+        }
+
+        let matcher_key = (host.clone(), path_prefix.clone());
+        if matcher_key.0.is_some() || matcher_key.1.is_some() {
+            if let Some(previous_index) = seen_matchers.insert(matcher_key, index) {
+                problems.push(format!(
+                    "{route_name} duplicates {name}[{previous_index}] with the same host and path_prefix matcher"
+                ));
+            }
+        }
+
+        validated.push(UpstreamRouteConfig {
+            path_prefix,
+            host,
+            upstream_url,
+        });
+    }
+
+    validated
+}
+
+fn normalize_route_path_prefix(
+    name: &str,
+    value: Option<String>,
+    problems: &mut Vec<String>,
+) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if is_valid_exempt_path(value) {
+        Some(value.to_owned())
+    } else {
+        problems.push(format!(
+            "{name} must be a URI path prefix starting with '/', got '{value}'"
+        ));
+        None
+    }
+}
+
+fn normalize_route_host(
+    name: &str,
+    value: Option<String>,
+    problems: &mut Vec<String>,
+) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let host = value.to_ascii_lowercase();
+    if is_valid_hostname_without_port(&host) {
+        Some(host)
+    } else {
+        problems.push(format!(
+            "{name} must be a hostname without a port, got '{value}'"
+        ));
+        None
+    }
+}
+
+fn validate_upstream_url(name: &str, value: &str, problems: &mut Vec<String>) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        problems.push(format!("{name} must be a non-empty http or https URL"));
+        return None;
+    }
+
     let parsed = match url::Url::parse(value) {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -1045,6 +1205,7 @@ mod tests {
             ]
         );
         assert_eq!(config.upstream_url, None);
+        assert!(config.upstream_routes.is_empty());
         assert_eq!(config.upstream_timeout_ms, None);
         assert_eq!(config.upstream_response_idle_timeout_ms, None);
         assert_eq!(config.upstream_connect_timeout_ms, None);
@@ -1760,6 +1921,111 @@ mod tests {
             config.upstream_url,
             Some("https://upstream.example.test:8443/base/path".to_owned())
         );
+    }
+
+    #[test]
+    fn upstream_routes_parse_json_array_and_normalize_matchers() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[
+                    {
+                        "path_prefix": " /api ",
+                        "host": " API.EXAMPLE.TEST ",
+                        "upstream_url": " https://api-upstream.example.test/base "
+                    },
+                    {
+                        "path_prefix": "/assets",
+                        "upstream_url": "http://assets.example.test"
+                    }
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.upstream_url, None);
+        assert_eq!(
+            config.upstream_routes,
+            vec![
+                UpstreamRouteConfig {
+                    path_prefix: Some("/api".to_owned()),
+                    host: Some("api.example.test".to_owned()),
+                    upstream_url: "https://api-upstream.example.test/base".to_owned(),
+                },
+                UpstreamRouteConfig {
+                    path_prefix: Some("/assets".to_owned()),
+                    host: None,
+                    upstream_url: "http://assets.example.test".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_upstream_routes_are_absent() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("empty UPSTREAM_ROUTES should parse as no route table");
+        assert!(config.upstream_routes.is_empty());
+
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok("[]".to_owned()),
+            "UPSTREAM_URL" => Ok("https://legacy.example.test".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("empty UPSTREAM_ROUTES should not conflict with UPSTREAM_URL");
+        assert!(config.upstream_routes.is_empty());
+        assert_eq!(
+            config.upstream_url,
+            Some("https://legacy.example.test".to_owned())
+        );
+    }
+
+    #[test]
+    fn upstream_url_and_non_empty_upstream_routes_are_mutually_exclusive() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_URL" => Ok("https://legacy.example.test".to_owned()),
+            "UPSTREAM_ROUTES" => Ok(
+                r#"[{"path_prefix":"/api","upstream_url":"https://api.example.test"}]"#.to_owned(),
+            ),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject ambiguous upstream routing config");
+
+        let message = error.to_string();
+        assert!(message.contains("UPSTREAM_URL and UPSTREAM_ROUTES are mutually exclusive"));
+        assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
+    fn invalid_upstream_routes_are_rejected_with_clear_errors() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[
+                    {"path_prefix":"api","upstream_url":"ftp://api.example.test"},
+                    {"path_prefix":"/","upstream_url":"https://catchall.example.test"},
+                    {"host":"api.example.test:443","upstream_url":"https://api.example.test"},
+                    {"upstream_url":"https://missing-matcher.example.test"},
+                    {"path_prefix":"/dup","upstream_url":"https://first.example.test"},
+                    {"path_prefix":"/dup","upstream_url":"https://second.example.test"}
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid upstream routes");
+
+        let message = error.to_string();
+        assert!(message.contains(
+            "UPSTREAM_ROUTES[0].path_prefix must be a URI path prefix starting with '/'"
+        ));
+        assert!(message.contains("UPSTREAM_ROUTES[0].upstream_url must use http or https"));
+        assert!(message.contains("UPSTREAM_ROUTES[1].path_prefix must not be '/' without host"));
+        assert!(message.contains("UPSTREAM_ROUTES[2].host must be a hostname without a port"));
+        assert!(message.contains("UPSTREAM_ROUTES[3] must set at least one of path_prefix or host"));
+        assert!(message.contains(
+            "UPSTREAM_ROUTES[5] duplicates UPSTREAM_ROUTES[4] with the same host and path_prefix matcher"
+        ));
+        assert_eq!(error.problems.len(), 8);
     }
 
     #[test]

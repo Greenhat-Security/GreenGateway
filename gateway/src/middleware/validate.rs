@@ -158,6 +158,7 @@ mod tests {
                 "/metrics".to_owned(),
             ],
             upstream_url: None,
+            upstream_routes: Vec::new(),
             upstream_timeout_ms: None,
             upstream_response_idle_timeout_ms: None,
             upstream_connect_timeout_ms: None,
