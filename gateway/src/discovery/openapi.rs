@@ -20,6 +20,32 @@ pub struct OpenApiOperation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub source: String,
+    #[serde(skip)]
+    pub request_shape: OpenApiRequestShape,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OpenApiRequestShape {
+    pub query_params: Vec<OpenApiQueryParam>,
+    pub json_body_keys: Vec<OpenApiJsonBodyKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenApiQueryParam {
+    pub name: String,
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenApiJsonBodyKey {
+    pub name: String,
+    pub required: bool,
+}
+
+impl OpenApiRequestShape {
+    pub fn is_empty(&self) -> bool {
+        self.query_params.is_empty() && self.json_body_keys.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -65,6 +91,8 @@ struct RawOpenApiDocument {
 #[derive(Default, Deserialize)]
 struct RawPathItem {
     #[serde(default)]
+    parameters: Vec<RawParameter>,
+    #[serde(default)]
     get: Option<RawOperation>,
     #[serde(default)]
     put: Option<RawOperation>,
@@ -88,6 +116,40 @@ struct RawOperation {
     operation_id: Option<String>,
     #[serde(default)]
     summary: Option<String>,
+    #[serde(default)]
+    parameters: Vec<RawParameter>,
+    #[serde(default, rename = "requestBody")]
+    request_body: Option<RawRequestBody>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct RawParameter {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, rename = "in")]
+    location: Option<String>,
+    #[serde(default)]
+    required: bool,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct RawRequestBody {
+    #[serde(default)]
+    content: BTreeMap<String, RawMediaType>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct RawMediaType {
+    #[serde(default)]
+    schema: Option<RawSchema>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct RawSchema {
+    #[serde(default)]
+    required: Vec<String>,
+    #[serde(default)]
+    properties: BTreeMap<String, RawSchema>,
 }
 
 impl OpenApiSpec {
@@ -111,13 +173,15 @@ impl OpenApiSpec {
                 return Err(OpenApiSpecError::InvalidPathTemplate { path_template });
             }
 
-            for (method, operation) in path_item.operations() {
+            for (method, operation, path_parameters) in path_item.operations() {
+                let request_shape = request_shape(&path_parameters, &operation);
                 operations.push(OpenApiOperation {
                     method: method.to_owned(),
                     path_template: path_template.clone(),
                     operation_id: non_empty_optional_string(operation.operation_id),
                     summary: non_empty_optional_string(operation.summary),
                     source: source.to_owned(),
+                    request_shape,
                 });
             }
         }
@@ -172,7 +236,7 @@ impl SchemaCoverage {
     }
 
     #[cfg(test)]
-    fn global(spec: OpenApiSpec) -> Self {
+    pub(crate) fn global_for_test(spec: OpenApiSpec) -> Self {
         Self {
             specs: vec![ConfiguredOpenApiSpec {
                 spec,
@@ -208,6 +272,13 @@ impl SchemaCoverage {
             undocumented_endpoints,
             unused_operations,
         }
+    }
+
+    pub fn request_shape_for(&self, method: &str, path: &str) -> Option<OpenApiRequestShape> {
+        self.operation_shapes()
+            .into_iter()
+            .find(|operation| operation.matches_request(method, path))
+            .map(|operation| operation.operation.request_shape)
     }
 
     fn operation_shapes(&self) -> Vec<OperationShape> {
@@ -274,16 +345,17 @@ impl Error for OpenApiSpecError {
 }
 
 impl RawPathItem {
-    fn operations(self) -> Vec<(&'static str, RawOperation)> {
+    fn operations(self) -> Vec<(&'static str, RawOperation, Vec<RawParameter>)> {
         let mut operations = Vec::new();
-        push_operation(&mut operations, "GET", self.get);
-        push_operation(&mut operations, "POST", self.post);
-        push_operation(&mut operations, "PUT", self.put);
-        push_operation(&mut operations, "PATCH", self.patch);
-        push_operation(&mut operations, "DELETE", self.delete);
-        push_operation(&mut operations, "HEAD", self.head);
-        push_operation(&mut operations, "OPTIONS", self.options);
-        push_operation(&mut operations, "TRACE", self.trace);
+        let parameters = self.parameters;
+        push_operation(&mut operations, "GET", self.get, &parameters);
+        push_operation(&mut operations, "POST", self.post, &parameters);
+        push_operation(&mut operations, "PUT", self.put, &parameters);
+        push_operation(&mut operations, "PATCH", self.patch, &parameters);
+        push_operation(&mut operations, "DELETE", self.delete, &parameters);
+        push_operation(&mut operations, "HEAD", self.head, &parameters);
+        push_operation(&mut operations, "OPTIONS", self.options, &parameters);
+        push_operation(&mut operations, "TRACE", self.trace, &parameters);
         operations
     }
 }
@@ -306,6 +378,18 @@ impl OperationShape {
                 .iter()
                 .any(|candidate| path_shapes_match(candidate, &observed.endpoint_template))
     }
+
+    fn matches_request(&self, method: &str, path: &str) -> bool {
+        self.operation.method == method
+            && self
+                .scope_path_prefix
+                .as_deref()
+                .is_none_or(|prefix| path_prefix_matches(path, prefix))
+            && self
+                .candidate_templates
+                .iter()
+                .any(|candidate| path_template_matches_request(candidate, path))
+    }
 }
 
 pub fn path_shapes_match(left: &str, right: &str) -> bool {
@@ -317,6 +401,17 @@ pub fn path_shapes_match(left: &str, right: &str) -> bool {
             .iter()
             .zip(right_segments.iter())
             .all(|(left, right)| segment_shape(left) == segment_shape(right))
+}
+
+pub fn path_template_matches_request(template: &str, path: &str) -> bool {
+    let template_segments = split_path(template);
+    let path_segments = split_path(path);
+
+    template_segments.len() == path_segments.len()
+        && template_segments
+            .iter()
+            .zip(path_segments.iter())
+            .all(|(template, segment)| is_placeholder_segment(template) || *template == *segment)
 }
 
 fn push_configured_spec(
@@ -363,13 +458,101 @@ fn parse_document(source: &str, contents: &str) -> Result<RawOpenApiDocument, Op
 }
 
 fn push_operation(
-    operations: &mut Vec<(&'static str, RawOperation)>,
+    operations: &mut Vec<(&'static str, RawOperation, Vec<RawParameter>)>,
     method: &'static str,
     operation: Option<RawOperation>,
+    path_parameters: &[RawParameter],
 ) {
     if let Some(operation) = operation {
-        operations.push((method, operation));
+        operations.push((method, operation, path_parameters.to_vec()));
     }
+}
+
+fn request_shape(
+    path_parameters: &[RawParameter],
+    operation: &RawOperation,
+) -> OpenApiRequestShape {
+    OpenApiRequestShape {
+        query_params: query_params(path_parameters, &operation.parameters),
+        json_body_keys: json_body_keys(operation),
+    }
+}
+
+fn query_params(
+    path_parameters: &[RawParameter],
+    operation_parameters: &[RawParameter],
+) -> Vec<OpenApiQueryParam> {
+    let mut params = BTreeMap::<String, bool>::new();
+    for parameter in path_parameters.iter().chain(operation_parameters.iter()) {
+        if !parameter
+            .location
+            .as_deref()
+            .is_some_and(|location| location.eq_ignore_ascii_case("query"))
+        {
+            continue;
+        }
+        let Some(name) = parameter.name.as_ref().map(|name| name.trim()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        params.insert(name.to_owned(), parameter.required);
+    }
+
+    params
+        .into_iter()
+        .map(|(name, required)| OpenApiQueryParam { name, required })
+        .collect()
+}
+
+fn json_body_keys(operation: &RawOperation) -> Vec<OpenApiJsonBodyKey> {
+    let Some(request_body) = operation.request_body.as_ref() else {
+        return Vec::new();
+    };
+    let Some(media_type) = request_body
+        .content
+        .iter()
+        .find(|(media_type, _)| is_json_media_type(media_type))
+        .map(|(_, media_type)| media_type)
+    else {
+        return Vec::new();
+    };
+    let Some(schema) = media_type.schema.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut keys = BTreeMap::<String, bool>::new();
+    for name in schema.properties.keys().map(|name| name.trim()) {
+        if !name.is_empty() {
+            keys.insert(name.to_owned(), false);
+        }
+    }
+    for name in schema.required.iter().map(|name| name.trim()) {
+        if !name.is_empty() {
+            keys.insert(name.to_owned(), true);
+        }
+    }
+
+    keys.into_iter()
+        .map(|(name, required)| OpenApiJsonBodyKey { name, required })
+        .collect()
+}
+
+fn is_json_media_type(media_type: &str) -> bool {
+    let media_type = media_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    if media_type.eq_ignore_ascii_case("application/json") {
+        return true;
+    }
+
+    let Some((_, subtype)) = media_type.split_once('/') else {
+        return false;
+    };
+    subtype.to_ascii_lowercase().ends_with("+json")
 }
 
 fn non_empty_optional_string(value: Option<String>) -> Option<String> {
@@ -497,6 +680,7 @@ paths:
                     operation_id: Some("getUser".to_owned()),
                     summary: Some("Fetch a user".to_owned()),
                     source: "test.yaml".to_owned(),
+                    request_shape: OpenApiRequestShape::default(),
                 },
                 OpenApiOperation {
                     method: "POST".to_owned(),
@@ -504,6 +688,7 @@ paths:
                     operation_id: None,
                     summary: Some("Replace a user".to_owned()),
                     source: "test.yaml".to_owned(),
+                    request_shape: OpenApiRequestShape::default(),
                 },
                 OpenApiOperation {
                     method: "HEAD".to_owned(),
@@ -511,6 +696,7 @@ paths:
                     operation_id: Some("statusHead".to_owned()),
                     summary: None,
                     source: "test.yaml".to_owned(),
+                    request_shape: OpenApiRequestShape::default(),
                 },
             ]
         );
@@ -535,6 +721,7 @@ paths:
                 operation_id: Some("deleteWidget".to_owned()),
                 summary: None,
                 source: "test.json".to_owned(),
+                request_shape: OpenApiRequestShape::default(),
             }]
         );
     }
@@ -558,7 +745,7 @@ paths:
             observed("GET", "/internal/health"),
         ];
 
-        let report = SchemaCoverage::global(spec).compare(&observed_endpoints);
+        let report = SchemaCoverage::global_for_test(spec).compare(&observed_endpoints);
 
         assert_eq!(
             report.undocumented_endpoints,
@@ -567,6 +754,95 @@ paths:
         assert_eq!(
             report.unused_operations,
             vec![operation("PATCH", "/users/{userId}", "updateUser")]
+        );
+    }
+
+    #[test]
+    fn parses_request_shape_from_operation_parameters_and_json_body_schema() {
+        let yaml = r#"
+openapi: 3.0.3
+info:
+  title: Shape API
+  version: 1.0.0
+paths:
+  /users/{userId}:
+    parameters:
+      - in: query
+        name: tenant
+        required: true
+    post:
+      operationId: updateUser
+      parameters:
+        - in: query
+          name: dry_run
+          required: false
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [display_name]
+              properties:
+                display_name:
+                  type: string
+                nickname:
+                  type: string
+"#;
+        let spec = OpenApiSpec::parse_str("shape.yaml", yaml).expect("spec should parse");
+
+        assert_eq!(spec.operations.len(), 1);
+        assert_eq!(
+            spec.operations[0].request_shape.query_params,
+            vec![
+                OpenApiQueryParam {
+                    name: "dry_run".to_owned(),
+                    required: false,
+                },
+                OpenApiQueryParam {
+                    name: "tenant".to_owned(),
+                    required: true,
+                },
+            ]
+        );
+        assert_eq!(
+            spec.operations[0].request_shape.json_body_keys,
+            vec![
+                OpenApiJsonBodyKey {
+                    name: "display_name".to_owned(),
+                    required: true,
+                },
+                OpenApiJsonBodyKey {
+                    name: "nickname".to_owned(),
+                    required: false,
+                },
+            ]
+        );
+
+        let coverage = SchemaCoverage::global_for_test(spec);
+        assert_eq!(
+            coverage.request_shape_for("POST", "/users/123"),
+            Some(OpenApiRequestShape {
+                query_params: vec![
+                    OpenApiQueryParam {
+                        name: "dry_run".to_owned(),
+                        required: false,
+                    },
+                    OpenApiQueryParam {
+                        name: "tenant".to_owned(),
+                        required: true,
+                    },
+                ],
+                json_body_keys: vec![
+                    OpenApiJsonBodyKey {
+                        name: "display_name".to_owned(),
+                        required: true,
+                    },
+                    OpenApiJsonBodyKey {
+                        name: "nickname".to_owned(),
+                        required: false,
+                    },
+                ],
+            })
         );
     }
 
@@ -589,6 +865,7 @@ paths:
             operation_id: Some(operation_id.to_owned()),
             summary: None,
             source: "inline".to_owned(),
+            request_shape: OpenApiRequestShape::default(),
         }
     }
 

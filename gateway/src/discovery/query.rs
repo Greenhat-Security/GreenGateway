@@ -81,6 +81,7 @@ pub struct EndpointSummary {
     pub first_seen: String,
     pub last_seen: String,
     pub call_count: u64,
+    pub schema_mismatch_count: u64,
     pub distinct_principal_count: u64,
     pub is_new: bool,
     pub reviewed: bool,
@@ -98,6 +99,7 @@ pub struct EndpointAggregateDetail {
     pub first_seen: String,
     pub last_seen: String,
     pub call_count: u64,
+    pub schema_mismatch_count: u64,
     pub distinct_principal_count: u64,
     pub is_new: bool,
     pub reviewed: bool,
@@ -402,6 +404,7 @@ impl DiscoveryQueryStore {
                     first_seen,
                     last_seen,
                     call_count,
+                    schema_mismatch_count,
                     latency_count,
                     latency_p50_ms,
                     latency_p95_ms,
@@ -674,6 +677,7 @@ struct RawEndpointAggregate {
     first_seen: String,
     last_seen: String,
     call_count: i64,
+    schema_mismatch_count: i64,
     latency_count: i64,
     latency_p50_ms: i64,
     latency_p95_ms: i64,
@@ -916,15 +920,16 @@ impl RawEndpointAggregate {
             first_seen: row.get(2)?,
             last_seen: row.get(3)?,
             call_count: row.get(4)?,
-            latency_count: row.get(5)?,
-            latency_p50_ms: row.get(6)?,
-            latency_p95_ms: row.get(7)?,
-            latency_p99_ms: row.get(8)?,
-            latency_samples_json: row.get(9)?,
-            distinct_principal_count: row.get(10)?,
-            updated_at: row.get(11)?,
-            reviewed_at: row.get(12)?,
-            reviewed_by: row.get(13)?,
+            schema_mismatch_count: row.get(5)?,
+            latency_count: row.get(6)?,
+            latency_p50_ms: row.get(7)?,
+            latency_p95_ms: row.get(8)?,
+            latency_p99_ms: row.get(9)?,
+            latency_samples_json: row.get(10)?,
+            distinct_principal_count: row.get(11)?,
+            updated_at: row.get(12)?,
+            reviewed_at: row.get(13)?,
+            reviewed_by: row.get(14)?,
         })
     }
 
@@ -953,6 +958,7 @@ impl RawEndpointAggregate {
             first_seen: self.first_seen,
             last_seen: self.last_seen,
             call_count: non_negative_i64_to_u64(self.call_count),
+            schema_mismatch_count: non_negative_i64_to_u64(self.schema_mismatch_count),
             distinct_principal_count: non_negative_i64_to_u64(self.distinct_principal_count),
             reviewed: review.reviewed,
             reviewed_at: review.reviewed_at,
@@ -992,6 +998,7 @@ impl RawEndpointAggregate {
             first_seen: self.first_seen,
             last_seen: self.last_seen,
             call_count: non_negative_i64_to_u64(self.call_count),
+            schema_mismatch_count: non_negative_i64_to_u64(self.schema_mismatch_count),
             distinct_principal_count: non_negative_i64_to_u64(self.distinct_principal_count),
             reviewed: review.reviewed,
             reviewed_at: review.reviewed_at,
@@ -1085,6 +1092,7 @@ fn build_endpoint_list_query(
             a.first_seen,
             a.last_seen,
             a.call_count,
+            a.schema_mismatch_count,
             a.latency_count,
             a.latency_p50_ms,
             a.latency_p95_ms,
@@ -1300,7 +1308,36 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
         PRAGMA synchronous=NORMAL;
         "#,
     )?;
-    connection.execute_batch(CREATE_REVIEW_SCHEMA_SQL)
+    connection.execute_batch(CREATE_REVIEW_SCHEMA_SQL)?;
+    ensure_discovery_endpoint_aggregate_column(
+        connection,
+        "schema_mismatch_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+}
+
+fn ensure_discovery_endpoint_aggregate_column(
+    connection: &Connection,
+    column_name: &str,
+    column_type: &str,
+) -> rusqlite::Result<()> {
+    let columns = discovery_endpoint_aggregate_columns(connection)?;
+    if columns.is_empty() || columns.iter().any(|column| column == column_name) {
+        return Ok(());
+    }
+
+    let sql =
+        format!("ALTER TABLE discovery_endpoint_aggregates ADD COLUMN {column_name} {column_type}");
+    connection.execute(&sql, [])?;
+    Ok(())
+}
+
+fn discovery_endpoint_aggregate_columns(connection: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut statement = connection.prepare("PRAGMA table_info(discovery_endpoint_aggregates)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(columns)
 }
 
 fn new_since_cutoff(new_since_hours: u64) -> String {

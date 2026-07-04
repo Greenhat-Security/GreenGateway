@@ -745,8 +745,6 @@ fn gateway_app_with_process_started_at(
 ) -> Result<GatewayApp, Box<dyn std::error::Error>> {
     let split_admin_listener = config.admin_listen_addr.is_some();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
-    let observation_state =
-        middleware::observation::ObservationState::from_config(&config, audit_log.clone());
     let audit_query_store = config
         .audit_sqlite_path
         .as_deref()
@@ -760,6 +758,15 @@ fn gateway_app_with_process_started_at(
         .map(discovery::query::DiscoveryQueryStore::open)
         .transpose()?
         .map(Arc::new);
+    let observation_state =
+        middleware::observation::ObservationState::from_config(&config, audit_log.clone())
+            .with_conformance(
+                middleware::observation::SchemaConformanceState::from_config(
+                    &config,
+                    schema_coverage.clone(),
+                    discovery_query_store.clone(),
+                ),
+            );
     let loaded_policy = rbac::Policy::from_config(&config)?;
     let rate_limit_state = middleware::rate_limit::RateLimitState::from_config_and_policy(
         &config,
@@ -9792,6 +9799,117 @@ paths:
     }
 
     #[tokio::test]
+    async fn traffic_endpoint_inventory_surfaces_schema_mismatch_count() {
+        let discovery_db = TempDb::new("traffic-schema-mismatch-count");
+        create_discovery_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/users/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 3,
+                latency_count: 3,
+                latency_p50_ms: 10,
+                latency_p95_ms: 20,
+                latency_p99_ms: 30,
+                distinct_principal_count: 1,
+                status_counts: &[(200, 3)],
+            },
+        );
+        set_schema_mismatch_count(&discovery_db.path, "GET", "/users/{id}", 2);
+        let (router, _policy) = traffic_admin_router(Some(&discovery_db.path), None);
+
+        let list = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?method=GET",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(list["endpoints"][0]["schema_mismatch_count"], json!(2));
+
+        let template = query_encode("/users/{id}");
+        let detail = traffic_json(
+            &router,
+            &format!("/v1/admin/traffic/endpoint?method=GET&endpoint_template={template}"),
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(detail["endpoint"]["schema_mismatch_count"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn spec_conformance_mismatch_is_visible_in_traffic_inventory() {
+        let discovery_db = TempDb::new("traffic-spec-conformance");
+        let spec = TempSpecFile::new(
+            "traffic-conformance",
+            r#"
+openapi: 3.0.3
+info:
+  title: Traffic Conformance API
+  version: 1.0.0
+paths:
+  /users/{userId}:
+    get:
+      parameters:
+        - in: query
+          name: page
+          required: true
+"#,
+        );
+        let policy = TempPolicyFile::new(&traffic_policy_document_string());
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.discovery_sqlite_path = Some(discovery_db.path.to_string_lossy().into_owned());
+        config.openapi_spec_path = Some(spec.path.clone());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config
+            .rbac_exempt_paths
+            .push(TRAFFIC_ENDPOINTS_ADMIN_ROUTE.to_owned());
+        config
+            .rbac_exempt_paths
+            .push(TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE.to_owned());
+        let (audit_log, audit_event_sender) =
+            audit::AuditLog::from_config(&config).expect("audit log should build");
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(config, recorder.handle(), audit_log, audit_event_sender)
+            .expect("app should build");
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/users/123")
+                    .header(REQUEST_ID_HEADER, "request-spec-conformance-missing")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body =
+            wait_for_traffic_json(&router, "/v1/admin/traffic/endpoints?method=GET", |body| {
+                body["endpoints"].as_array().is_some_and(|endpoints| {
+                    endpoints.iter().any(|endpoint| {
+                        endpoint["endpoint_template"] == json!("/users/{id}")
+                            && endpoint["schema_mismatch_count"] == json!(1)
+                    })
+                })
+            })
+            .await;
+        let users_endpoint = body["endpoints"]
+            .as_array()
+            .expect("endpoints should be an array")
+            .iter()
+            .find(|endpoint| endpoint["endpoint_template"] == json!("/users/{id}"))
+            .expect("users endpoint should be present");
+        assert_eq!(users_endpoint["schema_mismatch_count"], json!(1));
+    }
+
+    #[tokio::test]
     async fn traffic_endpoint_lifecycle_flags_rule_coverage_and_hot_reload() {
         let discovery_db = TempDb::new("traffic-lifecycle-coverage");
         create_discovery_schema(&discovery_db.path);
@@ -11975,6 +12093,25 @@ O2gecI9QwDJNpm29J9wJB2F8
                 )
                 .expect("endpoint status count should insert");
         }
+    }
+
+    fn set_schema_mismatch_count(
+        path: &PathBuf,
+        method: &str,
+        endpoint_template: &str,
+        count: i64,
+    ) {
+        let connection = Connection::open(path).expect("test discovery database should open");
+        connection
+            .execute(
+                r#"
+                UPDATE discovery_endpoint_aggregates
+                SET schema_mismatch_count = ?3
+                WHERE method = ?1 AND endpoint_template = ?2
+                "#,
+                params![method, endpoint_template, count],
+            )
+            .expect("schema mismatch count should update");
     }
 
     fn insert_discovery_principal(
