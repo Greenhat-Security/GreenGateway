@@ -53,6 +53,20 @@ pub(super) fn rule_matches(
     CompiledRule::new(0, rule).matches(method, path, principal)
 }
 
+/// Standalone method matcher reusing the hardened, anchored implementation
+/// backing `RuleMatcher`, for callers (e.g. rate-limit overrides) that need
+/// the same semantics without a full `Rule`.
+pub(crate) fn method_matches(methods: &[String], method: &str) -> bool {
+    MethodMatcher::new(methods).matches(method)
+}
+
+/// Standalone path-pattern matcher reusing the hardened, anchored
+/// implementation backing `RuleMatcher`, for callers (e.g. rate-limit
+/// overrides) that need the same semantics without a full `Rule`.
+pub(crate) fn path_pattern_matches(pattern: &str, path: &str) -> bool {
+    PathPattern::new(pattern).matches(path)
+}
+
 #[derive(Debug, Clone)]
 struct CompiledRule {
     rule_index: usize,
@@ -244,6 +258,7 @@ mod tests {
     #[test]
     fn example_rule_matches_one_user_segment_for_role() {
         let matcher = RuleMatcher::new(&[Rule {
+            id: None,
             methods: vec!["GET".to_owned()],
             path: "/api/users/*".to_owned(),
             principal: PrincipalMatcher {
@@ -617,6 +632,7 @@ mod tests {
             action_strategy(),
         )
             .prop_map(|(methods, path, principal, action)| Rule {
+                id: None,
                 methods,
                 path,
                 principal,
@@ -723,6 +739,7 @@ mod tests {
 
     fn rule(methods: &[&str], path: &str, action: RuleAction) -> Rule {
         Rule {
+            id: None,
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
             path: path.to_owned(),
             principal: PrincipalMatcher::default(),

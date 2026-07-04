@@ -48,6 +48,13 @@
     "egress": {
       "$ref": "#/$defs/egress_policy",
       "description": "Policy-driven outbound egress rules layered on top of EGRESS_ALLOWED_HOSTS and auto-seeded infrastructure endpoint hosts. Host patterns are additive. CIDRs explicitly allow matching private resolved IPs through EGRESS_DENY_PRIVATE_IPS=true; private IPs outside listed CIDRs remain blocked. If ports is non-empty, the destination port must be listed."
+    },
+    "rate_limits": {
+      "type": "array",
+      "description": "Ordered rate-limit override rules. Rules are evaluated in array order, and the first matching rule wins. This is an additional constraint layered on top of the always-enforced, pre-authentication RATE_LIMIT_READ_*/RATE_LIMIT_WRITE_* lanes, not a replacement for them: a matching rule applies only to authenticated requests with a validated principal, and the global lanes still apply to every request regardless of whether a rule matches.",
+      "items": {
+        "$ref": "#/$defs/rate_limit_rule"
+      }
     }
   },
   "$defs": {
@@ -130,6 +137,7 @@
       }
     },
     "rule_action": {
+      "description": "Direct rules run before, and take precedence over, the routes/permission model: the first matching rule is the sole authority for the request, and routes are never consulted once a rule matches. 'allow' forwards the request unconditionally (no downstream permission check). 'deny' blocks with 403. 'shadow' also forwards the request unconditionally (like 'allow') but records a would-deny observation event instead of an allowed one, for policy-authoring dry runs. Because both 'allow' and 'shadow' bypass the routes/permission model entirely, an overly broad rule (e.g. an unconstrained principal matcher on a sensitive path) can unintentionally grant access that the routes-based permission model would have denied — scope rule principal/path matchers carefully.",
       "enum": [
         "allow",
         "deny",
@@ -144,6 +152,10 @@
         "action"
       ],
       "properties": {
+        "id": {
+          "type": "string",
+          "description": "Optional stable identifier for audit and observation attribution. When omitted, live evaluation reports the rule's array index."
+        },
         "methods": {
           "type": "array",
           "description": "HTTP methods this rule matches. Empty or [\"*\"] means any method.",
@@ -192,6 +204,43 @@
             "minimum": 1,
             "maximum": 65535
           }
+        }
+      }
+    },
+    "rate_limit_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requests_per_second",
+        "burst"
+      ],
+      "properties": {
+        "principal": {
+          "$ref": "#/$defs/principal_matcher",
+          "description": "Optional principal constraints. Empty or omitted means any principal, authenticated or not."
+        },
+        "methods": {
+          "type": "array",
+          "description": "HTTP methods this override matches. Empty or [\"*\"] means any method.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Optional absolute path pattern matched against the whole request path. When omitted, any path matches. Syntax is segment-based and anchored, never substring-based. Literal segments match exactly and case-sensitively. * matches exactly one non-empty path segment. ** matches zero or more complete path segments. {name} matches exactly one non-empty segment and names the capture for future rule-preview/discovery UI; capture names use ASCII letters, digits, and _, and must start with a letter or _."
+        },
+        "requests_per_second": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Positive finite token refill rate for matching requests, in requests per second."
+        },
+        "burst": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "description": "Positive token bucket burst size for matching requests."
         }
       }
     }
