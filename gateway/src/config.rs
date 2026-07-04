@@ -1,14 +1,15 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env::{self, VarError},
     error::Error,
     fmt,
     net::SocketAddr,
+    path::PathBuf,
     str::FromStr,
     sync::LazyLock,
 };
 
-use http::{HeaderName, HeaderValue};
+use http::{header, HeaderName, HeaderValue};
 use serde::Deserialize;
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
@@ -84,6 +85,7 @@ const UPSTREAM_ROUTES: &str = "UPSTREAM_ROUTES";
 const UPSTREAM_TIMEOUT_MS: &str = "UPSTREAM_TIMEOUT_MS";
 const UPSTREAM_URL: &str = "UPSTREAM_URL";
 const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES";
+const REQUEST_ID_HEADER: &str = "x-request-id";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -142,6 +144,18 @@ pub struct UpstreamRouteConfig {
     #[serde(default)]
     pub host: Option<String>,
     pub upstream_url: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub response_idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub add_request_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub strip_request_headers: Vec<String>,
+    #[serde(default)]
+    pub tls_ca_bundle_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -873,7 +887,7 @@ fn parse_upstream_routes(
         Ok(routes) => routes,
         Err(err) => {
             problems.push(format!(
-                "{name} must be a JSON array of route objects with optional path_prefix, optional host, and required upstream_url: {err}"
+                "{name} must be a JSON array of route objects with optional path_prefix, optional host, required upstream_url, and optional per-route settings: {err}"
             ));
             return Vec::new();
         }
@@ -904,6 +918,22 @@ fn validate_upstream_routes(
             problems,
         )
         .unwrap_or_else(|| route.upstream_url.trim().to_owned());
+        let add_request_headers = normalize_route_add_request_headers(
+            &format!("{route_name}.add_request_headers"),
+            route.add_request_headers,
+            problems,
+        );
+        let strip_request_headers = normalize_route_strip_request_headers(
+            &format!("{route_name}.strip_request_headers"),
+            route.strip_request_headers,
+            &add_request_headers,
+            problems,
+        );
+        let tls_ca_bundle_path = normalize_route_tls_ca_bundle_path(
+            &format!("{route_name}.tls_ca_bundle_path"),
+            route.tls_ca_bundle_path,
+            problems,
+        );
 
         if path_prefix.is_none() && host.is_none() {
             problems.push(format!(
@@ -929,10 +959,152 @@ fn validate_upstream_routes(
             path_prefix,
             host,
             upstream_url,
+            timeout_ms: route.timeout_ms,
+            response_idle_timeout_ms: route.response_idle_timeout_ms,
+            connect_timeout_ms: route.connect_timeout_ms,
+            add_request_headers,
+            strip_request_headers,
+            tls_ca_bundle_path,
         });
     }
 
     validated
+}
+
+fn normalize_route_add_request_headers(
+    name: &str,
+    headers: HashMap<String, String>,
+    problems: &mut Vec<String>,
+) -> HashMap<String, String> {
+    let mut normalized = HashMap::with_capacity(headers.len());
+
+    for (raw_name, value) in headers {
+        let header_name =
+            match normalize_route_header_name(&format!("{name}.{raw_name}"), &raw_name, problems) {
+                Some(header_name) => header_name,
+                None => continue,
+            };
+
+        if is_unconditionally_stripped_request_header(&header_name) {
+            problems.push(format!(
+                "{name}.{raw_name} must not configure hop-by-hop or gateway-managed header '{}'",
+                header_name.as_str()
+            ));
+            continue;
+        }
+        if header_name.as_str() == REQUEST_ID_HEADER {
+            problems.push(format!(
+                "{name}.{raw_name} must not configure {REQUEST_ID_HEADER}; the gateway owns request-id propagation"
+            ));
+            continue;
+        }
+        if let Err(err) = HeaderValue::from_str(&value) {
+            problems.push(format!(
+                "{name}.{raw_name} must be a valid HTTP header value: {err}"
+            ));
+            continue;
+        }
+
+        if normalized
+            .insert(header_name.as_str().to_owned(), value)
+            .is_some()
+        {
+            problems.push(format!(
+                "{name} contains duplicate header '{}' after normalization",
+                header_name.as_str()
+            ));
+        }
+    }
+
+    normalized
+}
+
+fn normalize_route_strip_request_headers(
+    name: &str,
+    headers: Vec<String>,
+    add_request_headers: &HashMap<String, String>,
+    problems: &mut Vec<String>,
+) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(headers.len());
+    let mut seen = HashSet::new();
+
+    for raw_name in headers {
+        let header_name = match normalize_route_header_name(name, &raw_name, problems) {
+            Some(header_name) => header_name,
+            None => continue,
+        };
+
+        if header_name.as_str() == REQUEST_ID_HEADER {
+            problems.push(format!(
+                "{name} must not include {REQUEST_ID_HEADER}; the gateway owns request-id propagation"
+            ));
+            continue;
+        }
+        if add_request_headers.contains_key(header_name.as_str()) {
+            problems.push(format!(
+                "{name} must not include '{}' because the same route also adds it",
+                header_name.as_str()
+            ));
+            continue;
+        }
+
+        if seen.insert(header_name.clone()) {
+            normalized.push(header_name.as_str().to_owned());
+        }
+    }
+
+    normalized
+}
+
+fn normalize_route_header_name(
+    name: &str,
+    value: &str,
+    problems: &mut Vec<String>,
+) -> Option<HeaderName> {
+    let value = value.trim();
+    if value.is_empty() {
+        problems.push(format!("{name} must be a non-empty HTTP header name"));
+        return None;
+    }
+
+    match HeaderName::from_bytes(value.as_bytes()) {
+        Ok(header_name) => Some(header_name),
+        Err(err) => {
+            problems.push(format!(
+                "{name} must be a valid HTTP header name, got '{value}': {err}"
+            ));
+            None
+        }
+    }
+}
+
+fn normalize_route_tls_ca_bundle_path(
+    name: &str,
+    value: Option<PathBuf>,
+    problems: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let value = value?;
+    if value.as_os_str().is_empty() {
+        problems.push(format!("{name} must be a non-empty filesystem path"));
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn is_unconditionally_stripped_request_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    ) || name == header::HOST
+        || name == header::CONTENT_LENGTH
 }
 
 fn normalize_route_path_prefix(
@@ -1965,7 +2137,15 @@ mod tests {
                     {
                         "path_prefix": " /api ",
                         "host": " API.EXAMPLE.TEST ",
-                        "upstream_url": " https://api-upstream.example.test/base "
+                        "upstream_url": " https://api-upstream.example.test/base ",
+                        "timeout_ms": 1500,
+                        "response_idle_timeout_ms": 400,
+                        "connect_timeout_ms": 300,
+                        "add_request_headers": {
+                            " X-Route-Header ": "route-value"
+                        },
+                        "strip_request_headers": [" X-Client-Secret "],
+                        "tls_ca_bundle_path": "certs/internal-ca.pem"
                     },
                     {
                         "path_prefix": "/assets",
@@ -1985,11 +2165,26 @@ mod tests {
                     path_prefix: Some("/api".to_owned()),
                     host: Some("api.example.test".to_owned()),
                     upstream_url: "https://api-upstream.example.test/base".to_owned(),
+                    timeout_ms: Some(1500),
+                    response_idle_timeout_ms: Some(400),
+                    connect_timeout_ms: Some(300),
+                    add_request_headers: HashMap::from([(
+                        "x-route-header".to_owned(),
+                        "route-value".to_owned(),
+                    )]),
+                    strip_request_headers: vec!["x-client-secret".to_owned()],
+                    tls_ca_bundle_path: Some(PathBuf::from("certs/internal-ca.pem")),
                 },
                 UpstreamRouteConfig {
                     path_prefix: Some("/assets".to_owned()),
                     host: None,
                     upstream_url: "http://assets.example.test".to_owned(),
+                    timeout_ms: None,
+                    response_idle_timeout_ms: None,
+                    connect_timeout_ms: None,
+                    add_request_headers: HashMap::new(),
+                    strip_request_headers: Vec::new(),
+                    tls_ca_bundle_path: None,
                 },
             ]
         );
@@ -2061,6 +2256,53 @@ mod tests {
             "UPSTREAM_ROUTES[5] duplicates UPSTREAM_ROUTES[4] with the same host and path_prefix matcher"
         ));
         assert_eq!(error.problems.len(), 8);
+    }
+
+    #[test]
+    fn invalid_upstream_route_header_settings_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[
+                    {
+                        "path_prefix": "/api",
+                        "upstream_url": "https://api.example.test",
+                        "add_request_headers": {
+                            "connection": "close",
+                            "x-request-id": "not-operator-owned",
+                            "bad header": "value",
+                            "x-bad-value": "line\r\nbreak",
+                            "x-shared": "added"
+                        },
+                        "strip_request_headers": [
+                            "x-request-id",
+                            "bad strip header",
+                            "x-shared"
+                        ]
+                    }
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject unsafe route header settings");
+
+        let message = error.to_string();
+        assert!(message.contains(
+            "UPSTREAM_ROUTES[0].add_request_headers.connection must not configure hop-by-hop"
+        ));
+        assert!(message.contains(
+            "UPSTREAM_ROUTES[0].add_request_headers.x-request-id must not configure x-request-id"
+        ));
+        assert!(message.contains(
+            "UPSTREAM_ROUTES[0].add_request_headers.bad header must be a valid HTTP header name"
+        ));
+        assert!(message.contains(
+            "UPSTREAM_ROUTES[0].add_request_headers.x-bad-value must be a valid HTTP header value"
+        ));
+        assert!(message
+            .contains("UPSTREAM_ROUTES[0].strip_request_headers must not include x-request-id"));
+        assert!(message
+            .contains("UPSTREAM_ROUTES[0].strip_request_headers must be a valid HTTP header name"));
+        assert!(message
+            .contains("UPSTREAM_ROUTES[0].strip_request_headers must not include 'x-shared'"));
     }
 
     #[test]
