@@ -36,6 +36,7 @@ mod audit;
 mod auth;
 mod client_ip;
 mod config;
+mod discovery;
 mod egress;
 mod metrics;
 mod middleware;
