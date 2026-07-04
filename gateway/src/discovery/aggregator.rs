@@ -19,7 +19,7 @@
 //! `discovery_endpoint_principals` for the lifetime of the database.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     error::Error,
     fmt, io,
     path::PathBuf,
@@ -39,7 +39,11 @@ use crate::{
     audit::{event, redact::hash_args, AuditEvent, AuditEventSender, AuditSink},
     discovery::{
         path_template::{template_stateless, PathTemplateLearner},
-        signals::{self, EndpointSignalObservation, NewSignal, SignalEvaluator},
+        signals::{
+            self, EndpointSignalObservation, ErrorRateSpikeSignalObservation, NewSignal,
+            PrincipalNewToEndpointSignalObservation, SchemaMismatchSignalObservation,
+            SignalDetectorConfig, SignalEvaluator, VolumeOutlierSignalObservation,
+        },
     },
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
 };
@@ -152,6 +156,7 @@ pub struct EndpointAggregatorSinkConfig {
     pub path: PathBuf,
     pub payload_capture_enabled: bool,
     pub signal_event_sender: Option<AuditEventSender>,
+    pub signal_detector_config: SignalDetectorConfig,
 }
 
 pub struct EndpointAggregatorSink {
@@ -322,12 +327,15 @@ impl EndpointAggregatorSink {
                 }
             })?;
         }
-        let state = AggregatorState::load(&connection, config.payload_capture_enabled).map_err(
-            |source| EndpointAggregatorSinkError::Load {
-                path: config.path.clone(),
-                source,
-            },
-        )?;
+        let state = AggregatorState::load(
+            &connection,
+            config.payload_capture_enabled,
+            config.signal_detector_config,
+        )
+        .map_err(|source| EndpointAggregatorSinkError::Load {
+            path: config.path.clone(),
+            source,
+        })?;
 
         let shared = Arc::new(EndpointAggregatorShared {
             path: config.path,
@@ -537,6 +545,7 @@ struct EndpointAggregate {
     last_seen: String,
     call_count: u64,
     schema_mismatch_count: u64,
+    error_count: u64,
     status_counts: BTreeMap<u16, u64>,
     latency_count: u64,
     latency_samples: Vec<u64>,
@@ -549,6 +558,8 @@ struct EndpointAggregate {
     /// database. Future work should add TTL pruning or a configured
     /// cardinality cap if exactness becomes too costly.
     principals: HashMap<String, PrincipalSeen>,
+    recent_error_window: RecentErrorWindow,
+    volume_window: VolumeWindow,
 }
 
 impl EndpointAggregate {
@@ -559,16 +570,19 @@ impl EndpointAggregate {
             last_seen: timestamp.to_owned(),
             call_count: 0,
             schema_mismatch_count: 0,
+            error_count: 0,
             status_counts: BTreeMap::new(),
             latency_count: 0,
             latency_samples: Vec::new(),
             payload_shape_observation_count: 0,
             payload_shape_samples: Vec::new(),
             principals: HashMap::new(),
+            recent_error_window: RecentErrorWindow::default(),
+            volume_window: VolumeWindow::default(),
         }
     }
 
-    fn observe(&mut self, observation: &ObservedRequest) {
+    fn observe(&mut self, observation: &ObservedRequest) -> EndpointAggregateObservation {
         if timestamp_before(&observation.timestamp, &self.first_seen) {
             self.first_seen = observation.timestamp.clone();
         }
@@ -580,31 +594,40 @@ impl EndpointAggregate {
         if observation.schema_mismatch {
             self.schema_mismatch_count = self.schema_mismatch_count.saturating_add(1);
         }
+        let error_status = is_error_status(observation.status);
+        if error_status {
+            self.error_count = self.error_count.saturating_add(1);
+        }
         *self.status_counts.entry(observation.status).or_insert(0) += 1;
         self.record_latency(observation.latency_ms);
         if let Some(payload_shape) = observation.payload_shape.as_ref() {
             self.record_payload_shape(&observation.timestamp, payload_shape.clone());
         }
+        let recent_error_window = self.recent_error_window.observe(error_status);
+        let completed_volume_window = self.volume_window.observe(&observation.timestamp);
 
         if let Some(user_id) = observation.user_id.as_deref() {
-            if user_id.is_empty() {
-                return;
+            if !user_id.is_empty() {
+                self.principals
+                    .entry(user_id.to_owned())
+                    .and_modify(|seen| {
+                        if timestamp_before(&observation.timestamp, &seen.first_seen) {
+                            seen.first_seen = observation.timestamp.clone();
+                        }
+                        if timestamp_after(&observation.timestamp, &seen.last_seen) {
+                            seen.last_seen = observation.timestamp.clone();
+                        }
+                    })
+                    .or_insert_with(|| PrincipalSeen {
+                        first_seen: observation.timestamp.clone(),
+                        last_seen: observation.timestamp.clone(),
+                    });
             }
+        }
 
-            self.principals
-                .entry(user_id.to_owned())
-                .and_modify(|seen| {
-                    if timestamp_before(&observation.timestamp, &seen.first_seen) {
-                        seen.first_seen = observation.timestamp.clone();
-                    }
-                    if timestamp_after(&observation.timestamp, &seen.last_seen) {
-                        seen.last_seen = observation.timestamp.clone();
-                    }
-                })
-                .or_insert_with(|| PrincipalSeen {
-                    first_seen: observation.timestamp.clone(),
-                    last_seen: observation.timestamp.clone(),
-                });
+        EndpointAggregateObservation {
+            recent_error_window,
+            completed_volume_window,
         }
     }
 
@@ -620,6 +643,7 @@ impl EndpointAggregate {
         self.schema_mismatch_count = self
             .schema_mismatch_count
             .saturating_add(other.schema_mismatch_count);
+        self.error_count = self.error_count.saturating_add(other.error_count);
         for (status, count) in other.status_counts {
             *self.status_counts.entry(status).or_insert(0) += count;
         }
@@ -635,6 +659,8 @@ impl EndpointAggregate {
                 .and_modify(|seen| seen.merge(other_seen.clone()))
                 .or_insert(other_seen);
         }
+
+        self.reset_transient_signal_windows();
     }
 
     fn record_latency(&mut self, latency_ms: u64) {
@@ -707,6 +733,136 @@ impl EndpointAggregate {
     fn latency_percentiles(&self) -> LatencyPercentiles {
         LatencyPercentiles::from_samples(&self.latency_samples)
     }
+
+    fn reset_transient_signal_windows(&mut self) {
+        self.recent_error_window = RecentErrorWindow::default();
+        self.volume_window = VolumeWindow::default();
+    }
+}
+
+#[derive(Clone, Debug)]
+struct EndpointAggregateObservation {
+    recent_error_window: ErrorRateWindowSnapshot,
+    completed_volume_window: Option<CompletedVolumeWindow>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RecentErrorWindow {
+    samples: VecDeque<bool>,
+    error_count: u64,
+}
+
+impl RecentErrorWindow {
+    fn observe(&mut self, error_status: bool) -> ErrorRateWindowSnapshot {
+        let limit = signals::ERROR_RATE_SPIKE_MIN_SAMPLE_COUNT as usize;
+        if self.samples.len() == limit && self.samples.pop_front().unwrap_or(false) {
+            self.error_count = self.error_count.saturating_sub(1);
+        }
+
+        self.samples.push_back(error_status);
+        if error_status {
+            self.error_count = self.error_count.saturating_add(1);
+        }
+
+        ErrorRateWindowSnapshot {
+            sample_count: self.samples.len() as u64,
+            error_count: self.error_count,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ErrorRateWindowSnapshot {
+    sample_count: u64,
+    error_count: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct VolumeWindow {
+    current: Option<OpenVolumeWindow>,
+    baseline_window_count: u64,
+    baseline_rate_per_second: f64,
+}
+
+impl VolumeWindow {
+    fn observe(&mut self, timestamp: &str) -> Option<CompletedVolumeWindow> {
+        let timestamp_seconds = timestamp_seconds(timestamp)?;
+        let current = self.current.get_or_insert(OpenVolumeWindow {
+            first_timestamp_seconds: timestamp_seconds,
+            last_timestamp_seconds: timestamp_seconds,
+            call_count: 0,
+        });
+
+        if timestamp_seconds < current.last_timestamp_seconds {
+            self.current = Some(OpenVolumeWindow {
+                first_timestamp_seconds: timestamp_seconds,
+                last_timestamp_seconds: timestamp_seconds,
+                call_count: 1,
+            });
+            return None;
+        }
+
+        current.call_count = current.call_count.saturating_add(1);
+        current.last_timestamp_seconds = timestamp_seconds;
+
+        if current.call_count < signals::VOLUME_OUTLIER_WINDOW_SAMPLE_COUNT {
+            return None;
+        }
+
+        let duration_secs = current.duration_secs();
+        let rate_per_second = current.rate_per_second(duration_secs);
+        let completed = CompletedVolumeWindow {
+            call_count: current.call_count,
+            duration_secs,
+            rate_per_second,
+            baseline_window_count: self.baseline_window_count,
+            baseline_rate_per_second: self.baseline_rate_per_second,
+        };
+        self.observe_baseline_window(rate_per_second);
+        self.current = None;
+
+        Some(completed)
+    }
+
+    fn observe_baseline_window(&mut self, rate_per_second: f64) {
+        if !rate_per_second.is_finite() || rate_per_second <= 0.0 {
+            return;
+        }
+
+        let total = self.baseline_rate_per_second * self.baseline_window_count as f64;
+        self.baseline_window_count = self.baseline_window_count.saturating_add(1);
+        self.baseline_rate_per_second =
+            (total + rate_per_second) / self.baseline_window_count as f64;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OpenVolumeWindow {
+    first_timestamp_seconds: i64,
+    last_timestamp_seconds: i64,
+    call_count: u64,
+}
+
+impl OpenVolumeWindow {
+    fn duration_secs(&self) -> u64 {
+        let elapsed = self
+            .last_timestamp_seconds
+            .saturating_sub(self.first_timestamp_seconds);
+        u64::try_from(elapsed).unwrap_or(0).max(1)
+    }
+
+    fn rate_per_second(&self, duration_secs: u64) -> f64 {
+        self.call_count.saturating_sub(1) as f64 / duration_secs as f64
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CompletedVolumeWindow {
+    call_count: u64,
+    duration_secs: u64,
+    rate_per_second: f64,
+    baseline_window_count: u64,
+    baseline_rate_per_second: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -753,6 +909,7 @@ struct AggregatorState {
     dirty_keys: HashSet<EndpointKey>,
     deleted_keys: HashSet<EndpointKey>,
     pending_signals: Vec<NewSignal>,
+    queued_signal_identities: HashSet<SignalIdentity>,
     dirty_events: usize,
 }
 
@@ -760,9 +917,11 @@ impl AggregatorState {
     fn load(
         connection: &Connection,
         payload_capture_enabled: bool,
+        signal_detector_config: SignalDetectorConfig,
     ) -> Result<Self, EndpointAggregatorLoadError> {
         let mut state = Self {
             payload_capture_enabled,
+            signal_evaluator: SignalEvaluator::new(signal_detector_config),
             ..Self::default()
         };
 
@@ -777,12 +936,15 @@ impl AggregatorState {
                     last_seen: row.last_seen,
                     call_count: non_negative_i64_to_u64(row.call_count),
                     schema_mismatch_count: non_negative_i64_to_u64(row.schema_mismatch_count),
+                    error_count: 0,
                     status_counts: BTreeMap::new(),
                     latency_count: non_negative_i64_to_u64(row.latency_count),
                     latency_samples,
                     payload_shape_observation_count: 0,
                     payload_shape_samples: Vec::new(),
                     principals: HashMap::new(),
+                    recent_error_window: RecentErrorWindow::default(),
+                    volume_window: VolumeWindow::default(),
                 },
             );
         }
@@ -795,9 +957,11 @@ impl AggregatorState {
             let Ok(status) = u16::try_from(row.status) else {
                 continue;
             };
-            aggregate
-                .status_counts
-                .insert(status, non_negative_i64_to_u64(row.count));
+            let count = non_negative_i64_to_u64(row.count);
+            aggregate.status_counts.insert(status, count);
+            if is_error_status(status) {
+                aggregate.error_count = aggregate.error_count.saturating_add(count);
+            }
         }
 
         for row in load_principal_rows(connection)? {
@@ -845,26 +1009,107 @@ impl AggregatorState {
         let endpoint_template = self.endpoint_template(&observation.method, &observation.path);
         let key = EndpointKey::new(observation.method.clone(), endpoint_template);
         let is_new_endpoint = !self.aggregates.contains_key(&key);
-        let aggregate = self
-            .aggregates
-            .entry(key.clone())
-            .or_insert_with(|| EndpointAggregate::new(key.clone(), &observation.timestamp));
+        let principal = observation
+            .user_id
+            .as_deref()
+            .filter(|user_id| !user_id.is_empty());
+        let (
+            previous_schema_mismatch_count,
+            previous_distinct_principal_count,
+            principal_seen_before,
+            aggregate_call_count,
+            aggregate_schema_mismatch_count,
+            aggregate_error_count,
+            observation_effects,
+        ) = {
+            let aggregate = self
+                .aggregates
+                .entry(key.clone())
+                .or_insert_with(|| EndpointAggregate::new(key.clone(), &observation.timestamp));
+            let previous_schema_mismatch_count = aggregate.schema_mismatch_count;
+            let previous_distinct_principal_count = aggregate.principals.len() as u64;
+            let principal_seen_before =
+                principal.is_some_and(|user_id| aggregate.principals.contains_key(user_id));
+            let observation_effects = aggregate.observe(&observation);
 
-        aggregate.observe(&observation);
+            (
+                previous_schema_mismatch_count,
+                previous_distinct_principal_count,
+                principal_seen_before,
+                aggregate.call_count,
+                aggregate.schema_mismatch_count,
+                aggregate.error_count,
+                observation_effects,
+            )
+        };
+
+        let mut signals = Vec::new();
         if is_new_endpoint {
-            self.pending_signals
-                .extend(
-                    self.signal_evaluator
-                        .evaluate_new_endpoint(EndpointSignalObservation {
-                            method: &key.method,
-                            endpoint_template: &key.endpoint_template,
-                            first_seen: &observation.timestamp,
-                            status: observation.status,
-                            latency_ms: observation.latency_ms,
-                            user_id: observation.user_id.as_deref(),
-                        }),
-                );
+            signals.extend(self.signal_evaluator.evaluate_new_endpoint(
+                EndpointSignalObservation {
+                    method: &key.method,
+                    endpoint_template: &key.endpoint_template,
+                    first_seen: &observation.timestamp,
+                    status: observation.status,
+                    latency_ms: observation.latency_ms,
+                    user_id: observation.user_id.as_deref(),
+                },
+            ));
         }
+        signals.extend(self.signal_evaluator.evaluate_schema_mismatch(
+            SchemaMismatchSignalObservation {
+                method: &key.method,
+                endpoint_template: &key.endpoint_template,
+                observed_at: &observation.timestamp,
+                call_count: aggregate_call_count,
+                previous_schema_mismatch_count,
+                schema_mismatch_count: aggregate_schema_mismatch_count,
+            },
+        ));
+
+        let recent = observation_effects.recent_error_window;
+        signals.extend(self.signal_evaluator.evaluate_error_rate_spike(
+            ErrorRateSpikeSignalObservation {
+                method: &key.method,
+                endpoint_template: &key.endpoint_template,
+                observed_at: &observation.timestamp,
+                recent_sample_count: recent.sample_count,
+                recent_error_count: recent.error_count,
+                baseline_sample_count: aggregate_call_count.saturating_sub(recent.sample_count),
+                baseline_error_count: aggregate_error_count.saturating_sub(recent.error_count),
+            },
+        ));
+
+        if let Some(principal) = principal {
+            if !is_new_endpoint && !principal_seen_before {
+                signals.extend(self.signal_evaluator.evaluate_principal_new_to_endpoint(
+                    PrincipalNewToEndpointSignalObservation {
+                        method: &key.method,
+                        endpoint_template: &key.endpoint_template,
+                        observed_at: &observation.timestamp,
+                        principal,
+                        prior_distinct_principal_count: previous_distinct_principal_count,
+                    },
+                ));
+            }
+        }
+
+        if let Some(completed) = observation_effects.completed_volume_window {
+            signals.extend(self.signal_evaluator.evaluate_volume_outlier(
+                VolumeOutlierSignalObservation {
+                    method: &key.method,
+                    endpoint_template: &key.endpoint_template,
+                    observed_at: &observation.timestamp,
+                    window_call_count: completed.call_count,
+                    window_duration_secs: completed.duration_secs,
+                    current_rate_per_second: completed.rate_per_second,
+                    baseline_window_count: completed.baseline_window_count,
+                    baseline_rate_per_second: completed.baseline_rate_per_second,
+                },
+            ));
+        }
+
+        self.queue_signals(signals);
         self.deleted_keys.remove(&key);
         self.dirty_keys.insert(key);
         self.dirty_events += 1;
@@ -967,6 +1212,32 @@ impl AggregatorState {
         self.pending_signals.drain(..signal_count);
         if self.dirty_keys.is_empty() {
             self.dirty_events = 0;
+        }
+    }
+
+    fn queue_signals(&mut self, signals: impl IntoIterator<Item = NewSignal>) {
+        for signal in signals {
+            let identity = SignalIdentity::from(&signal);
+            if self.queued_signal_identities.insert(identity) {
+                self.pending_signals.push(signal);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SignalIdentity {
+    signal_type: String,
+    target_kind: String,
+    target_key: String,
+}
+
+impl From<&NewSignal> for SignalIdentity {
+    fn from(signal: &NewSignal) -> Self {
+        Self {
+            signal_type: signal.signal_type.clone(),
+            target_kind: signal.target_kind.clone(),
+            target_key: signal.target_key.clone(),
         }
     }
 }
@@ -1569,6 +1840,16 @@ fn parse_u64(value: &Value) -> Option<u64> {
         })
 }
 
+fn is_error_status(status: u16) -> bool {
+    (400..=599).contains(&status)
+}
+
+fn timestamp_seconds(timestamp: &str) -> Option<i64> {
+    OffsetDateTime::parse(timestamp, &Rfc3339)
+        .map(|timestamp| timestamp.unix_timestamp())
+        .ok()
+}
+
 fn contains_placeholder(template: &str) -> bool {
     template.contains(ID_PLACEHOLDER) || template.contains(PARAM_PLACEHOLDER)
 }
@@ -1748,6 +2029,7 @@ mod tests {
 
     use super::*;
     use crate::audit::{Actor, AuditLog};
+    use crate::discovery::signals::SignalDetectorConfig;
 
     #[test]
     fn varied_parameter_noise_rolls_up_to_stable_endpoint_rows() {
@@ -1964,7 +2246,7 @@ mod tests {
         ));
         sink.flush_for_test();
 
-        let rows = signal_rows(&db.path);
+        let rows = signal_rows_by_type(&db.path, "new_endpoint_seen");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].signal_type, "new_endpoint_seen");
         assert_eq!(rows[0].target_kind, "endpoint");
@@ -2003,7 +2285,365 @@ mod tests {
             sink.flush_for_test();
         }
 
-        assert_eq!(signal_rows(&db.path), Vec::<SignalRow>::new());
+        assert_eq!(
+            signal_rows_by_type(&db.path, "new_endpoint_seen"),
+            Vec::<SignalRow>::new()
+        );
+    }
+
+    #[test]
+    fn schema_mismatch_signal_fires_once_when_count_crosses_threshold() {
+        let db = TempDb::new("schema-mismatch-signal");
+        let sink = aggregator_sink_with_signal_config(
+            &db.path,
+            SignalDetectorConfig {
+                schema_mismatch_threshold: 2,
+                ..SignalDetectorConfig::default()
+            },
+        );
+
+        sink.emit(&observed_event_with_schema_mismatch(
+            "GET",
+            "/schemas/123",
+            200,
+            10,
+            Some("alice"),
+            "2024-06-01T12:00:00Z",
+            true,
+        ));
+        sink.flush_for_test();
+        assert!(
+            signal_rows_by_type(&db.path, "schema_mismatch").is_empty(),
+            "schema mismatch signal should wait until the configured count threshold is crossed"
+        );
+
+        sink.emit(&observed_event_with_schema_mismatch(
+            "GET",
+            "/schemas/456",
+            200,
+            12,
+            Some("alice"),
+            "2024-06-01T12:00:01Z",
+            true,
+        ));
+        sink.flush_for_test();
+
+        let rows = signal_rows_by_type(&db.path, "schema_mismatch");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target_kind, "endpoint");
+        assert_eq!(rows[0].target_key, "GET /schemas/{id}");
+        assert!(rows[0].explanation.contains("2 schema mismatches"));
+        let evidence: Value =
+            serde_json::from_str(&rows[0].evidence_json).expect("evidence should be JSON");
+        assert_eq!(evidence["schema_mismatch_count"], json!(2));
+        assert_eq!(evidence["call_count"], json!(2));
+        assert_eq!(evidence["threshold"], json!(2));
+
+        sink.emit(&observed_event_with_schema_mismatch(
+            "GET",
+            "/schemas/789",
+            200,
+            11,
+            Some("alice"),
+            "2024-06-01T12:00:02Z",
+            true,
+        ));
+        sink.flush_for_test();
+        assert_eq!(
+            signal_rows_by_type(&db.path, "schema_mismatch").len(),
+            1,
+            "schema mismatch signal should be idempotent per endpoint"
+        );
+    }
+
+    #[test]
+    fn error_rate_spike_signal_waits_for_sample_floor_then_fires_once() {
+        let db = TempDb::new("error-rate-spike-signal");
+        let sink = aggregator_sink_with_signal_config(
+            &db.path,
+            SignalDetectorConfig {
+                error_rate_spike_threshold: 0.40,
+                ..SignalDetectorConfig::default()
+            },
+        );
+
+        for index in 0..20 {
+            sink.emit(&observed_event(
+                "GET",
+                "/errors/steady",
+                200,
+                10,
+                Some("alice"),
+                timestamp_at(index),
+            ));
+        }
+        for index in 20..39 {
+            sink.emit(&observed_event(
+                "GET",
+                "/errors/steady",
+                500,
+                10,
+                Some("alice"),
+                timestamp_at(index),
+            ));
+        }
+        sink.flush_for_test();
+        assert!(
+            signal_rows_by_type(&db.path, "error_rate_spike").is_empty(),
+            "error rate spike signal should wait for both recent and baseline sample floors"
+        );
+
+        sink.emit(&observed_event(
+            "GET",
+            "/errors/steady",
+            500,
+            10,
+            Some("alice"),
+            timestamp_at(39),
+        ));
+        sink.flush_for_test();
+
+        let rows = signal_rows_by_type(&db.path, "error_rate_spike");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target_key, "GET /errors/steady");
+        assert!(rows[0].explanation.contains("100.0%"));
+        let evidence: Value =
+            serde_json::from_str(&rows[0].evidence_json).expect("evidence should be JSON");
+        assert_eq!(evidence["recent_sample_count"], json!(20));
+        assert_eq!(evidence["recent_error_count"], json!(20));
+        assert_eq!(evidence["baseline_sample_count"], json!(20));
+        assert_eq!(evidence["baseline_error_count"], json!(0));
+        assert_eq!(evidence["threshold_delta"], json!(0.40));
+
+        for index in 40..45 {
+            sink.emit(&observed_event(
+                "GET",
+                "/errors/steady",
+                500,
+                10,
+                Some("alice"),
+                timestamp_at(index),
+            ));
+        }
+        sink.flush_for_test();
+        assert_eq!(
+            signal_rows_by_type(&db.path, "error_rate_spike").len(),
+            1,
+            "error rate spike signal should be idempotent per endpoint"
+        );
+    }
+
+    #[test]
+    fn principal_new_to_endpoint_signal_uses_existing_principal_history() {
+        let db = TempDb::new("principal-new-signal");
+        let sink = aggregator_sink(&db.path);
+
+        sink.emit(&observed_event(
+            "POST",
+            "/principal-pairs/123",
+            200,
+            10,
+            Some("alice"),
+            "2024-06-01T12:00:00Z",
+        ));
+        sink.flush_for_test();
+        assert!(
+            signal_rows_by_type(&db.path, "principal_new_to_endpoint").is_empty(),
+            "principal-new signal should not double-fire with new_endpoint_seen"
+        );
+
+        sink.emit(&observed_event(
+            "POST",
+            "/principal-pairs/456",
+            200,
+            10,
+            Some("bob"),
+            "2024-06-01T12:00:01Z",
+        ));
+        sink.flush_for_test();
+
+        let rows = signal_rows_by_type(&db.path, "principal_new_to_endpoint");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target_kind, "principal_endpoint");
+        assert_eq!(rows[0].target_key, "POST /principal-pairs/{id} bob");
+        assert!(rows[0].explanation.contains("principal bob"));
+        let evidence: Value =
+            serde_json::from_str(&rows[0].evidence_json).expect("evidence should be JSON");
+        assert_eq!(evidence["principal"], json!("bob"));
+        assert_eq!(evidence["prior_distinct_principal_count"], json!(1));
+        assert_eq!(evidence["threshold"], json!(1));
+
+        sink.emit(&observed_event(
+            "POST",
+            "/principal-pairs/789",
+            200,
+            10,
+            Some("bob"),
+            "2024-06-01T12:00:02Z",
+        ));
+        sink.flush_for_test();
+        assert_eq!(
+            signal_rows_by_type(&db.path, "principal_new_to_endpoint").len(),
+            1,
+            "same principal/endpoint pair should not create duplicate signals"
+        );
+    }
+
+    #[test]
+    fn principal_new_to_endpoint_signal_respects_prior_principal_threshold() {
+        let db = TempDb::new("principal-new-threshold");
+        let sink = aggregator_sink_with_signal_config(
+            &db.path,
+            SignalDetectorConfig {
+                principal_new_to_endpoint_threshold: 2,
+                ..SignalDetectorConfig::default()
+            },
+        );
+
+        sink.emit(&observed_event(
+            "GET",
+            "/threshold-principals/123",
+            200,
+            10,
+            Some("alice"),
+            "2024-06-01T12:00:00Z",
+        ));
+        sink.emit(&observed_event(
+            "GET",
+            "/threshold-principals/456",
+            200,
+            10,
+            Some("bob"),
+            "2024-06-01T12:00:01Z",
+        ));
+        sink.flush_for_test();
+        assert!(
+            signal_rows_by_type(&db.path, "principal_new_to_endpoint").is_empty(),
+            "one prior principal is below the configured threshold of two"
+        );
+
+        sink.emit(&observed_event(
+            "GET",
+            "/threshold-principals/789",
+            200,
+            10,
+            Some("charlie"),
+            "2024-06-01T12:00:02Z",
+        ));
+        sink.flush_for_test();
+        assert_eq!(
+            signal_rows_by_type(&db.path, "principal_new_to_endpoint").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn volume_outlier_signal_waits_for_baseline_then_fires_once_on_surge() {
+        let db = TempDb::new("volume-outlier-surge");
+        let sink = aggregator_sink_with_signal_config(
+            &db.path,
+            SignalDetectorConfig {
+                volume_outlier_threshold: 3.0,
+                ..SignalDetectorConfig::default()
+            },
+        );
+
+        for index in 0..60 {
+            sink.emit(&observed_event(
+                "GET",
+                "/volume/surge",
+                200,
+                10,
+                Some("alice"),
+                timestamp_at(index),
+            ));
+        }
+        sink.flush_for_test();
+        assert!(
+            signal_rows_by_type(&db.path, "volume_outlier").is_empty(),
+            "volume outlier signal should wait for baseline windows before evaluating"
+        );
+
+        for _ in 0..20 {
+            sink.emit(&observed_event(
+                "GET",
+                "/volume/surge",
+                200,
+                10,
+                Some("alice"),
+                "2024-06-01T12:01:00Z",
+            ));
+        }
+        sink.flush_for_test();
+
+        let rows = signal_rows_by_type(&db.path, "volume_outlier");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target_key, "GET /volume/surge");
+        assert!(rows[0].explanation.contains("volume increase"));
+        let evidence: Value =
+            serde_json::from_str(&rows[0].evidence_json).expect("evidence should be JSON");
+        assert_eq!(evidence["direction"], json!("increase"));
+        assert_eq!(evidence["window_call_count"], json!(20));
+        assert_eq!(evidence["baseline_window_count"], json!(3));
+        assert_eq!(evidence["threshold_multiple"], json!(3.0));
+
+        for _ in 0..20 {
+            sink.emit(&observed_event(
+                "GET",
+                "/volume/surge",
+                200,
+                10,
+                Some("alice"),
+                "2024-06-01T12:01:01Z",
+            ));
+        }
+        sink.flush_for_test();
+        assert_eq!(
+            signal_rows_by_type(&db.path, "volume_outlier").len(),
+            1,
+            "volume outlier signal should be idempotent per endpoint"
+        );
+    }
+
+    #[test]
+    fn volume_outlier_signal_fires_on_slow_window_decrease() {
+        let db = TempDb::new("volume-outlier-decrease");
+        let sink = aggregator_sink_with_signal_config(
+            &db.path,
+            SignalDetectorConfig {
+                volume_outlier_threshold: 3.0,
+                ..SignalDetectorConfig::default()
+            },
+        );
+
+        for index in 0..60 {
+            sink.emit(&observed_event(
+                "GET",
+                "/volume/decrease",
+                200,
+                10,
+                Some("alice"),
+                timestamp_at(index),
+            ));
+        }
+        for index in 0..20 {
+            sink.emit(&observed_event(
+                "GET",
+                "/volume/decrease",
+                200,
+                10,
+                Some("alice"),
+                timestamp_at(120 + index * 10),
+            ));
+        }
+        sink.flush_for_test();
+
+        let rows = signal_rows_by_type(&db.path, "volume_outlier");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].explanation.contains("volume decrease"));
+        let evidence: Value =
+            serde_json::from_str(&rows[0].evidence_json).expect("evidence should be JSON");
+        assert_eq!(evidence["direction"], json!("decrease"));
     }
 
     #[test]
@@ -2238,6 +2878,22 @@ mod tests {
         aggregator_sink_with_interval(path, StdDuration::from_secs(60))
     }
 
+    fn aggregator_sink_with_signal_config(
+        path: &Path,
+        signal_detector_config: SignalDetectorConfig,
+    ) -> EndpointAggregatorSink {
+        EndpointAggregatorSink::new_with_flush_interval(
+            EndpointAggregatorSinkConfig {
+                path: path.to_owned(),
+                payload_capture_enabled: false,
+                signal_event_sender: None,
+                signal_detector_config,
+            },
+            StdDuration::from_secs(60),
+        )
+        .expect("aggregator sink should build")
+    }
+
     fn aggregator_sink_with_interval(
         path: &Path,
         flush_interval: StdDuration,
@@ -2247,6 +2903,7 @@ mod tests {
                 path: path.to_owned(),
                 payload_capture_enabled: false,
                 signal_event_sender: None,
+                signal_detector_config: SignalDetectorConfig::default(),
             },
             flush_interval,
         )
@@ -2259,6 +2916,7 @@ mod tests {
                 path: path.to_owned(),
                 payload_capture_enabled: true,
                 signal_event_sender: None,
+                signal_detector_config: SignalDetectorConfig::default(),
             },
             StdDuration::from_secs(60),
         )
@@ -2324,6 +2982,14 @@ mod tests {
 
     fn timestamp(index: usize) -> String {
         format!("2024-06-01T12:00:{:02}Z", index % 60)
+    }
+
+    fn timestamp_at(second: usize) -> String {
+        format!(
+            "2024-06-01T12:{:02}:{:02}Z",
+            (second / 60) % 60,
+            second % 60
+        )
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -2553,6 +3219,13 @@ mod tests {
             .expect("signal query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("signal rows should read")
+    }
+
+    fn signal_rows_by_type(path: &Path, signal_type: &str) -> Vec<SignalRow> {
+        signal_rows(path)
+            .into_iter()
+            .filter(|row| row.signal_type == signal_type)
+            .collect()
     }
 
     #[derive(Debug)]

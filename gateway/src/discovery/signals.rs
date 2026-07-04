@@ -3,7 +3,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const NEW_ENDPOINT_SEEN_SIGNAL_TYPE: &str = "new_endpoint_seen";
+pub const SCHEMA_MISMATCH_SIGNAL_TYPE: &str = "schema_mismatch";
+pub const ERROR_RATE_SPIKE_SIGNAL_TYPE: &str = "error_rate_spike";
+pub const PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_TYPE: &str = "principal_new_to_endpoint";
+pub const VOLUME_OUTLIER_SIGNAL_TYPE: &str = "volume_outlier";
 pub const ENDPOINT_TARGET_KIND: &str = "endpoint";
+pub const PRINCIPAL_ENDPOINT_TARGET_KIND: &str = "principal_endpoint";
+pub const DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD: u64 = 5;
+pub const DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD: f64 = 0.40;
+pub const DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD: u64 = 1;
+pub const DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD: f64 = 3.0;
+pub const ERROR_RATE_SPIKE_MIN_SAMPLE_COUNT: u64 = 20;
+pub const VOLUME_OUTLIER_WINDOW_SAMPLE_COUNT: u64 = 20;
+pub const VOLUME_OUTLIER_MIN_BASELINE_WINDOWS: u64 = 3;
 
 const CREATE_SIGNAL_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS discovery_signals (
@@ -191,18 +203,141 @@ pub struct EndpointSignalObservation<'a> {
     pub user_id: Option<&'a str>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SignalDetectorConfig {
+    pub schema_mismatch_threshold: u64,
+    pub error_rate_spike_threshold: f64,
+    pub principal_new_to_endpoint_threshold: u64,
+    pub volume_outlier_threshold: f64,
+}
+
+impl Default for SignalDetectorConfig {
+    fn default() -> Self {
+        Self {
+            schema_mismatch_threshold: DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
+            error_rate_spike_threshold: DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
+            principal_new_to_endpoint_threshold: DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
+            volume_outlier_threshold: DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SchemaMismatchSignalObservation<'a> {
+    pub method: &'a str,
+    pub endpoint_template: &'a str,
+    pub observed_at: &'a str,
+    pub call_count: u64,
+    pub previous_schema_mismatch_count: u64,
+    pub schema_mismatch_count: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ErrorRateSpikeSignalObservation<'a> {
+    pub method: &'a str,
+    pub endpoint_template: &'a str,
+    pub observed_at: &'a str,
+    pub recent_sample_count: u64,
+    pub recent_error_count: u64,
+    pub baseline_sample_count: u64,
+    pub baseline_error_count: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PrincipalNewToEndpointSignalObservation<'a> {
+    pub method: &'a str,
+    pub endpoint_template: &'a str,
+    pub observed_at: &'a str,
+    pub principal: &'a str,
+    pub prior_distinct_principal_count: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct VolumeOutlierSignalObservation<'a> {
+    pub method: &'a str,
+    pub endpoint_template: &'a str,
+    pub observed_at: &'a str,
+    pub window_call_count: u64,
+    pub window_duration_secs: u64,
+    pub current_rate_per_second: f64,
+    pub baseline_window_count: u64,
+    pub baseline_rate_per_second: f64,
+}
+
+#[derive(Debug)]
 pub struct SignalEvaluator {
+    config: SignalDetectorConfig,
     new_endpoint_seen: NewEndpointSeenDetector,
+    schema_mismatch: SchemaMismatchDetector,
+    error_rate_spike: ErrorRateSpikeDetector,
+    principal_new_to_endpoint: PrincipalNewToEndpointDetector,
+    volume_outlier: VolumeOutlierDetector,
+}
+
+impl Default for SignalEvaluator {
+    fn default() -> Self {
+        Self::new(SignalDetectorConfig::default())
+    }
 }
 
 impl SignalEvaluator {
+    pub fn new(config: SignalDetectorConfig) -> Self {
+        Self {
+            config,
+            new_endpoint_seen: NewEndpointSeenDetector,
+            schema_mismatch: SchemaMismatchDetector,
+            error_rate_spike: ErrorRateSpikeDetector,
+            principal_new_to_endpoint: PrincipalNewToEndpointDetector,
+            volume_outlier: VolumeOutlierDetector,
+        }
+    }
+
     pub fn evaluate_new_endpoint(
         &self,
         observation: EndpointSignalObservation<'_>,
     ) -> Vec<NewSignal> {
         self.new_endpoint_seen
             .evaluate(observation)
+            .into_iter()
+            .collect()
+    }
+
+    pub fn evaluate_schema_mismatch(
+        &self,
+        observation: SchemaMismatchSignalObservation<'_>,
+    ) -> Vec<NewSignal> {
+        self.schema_mismatch
+            .evaluate(observation, self.config.schema_mismatch_threshold)
+            .into_iter()
+            .collect()
+    }
+
+    pub fn evaluate_error_rate_spike(
+        &self,
+        observation: ErrorRateSpikeSignalObservation<'_>,
+    ) -> Vec<NewSignal> {
+        self.error_rate_spike
+            .evaluate(observation, self.config.error_rate_spike_threshold)
+            .into_iter()
+            .collect()
+    }
+
+    pub fn evaluate_principal_new_to_endpoint(
+        &self,
+        observation: PrincipalNewToEndpointSignalObservation<'_>,
+    ) -> Vec<NewSignal> {
+        self.principal_new_to_endpoint
+            .evaluate(observation, self.config.principal_new_to_endpoint_threshold)
+            .into_iter()
+            .collect()
+    }
+
+    pub fn evaluate_volume_outlier(
+        &self,
+        observation: VolumeOutlierSignalObservation<'_>,
+    ) -> Vec<NewSignal> {
+        self.volume_outlier
+            .evaluate(observation, self.config.volume_outlier_threshold)
             .into_iter()
             .collect()
     }
@@ -254,6 +389,234 @@ impl NewEndpointSeenDetector {
     }
 }
 
+#[derive(Debug, Default)]
+struct SchemaMismatchDetector;
+
+impl SchemaMismatchDetector {
+    fn evaluate(
+        &self,
+        observation: SchemaMismatchSignalObservation<'_>,
+        threshold: u64,
+    ) -> Option<NewSignal> {
+        if threshold == 0
+            || observation.previous_schema_mismatch_count >= threshold
+            || observation.schema_mismatch_count < threshold
+        {
+            return None;
+        }
+
+        let target_identity =
+            endpoint_target_identity(observation.method, observation.endpoint_template);
+        let evidence = json!({
+            "observed_at": observation.observed_at,
+            "call_count": observation.call_count,
+            "schema_mismatch_count": observation.schema_mismatch_count,
+            "previous_schema_mismatch_count": observation.previous_schema_mismatch_count,
+            "threshold": threshold,
+        });
+        let explanation = format!(
+            "Schema mismatch signal for {} {}: {} schema mismatches across {} observed calls crossed the configured threshold of {}.",
+            observation.method,
+            observation.endpoint_template,
+            observation.schema_mismatch_count,
+            observation.call_count,
+            threshold
+        );
+
+        Some(NewSignal::new(
+            SCHEMA_MISMATCH_SIGNAL_TYPE,
+            ENDPOINT_TARGET_KIND,
+            endpoint_target_key(observation.method, observation.endpoint_template),
+            target_identity,
+            explanation,
+            evidence,
+            observation.observed_at,
+        ))
+    }
+}
+
+#[derive(Debug, Default)]
+struct ErrorRateSpikeDetector;
+
+impl ErrorRateSpikeDetector {
+    fn evaluate(
+        &self,
+        observation: ErrorRateSpikeSignalObservation<'_>,
+        threshold_delta: f64,
+    ) -> Option<NewSignal> {
+        if !threshold_delta.is_finite()
+            || threshold_delta <= 0.0
+            || observation.recent_sample_count < ERROR_RATE_SPIKE_MIN_SAMPLE_COUNT
+            || observation.baseline_sample_count < ERROR_RATE_SPIKE_MIN_SAMPLE_COUNT
+        {
+            return None;
+        }
+
+        let recent_error_rate = rate(
+            observation.recent_error_count,
+            observation.recent_sample_count,
+        )?;
+        let baseline_error_rate = rate(
+            observation.baseline_error_count,
+            observation.baseline_sample_count,
+        )?;
+        let delta = recent_error_rate - baseline_error_rate;
+        if delta < threshold_delta {
+            return None;
+        }
+
+        let target_identity =
+            endpoint_target_identity(observation.method, observation.endpoint_template);
+        let evidence = json!({
+            "observed_at": observation.observed_at,
+            "recent_sample_count": observation.recent_sample_count,
+            "recent_error_count": observation.recent_error_count,
+            "recent_error_rate": recent_error_rate,
+            "baseline_sample_count": observation.baseline_sample_count,
+            "baseline_error_count": observation.baseline_error_count,
+            "baseline_error_rate": baseline_error_rate,
+            "error_rate_delta": delta,
+            "threshold_delta": threshold_delta,
+            "error_status_range": "400-599",
+        });
+        let explanation = format!(
+            "Error rate spike for {} {}: recent error rate is {} over {} calls versus baseline {} over {} calls, crossing the configured {} delta threshold.",
+            observation.method,
+            observation.endpoint_template,
+            percent(recent_error_rate),
+            observation.recent_sample_count,
+            percent(baseline_error_rate),
+            observation.baseline_sample_count,
+            percent(threshold_delta)
+        );
+
+        Some(NewSignal::new(
+            ERROR_RATE_SPIKE_SIGNAL_TYPE,
+            ENDPOINT_TARGET_KIND,
+            endpoint_target_key(observation.method, observation.endpoint_template),
+            target_identity,
+            explanation,
+            evidence,
+            observation.observed_at,
+        ))
+    }
+}
+
+#[derive(Debug, Default)]
+struct PrincipalNewToEndpointDetector;
+
+impl PrincipalNewToEndpointDetector {
+    fn evaluate(
+        &self,
+        observation: PrincipalNewToEndpointSignalObservation<'_>,
+        threshold: u64,
+    ) -> Option<NewSignal> {
+        if threshold == 0 || observation.prior_distinct_principal_count < threshold {
+            return None;
+        }
+
+        let target_identity = json!({
+            "method": observation.method,
+            "endpoint_template": observation.endpoint_template,
+            "principal": observation.principal,
+        });
+        let evidence = json!({
+            "observed_at": observation.observed_at,
+            "principal": observation.principal,
+            "prior_distinct_principal_count": observation.prior_distinct_principal_count,
+            "threshold": threshold,
+        });
+        let explanation = format!(
+            "Principal new to endpoint: principal {} first accessed {} {} after {} other distinct principals had already been observed, meeting the configured threshold of {}.",
+            observation.principal,
+            observation.method,
+            observation.endpoint_template,
+            observation.prior_distinct_principal_count,
+            threshold
+        );
+
+        Some(NewSignal::new(
+            PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_TYPE,
+            PRINCIPAL_ENDPOINT_TARGET_KIND,
+            principal_endpoint_target_key(
+                observation.method,
+                observation.endpoint_template,
+                observation.principal,
+            ),
+            target_identity,
+            explanation,
+            evidence,
+            observation.observed_at,
+        ))
+    }
+}
+
+#[derive(Debug, Default)]
+struct VolumeOutlierDetector;
+
+impl VolumeOutlierDetector {
+    fn evaluate(
+        &self,
+        observation: VolumeOutlierSignalObservation<'_>,
+        threshold_multiple: f64,
+    ) -> Option<NewSignal> {
+        if !threshold_multiple.is_finite()
+            || threshold_multiple <= 1.0
+            || observation.baseline_window_count < VOLUME_OUTLIER_MIN_BASELINE_WINDOWS
+            || observation.baseline_rate_per_second <= 0.0
+            || observation.current_rate_per_second <= 0.0
+        {
+            return None;
+        }
+
+        let direction = if observation.current_rate_per_second
+            >= observation.baseline_rate_per_second * threshold_multiple
+        {
+            "increase"
+        } else if observation.current_rate_per_second
+            <= observation.baseline_rate_per_second / threshold_multiple
+        {
+            "decrease"
+        } else {
+            return None;
+        };
+
+        let target_identity =
+            endpoint_target_identity(observation.method, observation.endpoint_template);
+        let evidence = json!({
+            "observed_at": observation.observed_at,
+            "direction": direction,
+            "window_call_count": observation.window_call_count,
+            "window_duration_secs": observation.window_duration_secs,
+            "current_rate_per_second": observation.current_rate_per_second,
+            "baseline_window_count": observation.baseline_window_count,
+            "baseline_rate_per_second": observation.baseline_rate_per_second,
+            "threshold_multiple": threshold_multiple,
+        });
+        let explanation = format!(
+            "Endpoint volume {} for {} {}: the latest {}-call window ran at {:.3} calls/sec versus a {:.3} calls/sec baseline across {} windows, crossing the configured {:.2}x threshold.",
+            direction,
+            observation.method,
+            observation.endpoint_template,
+            observation.window_call_count,
+            observation.current_rate_per_second,
+            observation.baseline_rate_per_second,
+            observation.baseline_window_count,
+            threshold_multiple
+        );
+
+        Some(NewSignal::new(
+            VOLUME_OUTLIER_SIGNAL_TYPE,
+            ENDPOINT_TARGET_KIND,
+            endpoint_target_key(observation.method, observation.endpoint_template),
+            target_identity,
+            explanation,
+            evidence,
+            observation.observed_at,
+        ))
+    }
+}
+
 pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(CREATE_SIGNAL_SCHEMA_SQL)
 }
@@ -290,6 +653,29 @@ pub fn insert_signals(
 
 pub fn endpoint_target_key(method: &str, endpoint_template: &str) -> String {
     format!("{method} {endpoint_template}")
+}
+
+pub fn principal_endpoint_target_key(
+    method: &str,
+    endpoint_template: &str,
+    principal: &str,
+) -> String {
+    format!("{method} {endpoint_template} {principal}")
+}
+
+fn endpoint_target_identity(method: &str, endpoint_template: &str) -> Value {
+    json!({
+        "method": method,
+        "endpoint_template": endpoint_template,
+    })
+}
+
+fn rate(numerator: u64, denominator: u64) -> Option<f64> {
+    (denominator > 0).then_some(numerator as f64 / denominator as f64)
+}
+
+fn percent(value: f64) -> String {
+    format!("{:.1}%", value * 100.0)
 }
 
 #[derive(Debug)]

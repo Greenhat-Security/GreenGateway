@@ -12,6 +12,12 @@ use std::{
 use http::{header, HeaderName, HeaderValue};
 use serde::Deserialize;
 
+use crate::discovery::signals::{
+    SignalDetectorConfig, DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
+    DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD, DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
+    DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+};
+
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
     DEFAULT_LISTEN_ADDR
@@ -58,6 +64,7 @@ const CSRF_ENABLED: &str = "CSRF_ENABLED";
 const CSRF_EXEMPT_PATHS: &str = "CSRF_EXEMPT_PATHS";
 const CSRF_HEADER_NAME: &str = "CSRF_HEADER_NAME";
 const DISCOVERY_SQLITE_PATH: &str = "DISCOVERY_SQLITE_PATH";
+const ERROR_RATE_SPIKE_SIGNAL_THRESHOLD: &str = "ERROR_RATE_SPIKE_SIGNAL_THRESHOLD";
 const EGRESS_ALLOWED_HOSTS: &str = "EGRESS_ALLOWED_HOSTS";
 const EGRESS_CONNECT_TIMEOUT_MS: &str = "EGRESS_CONNECT_TIMEOUT_MS";
 const EGRESS_DENY_PRIVATE_IPS: &str = "EGRESS_DENY_PRIVATE_IPS";
@@ -75,12 +82,15 @@ const OPENAPI_SPEC_PATH: &str = "OPENAPI_SPEC_PATH";
 const PAYLOAD_CAPTURE_ENABLED: &str = "PAYLOAD_CAPTURE_ENABLED";
 const PAYLOAD_CAPTURE_SAMPLE_RATE: &str = "PAYLOAD_CAPTURE_SAMPLE_RATE";
 const POLICY_FILE: &str = "POLICY_FILE";
+const PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD: &str =
+    "PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD";
 const RBAC_EXEMPT_PATHS: &str = "RBAC_EXEMPT_PATHS";
 const RATE_LIMIT_READ_RPS: &str = "RATE_LIMIT_READ_RPS";
 const RATE_LIMIT_READ_BURST: &str = "RATE_LIMIT_READ_BURST";
 const RATE_LIMIT_WRITE_RPS: &str = "RATE_LIMIT_WRITE_RPS";
 const RATE_LIMIT_WRITE_BURST: &str = "RATE_LIMIT_WRITE_BURST";
 const ROLES_CLAIM: &str = "ROLES_CLAIM";
+const SCHEMA_MISMATCH_SIGNAL_THRESHOLD: &str = "SCHEMA_MISMATCH_SIGNAL_THRESHOLD";
 const TRUST_PROXY_HEADERS: &str = "TRUST_PROXY_HEADERS";
 const SESSION_COOKIE_NAME: &str = "SESSION_COOKIE_NAME";
 const UPSTREAM_CONNECT_TIMEOUT_MS: &str = "UPSTREAM_CONNECT_TIMEOUT_MS";
@@ -89,6 +99,7 @@ const UPSTREAM_ROUTES: &str = "UPSTREAM_ROUTES";
 const UPSTREAM_TIMEOUT_MS: &str = "UPSTREAM_TIMEOUT_MS";
 const UPSTREAM_URL: &str = "UPSTREAM_URL";
 const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES";
+const VOLUME_OUTLIER_SIGNAL_THRESHOLD: &str = "VOLUME_OUTLIER_SIGNAL_THRESHOLD";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,6 +113,10 @@ pub struct Config {
     pub discovery_sqlite_path: Option<String>,
     pub payload_capture_enabled: bool,
     pub payload_capture_sample_rate: f64,
+    pub schema_mismatch_signal_threshold: u64,
+    pub error_rate_spike_signal_threshold: f64,
+    pub principal_new_to_endpoint_signal_threshold: u64,
+    pub volume_outlier_signal_threshold: f64,
     pub openapi_spec_path: Option<PathBuf>,
     pub policy_file: Option<String>,
     pub cors_allow_origins: Vec<String>,
@@ -264,6 +279,54 @@ impl Config {
                 "{PAYLOAD_CAPTURE_ENABLED}=true requires {DISCOVERY_SQLITE_PATH} to be set so captured request shapes have an explicit SQLite storage destination"
             ));
         }
+        let schema_mismatch_signal_threshold = validate_positive_u64(
+            SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
+            parse_var(
+                SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
+                get_var(SCHEMA_MISMATCH_SIGNAL_THRESHOLD),
+                DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
+                "positive integer",
+                &mut problems,
+            ),
+            DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
+            &mut problems,
+        );
+        let error_rate_spike_signal_threshold = validate_signal_ratio_threshold(
+            ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
+            parse_var(
+                ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
+                get_var(ERROR_RATE_SPIKE_SIGNAL_THRESHOLD),
+                DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
+                "ratio threshold",
+                &mut problems,
+            ),
+            DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
+            &mut problems,
+        );
+        let principal_new_to_endpoint_signal_threshold = validate_positive_u64(
+            PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
+            parse_var(
+                PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
+                get_var(PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD),
+                DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
+                "positive integer",
+                &mut problems,
+            ),
+            DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
+            &mut problems,
+        );
+        let volume_outlier_signal_threshold = validate_signal_multiple_threshold(
+            VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+            parse_var(
+                VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+                get_var(VOLUME_OUTLIER_SIGNAL_THRESHOLD),
+                DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+                "multiple threshold",
+                &mut problems,
+            ),
+            DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+            &mut problems,
+        );
         let openapi_spec_path =
             parse_optional_path(OPENAPI_SPEC_PATH, get_var(OPENAPI_SPEC_PATH), &mut problems);
         let policy_file = parse_optional_string(POLICY_FILE, get_var(POLICY_FILE), &mut problems);
@@ -511,6 +574,10 @@ impl Config {
                 discovery_sqlite_path,
                 payload_capture_enabled,
                 payload_capture_sample_rate,
+                schema_mismatch_signal_threshold,
+                error_rate_spike_signal_threshold,
+                principal_new_to_endpoint_signal_threshold,
+                volume_outlier_signal_threshold,
                 openapi_spec_path,
                 policy_file,
                 cors_allow_origins,
@@ -555,6 +622,15 @@ impl Config {
             Err(ConfigError { problems })
         }
     }
+
+    pub fn signal_detector_config(&self) -> SignalDetectorConfig {
+        SignalDetectorConfig {
+            schema_mismatch_threshold: self.schema_mismatch_signal_threshold,
+            error_rate_spike_threshold: self.error_rate_spike_signal_threshold,
+            principal_new_to_endpoint_threshold: self.principal_new_to_endpoint_signal_threshold,
+            volume_outlier_threshold: self.volume_outlier_signal_threshold,
+        }
+    }
 }
 
 impl fmt::Display for ConfigError {
@@ -596,6 +672,47 @@ fn validate_payload_capture_sample_rate(
     } else {
         problems.push(format!(
             "{name} must be a finite number greater than or equal to 0.0 and less than 1.0, got '{value}'"
+        ));
+        default
+    }
+}
+
+fn validate_positive_u64(name: &str, value: u64, default: u64, problems: &mut Vec<String>) -> u64 {
+    if value > 0 {
+        value
+    } else {
+        problems.push(format!("{name} must be greater than 0, got '{value}'"));
+        default
+    }
+}
+
+fn validate_signal_ratio_threshold(
+    name: &str,
+    value: f64,
+    default: f64,
+    problems: &mut Vec<String>,
+) -> f64 {
+    if value.is_finite() && value > 0.0 && value <= 1.0 {
+        value
+    } else {
+        problems.push(format!(
+            "{name} must be a finite number greater than 0.0 and less than or equal to 1.0, got '{value}'"
+        ));
+        default
+    }
+}
+
+fn validate_signal_multiple_threshold(
+    name: &str,
+    value: f64,
+    default: f64,
+    problems: &mut Vec<String>,
+) -> f64 {
+    if value.is_finite() && value > 1.0 {
+        value
+    } else {
+        problems.push(format!(
+            "{name} must be a finite number greater than 1.0, got '{value}'"
         ));
         default
     }
@@ -1571,6 +1688,10 @@ mod tests {
             config.payload_capture_sample_rate,
             DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE
         );
+        assert_eq!(
+            config.signal_detector_config(),
+            SignalDetectorConfig::default()
+        );
         assert_eq!(config.policy_file, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
@@ -1901,6 +2022,52 @@ mod tests {
             );
             assert_eq!(error.problems.len(), 1);
         }
+    }
+
+    #[test]
+    fn discovery_signal_thresholds_parse_from_env() {
+        let config = Config::from_env_vars(|name| match name {
+            "SCHEMA_MISMATCH_SIGNAL_THRESHOLD" => Ok("7".to_owned()),
+            "ERROR_RATE_SPIKE_SIGNAL_THRESHOLD" => Ok("0.25".to_owned()),
+            "PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD" => Ok("3".to_owned()),
+            "VOLUME_OUTLIER_SIGNAL_THRESHOLD" => Ok("4.5".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("discovery signal thresholds should parse");
+
+        assert_eq!(
+            config.signal_detector_config(),
+            SignalDetectorConfig {
+                schema_mismatch_threshold: 7,
+                error_rate_spike_threshold: 0.25,
+                principal_new_to_endpoint_threshold: 3,
+                volume_outlier_threshold: 4.5,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_discovery_signal_thresholds_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "SCHEMA_MISMATCH_SIGNAL_THRESHOLD" => Ok("0".to_owned()),
+            "ERROR_RATE_SPIKE_SIGNAL_THRESHOLD" => Ok("1.25".to_owned()),
+            "PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD" => Ok("0".to_owned()),
+            "VOLUME_OUTLIER_SIGNAL_THRESHOLD" => Ok("1.0".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("invalid discovery signal thresholds should be rejected");
+
+        let message = error.to_string();
+        assert!(message.contains("SCHEMA_MISMATCH_SIGNAL_THRESHOLD must be greater than 0"));
+        assert!(message.contains(
+            "ERROR_RATE_SPIKE_SIGNAL_THRESHOLD must be a finite number greater than 0.0 and less than or equal to 1.0"
+        ));
+        assert!(
+            message.contains("PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD must be greater than 0")
+        );
+        assert!(message
+            .contains("VOLUME_OUTLIER_SIGNAL_THRESHOLD must be a finite number greater than 1.0"));
+        assert_eq!(error.problems.len(), 4);
     }
 
     #[test]
