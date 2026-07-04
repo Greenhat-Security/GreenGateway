@@ -2,11 +2,13 @@
 
 `policy.json` is the seeded local-development policy used by `docker-compose.dev.yml`.
 
-It is intentionally small because Phase 2 has no reverse proxy target yet. The routes cover GreenGateway's own control-plane surface so local traffic can exercise auth, RBAC, and audit:
+It is intentionally small. Most routes cover GreenGateway's own control-plane surface so local traffic can exercise auth, RBAC, and audit:
 
 - `/v1/admin/audit`
 - `/v1/admin/events/stream`
 - `/v1/admin/status`
+
+The dev compose stack also starts an internal-only echo upstream and points `UPSTREAM_URL` at it. The `/__dev-echo` route is a narrow allowance for authenticated proxy smoke-test traffic to reach that upstream while the policy remains `default_action: "deny"`.
 
 The `admin` role grants `"*"` for local demos. The `reader` role intentionally has no seeded permissions so follow-up traffic tests can demonstrate denied requests without implying working control-plane access.
 
