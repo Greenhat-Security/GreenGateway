@@ -108,6 +108,7 @@ mod tests {
             routes: Vec::new(),
             rules: Vec::new(),
             egress: EgressPolicy::default(),
+            rate_limits: Vec::new(),
         }
     }
 

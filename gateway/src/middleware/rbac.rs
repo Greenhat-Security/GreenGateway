@@ -30,7 +30,10 @@ use crate::{
     },
 };
 
-use super::decision::{PolicyDecision, PolicyDecisionOutcome};
+use super::{
+    decision::{PolicyDecision, PolicyDecisionOutcome},
+    rate_limit::RateLimitState,
+};
 
 const AUTHZ_ALLOWED: &str = "authz.allowed";
 const AUTHZ_DENIED: &str = "authz.denied";
@@ -40,6 +43,7 @@ const POLICY_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 #[derive(Clone)]
 pub struct RbacState {
     policy: Arc<ArcSwap<RbacPolicyState>>,
+    rate_limit: Option<RateLimitState>,
     pub exempt_paths: Vec<String>,
     pub trust_proxy_headers: bool,
     pub audit: AuditLog,
@@ -84,13 +88,23 @@ impl RbacState {
     ) -> Self {
         Self {
             policy: Arc::new(ArcSwap::from_pointee(RbacPolicyState::from_policy(policy))),
+            rate_limit: None,
             exempt_paths,
             trust_proxy_headers,
             audit,
         }
     }
 
+    pub(crate) fn with_rate_limit_state(mut self, rate_limit: RateLimitState) -> Self {
+        self.rate_limit = Some(rate_limit);
+        self
+    }
+
     fn replace_policy(&self, policy: Policy) {
+        if let Some(rate_limit) = &self.rate_limit {
+            rate_limit.replace_policy(&policy);
+        }
+
         self.policy
             .store(Arc::new(RbacPolicyState::from_policy(policy)));
     }
@@ -149,12 +163,14 @@ pub fn reload_policy_from_file(
             let policy_id = policy.id.clone();
             let route_rules = policy.routes.len();
             let direct_rules = policy.rules.len();
+            let rate_limit_rules = policy.rate_limits.len();
             state.replace_policy(policy);
             tracing::info!(
                 policy_file = %path.display(),
                 policy_id = policy_id.as_deref().unwrap_or("unnamed"),
                 route_rules,
                 direct_rules,
+                rate_limit_rules,
                 "RBAC policy reload accepted"
             );
             Ok(())
@@ -1979,6 +1995,7 @@ mod tests {
             routes: routes.to_vec(),
             rules: Vec::new(),
             egress: EgressPolicy::default(),
+            rate_limits: Vec::new(),
         }
     }
 
