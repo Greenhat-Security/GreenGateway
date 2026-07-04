@@ -53,6 +53,10 @@ const AUDIT_ADMIN_ROUTE: &str = "/v1/admin/audit";
 const AUDIT_EVENTS_STREAM_ROUTE: &str = "/v1/admin/events/stream";
 const STATUS_ADMIN_ROUTE: &str = "/v1/admin/status";
 const POLICY_ADMIN_ROUTE: &str = "/v1/admin/policy";
+const POLICY_HISTORY_ADMIN_ROUTE: &str = "/v1/admin/policy/history";
+#[cfg(test)]
+const POLICY_ROLLBACK_ADMIN_ROUTE_PREFIX: &str = "/v1/admin/policy/rollback";
+const POLICY_ROLLBACK_ADMIN_ROUTE: &str = "/v1/admin/policy/rollback/{version}";
 const POLICY_RULE_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/preview";
 const POLICY_RULE_HITS_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/hits";
 const POLICY_VALIDATE_ADMIN_ROUTE: &str = "/v1/admin/policy/validate";
@@ -161,6 +165,8 @@ struct AdminRoutes {
     events_stream_route: String,
     status_route: String,
     policy_route: String,
+    policy_history_route: String,
+    policy_rollback_route: String,
     policy_rule_preview_route: String,
     policy_rule_hits_route: String,
     policy_validate_route: String,
@@ -225,6 +231,8 @@ impl AdminRoutes {
             events_stream_route: format!("{api_prefix}/events/stream"),
             status_route: format!("{api_prefix}/status"),
             policy_route: format!("{api_prefix}/policy"),
+            policy_history_route: format!("{api_prefix}/policy/history"),
+            policy_rollback_route: format!("{api_prefix}/policy/rollback/{{version}}"),
             policy_rule_preview_route: format!("{api_prefix}/policy/rules/preview"),
             policy_rule_hits_route: format!("{api_prefix}/policy/rules/hits"),
             policy_validate_route: format!("{api_prefix}/policy/validate"),
@@ -266,6 +274,7 @@ struct StatusAdminState {
 struct PolicyAdminState {
     policy_file: Option<PathBuf>,
     rbac_state: Option<middleware::rbac::RbacState>,
+    history_store: Option<Arc<rbac::PolicyHistoryStore>>,
     query_store: Option<Arc<audit::query::AuditQueryStore>>,
     audit: audit::AuditLog,
     trust_proxy_headers: bool,
@@ -463,6 +472,13 @@ struct RuleSuggestionListParams {
     suggestion_type: Option<String>,
     limit: Option<String>,
     cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PolicyHistoryParams {
+    limit: Option<String>,
+    cursor: Option<String>,
+    include_policy: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -854,6 +870,10 @@ fn gateway_app_with_process_started_at(
         })
         .transpose()?
         .map(Arc::new);
+    let policy_history_store = policy_history_sqlite_path(&config)
+        .map(rbac::PolicyHistoryStore::open)
+        .transpose()?
+        .map(Arc::new);
     let observation_state =
         middleware::observation::ObservationState::from_config(&config, audit_log.clone())
             .with_conformance(
@@ -924,6 +944,7 @@ fn gateway_app_with_process_started_at(
     let policy_admin_state = PolicyAdminState {
         policy_file: config.policy_file.as_ref().map(PathBuf::from),
         rbac_state: rbac_state.clone(),
+        history_store: policy_history_store,
         query_store: audit_query_store.clone(),
         audit: audit_log.clone(),
         trust_proxy_headers: config.trust_proxy_headers,
@@ -1011,6 +1032,23 @@ fn gateway_app_with_process_started_at(
             &middleware_stack,
         )))
     }
+}
+
+fn policy_history_sqlite_path(config: &config::Config) -> Option<PathBuf> {
+    config
+        .policy_history_sqlite_path
+        .as_ref()
+        .map(PathBuf::from)
+        .or_else(|| {
+            config
+                .policy_file
+                .as_deref()
+                .map(default_policy_history_sqlite_path)
+        })
+}
+
+fn default_policy_history_sqlite_path(policy_file: &str) -> PathBuf {
+    PathBuf::from(format!("{policy_file}.history.sqlite"))
 }
 
 fn unified_router(
@@ -1145,6 +1183,14 @@ fn add_admin_api_routes(
                 .route(
                     routes.admin.policy_route.as_str(),
                     get(policy_get_endpoint).put(policy_put_endpoint),
+                )
+                .route(
+                    routes.admin.policy_history_route.as_str(),
+                    get(policy_history_endpoint),
+                )
+                .route(
+                    routes.admin.policy_rollback_route.as_str(),
+                    post(policy_rollback_endpoint),
                 )
                 .route(
                     routes.admin.policy_rule_preview_route.as_str(),
@@ -2086,7 +2132,20 @@ async fn policy_put_endpoint(
     }
 
     let after_policy = rbac_state.current_policy();
-    emit_policy_changed(&state, &parts, &principal, &before_policy, &after_policy);
+    let diff_summary = json!({
+        "action": "policy_replaced",
+    });
+    if let Err(response) = append_policy_version(&state, &principal, &after_policy, &diff_summary) {
+        return *response;
+    }
+    emit_policy_rule_changed(
+        &state,
+        &parts,
+        &principal,
+        &before_policy,
+        &after_policy,
+        diff_summary,
+    );
 
     let new_etag = match policy_etag(&after_policy) {
         Ok(etag) => etag,
@@ -2094,6 +2153,124 @@ async fn policy_put_endpoint(
             tracing::error!(error = %err, "failed to compute updated policy ETag");
             return internal_server_error("policy ETag computation failed");
         }
+    };
+
+    (
+        StatusCode::OK,
+        [(header::ETAG, etag_header_value(&new_etag))],
+        Json(after_policy),
+    )
+        .into_response()
+}
+
+async fn policy_history_endpoint(
+    State(state): State<PolicyAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+    Query(params): Query<PolicyHistoryParams>,
+) -> Response {
+    record_request(POLICY_HISTORY_ADMIN_ROUTE);
+
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_policy_state(&state, &principal, ADMIN_POLICY_READ_PERMISSION) {
+        return policy_admin_authz_error_response(error);
+    }
+    let Some(history_store) = state.history_store.as_ref() else {
+        return policy_history_not_configured();
+    };
+    let filters = match params.into_filters() {
+        Ok(filters) => filters,
+        Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
+    };
+
+    match history_store.list_versions(&filters) {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(rbac::policy_history::PolicyHistoryError::InvalidCursor { parameter }) => {
+            bad_request(&format!("invalid query parameter: {parameter}"))
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to query policy history");
+            internal_server_error("policy history query failed")
+        }
+    }
+}
+
+async fn policy_rollback_endpoint(
+    State(state): State<PolicyAdminState>,
+    Path(version): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(POLICY_ROLLBACK_ADMIN_ROUTE);
+
+    let target_version = match parse_policy_history_version(&version) {
+        Ok(version) => version,
+        Err(parameter) => return bad_request(&format!("invalid path parameter: {parameter}")),
+    };
+    let (parts, _body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    let rbac_state =
+        match authorized_policy_state(&state, &principal, ADMIN_POLICY_WRITE_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return policy_admin_authz_error_response(error),
+        };
+    let Some(policy_file) = state.policy_file.as_deref() else {
+        return policy_not_configured();
+    };
+    let Some(history_store) = state.history_store.as_ref() else {
+        return policy_history_not_configured();
+    };
+
+    let target = match history_store.get_version(target_version) {
+        Ok(Some(version)) => version,
+        Ok(None) => return not_found("policy version was not found"),
+        Err(err) => {
+            tracing::error!(error = %err, version = target_version, "failed to load policy history version");
+            return internal_server_error("policy history query failed");
+        }
+    };
+    let Some(target_policy) = target.policy else {
+        tracing::error!(
+            version = target_version,
+            "policy history detail omitted target snapshot"
+        );
+        return internal_server_error("policy history query failed");
+    };
+
+    let _policy_write_guard = match rbac_state.policy_write_guard() {
+        Ok(guard) => guard,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to acquire policy write lock");
+            return internal_server_error("policy write lock failed");
+        }
+    };
+
+    let before_policy = rbac_state.current_policy();
+    match require_matching_if_match(&parts.headers, &before_policy) {
+        Ok(_) => {}
+        Err(response) => return *response,
+    }
+
+    let diff_summary = json!({
+        "action": "policy_rolled_back",
+        "target_version": target.version,
+    });
+    let (after_policy, new_etag) = match persist_policy_mutation(
+        PolicyMutationCommitContext {
+            state: &state,
+            rbac_state,
+            policy_file,
+            parts: &parts,
+            principal: &principal,
+        },
+        &before_policy,
+        &target_policy,
+        diff_summary,
+    ) {
+        Ok(result) => result,
+        Err(response) => return *response,
     };
 
     (
@@ -3391,6 +3568,20 @@ impl RuleSuggestionListParams {
     }
 }
 
+impl PolicyHistoryParams {
+    fn into_filters(self) -> Result<rbac::PolicyHistoryListFilters, &'static str> {
+        let limit = parse_limit(self.limit)?;
+        let include_policy =
+            parse_optional_bool("include_policy", self.include_policy)?.unwrap_or(false);
+
+        Ok(rbac::PolicyHistoryListFilters {
+            limit,
+            cursor: self.cursor,
+            include_policy,
+        })
+    }
+}
+
 struct TrafficEndpointDetailQuery {
     method: String,
     endpoint_template: String,
@@ -3573,6 +3764,13 @@ fn parse_optional_bool(
             _ => Err(parameter),
         })
         .transpose()
+}
+
+fn parse_policy_history_version(value: &str) -> Result<i64, &'static str> {
+    match value.parse::<i64>() {
+        Ok(version) if version > 0 => Ok(version),
+        _ => Err("version"),
+    }
 }
 
 fn parse_limit(value: Option<String>) -> Result<usize, &'static str> {
@@ -4328,6 +4526,12 @@ fn persist_policy_mutation(
     }
 
     let after_policy = context.rbac_state.current_policy();
+    append_policy_version(
+        context.state,
+        context.principal,
+        &after_policy,
+        &diff_summary,
+    )?;
     emit_policy_rule_changed(
         context.state,
         context.parts,
@@ -4348,6 +4552,25 @@ fn persist_policy_mutation(
     };
 
     Ok((after_policy, new_etag))
+}
+
+fn append_policy_version(
+    state: &PolicyAdminState,
+    principal: &auth::Principal,
+    policy: &rbac::Policy,
+    diff_summary: &Value,
+) -> ResponseResult<()> {
+    let Some(history_store) = state.history_store.as_ref() else {
+        return Err(Box::new(policy_history_not_configured()));
+    };
+
+    history_store
+        .append_version(&principal.user_id, diff_summary, policy)
+        .map(|_| ())
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to append policy history version");
+            Box::new(internal_server_error("policy history append failed"))
+        })
 }
 
 fn effective_rule_id(rule: &rbac::Rule, rule_index: usize) -> String {
@@ -4553,21 +4776,6 @@ fn policy_validation_failed(errors: Vec<String>) -> Response {
         }),
     )
         .into_response()
-}
-
-fn emit_policy_changed(
-    state: &PolicyAdminState,
-    parts: &http::request::Parts,
-    principal: &auth::Principal,
-    before: &rbac::Policy,
-    after: &rbac::Policy,
-) {
-    emit_policy_changed_payload(
-        state,
-        parts,
-        principal,
-        policy_change_payload(before, after),
-    );
 }
 
 fn emit_policy_rule_changed(
@@ -4803,6 +5011,18 @@ fn policy_not_configured() -> Response {
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
             error: "policy API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn policy_history_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error:
+                "policy history requires POLICY_FILE or POLICY_HISTORY_SQLITE_PATH to be configured"
+                    .to_owned(),
         }),
     )
         .into_response()
@@ -5057,6 +5277,7 @@ mod tests {
                 discovery::suggestions::DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
             openapi_spec_path: None,
             policy_file: None,
+            policy_history_sqlite_path: None,
             cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
             max_body_size: 1_048_576,
             rate_limit_read_rps: 50.0,
@@ -6040,6 +6261,14 @@ mod tests {
         assert_eq!(default_routes.status_route, STATUS_ADMIN_ROUTE);
         assert_eq!(default_routes.policy_route, POLICY_ADMIN_ROUTE);
         assert_eq!(
+            default_routes.policy_history_route,
+            POLICY_HISTORY_ADMIN_ROUTE
+        );
+        assert_eq!(
+            default_routes.policy_rollback_route,
+            POLICY_ROLLBACK_ADMIN_ROUTE
+        );
+        assert_eq!(
             default_routes.policy_rule_preview_route,
             POLICY_RULE_PREVIEW_ADMIN_ROUTE
         );
@@ -6098,6 +6327,11 @@ mod tests {
         assert_eq!(custom_routes.events_stream_route, "/v1/ops/events/stream");
         assert_eq!(custom_routes.status_route, "/v1/ops/status");
         assert_eq!(custom_routes.policy_route, "/v1/ops/policy");
+        assert_eq!(custom_routes.policy_history_route, "/v1/ops/policy/history");
+        assert_eq!(
+            custom_routes.policy_rollback_route,
+            "/v1/ops/policy/rollback/{version}"
+        );
         assert_eq!(
             custom_routes.policy_rule_preview_route,
             "/v1/ops/policy/rules/preview"
@@ -8129,9 +8363,359 @@ mod tests {
         assert_eq!(actor.roles, Some(vec!["admin".to_owned()]));
         assert_eq!(event.payload["before"]["id"], json!("initial-policy"));
         assert_eq!(event.payload["after"]["id"], json!("updated-policy"));
-        assert_eq!(event.payload["before"]["routes"], json!(4));
-        assert_eq!(event.payload["after"]["routes"], json!(4));
+        assert_eq!(event.payload["before"]["routes"], json!(6));
+        assert_eq!(event.payload["after"]["routes"], json!(6));
         assert_eq!(event.payload["changed_sections"], json!(["id", "routes"]));
+    }
+
+    #[tokio::test]
+    async fn policy_history_records_every_policy_mutation_path_once() {
+        let initial_policy = policy_document_with_rules_string(
+            "initial-policy",
+            json!([
+                direct_rule_json(Some("managed-rule"), &["GET"], "/managed", "allow"),
+                direct_rule_json(Some("second-rule"), &["POST"], "/second", "deny")
+            ]),
+        );
+        let policy = TempPolicyFile::new(&initial_policy);
+        let history_db = TempDb::new("policy-history-all-mutations");
+        let router = policy_admin_router_with_history(Some(&policy), &history_db);
+
+        assert!(policy_history_entries(&router, None).await.is_empty());
+
+        let (etag, _) = current_policy(&router).await;
+        let put_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(policy_document_with_rules_string(
+                    "whole-policy",
+                    json!([
+                        direct_rule_json(Some("managed-rule"), &["GET"], "/managed", "allow"),
+                        direct_rule_json(Some("second-rule"), &["POST"], "/second", "deny")
+                    ]),
+                )),
+                Some(&etag),
+            ))
+            .await
+            .expect("policy PUT should complete");
+        assert_eq!(put_response.status(), StatusCode::OK);
+        assert_history_versions(&router, &["policy_replaced"]).await;
+
+        let create_etag = policy_etag_header(&put_response);
+        let create_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_RULES_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(
+                    json!({ "id": "created-rule", "path": "/created", "action": "allow" })
+                        .to_string(),
+                ),
+                Some(&create_etag),
+            ))
+            .await
+            .expect("rule POST should complete");
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        assert_history_versions(&router, &["rule_created", "policy_replaced"]).await;
+
+        let patch_etag = policy_etag_header(&create_response);
+        let patch_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PATCH,
+                &format!("{POLICY_RULES_ADMIN_ROUTE}/created-rule"),
+                Some(test_principal(&["admin"])),
+                Some(json!({ "action": "deny" }).to_string()),
+                Some(&patch_etag),
+            ))
+            .await
+            .expect("rule PATCH should complete");
+        assert_eq!(patch_response.status(), StatusCode::OK);
+        assert_history_versions(
+            &router,
+            &["rule_updated", "rule_created", "policy_replaced"],
+        )
+        .await;
+
+        let delete_etag = policy_etag_header(&patch_response);
+        let delete_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::DELETE,
+                &format!("{POLICY_RULES_ADMIN_ROUTE}/created-rule"),
+                Some(test_principal(&["admin"])),
+                None,
+                Some(&delete_etag),
+            ))
+            .await
+            .expect("rule DELETE should complete");
+        assert_eq!(delete_response.status(), StatusCode::OK);
+        assert_history_versions(
+            &router,
+            &[
+                "rule_deleted",
+                "rule_updated",
+                "rule_created",
+                "policy_replaced",
+            ],
+        )
+        .await;
+
+        let reorder_etag = policy_etag_header(&delete_response);
+        let reorder_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_RULES_ORDER_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(json!(["second-rule", "managed-rule"]).to_string()),
+                Some(&reorder_etag),
+            ))
+            .await
+            .expect("rule order PUT should complete");
+        assert_eq!(reorder_response.status(), StatusCode::OK);
+
+        let entries = policy_history_page(
+            &router,
+            POLICY_HISTORY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+        )
+        .await["versions"]
+            .as_array()
+            .expect("versions should be an array")
+            .clone();
+        assert_eq!(
+            entries.len(),
+            5,
+            "every successful mutation should append exactly one version"
+        );
+        assert_eq!(
+            history_actions(&entries),
+            vec![
+                "rules_reordered",
+                "rule_deleted",
+                "rule_updated",
+                "rule_created",
+                "policy_replaced",
+            ]
+        );
+        for (expected_version, entry) in (1..=5).rev().zip(entries.iter()) {
+            assert_eq!(entry["version"], json!(expected_version));
+            assert_eq!(entry["actor"], json!("user-123"));
+            assert_rfc3339_timestamp(
+                entry["created_at"]
+                    .as_str()
+                    .expect("timestamp should exist"),
+            );
+            assert!(
+                entry.get("policy").is_none(),
+                "list entries should omit policy snapshots"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_history_list_paginates_and_requires_read_permission() {
+        let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+        let history_db = TempDb::new("policy-history-list");
+        let router = policy_admin_router_with_history(Some(&policy), &history_db);
+
+        for id in ["first-policy", "second-policy"] {
+            let (etag, _) = current_policy(&router).await;
+            let response = router
+                .clone()
+                .oneshot(policy_admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some(test_principal(&["admin"])),
+                    Some(policy_document_string(id, "test:new")),
+                    Some(&etag),
+                ))
+                .await
+                .expect("policy PUT should complete");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let first_page = policy_history_page(
+            &router,
+            "/v1/admin/policy/history?limit=1",
+            Some(test_principal(&["policy-reader"])),
+        )
+        .await;
+        assert_eq!(
+            first_page["versions"]
+                .as_array()
+                .expect("versions array")
+                .len(),
+            1
+        );
+        assert_eq!(first_page["versions"][0]["version"], json!(2));
+        let cursor = first_page["next_cursor"]
+            .as_str()
+            .expect("first page should include a cursor");
+
+        let second_page = policy_history_page(
+            &router,
+            &format!("/v1/admin/policy/history?limit=1&cursor={cursor}"),
+            Some(test_principal(&["policy-reader"])),
+        )
+        .await;
+        assert_eq!(
+            second_page["versions"]
+                .as_array()
+                .expect("versions array")
+                .len(),
+            1
+        );
+        assert_eq!(second_page["versions"][0]["version"], json!(1));
+        assert!(second_page["next_cursor"].is_null());
+
+        let forbidden = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                "/v1/admin/policy/history",
+                Some(test_principal(&["reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("forbidden history request should complete");
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let unauthenticated = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                "/v1/admin/policy/history",
+                None,
+                None,
+                None,
+            ))
+            .await
+            .expect("unauthenticated history request should complete");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn policy_rollback_restores_snapshot_appends_history_and_requires_write_permission() {
+        let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+        let history_db = TempDb::new("policy-history-rollback");
+        let router = policy_admin_router_with_history(Some(&policy), &history_db);
+
+        let (first_etag, _) = current_policy(&router).await;
+        let first_update = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(policy_document_string("target-policy", "test:new")),
+                Some(&first_etag),
+            ))
+            .await
+            .expect("first policy PUT should complete");
+        assert_eq!(first_update.status(), StatusCode::OK);
+
+        let (second_etag, _) = current_policy(&router).await;
+        let second_update = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(policy_document_string("later-policy", "test:old")),
+                Some(&second_etag),
+            ))
+            .await
+            .expect("second policy PUT should complete");
+        assert_eq!(second_update.status(), StatusCode::OK);
+
+        let entries_before_rollback = policy_history_entries(&router, None).await;
+        assert_eq!(entries_before_rollback.len(), 2);
+        assert_eq!(entries_before_rollback[1]["version"], json!(1));
+        let target_snapshot = entries_before_rollback[1]["policy"].clone();
+        assert_eq!(target_snapshot["id"], json!("target-policy"));
+
+        let (rollback_etag, _) = current_policy(&router).await;
+        let forbidden = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                "/v1/admin/policy/rollback/1",
+                Some(test_principal(&["policy-reader"])),
+                None,
+                Some(&rollback_etag),
+            ))
+            .await
+            .expect("read-only rollback request should complete");
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let unknown = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                "/v1/admin/policy/rollback/404",
+                Some(test_principal(&["admin"])),
+                None,
+                Some(&rollback_etag),
+            ))
+            .await
+            .expect("unknown rollback request should complete");
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let missing_if_match = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                "/v1/admin/policy/rollback/1",
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("missing If-Match rollback request should complete");
+        assert_eq!(missing_if_match.status(), StatusCode::PRECONDITION_REQUIRED);
+
+        let rollback = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                "/v1/admin/policy/rollback/1",
+                Some(test_principal(&["admin"])),
+                None,
+                Some(&rollback_etag),
+            ))
+            .await
+            .expect("rollback request should complete");
+        assert_eq!(rollback.status(), StatusCode::OK);
+        let rolled_back = json_body(rollback).await;
+        assert_eq!(rolled_back, target_snapshot);
+
+        let (_, live_policy) = current_policy(&router).await;
+        assert_eq!(live_policy, target_snapshot);
+
+        let entries_after_rollback = policy_history_entries(&router, None).await;
+        assert_eq!(
+            entries_after_rollback.len(),
+            entries_before_rollback.len() + 1,
+            "rollback should append history without deleting prior versions"
+        );
+        assert_eq!(
+            history_actions(&entries_after_rollback),
+            vec!["policy_rolled_back", "policy_replaced", "policy_replaced"]
+        );
+        assert_eq!(entries_after_rollback[0]["version"], json!(3));
+        assert_eq!(
+            entries_after_rollback[0]["diff_summary"]["target_version"],
+            json!(1)
+        );
+        assert_eq!(entries_after_rollback[0]["policy"], target_snapshot);
+        assert_eq!(entries_after_rollback[1], entries_before_rollback[0]);
+        assert_eq!(entries_after_rollback[2], entries_before_rollback[1]);
     }
 
     #[tokio::test]
@@ -13537,6 +14121,23 @@ paths:
         config
     }
 
+    fn policy_admin_config_with_history(
+        policy: Option<&TempPolicyFile>,
+        history_path: Option<&PathBuf>,
+    ) -> config::Config {
+        let mut config = policy_admin_config_with_sqlite(policy, None);
+        config.policy_history_sqlite_path =
+            history_path.map(|path| path.to_string_lossy().into_owned());
+        config
+            .rbac_exempt_paths
+            .push(POLICY_HISTORY_ADMIN_ROUTE.to_owned());
+        config
+            .rbac_exempt_paths
+            .push(POLICY_ROLLBACK_ADMIN_ROUTE_PREFIX.to_owned());
+
+        config
+    }
+
     fn policy_admin_router(policy: Option<&TempPolicyFile>, audit_log: audit::AuditLog) -> Router {
         policy_admin_router_with_sqlite(policy, audit_log, None)
     }
@@ -13551,6 +14152,20 @@ paths:
             policy_admin_config_with_sqlite(policy, sqlite_path),
             recorder.handle(),
             audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+    }
+
+    fn policy_admin_router_with_history(
+        policy: Option<&TempPolicyFile>,
+        history_db: &TempDb,
+    ) -> Router {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        app(
+            policy_admin_config_with_history(policy, Some(&history_db.path)),
+            recorder.handle(),
+            test_audit_log(),
             test_audit_event_sender(),
         )
         .expect("app should build")
@@ -13659,6 +14274,61 @@ paths:
         (etag, body)
     }
 
+    async fn policy_history_page(
+        router: &Router,
+        uri: &str,
+        principal: Option<auth::Principal>,
+    ) -> Value {
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                uri,
+                principal,
+                None,
+                None,
+            ))
+            .await
+            .expect("policy history request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await
+    }
+
+    async fn policy_history_entries(router: &Router, limit: Option<usize>) -> Vec<Value> {
+        let uri = limit
+            .map(|limit| format!("{POLICY_HISTORY_ADMIN_ROUTE}?limit={limit}&include_policy=true"))
+            .unwrap_or_else(|| format!("{POLICY_HISTORY_ADMIN_ROUTE}?include_policy=true"));
+        policy_history_page(router, &uri, Some(test_principal(&["admin"]))).await["versions"]
+            .as_array()
+            .expect("versions should be an array")
+            .clone()
+    }
+
+    async fn assert_history_versions(router: &Router, expected_actions: &[&str]) {
+        let entries = policy_history_entries(router, None).await;
+        assert_eq!(
+            history_actions(&entries),
+            expected_actions,
+            "unexpected policy history actions"
+        );
+    }
+
+    fn history_actions(entries: &[Value]) -> Vec<&str> {
+        entries
+            .iter()
+            .map(|entry| {
+                entry["diff_summary"]["action"]
+                    .as_str()
+                    .expect("history entry should include action")
+            })
+            .collect()
+    }
+
+    fn assert_rfc3339_timestamp(value: &str) {
+        OffsetDateTime::parse(value, &Rfc3339)
+            .unwrap_or_else(|err| panic!("timestamp should be RFC3339: {value}: {err}"));
+    }
+
     fn policy_document_string(id: &str, test_permission: &str) -> String {
         serde_json::to_string_pretty(&policy_document(id, test_permission))
             .expect("test policy should serialize")
@@ -13723,6 +14393,16 @@ paths:
                 {
                     "methods": ["PUT"],
                     "path_prefix": POLICY_ADMIN_ROUTE,
+                    "permission": ADMIN_POLICY_WRITE_PERMISSION
+                },
+                {
+                    "methods": ["GET"],
+                    "path_prefix": POLICY_HISTORY_ADMIN_ROUTE,
+                    "permission": ADMIN_POLICY_READ_PERMISSION
+                },
+                {
+                    "methods": ["POST"],
+                    "path_prefix": POLICY_ROLLBACK_ADMIN_ROUTE_PREFIX,
                     "permission": ADMIN_POLICY_WRITE_PERMISSION
                 },
                 {
@@ -15092,6 +15772,11 @@ O2gecI9QwDJNpm29J9wJB2F8
     impl Drop for TempPolicyFile {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
+            let history_path = default_policy_history_sqlite_path(&self.path.to_string_lossy());
+            for suffix in ["", "-wal", "-shm"] {
+                let path = PathBuf::from(format!("{}{}", history_path.display(), suffix));
+                let _ = fs::remove_file(path);
+            }
         }
     }
 

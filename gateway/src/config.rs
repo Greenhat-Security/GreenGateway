@@ -88,6 +88,7 @@ const OPENAPI_SPEC_PATH: &str = "OPENAPI_SPEC_PATH";
 const PAYLOAD_CAPTURE_ENABLED: &str = "PAYLOAD_CAPTURE_ENABLED";
 const PAYLOAD_CAPTURE_SAMPLE_RATE: &str = "PAYLOAD_CAPTURE_SAMPLE_RATE";
 const POLICY_FILE: &str = "POLICY_FILE";
+const POLICY_HISTORY_SQLITE_PATH: &str = "POLICY_HISTORY_SQLITE_PATH";
 const PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD: &str =
     "PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD";
 const RBAC_EXEMPT_PATHS: &str = "RBAC_EXEMPT_PATHS";
@@ -127,6 +128,7 @@ pub struct Config {
     pub rule_suggestion_baseline_window_hours: u64,
     pub openapi_spec_path: Option<PathBuf>,
     pub policy_file: Option<String>,
+    pub policy_history_sqlite_path: Option<String>,
     pub cors_allow_origins: Vec<String>,
     pub max_body_size: usize,
     pub rate_limit_read_rps: f64,
@@ -350,6 +352,11 @@ impl Config {
         let openapi_spec_path =
             parse_optional_path(OPENAPI_SPEC_PATH, get_var(OPENAPI_SPEC_PATH), &mut problems);
         let policy_file = parse_optional_string(POLICY_FILE, get_var(POLICY_FILE), &mut problems);
+        let policy_history_sqlite_path = parse_optional_string(
+            POLICY_HISTORY_SQLITE_PATH,
+            get_var(POLICY_HISTORY_SQLITE_PATH),
+            &mut problems,
+        );
         let cors_allow_origins = parse_comma_separated_header_values(
             CORS_ALLOW_ORIGINS,
             get_var(CORS_ALLOW_ORIGINS),
@@ -601,6 +608,7 @@ impl Config {
                 rule_suggestion_baseline_window_hours,
                 openapi_spec_path,
                 policy_file,
+                policy_history_sqlite_path,
                 cors_allow_origins,
                 max_body_size,
                 rate_limit_read_rps,
@@ -1574,6 +1582,7 @@ mod tests {
         assert_eq!(config.audit_sqlite_retention_days, None);
         assert_eq!(config.discovery_sqlite_path, None);
         assert_eq!(config.policy_file, None);
+        assert_eq!(config.policy_history_sqlite_path, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
         assert_eq!(config.rate_limit_read_rps, DEFAULT_RATE_LIMIT_READ_RPS);
@@ -1741,6 +1750,7 @@ mod tests {
             RuleSuggestionConfig::default()
         );
         assert_eq!(config.policy_file, None);
+        assert_eq!(config.policy_history_sqlite_path, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
         assert_eq!(config.rate_limit_read_rps, DEFAULT_RATE_LIMIT_READ_RPS);
@@ -2201,6 +2211,33 @@ mod tests {
         .expect("config should parse");
 
         assert_eq!(config.policy_file, None);
+    }
+
+    #[test]
+    fn policy_history_sqlite_path_parses_optional_path() {
+        let config = Config::from_env_vars(|name| match name {
+            "POLICY_HISTORY_SQLITE_PATH" => {
+                Ok("  /var/lib/greengateway/policy-history.sqlite  ".to_owned())
+            }
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.policy_history_sqlite_path,
+            Some("/var/lib/greengateway/policy-history.sqlite".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_policy_history_sqlite_path_is_none() {
+        let config = Config::from_env_vars(|name| match name {
+            "POLICY_HISTORY_SQLITE_PATH" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.policy_history_sqlite_path, None);
     }
 
     #[test]
