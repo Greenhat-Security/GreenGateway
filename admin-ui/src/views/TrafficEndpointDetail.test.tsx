@@ -256,6 +256,28 @@ describe('TrafficEndpointDetail', () => {
     expect(await screen.findByText('Request failed')).toBeTruthy();
     expect(screen.getByText('Network request failed: offline')).toBeTruthy();
   });
+
+  it('does not render a signal badge when open_signals is omitted', async () => {
+    const { open_signals: _openSignals, ...endpoint } = trafficEndpoint();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        jsonResponse(200, trafficDetailResponse({ endpoint })),
+      ),
+    );
+
+    renderEndpointDetail();
+
+    expect(
+      await screen.findByRole('heading', {
+        name: 'GET /users/{id}',
+      }),
+    ).toBeTruthy();
+    expect(screen.queryByText(/open signals/)).toBeNull();
+    expect(
+      screen.queryByRole('link', { name: /View .* open signals/ }),
+    ).toBeNull();
+  });
 });
 
 function renderEndpointDetail() {
@@ -368,8 +390,10 @@ function auditAvailable() {
   };
 }
 
+type TrafficEndpointFixture = ReturnType<typeof trafficEndpoint>;
+
 type DetailResponseShape = {
-  endpoint: ReturnType<typeof trafficEndpoint>;
+  endpoint: TrafficEndpointFixture | Omit<TrafficEndpointFixture, 'open_signals'>;
   principals: {
     principals: Array<{
       user_id: string;

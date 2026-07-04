@@ -88,6 +88,29 @@ describe('TrafficInventory', () => {
     ).toBeTruthy();
   });
 
+  it('does not render a signal badge when open_signals is omitted', async () => {
+    const { open_signals: _openSignals, ...endpoint } = trafficEndpoint({
+      endpoint_template: '/traffic-only',
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        jsonResponse(200, {
+          endpoints: [endpoint],
+          next_cursor: null,
+        }),
+      ),
+    );
+
+    renderTrafficInventory();
+
+    expect(await screen.findByText('/traffic-only')).toBeTruthy();
+    expect(screen.queryByText(/open signals/)).toBeNull();
+    expect(
+      screen.queryByRole('link', { name: /View .* open signals/ }),
+    ).toBeNull();
+  });
+
   it.each([
     {
       status: 401,

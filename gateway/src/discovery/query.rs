@@ -105,7 +105,8 @@ pub struct EndpointSummary {
     pub reviewed_at: Option<String>,
     pub reviewed_by: Option<String>,
     pub covered_by_rule: bool,
-    pub open_signals: OpenSignalSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_signals: Option<OpenSignalSummary>,
     pub latency: EndpointLatencySummary,
     pub status_counts: Vec<StatusCount>,
 }
@@ -124,7 +125,8 @@ pub struct EndpointAggregateDetail {
     pub reviewed_at: Option<String>,
     pub reviewed_by: Option<String>,
     pub covered_by_rule: bool,
-    pub open_signals: OpenSignalSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_signals: Option<OpenSignalSummary>,
     pub latency: EndpointLatencyDetail,
     pub status_counts: Vec<StatusCount>,
     pub updated_at: String,
@@ -353,6 +355,14 @@ impl DiscoveryQueryStore {
         &self,
         filters: &EndpointListFilters,
     ) -> Result<EndpointListPage, DiscoveryQueryError> {
+        self.list_endpoints_with_open_signal_summaries(filters, true)
+    }
+
+    pub fn list_endpoints_with_open_signal_summaries(
+        &self,
+        filters: &EndpointListFilters,
+        include_open_signals: bool,
+    ) -> Result<EndpointListPage, DiscoveryQueryError> {
         let cursor = filters
             .cursor
             .as_deref()
@@ -409,7 +419,11 @@ impl DiscoveryQueryStore {
         };
 
         let connection = self.connection_guard();
-        let open_signal_summaries = self.open_signal_summaries_for_rows(&connection, &rows)?;
+        let open_signal_summaries = if include_open_signals {
+            self.open_signal_summaries_for_rows(&connection, &rows)?
+        } else {
+            HashMap::new()
+        };
         let endpoints = rows
             .into_iter()
             .map(|row| {
@@ -419,10 +433,16 @@ impl DiscoveryQueryStore {
                     &row.method,
                     &row.endpoint_template,
                 )?;
-                let open_signals = open_signal_summaries
-                    .get(&(row.method.clone(), row.endpoint_template.clone()))
-                    .cloned()
-                    .unwrap_or_default();
+                let open_signals = if include_open_signals {
+                    Some(
+                        open_signal_summaries
+                            .get(&(row.method.clone(), row.endpoint_template.clone()))
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    None
+                };
                 Ok(row.into_summary(status_counts, open_signals, &new_since_cutoff))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -438,6 +458,21 @@ impl DiscoveryQueryStore {
         method: &str,
         endpoint_template: &str,
         new_since_hours: u64,
+    ) -> Result<Option<EndpointAggregateDetail>, DiscoveryQueryError> {
+        self.get_endpoint_with_open_signal_summaries(
+            method,
+            endpoint_template,
+            new_since_hours,
+            true,
+        )
+    }
+
+    pub fn get_endpoint_with_open_signal_summaries(
+        &self,
+        method: &str,
+        endpoint_template: &str,
+        new_since_hours: u64,
+        include_open_signals: bool,
     ) -> Result<Option<EndpointAggregateDetail>, DiscoveryQueryError> {
         let new_since_cutoff = new_since_cutoff(new_since_hours);
         let connection = self.connection_guard();
@@ -487,14 +522,20 @@ impl DiscoveryQueryStore {
 
         let status_counts =
             load_status_counts(&connection, &self.path, &row.method, &row.endpoint_template)?;
-        let open_signals = self.open_signal_summaries_for_keys(
-            &connection,
-            &[(row.method.clone(), row.endpoint_template.clone())],
-        )?;
-        let open_signals = open_signals
-            .get(&(row.method.clone(), row.endpoint_template.clone()))
-            .cloned()
-            .unwrap_or_default();
+        let open_signals = if include_open_signals {
+            let summaries = self.open_signal_summaries_for_keys(
+                &connection,
+                &[(row.method.clone(), row.endpoint_template.clone())],
+            )?;
+            Some(
+                summaries
+                    .get(&(row.method.clone(), row.endpoint_template.clone()))
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
         Ok(Some(row.into_detail(
             status_counts,
             open_signals,
@@ -1154,7 +1195,7 @@ impl RawEndpointAggregate {
     fn into_summary(
         self,
         status_counts: Vec<StatusCount>,
-        open_signals: OpenSignalSummary,
+        open_signals: Option<OpenSignalSummary>,
         new_since_cutoff: &str,
     ) -> EndpointSummary {
         let latency = self.latency_summary();
@@ -1183,7 +1224,7 @@ impl RawEndpointAggregate {
     fn into_detail(
         self,
         status_counts: Vec<StatusCount>,
-        open_signals: OpenSignalSummary,
+        open_signals: Option<OpenSignalSummary>,
         new_since_cutoff: &str,
     ) -> Result<EndpointAggregateDetail, DiscoveryQueryError> {
         let samples =

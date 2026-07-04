@@ -41,7 +41,7 @@ export type TrafficEndpoint = {
   reviewed_at: string | null;
   reviewed_by: string | null;
   covered_by_rule: boolean;
-  open_signals: TrafficOpenSignalSummary;
+  open_signals?: TrafficOpenSignalSummary;
   latency: TrafficEndpointLatency;
   status_counts: TrafficStatusCount[];
 };
