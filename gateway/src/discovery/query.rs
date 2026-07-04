@@ -12,9 +12,13 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
-use crate::metrics::LOCK_POISON_RECOVERIES_TOTAL;
+use crate::{
+    discovery::signals::{self, Signal, SignalLifecycleState, SignalListFilters, SignalTarget},
+    metrics::LOCK_POISON_RECOVERIES_TOTAL,
+};
 
 pub const DEFAULT_NEW_SINCE_HOURS: u64 = 24;
 /// 100 years, comfortably inside `OffsetDateTime`'s representable range and
@@ -183,6 +187,9 @@ pub enum DiscoveryQueryError {
     InvalidCursor {
         parameter: &'static str,
     },
+    InvalidSignalState {
+        state: String,
+    },
 }
 
 impl fmt::Display for DiscoveryQueryError {
@@ -204,6 +211,12 @@ impl fmt::Display for DiscoveryQueryError {
             Self::InvalidCursor { parameter } => {
                 write!(formatter, "invalid discovery query cursor: {parameter}")
             }
+            Self::InvalidSignalState { state } => {
+                write!(
+                    formatter,
+                    "invalid discovery signal state in database: {state}"
+                )
+            }
         }
     }
 }
@@ -213,7 +226,7 @@ impl Error for DiscoveryQueryError {
         match self {
             Self::Open { source, .. } | Self::Sqlite { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
-            Self::InvalidCursor { .. } => None,
+            Self::InvalidCursor { .. } | Self::InvalidSignalState { .. } => None,
         }
     }
 }
@@ -619,6 +632,101 @@ impl DiscoveryQueryStore {
                 reviewed_by: None,
             }))
         }
+    }
+
+    pub fn list_signals(
+        &self,
+        filters: &SignalListFilters,
+    ) -> Result<signals::SignalListPage, DiscoveryQueryError> {
+        let cursor = filters
+            .cursor
+            .as_deref()
+            .map(|value| decode_cursor::<SignalCursor>("cursor", value))
+            .transpose()?;
+        let (sql, params) = build_signal_list_query(filters, cursor.as_ref());
+
+        let rows = {
+            let connection = self.connection_guard();
+            let mut statement =
+                connection
+                    .prepare(&sql)
+                    .map_err(|source| DiscoveryQueryError::Sqlite {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            let rows = statement
+                .query_map(params_from_iter(params.iter()), RawSignal::from_row)
+                .map_err(|source| DiscoveryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| DiscoveryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            rows
+        };
+
+        let mut rows = rows;
+        let has_more = rows.len() > filters.limit;
+        if has_more {
+            rows.truncate(filters.limit);
+        }
+
+        let next_cursor = if has_more {
+            rows.last()
+                .map(|row| {
+                    encode_cursor(&SignalCursor {
+                        created_at: row.created_at.clone(),
+                        id: row.id.clone(),
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
+        let signals = rows
+            .into_iter()
+            .map(RawSignal::into_signal)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(signals::SignalListPage {
+            signals,
+            next_cursor,
+        })
+    }
+
+    pub fn transition_signal(
+        &self,
+        signal_id: &str,
+        state: SignalLifecycleState,
+        transitioned_by: Option<&str>,
+    ) -> Result<Option<Signal>, DiscoveryQueryError> {
+        let transitioned_at = utc_timestamp_rfc3339();
+        let connection = self.connection_guard();
+        let updated = connection
+            .execute(
+                r#"
+                UPDATE discovery_signals
+                SET state = ?2,
+                    updated_at = ?3,
+                    transitioned_at = ?3,
+                    transitioned_by = ?4
+                WHERE id = ?1
+                "#,
+                params![signal_id, state.as_str(), transitioned_at, transitioned_by,],
+            )
+            .map_err(|source| DiscoveryQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        if updated == 0 {
+            return Ok(None);
+        }
+
+        load_signal_by_id(&connection, &self.path, signal_id)
     }
 
     pub fn list_principals(
@@ -1072,6 +1180,12 @@ struct PrincipalCursor {
     user_id: String,
 }
 
+#[derive(Deserialize, Serialize)]
+struct SignalCursor {
+    created_at: String,
+    id: String,
+}
+
 impl Serialize for EndpointSort {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1282,6 +1396,59 @@ fn build_principal_query(
     (sql, params)
 }
 
+fn build_signal_list_query(
+    filters: &SignalListFilters,
+    cursor: Option<&SignalCursor>,
+) -> (String, Vec<SqlValue>) {
+    let mut sql = String::from(
+        r#"
+        SELECT
+            id,
+            signal_type,
+            target_kind,
+            target_key,
+            target_identity_json,
+            explanation,
+            evidence_json,
+            state,
+            created_at,
+            updated_at,
+            transitioned_at,
+            transitioned_by
+        FROM discovery_signals
+        "#,
+    );
+    let mut clauses = Vec::new();
+    let mut params = Vec::new();
+
+    if let Some(state) = filters.state {
+        clauses.push("state = ?");
+        params.push(SqlValue::Text(state.as_str().to_owned()));
+    }
+    if let Some(signal_type) = &filters.signal_type {
+        clauses.push("signal_type = ?");
+        params.push(SqlValue::Text(signal_type.clone()));
+    }
+    if let Some(cursor) = cursor {
+        clauses.push(
+            "(julianday(created_at) < julianday(?) OR (julianday(created_at) = julianday(?) AND id > ?))",
+        );
+        params.push(SqlValue::Text(cursor.created_at.clone()));
+        params.push(SqlValue::Text(cursor.created_at.clone()));
+        params.push(SqlValue::Text(cursor.id.clone()));
+    }
+
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+
+    sql.push_str(" ORDER BY julianday(created_at) DESC, id ASC LIMIT ?");
+    params.push(SqlValue::Integer(query_limit(filters.limit)));
+
+    (sql, params)
+}
+
 fn endpoint_cursor(
     row: &RawEndpointAggregate,
     sort: EndpointSort,
@@ -1298,6 +1465,120 @@ fn endpoint_cursor(
         method: row.method.clone(),
         endpoint_template: row.endpoint_template.clone(),
     })
+}
+
+#[derive(Debug)]
+struct RawSignal {
+    id: String,
+    signal_type: String,
+    target_kind: String,
+    target_key: String,
+    target_identity_json: String,
+    explanation: String,
+    evidence_json: String,
+    state: String,
+    created_at: String,
+    updated_at: String,
+    transitioned_at: Option<String>,
+    transitioned_by: Option<String>,
+}
+
+impl RawSignal {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            signal_type: row.get(1)?,
+            target_kind: row.get(2)?,
+            target_key: row.get(3)?,
+            target_identity_json: row.get(4)?,
+            explanation: row.get(5)?,
+            evidence_json: row.get(6)?,
+            state: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+            transitioned_at: row.get(10)?,
+            transitioned_by: row.get(11)?,
+        })
+    }
+
+    fn into_signal(self) -> Result<Signal, DiscoveryQueryError> {
+        let identity =
+            serde_json::from_str::<Value>(&self.target_identity_json).map_err(|source| {
+                DiscoveryQueryError::Json {
+                    context: "signal target identity",
+                    source,
+                }
+            })?;
+        let evidence = serde_json::from_str::<Value>(&self.evidence_json).map_err(|source| {
+            DiscoveryQueryError::Json {
+                context: "signal evidence",
+                source,
+            }
+        })?;
+        let state = SignalLifecycleState::parse(&self.state).map_err(|_| {
+            DiscoveryQueryError::InvalidSignalState {
+                state: self.state.clone(),
+            }
+        })?;
+        let _ = self.target_key;
+
+        Ok(Signal {
+            id: self.id,
+            signal_type: self.signal_type,
+            target: SignalTarget {
+                kind: self.target_kind,
+                identity,
+            },
+            explanation: self.explanation,
+            evidence,
+            state,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            transitioned_at: self.transitioned_at,
+            transitioned_by: self.transitioned_by,
+        })
+    }
+}
+
+fn load_signal_by_id(
+    connection: &Connection,
+    path: &Path,
+    signal_id: &str,
+) -> Result<Option<Signal>, DiscoveryQueryError> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT
+                id,
+                signal_type,
+                target_kind,
+                target_key,
+                target_identity_json,
+                explanation,
+                evidence_json,
+                state,
+                created_at,
+                updated_at,
+                transitioned_at,
+                transitioned_by
+            FROM discovery_signals
+            WHERE id = ?1
+            "#,
+        )
+        .map_err(|source| DiscoveryQueryError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    statement
+        .query_row(params![signal_id], RawSignal::from_row)
+        .optional()
+        .map_err(|source| DiscoveryQueryError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .map(RawSignal::into_signal)
+        .transpose()
 }
 
 fn load_status_counts(
@@ -1352,7 +1633,8 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
         connection,
         "schema_mismatch_count",
         "INTEGER NOT NULL DEFAULT 0",
-    )
+    )?;
+    signals::configure_connection(connection)
 }
 
 fn ensure_discovery_endpoint_aggregate_column(

@@ -37,7 +37,10 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     audit::{redact::hash_args, AuditEvent, AuditSink},
-    discovery::path_template::{template_stateless, PathTemplateLearner},
+    discovery::{
+        path_template::{template_stateless, PathTemplateLearner},
+        signals::{self, EndpointSignalObservation, NewSignal, SignalEvaluator},
+    },
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
 };
 
@@ -185,6 +188,7 @@ pub enum EndpointAggregatorLoadError {
 enum EndpointAggregatorFlushError {
     Sqlite(rusqlite::Error),
     Json(serde_json::Error),
+    Signal(signals::SignalStorageError),
 }
 
 impl fmt::Display for EndpointAggregatorSinkError {
@@ -258,6 +262,7 @@ impl fmt::Display for EndpointAggregatorFlushError {
         match self {
             Self::Sqlite(err) => write!(formatter, "SQLite error: {err}"),
             Self::Json(err) => write!(formatter, "JSON serialization error: {err}"),
+            Self::Signal(err) => write!(formatter, "signal storage error: {err}"),
         }
     }
 }
@@ -267,6 +272,7 @@ impl Error for EndpointAggregatorFlushError {
         match self {
             Self::Sqlite(err) => Some(err),
             Self::Json(err) => Some(err),
+            Self::Signal(err) => Some(err),
         }
     }
 }
@@ -280,6 +286,12 @@ impl From<rusqlite::Error> for EndpointAggregatorFlushError {
 impl From<serde_json::Error> for EndpointAggregatorFlushError {
     fn from(err: serde_json::Error) -> Self {
         Self::Json(err)
+    }
+}
+
+impl From<signals::SignalStorageError> for EndpointAggregatorFlushError {
+    fn from(err: signals::SignalStorageError) -> Self {
+        Self::Signal(err)
     }
 }
 
@@ -393,6 +405,7 @@ impl EndpointAggregatorShared {
 
         let deleted_keys = state.deleted_keys.iter().cloned().collect::<Vec<_>>();
         let dirty_keys = state.dirty_keys.iter().cloned().collect::<Vec<_>>();
+        let pending_signals = state.pending_signals.clone();
         let dirty_aggregates = dirty_keys
             .iter()
             .filter_map(|key| state.aggregates.get(key).cloned())
@@ -405,17 +418,19 @@ impl EndpointAggregatorShared {
                 &mut connection,
                 &deleted_keys,
                 &dirty_aggregates,
+                &pending_signals,
                 payload_capture_enabled,
             )
         };
 
         match result {
-            Ok(()) => state.mark_flushed(&deleted_keys, &dirty_keys),
+            Ok(()) => state.mark_flushed(&deleted_keys, &dirty_keys, pending_signals.len()),
             Err(err) => {
                 tracing::error!(
                     path = %self.path.display(),
                     deleted_count = deleted_keys.len(),
                     aggregate_count = dirty_aggregates.len(),
+                    signal_count = pending_signals.len(),
                     error = %err,
                     "failed to flush SQLite discovery aggregates; keeping dirty state for retry"
                 );
@@ -694,10 +709,12 @@ impl PrincipalSeen {
 #[derive(Debug, Default)]
 struct AggregatorState {
     payload_capture_enabled: bool,
+    signal_evaluator: SignalEvaluator,
     learner: PathTemplateLearner,
     aggregates: HashMap<EndpointKey, EndpointAggregate>,
     dirty_keys: HashSet<EndpointKey>,
     deleted_keys: HashSet<EndpointKey>,
+    pending_signals: Vec<NewSignal>,
     dirty_events: usize,
 }
 
@@ -789,12 +806,27 @@ impl AggregatorState {
     fn observe(&mut self, observation: ObservedRequest) -> bool {
         let endpoint_template = self.endpoint_template(&observation.method, &observation.path);
         let key = EndpointKey::new(observation.method.clone(), endpoint_template);
+        let is_new_endpoint = !self.aggregates.contains_key(&key);
         let aggregate = self
             .aggregates
             .entry(key.clone())
             .or_insert_with(|| EndpointAggregate::new(key.clone(), &observation.timestamp));
 
         aggregate.observe(&observation);
+        if is_new_endpoint {
+            self.pending_signals
+                .extend(
+                    self.signal_evaluator
+                        .evaluate_new_endpoint(EndpointSignalObservation {
+                            method: &key.method,
+                            endpoint_template: &key.endpoint_template,
+                            first_seen: &observation.timestamp,
+                            status: observation.status,
+                            latency_ms: observation.latency_ms,
+                            user_id: observation.user_id.as_deref(),
+                        }),
+                );
+        }
         self.deleted_keys.remove(&key);
         self.dirty_keys.insert(key);
         self.dirty_events += 1;
@@ -876,16 +908,25 @@ impl AggregatorState {
     }
 
     fn has_pending_flush(&self) -> bool {
-        !self.dirty_keys.is_empty() || !self.deleted_keys.is_empty()
+        !self.dirty_keys.is_empty()
+            || !self.deleted_keys.is_empty()
+            || !self.pending_signals.is_empty()
     }
 
-    fn mark_flushed(&mut self, deleted_keys: &[EndpointKey], dirty_keys: &[EndpointKey]) {
+    fn mark_flushed(
+        &mut self,
+        deleted_keys: &[EndpointKey],
+        dirty_keys: &[EndpointKey],
+        signal_count: usize,
+    ) {
         for key in deleted_keys {
             self.deleted_keys.remove(key);
         }
         for key in dirty_keys {
             self.dirty_keys.remove(key);
         }
+        let signal_count = signal_count.min(self.pending_signals.len());
+        self.pending_signals.drain(..signal_count);
         if self.dirty_keys.is_empty() {
             self.dirty_events = 0;
         }
@@ -1026,7 +1067,8 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
         connection,
         "schema_mismatch_count",
         "INTEGER NOT NULL DEFAULT 0",
-    )
+    )?;
+    signals::configure_connection(connection)
 }
 
 fn ensure_discovery_endpoint_aggregate_column(
@@ -1202,6 +1244,7 @@ fn write_flush(
     connection: &mut Connection,
     deleted_keys: &[EndpointKey],
     dirty_aggregates: &[EndpointAggregate],
+    pending_signals: &[NewSignal],
     payload_capture_enabled: bool,
 ) -> Result<(), EndpointAggregatorFlushError> {
     let transaction = connection.transaction()?;
@@ -1213,6 +1256,8 @@ fn write_flush(
     for aggregate in dirty_aggregates {
         upsert_aggregate(&transaction, aggregate, payload_capture_enabled)?;
     }
+
+    signals::insert_signals(&transaction, pending_signals)?;
 
     transaction.commit()?;
     Ok(())
@@ -1859,6 +1904,71 @@ mod tests {
     }
 
     #[test]
+    fn new_endpoint_seen_signal_fires_once_for_genuinely_new_endpoint() {
+        let db = TempDb::new("new-endpoint-signal-once");
+        let sink = aggregator_sink(&db.path);
+
+        sink.emit(&observed_event(
+            "GET",
+            "/signals/123",
+            200,
+            11,
+            Some("alice"),
+            "2024-06-01T12:00:00Z",
+        ));
+        sink.emit(&observed_event(
+            "GET",
+            "/signals/456",
+            200,
+            9,
+            Some("bob"),
+            "2024-06-01T12:00:01Z",
+        ));
+        sink.flush_for_test();
+
+        let rows = signal_rows(&db.path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].signal_type, "new_endpoint_seen");
+        assert_eq!(rows[0].target_kind, "endpoint");
+        assert_eq!(rows[0].target_key, "GET /signals/{id}");
+        assert_eq!(rows[0].state, "open");
+        assert!(
+            rows[0].explanation.contains("GET /signals/{id}"),
+            "signal explanation should name the endpoint: {}",
+            rows[0].explanation
+        );
+
+        let evidence: Value =
+            serde_json::from_str(&rows[0].evidence_json).expect("evidence should be JSON");
+        assert_eq!(evidence["first_seen"], json!("2024-06-01T12:00:00Z"));
+        assert_eq!(evidence["initial_call_count"], json!(1));
+        assert_eq!(evidence["initial_principal"], json!("alice"));
+    }
+
+    #[test]
+    fn new_endpoint_seen_signal_does_not_backfill_preexisting_discovery_rows() {
+        let db = TempDb::new("new-endpoint-signal-preexisting");
+
+        drop(aggregator_sink(&db.path));
+        insert_aggregate_without_signal(&db.path, "GET", "/preexisting/{id}");
+
+        {
+            let sink = aggregator_sink(&db.path);
+            sink.emit(&observed_event(
+                "GET",
+                "/preexisting/456",
+                200,
+                9,
+                Some("bob"),
+                "2024-06-01T12:00:01Z",
+            ));
+            sink.flush_for_test();
+        }
+
+        assert_eq!(signal_rows(&db.path), Vec::<SignalRow>::new());
+    }
+
+    #[test]
     fn learned_templates_are_reused_after_restart_without_new_literal_fragments() {
         let db = TempDb::new("restart-template");
 
@@ -2320,6 +2430,89 @@ mod tests {
             .expect("principal query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("principal rows should read")
+    }
+
+    fn insert_aggregate_without_signal(path: &Path, method: &str, endpoint_template: &str) {
+        let connection = Connection::open(path).expect("test database should open");
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_endpoint_aggregates (
+                    method,
+                    endpoint_template,
+                    first_seen,
+                    last_seen,
+                    call_count,
+                    latency_count,
+                    latency_p50_ms,
+                    latency_p95_ms,
+                    latency_p99_ms,
+                    latency_samples_json,
+                    distinct_principal_count,
+                    updated_at
+                ) VALUES (?1, ?2, '2024-06-01T12:00:00Z', '2024-06-01T12:00:00Z', 1, 1, 11, 11, 11, '[11]', 1, '2024-06-01T12:00:00Z')
+                "#,
+                params![method, endpoint_template],
+            )
+            .expect("preexisting aggregate should insert");
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_endpoint_status_counts (
+                    method, endpoint_template, status, count
+                ) VALUES (?1, ?2, 200, 1)
+                "#,
+                params![method, endpoint_template],
+            )
+            .expect("preexisting status count should insert");
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_endpoint_principals (
+                    method, endpoint_template, user_id, first_seen, last_seen
+                ) VALUES (?1, ?2, 'alice', '2024-06-01T12:00:00Z', '2024-06-01T12:00:00Z')
+                "#,
+                params![method, endpoint_template],
+            )
+            .expect("preexisting principal should insert");
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct SignalRow {
+        signal_type: String,
+        target_kind: String,
+        target_key: String,
+        explanation: String,
+        evidence_json: String,
+        state: String,
+    }
+
+    fn signal_rows(path: &Path) -> Vec<SignalRow> {
+        let connection = Connection::open(path).expect("test database should open");
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT signal_type, target_kind, target_key, explanation, evidence_json, state
+                FROM discovery_signals
+                ORDER BY created_at, id
+                "#,
+            )
+            .expect("signal query should prepare");
+
+        statement
+            .query_map([], |row| {
+                Ok(SignalRow {
+                    signal_type: row.get(0)?,
+                    target_kind: row.get(1)?,
+                    target_key: row.get(2)?,
+                    explanation: row.get(3)?,
+                    evidence_json: row.get(4)?,
+                    state: row.get(5)?,
+                })
+            })
+            .expect("signal query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("signal rows should read")
     }
 
     #[derive(Debug)]

@@ -60,6 +60,9 @@ const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
 const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
 const SCHEMA_COVERAGE_ADMIN_ROUTE: &str = "/v1/admin/schema/coverage";
+const SIGNALS_ADMIN_ROUTE: &str = "/v1/admin/signals";
+const SIGNAL_ACKNOWLEDGE_ADMIN_ROUTE: &str = "/v1/admin/signals/{id}/acknowledge";
+const SIGNAL_DISMISS_ADMIN_ROUTE: &str = "/v1/admin/signals/{id}/dismiss";
 const SCHEMA_INFERRED_ADMIN_ROUTE: &str = "/v1/admin/schema/inferred";
 const TRAFFIC_ENDPOINTS_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints";
 const TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoint";
@@ -68,6 +71,8 @@ const AUDIT_ADMIN_ROLE: &str = "admin";
 const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
 const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
 const ADMIN_SCHEMA_READ_PERMISSION: &str = "admin:schema:read";
+const ADMIN_SIGNALS_READ_PERMISSION: &str = "admin:signals:read";
+const ADMIN_SIGNALS_WRITE_PERMISSION: &str = "admin:signals:write";
 const ADMIN_TRAFFIC_READ_PERMISSION: &str = "admin:traffic:read";
 const ADMIN_TRAFFIC_WRITE_PERMISSION: &str = "admin:traffic:write";
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
@@ -157,6 +162,9 @@ struct AdminRoutes {
     policy_rule_route: String,
     policy_rules_order_route: String,
     schema_coverage_route: String,
+    signals_route: String,
+    signal_acknowledge_route: String,
+    signal_dismiss_route: String,
     schema_inferred_route: String,
     traffic_endpoints_route: String,
     traffic_endpoint_detail_route: String,
@@ -214,6 +222,9 @@ impl AdminRoutes {
             policy_rule_route: format!("{api_prefix}/policy/rules/{{id}}"),
             policy_rules_order_route: format!("{api_prefix}/policy/rules/order"),
             schema_coverage_route: format!("{api_prefix}/schema/coverage"),
+            signals_route: format!("{api_prefix}/signals"),
+            signal_acknowledge_route: format!("{api_prefix}/signals/{{id}}/acknowledge"),
+            signal_dismiss_route: format!("{api_prefix}/signals/{{id}}/dismiss"),
             schema_inferred_route: format!("{api_prefix}/schema/inferred"),
             traffic_endpoints_route: format!("{api_prefix}/traffic/endpoints"),
             traffic_endpoint_detail_route: format!("{api_prefix}/traffic/endpoint"),
@@ -256,6 +267,14 @@ struct SchemaAdminState {
 }
 
 #[derive(Clone)]
+struct SignalsAdminState {
+    discovery_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
+    rbac_state: Option<middleware::rbac::RbacState>,
+    audit: audit::AuditLog,
+    trust_proxy_headers: bool,
+}
+
+#[derive(Clone)]
 struct TrafficAdminState {
     discovery_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
     audit_query_store: Option<Arc<audit::query::AuditQueryStore>>,
@@ -263,6 +282,16 @@ struct TrafficAdminState {
     audit: audit::AuditLog,
     trust_proxy_headers: bool,
     max_body_size: usize,
+}
+
+#[derive(Clone)]
+struct AdminApiStates {
+    audit: AuditAdminState,
+    status: StatusAdminState,
+    policy: PolicyAdminState,
+    schema: SchemaAdminState,
+    signals: SignalsAdminState,
+    traffic: TrafficAdminState,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -393,6 +422,14 @@ struct TrafficEndpointListParams {
     reviewed: Option<String>,
     covered_by_rule: Option<String>,
     sort: Option<String>,
+    limit: Option<String>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SignalListParams {
+    state: Option<String>,
+    signal_type: Option<String>,
     limit: Option<String>,
     cursor: Option<String>,
 }
@@ -555,6 +592,11 @@ enum PolicyAdminAuthzError {
 }
 
 enum TrafficAdminAuthzError {
+    NotConfigured,
+    Forbidden,
+}
+
+enum SignalsAdminAuthzError {
     NotConfigured,
     Forbidden,
 }
@@ -873,6 +915,12 @@ fn gateway_app_with_process_started_at(
         query_store: audit_query_store,
         event_sender: audit_event_sender,
     };
+    let signals_admin_state = SignalsAdminState {
+        discovery_store: discovery_query_store.clone(),
+        rbac_state: rbac_state.clone(),
+        audit: audit_log.clone(),
+        trust_proxy_headers: config.trust_proxy_headers,
+    };
     let traffic_admin_state = TrafficAdminState {
         discovery_store: discovery_query_store,
         audit_query_store: audit_admin_state.query_store.clone(),
@@ -881,34 +929,26 @@ fn gateway_app_with_process_started_at(
         trust_proxy_headers: config.trust_proxy_headers,
         max_body_size: config.max_body_size,
     };
+    let admin_api_states = AdminApiStates {
+        audit: audit_admin_state,
+        status: status_state,
+        policy: policy_admin_state,
+        schema: schema_admin_state,
+        signals: signals_admin_state,
+        traffic: traffic_admin_state,
+    };
 
     if split_admin_listener {
         Ok(GatewayApp::Split {
             data: apply_middleware(data_router(app_state.clone()), &middleware_stack),
             admin: apply_middleware(
-                admin_router(
-                    &routes,
-                    app_state,
-                    audit_admin_state,
-                    status_state,
-                    policy_admin_state,
-                    schema_admin_state,
-                    traffic_admin_state,
-                ),
+                admin_router(&routes, app_state, admin_api_states),
                 &middleware_stack,
             ),
         })
     } else {
         Ok(GatewayApp::Unified(apply_middleware(
-            unified_router(
-                &routes,
-                app_state,
-                audit_admin_state,
-                status_state,
-                policy_admin_state,
-                schema_admin_state,
-                traffic_admin_state,
-            ),
+            unified_router(&routes, app_state, admin_api_states),
             &middleware_stack,
         )))
     }
@@ -917,11 +957,7 @@ fn gateway_app_with_process_started_at(
 fn unified_router(
     routes: &GatewayRoutes,
     app_state: AppState,
-    audit_admin_state: AuditAdminState,
-    status_state: StatusAdminState,
-    policy_admin_state: PolicyAdminState,
-    schema_admin_state: SchemaAdminState,
-    traffic_admin_state: TrafficAdminState,
+    admin_api_states: AdminApiStates,
 ) -> Router {
     let router = Router::new()
         .route("/health", get(health))
@@ -932,15 +968,7 @@ fn unified_router(
         .route(routes.admin.ui_asset_route.as_str(), get(admin_ui_asset));
 
     let router = with_proxy_fallback_if_configured(router, &app_state).with_state(app_state);
-    let router = add_admin_api_routes(
-        router,
-        routes,
-        audit_admin_state,
-        status_state,
-        policy_admin_state,
-        schema_admin_state,
-        traffic_admin_state,
-    );
+    let router = add_admin_api_routes(router, routes, admin_api_states);
 
     #[cfg(test)]
     let router = router.route(
@@ -963,11 +991,7 @@ fn data_router(app_state: AppState) -> Router {
 fn admin_router(
     routes: &GatewayRoutes,
     app_state: AppState,
-    audit_admin_state: AuditAdminState,
-    status_state: StatusAdminState,
-    policy_admin_state: PolicyAdminState,
-    schema_admin_state: SchemaAdminState,
-    traffic_admin_state: TrafficAdminState,
+    admin_api_states: AdminApiStates,
 ) -> Router {
     let router = Router::new()
         .route(routes.admin.ui_prefix.as_str(), get(admin_ui_index))
@@ -975,15 +999,7 @@ fn admin_router(
         .route(routes.admin.ui_asset_route.as_str(), get(admin_ui_asset))
         .with_state(app_state);
 
-    add_admin_api_routes(
-        router,
-        routes,
-        audit_admin_state,
-        status_state,
-        policy_admin_state,
-        schema_admin_state,
-        traffic_admin_state,
-    )
+    add_admin_api_routes(router, routes, admin_api_states)
 }
 
 fn with_proxy_fallback_if_configured(
@@ -1000,11 +1016,7 @@ fn with_proxy_fallback_if_configured(
 fn add_admin_api_routes(
     router: Router,
     routes: &GatewayRoutes,
-    audit_admin_state: AuditAdminState,
-    status_state: StatusAdminState,
-    policy_admin_state: PolicyAdminState,
-    schema_admin_state: SchemaAdminState,
-    traffic_admin_state: TrafficAdminState,
+    admin_api_states: AdminApiStates,
 ) -> Router {
     router
         .merge(
@@ -1014,12 +1026,12 @@ fn add_admin_api_routes(
                     routes.admin.events_stream_route.as_str(),
                     get(audit_events_stream_endpoint),
                 )
-                .with_state(audit_admin_state),
+                .with_state(admin_api_states.audit),
         )
         .merge(
             Router::new()
                 .route(routes.admin.status_route.as_str(), get(status_endpoint))
-                .with_state(status_state),
+                .with_state(admin_api_states.status),
         )
         .merge(
             Router::new()
@@ -1031,7 +1043,23 @@ fn add_admin_api_routes(
                     routes.admin.schema_inferred_route.as_str(),
                     get(schema_inferred_endpoint),
                 )
-                .with_state(schema_admin_state),
+                .with_state(admin_api_states.schema),
+        )
+        .merge(
+            Router::new()
+                .route(
+                    routes.admin.signals_route.as_str(),
+                    get(signals_list_endpoint),
+                )
+                .route(
+                    routes.admin.signal_acknowledge_route.as_str(),
+                    post(signal_acknowledge_endpoint),
+                )
+                .route(
+                    routes.admin.signal_dismiss_route.as_str(),
+                    post(signal_dismiss_endpoint),
+                )
+                .with_state(admin_api_states.signals),
         )
         .merge(
             Router::new()
@@ -1063,7 +1091,7 @@ fn add_admin_api_routes(
                     routes.admin.policy_rules_order_route.as_str(),
                     put(policy_rules_order_put_endpoint),
                 )
-                .with_state(policy_admin_state),
+                .with_state(admin_api_states.policy),
         )
         .merge(
             Router::new()
@@ -1079,7 +1107,7 @@ fn add_admin_api_routes(
                     routes.admin.traffic_endpoint_review_route.as_str(),
                     post(traffic_endpoint_review_endpoint),
                 )
-                .with_state(traffic_admin_state),
+                .with_state(admin_api_states.traffic),
         )
 }
 
@@ -2666,6 +2694,111 @@ async fn audit_query_endpoint(
     }
 }
 
+async fn signals_list_endpoint(
+    State(state): State<SignalsAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+    Query(params): Query<SignalListParams>,
+) -> Response {
+    record_request(SIGNALS_ADMIN_ROUTE);
+
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_signals_state(&state, &principal, ADMIN_SIGNALS_READ_PERMISSION)
+    {
+        return signals_admin_authz_error_response(error);
+    }
+
+    let Some(discovery_store) = state.discovery_store.as_ref() else {
+        return signals_discovery_not_configured();
+    };
+    let filters = match params.into_filters() {
+        Ok(filters) => filters,
+        Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
+    };
+
+    match discovery_store.list_signals(&filters) {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter }) => {
+            bad_request(&format!("invalid query parameter: {parameter}"))
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to query discovery signals");
+            internal_server_error("signals query failed")
+        }
+    }
+}
+
+async fn signal_acknowledge_endpoint(
+    State(state): State<SignalsAdminState>,
+    Path(id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    signal_transition_endpoint(
+        state,
+        request,
+        id,
+        discovery::signals::SignalLifecycleState::Acknowledged,
+        SIGNAL_ACKNOWLEDGE_ADMIN_ROUTE,
+    )
+    .await
+}
+
+async fn signal_dismiss_endpoint(
+    State(state): State<SignalsAdminState>,
+    Path(id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    signal_transition_endpoint(
+        state,
+        request,
+        id,
+        discovery::signals::SignalLifecycleState::Dismissed,
+        SIGNAL_DISMISS_ADMIN_ROUTE,
+    )
+    .await
+}
+
+async fn signal_transition_endpoint(
+    state: SignalsAdminState,
+    request: AxumRequest,
+    id: String,
+    lifecycle_state: discovery::signals::SignalLifecycleState,
+    route: &'static str,
+) -> Response {
+    record_request(route);
+
+    let (parts, _body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_signals_state(&state, &principal, ADMIN_SIGNALS_WRITE_PERMISSION)
+    {
+        return signals_admin_authz_error_response(error);
+    }
+
+    let id = id.trim();
+    if id.is_empty() {
+        return bad_request("invalid signal id");
+    }
+
+    let Some(discovery_store) = state.discovery_store.as_ref() else {
+        return signals_discovery_not_configured();
+    };
+    let signal =
+        match discovery_store.transition_signal(id, lifecycle_state, Some(&principal.user_id)) {
+            Ok(Some(signal)) => signal,
+            Ok(None) => return not_found("signal was not found"),
+            Err(err) => {
+                tracing::error!(error = %err, "failed to transition discovery signal");
+                return internal_server_error("signal transition failed");
+            }
+        };
+    emit_signal_lifecycle_changed(&state, &parts, &principal, &signal);
+
+    (StatusCode::OK, Json(signal)).into_response()
+}
+
 async fn traffic_endpoint_list_endpoint(
     State(state): State<TrafficAdminState>,
     principal: Option<Extension<auth::Principal>>,
@@ -2969,6 +3102,24 @@ impl AuditQueryParams {
     }
 }
 
+impl SignalListParams {
+    fn into_filters(self) -> Result<discovery::signals::SignalListFilters, &'static str> {
+        let state = self
+            .state
+            .as_deref()
+            .map(discovery::signals::SignalLifecycleState::parse)
+            .transpose()?;
+        let limit = parse_limit(self.limit)?;
+
+        Ok(discovery::signals::SignalListFilters {
+            state,
+            signal_type: empty_string_as_none(self.signal_type),
+            limit,
+            cursor: self.cursor,
+        })
+    }
+}
+
 struct TrafficEndpointDetailQuery {
     method: String,
     endpoint_template: String,
@@ -3258,6 +3409,22 @@ fn authorized_traffic_state<'a>(
     Ok(rbac_state)
 }
 
+fn authorized_signals_state<'a>(
+    state: &'a SignalsAdminState,
+    principal: &auth::Principal,
+    permission: &str,
+) -> Result<&'a middleware::rbac::RbacState, SignalsAdminAuthzError> {
+    let Some(rbac_state) = state.rbac_state.as_ref() else {
+        return Err(SignalsAdminAuthzError::NotConfigured);
+    };
+
+    if !rbac_state.principal_has_permission(principal, permission) {
+        return Err(SignalsAdminAuthzError::Forbidden);
+    }
+
+    Ok(rbac_state)
+}
+
 fn policy_admin_authz_error_response(error: PolicyAdminAuthzError) -> Response {
     match error {
         PolicyAdminAuthzError::NotConfigured => policy_not_configured(),
@@ -3269,6 +3436,13 @@ fn traffic_admin_authz_error_response(error: TrafficAdminAuthzError) -> Response
     match error {
         TrafficAdminAuthzError::NotConfigured => traffic_rbac_not_configured(),
         TrafficAdminAuthzError::Forbidden => forbidden(),
+    }
+}
+
+fn signals_admin_authz_error_response(error: SignalsAdminAuthzError) -> Response {
+    match error {
+        SignalsAdminAuthzError::NotConfigured => signals_rbac_not_configured(),
+        SignalsAdminAuthzError::Forbidden => forbidden(),
     }
 }
 
@@ -4100,6 +4274,37 @@ fn emit_traffic_endpoint_review_changed(
     ));
 }
 
+fn emit_signal_lifecycle_changed(
+    state: &SignalsAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    signal: &discovery::signals::Signal,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip = client_ip::canonical_client_ip(
+        &parts.headers,
+        &parts.extensions,
+        state.trust_proxy_headers,
+    );
+    let actor = Some(auth::actor_from_principal(principal));
+    let payload = json!({
+        "id": &signal.id,
+        "signal_type": &signal.signal_type,
+        "target": &signal.target,
+        "state": signal.state.as_str(),
+        "transitioned_at": &signal.transitioned_at,
+        "transitioned_by": &signal.transitioned_by,
+    });
+
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::SIGNAL_LIFECYCLE_CHANGED,
+        request_id,
+        source_ip,
+        actor,
+        payload,
+    ));
+}
+
 fn policy_change_payload(before: &rbac::Policy, after: &rbac::Policy) -> Value {
     json!({
         "before": policy_audit_summary(before),
@@ -4223,6 +4428,16 @@ fn traffic_rbac_not_configured() -> Response {
         .into_response()
 }
 
+fn signals_rbac_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "signals API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
 fn schema_discovery_not_configured() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -4275,6 +4490,16 @@ fn discovery_not_configured() -> Response {
         Json(ErrorResponse {
             error: "traffic endpoint inventory requires DISCOVERY_SQLITE_PATH to be configured"
                 .to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn signals_discovery_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "signals API requires DISCOVERY_SQLITE_PATH to be configured".to_owned(),
         }),
     )
         .into_response()
@@ -10258,6 +10483,254 @@ paths:
         );
     }
 
+    #[tokio::test]
+    async fn signals_admin_list_filters_paginates_and_explains() {
+        let discovery_db = TempDb::new("signals-list");
+        create_signal_schema(&discovery_db.path);
+        insert_signal(
+            &discovery_db.path,
+            SignalSeed {
+                id: "sig-open-newer",
+                signal_type: "new_endpoint_seen",
+                method: "POST",
+                endpoint_template: "/widgets",
+                explanation:
+                    "New endpoint observed: POST /widgets was first seen at 2024-06-03T00:00:00Z.",
+                evidence: json!({
+                    "first_seen": "2024-06-03T00:00:00Z",
+                    "initial_call_count": 1,
+                    "initial_principal": "alice"
+                }),
+                state: "open",
+                created_at: "2024-06-03T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+            },
+        );
+        insert_signal(
+            &discovery_db.path,
+            SignalSeed {
+                id: "sig-acknowledged",
+                signal_type: "new_endpoint_seen",
+                method: "DELETE",
+                endpoint_template: "/widgets/{id}",
+                explanation: "New endpoint observed: DELETE /widgets/{id} was first seen at 2024-06-02T00:00:00Z.",
+                evidence: json!({
+                    "first_seen": "2024-06-02T00:00:00Z",
+                    "initial_call_count": 1,
+                    "initial_principal": "bob"
+                }),
+                state: "acknowledged",
+                created_at: "2024-06-02T00:00:00Z",
+                transitioned_at: Some("2024-06-02T01:00:00Z"),
+                transitioned_by: Some("reviewer"),
+            },
+        );
+        insert_signal(
+            &discovery_db.path,
+            SignalSeed {
+                id: "sig-open-older",
+                signal_type: "new_endpoint_seen",
+                method: "GET",
+                endpoint_template: "/widgets/{id}",
+                explanation: "New endpoint observed: GET /widgets/{id} was first seen at 2024-06-01T00:00:00Z.",
+                evidence: json!({
+                    "first_seen": "2024-06-01T00:00:00Z",
+                    "initial_call_count": 1,
+                    "initial_principal": "carol"
+                }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+            },
+        );
+        let (router, _policy) = signals_admin_router(Some(&discovery_db.path));
+
+        let first_page = signals_json(
+            &router,
+            "/v1/admin/signals?state=open&limit=1",
+            Some(test_principal(&["signals-reader"])),
+        )
+        .await;
+        assert_eq!(signal_ids(&first_page), vec!["sig-open-newer".to_owned()]);
+        assert!(first_page["next_cursor"].as_str().is_some());
+        assert_eq!(first_page["signals"][0]["state"], json!("open"));
+        assert_eq!(
+            first_page["signals"][0]["target"],
+            json!({
+                "kind": "endpoint",
+                "identity": {
+                    "method": "POST",
+                    "endpoint_template": "/widgets"
+                }
+            })
+        );
+        assert!(
+            first_page["signals"][0]["explanation"]
+                .as_str()
+                .expect("signal explanation should be a string")
+                .contains("POST /widgets"),
+            "signal explanation should describe what fired"
+        );
+
+        let cursor = first_page["next_cursor"]
+            .as_str()
+            .expect("first page should include next cursor");
+        let second_page = signals_json(
+            &router,
+            &format!("/v1/admin/signals?state=open&limit=1&cursor={cursor}"),
+            Some(test_principal(&["signals-reader"])),
+        )
+        .await;
+        assert_eq!(signal_ids(&second_page), vec!["sig-open-older".to_owned()]);
+        assert!(second_page["next_cursor"].is_null());
+
+        let acknowledged = signals_json(
+            &router,
+            "/v1/admin/signals?state=acknowledged",
+            Some(test_principal(&["signals-reader"])),
+        )
+        .await;
+        assert_eq!(
+            signal_ids(&acknowledged),
+            vec!["sig-acknowledged".to_owned()]
+        );
+
+        let forbidden = router
+            .clone()
+            .oneshot(signals_admin_request(
+                "/v1/admin/signals",
+                Some(test_principal(&["reader"])),
+            ))
+            .await
+            .expect("signals request should complete");
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let unauthenticated = router
+            .clone()
+            .oneshot(signals_admin_request("/v1/admin/signals", None))
+            .await
+            .expect("signals request should complete");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn signals_admin_lifecycle_transitions_persist_and_require_write_permission() {
+        let discovery_db = TempDb::new("signals-lifecycle");
+        create_signal_schema(&discovery_db.path);
+        insert_signal(
+            &discovery_db.path,
+            SignalSeed {
+                id: "sig-ack",
+                signal_type: "new_endpoint_seen",
+                method: "GET",
+                endpoint_template: "/ack/{id}",
+                explanation:
+                    "New endpoint observed: GET /ack/{id} was first seen at 2024-06-01T00:00:00Z.",
+                evidence: json!({
+                    "first_seen": "2024-06-01T00:00:00Z",
+                    "initial_call_count": 1
+                }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+            },
+        );
+        insert_signal(
+            &discovery_db.path,
+            SignalSeed {
+                id: "sig-dismiss",
+                signal_type: "new_endpoint_seen",
+                method: "GET",
+                endpoint_template: "/dismiss/{id}",
+                explanation: "New endpoint observed: GET /dismiss/{id} was first seen at 2024-06-01T01:00:00Z.",
+                evidence: json!({
+                    "first_seen": "2024-06-01T01:00:00Z",
+                    "initial_call_count": 1
+                }),
+                state: "open",
+                created_at: "2024-06-01T01:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+            },
+        );
+        let (router, _policy) = signals_admin_router(Some(&discovery_db.path));
+
+        let unauthenticated = router
+            .clone()
+            .oneshot(signals_admin_json_request(
+                Method::POST,
+                "/v1/admin/signals/sig-ack/acknowledge",
+                None,
+            ))
+            .await
+            .expect("signals transition request should complete");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let read_only = router
+            .clone()
+            .oneshot(signals_admin_json_request(
+                Method::POST,
+                "/v1/admin/signals/sig-ack/acknowledge",
+                Some(test_principal(&["signals-reader"])),
+            ))
+            .await
+            .expect("signals transition request should complete");
+        assert_eq!(read_only.status(), StatusCode::FORBIDDEN);
+
+        let acknowledged = router
+            .clone()
+            .oneshot(signals_admin_json_request(
+                Method::POST,
+                "/v1/admin/signals/sig-ack/acknowledge",
+                Some(test_principal(&["signals-writer"])),
+            ))
+            .await
+            .expect("signals transition request should complete");
+        assert_eq!(acknowledged.status(), StatusCode::OK);
+        let acknowledged_body = json_body(acknowledged).await;
+        assert_eq!(acknowledged_body["state"], json!("acknowledged"));
+        assert_eq!(acknowledged_body["transitioned_by"], json!("user-123"));
+        assert!(acknowledged_body["transitioned_at"].as_str().is_some());
+
+        let dismissed = router
+            .clone()
+            .oneshot(signals_admin_json_request(
+                Method::POST,
+                "/v1/admin/signals/sig-dismiss/dismiss",
+                Some(test_principal(&["signals-writer"])),
+            ))
+            .await
+            .expect("signals transition request should complete");
+        assert_eq!(dismissed.status(), StatusCode::OK);
+        let dismissed_body = json_body(dismissed).await;
+        assert_eq!(dismissed_body["state"], json!("dismissed"));
+        assert_eq!(dismissed_body["transitioned_by"], json!("user-123"));
+        assert!(dismissed_body["transitioned_at"].as_str().is_some());
+
+        let acknowledged_page = signals_json(
+            &router,
+            "/v1/admin/signals?state=acknowledged",
+            Some(test_principal(&["signals-reader"])),
+        )
+        .await;
+        assert_eq!(signal_ids(&acknowledged_page), vec!["sig-ack".to_owned()]);
+        assert_eq!(
+            acknowledged_page["signals"][0]["transitioned_by"],
+            json!("user-123")
+        );
+
+        let dismissed_page = signals_json(
+            &router,
+            "/v1/admin/signals?state=dismissed",
+            Some(test_principal(&["signals-reader"])),
+        )
+        .await;
+        assert_eq!(signal_ids(&dismissed_page), vec!["sig-dismiss".to_owned()]);
+    }
+
     #[test]
     fn endpoint_rule_coverage_without_rbac_is_false() {
         assert!(!endpoint_covered_by_active_direct_rule(
@@ -11174,6 +11647,115 @@ paths:
         .expect("traffic policy should serialize")
     }
 
+    fn signals_admin_config(
+        discovery_path: Option<&PathBuf>,
+        policy: &TempPolicyFile,
+    ) -> config::Config {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.discovery_sqlite_path =
+            discovery_path.map(|path| path.to_string_lossy().into_owned());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config
+            .rbac_exempt_paths
+            .push("/v1/admin/signals".to_owned());
+        config
+    }
+
+    fn signals_admin_router(discovery_path: Option<&PathBuf>) -> (Router, TempPolicyFile) {
+        let policy = TempPolicyFile::new(&signals_policy_document_string());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            signals_admin_config(discovery_path, &policy),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        (router, policy)
+    }
+
+    fn signals_admin_request(uri: &str, principal: Option<auth::Principal>) -> Request<Body> {
+        let mut request = Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request should build");
+        if let Some(principal) = principal {
+            request.extensions_mut().insert(principal);
+        }
+
+        request
+    }
+
+    fn signals_admin_json_request(
+        method: Method,
+        uri: &str,
+        principal: Option<auth::Principal>,
+    ) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .body(Body::empty())
+            .expect("request should build");
+        if let Some(principal) = principal {
+            request.extensions_mut().insert(principal);
+        }
+
+        request
+    }
+
+    async fn signals_json(router: &Router, uri: &str, principal: Option<auth::Principal>) -> Value {
+        let response = router
+            .clone()
+            .oneshot(signals_admin_request(uri, principal))
+            .await
+            .expect("signals request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await
+    }
+
+    fn signal_ids(body: &Value) -> Vec<String> {
+        body["signals"]
+            .as_array()
+            .expect("signals should be an array")
+            .iter()
+            .map(|signal| {
+                signal["id"]
+                    .as_str()
+                    .expect("signal id should be a string")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn signals_policy_document_string() -> String {
+        serde_json::to_string_pretty(&json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "signals-reader": {
+                    "permissions": ["admin:signals:read"]
+                },
+                "signals-writer": {
+                    "permissions": [
+                        "admin:signals:read",
+                        "admin:signals:write"
+                    ]
+                },
+                "reader": {
+                    "permissions": []
+                }
+            },
+            "rules": []
+        }))
+        .expect("signals policy should serialize")
+    }
+
     fn audit_events_router() -> (Router, audit::AuditLog) {
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
@@ -11957,6 +12539,36 @@ O2gecI9QwDJNpm29J9wJB2F8
         );
     }
 
+    fn create_signal_schema(path: &PathBuf) {
+        let connection = Connection::open(path).expect("test discovery database should open");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS discovery_signals (
+                    id TEXT PRIMARY KEY,
+                    signal_type TEXT NOT NULL,
+                    target_kind TEXT NOT NULL,
+                    target_key TEXT NOT NULL,
+                    target_identity_json TEXT NOT NULL,
+                    explanation TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    transitioned_at TEXT,
+                    transitioned_by TEXT
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_signals_identity
+                ON discovery_signals(signal_type, target_kind, target_key);
+
+                CREATE INDEX IF NOT EXISTS idx_discovery_signals_state_created
+                ON discovery_signals(state, created_at, id);
+                "#,
+            )
+            .expect("signal schema should create");
+    }
+
     fn seed_list_discovery_endpoints(path: &PathBuf) {
         insert_discovery_endpoint(
             path,
@@ -12022,6 +12634,64 @@ O2gecI9QwDJNpm29J9wJB2F8
                 status_counts: &[(204, 1)],
             },
         );
+    }
+
+    struct SignalSeed<'a> {
+        id: &'a str,
+        signal_type: &'a str,
+        method: &'a str,
+        endpoint_template: &'a str,
+        explanation: &'a str,
+        evidence: Value,
+        state: &'a str,
+        created_at: &'a str,
+        transitioned_at: Option<&'a str>,
+        transitioned_by: Option<&'a str>,
+    }
+
+    fn insert_signal(path: &PathBuf, signal: SignalSeed<'_>) {
+        let connection = Connection::open(path).expect("test discovery database should open");
+        let target_identity_json = serde_json::to_string(&json!({
+            "method": signal.method,
+            "endpoint_template": signal.endpoint_template,
+        }))
+        .expect("target identity should serialize");
+        let evidence_json =
+            serde_json::to_string(&signal.evidence).expect("evidence should serialize");
+        let target_key = format!("{} {}", signal.method, signal.endpoint_template);
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_signals (
+                    id,
+                    signal_type,
+                    target_kind,
+                    target_key,
+                    target_identity_json,
+                    explanation,
+                    evidence_json,
+                    state,
+                    created_at,
+                    updated_at,
+                    transitioned_at,
+                    transitioned_by
+                ) VALUES (?1, ?2, 'endpoint', ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10)
+                "#,
+                params![
+                    signal.id,
+                    signal.signal_type,
+                    target_key,
+                    target_identity_json,
+                    signal.explanation,
+                    evidence_json,
+                    signal.state,
+                    signal.created_at,
+                    signal.transitioned_at,
+                    signal.transitioned_by,
+                ],
+            )
+            .expect("signal should insert");
     }
 
     struct SeedEndpoint<'a> {
