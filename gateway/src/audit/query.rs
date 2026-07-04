@@ -91,6 +91,7 @@ pub struct EndpointAuditActivity {
     pub time_series_truncated: bool,
     pub recent_events: Vec<EndpointRecentEvent>,
     pub recent_events_next_cursor: Option<i64>,
+    pub recent_events_scan_truncated: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -276,9 +277,16 @@ impl AuditQueryStore {
             .collect();
 
         let mut recent_events = Vec::with_capacity(filters.recent_limit.saturating_add(1));
+        let mut recent_events_scanned_rows = 0_usize;
+        let mut recent_events_scan_truncated = false;
         self.scan_request_observations(
             &endpoint_request_observation_filters(filters, filters.recent_before_id),
             |observation| {
+                if recent_events_scanned_rows >= max_scan_rows {
+                    recent_events_scan_truncated = true;
+                    return false;
+                }
+                recent_events_scanned_rows = recent_events_scanned_rows.saturating_add(1);
                 if let Some(event) = endpoint_recent_event_from_observation(observation, filters) {
                     recent_events.push(event);
                     if recent_events.len() > filters.recent_limit {
@@ -304,6 +312,7 @@ impl AuditQueryStore {
             time_series_truncated,
             recent_events,
             recent_events_next_cursor,
+            recent_events_scan_truncated,
         })
     }
 
@@ -1066,6 +1075,7 @@ mod tests {
         assert!(!activity.time_series_truncated);
         assert_eq!(activity.recent_events.len(), 1);
         assert_eq!(activity.recent_events[0].event_id, "target");
+        assert!(!activity.recent_events_scan_truncated);
     }
 
     #[test]
@@ -1111,7 +1121,8 @@ mod tests {
             }]
         );
         assert!(activity.time_series_truncated);
-        assert_eq!(activity.recent_events.len(), 3);
+        assert_eq!(activity.recent_events.len(), 2);
+        assert!(activity.recent_events_scan_truncated);
     }
 
     #[test]

@@ -418,6 +418,8 @@ struct TrafficEndpointAuditEnrichment {
     recent_events: Option<Vec<audit::query::EndpointRecentEvent>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recent_events_next_cursor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recent_events_scan_truncated: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -2590,6 +2592,7 @@ async fn traffic_endpoint_detail_endpoint(
                     time_series: Some(activity.time_series),
                     recent_events: Some(activity.recent_events),
                     recent_events_next_cursor: activity.recent_events_next_cursor,
+                    recent_events_scan_truncated: Some(activity.recent_events_scan_truncated),
                 },
                 Err(err) => {
                     tracing::error!(error = %err, "failed to query traffic endpoint audit enrichment");
@@ -2606,6 +2609,7 @@ async fn traffic_endpoint_detail_endpoint(
             time_series: None,
             recent_events: None,
             recent_events_next_cursor: None,
+            recent_events_scan_truncated: None,
         },
     };
 
@@ -8926,6 +8930,7 @@ mod tests {
             recent_paths,
             vec!["/users/789".to_owned(), "/users/456".to_owned()]
         );
+        assert_eq!(body["audit"]["recent_events_scan_truncated"], json!(false));
         assert!(body["audit"]["recent_events_next_cursor"]
             .as_i64()
             .is_some());
