@@ -10,6 +10,7 @@ async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 http.workspace = true
 ipnet.workspace = true

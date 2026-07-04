@@ -1,5 +1,6 @@
 pub mod jwt;
 pub mod principal;
+pub mod tokens;
 pub mod validator;
 
 #[allow(unused_imports)] // Public JWT API re-export reserved for PR 3 auth middleware.
