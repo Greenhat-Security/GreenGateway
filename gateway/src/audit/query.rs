@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     error::Error,
     fmt,
     path::PathBuf,
@@ -22,10 +23,34 @@ pub struct AuditQueryFilters {
     pub to: Option<String>,
     pub event_type: Option<String>,
     pub actor: Option<String>,
+    pub method: Option<String>,
     pub path: Option<String>,
     pub status: Option<i64>,
+    pub matched_rule_id: Option<String>,
     pub limit: usize,
     pub before_id: Option<i64>,
+}
+
+pub struct RequestObservationFilters {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub methods: Vec<String>,
+    pub path_exact: Option<String>,
+    pub path_prefix: Option<String>,
+}
+
+pub struct RequestObservation {
+    pub event_id: String,
+    pub timestamp: String,
+    pub request_id: String,
+    pub source_ip: String,
+    pub user_agent: Option<String>,
+    pub actor: Option<Actor>,
+    pub method: String,
+    pub path: String,
+    pub status: Option<i64>,
+    pub matched_rule_id: Option<String>,
+    pub payload_json: String,
 }
 
 pub struct AuditQueryPage {
@@ -156,6 +181,80 @@ impl AuditQueryStore {
         })
     }
 
+    pub fn scan_request_observations(
+        &self,
+        filters: &RequestObservationFilters,
+        mut visitor: impl FnMut(RequestObservation) -> bool,
+    ) -> Result<(), AuditQueryError> {
+        let (sql, params) = build_request_observation_query(filters);
+        let connection = self.connection_guard();
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|source| AuditQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut rows = statement
+            .query(params_from_iter(params.iter()))
+            .map_err(|source| AuditQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        while let Some(row) = rows.next().map_err(|source| AuditQueryError::Sqlite {
+            path: self.path.clone(),
+            source,
+        })? {
+            let observation = request_observation_row(row)
+                .map_err(|source| AuditQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .into_observation()?;
+
+            if !visitor(observation) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn rule_hit_counts(&self) -> Result<HashMap<String, u64>, AuditQueryError> {
+        let connection = self.connection_guard();
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT payload_matched_rule_id, COUNT(*)
+                FROM audit_events
+                WHERE event_type = 'http.request_observed'
+                  AND payload_matched_rule_id IS NOT NULL
+                GROUP BY payload_matched_rule_id
+                "#,
+            )
+            .map_err(|source| AuditQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                let rule_id: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((rule_id, u64::try_from(count).unwrap_or(u64::MAX)))
+            })
+            .map_err(|source| AuditQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|source| AuditQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        Ok(rows)
+    }
+
     fn connection_guard(&self) -> MutexGuard<'_, Connection> {
         match self.connection.lock() {
             Ok(guard) => guard,
@@ -212,6 +311,10 @@ fn build_query(filters: &AuditQueryFilters) -> (String, Vec<SqlValue>) {
         clauses.push("actor_user_id = ?");
         params.push(SqlValue::Text(actor.clone()));
     }
+    if let Some(method) = &filters.method {
+        clauses.push("payload_method = ?");
+        params.push(SqlValue::Text(method.clone()));
+    }
     if let Some(path) = &filters.path {
         clauses.push("payload_path = ?");
         params.push(SqlValue::Text(path.clone()));
@@ -219,6 +322,10 @@ fn build_query(filters: &AuditQueryFilters) -> (String, Vec<SqlValue>) {
     if let Some(status) = filters.status {
         clauses.push("payload_status = ?");
         params.push(SqlValue::Integer(status));
+    }
+    if let Some(matched_rule_id) = &filters.matched_rule_id {
+        clauses.push("payload_matched_rule_id = ?");
+        params.push(SqlValue::Text(matched_rule_id.clone()));
     }
     if let Some(before_id) = filters.before_id {
         clauses.push("id < ?");
@@ -236,6 +343,102 @@ fn build_query(filters: &AuditQueryFilters) -> (String, Vec<SqlValue>) {
     (sql, params)
 }
 
+fn build_request_observation_query(filters: &RequestObservationFilters) -> (String, Vec<SqlValue>) {
+    let mut sql = String::from(
+        r#"
+        SELECT
+            event_id,
+            timestamp,
+            request_id,
+            source_ip,
+            user_agent,
+            actor_json,
+            payload_method,
+            payload_path,
+            payload_status,
+            payload_matched_rule_id,
+            payload_json
+        FROM audit_events
+        "#,
+    );
+    let mut clauses = vec![
+        "event_type = 'http.request_observed'".to_owned(),
+        "payload_method IS NOT NULL".to_owned(),
+        "payload_path IS NOT NULL".to_owned(),
+    ];
+    let mut params = Vec::new();
+
+    if let Some(from) = &filters.from {
+        clauses.push("julianday(timestamp) >= julianday(?)".to_owned());
+        params.push(SqlValue::Text(from.clone()));
+    }
+    if let Some(to) = &filters.to {
+        clauses.push("julianday(timestamp) <= julianday(?)".to_owned());
+        params.push(SqlValue::Text(to.clone()));
+    }
+
+    let methods = exact_method_filters(&filters.methods);
+    if !methods.is_empty() {
+        clauses.push(format!(
+            "payload_method IN ({})",
+            std::iter::repeat_n("?", methods.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        params.extend(methods.into_iter().map(SqlValue::Text));
+    }
+    if let Some(path_exact) = &filters.path_exact {
+        clauses.push("payload_path = ?".to_owned());
+        params.push(SqlValue::Text(path_exact.clone()));
+    } else if let Some(path_prefix) = filters
+        .path_prefix
+        .as_deref()
+        .filter(|prefix| !prefix.is_empty())
+    {
+        if let Some(upper_bound) = string_prefix_upper_bound(path_prefix) {
+            clauses.push("payload_path >= ?".to_owned());
+            params.push(SqlValue::Text(path_prefix.to_owned()));
+            clauses.push("payload_path < ?".to_owned());
+            params.push(SqlValue::Text(upper_bound));
+        }
+    }
+
+    sql.push_str(" WHERE ");
+    sql.push_str(&clauses.join(" AND "));
+    sql.push_str(" ORDER BY id DESC");
+
+    (sql, params)
+}
+
+fn exact_method_filters(methods: &[String]) -> Vec<String> {
+    if methods.iter().any(|method| method.trim() == "*") {
+        return Vec::new();
+    }
+
+    let mut exact = methods
+        .iter()
+        .map(|method| method.trim())
+        .filter(|method| !method.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>();
+    exact.sort();
+    exact.dedup();
+    exact
+}
+
+fn string_prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    for index in (0..bytes.len()).rev() {
+        if bytes[index] < u8::MAX {
+            bytes[index] += 1;
+            bytes.truncate(index + 1);
+            return String::from_utf8(bytes).ok();
+        }
+    }
+
+    None
+}
+
 fn query_limit(limit: usize) -> i64 {
     i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
 }
@@ -250,6 +453,20 @@ struct RawAuditEventRow {
     source_ip: String,
     user_agent: Option<String>,
     actor_json: Option<String>,
+    payload_json: String,
+}
+
+struct RawRequestObservationRow {
+    event_id: String,
+    timestamp: String,
+    request_id: String,
+    source_ip: String,
+    user_agent: Option<String>,
+    actor_json: Option<String>,
+    method: String,
+    path: String,
+    status: Option<i64>,
+    matched_rule_id: Option<String>,
     payload_json: String,
 }
 
@@ -286,6 +503,35 @@ impl RawAuditEventRow {
     }
 }
 
+impl RawRequestObservationRow {
+    fn into_observation(self) -> Result<RequestObservation, AuditQueryError> {
+        let actor = self
+            .actor_json
+            .as_deref()
+            .map(|json| {
+                serde_json::from_str::<Actor>(json).map_err(|source| AuditQueryError::ActorJson {
+                    event_id: self.event_id.clone(),
+                    source,
+                })
+            })
+            .transpose()?;
+
+        Ok(RequestObservation {
+            event_id: self.event_id,
+            timestamp: self.timestamp,
+            request_id: self.request_id,
+            source_ip: self.source_ip,
+            user_agent: self.user_agent,
+            actor,
+            method: self.method,
+            path: self.path,
+            status: self.status,
+            matched_rule_id: self.matched_rule_id,
+            payload_json: self.payload_json,
+        })
+    }
+}
+
 fn raw_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAuditEventRow> {
     Ok(RawAuditEventRow {
         id: row.get(0)?,
@@ -298,6 +544,22 @@ fn raw_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAuditEventRow> 
         user_agent: row.get(7)?,
         actor_json: row.get(8)?,
         payload_json: row.get(9)?,
+    })
+}
+
+fn request_observation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRequestObservationRow> {
+    Ok(RawRequestObservationRow {
+        event_id: row.get(0)?,
+        timestamp: row.get(1)?,
+        request_id: row.get(2)?,
+        source_ip: row.get(3)?,
+        user_agent: row.get(4)?,
+        actor_json: row.get(5)?,
+        method: row.get(6)?,
+        path: row.get(7)?,
+        status: row.get(8)?,
+        matched_rule_id: row.get(9)?,
+        payload_json: row.get(10)?,
     })
 }
 
@@ -358,8 +620,10 @@ mod tests {
                 to: None,
                 event_type: None,
                 actor: None,
+                method: None,
                 path: None,
                 status: None,
+                matched_rule_id: None,
                 limit: 10,
                 before_id: None,
             })
@@ -373,6 +637,148 @@ mod tests {
                 "cutoff-event".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn scans_request_observations_with_method_and_time_filters() {
+        let db = TempDb::new("request-observation-scan");
+        create_schema(&db.path);
+        insert_observation_event(
+            &db.path,
+            SeedObservationEvent {
+                event_id: "old-get",
+                timestamp: "2024-06-01T11:59:59Z",
+                actor_user_id: "reader-1",
+                method: "GET",
+                path: "/items/1",
+                status: 200,
+                matched_rule_id: Some("allow-items"),
+            },
+        );
+        insert_observation_event(
+            &db.path,
+            SeedObservationEvent {
+                event_id: "matching-get",
+                timestamp: "2024-06-01T12:00:01Z",
+                actor_user_id: "reader-1",
+                method: "GET",
+                path: "/items/2",
+                status: 200,
+                matched_rule_id: Some("allow-items"),
+            },
+        );
+        insert_observation_event(
+            &db.path,
+            SeedObservationEvent {
+                event_id: "matching-newer-get",
+                timestamp: "2024-06-01T12:00:02Z",
+                actor_user_id: "reader-2",
+                method: "GET",
+                path: "/items/3",
+                status: 404,
+                matched_rule_id: Some("deny-items"),
+            },
+        );
+        insert_observation_event(
+            &db.path,
+            SeedObservationEvent {
+                event_id: "post",
+                timestamp: "2024-06-01T12:00:03Z",
+                actor_user_id: "reader-1",
+                method: "POST",
+                path: "/items/4",
+                status: 201,
+                matched_rule_id: None,
+            },
+        );
+
+        let store = AuditQueryStore::open(&db.path).expect("query store should open");
+        let mut observed = Vec::new();
+        store
+            .scan_request_observations(
+                &RequestObservationFilters {
+                    from: Some("2024-06-01T12:00:00Z".to_owned()),
+                    to: Some("2024-06-01T12:00:02Z".to_owned()),
+                    methods: vec!["get".to_owned()],
+                    path_exact: None,
+                    path_prefix: None,
+                },
+                |event| {
+                    observed.push((event.event_id, event.method, event.status));
+                    true
+                },
+            )
+            .expect("request observation scan should succeed");
+
+        assert_eq!(
+            observed,
+            vec![
+                ("matching-newer-get".to_owned(), "GET".to_owned(), Some(404)),
+                ("matching-get".to_owned(), "GET".to_owned(), Some(200)),
+            ]
+        );
+    }
+
+    #[test]
+    fn rule_hit_counts_count_observed_requests_by_matched_rule_id() {
+        let db = TempDb::new("rule-hit-counts");
+        create_schema(&db.path);
+        insert_observation_event(
+            &db.path,
+            SeedObservationEvent {
+                event_id: "allow-1",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: "reader-1",
+                method: "GET",
+                path: "/items/1",
+                status: 200,
+                matched_rule_id: Some("allow-items"),
+            },
+        );
+        insert_observation_event(
+            &db.path,
+            SeedObservationEvent {
+                event_id: "allow-2",
+                timestamp: "2024-06-01T12:00:01Z",
+                actor_user_id: "reader-1",
+                method: "GET",
+                path: "/items/2",
+                status: 200,
+                matched_rule_id: Some("allow-items"),
+            },
+        );
+        insert_observation_event(
+            &db.path,
+            SeedObservationEvent {
+                event_id: "deny-1",
+                timestamp: "2024-06-01T12:00:02Z",
+                actor_user_id: "reader-1",
+                method: "GET",
+                path: "/items/3",
+                status: 403,
+                matched_rule_id: Some("deny-items"),
+            },
+        );
+        insert_event(
+            &db.path,
+            SeedEvent {
+                event_id: "authz-duplicate",
+                event_type: "authz.allowed",
+                timestamp: "2024-06-01T12:00:03Z",
+                actor_user_id: "reader-1",
+                path: "/items/1",
+                status: 200,
+            },
+        );
+
+        let counts = AuditQueryStore::open(&db.path)
+            .expect("query store should open")
+            .rule_hit_counts()
+            .expect("rule hit counts should query");
+
+        assert_eq!(counts.get("allow-items"), Some(&2));
+        assert_eq!(counts.get("deny-items"), Some(&1));
+        assert_eq!(counts.get("authz-duplicate"), None);
     }
 
     /// Run with:
@@ -399,8 +805,10 @@ mod tests {
                 to: Some("2026-01-06T21:40:00Z".to_owned()),
                 event_type: Some("audit.benchmark.42".to_owned()),
                 actor: None,
+                method: None,
                 path: None,
                 status: None,
+                matched_rule_id: None,
                 limit: 100,
                 before_id: None,
             },
@@ -414,8 +822,10 @@ mod tests {
                 to: None,
                 event_type: None,
                 actor: Some("actor-123".to_owned()),
+                method: None,
                 path: Some("/benchmark/123".to_owned()),
                 status: None,
+                matched_rule_id: None,
                 limit: 100,
                 before_id: None,
             },
@@ -429,8 +839,10 @@ mod tests {
                 to: None,
                 event_type: None,
                 actor: None,
+                method: None,
                 path: None,
                 status: Some(204),
+                matched_rule_id: None,
                 limit: 100,
                 before_id: None,
             },
@@ -444,8 +856,10 @@ mod tests {
                 to: None,
                 event_type: None,
                 actor: None,
+                method: None,
                 path: None,
                 status: None,
+                matched_rule_id: None,
                 limit: 100,
                 before_id: Some(500_000),
             },
@@ -507,8 +921,10 @@ mod tests {
         })
         .to_string();
         let payload_json = json!({
+            "method": "GET",
             "path": event.path,
-            "status": event.status
+            "status": event.status,
+            "matched_rule_id": "authz-duplicate"
         })
         .to_string();
 
@@ -524,10 +940,12 @@ mod tests {
                     source_ip,
                     actor_user_id,
                     actor_json,
+                    payload_method,
                     payload_path,
                     payload_status,
+                    payload_matched_rule_id,
                     payload_json
-                ) VALUES (?1, ?2, ?3, '0.1.0', 'request-test', '203.0.113.10', ?4, ?5, ?6, ?7, ?8)
+                ) VALUES (?1, ?2, ?3, '0.1.0', 'request-test', '203.0.113.10', ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 "#,
                 params![
                     event.event_id,
@@ -535,12 +953,77 @@ mod tests {
                     event.timestamp,
                     event.actor_user_id,
                     actor_json,
+                    "GET",
                     event.path,
                     event.status,
+                    "authz-duplicate",
                     payload_json
                 ],
             )
             .expect("event should insert");
+    }
+
+    struct SeedObservationEvent<'a> {
+        event_id: &'a str,
+        timestamp: &'a str,
+        actor_user_id: &'a str,
+        method: &'a str,
+        path: &'a str,
+        status: i64,
+        matched_rule_id: Option<&'a str>,
+    }
+
+    fn insert_observation_event(path: &PathBuf, event: SeedObservationEvent<'_>) {
+        let connection = Connection::open(path).expect("test database should open");
+        let actor_json = json!({
+            "user_id": event.actor_user_id,
+            "roles": ["reader"],
+            "auth_mode": "bearer_token"
+        })
+        .to_string();
+        let mut payload = json!({
+            "method": event.method,
+            "path": event.path,
+            "status": event.status,
+            "policy_decision": "allowed"
+        });
+        if let Some(matched_rule_id) = event.matched_rule_id {
+            payload["matched_rule_id"] = json!(matched_rule_id);
+        }
+        let payload_json = payload.to_string();
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO audit_events (
+                    event_id,
+                    event_type,
+                    timestamp,
+                    schema_version,
+                    request_id,
+                    source_ip,
+                    actor_user_id,
+                    actor_json,
+                    payload_method,
+                    payload_path,
+                    payload_status,
+                    payload_matched_rule_id,
+                    payload_json
+                ) VALUES (?1, 'http.request_observed', ?2, '0.1.0', 'request-test', '203.0.113.10', ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                params![
+                    event.event_id,
+                    event.timestamp,
+                    event.actor_user_id,
+                    actor_json,
+                    event.method,
+                    event.path,
+                    event.status,
+                    event.matched_rule_id,
+                    payload_json
+                ],
+            )
+            .expect("observation event should insert");
     }
 
     fn bulk_insert_benchmark_events(path: &PathBuf, event_count: usize) {
@@ -574,10 +1057,12 @@ mod tests {
                             source_ip,
                             actor_user_id,
                             actor_json,
+                            payload_method,
                             payload_path,
                             payload_status,
+                            payload_matched_rule_id,
                             payload_json
-                        ) VALUES (?1, ?2, ?3, '0.1.0', ?4, '203.0.113.10', ?5, ?6, ?7, ?8, ?9)
+                        ) VALUES (?1, ?2, ?3, '0.1.0', ?4, '203.0.113.10', ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                         "#,
                     )
                     .expect("benchmark insert should prepare");
@@ -585,12 +1070,15 @@ mod tests {
                 for index in chunk_start..chunk_end {
                     let event_type = format!("audit.benchmark.{}", index % 100);
                     let actor_user_id = format!("actor-{}", index % 1000);
+                    let payload_method = if index % 3 == 0 { "POST" } else { "GET" };
                     let payload_path = format!("/benchmark/{}", index % 1000);
                     let status = 200 + i64::try_from(index % 5).expect("status should fit");
                     let actor_json = format!(
                         r#"{{"user_id":"{actor_user_id}","roles":["admin"],"auth_mode":"bearer_token"}}"#
                     );
-                    let payload_json = format!(r#"{{"path":"{payload_path}","status":{status}}}"#);
+                    let payload_json = format!(
+                        r#"{{"method":"{payload_method}","path":"{payload_path}","status":{status}}}"#
+                    );
 
                     statement
                         .execute(params![
@@ -600,8 +1088,10 @@ mod tests {
                             format!("benchmark-request-{index:07}"),
                             actor_user_id,
                             actor_json,
+                            payload_method,
                             payload_path,
                             status,
+                            Option::<String>::None,
                             payload_json
                         ])
                         .expect("benchmark event should insert");
