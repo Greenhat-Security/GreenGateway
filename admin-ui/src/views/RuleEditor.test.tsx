@@ -12,6 +12,123 @@ afterEach(() => {
 });
 
 describe('RuleEditor', () => {
+  it('starts from the unchanged blank form when no prefill params are present', async () => {
+    vi.stubGlobal('fetch', policyBackedFetch(policyFixture(), 'W/"policy-1"'));
+
+    renderRuleEditor();
+
+    const pathInput = (await screen.findByLabelText(
+      'Path pattern',
+    )) as HTMLInputElement;
+    expect(pathInput.value).toBe('');
+    expect((screen.getByLabelText('Any method') as HTMLInputElement).checked).toBe(
+      true,
+    );
+    expect((screen.getByLabelText('GET') as HTMLInputElement).checked).toBe(
+      false,
+    );
+    expect(screen.getByText('Any role')).toBeTruthy();
+    expect(screen.getByText('Any principal ID')).toBeTruthy();
+    expect(
+      (screen.getByLabelText('Bearer token') as HTMLInputElement).checked,
+    ).toBe(false);
+    expect(
+      (screen.getByLabelText('Session cookie') as HTMLInputElement).checked,
+    ).toBe(false);
+    expect(
+      (screen.getByRole('radio', { name: /Deny/ }) as HTMLInputElement).checked,
+    ).toBe(true);
+  });
+
+  it('applies each valid prefill query param to a new rule form', async () => {
+    vi.stubGlobal('fetch', policyBackedFetch(policyFixture(), 'W/"policy-1"'));
+
+    renderRuleEditor(
+      '/policy/rules/editor?prefill_method=post&prefill_path=%2Fapi%2Freports%2F%7Bid%7D&prefill_role=support&prefill_auth_method=session_cookie&prefill_principal_id=user-123&prefill_action=shadow',
+    );
+
+    expect(await screen.findByDisplayValue('/api/reports/{id}')).toBeTruthy();
+    expect((screen.getByLabelText('POST') as HTMLInputElement).checked).toBe(
+      true,
+    );
+    expect(
+      screen.getByLabelText('Role constraints selected values').textContent,
+    ).toContain('support');
+    expect(
+      (screen.getByLabelText('Session cookie') as HTMLInputElement).checked,
+    ).toBe(true);
+    expect(
+      screen.getByLabelText('Principal IDs selected values').textContent,
+    ).toContain('user-123');
+    expect(
+      (screen.getByRole('radio', { name: /Shadow/ }) as HTMLInputElement).checked,
+    ).toBe(true);
+  });
+
+  it('ignores invalid prefill auth method and action values', async () => {
+    vi.stubGlobal('fetch', policyBackedFetch(policyFixture(), 'W/"policy-1"'));
+
+    renderRuleEditor(
+      '/policy/rules/editor?prefill_path=%2Fapi%2Fusers&prefill_auth_method=api_key&prefill_action=block',
+    );
+
+    expect(await screen.findByDisplayValue('/api/users')).toBeTruthy();
+    expect(
+      (screen.getByLabelText('Bearer token') as HTMLInputElement).checked,
+    ).toBe(false);
+    expect(
+      (screen.getByLabelText('Session cookie') as HTMLInputElement).checked,
+    ).toBe(false);
+    expect(
+      (screen.getByRole('radio', { name: /Deny/ }) as HTMLInputElement).checked,
+    ).toBe(true);
+  });
+
+  it('ignores prefill params when rule_id is present', async () => {
+    const existingRule: PolicyRule = {
+      id: 'support-read',
+      methods: ['GET'],
+      path: '/existing/{id}',
+      principal: {
+        roles: ['support'],
+        auth_methods: ['bearer_token'],
+        principal_ids: ['existing-user'],
+      },
+      action: 'allow',
+    };
+    vi.stubGlobal(
+      'fetch',
+      policyBackedFetch(policyFixture({ rules: [existingRule] }), 'W/"policy-1"'),
+    );
+
+    renderRuleEditor(
+      '/policy/rules/editor?rule_id=support-read&prefill_method=POST&prefill_path=%2Fprefill&prefill_role=prefill-role&prefill_auth_method=session_cookie&prefill_principal_id=prefill-user&prefill_action=shadow',
+    );
+
+    expect(await screen.findByDisplayValue('/existing/{id}')).toBeTruthy();
+    expect((screen.getByLabelText('GET') as HTMLInputElement).checked).toBe(
+      true,
+    );
+    expect((screen.getByLabelText('POST') as HTMLInputElement).checked).toBe(
+      false,
+    );
+    expect(
+      screen.getByLabelText('Role constraints selected values').textContent,
+    ).toContain('support');
+    expect(
+      screen.getByLabelText('Role constraints selected values').textContent,
+    ).not.toContain('prefill-role');
+    expect(
+      (screen.getByLabelText('Bearer token') as HTMLInputElement).checked,
+    ).toBe(true);
+    expect(
+      screen.getByLabelText('Principal IDs selected values').textContent,
+    ).toContain('existing-user');
+    expect(
+      (screen.getByRole('radio', { name: /Allow/ }) as HTMLInputElement).checked,
+    ).toBe(true);
+  });
+
   it('validates path patterns before submitting', async () => {
     const fetchMock = policyBackedFetch(policyFixture(), 'W/"policy-1"');
     vi.stubGlobal('fetch', fetchMock);

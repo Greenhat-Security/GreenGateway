@@ -1,7 +1,8 @@
 import { FormEvent, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
+import { currentTokenCanWritePolicy, fetchPolicy } from '../lib/policy';
 import {
   TrafficEndpoint,
   TrafficFilters,
@@ -43,6 +44,7 @@ const METHOD_OPTIONS = [
 // with no record of which upstream route produced an observation, so there is
 // no data to group by yet. Revisit once that gap is closed upstream.
 export function TrafficInventory() {
+  const navigate = useNavigate();
   const [filters, setFilters] = useState<TrafficFilters>(() =>
     emptyTrafficFilters(),
   );
@@ -59,6 +61,7 @@ export function TrafficInventory() {
     null,
   );
   const [canWriteReviews, setCanWriteReviews] = useState(true);
+  const [canCreateRules, setCanCreateRules] = useState(false);
 
   useEffect(() => {
     let isCurrent = true;
@@ -97,6 +100,29 @@ export function TrafficInventory() {
       isCurrent = false;
     };
   }, [appliedFilters]);
+
+  useEffect(() => {
+    let isCurrent = true;
+
+    async function loadPolicyWritePermission() {
+      try {
+        const response = await fetchPolicy();
+        if (isCurrent) {
+          setCanCreateRules(currentTokenCanWritePolicy(response.policy));
+        }
+      } catch {
+        if (isCurrent) {
+          setCanCreateRules(false);
+        }
+      }
+    }
+
+    void loadPolicyWritePermission();
+
+    return () => {
+      isCurrent = false;
+    };
+  }, []);
 
   function updateTextFilter(name: 'endpointTemplate' | 'method', value: string) {
     setFilters((current) => ({ ...current, [name]: value }));
@@ -179,6 +205,14 @@ export function TrafficInventory() {
     } finally {
       setUpdatingReviewKey(null);
     }
+  }
+
+  function createRuleFromEndpoint(endpoint: TrafficEndpoint) {
+    if (!canCreateRules) {
+      return;
+    }
+
+    navigate(ruleEditorPathForTrafficEndpoint(endpoint));
   }
 
   return (
@@ -336,6 +370,20 @@ export function TrafficInventory() {
                             <button
                               type="button"
                               className="secondary-button row-action-button"
+                              aria-label={`Create rule for ${endpoint.method} ${endpoint.endpoint_template}`}
+                              title={
+                                canCreateRules
+                                  ? undefined
+                                  : 'Requires admin:policy:write'
+                              }
+                              disabled={!canCreateRules || isUpdating}
+                              onClick={() => createRuleFromEndpoint(endpoint)}
+                            >
+                              Create rule
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-button row-action-button"
                               aria-label={`${endpoint.reviewed ? 'Clear review' : 'Mark reviewed'} ${endpoint.method} ${endpoint.endpoint_template}`}
                               title={
                                 canWriteReviews
@@ -429,6 +477,14 @@ function trafficEndpointDetailPath(endpoint: TrafficEndpoint): string {
   params.set('endpoint_template', endpoint.endpoint_template);
 
   return `/traffic/detail?${params.toString()}`;
+}
+
+function ruleEditorPathForTrafficEndpoint(endpoint: TrafficEndpoint): string {
+  const params = new URLSearchParams();
+  params.set('prefill_method', endpoint.method);
+  params.set('prefill_path', endpoint.endpoint_template);
+
+  return `/policy/rules/editor?${params.toString()}`;
 }
 
 function TrafficErrorMessage({ error }: { error: TrafficLoadError }) {

@@ -6,10 +6,13 @@ import {
   screen,
   waitFor,
 } from '@testing-library/react';
+import { Buffer } from 'node:buffer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 
+import { ADMIN_TOKEN_STORAGE_KEY } from '../lib/auth';
 import { AuditEvent } from '../lib/audit';
+import type { PolicyDocument } from '../lib/policy';
 import {
   LIVE_TAIL_EVENT_LIMIT,
   LIVE_TAIL_RECONNECT_DELAY_MS,
@@ -20,6 +23,7 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.useRealTimers();
+  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
 });
 
 describe('LiveTail', () => {
@@ -65,6 +69,127 @@ describe('LiveTail', () => {
     expect(screen.getByText('3 events')).toBeTruthy();
   });
 
+  it('navigates to a richly prefilled rule editor from an audit event row', async () => {
+    const stream = sseFetchMock({
+      policy: policyDocument({
+        roles: {
+          writer: { permissions: ['admin:policy:write'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', stream.fetch);
+    const event = auditEvent({
+      event_id: 'rich-event',
+      request_id: 'rich-event',
+      actor: {
+        user_id: 'alice',
+        roles: ['support', 'admin'],
+        auth_mode: 'bearer_token',
+      },
+      payload: {
+        method: 'POST',
+        path: '/admin/users',
+        status: 403,
+      },
+    });
+
+    renderLiveTail({ token: jwtWithRoles(['writer']) });
+
+    expect(await screen.findByText('Connected')).toBeTruthy();
+    act(() => {
+      stream.calls[0].enqueue(sseFrame(event));
+    });
+
+    expect(await screen.findByText('rich-event')).toBeTruthy();
+    const createRuleButton = screen.getByRole('button', {
+      name: 'Create rule from POST /admin/users',
+    }) as HTMLButtonElement;
+    await waitFor(() => expect(createRuleButton.disabled).toBe(false));
+
+    fireEvent.click(createRuleButton);
+
+    expect(screen.getByTestId('location').textContent).toBe(
+      '/policy/rules/editor?prefill_method=POST&prefill_path=%2Fadmin%2Fusers&prefill_role=support&prefill_auth_method=bearer_token&prefill_principal_id=alice',
+    );
+  });
+
+  it('creates a method-and-path-only prefill link when an audit event has no actor', async () => {
+    const stream = sseFetchMock({
+      policy: policyDocument({
+        roles: {
+          writer: { permissions: ['admin:policy:write'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', stream.fetch);
+    const event = auditEvent({
+      event_id: 'anonymous-event',
+      request_id: 'anonymous-event',
+      actor: null,
+      payload: {
+        method: 'GET',
+        path: '/public/status',
+        status: 200,
+      },
+    });
+
+    renderLiveTail({ token: jwtWithRoles(['writer']) });
+
+    expect(await screen.findByText('Connected')).toBeTruthy();
+    act(() => {
+      stream.calls[0].enqueue(sseFrame(event));
+    });
+
+    expect(await screen.findByText('anonymous-event')).toBeTruthy();
+    const createRuleButton = screen.getByRole('button', {
+      name: 'Create rule from GET /public/status',
+    }) as HTMLButtonElement;
+    await waitFor(() => expect(createRuleButton.disabled).toBe(false));
+
+    fireEvent.click(createRuleButton);
+
+    expect(screen.getByTestId('location').textContent).toBe(
+      '/policy/rules/editor?prefill_method=GET&prefill_path=%2Fpublic%2Fstatus',
+    );
+  });
+
+  it('disables audit-event rule creation for a read-only policy principal', async () => {
+    const stream = sseFetchMock({
+      policy: policyDocument({
+        roles: {
+          reader: { permissions: ['admin:policy:read'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', stream.fetch);
+
+    renderLiveTail({ token: jwtWithRoles(['reader']) });
+
+    expect(await screen.findByText('Connected')).toBeTruthy();
+    act(() => {
+      stream.calls[0].enqueue(
+        sseFrame(
+          auditEvent({
+            payload: {
+              method: 'GET',
+              path: '/readonly',
+              status: 200,
+            },
+          }),
+        ),
+      );
+    });
+
+    const createRuleButton = (await screen.findByRole('button', {
+      name: 'Create rule from GET /readonly',
+    })) as HTMLButtonElement;
+
+    expect(createRuleButton.disabled).toBe(true);
+    expect(createRuleButton.getAttribute('title')).toBe(
+      'Requires admin:policy:write',
+    );
+  });
+
   it('aborts the previous stream and reconnects when filters change', async () => {
     const stream = sseFetchMock();
     vi.stubGlobal('fetch', stream.fetch);
@@ -78,7 +203,7 @@ describe('LiveTail', () => {
       target: { value: 'auth.success' },
     });
 
-    await waitFor(() => expect(stream.fetch).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(stream.calls).toHaveLength(2));
     expect(firstCall.aborted).toBe(true);
 
     const secondCall = stream.calls[1];
@@ -86,7 +211,7 @@ describe('LiveTail', () => {
       target: { value: '/admin' },
     });
 
-    await waitFor(() => expect(stream.fetch).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(stream.calls).toHaveLength(3));
     expect(secondCall.aborted).toBe(true);
 
     const nextUrl = new URL(stream.calls[2].url, 'http://localhost');
@@ -210,7 +335,7 @@ describe('LiveTail', () => {
     });
     await flushStreamWork();
 
-    expect(stream.fetch).toHaveBeenCalledTimes(2);
+    expect(stream.calls).toHaveLength(2);
     expect(screen.getByText('Connected')).toBeTruthy();
   });
 
@@ -294,18 +419,52 @@ type StreamCall = {
   error: (error: unknown) => void;
 };
 
-function renderLiveTail() {
+function renderLiveTail({
+  token = null,
+}: {
+  token?: string | null;
+} = {}) {
+  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  if (token !== null) {
+    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+  }
+
   render(
     <MemoryRouter>
       <LiveTail />
+      <LocationProbe />
     </MemoryRouter>,
   );
 }
 
-function sseFetchMock() {
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <div data-testid="location">
+      {location.pathname}
+      {location.search}
+    </div>
+  );
+}
+
+function sseFetchMock({
+  policy = policyDocument(),
+}: {
+  policy?: PolicyDocument;
+} = {}) {
   const encoder = new TextEncoder();
   const calls: StreamCall[] = [];
   const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input), 'http://localhost');
+
+    if (url.pathname === '/v1/admin/policy' && !init?.method) {
+      return Promise.resolve(jsonResponse(200, policy, { ETag: '"policy-etag"' }));
+    }
+
+    if (url.pathname !== '/v1/admin/events/stream') {
+      return Promise.reject(new Error(`unexpected fetch: ${url.pathname}`));
+    }
+
     let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
     let isClosed = false;
     const stream = new ReadableStream<Uint8Array>({
@@ -361,11 +520,16 @@ function sseFetchMock() {
   return { calls, fetch };
 }
 
-function jsonResponse(status: number, body: unknown): Response {
+function jsonResponse(
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       'Content-Type': 'application/json',
+      ...headers,
     },
   });
 }
@@ -402,4 +566,31 @@ function auditEvent(overrides: Partial<AuditEvent> = {}): AuditEvent {
     },
     ...overrides,
   };
+}
+
+function policyDocument(
+  overrides: Partial<PolicyDocument> = {},
+): PolicyDocument {
+  return {
+    schema_version: '0.1.0',
+    id: 'live-tail-test-policy',
+    default_action: 'deny',
+    enforcement_mode: 'enforce',
+    roles: {},
+    routes: [],
+    rules: [],
+    ...overrides,
+  };
+}
+
+function jwtWithRoles(roles: string[]): string {
+  return [
+    base64UrlJson({ alg: 'none', typ: 'JWT' }),
+    base64UrlJson({ sub: 'test-user', roles }),
+    'signature',
+  ].join('.');
+}
+
+function base64UrlJson(value: unknown): string {
+  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
 }

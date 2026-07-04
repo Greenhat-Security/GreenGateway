@@ -1,13 +1,17 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { Buffer } from 'node:buffer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 
+import { ADMIN_TOKEN_STORAGE_KEY } from '../lib/auth';
+import type { PolicyDocument } from '../lib/policy';
 import type { TrafficEndpoint } from '../lib/traffic';
 import { TrafficInventory } from './TrafficInventory';
 
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
 });
 
 describe('TrafficInventory', () => {
@@ -64,10 +68,71 @@ describe('TrafficInventory', () => {
       '/signals?state=open&target_kind=endpoint&target_key=GET+%2Fusers%2F%7Bid%7D',
     );
 
-    const firstUrl = new URL(String(fetchMock.mock.calls[0][0]), 'http://localhost');
+    const firstUrl = trafficEndpointUrls(fetchMock)[0];
     expect(firstUrl.pathname).toBe('/v1/admin/traffic/endpoints');
     expect(firstUrl.searchParams.get('limit')).toBe('50');
     expect(firstUrl.searchParams.get('sort')).toBe('last_seen');
+  });
+
+  it('navigates to a prefilled rule editor from an endpoint row', async () => {
+    const fetcher = trafficInventoryFetchMock({
+      endpoints: [
+        trafficEndpoint({
+          method: 'POST',
+          endpoint_template: '/reports/{id}',
+        }),
+      ],
+      policy: policyDocument({
+        roles: {
+          writer: { permissions: ['admin:policy:write'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderTrafficInventory({ token: jwtWithRoles(['writer']) });
+
+    expect(await screen.findByText('/reports/{id}')).toBeTruthy();
+    const createRuleButton = screen.getByRole('button', {
+      name: 'Create rule for POST /reports/{id}',
+    }) as HTMLButtonElement;
+    await waitFor(() => expect(createRuleButton.disabled).toBe(false));
+
+    fireEvent.click(createRuleButton);
+
+    expect(await screen.findByTestId('location')).toBeTruthy();
+    expect(screen.getByTestId('location').textContent).toBe(
+      '/policy/rules/editor?prefill_method=POST&prefill_path=%2Freports%2F%7Bid%7D',
+    );
+  });
+
+  it('disables endpoint rule creation for a read-only policy principal', async () => {
+    const fetcher = trafficInventoryFetchMock({
+      endpoints: [
+        trafficEndpoint({
+          method: 'GET',
+          endpoint_template: '/readonly',
+        }),
+      ],
+      policy: policyDocument({
+        roles: {
+          reader: { permissions: ['admin:policy:read'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderTrafficInventory({ token: jwtWithRoles(['reader']) });
+
+    expect(await screen.findByText('/readonly')).toBeTruthy();
+    const createRuleButton = screen.getByRole('button', {
+      name: 'Create rule for GET /readonly',
+    }) as HTMLButtonElement;
+
+    expect(createRuleButton.disabled).toBe(true);
+    expect(createRuleButton.getAttribute('title')).toBe(
+      'Requires admin:policy:write',
+    );
   });
 
   it('renders a genuine empty state when no endpoints match', async () => {
@@ -182,11 +247,9 @@ describe('TrafficInventory', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Reviewed' }));
     fireEvent.click(screen.getByRole('button', { name: 'Apply filters' }));
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const secondUrl = new URL(
-      String(fetchMock.mock.calls[1][0]),
-      'http://localhost',
-    );
+    const trafficUrls = trafficEndpointUrls(fetchMock);
+    expect(trafficUrls).toHaveLength(2);
+    const secondUrl = trafficUrls[1];
     expect(secondUrl.pathname).toBe('/v1/admin/traffic/endpoints');
     expect(secondUrl.searchParams.get('endpoint_template')).toBe('users');
     expect(secondUrl.searchParams.get('method')).toBe('GET');
@@ -198,10 +261,9 @@ describe('TrafficInventory', () => {
   });
 
   it('loads the next cursor page and appends endpoints', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        jsonResponse(200, {
+    const fetcher = trafficInventoryFetchMock({
+      pages: [
+        {
           endpoints: [
             trafficEndpoint({
               method: 'GET',
@@ -209,10 +271,8 @@ describe('TrafficInventory', () => {
             }),
           ],
           next_cursor: 'page-2',
-        }),
-      )
-      .mockResolvedValueOnce(
-        jsonResponse(200, {
+        },
+        {
           endpoints: [
             trafficEndpoint({
               method: 'POST',
@@ -220,9 +280,10 @@ describe('TrafficInventory', () => {
             }),
           ],
           next_cursor: null,
-        }),
-      );
-    vi.stubGlobal('fetch', fetchMock);
+        },
+      ],
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
 
     renderTrafficInventory();
 
@@ -233,44 +294,34 @@ describe('TrafficInventory', () => {
     expect(await screen.findByText('/reports')).toBeTruthy();
     expect(screen.getByText('/users/{id}')).toBeTruthy();
 
-    const secondUrl = new URL(
-      String(fetchMock.mock.calls[1][0]),
-      'http://localhost',
-    );
+    const secondUrl = trafficEndpointUrls(fetcher.fetch)[1];
     expect(secondUrl.searchParams.get('cursor')).toBe('page-2');
     expect(secondUrl.searchParams.get('sort')).toBe('last_seen');
   });
 
   it('marks and clears endpoint review state from the table', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        jsonResponse(200, {
-          endpoints: [
-            trafficEndpoint({
-              method: 'GET',
-              endpoint_template: '/users/{id}',
-              reviewed: false,
-            }),
-          ],
-          next_cursor: null,
+    const fetcher = trafficInventoryFetchMock({
+      endpoints: [
+        trafficEndpoint({
+          method: 'GET',
+          endpoint_template: '/users/{id}',
+          reviewed: false,
         }),
-      )
-      .mockResolvedValueOnce(
-        jsonResponse(200, {
+      ],
+      reviewResponses: [
+        {
           reviewed: true,
           reviewed_at: '2026-07-04T12:00:00Z',
           reviewed_by: 'admin-user',
-        }),
-      )
-      .mockResolvedValueOnce(
-        jsonResponse(200, {
+        },
+        {
           reviewed: false,
           reviewed_at: null,
           reviewed_by: null,
-        }),
-      );
-    vi.stubGlobal('fetch', fetchMock);
+        },
+      ],
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
 
     renderTrafficInventory();
 
@@ -287,7 +338,7 @@ describe('TrafficInventory', () => {
         name: 'Clear review GET /users/{id}',
       }),
     ).toBeTruthy();
-    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+    expect(JSON.parse(String(reviewRequests(fetcher.fetch)[0][1]?.body))).toEqual({
       method: 'GET',
       endpoint_template: '/users/{id}',
       reviewed: true,
@@ -304,7 +355,7 @@ describe('TrafficInventory', () => {
         name: 'Mark reviewed GET /users/{id}',
       }),
     ).toBeTruthy();
-    expect(JSON.parse(String(fetchMock.mock.calls[2][1]?.body))).toEqual({
+    expect(JSON.parse(String(reviewRequests(fetcher.fetch)[1][1]?.body))).toEqual({
       method: 'GET',
       endpoint_template: '/users/{id}',
       reviewed: false,
@@ -312,22 +363,17 @@ describe('TrafficInventory', () => {
   });
 
   it('disables review controls after a write-permission denial', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        jsonResponse(200, {
-          endpoints: [
-            trafficEndpoint({
-              method: 'GET',
-              endpoint_template: '/users/{id}',
-              reviewed: false,
-            }),
-          ],
-          next_cursor: null,
+    const fetcher = trafficInventoryFetchMock({
+      endpoints: [
+        trafficEndpoint({
+          method: 'GET',
+          endpoint_template: '/users/{id}',
+          reviewed: false,
         }),
-      )
-      .mockResolvedValueOnce(jsonResponse(403, { error: 'forbidden' }));
-    vi.stubGlobal('fetch', fetchMock);
+      ],
+      reviewStatus: 403,
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
 
     renderTrafficInventory();
 
@@ -350,21 +396,143 @@ describe('TrafficInventory', () => {
   });
 });
 
-function renderTrafficInventory() {
+function renderTrafficInventory({
+  token = null,
+}: {
+  token?: string | null;
+} = {}) {
+  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  if (token !== null) {
+    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+  }
+
   render(
     <MemoryRouter>
       <TrafficInventory />
+      <LocationProbe />
     </MemoryRouter>,
   );
 }
 
-function jsonResponse(status: number, body: unknown): Response {
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <div data-testid="location">
+      {location.pathname}
+      {location.search}
+    </div>
+  );
+}
+
+function trafficEndpointUrls(fetchMock: ReturnType<typeof vi.fn>): URL[] {
+  return fetchMock.mock.calls
+    .map(([input]) => new URL(String(input), 'http://localhost'))
+    .filter((url) => url.pathname === '/v1/admin/traffic/endpoints');
+}
+
+function reviewRequests(fetchMock: ReturnType<typeof vi.fn>) {
+  return fetchMock.mock.calls.filter(([input, init]) => {
+    const url = new URL(String(input), 'http://localhost');
+    return (
+      url.pathname === '/v1/admin/traffic/endpoints/review' &&
+      init?.method === 'POST'
+    );
+  });
+}
+
+function trafficInventoryFetchMock({
+  endpoints = [],
+  pages,
+  policy = policyDocument(),
+  reviewResponses = [],
+  reviewStatus = 200,
+}: {
+  endpoints?: TrafficEndpoint[];
+  pages?: Array<{ endpoints: TrafficEndpoint[]; next_cursor: string | null }>;
+  policy?: PolicyDocument;
+  reviewResponses?: Array<{
+    reviewed: boolean;
+    reviewed_at: string | null;
+    reviewed_by: string | null;
+  }>;
+  reviewStatus?: number;
+}) {
+  const trafficPages = [
+    ...(pages ?? [
+      {
+        endpoints,
+        next_cursor: null,
+      },
+    ]),
+  ];
+  const reviews = [...reviewResponses];
+  const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input), 'http://localhost');
+
+    if (url.pathname === '/v1/admin/traffic/endpoints' && !init?.method) {
+      return Promise.resolve(jsonResponse(200, trafficPages.shift() ?? {
+        endpoints: [],
+        next_cursor: null,
+      }));
+    }
+
+    if (url.pathname === '/v1/admin/policy' && !init?.method) {
+      return Promise.resolve(jsonResponse(200, policy, { ETag: '"policy-etag"' }));
+    }
+
+    if (
+      url.pathname === '/v1/admin/traffic/endpoints/review' &&
+      init?.method === 'POST'
+    ) {
+      if (reviewStatus !== 200) {
+        return Promise.resolve(jsonResponse(reviewStatus, { error: 'forbidden' }));
+      }
+
+      return Promise.resolve(
+        jsonResponse(
+          200,
+          reviews.shift() ?? {
+            reviewed: true,
+            reviewed_at: '2026-07-04T12:00:00Z',
+            reviewed_by: 'admin-user',
+          },
+        ),
+      );
+    }
+
+    return Promise.reject(new Error(`unexpected fetch: ${url.pathname}`));
+  });
+
+  return { fetch };
+}
+
+function jsonResponse(
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       'Content-Type': 'application/json',
+      ...headers,
     },
   });
+}
+
+function policyDocument(
+  overrides: Partial<PolicyDocument> = {},
+): PolicyDocument {
+  return {
+    schema_version: '0.1.0',
+    id: 'traffic-test-policy',
+    default_action: 'deny',
+    enforcement_mode: 'enforce',
+    roles: {},
+    routes: [],
+    rules: [],
+    ...overrides,
+  };
 }
 
 function trafficEndpoint(
@@ -395,4 +563,16 @@ function trafficEndpoint(
     status_counts: [{ status: 200, count: 1 }],
     ...overrides,
   };
+}
+
+function jwtWithRoles(roles: string[]): string {
+  return [
+    base64UrlJson({ alg: 'none', typ: 'JWT' }),
+    base64UrlJson({ sub: 'test-user', roles }),
+    'signature',
+  ].join('.');
+}
+
+function base64UrlJson(value: unknown): string {
+  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
 }

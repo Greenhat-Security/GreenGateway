@@ -2,11 +2,11 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
-import { decodeJwtRolesClaim, getStoredToken } from '../lib/auth';
 import {
   PolicyDefaultAction,
   PolicyDocument,
   PolicyRule,
+  currentTokenCanWritePolicy,
   deletePolicyRule,
   fetchPolicy,
   fetchPolicyRuleHits,
@@ -33,8 +33,6 @@ type RuleRow = {
   id: string;
   index: number;
 };
-
-const POLICY_WRITE_PERMISSION = 'admin:policy:write';
 
 export function RuleTable() {
   const [policy, setPolicy] = useState<PolicyDocument | null>(null);
@@ -352,30 +350,6 @@ export function RuleTable() {
   );
 }
 
-function currentTokenCanWritePolicy(policy: PolicyDocument): boolean {
-  const token = getStoredToken();
-  if (!token) {
-    return false;
-  }
-
-  const roles = decodeJwtRolesClaim(token);
-  if (roles === null) {
-    return false;
-  }
-
-  return roles.some((roleName) => roleGrantsPolicyWrite(policy.roles?.[roleName]));
-}
-
-function roleGrantsPolicyWrite(role: unknown): boolean {
-  if (!isJsonObject(role) || !Array.isArray(role.permissions)) {
-    return false;
-  }
-
-  return role.permissions.some(
-    (permission) => permission === POLICY_WRITE_PERMISSION || permission === '*',
-  );
-}
-
 function DefaultActionBanner({ action }: { action: PolicyDefaultAction }) {
   const title = actionTitle(action);
   const alertClass = action === 'allow' ? 'success' : 'error';
@@ -686,8 +660,4 @@ function toPolicyLoadError(error: unknown): PolicyLoadError {
   }
 
   return { kind: 'network', message: 'Network request failed.' };
-}
-
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

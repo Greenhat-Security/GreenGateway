@@ -19,6 +19,8 @@ import {
   PrincipalMatcher,
   createPolicyRule,
   fetchPolicy,
+  isAuthMethodName,
+  isPolicyRuleAction,
   patchPolicyRule,
   previewPolicyRule,
 } from '../lib/policy';
@@ -111,7 +113,10 @@ type PreviewState =
 export function RuleEditor() {
   const [searchParams] = useSearchParams();
   const requestedRuleId = searchParams.get('rule_id')?.trim() || null;
-  const [form, setForm] = useState<RuleFormState>(() => emptyRuleForm());
+  const [form, setForm] = useState<RuleFormState>(() => ({
+    ...emptyRuleForm(),
+    ...(requestedRuleId === null ? formFromPrefillParams(searchParams) : {}),
+  }));
   const [policyEtag, setPolicyEtag] = useState<string | null>(null);
   const [roleOptions, setRoleOptions] = useState<string[]>([]);
   const [endpointTemplates, setEndpointTemplates] = useState<string[]>([]);
@@ -882,6 +887,44 @@ function emptyRuleForm(): RuleFormState {
   };
 }
 
+function formFromPrefillParams(
+  searchParams: URLSearchParams,
+): Partial<RuleFormState> {
+  const form: Partial<RuleFormState> = {};
+
+  const method = trimmedSearchParam(searchParams, 'prefill_method');
+  if (method !== null && method !== '*') {
+    form.methods = [method.toUpperCase()];
+  }
+
+  const path = trimmedSearchParam(searchParams, 'prefill_path');
+  if (path !== null) {
+    form.path = path;
+  }
+
+  const role = trimmedSearchParam(searchParams, 'prefill_role');
+  if (role !== null) {
+    form.roles = [role];
+  }
+
+  const authMethod = trimmedSearchParam(searchParams, 'prefill_auth_method');
+  if (authMethod !== null && isAuthMethodName(authMethod)) {
+    form.authMethods = [authMethod];
+  }
+
+  const principalId = trimmedSearchParam(searchParams, 'prefill_principal_id');
+  if (principalId !== null) {
+    form.principalIds = [principalId];
+  }
+
+  const action = trimmedSearchParam(searchParams, 'prefill_action');
+  if (action !== null && isPolicyRuleAction(action)) {
+    form.action = action;
+  }
+
+  return form;
+}
+
 function formFromRule(rule: PolicyRule): RuleFormState {
   return {
     methods: normalizeMethods(rule.methods ?? []),
@@ -974,12 +1017,16 @@ function normalizeAuthMethods(values: string[]): AuthMethodName[] {
   return values.filter(isAuthMethodName);
 }
 
-function isAuthMethodName(value: string): value is AuthMethodName {
-  return value === 'bearer_token' || value === 'session_cookie';
-}
-
 function addUnique(values: string[], value: string): string[] {
   return normalizeStrings([...values, value]);
+}
+
+function trimmedSearchParam(
+  searchParams: URLSearchParams,
+  name: string,
+): string | null {
+  const value = searchParams.get(name)?.trim();
+  return value && value.length > 0 ? value : null;
 }
 
 function policyRoleNames(policy: PolicyDocument): string[] {
