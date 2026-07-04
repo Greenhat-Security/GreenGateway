@@ -1,11 +1,12 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AdminShell } from './App';
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   window.localStorage.removeItem('greengateway_admin_theme');
   delete document.documentElement.dataset.theme;
 });
@@ -45,6 +46,40 @@ describe('AdminShell', () => {
     expect(document.documentElement.dataset.theme).toBe('dark');
     expect(
       screen.getByRole('button', { name: 'Switch to light theme' }),
+    ).toBeTruthy();
+  });
+
+  it('registers the traffic inventory route and navigation entry', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            endpoints: [],
+            next_cursor: null,
+          }),
+          {
+            status: 200,
+            headers: {
+              'Content-Type': 'application/json',
+            },
+          },
+        ),
+      ),
+    );
+
+    render(
+      <MemoryRouter initialEntries={['/traffic']}>
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: 'Traffic' })).toBeTruthy();
+    expect(
+      await screen.findByRole('heading', {
+        level: 2,
+        name: 'Traffic inventory',
+      }),
     ).toBeTruthy();
   });
 });

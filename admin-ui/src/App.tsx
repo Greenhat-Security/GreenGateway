@@ -17,6 +17,7 @@ import { adminBasePath } from './lib/config';
 import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
 import { StatusPage } from './views/StatusPage';
+import { TrafficInventory } from './views/TrafficInventory';
 
 const THEME_STORAGE_KEY = 'greengateway_admin_theme';
 
@@ -63,6 +64,9 @@ export function AdminShell() {
           <NavLink to="/logs" className={navItemClassName}>
             Logs
           </NavLink>
+          <NavLink to="/traffic" className={navItemClassName}>
+            Traffic
+          </NavLink>
           <NavLink to="/live" className={navItemClassName}>
             Live
           </NavLink>
@@ -96,6 +100,7 @@ export function AdminShell() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/logs" element={<LogExplorer />} />
+          <Route path="/traffic" element={<TrafficInventory />} />
           <Route path="/live" element={<LiveTail />} />
           <Route path="/status" element={<StatusPage />} />
           <Route path="*" element={<NotFoundPage />} />
@@ -119,6 +124,10 @@ function Dashboard() {
           <Link to="/logs">
             <span>Log explorer</span>
             <small>Audit history and filters</small>
+          </Link>
+          <Link to="/traffic">
+            <span>Traffic inventory</span>
+            <small>Discovered endpoints and rule coverage</small>
           </Link>
           <Link to="/live">
             <span>Live tail</span>
@@ -240,6 +249,9 @@ function navItemClassName({ isActive }: { isActive: boolean }): string {
 function pageTitleForPath(pathname: string): string {
   if (pathname === '/logs') {
     return 'Log explorer';
+  }
+  if (pathname === '/traffic') {
+    return 'Traffic inventory';
   }
   if (pathname === '/live') {
     return 'Live tail';
