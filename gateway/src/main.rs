@@ -147,6 +147,7 @@ struct AuditAdminState {
 struct StatusAdminState {
     config: config::Config,
     rbac: RbacStatus,
+    egress_allowed_hosts_count: usize,
     process_started_at: Instant,
 }
 
@@ -330,9 +331,9 @@ fn app_with_process_started_at(
         .map(audit::query::AuditQueryStore::open)
         .transpose()?
         .map(Arc::new);
-    let egress_client = Arc::new(egress::EgressClient::new(
-        egress::EgressConfig::from_config(&config),
-    )?);
+    let egress_config = egress::EgressConfig::from_config(&config);
+    let egress_allowed_hosts_count = egress_config.allowed_hosts.len();
+    let egress_client = Arc::new(egress::EgressClient::new(egress_config)?);
     let proxy_state = ProxyState::from_config(&config, Arc::clone(&egress_client));
     let routes = GatewayRoutes::from_config(&config);
     let validator = auth::JwtValidator::from_config(&config, egress_client)?
@@ -368,6 +369,7 @@ fn app_with_process_started_at(
     let status_state = StatusAdminState {
         config: config.clone(),
         rbac: rbac_status,
+        egress_allowed_hosts_count,
         process_started_at,
     };
 
@@ -887,7 +889,7 @@ impl StatusResponse {
             trust_proxy_headers: config.trust_proxy_headers,
             csrf_enabled: config.csrf_enabled,
             egress: EgressStatus {
-                allowed_hosts_count: config.egress_allowed_hosts.len(),
+                allowed_hosts_count: state.egress_allowed_hosts_count,
                 deny_private_ips: config.egress_deny_private_ips,
             },
         }
@@ -1903,6 +1905,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_auto_seeds_configured_upstream_host_into_egress_allowlist() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut config = proxy_config(upstream_addr);
+        config.egress_allowed_hosts.clear();
+        let router = proxy_router(config, test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/auto-seeded?ok=true")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            body_string(response).await,
+            "upstream GET /auto-seeded?ok=true"
+        );
+        let upstream = captured
+            .recv()
+            .await
+            .expect("upstream should receive proxied request");
+        assert_eq!(upstream.path_and_query, "/auto-seeded?ok=true");
+    }
+
+    #[tokio::test]
+    async fn proxy_auto_seeded_private_upstream_still_requires_private_ip_opt_out() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut config = proxy_config(upstream_addr);
+        config.egress_allowed_hosts.clear();
+        config.egress_deny_private_ips = true;
+        let egress_config = egress::EgressConfig::from_config(&config);
+        assert!(egress_config.allowed_hosts.contains("127.0.0.1"));
+        assert!(egress_config.deny_private_ips);
+        let router = proxy_router(config, test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/private-blocked")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(body_string(response).await, r#"{"error":"bad_gateway"}"#);
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "auto-seeded private upstream should still be blocked before proxying",
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn proxy_streams_upstream_response_without_buffering() {
         let upstream_addr =
             spawn_router(Router::new().route("/stream", get(delayed_stream_upstream))).await;
@@ -2612,6 +2673,20 @@ mod tests {
         assert_eq!(minimal["cors_allow_origins"], json!([]));
         assert_eq!(minimal["egress"]["allowed_hosts_count"], 0);
         assert_eq!(minimal["egress"]["deny_private_ips"], true);
+    }
+
+    #[tokio::test]
+    async fn status_reports_effective_egress_allowlist_count() {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.auth_exempt_paths.push(STATUS_ADMIN_ROUTE.to_owned());
+        config.egress_allowed_hosts = vec!["api.example.test".to_owned()];
+        config.upstream_url = Some("https://upstream.example.test/base".to_owned());
+        let router = status_router(config, Instant::now());
+
+        let status = status_json(router, Some(test_principal(&["admin"]))).await;
+
+        assert_eq!(status["egress"]["allowed_hosts_count"], 2);
     }
 
     #[tokio::test]
