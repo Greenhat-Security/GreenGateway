@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+arc-swap.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
@@ -15,6 +16,7 @@ jsonwebtoken.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 mime_guess.workspace = true
+notify.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 rust-embed.workspace = true
