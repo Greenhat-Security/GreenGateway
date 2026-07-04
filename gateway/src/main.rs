@@ -1078,6 +1078,7 @@ mod tests {
             session_cookie_name: String::new(),
             validation_allowed_content_types: vec!["application/json".to_owned()],
             auth_enabled: true,
+            auth_mode: config::AuthMode::Required,
             auth_cookie_name: "session".to_owned(),
             auth_exempt_paths: vec![
                 "/health".to_owned(),
@@ -1532,6 +1533,101 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| event.event_type.starts_with("auth.")));
+    }
+
+    #[tokio::test]
+    async fn observe_auth_forwards_anonymous_request_to_rbac_enforcement() {
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "deny",
+                "enforcement_mode": "enforce",
+                "roles": {},
+                "routes": [
+                    {
+                        "path_prefix": "/__test",
+                        "permission": "test:read"
+                    }
+                ]
+            }"#,
+        );
+        let mut config = test_config(Vec::new());
+        config.auth_mode = config::AuthMode::Observe;
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+        let request_id = "request-observe-auth-rbac-deny";
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .header(REQUEST_ID_HEADER, request_id)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_string(response).await, r#"{"error":"forbidden"}"#);
+        assert_eventually(Duration::from_secs(1), || {
+            let events = capture.events();
+            events
+                .iter()
+                .any(|event| event.event_type == "auth.failure")
+                && events
+                    .iter()
+                    .any(|event| event.event_type == "authz.denied")
+                && events
+                    .iter()
+                    .any(|event| event.event_type == "http.request_observed")
+        });
+
+        let events = capture.events();
+        let auth_failure = events
+            .iter()
+            .find(|event| event.event_type == "auth.failure")
+            .expect("auth failure should be captured");
+        assert_eq!(auth_failure.request_id, request_id);
+        assert_eq!(auth_failure.payload["path"], json!("/__test/principal"));
+        assert_eq!(auth_failure.payload["reason"], json!("missing_credential"));
+
+        let authz_denied = events
+            .iter()
+            .find(|event| event.event_type == "authz.denied")
+            .expect("authz denied should be captured");
+        assert_eq!(authz_denied.request_id, request_id);
+        assert_eq!(authz_denied.payload["path"], json!("/__test/principal"));
+        assert_eq!(authz_denied.payload["path_prefix"], json!("/__test"));
+        assert_eq!(authz_denied.payload["permission"], json!("test:read"));
+        assert_eq!(authz_denied.payload["reason"], json!("missing_principal"));
+
+        let observed = events
+            .iter()
+            .find(|event| event.event_type == "http.request_observed")
+            .expect("observation event should be captured");
+        assert_eq!(observed.request_id, request_id);
+        assert_eq!(observed.payload["status"], json!(403));
+        assert_eq!(
+            observed.payload["auth_outcome"],
+            json!("anonymous_or_failed")
+        );
+        assert_eq!(observed.payload["auth_reason"], json!("missing_credential"));
+        assert_eq!(observed.payload["policy_decision"], json!("denied"));
+        assert_eq!(
+            observed.payload["policy_reason"],
+            json!("missing_principal")
+        );
     }
 
     #[tokio::test]

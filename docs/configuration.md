@@ -134,7 +134,15 @@ Enables global authentication middleware.
 
 Default: `true`
 
-Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, non-exempt requests must present a supported, valid credential or they are rejected with `401 Unauthorized`. When disabled, authentication is a no-op passthrough and no `Principal` is injected for downstream handlers. A future observe mode in Phase 3 will add a middle ground; today this setting is enabled or disabled.
+Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, non-exempt requests run through authentication. When disabled, authentication is a no-op passthrough and no `Principal` is injected for downstream handlers.
+
+### AUTH_MODE
+
+Authentication enforcement mode.
+
+Default: `required`
+
+Format and validation: must be `required` or `observe`. In `required` mode, non-exempt requests must present a supported, valid credential or they are rejected with `401 Unauthorized`. In `observe` mode, authentication still attempts to validate credentials and still emits `auth.failure` audit events, but authentication failures are forwarded without a `Principal` and tagged on observation events as unauthenticated. `AUTH_ENABLED=false` skips authentication entirely; `AUTH_MODE=observe` keeps authentication running without letting the auth layer itself block.
 
 ### AUTH_COOKIE_NAME
 
