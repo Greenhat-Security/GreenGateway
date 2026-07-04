@@ -12,6 +12,10 @@ use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, Of
 use crate::metrics::LOCK_POISON_RECOVERIES_TOTAL;
 
 pub const DEFAULT_NEW_SINCE_HOURS: u64 = 24;
+/// 100 years, comfortably inside `OffsetDateTime`'s representable range and
+/// far beyond any meaningful "new since" window; guards against overflow in
+/// `TimeDuration::hours` for pathological caller-supplied values.
+pub const MAX_NEW_SINCE_HOURS: u64 = 876_000;
 
 const CREATE_REVIEW_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS discovery_endpoint_reviews (

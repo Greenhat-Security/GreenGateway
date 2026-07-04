@@ -2913,9 +2913,7 @@ impl TrafficEndpointListParams {
         let last_seen_before = validate_rfc3339("last_seen_before", self.last_seen_before)?;
         let min_call_count =
             parse_optional_non_negative_i64("min_call_count", self.min_call_count)?;
-        let new_since_hours =
-            parse_optional_non_negative_u64("new_since_hours", self.new_since_hours)?
-                .unwrap_or(discovery::query::DEFAULT_NEW_SINCE_HOURS);
+        let new_since_hours = parse_new_since_hours(self.new_since_hours)?;
         let is_new = parse_optional_bool("is_new", self.is_new)?;
         let reviewed = parse_optional_bool("reviewed", self.reviewed)?;
         let covered_by_rule = parse_optional_bool("covered_by_rule", self.covered_by_rule)?;
@@ -2957,9 +2955,7 @@ impl TrafficEndpointDetailParams {
             parse_limit_with_default(self.principal_limit, DEFAULT_AUDIT_QUERY_LIMIT)?;
         let from = validate_rfc3339("from", self.from)?;
         let to = validate_rfc3339("to", self.to)?;
-        let new_since_hours =
-            parse_optional_non_negative_u64("new_since_hours", self.new_since_hours)?
-                .unwrap_or(discovery::query::DEFAULT_NEW_SINCE_HOURS);
+        let new_since_hours = parse_new_since_hours(self.new_since_hours)?;
         let bucket = parse_endpoint_audit_bucket(self.bucket)?;
         let events_limit =
             parse_limit_with_default(self.events_limit, DEFAULT_TRAFFIC_RECENT_EVENTS_LIMIT)?;
@@ -3042,6 +3038,15 @@ fn parse_optional_non_negative_u64(
             Ok(parsed)
         })
         .transpose()
+}
+
+fn parse_new_since_hours(value: Option<String>) -> Result<u64, &'static str> {
+    let hours = parse_optional_non_negative_u64("new_since_hours", value)?
+        .unwrap_or(discovery::query::DEFAULT_NEW_SINCE_HOURS);
+    if hours > discovery::query::MAX_NEW_SINCE_HOURS {
+        return Err("new_since_hours");
+    }
+    Ok(hours)
 }
 
 fn parse_optional_bool(
@@ -9656,6 +9661,34 @@ paths:
         )
         .await;
         assert_eq!(endpoint_templates(&only_new), vec!["/recent".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn traffic_endpoint_new_since_hours_rejects_out_of_range_values_instead_of_panicking() {
+        let discovery_db = TempDb::new("traffic-lifecycle-new-since-bounds");
+        create_discovery_schema(&discovery_db.path);
+        let (router, _policy) = traffic_admin_router(Some(&discovery_db.path), None);
+        let principal = Some(test_principal(&["traffic-reader"]));
+        let template = query_encode("/users/{id}");
+
+        for uri in [
+            "/v1/admin/traffic/endpoints?new_since_hours=1000000000".to_owned(),
+            format!(
+                "/v1/admin/traffic/endpoint?method=GET&endpoint_template={template}&new_since_hours=1000000000"
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(traffic_admin_request(&uri, principal.clone()))
+                .await
+                .expect("traffic request should complete");
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                body_string(response).await,
+                r#"{"error":"invalid query parameter: new_since_hours"}"#
+            );
+        }
     }
 
     #[tokio::test]
