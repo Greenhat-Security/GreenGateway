@@ -3007,6 +3007,18 @@ async fn rule_suggestion_transition_endpoint(
     let Some(suggestion_engine) = state.suggestion_engine.as_ref() else {
         return suggestions_discovery_not_configured();
     };
+    match suggestion_engine.get_suggestion(id) {
+        Ok(Some(suggestion)) => {
+            if suggestion.state != discovery::suggestions::RuleSuggestionLifecycleState::Open {
+                return conflict("suggestion is not open");
+            }
+        }
+        Ok(None) => return not_found("suggestion was not found"),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to load rule suggestion");
+            return internal_server_error("suggestion query failed");
+        }
+    }
     let suggestion = match suggestion_engine.transition_suggestion(
         id,
         lifecycle_state,
@@ -12145,6 +12157,79 @@ paths:
             .expect("suggestion lifecycle event should be emitted");
         assert_eq!(event.payload["id"], json!("sug-dismiss"));
         assert_eq!(event.payload["state"], json!("dismissed"));
+    }
+
+    #[tokio::test]
+    async fn suggestions_admin_dismiss_rejects_non_open_suggestion_without_overwriting_state() {
+        let discovery_db = TempDb::new("suggestions-dismiss-non-open");
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-already-dismissed",
+                suggestion_type: "signal_shadow_schema_mismatch",
+                method: "PATCH",
+                path_pattern: "/dismiss/{id}",
+                role: None,
+                action: "shadow",
+                rationale: "Open schema mismatch signal targets PATCH /dismiss/{id}.",
+                evidence: json!({ "source_signal_id": "sig-schema" }),
+                state: "dismissed",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: Some("2024-06-02T00:00:00Z"),
+                transitioned_by: Some("original-dismisser"),
+                source_signal_id: Some("sig-schema"),
+            },
+        );
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let router = suggestions_admin_router_with_policy(
+            Some(&discovery_db.path),
+            None,
+            &policy,
+            audit_log,
+        );
+
+        let response = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-already-dismissed/dismiss",
+                Some(test_principal(&["suggestions-writer"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("dismiss request should complete");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let page = suggestions_json(
+            &router,
+            "/v1/admin/suggestions?state=dismissed",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        let suggestion = page["suggestions"]
+            .as_array()
+            .expect("suggestions array should exist")
+            .iter()
+            .find(|suggestion| suggestion["id"] == json!("sug-already-dismissed"))
+            .expect("suggestion should still exist");
+        assert_eq!(
+            suggestion["transitioned_by"],
+            json!("original-dismisser"),
+            "rejected dismiss must not overwrite the original transition metadata"
+        );
+        assert_eq!(suggestion["transitioned_at"], json!("2024-06-02T00:00:00Z"));
+
+        assert!(
+            capture
+                .events()
+                .iter()
+                .all(|event| event.event_type != audit::event::SUGGESTION_LIFECYCLE_CHANGED),
+            "a rejected dismiss must not emit a lifecycle-changed audit event"
+        );
     }
 
     #[test]
