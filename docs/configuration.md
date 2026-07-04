@@ -10,6 +10,16 @@ Default: `0.0.0.0:8080`
 
 Format and validation: must parse as a Rust `SocketAddr`, such as `127.0.0.1:8080`, `0.0.0.0:8080`, or `[::1]:8080`. Non-Unicode values and invalid socket addresses are rejected during configuration loading.
 
+### ADMIN_LISTEN_ADDR
+
+Optional socket address for serving the gateway admin UI and control-plane API on a separate listener.
+
+Default: empty, which serves the admin surface on `LISTEN_ADDR` with the data-path routes, matching the single-listener default.
+
+Format and validation: unset, empty, or whitespace-only values disable split-listener mode. Non-empty values must parse as a Rust `SocketAddr`, using the same validation as `LISTEN_ADDR`. When set, `ADMIN_LISTEN_ADDR` must differ from `LISTEN_ADDR`.
+
+When set, GreenGateway starts two listeners in the same process. `LISTEN_ADDR` serves `/health`, `/version`, `/metrics`, and the reverse proxy fallback when `UPSTREAM_URL` is configured. `ADMIN_LISTEN_ADDR` serves the admin UI at `ADMIN_PREFIX` and admin APIs under `/v1{ADMIN_PREFIX}`. The same security middleware stack applies to both listeners; only the route sets differ.
+
 ### ADMIN_PREFIX
 
 Path prefix for the gateway's admin UI and control-plane API surface.
@@ -300,7 +310,9 @@ Format and validation: unset, empty, or whitespace-only values become `None`. No
 
 ## Gateway-Owned Paths And Proxy Collisions
 
-GreenGateway separates its control plane from proxied data-plane traffic. Gateway-owned paths are matched before the reverse proxy fallback, and unmatched paths under gateway-owned control-plane prefixes are not forwarded to the upstream. If an upstream also serves content at one of these paths, that upstream content is unreachable through GreenGateway at the colliding path; move the gateway admin surface with `ADMIN_PREFIX` if the upstream genuinely needs that namespace.
+GreenGateway separates its control plane from proxied data-plane traffic. In the default single-listener mode, gateway-owned paths are matched before the reverse proxy fallback, and unmatched paths under gateway-owned control-plane prefixes are not forwarded to the upstream. If an upstream also serves content at one of these paths, that upstream content is unreachable through GreenGateway at the colliding path; move the gateway admin surface with `ADMIN_PREFIX` if the upstream genuinely needs that namespace.
+
+When `ADMIN_LISTEN_ADDR` is set, this separation is stronger: the data-path listener does not register the admin UI or admin API routes, and the admin listener does not register probes, metrics, or the reverse proxy fallback.
 
 The current gateway-owned paths are:
 
