@@ -59,12 +59,14 @@ const POLICY_VALIDATE_ADMIN_ROUTE: &str = "/v1/admin/policy/validate";
 const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
 const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
+const SCHEMA_COVERAGE_ADMIN_ROUTE: &str = "/v1/admin/schema/coverage";
 const TRAFFIC_ENDPOINTS_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints";
 const TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoint";
 const TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints/review";
 const AUDIT_ADMIN_ROLE: &str = "admin";
 const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
 const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
+const ADMIN_SCHEMA_READ_PERMISSION: &str = "admin:schema:read";
 const ADMIN_TRAFFIC_READ_PERMISSION: &str = "admin:traffic:read";
 const ADMIN_TRAFFIC_WRITE_PERMISSION: &str = "admin:traffic:write";
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
@@ -153,6 +155,7 @@ struct AdminRoutes {
     policy_rules_route: String,
     policy_rule_route: String,
     policy_rules_order_route: String,
+    schema_coverage_route: String,
     traffic_endpoints_route: String,
     traffic_endpoint_detail_route: String,
     traffic_endpoint_review_route: String,
@@ -208,6 +211,7 @@ impl AdminRoutes {
             policy_rules_route: format!("{api_prefix}/policy/rules"),
             policy_rule_route: format!("{api_prefix}/policy/rules/{{id}}"),
             policy_rules_order_route: format!("{api_prefix}/policy/rules/order"),
+            schema_coverage_route: format!("{api_prefix}/schema/coverage"),
             traffic_endpoints_route: format!("{api_prefix}/traffic/endpoints"),
             traffic_endpoint_detail_route: format!("{api_prefix}/traffic/endpoint"),
             traffic_endpoint_review_route: format!("{api_prefix}/traffic/endpoints/review"),
@@ -238,6 +242,13 @@ struct PolicyAdminState {
     audit: audit::AuditLog,
     trust_proxy_headers: bool,
     max_body_size: usize,
+}
+
+#[derive(Clone)]
+struct SchemaAdminState {
+    coverage: discovery::openapi::SchemaCoverage,
+    query_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
+    rbac_state: Option<middleware::rbac::RbacState>,
 }
 
 #[derive(Clone)]
@@ -543,6 +554,18 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Serialize)]
+struct SchemaNotConfiguredResponse {
+    error: String,
+    spec_configured: bool,
+}
+
+#[derive(Serialize)]
+struct DiscoveryNotConfiguredResponse {
+    error: String,
+    discovery_configured: bool,
+}
+
 enum GatewayApp {
     Unified(Router),
     Split { data: Router, admin: Router },
@@ -703,6 +726,7 @@ fn gateway_app_with_process_started_at(
         .map(audit::query::AuditQueryStore::open)
         .transpose()?
         .map(Arc::new);
+    let schema_coverage = discovery::openapi::SchemaCoverage::from_config(&config)?;
     let discovery_query_store = config
         .discovery_sqlite_path
         .as_deref()
@@ -775,6 +799,11 @@ fn gateway_app_with_process_started_at(
         trust_proxy_headers: config.trust_proxy_headers,
         max_body_size: config.max_body_size,
     };
+    let schema_admin_state = SchemaAdminState {
+        coverage: schema_coverage,
+        query_store: discovery_query_store.clone(),
+        rbac_state: rbac_state.clone(),
+    };
 
     if config.auth_enabled && validator.is_none() {
         tracing::warn!(
@@ -828,6 +857,7 @@ fn gateway_app_with_process_started_at(
                     audit_admin_state,
                     status_state,
                     policy_admin_state,
+                    schema_admin_state,
                     traffic_admin_state,
                 ),
                 &middleware_stack,
@@ -841,6 +871,7 @@ fn gateway_app_with_process_started_at(
                 audit_admin_state,
                 status_state,
                 policy_admin_state,
+                schema_admin_state,
                 traffic_admin_state,
             ),
             &middleware_stack,
@@ -854,6 +885,7 @@ fn unified_router(
     audit_admin_state: AuditAdminState,
     status_state: StatusAdminState,
     policy_admin_state: PolicyAdminState,
+    schema_admin_state: SchemaAdminState,
     traffic_admin_state: TrafficAdminState,
 ) -> Router {
     let router = Router::new()
@@ -871,6 +903,7 @@ fn unified_router(
         audit_admin_state,
         status_state,
         policy_admin_state,
+        schema_admin_state,
         traffic_admin_state,
     );
 
@@ -898,6 +931,7 @@ fn admin_router(
     audit_admin_state: AuditAdminState,
     status_state: StatusAdminState,
     policy_admin_state: PolicyAdminState,
+    schema_admin_state: SchemaAdminState,
     traffic_admin_state: TrafficAdminState,
 ) -> Router {
     let router = Router::new()
@@ -912,6 +946,7 @@ fn admin_router(
         audit_admin_state,
         status_state,
         policy_admin_state,
+        schema_admin_state,
         traffic_admin_state,
     )
 }
@@ -933,6 +968,7 @@ fn add_admin_api_routes(
     audit_admin_state: AuditAdminState,
     status_state: StatusAdminState,
     policy_admin_state: PolicyAdminState,
+    schema_admin_state: SchemaAdminState,
     traffic_admin_state: TrafficAdminState,
 ) -> Router {
     router
@@ -949,6 +985,14 @@ fn add_admin_api_routes(
             Router::new()
                 .route(routes.admin.status_route.as_str(), get(status_endpoint))
                 .with_state(status_state),
+        )
+        .merge(
+            Router::new()
+                .route(
+                    routes.admin.schema_coverage_route.as_str(),
+                    get(schema_coverage_endpoint),
+                )
+                .with_state(schema_admin_state),
         )
         .merge(
             Router::new()
@@ -2345,6 +2389,36 @@ async fn policy_rule_hits_endpoint(
     .into_response()
 }
 
+async fn schema_coverage_endpoint(
+    State(state): State<SchemaAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(SCHEMA_COVERAGE_ADMIN_ROUTE);
+
+    let Some(principal) = request.extensions().get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    if !authorized_schema_reader(&state, principal) {
+        return forbidden();
+    }
+    if !state.coverage.spec_configured() {
+        return schema_not_configured();
+    }
+    let Some(query_store) = state.query_store.as_ref() else {
+        return schema_discovery_not_configured();
+    };
+
+    let observed = match query_store.observed_endpoints() {
+        Ok(observed) => observed,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to query schema coverage discovery inventory");
+            return internal_server_error("schema coverage discovery query failed");
+        }
+    };
+
+    Json(state.coverage.compare(&observed)).into_response()
+}
+
 async fn admin_ui_index(State(state): State<AppState>) -> Response {
     record_request(ADMIN_UI_ROUTE);
     admin_ui_index_response(&state.routes.admin)
@@ -3064,6 +3138,12 @@ fn authorized_policy_state<'a>(
     }
 
     Ok(rbac_state)
+}
+
+fn authorized_schema_reader(state: &SchemaAdminState, principal: &auth::Principal) -> bool {
+    state.rbac_state.as_ref().is_some_and(|rbac_state| {
+        rbac_state.principal_has_permission(principal, ADMIN_SCHEMA_READ_PERMISSION)
+    })
 }
 
 fn authorized_traffic_state<'a>(
@@ -4026,11 +4106,33 @@ fn policy_not_configured() -> Response {
         .into_response()
 }
 
+fn schema_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(SchemaNotConfiguredResponse {
+            error: "schema coverage requires OPENAPI_SPEC_PATH or UPSTREAM_ROUTES[].openapi_spec_path to be configured".to_owned(),
+            spec_configured: false,
+        }),
+    )
+        .into_response()
+}
+
 fn traffic_rbac_not_configured() -> Response {
     (
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
             error: "traffic endpoint inventory requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn schema_discovery_not_configured() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(DiscoveryNotConfiguredResponse {
+            error: "schema coverage requires DISCOVERY_SQLITE_PATH to be configured".to_owned(),
+            discovery_configured: false,
         }),
     )
         .into_response()
@@ -4154,6 +4256,7 @@ mod tests {
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,
             discovery_sqlite_path: None,
+            openapi_spec_path: None,
             policy_file: None,
             cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
             max_body_size: 1_048_576,
@@ -4878,6 +4981,7 @@ mod tests {
             add_request_headers: HashMap::new(),
             strip_request_headers: Vec::new(),
             tls_ca_bundle_path: None,
+            openapi_spec_path: None,
         }
     }
 
@@ -5155,6 +5259,10 @@ mod tests {
             POLICY_RULES_ORDER_ADMIN_ROUTE
         );
         assert_eq!(
+            default_routes.schema_coverage_route,
+            SCHEMA_COVERAGE_ADMIN_ROUTE
+        );
+        assert_eq!(
             default_routes.traffic_endpoints_route,
             TRAFFIC_ENDPOINTS_ADMIN_ROUTE
         );
@@ -5191,6 +5299,10 @@ mod tests {
         assert_eq!(
             custom_routes.policy_rules_order_route,
             "/v1/ops/policy/rules/order"
+        );
+        assert_eq!(
+            custom_routes.schema_coverage_route,
+            "/v1/ops/schema/coverage"
         );
         assert_eq!(
             custom_routes.traffic_endpoints_route,
@@ -8673,6 +8785,241 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_coverage_reports_undocumented_endpoints_and_unused_operations() {
+        let discovery_db = TempDb::new("schema-coverage");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/users/{id}");
+        seed_discovery_endpoint(&discovery_db.path, "POST", "/users");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/internal/health");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/reports/{id}/summary/details");
+        let spec = TempSpecFile::new(
+            "coverage",
+            r#"
+openapi: 3.0.3
+info:
+  title: Coverage API
+  version: 1.0.0
+paths:
+  /users/{userId}:
+    get:
+      operationId: getUser
+      summary: Fetch a user
+    patch:
+      operationId: updateUser
+      summary: Update a user
+  /users:
+    post:
+      operationId: createUser
+  /reports/{reportId}/summary:
+    get:
+      operationId: reportSummary
+"#,
+        );
+        let policy = TempPolicyFile::new(&schema_policy_document());
+        let router = schema_coverage_router(Some(&spec), Some(&discovery_db), &policy);
+
+        let response = router
+            .oneshot(audit_query_request(
+                SCHEMA_COVERAGE_ADMIN_ROUTE,
+                Some(test_principal(&["schema-reader"])),
+            ))
+            .await
+            .expect("schema coverage request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["spec_configured"], true);
+        assert_eq!(body["discovery_configured"], true);
+        assert_eq!(
+            body["undocumented_endpoints"],
+            json!([
+                {
+                    "method": "GET",
+                    "endpoint_template": "/internal/health"
+                },
+                {
+                    "method": "GET",
+                    "endpoint_template": "/reports/{id}/summary/details"
+                }
+            ])
+        );
+        assert_eq!(
+            body["unused_operations"],
+            json!([
+                {
+                    "method": "GET",
+                    "path_template": "/reports/{reportId}/summary",
+                    "operation_id": "reportSummary",
+                    "source": spec.path.to_string_lossy()
+                },
+                {
+                    "method": "PATCH",
+                    "path_template": "/users/{userId}",
+                    "operation_id": "updateUser",
+                    "summary": "Update a user",
+                    "source": spec.path.to_string_lossy()
+                }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_coverage_without_spec_returns_not_found() {
+        let discovery_db = TempDb::new("schema-no-spec");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/users/{id}");
+        let policy = TempPolicyFile::new(&schema_policy_document());
+        let router = schema_coverage_router(None, Some(&discovery_db), &policy);
+
+        let response = router
+            .oneshot(audit_query_request(
+                SCHEMA_COVERAGE_ADMIN_ROUTE,
+                Some(test_principal(&["schema-reader"])),
+            ))
+            .await
+            .expect("schema coverage request should complete");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"schema coverage requires OPENAPI_SPEC_PATH or UPSTREAM_ROUTES[].openapi_spec_path to be configured","spec_configured":false}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_coverage_without_discovery_store_returns_service_unavailable() {
+        let spec = TempSpecFile::new(
+            "no-discovery",
+            r#"
+openapi: 3.0.3
+info:
+  title: Coverage API
+  version: 1.0.0
+paths:
+  /users/{userId}:
+    get:
+      operationId: getUser
+"#,
+        );
+        let policy = TempPolicyFile::new(&schema_policy_document());
+        let router = schema_coverage_router(Some(&spec), None, &policy);
+
+        let response = router
+            .oneshot(audit_query_request(
+                SCHEMA_COVERAGE_ADMIN_ROUTE,
+                Some(test_principal(&["schema-reader"])),
+            ))
+            .await
+            .expect("schema coverage request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"schema coverage requires DISCOVERY_SQLITE_PATH to be configured","discovery_configured":false}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_coverage_requires_schema_read_permission() {
+        let discovery_db = TempDb::new("schema-authz");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/users/{id}");
+        let spec = TempSpecFile::new(
+            "authz",
+            r#"
+openapi: 3.0.3
+info:
+  title: Coverage API
+  version: 1.0.0
+paths:
+  /users/{userId}:
+    get:
+      operationId: getUser
+"#,
+        );
+        let policy = TempPolicyFile::new(&schema_policy_document());
+        let router = schema_coverage_router(Some(&spec), Some(&discovery_db), &policy);
+
+        let unauthenticated = router
+            .clone()
+            .oneshot(audit_query_request(SCHEMA_COVERAGE_ADMIN_ROUTE, None))
+            .await
+            .expect("unauthenticated request should complete");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body_string(unauthenticated).await,
+            r#"{"error":"unauthorized"}"#
+        );
+
+        let forbidden_response = router
+            .oneshot(audit_query_request(
+                SCHEMA_COVERAGE_ADMIN_ROUTE,
+                Some(test_principal(&["reader"])),
+            ))
+            .await
+            .expect("forbidden request should complete");
+        assert_eq!(forbidden_response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            body_string(forbidden_response).await,
+            r#"{"error":"forbidden"}"#
+        );
+    }
+
+    #[test]
+    fn missing_openapi_spec_file_returns_actionable_startup_error() {
+        let mut config = test_config(Vec::new());
+        config.openapi_spec_path = Some(
+            std::env::temp_dir().join(format!("missing-openapi-{}.yaml", uuid::Uuid::new_v4())),
+        );
+        let recorder = PrometheusBuilder::new().build_recorder();
+
+        let error = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect_err("app startup should reject missing OpenAPI spec file");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("OpenAPI schema configuration is invalid"),
+            "unexpected startup error: {message}"
+        );
+        assert!(
+            message.contains("OPENAPI_SPEC_PATH"),
+            "startup error should name OPENAPI_SPEC_PATH: {message}"
+        );
+    }
+
+    #[test]
+    fn broken_openapi_spec_file_returns_actionable_startup_error() {
+        let spec = TempSpecFile::new("broken", "openapi: 2.0\npaths: {}\n");
+        let mut config = test_config(Vec::new());
+        config.openapi_spec_path = Some(spec.path.clone());
+        let recorder = PrometheusBuilder::new().build_recorder();
+
+        let error = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect_err("app startup should reject broken OpenAPI spec file");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("OpenAPI schema configuration is invalid"),
+            "unexpected startup error: {message}"
+        );
+        assert!(
+            message.contains("OPENAPI_SPEC_PATH"),
+            "startup error should name OPENAPI_SPEC_PATH: {message}"
+        );
+        assert!(
+            message.contains("OpenAPI 3.x"),
+            "startup error should explain the expected spec version: {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn status_uptime_increases_between_requests() {
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
@@ -10398,6 +10745,31 @@ mod tests {
         .expect("app should build")
     }
 
+    fn schema_coverage_router(
+        spec: Option<&TempSpecFile>,
+        discovery_db: Option<&TempDb>,
+        policy: &TempPolicyFile,
+    ) -> Router {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config
+            .rbac_exempt_paths
+            .push(SCHEMA_COVERAGE_ADMIN_ROUTE.to_owned());
+        config.openapi_spec_path = spec.map(|spec| spec.path.clone());
+        config.discovery_sqlite_path =
+            discovery_db.map(|db| db.path.to_string_lossy().into_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+
+        app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+    }
+
     fn audit_query_request(uri: &str, principal: Option<auth::Principal>) -> Request<Body> {
         let mut request = Request::builder()
             .uri(uri)
@@ -10625,6 +10997,24 @@ mod tests {
                 }
             ]
         })
+    }
+
+    fn schema_policy_document() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "id": "schema-policy",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "schema-reader": {
+                    "permissions": [ADMIN_SCHEMA_READ_PERMISSION]
+                },
+                "reader": {
+                    "permissions": []
+                }
+            }
+        })
+        .to_string()
     }
 
     fn direct_rule_policy_document() -> String {
@@ -11681,6 +12071,75 @@ O2gecI9QwDJNpm29J9wJB2F8
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
         }
+    }
+
+    struct TempSpecFile {
+        path: PathBuf,
+    }
+
+    impl TempSpecFile {
+        fn new(test_name: &str, contents: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "greengateway-openapi-{test_name}-{}.yaml",
+                uuid::Uuid::new_v4()
+            ));
+            fs::write(&path, contents)
+                .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
+
+            Self { path }
+        }
+    }
+
+    impl Drop for TempSpecFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    fn seed_discovery_endpoint(path: &PathBuf, method: &str, endpoint_template: &str) {
+        let connection = Connection::open(path).expect("test database should open");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS discovery_endpoint_aggregates (
+                    method TEXT NOT NULL,
+                    endpoint_template TEXT NOT NULL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    call_count INTEGER NOT NULL,
+                    latency_count INTEGER NOT NULL,
+                    latency_p50_ms INTEGER NOT NULL,
+                    latency_p95_ms INTEGER NOT NULL,
+                    latency_p99_ms INTEGER NOT NULL,
+                    latency_samples_json TEXT NOT NULL,
+                    distinct_principal_count INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (method, endpoint_template)
+                );
+                "#,
+            )
+            .expect("discovery schema should create");
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_endpoint_aggregates (
+                    method,
+                    endpoint_template,
+                    first_seen,
+                    last_seen,
+                    call_count,
+                    latency_count,
+                    latency_p50_ms,
+                    latency_p95_ms,
+                    latency_p99_ms,
+                    latency_samples_json,
+                    distinct_principal_count,
+                    updated_at
+                ) VALUES (?1, ?2, '2024-06-01T12:00:00Z', '2024-06-01T12:00:00Z', 1, 1, 1, 1, 1, '[]', 0, '2024-06-01T12:00:00Z')
+                "#,
+                params![method, endpoint_template],
+            )
+            .expect("endpoint aggregate should insert");
     }
 
     fn assert_eventually(timeout: Duration, condition: impl Fn() -> bool) {

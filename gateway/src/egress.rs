@@ -1183,6 +1183,7 @@ mod tests {
                 add_request_headers: HashMap::new(),
                 strip_request_headers: Vec::new(),
                 tls_ca_bundle_path: None,
+                openapi_spec_path: None,
             },
             crate::config::UpstreamRouteConfig {
                 path_prefix: Some("/assets".to_owned()),
@@ -1194,6 +1195,7 @@ mod tests {
                 add_request_headers: HashMap::new(),
                 strip_request_headers: Vec::new(),
                 tls_ca_bundle_path: None,
+                openapi_spec_path: None,
             },
         ];
 
@@ -1771,6 +1773,7 @@ mod tests {
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,
             discovery_sqlite_path: None,
+            openapi_spec_path: None,
             policy_file: None,
             cors_allow_origins: Vec::new(),
             max_body_size: 1_048_576,
