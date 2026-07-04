@@ -80,6 +80,8 @@ Policy administration uses dedicated RBAC permissions. `GET /v1{ADMIN_PREFIX}/po
 
 `POST /v1{ADMIN_PREFIX}/policy/validate` validates a candidate whole-policy JSON document without persisting it, changing the live policy, or emitting `policy.changed`. It returns `{"valid":true}` on success or `400 Bad Request` with `{"valid":false,"errors":[...]}` on failure.
 
+Concurrent `PUT` requests are safely serialized against each other (a losing request receives `412 Precondition Failed`, never a silently-overwritten update), but the `If-Match` guard only orders `PUT` against other `PUT`s through this API — it does not order against a direct edit of the `POLICY_FILE` on disk racing an in-flight `PUT`. The file's own atomic write (temp file + rename) means a concurrent reader, including the background file watcher, never observes a torn/partial file, but if something outside this API writes to `POLICY_FILE` at the same moment a `PUT` completes, the file watcher's next debounced reload may pick up either write, and the ETag a `PUT` caller received may no longer describe the live policy a moment later. Treat the returned `ETag` as best-effort freshness, not a guarantee against external file edits, if anything outside this API also writes to `POLICY_FILE`.
+
 ### RBAC_EXEMPT_PATHS
 
 Comma-separated paths that bypass RBAC authorization.
