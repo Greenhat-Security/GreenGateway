@@ -866,6 +866,7 @@ mod tests {
                 "schema_version": "0.1.0",
                 "rules": [
                     {
+                        "id": "support-user-read",
                         "methods": ["GET", "HEAD"],
                         "path": "/api/users/{id}",
                         "principal": {
@@ -896,6 +897,7 @@ mod tests {
         let policy = Policy::from_file(file.path()).expect("rules section should parse");
 
         assert_eq!(policy.rules.len(), 3);
+        assert_eq!(policy.rules[0].id.as_deref(), Some("support-user-read"));
         assert_eq!(
             policy.rules[0].methods,
             vec!["GET".to_owned(), "HEAD".to_owned()]
@@ -1501,6 +1503,7 @@ mod tests {
             "default_action": "deny",
             "rules": [
                 {
+                    "id": "support-user-read",
                     "methods": ["GET", "HEAD"],
                     "path": "/api/users/{id}",
                     "principal": {
@@ -1767,6 +1770,7 @@ mod tests {
             listen_addr: "127.0.0.1:0"
                 .parse()
                 .expect("test listen address should parse"),
+            admin_listen_addr: None,
             admin_prefix: "/admin".to_owned(),
             audit_log_file: None,
             audit_sqlite_path: None,

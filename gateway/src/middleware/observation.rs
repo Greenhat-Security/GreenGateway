@@ -117,6 +117,10 @@ fn observation_payload(
         if let Some(path_prefix) = decision.path_prefix.as_deref() {
             payload.insert("path_prefix".to_owned(), json!(path_prefix));
         }
+
+        if let Some(matched_rule_id) = decision.matched_rule_id.as_deref() {
+            payload.insert("matched_rule_id".to_owned(), json!(matched_rule_id));
+        }
     }
 
     if let Some(outcome) = upstream_outcome {
@@ -179,7 +183,7 @@ mod tests {
         middleware::{auth, rbac},
         rbac::{
             policy::{EgressPolicy, RoleEntry},
-            DefaultAction, EnforcementMode, Policy, RouteRule,
+            DefaultAction, EnforcementMode, Policy, PrincipalMatcher, RouteRule, Rule, RuleAction,
         },
     };
 
@@ -316,6 +320,7 @@ mod tests {
         assert_eq!(event.payload["policy_decision"], json!("allowed"));
         assert_eq!(event.payload["policy_reason"], json!("matched_rule"));
         assert_eq!(event.payload["permission"], json!("data:read"));
+        assert!(event.payload.get("matched_rule_id").is_none());
     }
 
     #[tokio::test]
@@ -338,6 +343,7 @@ mod tests {
         assert_eq!(event.payload["policy_decision"], json!("denied"));
         assert_eq!(event.payload["policy_reason"], json!("missing_permission"));
         assert_eq!(event.payload["permission"], json!("data:read"));
+        assert!(event.payload.get("matched_rule_id").is_none());
     }
 
     #[tokio::test]
@@ -361,6 +367,7 @@ mod tests {
         assert_eq!(event.payload["policy_reason"], json!("missing_permission"));
         assert_eq!(event.payload["permission"], json!("data:read"));
         assert_eq!(event.payload["path_prefix"], json!("/data"));
+        assert!(event.payload.get("matched_rule_id").is_none());
     }
 
     #[tokio::test]
@@ -414,10 +421,69 @@ mod tests {
         assert_eq!(observed.payload["auth_outcome"], json!("authenticated"));
         assert_eq!(observed.payload["policy_decision"], json!("allowed"));
         assert_eq!(observed.payload["permission"], json!("data:read"));
+        assert!(observed.payload.get("matched_rule_id").is_none());
         assert_eq!(
             observed.actor.as_ref().map(|actor| actor.user_id.as_str()),
             Some("user-123")
         );
+    }
+
+    #[tokio::test]
+    async fn observation_correlates_with_real_direct_rule_decision() {
+        let (audit, capture) = test_audit_log();
+        let router = auth_rbac_observation_router(
+            audit,
+            validator(Ok(test_principal(&["reader"]))),
+            test_policy_with_rules(
+                DefaultAction::Deny,
+                &[("reader", &["data:read"])],
+                &[],
+                &[direct_rule(
+                    Some("allow-data-item"),
+                    &["GET"],
+                    "/data/items",
+                    RuleAction::Allow,
+                )],
+            ),
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/data/items")
+                    .header(crate::REQUEST_ID_HEADER, "request-real-direct-rule")
+                    .header(AUTHORIZATION, "Bearer token-123")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eventually(Duration::from_secs(1), || capture.events().len() >= 3);
+        let events = capture.events();
+        let authz = events
+            .iter()
+            .find(|event| event.event_type == "authz.allowed")
+            .expect("authz allowed event should be captured");
+        assert_eq!(authz.payload["matched_rule_id"], json!("allow-data-item"));
+        assert!(authz.payload.get("permission").is_none());
+        assert!(authz.payload.get("path_prefix").is_none());
+
+        let observed = events
+            .iter()
+            .find(|event| event.event_type == HTTP_REQUEST_OBSERVED)
+            .expect("observation event should be captured");
+        assert_eq!(observed.payload["auth_outcome"], json!("authenticated"));
+        assert_eq!(observed.payload["policy_decision"], json!("allowed"));
+        assert_eq!(observed.payload["policy_reason"], json!("matched_rule"));
+        assert_eq!(
+            observed.payload["matched_rule_id"],
+            json!("allow-data-item")
+        );
+        assert!(observed.payload.get("permission").is_none());
+        assert!(observed.payload.get("path_prefix").is_none());
     }
 
     #[tokio::test]
@@ -460,6 +526,7 @@ mod tests {
         assert_eq!(observed.payload["policy_decision"], json!("allowed"));
         assert_eq!(observed.payload["policy_reason"], json!("default_allow"));
         assert!(observed.payload.get("permission").is_none());
+        assert!(observed.payload.get("matched_rule_id").is_none());
         assert_eq!(
             observed.actor.as_ref().map(|actor| actor.user_id.as_str()),
             Some("user-123")
@@ -516,6 +583,7 @@ mod tests {
         );
         assert_eq!(observed.payload["permission"], json!("admin:read"));
         assert_eq!(observed.payload["path_prefix"], json!("/data"));
+        assert!(observed.payload.get("matched_rule_id").is_none());
         assert_eq!(
             observed.actor.as_ref().map(|actor| actor.user_id.as_str()),
             Some("user-123")
@@ -624,6 +692,7 @@ mod tests {
                     reason: "matched_rule",
                     permission: Some("data:read".to_owned()),
                     path_prefix: Some("/data".to_owned()),
+                    matched_rule_id: None,
                 });
                 response
             }
@@ -634,6 +703,7 @@ mod tests {
                     reason: "missing_permission",
                     permission: Some("data:read".to_owned()),
                     path_prefix: Some("/data".to_owned()),
+                    matched_rule_id: None,
                 });
                 response
             }
@@ -644,6 +714,7 @@ mod tests {
                     reason: "missing_permission",
                     permission: Some("data:read".to_owned()),
                     path_prefix: Some("/data".to_owned()),
+                    matched_rule_id: None,
                 });
                 response
             }
@@ -725,6 +796,17 @@ mod tests {
         test_policy_with_enforcement(default_action, EnforcementMode::Enforce, roles, routes)
     }
 
+    fn test_policy_with_rules(
+        default_action: DefaultAction,
+        roles: &[(&str, &[&str])],
+        routes: &[RouteRule],
+        rules: &[Rule],
+    ) -> Policy {
+        let mut policy = test_policy(default_action, roles, routes);
+        policy.rules = rules.to_vec();
+        policy
+    }
+
     fn test_policy_with_enforcement(
         default_action: DefaultAction,
         enforcement_mode: EnforcementMode,
@@ -763,6 +845,16 @@ mod tests {
             path_prefix: path_prefix.to_owned(),
             permission: permission.to_owned(),
             enforcement_mode: None,
+        }
+    }
+
+    fn direct_rule(id: Option<&str>, methods: &[&str], path: &str, action: RuleAction) -> Rule {
+        Rule {
+            id: id.map(str::to_owned),
+            methods: methods.iter().map(|method| (*method).to_owned()).collect(),
+            path: path.to_owned(),
+            principal: PrincipalMatcher::default(),
+            action,
         }
     }
 

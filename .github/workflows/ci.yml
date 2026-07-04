@@ -128,7 +128,7 @@ jobs:
           done
 
           if [ "$healthy" -ne 1 ]; then
-            docker compose $compose_files logs gateway dev-jwks
+            docker compose $compose_files logs gateway dev-jwks dev-echo
             exit 1
           fi
 

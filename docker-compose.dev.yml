@@ -22,12 +22,32 @@ services:
       timeout: 3s
       retries: 12
 
+  dev-echo:
+    image: python:3-slim
+    command:
+      - python
+      - /srv/echo/echo-server.py
+    volumes:
+      - ./dev/echo-server.py:/srv/echo/echo-server.py:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; request = urllib.request.Request('http://127.0.0.1:8080/', method='HEAD'); urllib.request.urlopen(request, timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   gateway:
     depends_on:
       dev-jwks:
         condition: service_healthy
+      dev-echo:
+        condition: service_healthy
     environment:
       LISTEN_ADDR: 0.0.0.0:8080
+      UPSTREAM_URL: http://dev-echo:8080
       AUTH_ENABLED: "true"
       AUTH_EXEMPT_PATHS: /health,/version,/metrics,/admin
       RBAC_EXEMPT_PATHS: /health,/version,/metrics,/admin

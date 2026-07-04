@@ -25,7 +25,9 @@ use crate::{
     client_ip::{canonical_client_ip, request_id},
     config::Config,
     path_match::path_prefix_matches,
-    rbac::{DefaultAction, EnforcementMode, Policy, PolicyEngine, RouteRule},
+    rbac::{
+        DefaultAction, EnforcementMode, Policy, PolicyEngine, RouteRule, RuleAction, RuleMatcher,
+    },
 };
 
 use super::{
@@ -49,6 +51,8 @@ pub struct RbacState {
 
 struct RbacPolicyState {
     engine: PolicyEngine,
+    rule_matcher: RuleMatcher,
+    rule_ids: Vec<String>,
     default_action: DefaultAction,
     enforcement_mode: EnforcementMode,
     routes: Vec<RouteRule>,
@@ -111,13 +115,29 @@ impl RbacPolicyState {
         let default_action = policy.default_action.clone();
         let enforcement_mode = policy.enforcement_mode;
         let routes = policy.routes.clone();
+        let rule_ids = policy
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(rule_index, rule)| rule.id.clone().unwrap_or_else(|| rule_index.to_string()))
+            .collect();
+        let rule_matcher = RuleMatcher::new(&policy.rules);
 
         Self {
             engine: PolicyEngine::new(policy),
+            rule_matcher,
+            rule_ids,
             default_action,
             enforcement_mode,
             routes,
         }
+    }
+
+    fn rule_id(&self, rule_index: usize) -> String {
+        self.rule_ids
+            .get(rule_index)
+            .cloned()
+            .unwrap_or_else(|| rule_index.to_string())
     }
 }
 
@@ -131,12 +151,14 @@ pub fn reload_policy_from_file(
         Ok(policy) => {
             let policy_id = policy.id.clone();
             let route_rules = policy.routes.len();
+            let direct_rules = policy.rules.len();
             let rate_limit_rules = policy.rate_limits.len();
             state.replace_policy(policy);
             tracing::info!(
                 policy_file = %path.display(),
                 policy_id = policy_id.as_deref().unwrap_or("unnamed"),
                 route_rules,
+                direct_rules,
                 rate_limit_rules,
                 "RBAC policy reload accepted"
             );
@@ -273,6 +295,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 reason: "unsafe_path",
                 permission: None,
                 path_prefix: None,
+                matched_rule_id: None,
             },
         );
     }
@@ -289,6 +312,54 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     let principal = req.extensions().get::<auth::Principal>().cloned();
 
     let policy = state.policy.load();
+    // Direct firewall rules are additive alongside route-to-permission rules
+    // and run first because they make an explicit allow/deny/shadow decision
+    // for the full request tuple. If no direct rule matches, route and
+    // default-action behavior continues exactly as it did before rules were
+    // integrated.
+    if let Some(rule_decision) =
+        policy
+            .rule_matcher
+            .evaluate(req.method().as_str(), path, principal.as_ref())
+    {
+        let matched_rule_id = policy.rule_id(rule_decision.rule_index);
+        return match rule_decision.action {
+            RuleAction::Allow => {
+                emit_rule_allowed(&state, &context, principal.as_ref(), &matched_rule_id);
+                let decision = decision_for_direct_rule(
+                    PolicyDecisionOutcome::Allowed,
+                    "matched_rule",
+                    matched_rule_id,
+                );
+                drop(policy);
+                let response = next.run(req).await;
+                with_policy_decision(response, decision)
+            }
+            RuleAction::Deny => {
+                emit_rule_denied(&state, &context, principal.as_ref(), &matched_rule_id);
+                with_policy_decision(
+                    forbidden(),
+                    decision_for_direct_rule(
+                        PolicyDecisionOutcome::Denied,
+                        "matched_rule",
+                        matched_rule_id,
+                    ),
+                )
+            }
+            RuleAction::Shadow => {
+                emit_rule_would_deny(&state, &context, principal.as_ref(), &matched_rule_id);
+                let decision = decision_for_direct_rule(
+                    PolicyDecisionOutcome::WouldDeny,
+                    "matched_rule",
+                    matched_rule_id,
+                );
+                drop(policy);
+                let response = next.run(req).await;
+                with_policy_decision(response, decision)
+            }
+        };
+    }
+
     if let Some(rule) = matching_route(&policy.routes, req.method(), path) {
         if principal.as_ref().is_some_and(|principal| {
             policy
@@ -336,6 +407,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 reason: "default_allow",
                 permission: None,
                 path_prefix: None,
+                matched_rule_id: None,
             };
             emit_allowed(
                 &state,
@@ -357,6 +429,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                         reason: "default_deny",
                         permission: None,
                         path_prefix: None,
+                        matched_rule_id: None,
                     },
                 )
             }
@@ -370,6 +443,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                         reason: "default_deny",
                         permission: None,
                         path_prefix: None,
+                        matched_rule_id: None,
                     },
                 )
             }
@@ -467,6 +541,79 @@ fn emit_would_deny(
     emit_denial_event(state, context, principal, reason, rule, AUTHZ_WOULD_DENY);
 }
 
+fn emit_rule_allowed(
+    state: &RbacState,
+    context: &AuditContext,
+    principal: Option<&auth::Principal>,
+    matched_rule_id: &str,
+) {
+    emit_direct_rule_event(
+        state,
+        context,
+        principal,
+        "matched_rule",
+        matched_rule_id,
+        AUTHZ_ALLOWED,
+    );
+}
+
+fn emit_rule_denied(
+    state: &RbacState,
+    context: &AuditContext,
+    principal: Option<&auth::Principal>,
+    matched_rule_id: &str,
+) {
+    emit_direct_rule_event(
+        state,
+        context,
+        principal,
+        "matched_rule",
+        matched_rule_id,
+        AUTHZ_DENIED,
+    );
+}
+
+fn emit_rule_would_deny(
+    state: &RbacState,
+    context: &AuditContext,
+    principal: Option<&auth::Principal>,
+    matched_rule_id: &str,
+) {
+    emit_direct_rule_event(
+        state,
+        context,
+        principal,
+        "matched_rule",
+        matched_rule_id,
+        AUTHZ_WOULD_DENY,
+    );
+}
+
+fn emit_direct_rule_event(
+    state: &RbacState,
+    context: &AuditContext,
+    principal: Option<&auth::Principal>,
+    reason: &'static str,
+    matched_rule_id: &str,
+    event_type: &'static str,
+) {
+    let actor = principal.map(actor_from_principal);
+    let payload = json!({
+        "path": &context.path,
+        "method": &context.method,
+        "reason": reason,
+        "matched_rule_id": matched_rule_id,
+    });
+
+    state.audit.emit(AuditEvent::new(
+        event_type,
+        &context.request_id,
+        &context.source_ip,
+        actor,
+        payload,
+    ));
+}
+
 fn emit_denial_event(
     state: &RbacState,
     context: &AuditContext,
@@ -518,6 +665,21 @@ fn decision_for_rule(
         reason,
         permission: Some(rule.permission.clone()),
         path_prefix: Some(rule.path_prefix.clone()),
+        matched_rule_id: None,
+    }
+}
+
+fn decision_for_direct_rule(
+    outcome: PolicyDecisionOutcome,
+    reason: &'static str,
+    matched_rule_id: String,
+) -> PolicyDecision {
+    PolicyDecision {
+        outcome,
+        reason,
+        permission: None,
+        path_prefix: None,
+        matched_rule_id: Some(matched_rule_id),
     }
 }
 
@@ -538,14 +700,17 @@ mod tests {
 
     use axum::{body::Body, middleware::from_fn_with_state, routing::any, Router};
     use http::Request;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tower::ServiceExt;
 
     use super::*;
     use crate::{
         audit::{sink::tests::CaptureSink, AuditSink},
         auth::{AuthMethod, Principal},
-        rbac::policy::{EgressPolicy, RoleEntry},
+        rbac::{
+            policy::{EgressPolicy, RoleEntry},
+            PrincipalMatcher, Rule, RuleAction,
+        },
     };
 
     #[tokio::test]
@@ -917,6 +1082,298 @@ mod tests {
             .any(|event| event.event_type == AUTHZ_WOULD_DENY));
     }
 
+    #[tokio::test]
+    async fn direct_allow_rule_takes_precedence_over_route_and_default_deny() {
+        let (state, capture) = test_state(
+            test_policy_with_rules(
+                DefaultAction::Deny,
+                &[("reader", &["data:read"])],
+                &[route(&[], "/direct", "admin:read")],
+                &[direct_rule(
+                    Some("allow-public-direct"),
+                    &["GET"],
+                    "/direct/**",
+                    RuleAction::Allow,
+                )],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, "/direct/report"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.outcome, PolicyDecisionOutcome::Allowed);
+        assert_eq!(decision.reason, "matched_rule");
+        assert_eq!(
+            decision.matched_rule_id.as_deref(),
+            Some("allow-public-direct")
+        );
+        assert!(decision.permission.is_none());
+        assert!(decision.path_prefix.is_none());
+
+        let event = captured_event(&capture, AUTHZ_ALLOWED).await;
+        assert_eq!(
+            event.payload["matched_rule_id"],
+            json!("allow-public-direct")
+        );
+        assert_eq!(event.payload["reason"], json!("matched_rule"));
+        assert!(event.payload.get("permission").is_none());
+        assert!(event.payload.get("path_prefix").is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_deny_rule_takes_precedence_over_route_allow() {
+        let (state, capture) = test_state(
+            test_policy_with_rules(
+                DefaultAction::Deny,
+                &[("reader", &["data:read"])],
+                &[route(&[], "/data", "data:read")],
+                &[direct_rule(
+                    Some("deny-data-direct"),
+                    &["GET"],
+                    "/data/**",
+                    RuleAction::Deny,
+                )],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, "/data/report"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.outcome, PolicyDecisionOutcome::Denied);
+        assert_eq!(decision.reason, "matched_rule");
+        assert_eq!(
+            decision.matched_rule_id.as_deref(),
+            Some("deny-data-direct")
+        );
+        assert!(decision.permission.is_none());
+        assert!(decision.path_prefix.is_none());
+
+        let event = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(event.payload["matched_rule_id"], json!("deny-data-direct"));
+        assert_eq!(event.payload["reason"], json!("matched_rule"));
+        assert!(event.payload.get("permission").is_none());
+        assert!(event.payload.get("path_prefix").is_none());
+        assert!(!capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == AUTHZ_ALLOWED));
+    }
+
+    #[tokio::test]
+    async fn direct_shadow_rule_emits_would_deny_and_forwards() {
+        let (state, capture) = test_state(
+            test_policy_with_rules(
+                DefaultAction::Deny,
+                &[],
+                &[],
+                &[direct_rule(
+                    Some("shadow-admin-direct"),
+                    &["GET"],
+                    "/admin/**",
+                    RuleAction::Shadow,
+                )],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, None)
+            .oneshot(request(Method::GET, "/admin/report"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.outcome, PolicyDecisionOutcome::WouldDeny);
+        assert_eq!(decision.reason, "matched_rule");
+        assert_eq!(
+            decision.matched_rule_id.as_deref(),
+            Some("shadow-admin-direct")
+        );
+
+        let event = captured_event(&capture, AUTHZ_WOULD_DENY).await;
+        assert_eq!(
+            event.payload["matched_rule_id"],
+            json!("shadow-admin-direct")
+        );
+        assert_eq!(event.payload["reason"], json!("matched_rule"));
+        assert!(!capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == AUTHZ_DENIED));
+    }
+
+    #[tokio::test]
+    async fn first_matching_direct_rule_wins_and_records_only_first_id() {
+        let (state, capture) = test_state(
+            test_policy_with_rules(
+                DefaultAction::Deny,
+                &[],
+                &[],
+                &[
+                    direct_rule(
+                        Some("first-shadow"),
+                        &["GET"],
+                        "/admin/**",
+                        RuleAction::Shadow,
+                    ),
+                    direct_rule(Some("second-deny"), &["GET"], "/admin/**", RuleAction::Deny),
+                ],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, None)
+            .oneshot(request(Method::GET, "/admin/settings"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.outcome, PolicyDecisionOutcome::WouldDeny);
+        assert_eq!(decision.matched_rule_id.as_deref(), Some("first-shadow"));
+
+        let event = captured_event(&capture, AUTHZ_WOULD_DENY).await;
+        assert_eq!(event.payload["matched_rule_id"], json!("first-shadow"));
+        assert!(!capture
+            .events()
+            .iter()
+            .any(|event| event.payload["matched_rule_id"] == json!("second-deny")));
+        assert!(!capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == AUTHZ_DENIED));
+    }
+
+    #[tokio::test]
+    async fn direct_rule_without_id_records_index_fallback() {
+        let (state, capture) = test_state(
+            test_policy_with_rules(
+                DefaultAction::Deny,
+                &[],
+                &[],
+                &[direct_rule(None, &["GET"], "/public/**", RuleAction::Allow)],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, None)
+            .oneshot(request(Method::GET, "/public/status"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.matched_rule_id.as_deref(), Some("0"));
+
+        let event = captured_event(&capture, AUTHZ_ALLOWED).await;
+        assert_eq!(event.payload["matched_rule_id"], json!("0"));
+    }
+
+    #[tokio::test]
+    async fn unmatched_direct_rules_fall_through_to_routes_and_default_action() {
+        let (state, capture) = test_state(
+            test_policy_with_rules(
+                DefaultAction::Deny,
+                &[("reader", &["data:read"])],
+                &[route(&[], "/data", "data:read")],
+                &[direct_rule(
+                    Some("admin-only-direct"),
+                    &["GET"],
+                    "/admin/**",
+                    RuleAction::Deny,
+                )],
+            ),
+            &[],
+        );
+        let router = test_router(state, Some(test_principal(&["reader"])));
+
+        let route_response = router
+            .clone()
+            .oneshot(request(Method::GET, "/data/report"))
+            .await
+            .expect("route request should complete");
+        assert_eq!(route_response.status(), StatusCode::OK);
+        let route_decision = route_response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("route policy decision should be attached");
+        assert_eq!(route_decision.outcome, PolicyDecisionOutcome::Allowed);
+        assert_eq!(route_decision.permission.as_deref(), Some("data:read"));
+        assert_eq!(route_decision.path_prefix.as_deref(), Some("/data"));
+        assert!(route_decision.matched_rule_id.is_none());
+
+        let default_response = router
+            .oneshot(request(Method::GET, "/unmatched"))
+            .await
+            .expect("default request should complete");
+        assert_eq!(default_response.status(), StatusCode::FORBIDDEN);
+        let default_decision = default_response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("default policy decision should be attached");
+        assert_eq!(default_decision.reason, "default_deny");
+        assert!(default_decision.permission.is_none());
+        assert!(default_decision.path_prefix.is_none());
+        assert!(default_decision.matched_rule_id.is_none());
+
+        let allowed = captured_event(&capture, AUTHZ_ALLOWED).await;
+        assert_eq!(allowed.payload["permission"], json!("data:read"));
+        assert!(allowed.payload.get("matched_rule_id").is_none());
+        let denied = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(denied.payload["reason"], json!("default_deny"));
+        assert!(denied.payload.get("matched_rule_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn absent_and_empty_rules_lists_have_identical_route_behavior() {
+        let absent_file = TempPolicyFile::new(&route_policy_document_without_rules());
+        let empty_file = TempPolicyFile::new(&route_policy_document_with_empty_rules());
+        let absent_policy =
+            Policy::from_file(absent_file.path()).expect("absent-rules policy should parse");
+        let empty_policy =
+            Policy::from_file(empty_file.path()).expect("empty-rules policy should parse");
+
+        let absent_route = behavior_snapshot(absent_policy.clone(), "/data/report").await;
+        let empty_route = behavior_snapshot(empty_policy.clone(), "/data/report").await;
+        let absent_default = behavior_snapshot(absent_policy, "/unmatched").await;
+        let empty_default = behavior_snapshot(empty_policy, "/unmatched").await;
+
+        assert_eq!(empty_route, absent_route);
+        assert_eq!(empty_default, absent_default);
+        assert!(absent_route.decision.matched_rule_id.is_none());
+        assert!(absent_route.event_payload.get("matched_rule_id").is_none());
+        assert!(absent_default.decision.matched_rule_id.is_none());
+        assert!(absent_default
+            .event_payload
+            .get("matched_rule_id")
+            .is_none());
+    }
+
     #[test]
     fn route_prefix_matches_only_at_segment_boundary() {
         let routes = vec![
@@ -1149,6 +1606,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn valid_policy_reload_swaps_direct_rule_matcher_together() {
+        let file = TempPolicyFile::new(&direct_rule_policy_document("old-deny", "deny"));
+        let initial_policy =
+            Policy::from_file(file.path()).expect("initial policy should parse before test");
+        let (state, _capture) = test_state(initial_policy, &[]);
+        let router = test_router(state.clone(), None);
+
+        let response = router
+            .clone()
+            .oneshot(request(Method::GET, "/swap/item"))
+            .await
+            .expect("request should complete before reload");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<PolicyDecision>()
+                .expect("policy decision should be attached")
+                .matched_rule_id
+                .as_deref(),
+            Some("old-deny")
+        );
+
+        file.write(&direct_rule_policy_document("new-allow", "allow"));
+        reload_policy_from_file(&state, file.path()).expect("valid policy reload should succeed");
+
+        let response = router
+            .oneshot(request(Method::GET, "/swap/item"))
+            .await
+            .expect("request should complete after reload");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<PolicyDecision>()
+                .expect("policy decision should be attached")
+                .matched_rule_id
+                .as_deref(),
+            Some("new-allow")
+        );
+    }
+
+    #[tokio::test]
     async fn file_watch_reload_applies_valid_policy_update() {
         let file = TempPolicyFile::new(&default_policy_document("deny"));
         let initial_policy =
@@ -1363,6 +1863,44 @@ mod tests {
         next.run(req).await
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct BehaviorSnapshot {
+        status: StatusCode,
+        body: String,
+        decision: PolicyDecision,
+        event_type: String,
+        event_payload: Value,
+    }
+
+    async fn behavior_snapshot(policy: Policy, path: &str) -> BehaviorSnapshot {
+        let (state, capture) = test_state(policy, &[]);
+        let response = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, path))
+            .await
+            .expect("request should complete");
+        let status = response.status();
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .cloned()
+            .expect("policy decision should be attached");
+        let body = body_string(response).await;
+        let event_type = if status == StatusCode::OK {
+            AUTHZ_ALLOWED
+        } else {
+            AUTHZ_DENIED
+        };
+        let event = captured_event(&capture, event_type).await;
+
+        BehaviorSnapshot {
+            status,
+            body,
+            decision,
+            event_type: event.event_type,
+            event_payload: event.payload,
+        }
+    }
+
     fn test_state(policy: Policy, exempt_paths: &[&str]) -> (RbacState, CaptureSink) {
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
@@ -1407,6 +1945,17 @@ mod tests {
         test_policy_with_enforcement(default_action, EnforcementMode::Enforce, roles, routes)
     }
 
+    fn test_policy_with_rules(
+        default_action: DefaultAction,
+        roles: &[(&str, &[&str])],
+        routes: &[RouteRule],
+        rules: &[Rule],
+    ) -> Policy {
+        let mut policy = test_policy(default_action, roles, routes);
+        policy.rules = rules.to_vec();
+        policy
+    }
+
     fn test_policy_with_enforcement(
         default_action: DefaultAction,
         enforcement_mode: EnforcementMode,
@@ -1441,6 +1990,16 @@ mod tests {
 
     fn route(methods: &[&str], path_prefix: &str, permission: &str) -> RouteRule {
         route_with_enforcement(methods, path_prefix, permission, None)
+    }
+
+    fn direct_rule(id: Option<&str>, methods: &[&str], path: &str, action: RuleAction) -> Rule {
+        Rule {
+            id: id.map(str::to_owned),
+            methods: methods.iter().map(|method| (*method).to_owned()).collect(),
+            path: path.to_owned(),
+            principal: PrincipalMatcher::default(),
+            action,
+        }
     }
 
     fn route_with_enforcement(
@@ -1502,6 +2061,57 @@ mod tests {
                 ]
             }}"#
         )
+    }
+
+    fn direct_rule_policy_document(rule_id: &str, action: &str) -> String {
+        format!(
+            r#"{{
+                "schema_version": "0.1.0",
+                "default_action": "deny",
+                "rules": [
+                    {{
+                        "id": "{rule_id}",
+                        "path": "/swap/**",
+                        "action": "{action}"
+                    }}
+                ]
+            }}"#
+        )
+    }
+
+    fn route_policy_document_without_rules() -> String {
+        r#"{
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "roles": {
+                "reader": { "permissions": ["data:read"] }
+            },
+            "routes": [
+                {
+                    "path_prefix": "/data",
+                    "permission": "data:read"
+                }
+            ]
+        }"#
+        .to_owned()
+    }
+
+    fn route_policy_document_with_empty_rules() -> String {
+        r#"{
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "roles": {
+                "reader": { "permissions": ["data:read"] }
+            },
+            "routes": [
+                {
+                    "path_prefix": "/data",
+                    "permission": "data:read"
+                }
+            ],
+            "rules": []
+        }"#
+        .to_owned()
     }
 
     async fn captured_event(capture: &CaptureSink, event_type: &str) -> AuditEvent {

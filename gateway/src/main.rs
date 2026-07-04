@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     convert::Infallible,
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -270,6 +271,22 @@ struct ErrorResponse {
     error: String,
 }
 
+enum GatewayApp {
+    Unified(Router),
+    Split { data: Router, admin: Router },
+}
+
+#[derive(Clone)]
+struct MiddlewareStack {
+    config: config::Config,
+    audit_log: audit::AuditLog,
+    csrf_config: middleware::csrf::CsrfConfig,
+    rate_limit_state: middleware::rate_limit::RateLimitState,
+    observation_state: middleware::observation::ObservationState,
+    rbac_state: Option<middleware::rbac::RbacState>,
+    auth_state: Option<middleware::auth::AuthState>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let process_started_at = Instant::now();
@@ -288,36 +305,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let metrics_handle = install_metrics_recorder()?;
     let listen_addr = config.listen_addr;
+    let admin_listen_addr = config.admin_listen_addr;
     let (audit_log, audit_event_sender) = audit::AuditLog::from_config(&config)?;
-    let app = app_with_process_started_at(
+    let app = gateway_app_with_process_started_at(
         config,
         metrics_handle,
         audit_log.clone(),
         audit_event_sender,
         process_started_at,
     )?;
-    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    let bound_addr = listener.local_addr()?;
 
-    audit_log.emit(audit::AuditEvent::new(
-        "gateway.startup",
-        "startup",
-        "internal",
-        None::<audit::Actor>,
-        json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "listen_addr": bound_addr.to_string(),
-        }),
-    ));
+    match app {
+        GatewayApp::Unified(app) => {
+            let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+            let bound_addr = listener.local_addr()?;
 
-    tracing::info!(listen_addr = %bound_addr, "gateway listening");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+            audit_log.emit(audit::AuditEvent::new(
+                "gateway.startup",
+                "startup",
+                "internal",
+                None::<audit::Actor>,
+                json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "listen_addr": bound_addr.to_string(),
+                }),
+            ));
+
+            tracing::info!(listen_addr = %bound_addr, "gateway listening");
+            serve_router(listener, app).await?;
+        }
+        GatewayApp::Split { data, admin } => {
+            let admin_listen_addr = admin_listen_addr
+                .expect("split gateway app should only be built when ADMIN_LISTEN_ADDR is set");
+            let data_listener = tokio::net::TcpListener::bind(listen_addr).await?;
+            let data_bound_addr = data_listener.local_addr()?;
+            let admin_listener = tokio::net::TcpListener::bind(admin_listen_addr).await?;
+            let admin_bound_addr = admin_listener.local_addr()?;
+
+            audit_log.emit(audit::AuditEvent::new(
+                "gateway.startup",
+                "startup",
+                "internal",
+                None::<audit::Actor>,
+                json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "listen_addr": data_bound_addr.to_string(),
+                    "admin_listen_addr": admin_bound_addr.to_string(),
+                }),
+            ));
+
+            tracing::info!(listen_addr = %data_bound_addr, "gateway data listener listening");
+            tracing::info!(admin_listen_addr = %admin_bound_addr, "gateway admin listener listening");
+            tokio::try_join!(
+                serve_router(data_listener, data),
+                serve_router(admin_listener, admin)
+            )?;
+        }
+    }
 
     Ok(())
+}
+
+async fn serve_router(listener: tokio::net::TcpListener, app: Router) -> std::io::Result<()> {
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -336,6 +390,7 @@ fn app(
     )
 }
 
+#[cfg(test)]
 fn app_with_process_started_at(
     config: config::Config,
     metrics_handle: PrometheusHandle,
@@ -343,7 +398,30 @@ fn app_with_process_started_at(
     audit_event_sender: audit::AuditEventSender,
     process_started_at: Instant,
 ) -> Result<Router, Box<dyn std::error::Error>> {
-    let request_id_header = request_id_header();
+    match gateway_app_with_process_started_at(
+        config,
+        metrics_handle,
+        audit_log,
+        audit_event_sender,
+        process_started_at,
+    )? {
+        GatewayApp::Unified(router) => Ok(router),
+        GatewayApp::Split { .. } => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "app_with_process_started_at requires ADMIN_LISTEN_ADDR to be unset",
+        )
+        .into()),
+    }
+}
+
+fn gateway_app_with_process_started_at(
+    config: config::Config,
+    metrics_handle: PrometheusHandle,
+    audit_log: audit::AuditLog,
+    audit_event_sender: audit::AuditEventSender,
+    process_started_at: Instant,
+) -> Result<GatewayApp, Box<dyn std::error::Error>> {
+    let split_admin_listener = config.admin_listen_addr.is_some();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
     let observation_state =
         middleware::observation::ObservationState::from_config(&config, audit_log.clone());
@@ -418,6 +496,56 @@ fn app_with_process_started_at(
         );
     }
 
+    let auth_state = if config.auth_enabled {
+        Some(middleware::auth::AuthState::from_config(
+            &config,
+            validator,
+            audit_log.clone(),
+        ))
+    } else {
+        None
+    };
+    let middleware_stack = MiddlewareStack {
+        config: config.clone(),
+        audit_log: audit_log.clone(),
+        csrf_config,
+        rate_limit_state,
+        observation_state,
+        rbac_state,
+        auth_state,
+    };
+    let app_state = AppState {
+        metrics_handle,
+        proxy: proxy_state,
+        routes: routes.clone(),
+    };
+    let audit_admin_state = AuditAdminState {
+        query_store: audit_query_store,
+        event_sender: audit_event_sender,
+    };
+
+    if split_admin_listener {
+        Ok(GatewayApp::Split {
+            data: apply_middleware(data_router(app_state.clone()), &middleware_stack),
+            admin: apply_middleware(
+                admin_router(&routes, app_state, audit_admin_state, status_state),
+                &middleware_stack,
+            ),
+        })
+    } else {
+        Ok(GatewayApp::Unified(apply_middleware(
+            unified_router(&routes, app_state, audit_admin_state, status_state),
+            &middleware_stack,
+        )))
+    }
+}
+
+fn unified_router(
+    routes: &GatewayRoutes,
+    app_state: AppState,
+    audit_admin_state: AuditAdminState,
+    status_state: StatusAdminState,
+) -> Router {
     let router = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
@@ -426,35 +554,8 @@ fn app_with_process_started_at(
         .route(routes.admin.ui_slash_route.as_str(), get(admin_ui_index))
         .route(routes.admin.ui_asset_route.as_str(), get(admin_ui_asset));
 
-    let router = if proxy_state.is_some() {
-        router.fallback(any(proxy_fallback))
-    } else {
-        router
-    };
-
-    let router = router
-        .with_state(AppState {
-            metrics_handle,
-            proxy: proxy_state,
-            routes: routes.clone(),
-        })
-        .merge(
-            Router::new()
-                .route(routes.admin.audit_route.as_str(), get(audit_query_endpoint))
-                .route(
-                    routes.admin.events_stream_route.as_str(),
-                    get(audit_events_stream_endpoint),
-                )
-                .with_state(AuditAdminState {
-                    query_store: audit_query_store,
-                    event_sender: audit_event_sender,
-                }),
-        )
-        .merge(
-            Router::new()
-                .route(routes.admin.status_route.as_str(), get(status_endpoint))
-                .with_state(status_state),
-        );
+    let router = with_proxy_fallback_if_configured(router, &app_state).with_state(app_state);
+    let router = add_admin_api_routes(router, routes, audit_admin_state, status_state);
 
     #[cfg(test)]
     let router = router.route(
@@ -462,12 +563,76 @@ fn app_with_process_started_at(
         get(principal_probe).options(principal_probe),
     );
 
+    router
+}
+
+fn data_router(app_state: AppState) -> Router {
+    let router = Router::new()
+        .route("/health", get(health))
+        .route("/version", get(version))
+        .route("/metrics", get(metrics_endpoint));
+
+    with_proxy_fallback_if_configured(router, &app_state).with_state(app_state)
+}
+
+fn admin_router(
+    routes: &GatewayRoutes,
+    app_state: AppState,
+    audit_admin_state: AuditAdminState,
+    status_state: StatusAdminState,
+) -> Router {
+    let router = Router::new()
+        .route(routes.admin.ui_prefix.as_str(), get(admin_ui_index))
+        .route(routes.admin.ui_slash_route.as_str(), get(admin_ui_index))
+        .route(routes.admin.ui_asset_route.as_str(), get(admin_ui_asset))
+        .with_state(app_state);
+
+    add_admin_api_routes(router, routes, audit_admin_state, status_state)
+}
+
+fn with_proxy_fallback_if_configured(
+    router: Router<AppState>,
+    app_state: &AppState,
+) -> Router<AppState> {
+    if app_state.proxy.is_some() {
+        router.fallback(any(proxy_fallback))
+    } else {
+        router
+    }
+}
+
+fn add_admin_api_routes(
+    router: Router,
+    routes: &GatewayRoutes,
+    audit_admin_state: AuditAdminState,
+    status_state: StatusAdminState,
+) -> Router {
+    router
+        .merge(
+            Router::new()
+                .route(routes.admin.audit_route.as_str(), get(audit_query_endpoint))
+                .route(
+                    routes.admin.events_stream_route.as_str(),
+                    get(audit_events_stream_endpoint),
+                )
+                .with_state(audit_admin_state),
+        )
+        .merge(
+            Router::new()
+                .route(routes.admin.status_route.as_str(), get(status_endpoint))
+                .with_state(status_state),
+        )
+}
+
+fn apply_middleware(router: Router, stack: &MiddlewareStack) -> Router {
+    let request_id_header = request_id_header();
+
     // Later axum layers run earlier at runtime. Attach RBAC before auth, then
     // auth before CSRF, so requests flow through CSRF, auth, RBAC, then the
     // route handler. The coarse global rate limiter remains outside auth for
     // early IP/session DoS protection; policy overrides run inside auth so
     // principal-aware buckets are based on real authenticated principals.
-    let router = if let Some(rbac_state) = rbac_state {
+    let router = if let Some(rbac_state) = stack.rbac_state.clone() {
         router.layer(axum::middleware::from_fn_with_state(
             rbac_state,
             middleware::rbac::rbac_middleware,
@@ -477,13 +642,13 @@ fn app_with_process_started_at(
     };
 
     let router = router.layer(axum::middleware::from_fn_with_state(
-        rate_limit_state.clone(),
+        stack.rate_limit_state.clone(),
         middleware::rate_limit::policy_rate_limit_request,
     ));
 
-    let router = if config.auth_enabled {
+    let router = if let Some(auth_state) = stack.auth_state.clone() {
         router.layer(axum::middleware::from_fn_with_state(
-            middleware::auth::AuthState::from_config(&config, validator, audit_log.clone()),
+            auth_state,
             middleware::auth::auth_middleware,
         ))
     } else {
@@ -492,25 +657,25 @@ fn app_with_process_started_at(
 
     let router = router
         .layer(axum::middleware::from_fn_with_state(
-            csrf_config,
+            stack.csrf_config.clone(),
             middleware::csrf::csrf_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
-            config.clone(),
+            stack.config.clone(),
             middleware::validate::validate_request,
         ))
         .layer(axum::middleware::from_fn_with_state(
-            rate_limit_state,
+            stack.rate_limit_state.clone(),
             middleware::rate_limit::rate_limit_request,
         ))
         .layer(axum::middleware::from_fn_with_state(
-            observation_state,
+            stack.observation_state.clone(),
             middleware::observation::observation_middleware,
         ))
         .layer(axum::middleware::from_fn(
             middleware::headers::header_hardening_middleware,
         ))
-        .layer(cors_layer(&config))
+        .layer(cors_layer(&stack.config))
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(TraceLayer::new_for_http())
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid));
@@ -518,7 +683,7 @@ fn app_with_process_started_at(
     #[cfg(test)]
     let router = router.layer(axum::middleware::from_fn(audit_extension_probe_middleware));
 
-    Ok(router.layer(Extension(audit_log)))
+    router.layer(Extension(stack.audit_log.clone()))
 }
 
 fn install_metrics_recorder() -> Result<PrometheusHandle, metrics_exporter_prometheus::BuildError> {
@@ -1344,7 +1509,7 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant},
     };
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
     fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
@@ -1352,6 +1517,7 @@ mod tests {
             listen_addr: "127.0.0.1:0"
                 .parse()
                 .expect("test listen address should parse"),
+            admin_listen_addr: None,
             admin_prefix: config::DEFAULT_ADMIN_PREFIX.to_owned(),
             audit_log_file: None,
             audit_sqlite_path: None,
@@ -1491,6 +1657,242 @@ mod tests {
         });
 
         addr
+    }
+
+    fn gateway_app_for_test(config: config::Config) -> GatewayApp {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        gateway_app_with_process_started_at(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+            Instant::now(),
+        )
+        .expect("gateway app should build")
+    }
+
+    fn split_gateway_routers(config: config::Config) -> (Router, Router) {
+        match gateway_app_for_test(config) {
+            GatewayApp::Split { data, admin } => (data, admin),
+            GatewayApp::Unified(_) => panic!("gateway app should build split routers"),
+        }
+    }
+
+    async fn spawn_gateway_router(
+        router: Router,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test gateway should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test gateway address should be available");
+        let server = tokio::spawn(async move {
+            serve_router(listener, router)
+                .await
+                .expect("test gateway should serve");
+        });
+
+        (addr, server)
+    }
+
+    async fn spawn_split_gateway(
+        config: config::Config,
+    ) -> (
+        std::net::SocketAddr,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (data, admin) = split_gateway_routers(config);
+        let (data_addr, data_server) = spawn_gateway_router(data).await;
+        let (admin_addr, admin_server) = spawn_gateway_router(admin).await;
+
+        (data_addr, admin_addr, data_server, admin_server)
+    }
+
+    fn split_config() -> config::Config {
+        let mut config = test_config(Vec::new());
+        config.admin_listen_addr = Some(
+            "127.0.0.1:0"
+                .parse()
+                .expect("test admin listen address should parse"),
+        );
+        config
+    }
+
+    #[derive(Debug)]
+    struct TestHttpResponse {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: String,
+    }
+
+    impl TestHttpResponse {
+        fn status(&self) -> StatusCode {
+            self.status
+        }
+
+        fn headers(&self) -> &HeaderMap {
+            &self.headers
+        }
+    }
+
+    async fn test_http_request(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        bearer: Option<&str>,
+    ) -> TestHttpResponse {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .unwrap_or_else(|err| panic!("test HTTP client should connect to {addr}: {err}"));
+            let mut request =
+                format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+            if let Some(token) = bearer {
+                request.push_str("Authorization: Bearer ");
+                request.push_str(token);
+                request.push_str("\r\n");
+            }
+            request.push_str("\r\n");
+
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .unwrap_or_else(|err| panic!("test HTTP client should write request: {err}"));
+            stream
+                .flush()
+                .await
+                .unwrap_or_else(|err| panic!("test HTTP client should flush request: {err}"));
+
+            let mut raw_response = Vec::new();
+            stream
+                .read_to_end(&mut raw_response)
+                .await
+                .unwrap_or_else(|err| panic!("test HTTP client should read response: {err}"));
+
+            parse_test_http_response(&raw_response)
+        })
+        .await
+        .unwrap_or_else(|_| panic!("test HTTP request timed out: {method} {path}"))
+    }
+
+    fn parse_test_http_response(raw_response: &[u8]) -> TestHttpResponse {
+        let header_end = raw_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("test HTTP response should contain headers");
+        let raw_headers = std::str::from_utf8(&raw_response[..header_end])
+            .expect("test HTTP response headers should be UTF-8");
+        let raw_body = &raw_response[header_end + 4..];
+
+        let mut lines = raw_headers.split("\r\n");
+        let status_line = lines
+            .next()
+            .expect("test HTTP response should include a status line");
+        let mut status_parts = status_line.splitn(3, ' ');
+        let version = status_parts
+            .next()
+            .expect("test HTTP response should include a version");
+        assert!(
+            version.starts_with("HTTP/"),
+            "test HTTP response should use HTTP, got {version}"
+        );
+        let status = status_parts
+            .next()
+            .expect("test HTTP response should include a status code")
+            .parse::<u16>()
+            .expect("test HTTP response status should be numeric");
+        let status =
+            StatusCode::from_u16(status).expect("test HTTP response status should be valid");
+
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            let (name, value) = line
+                .split_once(':')
+                .unwrap_or_else(|| panic!("test HTTP response header should contain ':': {line}"));
+            let name = HeaderName::from_bytes(name.trim().as_bytes())
+                .expect("test HTTP response header name should be valid");
+            let value = HeaderValue::from_str(value.trim())
+                .expect("test HTTP response header value should be valid");
+            headers.append(name, value);
+        }
+
+        let body = if response_is_chunked(&headers) {
+            decode_chunked_body(raw_body)
+        } else if let Some(content_length) = headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("test HTTP response Content-Length should be numeric")
+            })
+        {
+            assert!(
+                raw_body.len() >= content_length,
+                "test HTTP response body should contain Content-Length bytes"
+            );
+            raw_body[..content_length].to_vec()
+        } else {
+            raw_body.to_vec()
+        };
+
+        TestHttpResponse {
+            status,
+            headers,
+            body: String::from_utf8(body).expect("test HTTP response body should be UTF-8"),
+        }
+    }
+
+    fn response_is_chunked(headers: &HeaderMap) -> bool {
+        headers
+            .get(header::TRANSFER_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
+            })
+    }
+
+    fn decode_chunked_body(mut encoded: &[u8]) -> Vec<u8> {
+        let mut decoded = Vec::new();
+
+        loop {
+            let line_end = encoded
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .expect("test HTTP chunk should include a size line");
+            let size_line = std::str::from_utf8(&encoded[..line_end])
+                .expect("test HTTP chunk size should be UTF-8");
+            let size_text = size_line
+                .split_once(';')
+                .map_or(size_line, |(size, _extension)| size)
+                .trim();
+            let size = usize::from_str_radix(size_text, 16)
+                .expect("test HTTP chunk size should be hexadecimal");
+            encoded = &encoded[line_end + 2..];
+
+            if size == 0 {
+                break;
+            }
+
+            assert!(
+                encoded.len() >= size + 2,
+                "test HTTP chunk should contain declared bytes and trailing CRLF"
+            );
+            decoded.extend_from_slice(&encoded[..size]);
+            assert_eq!(
+                &encoded[size..size + 2],
+                b"\r\n",
+                "test HTTP chunk should end with CRLF"
+            );
+            encoded = &encoded[size + 2..];
+        }
+
+        decoded
     }
 
     async fn capture_upstream(
@@ -1798,6 +2200,178 @@ mod tests {
         assert_eq!(custom_routes.audit_route, "/v1/ops/audit");
         assert_eq!(custom_routes.events_stream_route, "/v1/ops/events/stream");
         assert_eq!(custom_routes.status_route, "/v1/ops/status");
+    }
+
+    #[tokio::test]
+    async fn default_admin_listener_unset_builds_single_router_with_data_and_admin_routes() {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+
+        let router = match gateway_app_for_test(config) {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("ADMIN_LISTEN_ADDR unset should build one router"),
+        };
+
+        let health_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("health request should complete");
+        assert_eq!(health_response.status(), StatusCode::OK);
+
+        let admin_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("admin UI request should complete");
+        assert_eq!(admin_response.status(), StatusCode::OK);
+        assert!(body_string(admin_response)
+            .await
+            .contains(r#"<div id="root"></div>"#));
+
+        let status_response = router
+            .oneshot(audit_query_request(
+                STATUS_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+            ))
+            .await
+            .expect("admin status request should complete");
+        assert_eq!(status_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn split_listeners_expose_admin_and_data_surfaces_separately() {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut config = split_config();
+        config.upstream_url = Some(format!(
+            "http://127.0.0.1:{}/ignored-base",
+            upstream_addr.port()
+        ));
+        config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
+        config.egress_deny_private_ips = false;
+        config.jwt_jwks_url = Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
+        let token = signed_admin_token();
+        let (data_addr, admin_addr, data_server, admin_server) = spawn_split_gateway(config).await;
+
+        let data_admin_response = test_http_request(data_addr, "GET", "/admin", None).await;
+        assert_eq!(data_admin_response.status(), StatusCode::NOT_FOUND);
+
+        let data_admin_api_response =
+            test_http_request(data_addr, "GET", STATUS_ADMIN_ROUTE, Some(&token)).await;
+        assert_eq!(data_admin_api_response.status(), StatusCode::NOT_FOUND);
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "split data listener should reserve admin UI and API paths from proxy fallback",
+        )
+        .await;
+
+        let admin_ui_response = test_http_request(admin_addr, "GET", "/admin", None).await;
+        assert_eq!(admin_ui_response.status(), StatusCode::OK);
+        assert!(admin_ui_response.body.contains(r#"<div id="root"></div>"#));
+
+        let admin_status_response =
+            test_http_request(admin_addr, "GET", STATUS_ADMIN_ROUTE, Some(&token)).await;
+        assert_eq!(admin_status_response.status(), StatusCode::OK);
+        let admin_status: Value = serde_json::from_str(&admin_status_response.body)
+            .expect("admin status body should be JSON");
+        assert_eq!(admin_status["version"], json!(env!("CARGO_PKG_VERSION")));
+
+        for path in ["/health", "/version", "/metrics"] {
+            let data_response = test_http_request(data_addr, "GET", path, None).await;
+            assert_eq!(data_response.status(), StatusCode::OK, "{path}");
+
+            let admin_response = test_http_request(admin_addr, "GET", path, None).await;
+            assert_eq!(admin_response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+
+        let proxied_response =
+            test_http_request(data_addr, "GET", "/proxied?x=1", Some(&token)).await;
+        assert_eq!(proxied_response.status(), StatusCode::CREATED);
+        assert_eq!(proxied_response.body, "upstream GET /proxied?x=1");
+        let proxied_request =
+            next_proxied_request(&mut captured, "data listener should proxy unmatched paths").await;
+        assert_eq!(proxied_request.method, Method::GET);
+        assert_eq!(proxied_request.path_and_query, "/proxied?x=1");
+
+        let admin_proxy_response =
+            test_http_request(admin_addr, "GET", "/proxied?x=1", Some(&token)).await;
+        assert_eq!(admin_proxy_response.status(), StatusCode::NOT_FOUND);
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "split admin listener should not register proxy fallback",
+        )
+        .await;
+
+        data_server.abort();
+        admin_server.abort();
+    }
+
+    #[tokio::test]
+    async fn split_listeners_handle_concurrent_requests() {
+        let (data_addr, admin_addr, data_server, admin_server) =
+            spawn_split_gateway(split_config()).await;
+
+        let (data_response, admin_response) = tokio::join!(
+            test_http_request(data_addr, "GET", "/health", None),
+            test_http_request(admin_addr, "GET", "/admin", None),
+        );
+
+        assert_eq!(data_response.status(), StatusCode::OK);
+        assert_eq!(admin_response.status(), StatusCode::OK);
+
+        data_server.abort();
+        admin_server.abort();
+    }
+
+    #[tokio::test]
+    async fn split_admin_listener_enforces_auth_and_rbac_on_admin_api() {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "deny",
+                "enforcement_mode": "enforce",
+                "roles": {
+                    "admin": { "permissions": ["admin:read"] }
+                }
+            }"#,
+        );
+        let mut config = split_config();
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.jwt_jwks_url = Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
+        config.egress_deny_private_ips = false;
+        let token = signed_admin_token();
+        let (_data_addr, admin_addr, data_server, admin_server) = spawn_split_gateway(config).await;
+
+        let unauthenticated = test_http_request(admin_addr, "GET", STATUS_ADMIN_ROUTE, None).await;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            unauthenticated
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer")
+        );
+        assert_eq!(unauthenticated.body, r#"{"error":"unauthorized"}"#);
+
+        let rbac_denied =
+            test_http_request(admin_addr, "GET", STATUS_ADMIN_ROUTE, Some(&token)).await;
+        assert_eq!(rbac_denied.status(), StatusCode::FORBIDDEN);
+        assert_eq!(rbac_denied.body, r#"{"error":"forbidden"}"#);
+
+        data_server.abort();
+        admin_server.abort();
     }
 
     #[tokio::test]

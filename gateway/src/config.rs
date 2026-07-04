@@ -38,6 +38,7 @@ const DEFAULT_EGRESS_CONNECT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_EGRESS_MAX_RESPONSE_BYTES: usize = 5_242_880;
 const DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_EGRESS_DENY_PRIVATE_IPS: bool = true;
+const ADMIN_LISTEN_ADDR: &str = "ADMIN_LISTEN_ADDR";
 const ADMIN_PREFIX: &str = "ADMIN_PREFIX";
 const AUDIT_LOG_FILE: &str = "AUDIT_LOG_FILE";
 const AUDIT_SQLITE_PATH: &str = "AUDIT_SQLITE_PATH";
@@ -83,6 +84,7 @@ const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub listen_addr: SocketAddr,
+    pub admin_listen_addr: Option<SocketAddr>,
     pub admin_prefix: String,
     pub audit_log_file: Option<String>,
     pub audit_sqlite_path: Option<String>,
@@ -160,6 +162,7 @@ impl Config {
         let mut problems = Vec::new();
         const LISTEN_ADDR: &str = "LISTEN_ADDR";
 
+        let listener_problem_count = problems.len();
         let listen_addr = parse_var(
             LISTEN_ADDR,
             get_var(LISTEN_ADDR),
@@ -167,6 +170,16 @@ impl Config {
             "socket address",
             &mut problems,
         );
+        let admin_listen_addr = parse_optional_socket_addr(
+            ADMIN_LISTEN_ADDR,
+            get_var(ADMIN_LISTEN_ADDR),
+            &mut problems,
+        );
+        if problems.len() == listener_problem_count && admin_listen_addr == Some(listen_addr) {
+            problems.push(format!(
+                "{ADMIN_LISTEN_ADDR} must not be the same address as {LISTEN_ADDR} (both resolved to {listen_addr}); choose a different port for the admin listener or leave {ADMIN_LISTEN_ADDR} unset"
+            ));
+        }
         let admin_prefix = parse_admin_prefix(
             ADMIN_PREFIX,
             get_var(ADMIN_PREFIX),
@@ -413,6 +426,7 @@ impl Config {
         if problems.is_empty() {
             Ok(Self {
                 listen_addr,
+                admin_listen_addr,
                 admin_prefix,
                 audit_log_file,
                 audit_sqlite_path,
@@ -573,6 +587,36 @@ where
         Some(parsed)
     } else {
         None
+    }
+}
+
+fn parse_optional_socket_addr(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Option<SocketAddr> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return None,
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return None;
+        }
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    match value.parse() {
+        Ok(parsed) => Some(parsed),
+        Err(err) => {
+            problems.push(format!(
+                "{name} must be a valid socket address, got '{value}': {err}"
+            ));
+            None
+        }
     }
 }
 
@@ -922,6 +966,7 @@ mod tests {
     fn valid_listen_addr_parses() {
         let config = Config::from_env_vars(|name| match name {
             "LISTEN_ADDR" => Ok("127.0.0.1:9090".to_owned()),
+            "ADMIN_LISTEN_ADDR" => Ok("127.0.0.1:9091".to_owned()),
             _ => Err(VarError::NotPresent),
         })
         .expect("config should parse");
@@ -931,6 +976,14 @@ mod tests {
             "127.0.0.1:9090"
                 .parse::<SocketAddr>()
                 .expect("test address should parse")
+        );
+        assert_eq!(
+            config.admin_listen_addr,
+            Some(
+                "127.0.0.1:9091"
+                    .parse::<SocketAddr>()
+                    .expect("test admin address should parse")
+            )
         );
         assert_eq!(config.admin_prefix, DEFAULT_ADMIN_PREFIX);
         assert_eq!(config.audit_log_file, None);
@@ -1017,9 +1070,48 @@ mod tests {
     }
 
     #[test]
+    fn admin_listen_addr_must_differ_from_listen_addr() {
+        let error = Config::from_env_vars(|name| match name {
+            "LISTEN_ADDR" | "ADMIN_LISTEN_ADDR" => Ok("127.0.0.1:9090".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject duplicate listener addresses");
+
+        let message = error.to_string();
+        assert!(message.contains("configuration is invalid:"));
+        assert!(message.contains("ADMIN_LISTEN_ADDR must not be the same address as LISTEN_ADDR"));
+        assert!(message.contains("both resolved to 127.0.0.1:9090"));
+        assert!(message.contains("choose a different port for the admin listener"));
+        assert_eq!(error.problems.len(), 1);
+
+        let split_config = Config::from_env_vars(|name| match name {
+            "LISTEN_ADDR" => Ok("127.0.0.1:9090".to_owned()),
+            "ADMIN_LISTEN_ADDR" => Ok("127.0.0.1:9091".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should allow different listener addresses");
+        assert_eq!(
+            split_config.admin_listen_addr,
+            Some(
+                "127.0.0.1:9091"
+                    .parse::<SocketAddr>()
+                    .expect("test admin address should parse")
+            )
+        );
+
+        let unified_config = Config::from_env_vars(|name| match name {
+            "LISTEN_ADDR" => Ok("127.0.0.1:9090".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should allow ADMIN_LISTEN_ADDR to be unset");
+        assert_eq!(unified_config.admin_listen_addr, None);
+    }
+
+    #[test]
     fn invalid_listen_addr_is_rejected() {
         let error = Config::from_env_vars(|name| match name {
             "LISTEN_ADDR" => Ok("not-a-socket".to_owned()),
+            "ADMIN_LISTEN_ADDR" => Ok("also-not-a-socket".to_owned()),
             _ => Err(VarError::NotPresent),
         })
         .expect_err("config should reject invalid socket addresses");
@@ -1028,7 +1120,9 @@ mod tests {
         assert!(message.contains("configuration is invalid:"));
         assert!(message.contains("LISTEN_ADDR must be a valid socket address"));
         assert!(message.contains("not-a-socket"));
-        assert_eq!(error.problems.len(), 1);
+        assert!(message.contains("ADMIN_LISTEN_ADDR must be a valid socket address"));
+        assert!(message.contains("also-not-a-socket"));
+        assert_eq!(error.problems.len(), 2);
     }
 
     #[test]
@@ -1042,6 +1136,7 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("default address should parse")
         );
+        assert_eq!(config.admin_listen_addr, None);
         assert_eq!(config.admin_prefix, DEFAULT_ADMIN_PREFIX);
         assert_eq!(config.audit_log_file, None);
         assert_eq!(config.audit_sqlite_path, None);
@@ -1124,6 +1219,17 @@ mod tests {
             DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES
         );
         assert!(config.egress_deny_private_ips);
+    }
+
+    #[test]
+    fn empty_admin_listen_addr_is_unset() {
+        let config = Config::from_env_vars(|name| match name {
+            "ADMIN_LISTEN_ADDR" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.admin_listen_addr, None);
     }
 
     #[test]

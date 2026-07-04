@@ -6,6 +6,15 @@ pub const AUTH_METHOD_BEARER_TOKEN: &str = "bearer_token";
 pub const AUTH_METHOD_SESSION_COOKIE: &str = "session_cookie";
 
 /// Action applied by a first-match-wins firewall rule.
+///
+/// Direct rules run before, and take precedence over, the routes/permission
+/// model: once a rule matches, it is the sole authority for the request and
+/// routes are never consulted. `Allow` and `Shadow` both forward the request
+/// unconditionally (no downstream permission check) — `Shadow` differs only
+/// in recording a would-deny observation event instead of an allowed one, for
+/// policy-authoring dry runs. An overly broad rule (e.g. an unconstrained
+/// principal matcher on a sensitive path) can therefore grant access the
+/// routes-based permission model would have denied.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleAction {
@@ -72,11 +81,16 @@ impl PrincipalMatcher {
 /// Direct firewall rule model.
 ///
 /// Rules are stored in policy order and are intended to be evaluated with
-/// first-match-wins semantics. This PR only defines the policy data shape; live
-/// request-path integration lands in a later PR.
+/// first-match-wins semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
+    /// Optional stable identifier for audit/observation attribution and future
+    /// rule-management APIs. When omitted, live evaluation falls back to the
+    /// rule's array index.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// HTTP methods this rule matches. Empty or ["*"] matches any method.
     #[serde(default)]
     pub methods: Vec<String>,
@@ -97,16 +111,13 @@ pub struct Rule {
 }
 
 impl Rule {
-    /// Naive reference matcher for the documented rule syntax.
+    /// Returns true when this rule matches the request tuple.
     ///
-    /// PR2 will replace or harden this with the matcher engine, optimized
-    /// evaluation, and exhaustive glob/template edge-case tests. This function
-    /// exists only as a small correctness reference for the PR1 data model.
+    /// Policy-level evaluation should use `RuleMatcher` so path patterns are
+    /// parsed once per loaded policy instead of once per request.
     #[allow(dead_code)]
     pub fn matches(&self, method: &str, path: &str, principal: Option<&Principal>) -> bool {
-        method_matches(&self.methods, method)
-            && path_pattern_matches(&self.path, path)
-            && self.principal.matches(principal)
+        super::matcher::rule_matches(self, method, path, principal)
     }
 }
 
@@ -123,88 +134,6 @@ fn auth_method_policy_value(auth_method: &AuthMethod) -> &'static str {
 
 fn constraint_matches(values: &[String], matches_value: impl Fn(&str) -> bool) -> bool {
     values.is_empty() || values.iter().any(|value| matches_value(value))
-}
-
-pub(crate) fn method_matches(methods: &[String], method: &str) -> bool {
-    methods.is_empty()
-        || methods.iter().any(|configured| {
-            let configured = configured.trim();
-            configured == "*" || configured.eq_ignore_ascii_case(method)
-        })
-}
-
-pub(crate) fn path_pattern_matches(pattern: &str, path: &str) -> bool {
-    let Some(pattern_segments) = absolute_path_segments(pattern) else {
-        return false;
-    };
-    let Some(path_segments) = absolute_path_segments(path) else {
-        return false;
-    };
-
-    path_segments_match(&pattern_segments, &path_segments)
-}
-
-fn absolute_path_segments(value: &str) -> Option<Vec<&str>> {
-    if !value.starts_with('/') {
-        return None;
-    }
-
-    if value == "/" {
-        return Some(Vec::new());
-    }
-
-    Some(value[1..].split('/').collect())
-}
-
-fn path_segments_match(pattern: &[&str], path: &[&str]) -> bool {
-    let Some((head, pattern_tail)) = pattern.split_first() else {
-        return path.is_empty();
-    };
-
-    if *head == "**" {
-        return path_segments_match(pattern_tail, path)
-            || path
-                .split_first()
-                .is_some_and(|(_, path_tail)| path_segments_match(pattern, path_tail));
-    }
-
-    path.split_first().is_some_and(|(path_head, path_tail)| {
-        path_segment_matches(head, path_head) && path_segments_match(pattern_tail, path_tail)
-    })
-}
-
-fn path_segment_matches(pattern: &str, path: &str) -> bool {
-    match pattern {
-        "*" => !path.is_empty(),
-        _ if is_capture_segment(pattern) => !path.is_empty(),
-        _ if has_capture_delimiter(pattern) => false,
-        _ => pattern == path,
-    }
-}
-
-fn is_capture_segment(segment: &str) -> bool {
-    let Some(name) = segment
-        .strip_prefix('{')
-        .and_then(|value| value.strip_suffix('}'))
-    else {
-        return false;
-    };
-
-    is_valid_capture_name(name)
-}
-
-fn has_capture_delimiter(segment: &str) -> bool {
-    segment.contains('{') || segment.contains('}')
-}
-
-fn is_valid_capture_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-
-    (first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 #[cfg(test)]
@@ -255,8 +184,9 @@ mod tests {
     }
 
     #[test]
-    fn reference_rule_matcher_supports_method_wildcards() {
+    fn rule_matcher_supports_method_wildcards() {
         let rule = Rule {
+            id: None,
             methods: vec!["GET".to_owned(), "HEAD".to_owned()],
             path: "/data".to_owned(),
             principal: PrincipalMatcher::default(),
@@ -268,6 +198,7 @@ mod tests {
         assert!(!rule.matches("POST", "/data", None));
 
         let wildcard_rule = Rule {
+            id: None,
             methods: vec!["*".to_owned()],
             path: "/data".to_owned(),
             principal: PrincipalMatcher::default(),
@@ -278,20 +209,23 @@ mod tests {
     }
 
     #[test]
-    fn reference_rule_matcher_supports_literals_globs_and_params() {
+    fn rule_matcher_supports_literals_globs_and_params() {
         let user_item = Rule {
+            id: None,
             methods: Vec::new(),
             path: "/api/users/{id}".to_owned(),
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
         let one_asset_segment = Rule {
+            id: None,
             methods: Vec::new(),
             path: "/assets/*".to_owned(),
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
         let any_admin_depth = Rule {
+            id: None,
             methods: Vec::new(),
             path: "/admin/**".to_owned(),
             principal: PrincipalMatcher::default(),
@@ -307,8 +241,9 @@ mod tests {
     }
 
     #[test]
-    fn reference_rule_matcher_is_anchored_to_whole_path() {
+    fn rule_matcher_is_anchored_to_whole_path() {
         let rule = Rule {
+            id: None,
             methods: Vec::new(),
             path: "/api/users/{id}".to_owned(),
             principal: PrincipalMatcher::default(),

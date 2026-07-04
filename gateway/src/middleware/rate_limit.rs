@@ -26,7 +26,7 @@ use crate::{
     config::Config,
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
     rbac::{
-        rule::{method_matches, path_pattern_matches},
+        matcher::{method_matches, path_pattern_matches},
         Policy, RateLimitRule,
     },
 };
