@@ -4614,6 +4614,14 @@ mod tests {
             discovery_sqlite_path: None,
             payload_capture_enabled: false,
             payload_capture_sample_rate: config::DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
+            schema_mismatch_signal_threshold:
+                discovery::signals::DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
+            error_rate_spike_signal_threshold:
+                discovery::signals::DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
+            principal_new_to_endpoint_signal_threshold:
+                discovery::signals::DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
+            volume_outlier_signal_threshold:
+                discovery::signals::DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
             openapi_spec_path: None,
             policy_file: None,
             cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
@@ -12533,6 +12541,7 @@ O2gecI9QwDJNpm29J9wJB2F8
                 discovery::aggregator::EndpointAggregatorSinkConfig {
                     path: path.clone(),
                     payload_capture_enabled: false,
+                    signal_detector_config: discovery::signals::SignalDetectorConfig::default(),
                 },
             )
             .expect("discovery aggregator should create schema"),
@@ -12814,6 +12823,7 @@ O2gecI9QwDJNpm29J9wJB2F8
             discovery::aggregator::EndpointAggregatorSinkConfig {
                 path: discovery_path.clone(),
                 payload_capture_enabled: false,
+                signal_detector_config: discovery::signals::SignalDetectorConfig::default(),
             },
         )
         .expect("discovery aggregator should build");
