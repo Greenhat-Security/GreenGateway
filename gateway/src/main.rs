@@ -63,6 +63,7 @@ const SCHEMA_COVERAGE_ADMIN_ROUTE: &str = "/v1/admin/schema/coverage";
 const SIGNALS_ADMIN_ROUTE: &str = "/v1/admin/signals";
 const SIGNAL_ACKNOWLEDGE_ADMIN_ROUTE: &str = "/v1/admin/signals/{id}/acknowledge";
 const SIGNAL_DISMISS_ADMIN_ROUTE: &str = "/v1/admin/signals/{id}/dismiss";
+const SCHEMA_INFERRED_ADMIN_ROUTE: &str = "/v1/admin/schema/inferred";
 const TRAFFIC_ENDPOINTS_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints";
 const TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoint";
 const TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints/review";
@@ -164,6 +165,7 @@ struct AdminRoutes {
     signals_route: String,
     signal_acknowledge_route: String,
     signal_dismiss_route: String,
+    schema_inferred_route: String,
     traffic_endpoints_route: String,
     traffic_endpoint_detail_route: String,
     traffic_endpoint_review_route: String,
@@ -223,6 +225,7 @@ impl AdminRoutes {
             signals_route: format!("{api_prefix}/signals"),
             signal_acknowledge_route: format!("{api_prefix}/signals/{{id}}/acknowledge"),
             signal_dismiss_route: format!("{api_prefix}/signals/{{id}}/dismiss"),
+            schema_inferred_route: format!("{api_prefix}/schema/inferred"),
             traffic_endpoints_route: format!("{api_prefix}/traffic/endpoints"),
             traffic_endpoint_detail_route: format!("{api_prefix}/traffic/endpoint"),
             traffic_endpoint_review_route: format!("{api_prefix}/traffic/endpoints/review"),
@@ -260,6 +263,7 @@ struct SchemaAdminState {
     coverage: discovery::openapi::SchemaCoverage,
     query_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
     rbac_state: Option<middleware::rbac::RbacState>,
+    payload_capture_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -445,6 +449,12 @@ struct TrafficEndpointDetailParams {
 }
 
 #[derive(Deserialize)]
+struct InferredSchemaParams {
+    method: Option<String>,
+    endpoint_template: Option<String>,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TrafficEndpointReviewRequest {
     method: String,
@@ -488,6 +498,11 @@ struct TrafficEndpointAuditEnrichment {
     recent_events_next_cursor: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recent_events_scan_truncated: Option<bool>,
+}
+
+struct InferredSchemaQuery {
+    method: String,
+    endpoint_template: String,
 }
 
 #[derive(Serialize)]
@@ -606,6 +621,18 @@ struct SchemaNotConfiguredResponse {
 struct DiscoveryNotConfiguredResponse {
     error: String,
     discovery_configured: bool,
+}
+
+#[derive(Serialize)]
+struct PayloadCaptureNotConfiguredResponse {
+    error: String,
+    payload_capture_configured: bool,
+}
+
+#[derive(Serialize)]
+struct InferredSchemaNoSamplesResponse {
+    error: String,
+    schema_inferred: bool,
 }
 
 enum GatewayApp {
@@ -845,6 +872,7 @@ fn gateway_app_with_process_started_at(
         coverage: schema_coverage,
         query_store: discovery_query_store.clone(),
         rbac_state: rbac_state.clone(),
+        payload_capture_enabled: config.payload_capture_enabled,
     };
 
     if config.auth_enabled && validator.is_none() {
@@ -1003,6 +1031,10 @@ fn add_admin_api_routes(
                 .route(
                     routes.admin.schema_coverage_route.as_str(),
                     get(schema_coverage_endpoint),
+                )
+                .route(
+                    routes.admin.schema_inferred_route.as_str(),
+                    get(schema_inferred_endpoint),
                 )
                 .with_state(admin_api_states.schema),
         )
@@ -2456,6 +2488,40 @@ async fn schema_coverage_endpoint(
     Json(state.coverage.compare(&observed)).into_response()
 }
 
+async fn schema_inferred_endpoint(
+    State(state): State<SchemaAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+    Query(params): Query<InferredSchemaParams>,
+) -> Response {
+    record_request(SCHEMA_INFERRED_ADMIN_ROUTE);
+
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+    if !authorized_schema_reader(&state, &principal) {
+        return forbidden();
+    }
+    if !state.payload_capture_enabled {
+        return payload_capture_not_configured();
+    }
+    let Some(query_store) = state.query_store.as_ref() else {
+        return schema_inference_discovery_not_configured();
+    };
+    let query = match params.into_query() {
+        Ok(query) => query,
+        Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
+    };
+
+    match query_store.inferred_request_schema(&query.method, &query.endpoint_template) {
+        Ok(Some(schema)) => (StatusCode::OK, Json(schema)).into_response(),
+        Ok(None) => inferred_schema_no_samples(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to query inferred request schema");
+            internal_server_error("inferred schema query failed")
+        }
+    }
+}
+
 async fn admin_ui_index(State(state): State<AppState>) -> Response {
     record_request(ADMIN_UI_ROUTE);
     admin_ui_index_response(&state.routes.admin)
@@ -3132,6 +3198,15 @@ impl TrafficEndpointDetailParams {
             bucket,
             events_limit,
             events_before_id,
+        })
+    }
+}
+
+impl InferredSchemaParams {
+    fn into_query(self) -> Result<InferredSchemaQuery, &'static str> {
+        Ok(InferredSchemaQuery {
+            method: required_non_empty("method", self.method)?,
+            endpoint_template: required_non_empty("endpoint_template", self.endpoint_template)?,
         })
     }
 }
@@ -4367,6 +4442,41 @@ fn schema_discovery_not_configured() -> Response {
         .into_response()
 }
 
+fn schema_inference_discovery_not_configured() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(DiscoveryNotConfiguredResponse {
+            error: "inferred schema requires DISCOVERY_SQLITE_PATH to be configured".to_owned(),
+            discovery_configured: false,
+        }),
+    )
+        .into_response()
+}
+
+fn payload_capture_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(PayloadCaptureNotConfiguredResponse {
+            error: "inferred schema requires PAYLOAD_CAPTURE_ENABLED=true".to_owned(),
+            payload_capture_configured: false,
+        }),
+    )
+        .into_response()
+}
+
+fn inferred_schema_no_samples() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(InferredSchemaNoSamplesResponse {
+            error:
+                "inferred schema has no captured payload samples for method and endpoint_template"
+                    .to_owned(),
+            schema_inferred: false,
+        }),
+    )
+        .into_response()
+}
+
 fn discovery_not_configured() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -5504,6 +5614,10 @@ mod tests {
             SCHEMA_COVERAGE_ADMIN_ROUTE
         );
         assert_eq!(
+            default_routes.schema_inferred_route,
+            SCHEMA_INFERRED_ADMIN_ROUTE
+        );
+        assert_eq!(
             default_routes.traffic_endpoints_route,
             TRAFFIC_ENDPOINTS_ADMIN_ROUTE
         );
@@ -5544,6 +5658,10 @@ mod tests {
         assert_eq!(
             custom_routes.schema_coverage_route,
             "/v1/ops/schema/coverage"
+        );
+        assert_eq!(
+            custom_routes.schema_inferred_route,
+            "/v1/ops/schema/inferred"
         );
         assert_eq!(
             custom_routes.traffic_endpoints_route,
@@ -9203,6 +9321,183 @@ paths:
         );
     }
 
+    #[tokio::test]
+    async fn schema_inference_returns_inferred_payload_shape_schema() {
+        let discovery_db = TempDb::new("schema-inferred");
+        seed_payload_shape_samples(
+            &discovery_db.path,
+            "POST",
+            "/users/{id}",
+            &[
+                json!({
+                    "query_params": [
+                        { "name": "page", "redacted": false, "value_type": "number" },
+                        { "name": "search", "redacted": false, "value_type": "string" }
+                    ],
+                    "json_body": {
+                        "top_level_keys": [
+                            { "name": "display_name", "redacted": false },
+                            { "name_hash": "sha256:redacted-body-key", "redacted": true }
+                        ]
+                    }
+                }),
+                json!({
+                    "query_params": [
+                        { "name": "page", "redacted": false, "value_type": "number" }
+                    ],
+                    "json_body": {
+                        "top_level_keys": [
+                            { "name": "display_name", "redacted": false }
+                        ]
+                    }
+                }),
+            ],
+        );
+        let policy = TempPolicyFile::new(&schema_policy_document());
+        let router = schema_inference_router(Some(&discovery_db), true, &policy);
+        let template = query_encode("/users/{id}");
+
+        let response = router
+            .oneshot(audit_query_request(
+                &format!("/v1/admin/schema/inferred?method=POST&endpoint_template={template}"),
+                Some(test_principal(&["schema-reader"])),
+            ))
+            .await
+            .expect("schema inference request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["method"], json!("POST"));
+        assert_eq!(body["endpoint_template"], json!("/users/{id}"));
+        assert_eq!(body["sample_count"], json!(2));
+        assert_eq!(body["required_threshold"], json!(0.95));
+        assert_eq!(
+            body["query_params"],
+            json!([
+                {
+                    "name": "page",
+                    "redacted": false,
+                    "present_count": 2,
+                    "frequency": 1.0,
+                    "required": true,
+                    "value_types": [
+                        { "value_type": "number", "count": 2 }
+                    ]
+                },
+                {
+                    "name": "search",
+                    "redacted": false,
+                    "present_count": 1,
+                    "frequency": 0.5,
+                    "required": false,
+                    "value_types": [
+                        { "value_type": "string", "count": 1 }
+                    ]
+                }
+            ])
+        );
+        assert_eq!(
+            body["json_body_keys"],
+            json!([
+                {
+                    "name": "display_name",
+                    "redacted": false,
+                    "present_count": 2,
+                    "frequency": 1.0,
+                    "required": true
+                },
+                {
+                    "name_hash": "sha256:redacted-body-key",
+                    "redacted": true,
+                    "present_count": 1,
+                    "frequency": 0.5,
+                    "required": false
+                }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_inference_distinguishes_payload_capture_disabled_from_no_samples() {
+        let discovery_db = TempDb::new("schema-inferred-empty");
+        let policy = TempPolicyFile::new(&schema_policy_document());
+        let configured_router = schema_inference_router(Some(&discovery_db), true, &policy);
+        let template = query_encode("/users/{id}");
+
+        let no_samples = configured_router
+            .oneshot(audit_query_request(
+                &format!("/v1/admin/schema/inferred?method=POST&endpoint_template={template}"),
+                Some(test_principal(&["schema-reader"])),
+            ))
+            .await
+            .expect("schema inference no-samples request should complete");
+
+        assert_eq!(no_samples.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_string(no_samples).await,
+            r#"{"error":"inferred schema has no captured payload samples for method and endpoint_template","schema_inferred":false}"#
+        );
+
+        let disabled_router = schema_inference_router(Some(&discovery_db), false, &policy);
+        let disabled = disabled_router
+            .oneshot(audit_query_request(
+                &format!("/v1/admin/schema/inferred?method=POST&endpoint_template={template}"),
+                Some(test_principal(&["schema-reader"])),
+            ))
+            .await
+            .expect("schema inference disabled request should complete");
+
+        assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_string(disabled).await,
+            r#"{"error":"inferred schema requires PAYLOAD_CAPTURE_ENABLED=true","payload_capture_configured":false}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_inference_requires_schema_read_permission() {
+        let discovery_db = TempDb::new("schema-inferred-authz");
+        seed_payload_shape_samples(
+            &discovery_db.path,
+            "GET",
+            "/users",
+            &[json!({
+                "query_params": [
+                    { "name": "page", "redacted": false, "value_type": "number" }
+                ]
+            })],
+        );
+        let policy = TempPolicyFile::new(&schema_policy_document());
+        let router = schema_inference_router(Some(&discovery_db), true, &policy);
+
+        let unauthenticated = router
+            .clone()
+            .oneshot(audit_query_request(
+                "/v1/admin/schema/inferred?method=GET&endpoint_template=%2Fusers",
+                None,
+            ))
+            .await
+            .expect("unauthenticated schema inference request should complete");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body_string(unauthenticated).await,
+            r#"{"error":"unauthorized"}"#
+        );
+
+        let forbidden_response = router
+            .oneshot(audit_query_request(
+                "/v1/admin/schema/inferred?method=GET&endpoint_template=%2Fusers",
+                Some(test_principal(&["reader"])),
+            ))
+            .await
+            .expect("forbidden schema inference request should complete");
+        assert_eq!(forbidden_response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            body_string(forbidden_response).await,
+            r#"{"error":"forbidden"}"#
+        );
+    }
+
     #[test]
     fn missing_openapi_spec_file_returns_actionable_startup_error() {
         let mut config = test_config(Vec::new());
@@ -11396,6 +11691,31 @@ paths:
         .expect("app should build")
     }
 
+    fn schema_inference_router(
+        discovery_db: Option<&TempDb>,
+        payload_capture_enabled: bool,
+        policy: &TempPolicyFile,
+    ) -> Router {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config
+            .rbac_exempt_paths
+            .push(SCHEMA_INFERRED_ADMIN_ROUTE.to_owned());
+        config.discovery_sqlite_path =
+            discovery_db.map(|db| db.path.to_string_lossy().into_owned());
+        config.payload_capture_enabled = payload_capture_enabled;
+        let recorder = PrometheusBuilder::new().build_recorder();
+
+        app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+    }
+
     fn audit_query_request(uri: &str, principal: Option<auth::Principal>) -> Request<Body> {
         let mut request = Request::builder()
             .uri(uri)
@@ -12858,6 +13178,80 @@ O2gecI9QwDJNpm29J9wJB2F8
                 params![method, endpoint_template],
             )
             .expect("endpoint aggregate should insert");
+    }
+
+    fn seed_payload_shape_samples(
+        path: &PathBuf,
+        method: &str,
+        endpoint_template: &str,
+        shapes: &[Value],
+    ) {
+        let connection = Connection::open(path).expect("test database should open");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS discovery_payload_shape_stats (
+                    method TEXT NOT NULL,
+                    endpoint_template TEXT NOT NULL,
+                    shape_observation_count INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (method, endpoint_template)
+                );
+
+                CREATE TABLE IF NOT EXISTS discovery_payload_shape_samples (
+                    method TEXT NOT NULL,
+                    endpoint_template TEXT NOT NULL,
+                    sample_slot INTEGER NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    shape_hash TEXT NOT NULL,
+                    shape_json TEXT NOT NULL,
+                    PRIMARY KEY (method, endpoint_template, sample_slot)
+                );
+                "#,
+            )
+            .expect("payload shape schema should create");
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_payload_shape_stats (
+                    method,
+                    endpoint_template,
+                    shape_observation_count,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, '2024-06-01T12:00:00Z')
+                "#,
+                params![
+                    method,
+                    endpoint_template,
+                    i64::try_from(shapes.len()).expect("shape count should fit i64")
+                ],
+            )
+            .expect("payload shape stats should insert");
+
+        for (index, shape) in shapes.iter().enumerate() {
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO discovery_payload_shape_samples (
+                        method,
+                        endpoint_template,
+                        sample_slot,
+                        observed_at,
+                        shape_hash,
+                        shape_json
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#,
+                    params![
+                        method,
+                        endpoint_template,
+                        i64::try_from(index).expect("sample slot should fit i64"),
+                        format!("2024-06-01T12:00:0{index}Z"),
+                        format!("sha256:test-shape-{index}"),
+                        shape.to_string(),
+                    ],
+                )
+                .expect("payload shape sample should insert");
+        }
     }
 
     fn assert_eventually(timeout: Duration, condition: impl Fn() -> bool) {
