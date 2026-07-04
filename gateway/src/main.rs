@@ -61,10 +61,12 @@ const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
 const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
 const TRAFFIC_ENDPOINTS_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints";
 const TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoint";
+const TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints/review";
 const AUDIT_ADMIN_ROLE: &str = "admin";
 const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
 const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
 const ADMIN_TRAFFIC_READ_PERMISSION: &str = "admin:traffic:read";
+const ADMIN_TRAFFIC_WRITE_PERMISSION: &str = "admin:traffic:write";
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
 const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
@@ -153,6 +155,7 @@ struct AdminRoutes {
     policy_rules_order_route: String,
     traffic_endpoints_route: String,
     traffic_endpoint_detail_route: String,
+    traffic_endpoint_review_route: String,
 }
 
 impl GatewayRoutes {
@@ -207,6 +210,7 @@ impl AdminRoutes {
             policy_rules_order_route: format!("{api_prefix}/policy/rules/order"),
             traffic_endpoints_route: format!("{api_prefix}/traffic/endpoints"),
             traffic_endpoint_detail_route: format!("{api_prefix}/traffic/endpoint"),
+            traffic_endpoint_review_route: format!("{api_prefix}/traffic/endpoints/review"),
             api_prefix,
         }
     }
@@ -241,6 +245,9 @@ struct TrafficAdminState {
     discovery_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
     audit_query_store: Option<Arc<audit::query::AuditQueryStore>>,
     rbac_state: Option<middleware::rbac::RbacState>,
+    audit: audit::AuditLog,
+    trust_proxy_headers: bool,
+    max_body_size: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -366,6 +373,10 @@ struct TrafficEndpointListParams {
     last_seen_after: Option<String>,
     last_seen_before: Option<String>,
     min_call_count: Option<String>,
+    new_since_hours: Option<String>,
+    is_new: Option<String>,
+    reviewed: Option<String>,
+    covered_by_rule: Option<String>,
     sort: Option<String>,
     limit: Option<String>,
     cursor: Option<String>,
@@ -379,9 +390,18 @@ struct TrafficEndpointDetailParams {
     principal_cursor: Option<String>,
     from: Option<String>,
     to: Option<String>,
+    new_since_hours: Option<String>,
     bucket: Option<String>,
     events_limit: Option<String>,
     events_before_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrafficEndpointReviewRequest {
+    method: String,
+    endpoint_template: String,
+    reviewed: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -793,6 +813,9 @@ fn gateway_app_with_process_started_at(
         discovery_store: discovery_query_store,
         audit_query_store: audit_admin_state.query_store.clone(),
         rbac_state,
+        audit: audit_log,
+        trust_proxy_headers: config.trust_proxy_headers,
+        max_body_size: config.max_body_size,
     };
 
     if split_admin_listener {
@@ -968,6 +991,10 @@ fn add_admin_api_routes(
                 .route(
                     routes.admin.traffic_endpoint_detail_route.as_str(),
                     get(traffic_endpoint_detail_endpoint),
+                )
+                .route(
+                    routes.admin.traffic_endpoint_review_route.as_str(),
+                    post(traffic_endpoint_review_endpoint),
                 )
                 .with_state(traffic_admin_state),
         )
@@ -2493,19 +2520,20 @@ async fn traffic_endpoint_list_endpoint(
     let Some(Extension(principal)) = principal else {
         return unauthorized();
     };
-    if let Err(error) = authorized_traffic_state(&state, &principal) {
+    if let Err(error) = authorized_traffic_state(&state, &principal, ADMIN_TRAFFIC_READ_PERMISSION)
+    {
         return traffic_admin_authz_error_response(error);
     }
 
     let Some(discovery_store) = state.discovery_store.as_ref() else {
         return discovery_not_configured();
     };
-    let filters = match params.into_filters() {
-        Ok(filters) => filters,
+    let query = match params.into_query() {
+        Ok(query) => query,
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    match discovery_store.list_endpoints(&filters) {
+    match list_traffic_endpoint_page(discovery_store, &query, state.rbac_state.as_ref()) {
         Ok(page) => (StatusCode::OK, Json(page)).into_response(),
         Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter }) => {
             bad_request(&format!("invalid query parameter: {parameter}"))
@@ -2527,7 +2555,8 @@ async fn traffic_endpoint_detail_endpoint(
     let Some(Extension(principal)) = principal else {
         return unauthorized();
     };
-    if let Err(error) = authorized_traffic_state(&state, &principal) {
+    if let Err(error) = authorized_traffic_state(&state, &principal, ADMIN_TRAFFIC_READ_PERMISSION)
+    {
         return traffic_admin_authz_error_response(error);
     }
 
@@ -2539,7 +2568,11 @@ async fn traffic_endpoint_detail_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    let endpoint = match discovery_store.get_endpoint(&params.method, &params.endpoint_template) {
+    let mut endpoint = match discovery_store.get_endpoint(
+        &params.method,
+        &params.endpoint_template,
+        params.new_since_hours,
+    ) {
         Ok(Some(endpoint)) => endpoint,
         Ok(None) => return not_found("traffic endpoint was not found"),
         Err(err) => {
@@ -2547,6 +2580,11 @@ async fn traffic_endpoint_detail_endpoint(
             return internal_server_error("traffic endpoint detail query failed");
         }
     };
+    endpoint.covered_by_rule = endpoint_covered_by_active_direct_rule(
+        state.rbac_state.as_ref(),
+        &params.method,
+        &params.endpoint_template,
+    );
     let principals = match discovery_store.list_principals(
         &params.method,
         &params.endpoint_template,
@@ -2622,6 +2660,69 @@ async fn traffic_endpoint_detail_endpoint(
         }),
     )
         .into_response()
+}
+
+async fn traffic_endpoint_review_endpoint(
+    State(state): State<TrafficAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_traffic_state(&state, &principal, ADMIN_TRAFFIC_WRITE_PERMISSION)
+    {
+        return traffic_admin_authz_error_response(error);
+    }
+
+    let Some(discovery_store) = state.discovery_store.as_ref() else {
+        return discovery_not_configured();
+    };
+    let body = match read_request_body(body, state.max_body_size).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let request = match serde_json::from_slice::<TrafficEndpointReviewRequest>(&body) {
+        Ok(request) => request,
+        Err(err) => {
+            tracing::warn!(error = %err, "traffic endpoint review request body was invalid");
+            return bad_request("invalid traffic endpoint review request body");
+        }
+    };
+    let method = request.method.trim();
+    if method.is_empty() {
+        return bad_request("invalid traffic endpoint review request body: method");
+    }
+    let endpoint_template = request.endpoint_template.trim();
+    if endpoint_template.is_empty() {
+        return bad_request("invalid traffic endpoint review request body: endpoint_template");
+    }
+
+    let review = match discovery_store.set_endpoint_review(
+        method,
+        endpoint_template,
+        request.reviewed,
+        Some(&principal.user_id),
+    ) {
+        Ok(Some(review)) => review,
+        Ok(None) => return not_found("traffic endpoint was not found"),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to update traffic endpoint review state");
+            return internal_server_error("traffic endpoint review update failed");
+        }
+    };
+    emit_traffic_endpoint_review_changed(
+        &state,
+        &parts,
+        &principal,
+        method,
+        endpoint_template,
+        &review,
+    );
+
+    (StatusCode::OK, Json(review)).into_response()
 }
 
 async fn audit_events_stream_endpoint(
@@ -2715,6 +2816,7 @@ impl AuditQueryParams {
 struct TrafficEndpointDetailQuery {
     method: String,
     endpoint_template: String,
+    new_since_hours: u64,
     principal_limit: usize,
     principal_cursor: Option<String>,
     from: Option<String>,
@@ -2724,14 +2826,25 @@ struct TrafficEndpointDetailQuery {
     events_before_id: Option<i64>,
 }
 
+struct TrafficEndpointListQuery {
+    filters: discovery::query::EndpointListFilters,
+    covered_by_rule: Option<bool>,
+}
+
 impl TrafficEndpointListParams {
-    fn into_filters(self) -> Result<discovery::query::EndpointListFilters, &'static str> {
+    fn into_query(self) -> Result<TrafficEndpointListQuery, &'static str> {
         let first_seen_after = validate_rfc3339("first_seen_after", self.first_seen_after)?;
         let first_seen_before = validate_rfc3339("first_seen_before", self.first_seen_before)?;
         let last_seen_after = validate_rfc3339("last_seen_after", self.last_seen_after)?;
         let last_seen_before = validate_rfc3339("last_seen_before", self.last_seen_before)?;
         let min_call_count =
             parse_optional_non_negative_i64("min_call_count", self.min_call_count)?;
+        let new_since_hours =
+            parse_optional_non_negative_u64("new_since_hours", self.new_since_hours)?
+                .unwrap_or(discovery::query::DEFAULT_NEW_SINCE_HOURS);
+        let is_new = parse_optional_bool("is_new", self.is_new)?;
+        let reviewed = parse_optional_bool("reviewed", self.reviewed)?;
+        let covered_by_rule = parse_optional_bool("covered_by_rule", self.covered_by_rule)?;
         let sort = self
             .sort
             .as_deref()
@@ -2740,18 +2853,24 @@ impl TrafficEndpointListParams {
             .unwrap_or(discovery::query::EndpointSort::LastSeen);
         let limit = parse_limit(self.limit)?;
 
-        Ok(discovery::query::EndpointListFilters {
-            method: empty_string_as_none(self.method),
-            endpoint_template_contains: empty_string_as_none(self.endpoint_template),
-            endpoint_template_prefix: empty_string_as_none(self.endpoint_template_prefix),
-            first_seen_after,
-            first_seen_before,
-            last_seen_after,
-            last_seen_before,
-            min_call_count,
-            sort,
-            limit,
-            cursor: self.cursor,
+        Ok(TrafficEndpointListQuery {
+            filters: discovery::query::EndpointListFilters {
+                method: empty_string_as_none(self.method),
+                endpoint_template_contains: empty_string_as_none(self.endpoint_template),
+                endpoint_template_prefix: empty_string_as_none(self.endpoint_template_prefix),
+                first_seen_after,
+                first_seen_before,
+                last_seen_after,
+                last_seen_before,
+                min_call_count,
+                new_since_hours,
+                is_new,
+                reviewed,
+                sort,
+                limit,
+                cursor: self.cursor,
+            },
+            covered_by_rule,
         })
     }
 }
@@ -2764,6 +2883,9 @@ impl TrafficEndpointDetailParams {
             parse_limit_with_default(self.principal_limit, DEFAULT_AUDIT_QUERY_LIMIT)?;
         let from = validate_rfc3339("from", self.from)?;
         let to = validate_rfc3339("to", self.to)?;
+        let new_since_hours =
+            parse_optional_non_negative_u64("new_since_hours", self.new_since_hours)?
+                .unwrap_or(discovery::query::DEFAULT_NEW_SINCE_HOURS);
         let bucket = parse_endpoint_audit_bucket(self.bucket)?;
         let events_limit =
             parse_limit_with_default(self.events_limit, DEFAULT_TRAFFIC_RECENT_EVENTS_LIMIT)?;
@@ -2772,6 +2894,7 @@ impl TrafficEndpointDetailParams {
         Ok(TrafficEndpointDetailQuery {
             method,
             endpoint_template,
+            new_since_hours,
             principal_limit,
             principal_cursor: self.principal_cursor,
             from,
@@ -2833,6 +2956,31 @@ fn parse_optional_non_negative_i64(
     }
 
     Ok(Some(value))
+}
+
+fn parse_optional_non_negative_u64(
+    parameter: &'static str,
+    value: Option<String>,
+) -> Result<Option<u64>, &'static str> {
+    value
+        .map(|value| {
+            let parsed = value.parse::<u64>().map_err(|_| parameter)?;
+            Ok(parsed)
+        })
+        .transpose()
+}
+
+fn parse_optional_bool(
+    parameter: &'static str,
+    value: Option<String>,
+) -> Result<Option<bool>, &'static str> {
+    value
+        .map(|value| match value.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(parameter),
+        })
+        .transpose()
 }
 
 fn parse_limit(value: Option<String>) -> Result<usize, &'static str> {
@@ -2921,12 +3069,13 @@ fn authorized_policy_state<'a>(
 fn authorized_traffic_state<'a>(
     state: &'a TrafficAdminState,
     principal: &auth::Principal,
+    permission: &str,
 ) -> Result<&'a middleware::rbac::RbacState, TrafficAdminAuthzError> {
     let Some(rbac_state) = state.rbac_state.as_ref() else {
         return Err(TrafficAdminAuthzError::NotConfigured);
     };
 
-    if !rbac_state.principal_has_permission(principal, ADMIN_TRAFFIC_READ_PERMISSION) {
+    if !rbac_state.principal_has_permission(principal, permission) {
         return Err(TrafficAdminAuthzError::Forbidden);
     }
 
@@ -3195,6 +3344,166 @@ fn preview_sample(observation: audit::query::RequestObservation) -> PolicyRulePr
         policy_decision,
         matched_rule_id: observation.matched_rule_id,
     }
+}
+
+fn enrich_endpoint_summaries_with_rule_coverage(
+    endpoints: &mut [discovery::query::EndpointSummary],
+    rbac_state: Option<&middleware::rbac::RbacState>,
+) {
+    let Some(rbac_state) = rbac_state else {
+        return;
+    };
+    let policy = rbac_state.current_policy();
+
+    for endpoint in endpoints {
+        endpoint.covered_by_rule = endpoint_covered_by_policy_direct_rules(
+            &policy,
+            &endpoint.method,
+            &endpoint.endpoint_template,
+        );
+    }
+}
+
+fn list_traffic_endpoint_page(
+    discovery_store: &discovery::query::DiscoveryQueryStore,
+    query: &TrafficEndpointListQuery,
+    rbac_state: Option<&middleware::rbac::RbacState>,
+) -> Result<discovery::query::EndpointListPage, discovery::query::DiscoveryQueryError> {
+    let Some(covered_by_rule) = query.covered_by_rule else {
+        let mut page = discovery_store.list_endpoints(&query.filters)?;
+        enrich_endpoint_summaries_with_rule_coverage(&mut page.endpoints, rbac_state);
+        return Ok(page);
+    };
+
+    let requested_limit = query.filters.limit;
+    let mut scan_filters = query.filters.clone();
+    scan_filters.limit = 1;
+    let mut cursor = scan_filters.cursor.clone();
+    let mut endpoints = Vec::with_capacity(requested_limit);
+    let mut next_cursor = None;
+
+    loop {
+        scan_filters.cursor = cursor;
+        let mut page = discovery_store.list_endpoints(&scan_filters)?;
+        enrich_endpoint_summaries_with_rule_coverage(&mut page.endpoints, rbac_state);
+
+        if let Some(endpoint) = page.endpoints.into_iter().next() {
+            if endpoint.covered_by_rule == covered_by_rule {
+                endpoints.push(endpoint);
+                if endpoints.len() == requested_limit {
+                    next_cursor = page.next_cursor;
+                    break;
+                }
+            }
+        }
+
+        let Some(cursor_after_page) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(cursor_after_page);
+    }
+
+    Ok(discovery::query::EndpointListPage {
+        endpoints,
+        next_cursor,
+    })
+}
+
+fn endpoint_covered_by_active_direct_rule(
+    rbac_state: Option<&middleware::rbac::RbacState>,
+    method: &str,
+    endpoint_template: &str,
+) -> bool {
+    let Some(rbac_state) = rbac_state else {
+        return false;
+    };
+    let policy = rbac_state.current_policy();
+
+    endpoint_covered_by_policy_direct_rules(&policy, method, endpoint_template)
+}
+
+fn endpoint_covered_by_policy_direct_rules(
+    policy: &rbac::Policy,
+    method: &str,
+    endpoint_template: &str,
+) -> bool {
+    if policy.rules.is_empty() {
+        return false;
+    }
+
+    let path = representative_path_from_endpoint_template(endpoint_template);
+    let matcher = rbac::RuleMatcher::new(&policy.rules);
+    if matcher.evaluate(method, &path, None).is_some() {
+        return true;
+    }
+
+    policy.rules.iter().any(|rule| {
+        let Some(principal) = representative_principal_for_rule(rule) else {
+            return false;
+        };
+        matcher.evaluate(method, &path, Some(&principal)).is_some()
+    })
+}
+
+fn representative_path_from_endpoint_template(endpoint_template: &str) -> String {
+    let Some(tail) = endpoint_template.strip_prefix('/') else {
+        return endpoint_template.to_owned();
+    };
+    if tail.is_empty() {
+        return "/".to_owned();
+    }
+
+    let segments = tail
+        .split('/')
+        .map(representative_path_segment)
+        .collect::<Vec<_>>();
+    format!("/{}", segments.join("/"))
+}
+
+fn representative_path_segment(segment: &str) -> String {
+    let Some(capture) = segment
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return segment.to_owned();
+    };
+
+    if capture.eq_ignore_ascii_case("id") {
+        "123".to_owned()
+    } else {
+        "sample".to_owned()
+    }
+}
+
+fn representative_principal_for_rule(rule: &rbac::Rule) -> Option<auth::Principal> {
+    if rule.principal.is_unconstrained() {
+        return None;
+    }
+
+    let auth_method = if rule
+        .principal
+        .auth_methods
+        .iter()
+        .any(|method| method == rbac::rule::AUTH_METHOD_SESSION_COOKIE)
+    {
+        auth::AuthMethod::Cookie
+    } else {
+        auth::AuthMethod::Bearer
+    };
+
+    Some(auth::Principal {
+        user_id: rule
+            .principal
+            .principal_ids
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "traffic-coverage-principal".to_owned()),
+        email: None,
+        org_id: None,
+        roles: rule.principal.roles.clone(),
+        session_id: "traffic-coverage".to_owned(),
+        auth_method,
+    })
 }
 
 fn policy_error_message(error: &rbac::policy::PolicyError) -> String {
@@ -3576,6 +3885,38 @@ fn emit_policy_changed_payload(
 
     state.audit.emit(audit::AuditEvent::new(
         audit::event::POLICY_CHANGED,
+        request_id,
+        source_ip,
+        actor,
+        payload,
+    ));
+}
+
+fn emit_traffic_endpoint_review_changed(
+    state: &TrafficAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    method: &str,
+    endpoint_template: &str,
+    review: &discovery::query::EndpointReviewState,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip = client_ip::canonical_client_ip(
+        &parts.headers,
+        &parts.extensions,
+        state.trust_proxy_headers,
+    );
+    let actor = Some(auth::actor_from_principal(principal));
+    let payload = json!({
+        "method": method,
+        "endpoint_template": endpoint_template,
+        "reviewed": review.reviewed,
+        "reviewed_at": review.reviewed_at,
+        "reviewed_by": review.reviewed_by,
+    });
+
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::TRAFFIC_ENDPOINT_REVIEW_CHANGED,
         request_id,
         source_ip,
         actor,
@@ -4821,6 +5162,10 @@ mod tests {
             default_routes.traffic_endpoint_detail_route,
             TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE
         );
+        assert_eq!(
+            default_routes.traffic_endpoint_review_route,
+            TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE
+        );
 
         let custom_routes = AdminRoutes::from_prefix("/ops");
         assert_eq!(custom_routes.ui_prefix, "/ops");
@@ -4854,6 +5199,10 @@ mod tests {
         assert_eq!(
             custom_routes.traffic_endpoint_detail_route,
             "/v1/ops/traffic/endpoint"
+        );
+        assert_eq!(
+            custom_routes.traffic_endpoint_review_route,
+            "/v1/ops/traffic/endpoints/review"
         );
     }
 
@@ -8785,6 +9134,336 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn traffic_endpoint_lifecycle_flags_rule_coverage_and_hot_reload() {
+        let discovery_db = TempDb::new("traffic-lifecycle-coverage");
+        create_discovery_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/covered/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 3,
+                latency_count: 3,
+                latency_p50_ms: 10,
+                latency_p95_ms: 20,
+                latency_p99_ms: 30,
+                distinct_principal_count: 1,
+                status_counts: &[(200, 3)],
+            },
+        );
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/open/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 2,
+                latency_count: 2,
+                latency_p50_ms: 10,
+                latency_p95_ms: 20,
+                latency_p99_ms: 30,
+                distinct_principal_count: 1,
+                status_counts: &[(200, 2)],
+            },
+        );
+        let policy = TempPolicyFile::new(&traffic_policy_document_with_rules(json!([
+            {
+                "id": "cover-id-endpoint",
+                "methods": ["GET"],
+                "path": "/covered/{id}",
+                "action": "allow"
+            }
+        ])));
+        let router = traffic_admin_router_with_policy(Some(&discovery_db.path), None, &policy);
+
+        let body = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?sort=first_seen",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            endpoint_coverage(&body),
+            HashMap::from([
+                ("/covered/{id}".to_owned(), true),
+                ("/open/{id}".to_owned(), false)
+            ])
+        );
+
+        let uncovered = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?covered_by_rule=false&sort=first_seen",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            endpoint_templates(&uncovered),
+            vec!["/open/{id}".to_owned()]
+        );
+
+        let uncovered_limited = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?covered_by_rule=false&sort=first_seen&limit=1",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            endpoint_templates(&uncovered_limited),
+            vec!["/open/{id}".to_owned()]
+        );
+
+        policy.write(&traffic_policy_document_with_rules(json!([
+            {
+                "id": "cover-id-endpoint",
+                "methods": ["GET"],
+                "path": "/covered/{id}",
+                "action": "allow"
+            },
+            {
+                "id": "cover-open-endpoint",
+                "methods": ["GET"],
+                "path": "/open/{id}",
+                "principal": {
+                    "roles": ["traffic-reader"],
+                    "auth_methods": ["bearer_token"]
+                },
+                "action": "shadow"
+            }
+        ])));
+
+        let reloaded = wait_for_traffic_json(&router, "/v1/admin/traffic/endpoints", |body| {
+            endpoint_coverage(body).get("/open/{id}") == Some(&true)
+        })
+        .await;
+        assert_eq!(
+            endpoint_coverage(&reloaded),
+            HashMap::from([
+                ("/covered/{id}".to_owned(), true),
+                ("/open/{id}".to_owned(), true)
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_endpoint_new_flag_uses_configurable_window() {
+        let discovery_db = TempDb::new("traffic-lifecycle-new");
+        create_discovery_schema(&discovery_db.path);
+        let recent = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .expect("current timestamp should format");
+        let old = (OffsetDateTime::now_utc() - time::Duration::hours(48))
+            .format(&Rfc3339)
+            .expect("old timestamp should format");
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/recent",
+                first_seen: &recent,
+                last_seen: &recent,
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 1,
+                latency_p95_ms: 1,
+                latency_p99_ms: 1,
+                distinct_principal_count: 0,
+                status_counts: &[(200, 1)],
+            },
+        );
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/old",
+                first_seen: &old,
+                last_seen: &old,
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 1,
+                latency_p95_ms: 1,
+                latency_p99_ms: 1,
+                distinct_principal_count: 0,
+                status_counts: &[(200, 1)],
+            },
+        );
+        let (router, _policy) = traffic_admin_router(Some(&discovery_db.path), None);
+
+        let body = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?new_since_hours=24&sort=first_seen",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            endpoint_new_flags(&body),
+            HashMap::from([("/recent".to_owned(), true), ("/old".to_owned(), false)])
+        );
+
+        let only_new = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?is_new=true&new_since_hours=24",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(endpoint_templates(&only_new), vec!["/recent".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn traffic_endpoint_review_mark_clear_and_write_permission() {
+        let discovery_db = TempDb::new("traffic-lifecycle-review");
+        create_discovery_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/reviewed/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 10,
+                latency_p95_ms: 10,
+                latency_p99_ms: 10,
+                distinct_principal_count: 0,
+                status_counts: &[(200, 1)],
+            },
+        );
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let policy = TempPolicyFile::new(&traffic_policy_document_string());
+        let router = traffic_admin_router_with_policy_and_audit(
+            Some(&discovery_db.path),
+            None,
+            &policy,
+            audit_log,
+        );
+        let body = json!({
+            "method": "GET",
+            "endpoint_template": "/reviewed/{id}",
+            "reviewed": true
+        })
+        .to_string();
+
+        let unauthenticated = router
+            .clone()
+            .oneshot(traffic_admin_json_request(
+                Method::POST,
+                TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE,
+                None,
+                Some(body.clone()),
+            ))
+            .await
+            .expect("traffic review request should complete");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let read_only = router
+            .clone()
+            .oneshot(traffic_admin_json_request(
+                Method::POST,
+                TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["traffic-reader"])),
+                Some(body.clone()),
+            ))
+            .await
+            .expect("traffic review request should complete");
+        assert_eq!(read_only.status(), StatusCode::FORBIDDEN);
+
+        let marked = router
+            .clone()
+            .oneshot(traffic_admin_json_request(
+                Method::POST,
+                TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["traffic-writer"])),
+                Some(body),
+            ))
+            .await
+            .expect("traffic review request should complete");
+        assert_eq!(marked.status(), StatusCode::OK);
+        let marked_body = json_body(marked).await;
+        assert_eq!(marked_body["reviewed"], json!(true));
+        assert!(marked_body["reviewed_at"].as_str().is_some());
+        assert_eq!(marked_body["reviewed_by"], json!("user-123"));
+
+        let template = query_encode("/reviewed/{id}");
+        let detail = traffic_json(
+            &router,
+            &format!("/v1/admin/traffic/endpoint?method=GET&endpoint_template={template}"),
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(detail["endpoint"]["reviewed"], json!(true));
+        assert_eq!(
+            detail["endpoint"]["reviewed_at"],
+            marked_body["reviewed_at"]
+        );
+        assert_eq!(detail["endpoint"]["reviewed_by"], json!("user-123"));
+
+        let reviewed_list = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?reviewed=true",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            endpoint_templates(&reviewed_list),
+            vec!["/reviewed/{id}".to_owned()]
+        );
+        assert_eventually(Duration::from_secs(1), || {
+            capture
+                .events()
+                .iter()
+                .any(|event| event.event_type == audit::event::TRAFFIC_ENDPOINT_REVIEW_CHANGED)
+        });
+
+        let cleared = router
+            .clone()
+            .oneshot(traffic_admin_json_request(
+                Method::POST,
+                TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["traffic-writer"])),
+                Some(
+                    json!({
+                        "method": "GET",
+                        "endpoint_template": "/reviewed/{id}",
+                        "reviewed": false
+                    })
+                    .to_string(),
+                ),
+            ))
+            .await
+            .expect("traffic review clear request should complete");
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let cleared_body = json_body(cleared).await;
+        assert_eq!(cleared_body["reviewed"], json!(false));
+        assert!(cleared_body["reviewed_at"].is_null());
+        assert!(cleared_body["reviewed_by"].is_null());
+
+        let unreviewed_list = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?reviewed=false",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            endpoint_templates(&unreviewed_list),
+            vec!["/reviewed/{id}".to_owned()]
+        );
+    }
+
+    #[test]
+    fn endpoint_rule_coverage_without_rbac_is_false() {
+        assert!(!endpoint_covered_by_active_direct_rule(
+            None,
+            "GET",
+            "/anything/{id}"
+        ));
+    }
+
+    #[tokio::test]
     async fn traffic_endpoint_detail_paginates_principals() {
         let discovery_db = TempDb::new("traffic-principals");
         create_discovery_schema(&discovery_db.path);
@@ -9552,6 +10231,9 @@ mod tests {
             .rbac_exempt_paths
             .push(TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE.to_owned());
         config
+            .rbac_exempt_paths
+            .push(TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE.to_owned());
+        config
     }
 
     fn traffic_admin_router(
@@ -9559,22 +10241,67 @@ mod tests {
         audit_path: Option<&PathBuf>,
     ) -> (Router, TempPolicyFile) {
         let policy = TempPolicyFile::new(&traffic_policy_document_string());
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let router = app(
-            traffic_admin_config(discovery_path, audit_path, &policy),
-            recorder.handle(),
-            test_audit_log(),
-            test_audit_event_sender(),
-        )
-        .expect("app should build");
+        let router = traffic_admin_router_with_policy(discovery_path, audit_path, &policy);
 
         (router, policy)
+    }
+
+    fn traffic_admin_router_with_policy(
+        discovery_path: Option<&PathBuf>,
+        audit_path: Option<&PathBuf>,
+        policy: &TempPolicyFile,
+    ) -> Router {
+        traffic_admin_router_with_policy_and_audit(
+            discovery_path,
+            audit_path,
+            policy,
+            test_audit_log(),
+        )
+    }
+
+    fn traffic_admin_router_with_policy_and_audit(
+        discovery_path: Option<&PathBuf>,
+        audit_path: Option<&PathBuf>,
+        policy: &TempPolicyFile,
+        audit_log: audit::AuditLog,
+    ) -> Router {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        app(
+            traffic_admin_config(discovery_path, audit_path, policy),
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
     }
 
     fn traffic_admin_request(uri: &str, principal: Option<auth::Principal>) -> Request<Body> {
         let mut request = Request::builder()
             .uri(uri)
             .body(Body::empty())
+            .expect("request should build");
+        if let Some(principal) = principal {
+            request.extensions_mut().insert(principal);
+        }
+
+        request
+    }
+
+    fn traffic_admin_json_request(
+        method: Method,
+        uri: &str,
+        principal: Option<auth::Principal>,
+        body: Option<String>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method(method.clone()).uri(uri);
+        if matches!(method, Method::POST | Method::PUT | Method::PATCH) {
+            builder = builder
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test-token");
+        }
+
+        let mut request = builder
+            .body(Body::from(body.unwrap_or_default()))
             .expect("request should build");
         if let Some(principal) = principal {
             request.extensions_mut().insert(principal);
@@ -9594,7 +10321,32 @@ mod tests {
         json_body(response).await
     }
 
+    async fn wait_for_traffic_json(
+        router: &Router,
+        uri: &str,
+        condition: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let started = Instant::now();
+
+        loop {
+            let body = traffic_json(router, uri, Some(test_principal(&["traffic-reader"]))).await;
+            if condition(&body) {
+                return body;
+            }
+
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "traffic response did not match condition within reload window: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     fn traffic_policy_document_string() -> String {
+        traffic_policy_document_with_rules(json!([]))
+    }
+
+    fn traffic_policy_document_with_rules(rules: Value) -> String {
         serde_json::to_string_pretty(&json!({
             "schema_version": "0.1.0",
             "default_action": "deny",
@@ -9603,10 +10355,17 @@ mod tests {
                 "traffic-reader": {
                     "permissions": [ADMIN_TRAFFIC_READ_PERMISSION]
                 },
+                "traffic-writer": {
+                    "permissions": [
+                        ADMIN_TRAFFIC_READ_PERMISSION,
+                        ADMIN_TRAFFIC_WRITE_PERMISSION
+                    ]
+                },
                 "reader": {
                     "permissions": []
                 }
-            }
+            },
+            "rules": rules
         }))
         .expect("traffic policy should serialize")
     }
@@ -10099,6 +10858,44 @@ mod tests {
                     .as_str()
                     .expect("endpoint_template should be a string")
                     .to_owned()
+            })
+            .collect()
+    }
+
+    fn endpoint_coverage(body: &Value) -> HashMap<String, bool> {
+        body["endpoints"]
+            .as_array()
+            .expect("endpoints should be an array")
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint["endpoint_template"]
+                        .as_str()
+                        .expect("endpoint_template should be a string")
+                        .to_owned(),
+                    endpoint["covered_by_rule"]
+                        .as_bool()
+                        .expect("covered_by_rule should be a boolean"),
+                )
+            })
+            .collect()
+    }
+
+    fn endpoint_new_flags(body: &Value) -> HashMap<String, bool> {
+        body["endpoints"]
+            .as_array()
+            .expect("endpoints should be an array")
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint["endpoint_template"]
+                        .as_str()
+                        .expect("endpoint_template should be a string")
+                        .to_owned(),
+                    endpoint["is_new"]
+                        .as_bool()
+                        .expect("is_new should be a boolean"),
+                )
             })
             .collect()
     }
@@ -10872,6 +11669,11 @@ O2gecI9QwDJNpm29J9wJB2F8
                 .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
 
             Self { path }
+        }
+
+        fn write(&self, contents: &str) {
+            fs::write(&self.path, contents)
+                .unwrap_or_else(|err| panic!("failed to write {}: {err}", self.path.display()));
         }
     }
 
