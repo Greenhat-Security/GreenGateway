@@ -10,8 +10,14 @@ use serde_json::Value;
 
 use crate::config::Config;
 
-const KNOWN_TOP_LEVEL_KEYS: &[&str] =
-    &["schema_version", "id", "default_action", "roles", "routes"];
+const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "schema_version",
+    "id",
+    "default_action",
+    "enforcement_mode",
+    "roles",
+    "routes",
+];
 
 /// Action to apply when no route rule matches.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -28,6 +34,15 @@ impl Default for DefaultAction {
     }
 }
 
+/// Enforcement behavior for authorization denials.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnforcementMode {
+    #[default]
+    Enforce,
+    Shadow,
+}
+
 /// RBAC policy document.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Policy {
@@ -40,6 +55,9 @@ pub struct Policy {
     /// kernel only stores this value.
     #[serde(default)]
     pub default_action: DefaultAction,
+    /// Governs whether deny decisions block or are observed as would-deny events.
+    #[serde(default)]
+    pub enforcement_mode: EnforcementMode,
     #[serde(default)]
     pub roles: HashMap<String, RoleEntry>,
     /// Ordered route-to-permission rules. First matching rule wins.
@@ -66,6 +84,9 @@ pub struct RouteRule {
     pub path_prefix: String,
     /// Permission required to access a matching route.
     pub permission: String,
+    /// Optional per-rule enforcement override. Unset inherits the policy default.
+    #[serde(default)]
+    pub enforcement_mode: Option<EnforcementMode>,
 }
 
 #[derive(Debug)]
@@ -275,6 +296,89 @@ mod tests {
     }
 
     #[test]
+    fn enforcement_mode_parses_shadow_and_defaults_to_enforce() {
+        let file = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "enforcement_mode": "shadow",
+                "roles": {
+                    "reader": { "permissions": ["data:read"] }
+                },
+                "routes": [
+                    {
+                        "path_prefix": "/admin",
+                        "permission": "admin:read",
+                        "enforcement_mode": "enforce"
+                    },
+                    {
+                        "path_prefix": "/data",
+                        "permission": "data:read"
+                    }
+                ]
+            }"#,
+        );
+
+        let policy = Policy::from_file(file.path()).expect("enforcement_mode should parse");
+
+        assert_eq!(policy.enforcement_mode, EnforcementMode::Shadow);
+        assert_eq!(
+            policy.routes[0].enforcement_mode,
+            Some(EnforcementMode::Enforce)
+        );
+        assert_eq!(policy.routes[1].enforcement_mode, None);
+
+        let file = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "roles": {
+                    "reader": { "permissions": ["data:read"] }
+                }
+            }"#,
+        );
+
+        let policy = Policy::from_file(file.path()).expect("missing enforcement_mode should parse");
+
+        assert_eq!(policy.enforcement_mode, EnforcementMode::Enforce);
+    }
+
+    #[test]
+    fn invalid_enforcement_mode_is_rejected() {
+        for document in [
+            r#"{
+                "schema_version": "0.1.0",
+                "enforcement_mode": "maybe",
+                "roles": {
+                    "reader": { "permissions": ["data:read"] }
+                }
+            }"#,
+            r#"{
+                "schema_version": "0.1.0",
+                "roles": {
+                    "reader": { "permissions": ["data:read"] }
+                },
+                "routes": [
+                    {
+                        "path_prefix": "/data",
+                        "permission": "data:read",
+                        "enforcement_mode": "maybe"
+                    }
+                ]
+            }"#,
+        ] {
+            let file = TempPolicyFile::new(document);
+
+            let error =
+                Policy::from_file(file.path()).expect_err("bad enforcement_mode should fail");
+
+            assert!(matches!(error, PolicyError::Parse { .. }));
+            assert!(
+                error.to_string().contains("expected `enforce` or `shadow`"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn bad_schema_version_is_rejected() {
         for schema_version in ["1.0.0", "nope"] {
             let file = TempPolicyFile::new(&format!(
@@ -463,15 +567,24 @@ mod tests {
         assert_eq!(policy.schema_version, "0.1.0");
         assert_eq!(policy.id.as_deref(), Some("starter"));
         assert_eq!(policy.default_action, DefaultAction::Allow);
+        assert_eq!(policy.enforcement_mode, EnforcementMode::Enforce);
         assert!(policy.roles.is_empty());
         assert!(policy.routes.is_empty());
         assert_schema_accepts(&policy_schema_validator(), &value);
     }
 
     #[test]
-    fn published_schema_accepts_policy_with_routes() {
+    fn published_schema_accepts_enforcement_mode_at_top_level_and_route_level() {
         let validator = policy_schema_validator();
-        let policy = json!({
+        let top_level_policy = json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "enforcement_mode": "shadow",
+            "roles": {
+                "reader": { "permissions": ["data:read"] }
+            }
+        });
+        let route_override_policy = json!({
             "schema_version": "0.1.0",
             "default_action": "deny",
             "roles": {
@@ -481,16 +594,47 @@ mod tests {
                 {
                     "methods": ["GET", "HEAD"],
                     "path_prefix": "/data",
-                    "permission": "data:read"
+                    "permission": "data:read",
+                    "enforcement_mode": "shadow"
                 },
                 {
                     "path_prefix": "/admin",
-                    "permission": "admin:read"
+                    "permission": "admin:read",
+                    "enforcement_mode": "enforce"
                 }
             ]
         });
 
-        assert_schema_accepts(&validator, &policy);
+        assert_schema_accepts(&validator, &top_level_policy);
+        assert_schema_accepts(&validator, &route_override_policy);
+    }
+
+    #[test]
+    fn published_schema_rejects_bad_enforcement_mode_values() {
+        let validator = policy_schema_validator();
+        let top_level_policy = json!({
+            "schema_version": "0.1.0",
+            "enforcement_mode": "maybe"
+        });
+        let route_override_policy = json!({
+            "schema_version": "0.1.0",
+            "routes": [
+                {
+                    "path_prefix": "/data",
+                    "permission": "data:read",
+                    "enforcement_mode": "maybe"
+                }
+            ]
+        });
+
+        assert!(
+            !validator.is_valid(&top_level_policy),
+            "published schema should reject a bad top-level enforcement_mode"
+        );
+        assert!(
+            !validator.is_valid(&route_override_policy),
+            "published schema should reject a bad route enforcement_mode"
+        );
     }
 
     #[test]
@@ -553,6 +697,7 @@ mod tests {
             methods: Vec::new(),
             path_prefix: path_prefix.to_owned(),
             permission: permission.to_owned(),
+            enforcement_mode: None,
         }
     }
 

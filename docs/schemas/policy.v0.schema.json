@@ -22,6 +22,9 @@
         "deny"
       ]
     },
+    "enforcement_mode": {
+      "$ref": "#/$defs/enforcement_mode"
+    },
     "roles": {
       "type": "object",
       "additionalProperties": {
@@ -37,6 +40,12 @@
     }
   },
   "$defs": {
+    "enforcement_mode": {
+      "enum": [
+        "enforce",
+        "shadow"
+      ]
+    },
     "role_entry": {
       "type": "object",
       "additionalProperties": false,
@@ -71,6 +80,10 @@
         "permission": {
           "type": "string",
           "description": "Permission required to access a matching route."
+        },
+        "enforcement_mode": {
+          "$ref": "#/$defs/enforcement_mode",
+          "description": "Optional rule-level override for whether deny decisions block or emit authz.would_deny and forward."
         }
       }
     }
