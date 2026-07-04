@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::rule::{
-    valid_auth_method_name, Rule, AUTH_METHOD_BEARER_TOKEN, AUTH_METHOD_SESSION_COOKIE,
+    valid_auth_method_name, PrincipalMatcher, Rule, AUTH_METHOD_BEARER_TOKEN,
+    AUTH_METHOD_SESSION_COOKIE,
 };
 use crate::config::Config;
 
@@ -26,6 +27,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "routes",
     "rules",
     "egress",
+    "rate_limits",
 ];
 #[allow(dead_code)]
 const TEMP_FILE_CREATE_ATTEMPTS: u8 = 16;
@@ -58,7 +60,7 @@ pub enum EnforcementMode {
 }
 
 /// RBAC policy document.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Policy {
     pub schema_version: String,
     #[serde(default)]
@@ -85,6 +87,10 @@ pub struct Policy {
     #[serde(default)]
     #[serde(skip_serializing_if = "EgressPolicy::is_empty")]
     pub egress: EgressPolicy,
+    /// Ordered rate-limit override rules. First matching rule wins.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rate_limits: Vec<RateLimitRule>,
 }
 
 /// Permissions granted by one role.
@@ -137,6 +143,30 @@ pub struct EgressPolicy {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<u16>,
+}
+
+/// Policy-driven rate-limit override rule.
+///
+/// Rules are evaluated in document order with first-match-wins semantics.
+/// Empty `methods` match any method. An omitted `path` matches any request
+/// path; when present, it uses the same anchored segment glob syntax as
+/// direct firewall rule paths.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitRule {
+    /// Optional principal constraints. Empty or omitted means any principal,
+    /// authenticated or not.
+    #[serde(default)]
+    pub principal: PrincipalMatcher,
+    /// HTTP methods this rule matches. Empty or ["*"] matches any method.
+    #[serde(default)]
+    pub methods: Vec<String>,
+    /// Absolute path pattern matched against the whole request path.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub requests_per_second: f64,
+    pub burst: u32,
 }
 
 #[derive(Debug)]
@@ -229,6 +259,7 @@ impl Policy {
         }
 
         validate_rules(&self.rules)?;
+        validate_rate_limits(&self.rate_limits)?;
 
         self.egress.validate()
     }
@@ -243,14 +274,53 @@ fn validate_rules(rules: &[Rule]) -> Result<(), PolicyError> {
             )));
         }
 
-        for auth_method in &rule.principal.auth_methods {
-            if !valid_auth_method_name(auth_method) {
+        validate_principal_matcher(&rule.principal, &format!("rules[{rule_index}].principal"))?;
+    }
+
+    Ok(())
+}
+
+fn validate_rate_limits(rate_limits: &[RateLimitRule]) -> Result<(), PolicyError> {
+    for (rule_index, rule) in rate_limits.iter().enumerate() {
+        if !rule.requests_per_second.is_finite() || rule.requests_per_second <= 0.0 {
+            return Err(PolicyError::Invalid(format!(
+                "rate_limits[{rule_index}].requests_per_second must be finite and positive"
+            )));
+        }
+
+        if rule.burst == 0 {
+            return Err(PolicyError::Invalid(format!(
+                "rate_limits[{rule_index}].burst must be positive"
+            )));
+        }
+
+        if let Some(path) = rule.path.as_ref() {
+            if !path.starts_with('/') {
                 return Err(PolicyError::Invalid(format!(
-                    "rules[{rule_index}].principal.auth_methods contains unknown auth method \
-                     '{auth_method}', expected '{AUTH_METHOD_BEARER_TOKEN}' or \
-                     '{AUTH_METHOD_SESSION_COOKIE}'"
+                    "rate_limits[{rule_index}].path must start with '/', got '{path}'"
                 )));
             }
+        }
+
+        validate_principal_matcher(
+            &rule.principal,
+            &format!("rate_limits[{rule_index}].principal"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_principal_matcher(
+    principal: &PrincipalMatcher,
+    field_path: &str,
+) -> Result<(), PolicyError> {
+    for auth_method in &principal.auth_methods {
+        if !valid_auth_method_name(auth_method) {
+            return Err(PolicyError::Invalid(format!(
+                "{field_path}.auth_methods contains unknown auth method '{auth_method}', expected \
+                 '{AUTH_METHOD_BEARER_TOKEN}' or '{AUTH_METHOD_SESSION_COOKIE}'"
+            )));
         }
     }
 
@@ -569,6 +639,7 @@ mod tests {
         );
         assert!(policy.routes.is_empty());
         assert!(policy.rules.is_empty());
+        assert!(policy.rate_limits.is_empty());
     }
 
     #[test]
@@ -852,6 +923,156 @@ mod tests {
             serde_json::from_value(round_trip_value).expect("serialized policy should parse");
 
         assert_eq!(round_tripped, policy);
+    }
+
+    #[test]
+    fn rate_limits_section_parses_and_round_trips_as_ordered_first_match_rules() {
+        let file = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "rate_limits": [
+                    {
+                        "methods": ["GET", "HEAD"],
+                        "path": "/api/users/{id}",
+                        "principal": {
+                            "roles": ["admin", "support"],
+                            "auth_methods": ["bearer_token"],
+                            "principal_ids": ["user-123"]
+                        },
+                        "requests_per_second": 25.5,
+                        "burst": 50
+                    },
+                    {
+                        "principal": {},
+                        "requests_per_second": 5.0,
+                        "burst": 10
+                    }
+                ]
+            }"#,
+        );
+
+        let policy = Policy::from_file(file.path()).expect("rate_limits section should parse");
+
+        assert_eq!(policy.rate_limits.len(), 2);
+        assert_eq!(
+            policy.rate_limits[0].methods,
+            vec!["GET".to_owned(), "HEAD".to_owned()]
+        );
+        assert_eq!(
+            policy.rate_limits[0].path.as_deref(),
+            Some("/api/users/{id}")
+        );
+        assert_eq!(
+            policy.rate_limits[0].principal,
+            PrincipalMatcher {
+                roles: vec!["admin".to_owned(), "support".to_owned()],
+                auth_methods: vec!["bearer_token".to_owned()],
+                principal_ids: vec!["user-123".to_owned()],
+            }
+        );
+        assert_eq!(policy.rate_limits[0].requests_per_second, 25.5);
+        assert_eq!(policy.rate_limits[0].burst, 50);
+        assert!(policy.rate_limits[1].methods.is_empty());
+        assert!(policy.rate_limits[1].path.is_none());
+        assert!(policy.rate_limits[1].principal.is_unconstrained());
+
+        let round_trip_value =
+            serde_json::to_value(&policy).expect("policy with rate_limits should serialize");
+        let round_tripped: Policy =
+            serde_json::from_value(round_trip_value).expect("serialized policy should parse");
+
+        assert_eq!(round_tripped, policy);
+    }
+
+    #[test]
+    fn malformed_rate_limits_are_rejected_by_parser_and_schema() {
+        let cases = [
+            (
+                "zero rps",
+                json!({
+                    "schema_version": "0.1.0",
+                    "rate_limits": [
+                        {
+                            "requests_per_second": 0.0,
+                            "burst": 1
+                        }
+                    ]
+                }),
+                "requests_per_second must be finite and positive",
+            ),
+            (
+                "negative rps",
+                json!({
+                    "schema_version": "0.1.0",
+                    "rate_limits": [
+                        {
+                            "requests_per_second": -1.0,
+                            "burst": 1
+                        }
+                    ]
+                }),
+                "requests_per_second must be finite and positive",
+            ),
+            (
+                "zero burst",
+                json!({
+                    "schema_version": "0.1.0",
+                    "rate_limits": [
+                        {
+                            "requests_per_second": 1.0,
+                            "burst": 0
+                        }
+                    ]
+                }),
+                "burst must be positive",
+            ),
+            (
+                "non-absolute path",
+                json!({
+                    "schema_version": "0.1.0",
+                    "rate_limits": [
+                        {
+                            "path": "api/**",
+                            "requests_per_second": 1.0,
+                            "burst": 1
+                        }
+                    ]
+                }),
+                "path must start with '/'",
+            ),
+            (
+                "unknown auth method",
+                json!({
+                    "schema_version": "0.1.0",
+                    "rate_limits": [
+                        {
+                            "principal": {
+                                "auth_methods": ["api_key"]
+                            },
+                            "requests_per_second": 1.0,
+                            "burst": 1
+                        }
+                    ]
+                }),
+                "unknown auth method 'api_key'",
+            ),
+        ];
+        let validator = policy_schema_validator();
+
+        for (name, value, expected_error) in cases {
+            assert!(
+                !validator.is_valid(&value),
+                "published schema should reject {name}"
+            );
+
+            let error = Policy::from_json_value(value, None)
+                .expect_err("malformed rate_limit should fail parser or validation");
+
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error for {name}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1234,6 +1455,7 @@ mod tests {
         assert!(policy.roles.is_empty());
         assert!(policy.routes.is_empty());
         assert!(policy.rules.is_empty());
+        assert!(policy.rate_limits.is_empty());
         assert_schema_accepts(&policy_schema_validator(), &value);
     }
 
@@ -1309,6 +1531,35 @@ mod tests {
         });
 
         assert_schema_accepts(&validator, &policy);
+    }
+
+    #[test]
+    fn published_schema_accepts_policy_with_rate_limits() {
+        let validator = policy_schema_validator();
+        let policy = json!({
+            "schema_version": "0.1.0",
+            "rate_limits": [
+                {
+                    "methods": ["GET", "HEAD"],
+                    "path": "/api/users/{id}",
+                    "principal": {
+                        "roles": ["admin", "support"],
+                        "auth_methods": ["bearer_token"],
+                        "principal_ids": ["user-123"]
+                    },
+                    "requests_per_second": 25.5,
+                    "burst": 50
+                },
+                {
+                    "requests_per_second": 5.0,
+                    "burst": 10
+                }
+            ]
+        });
+
+        assert_schema_accepts(&validator, &policy);
+        Policy::from_json_value(policy, None)
+            .expect("schema-valid rate_limits policy should parse");
     }
 
     #[test]
@@ -1500,6 +1751,17 @@ mod tests {
             ],
             rules: Vec::new(),
             egress: EgressPolicy::default(),
+            rate_limits: vec![RateLimitRule {
+                principal: PrincipalMatcher {
+                    roles: vec!["admin".to_owned()],
+                    auth_methods: vec!["bearer_token".to_owned()],
+                    principal_ids: Vec::new(),
+                },
+                methods: vec!["GET".to_owned()],
+                path: Some("/admin/**".to_owned()),
+                requests_per_second: 20.0,
+                burst: 40,
+            }],
         }
     }
 

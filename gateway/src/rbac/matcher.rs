@@ -53,6 +53,20 @@ pub(super) fn rule_matches(
     CompiledRule::new(0, rule).matches(method, path, principal)
 }
 
+/// Standalone method matcher reusing the hardened, anchored implementation
+/// backing `RuleMatcher`, for callers (e.g. rate-limit overrides) that need
+/// the same semantics without a full `Rule`.
+pub(crate) fn method_matches(methods: &[String], method: &str) -> bool {
+    MethodMatcher::new(methods).matches(method)
+}
+
+/// Standalone path-pattern matcher reusing the hardened, anchored
+/// implementation backing `RuleMatcher`, for callers (e.g. rate-limit
+/// overrides) that need the same semantics without a full `Rule`.
+pub(crate) fn path_pattern_matches(pattern: &str, path: &str) -> bool {
+    PathPattern::new(pattern).matches(path)
+}
+
 #[derive(Debug, Clone)]
 struct CompiledRule {
     rule_index: usize,
