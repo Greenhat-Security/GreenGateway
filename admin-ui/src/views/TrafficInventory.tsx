@@ -32,6 +32,10 @@ const METHOD_OPTIONS = [
   'OPTIONS',
 ];
 
+// Renders a flat, sortable/filterable list rather than grouping by upstream:
+// discovery_endpoint_aggregates is keyed only by (method, endpoint_template),
+// with no record of which upstream route produced an observation, so there is
+// no data to group by yet. Revisit once that gap is closed upstream.
 export function TrafficInventory() {
   const [filters, setFilters] = useState<TrafficFilters>(() =>
     emptyTrafficFilters(),
