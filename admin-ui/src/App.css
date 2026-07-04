@@ -1413,6 +1413,108 @@ select:focus-visible {
   background: var(--gh-sys-danger-subtle);
 }
 
+.policy-history-list {
+  display: grid;
+  overflow: hidden;
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-comp-card-radius);
+  margin: 0;
+  padding: 0;
+  background: var(--gh-sys-bg-canvas);
+  list-style: none;
+}
+
+.policy-history-entry {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  border-bottom: 1px solid var(--gh-sys-border);
+}
+
+.policy-history-entry:last-child {
+  border-bottom: 0;
+}
+
+.policy-history-marker {
+  position: relative;
+  min-height: 100%;
+}
+
+.policy-history-marker::before {
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 16px;
+  width: 2px;
+  background: var(--gh-sys-border);
+  content: "";
+}
+
+.policy-history-marker::after {
+  position: absolute;
+  inset-block-start: 24px;
+  inset-inline-start: 11px;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--gh-sys-primary);
+  border-radius: 50%;
+  background: var(--gh-sys-bg-canvas);
+  content: "";
+}
+
+.policy-history-content {
+  display: grid;
+  gap: 14px;
+  padding: 16px 16px 16px 4px;
+}
+
+.policy-history-entry-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.policy-history-entry-heading h3 {
+  margin: 8px 0 0;
+  color: var(--gh-sys-fg);
+  font-size: var(--gh-type-body);
+  line-height: var(--gh-lh-body);
+  overflow-wrap: anywhere;
+}
+
+.policy-history-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin: 0;
+}
+
+.policy-history-meta div {
+  display: grid;
+  gap: 2px;
+}
+
+.policy-history-meta dt {
+  color: var(--gh-sys-fg-subtle);
+  font-size: var(--gh-type-caption);
+  font-weight: 700;
+  line-height: var(--gh-lh-caption);
+  text-transform: uppercase;
+}
+
+.policy-history-meta dd {
+  margin: 0;
+  color: var(--gh-sys-fg-muted);
+  font-size: var(--gh-type-body-sm);
+  line-height: var(--gh-lh-body-sm);
+  overflow-wrap: anywhere;
+}
+
+.policy-history-actions,
+.policy-history-footer {
+  display: flex;
+  justify-content: flex-start;
+}
+
 .expand-button {
   display: inline-grid;
   width: 30px;
