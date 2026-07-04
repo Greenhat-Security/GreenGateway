@@ -1,16 +1,22 @@
-use std::{convert::Infallible, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::get,
+    routing::{any, get},
     Extension, Json, Router,
 };
-use futures_util::{stream, Stream};
-use http::{header, HeaderName, HeaderValue, Method, Request, StatusCode};
+use futures_util::{stream, Stream, StreamExt};
+use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -20,6 +26,7 @@ use tower_http::{
     request_id::{MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
     trace::TraceLayer,
 };
+use url::Url;
 
 mod audit;
 mod auth;
@@ -40,6 +47,7 @@ const AUDIT_ADMIN_ROUTE: &str = "/v1/admin/audit";
 const AUDIT_EVENTS_STREAM_ROUTE: &str = "/v1/admin/events/stream";
 const STATUS_ADMIN_ROUTE: &str = "/v1/admin/status";
 const AUDIT_ADMIN_ROLE: &str = "admin";
+const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
 const MAX_AUDIT_QUERY_LIMIT: usize = 500;
 
@@ -50,6 +58,14 @@ struct AdminUiAssets;
 #[derive(Clone)]
 struct AppState {
     metrics_handle: PrometheusHandle,
+    proxy: Option<ProxyState>,
+}
+
+#[derive(Clone)]
+struct ProxyState {
+    upstream_origin: String,
+    egress_client: Arc<egress::EgressClient>,
+    max_request_body_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -248,6 +264,7 @@ fn app_with_process_started_at(
     let egress_client = Arc::new(egress::EgressClient::new(
         egress::EgressConfig::from_config(&config),
     )?);
+    let proxy_state = ProxyState::from_config(&config, Arc::clone(&egress_client));
     let validator = auth::JwtValidator::from_config(&config, egress_client)?
         .map(|validator| Arc::new(validator) as Arc<dyn auth::SessionValidator>);
     let loaded_policy = rbac::Policy::from_config(&config)?;
@@ -291,8 +308,19 @@ fn app_with_process_started_at(
         .route("/metrics", get(metrics_endpoint))
         .route(ADMIN_UI_ROUTE, get(admin_ui_index))
         .route("/admin/", get(admin_ui_index))
-        .route("/admin/{*path}", get(admin_ui_asset))
-        .with_state(AppState { metrics_handle })
+        .route("/admin/{*path}", get(admin_ui_asset));
+
+    let router = if proxy_state.is_some() {
+        router.fallback(any(proxy_fallback))
+    } else {
+        router
+    };
+
+    let router = router
+        .with_state(AppState {
+            metrics_handle,
+            proxy: proxy_state,
+        })
         .merge(
             Router::new()
                 .route(AUDIT_ADMIN_ROUTE, get(audit_query_endpoint))
@@ -449,6 +477,196 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
         )],
         state.metrics_handle.render(),
     )
+}
+
+impl ProxyState {
+    fn from_config(
+        config: &config::Config,
+        egress_client: Arc<egress::EgressClient>,
+    ) -> Option<Self> {
+        let upstream_url = config.upstream_url.as_deref()?;
+        let upstream = Url::parse(upstream_url)
+            .expect("validated UPSTREAM_URL should parse when building proxy state");
+
+        Some(Self {
+            upstream_origin: upstream.origin().ascii_serialization(),
+            egress_client,
+            max_request_body_bytes: config.egress_max_request_body_bytes,
+        })
+    }
+}
+
+async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -> Response {
+    record_request(PROXY_FALLBACK_ROUTE);
+
+    let Some(proxy) = state.proxy.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let (parts, body) = request.into_parts();
+    let target_url = proxy_target_url(&proxy.upstream_origin, &parts.uri);
+    let mut headers = strip_hop_by_hop_headers(&parts.headers);
+    if let Some(request_id) = parts.headers.get(REQUEST_ID_HEADER) {
+        headers.insert(request_id_header(), request_id.clone());
+    }
+    let request_id = parts.headers.get(REQUEST_ID_HEADER).cloned();
+    let body = match axum::body::to_bytes(body, proxy.max_request_body_bytes).await {
+        Ok(body) if body.is_empty() => None,
+        Ok(body) => Some(body.to_vec()),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                max = proxy.max_request_body_bytes,
+                "failed to read proxied request body"
+            );
+            return payload_too_large(proxy.max_request_body_bytes);
+        }
+    };
+
+    let upstream_started = Instant::now();
+    let upstream = match proxy
+        .egress_client
+        .stream_request_with_headers(parts.method, &target_url, headers, body)
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            let latency_ms = duration_millis(upstream_started.elapsed());
+            tracing::warn!(error = %err, "proxied upstream request failed");
+            let mut response = proxy_error_response(&err);
+            response
+                .extensions_mut()
+                .insert(middleware::decision::UpstreamOutcome {
+                    latency_ms,
+                    status: None,
+                });
+            if let Some(request_id) = request_id {
+                response
+                    .headers_mut()
+                    .insert(request_id_header(), request_id);
+            }
+            return response;
+        }
+    };
+    let upstream_latency_ms = duration_millis(upstream_started.elapsed());
+    let upstream_status = upstream.status;
+    let upstream_headers = strip_hop_by_hop_headers(&upstream.headers);
+    let mut upstream_body = upstream.body;
+    let first_chunk = match upstream_body.next().await {
+        Some(Ok(chunk)) => Some(chunk),
+        Some(Err(err)) => {
+            let latency_ms = duration_millis(upstream_started.elapsed());
+            tracing::warn!(error = %err, "proxied upstream response body failed");
+            let mut response = proxy_error_response(&err);
+            response
+                .extensions_mut()
+                .insert(middleware::decision::UpstreamOutcome {
+                    latency_ms,
+                    status: None,
+                });
+            if let Some(request_id) = request_id {
+                response
+                    .headers_mut()
+                    .insert(request_id_header(), request_id);
+            }
+            return response;
+        }
+        None => None,
+    };
+    let response_body = match first_chunk {
+        Some(chunk) => Body::from_stream(
+            stream::once(async move { Ok::<_, egress::EgressError>(chunk) }).chain(upstream_body),
+        ),
+        None => Body::empty(),
+    };
+    let mut response = Response::new(response_body);
+    *response.status_mut() = upstream_status;
+    *response.headers_mut() = upstream_headers;
+    response
+        .extensions_mut()
+        .insert(middleware::decision::UpstreamOutcome {
+            latency_ms: upstream_latency_ms,
+            status: Some(upstream_status.as_u16()),
+        });
+    if let Some(request_id) = request_id {
+        response
+            .headers_mut()
+            .insert(request_id_header(), request_id);
+    }
+
+    response
+}
+
+fn proxy_target_url(upstream_origin: &str, uri: &http::Uri) -> String {
+    let path_and_query = uri.path_and_query().map_or("/", |value| value.as_str());
+    format!("{upstream_origin}{path_and_query}")
+}
+
+fn strip_hop_by_hop_headers(headers: &HeaderMap) -> HeaderMap {
+    let connection_named_headers = connection_named_headers(headers);
+    let mut forwarded = HeaderMap::new();
+
+    for (name, value) in headers {
+        if is_hop_by_hop_header(name) || connection_named_headers.contains(name) {
+            continue;
+        }
+        forwarded.append(name.clone(), value.clone());
+    }
+
+    forwarded
+}
+
+fn connection_named_headers(headers: &HeaderMap) -> HashSet<HeaderName> {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .collect()
+}
+
+fn is_hop_by_hop_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "host"
+            | "content-length"
+    )
+}
+
+fn proxy_error_response(error: &egress::EgressError) -> Response {
+    let (status, code) = if error.is_timeout() {
+        (StatusCode::GATEWAY_TIMEOUT, "gateway_timeout")
+    } else {
+        (StatusCode::BAD_GATEWAY, "bad_gateway")
+    };
+
+    (
+        status,
+        Json(ErrorResponse {
+            error: code.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn payload_too_large(max_body_size: usize) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({
+            "error": "payload too large",
+            "max_body_size": max_body_size,
+        })),
+    )
+        .into_response()
 }
 
 async fn status_endpoint(
@@ -792,6 +1010,10 @@ fn record_request(route: &'static str) {
     ::metrics::counter!(REQUEST_COUNTER, "route" => route).increment(1);
 }
 
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 async fn audit_extension_probe_middleware(
     req: axum::extract::Request,
@@ -828,6 +1050,7 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant},
     };
+    use tokio::io::AsyncWriteExt;
     use tower::ServiceExt;
 
     fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
@@ -877,8 +1100,10 @@ mod tests {
                 "/version".to_owned(),
                 "/metrics".to_owned(),
             ],
+            upstream_url: None,
             egress_allowed_hosts: Vec::new(),
             egress_timeout_ms: 30_000,
+            egress_response_idle_timeout_ms: 30_000,
             egress_connect_timeout_ms: 10_000,
             egress_max_response_bytes: 5_242_880,
             egress_max_request_body_bytes: 1_048_576,
@@ -930,6 +1155,140 @@ mod tests {
         ])) as Arc<dyn audit::AuditSink>);
 
         (audit_log, sender)
+    }
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        method: Method,
+        path_and_query: String,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    }
+
+    async fn spawn_capture_upstream() -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::Receiver<CapturedRequest>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let router = Router::new()
+            .fallback(any(capture_upstream))
+            .with_state(sender);
+        let addr = spawn_router(router).await;
+
+        (addr, receiver)
+    }
+
+    async fn spawn_router(router: Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test upstream should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test upstream address should be available");
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("test upstream should serve");
+        });
+
+        addr
+    }
+
+    async fn capture_upstream(
+        State(sender): State<tokio::sync::mpsc::Sender<CapturedRequest>>,
+        request: Request<Body>,
+    ) -> Response {
+        let (parts, body) = request.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("upstream should read request body");
+        let method = parts.method.clone();
+        let path_and_query = parts
+            .uri
+            .path_and_query()
+            .map_or("/", |value| value.as_str())
+            .to_owned();
+        let _ = sender
+            .send(CapturedRequest {
+                method: method.clone(),
+                path_and_query: path_and_query.clone(),
+                headers: parts.headers,
+                body: body.to_vec(),
+            })
+            .await;
+
+        let mut response = (
+            StatusCode::CREATED,
+            format!("upstream {method} {path_and_query}"),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert("x-upstream-end-to-end", HeaderValue::from_static("kept"));
+        response.headers_mut().insert(
+            header::CONNECTION,
+            HeaderValue::from_static("x-upstream-hop"),
+        );
+        response
+            .headers_mut()
+            .insert("x-upstream-hop", HeaderValue::from_static("strip"));
+        response
+            .headers_mut()
+            .insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        response.headers_mut().insert(
+            "proxy-authenticate",
+            HeaderValue::from_static("Basic realm=\"upstream\""),
+        );
+        response
+    }
+
+    async fn delayed_stream_upstream() -> Response {
+        let chunks = futures_util::stream::unfold(0, |index| async move {
+            match index {
+                0 => Some((Ok::<_, Infallible>(bytes::Bytes::from_static(b"first")), 1)),
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    Some((Ok::<_, Infallible>(bytes::Bytes::from_static(b"second")), 2))
+                }
+                _ => None,
+            }
+        });
+
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            Body::from_stream(chunks),
+        )
+            .into_response()
+    }
+
+    fn proxy_config(upstream_addr: std::net::SocketAddr) -> config::Config {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.csrf_enabled = false;
+        config.validation_allowed_content_types = vec![
+            "application/json".to_owned(),
+            "application/octet-stream".to_owned(),
+            "text/plain".to_owned(),
+        ];
+        config.upstream_url = Some(format!(
+            "http://127.0.0.1:{}/ignored-base",
+            upstream_addr.port()
+        ));
+        config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
+        config.egress_deny_private_ips = false;
+        config
+    }
+
+    fn proxy_router(config: config::Config, audit_log: audit::AuditLog) -> Router {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        app(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
     }
 
     async fn preflight_response_to_path(
@@ -1173,6 +1532,363 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| event.event_type.starts_with("auth.")));
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_methods_path_query_headers_and_bodies() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let router = proxy_router(proxy_config(upstream_addr), test_audit_log());
+
+        for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+            let body = if matches!(method, Method::POST | Method::PUT) {
+                format!("body for {method}").into_bytes()
+            } else {
+                Vec::new()
+            };
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri("/api/items/42/?x=1&name=two%20words")
+                        .header(header::AUTHORIZATION, "Bearer upstream-token")
+                        .header(header::COOKIE, "session=abc")
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .header(header::CONNECTION, "keep-alive, x-hop-by-connection")
+                        .header("keep-alive", "timeout=5")
+                        .header("proxy-authorization", "Basic stripped")
+                        .header("te", "trailers")
+                        .header("upgrade", "websocket")
+                        .header(header::CONTENT_LENGTH, "0")
+                        .header("x-hop-by-connection", "strip me")
+                        .header("x-end-to-end", "keep me")
+                        .body(Body::from(body.clone()))
+                        .expect("request should build"),
+                )
+                .await
+                .expect("proxy request should complete");
+
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(
+                response.headers().get("x-upstream-end-to-end"),
+                Some(&HeaderValue::from_static("kept"))
+            );
+            for stripped in [
+                header::CONNECTION.as_str(),
+                "keep-alive",
+                "proxy-authenticate",
+                "transfer-encoding",
+                "content-length",
+                "x-upstream-hop",
+            ] {
+                assert!(
+                    !response.headers().contains_key(stripped),
+                    "proxied response should strip {stripped}"
+                );
+            }
+            let response_request_id = response
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .cloned()
+                .expect("response should contain gateway request id");
+            let response_body = body_string(response).await;
+            assert_eq!(
+                response_body,
+                format!("upstream {method} /api/items/42/?x=1&name=two%20words")
+            );
+
+            let upstream = captured
+                .recv()
+                .await
+                .expect("upstream should receive proxied request");
+            assert_eq!(upstream.method, method);
+            assert_eq!(
+                upstream.path_and_query,
+                "/api/items/42/?x=1&name=two%20words"
+            );
+            assert_eq!(upstream.body, body);
+            assert_eq!(
+                upstream.headers.get(header::AUTHORIZATION),
+                Some(&HeaderValue::from_static("Bearer upstream-token"))
+            );
+            assert_eq!(
+                upstream.headers.get(header::COOKIE),
+                Some(&HeaderValue::from_static("session=abc"))
+            );
+            assert_eq!(
+                upstream.headers.get("x-end-to-end"),
+                Some(&HeaderValue::from_static("keep me"))
+            );
+            if !body.is_empty() {
+                assert_ne!(
+                    upstream.headers.get(header::CONTENT_LENGTH),
+                    Some(&HeaderValue::from_static("0")),
+                    "upstream request should not forward the stale client content-length"
+                );
+            }
+            assert_eq!(
+                upstream.headers.get(REQUEST_ID_HEADER),
+                Some(&response_request_id)
+            );
+            for stripped in [
+                header::CONNECTION.as_str(),
+                "keep-alive",
+                "proxy-authorization",
+                "te",
+                "upgrade",
+                "x-hop-by-connection",
+            ] {
+                assert!(
+                    !upstream.headers.contains_key(stripped),
+                    "upstream request should strip {stripped}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_streams_upstream_response_without_buffering() {
+        let upstream_addr =
+            spawn_router(Router::new().route("/stream", get(delayed_stream_upstream))).await;
+        let router = proxy_router(proxy_config(upstream_addr), test_audit_log());
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            router.oneshot(
+                Request::builder()
+                    .uri("/stream")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            ),
+        )
+        .await
+        .expect("proxy should return response headers before full body is sent")
+        .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_millis(200), body.next())
+            .await
+            .expect("first proxied chunk should arrive")
+            .expect("body should yield first chunk")
+            .expect("first chunk should be ok");
+        assert_eq!(&first[..], b"first");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), body.next())
+                .await
+                .is_err(),
+            "second chunk should not be buffered before upstream sends it"
+        );
+
+        let second = tokio::time::timeout(Duration::from_secs(1), body.next())
+            .await
+            .expect("second proxied chunk should arrive")
+            .expect("body should yield second chunk")
+            .expect("second chunk should be ok");
+        assert_eq!(&second[..], b"second");
+    }
+
+    #[tokio::test]
+    async fn proxy_returns_502_for_reset_upstream_without_leaking_details() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let upstream_addr = listener
+            .local_addr()
+            .expect("listener address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one connection");
+            drop(stream);
+        });
+        let mut config = proxy_config(upstream_addr);
+        config.egress_timeout_ms = 1000;
+        config.egress_connect_timeout_ms = 100;
+        let router = proxy_router(config, test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/unmatched")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(body_string(response).await, r#"{"error":"bad_gateway"}"#);
+        server.await.expect("reset server task should finish");
+    }
+
+    #[tokio::test]
+    async fn proxy_returns_504_for_timed_out_upstream_without_leaking_details() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let upstream_addr = listener
+            .local_addr()
+            .expect("listener address should be available");
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one connection");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let mut config = proxy_config(upstream_addr);
+        config.egress_timeout_ms = 100;
+        config.egress_connect_timeout_ms = 100;
+        let router = proxy_router(config, test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/slow")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"gateway_timeout"}"#
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_returns_504_when_streaming_upstream_body_idles_before_first_chunk() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let upstream_addr = listener
+            .local_addr()
+            .expect("listener address should be available");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one connection");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("test server should write response headers");
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let mut config = proxy_config(upstream_addr);
+        config.egress_timeout_ms = 5_000;
+        config.egress_response_idle_timeout_ms = 100;
+        config.egress_connect_timeout_ms = 100;
+        let router = proxy_router(config, test_audit_log());
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.oneshot(
+                Request::builder()
+                    .uri("/slow-body")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            ),
+        )
+        .await
+        .expect("proxy should return idle timeout response")
+        .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"gateway_timeout"}"#
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn existing_routes_win_over_proxy_fallback() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let router = proxy_router(proxy_config(upstream_addr), test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("health request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_string(response).await, r#"{"status":"ok"}"#);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), captured.recv())
+                .await
+                .is_err(),
+            "health route should not be proxied"
+        );
+    }
+
+    #[tokio::test]
+    async fn unmatched_paths_still_404_when_upstream_url_is_unset() {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.csrf_enabled = false;
+        let router = proxy_router(config, test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/unmatched")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn proxy_observation_event_includes_upstream_latency_and_status() {
+        let (upstream_addr, _) = spawn_capture_upstream().await;
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = proxy_router(proxy_config(upstream_addr), audit_log);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/observed")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eventually(Duration::from_secs(1), || {
+            capture
+                .events()
+                .iter()
+                .any(|event| event.event_type == "http.request_observed")
+        });
+        let observed = capture
+            .events()
+            .into_iter()
+            .find(|event| event.event_type == "http.request_observed")
+            .expect("observation event should be captured");
+        assert_eq!(observed.payload["path"], json!("/observed"));
+        assert_eq!(observed.payload["status"], json!(201));
+        assert_eq!(observed.payload["upstream_status"], json!(201));
+        assert!(observed.payload["upstream_latency_ms"].as_u64().is_some());
     }
 
     #[tokio::test]

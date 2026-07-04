@@ -32,6 +32,7 @@ const DEFAULT_CSRF_COOKIE_NAME: &str = "csrf_token";
 const DEFAULT_CSRF_HEADER_NAME: &str = "x-csrf-token";
 const DEFAULT_CSRF_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_EGRESS_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_EGRESS_RESPONSE_IDLE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_EGRESS_CONNECT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_EGRESS_MAX_RESPONSE_BYTES: usize = 5_242_880;
 const DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
@@ -53,6 +54,7 @@ const EGRESS_CONNECT_TIMEOUT_MS: &str = "EGRESS_CONNECT_TIMEOUT_MS";
 const EGRESS_DENY_PRIVATE_IPS: &str = "EGRESS_DENY_PRIVATE_IPS";
 const EGRESS_MAX_REQUEST_BODY_BYTES: &str = "EGRESS_MAX_REQUEST_BODY_BYTES";
 const EGRESS_MAX_RESPONSE_BYTES: &str = "EGRESS_MAX_RESPONSE_BYTES";
+const EGRESS_RESPONSE_IDLE_TIMEOUT_MS: &str = "EGRESS_RESPONSE_IDLE_TIMEOUT_MS";
 const EGRESS_TIMEOUT_MS: &str = "EGRESS_TIMEOUT_MS";
 const JWT_AUDIENCE: &str = "JWT_AUDIENCE";
 const JWT_ISSUER: &str = "JWT_ISSUER";
@@ -69,6 +71,7 @@ const RATE_LIMIT_WRITE_BURST: &str = "RATE_LIMIT_WRITE_BURST";
 const ROLES_CLAIM: &str = "ROLES_CLAIM";
 const TRUST_PROXY_HEADERS: &str = "TRUST_PROXY_HEADERS";
 const SESSION_COOKIE_NAME: &str = "SESSION_COOKIE_NAME";
+const UPSTREAM_URL: &str = "UPSTREAM_URL";
 const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,8 +105,10 @@ pub struct Config {
     pub csrf_header_name: String,
     pub csrf_cookie_domain: Option<String>,
     pub csrf_exempt_paths: Vec<String>,
+    pub upstream_url: Option<String>,
     pub egress_allowed_hosts: Vec<String>,
     pub egress_timeout_ms: u64,
+    pub egress_response_idle_timeout_ms: u64,
     pub egress_connect_timeout_ms: u64,
     pub egress_max_response_bytes: usize,
     pub egress_max_request_body_bytes: usize,
@@ -295,6 +300,8 @@ impl Config {
             DEFAULT_CSRF_EXEMPT_PATHS,
             &mut problems,
         );
+        let upstream_url =
+            parse_optional_upstream_url(UPSTREAM_URL, get_var(UPSTREAM_URL), &mut problems);
         let egress_allowed_hosts = parse_comma_separated_hostnames(
             EGRESS_ALLOWED_HOSTS,
             get_var(EGRESS_ALLOWED_HOSTS),
@@ -304,6 +311,13 @@ impl Config {
             EGRESS_TIMEOUT_MS,
             get_var(EGRESS_TIMEOUT_MS),
             DEFAULT_EGRESS_TIMEOUT_MS,
+            "millisecond duration",
+            &mut problems,
+        );
+        let egress_response_idle_timeout_ms = parse_var(
+            EGRESS_RESPONSE_IDLE_TIMEOUT_MS,
+            get_var(EGRESS_RESPONSE_IDLE_TIMEOUT_MS),
+            DEFAULT_EGRESS_RESPONSE_IDLE_TIMEOUT_MS,
             "millisecond duration",
             &mut problems,
         );
@@ -367,8 +381,10 @@ impl Config {
                 csrf_header_name,
                 csrf_cookie_domain,
                 csrf_exempt_paths,
+                upstream_url,
                 egress_allowed_hosts,
                 egress_timeout_ms,
+                egress_response_idle_timeout_ms,
                 egress_connect_timeout_ms,
                 egress_max_response_bytes,
                 egress_max_request_body_bytes,
@@ -654,6 +670,53 @@ fn parse_optional_cookie_domain(
     }
 }
 
+fn parse_optional_upstream_url(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Option<String> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return None,
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return None;
+        }
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let parsed = match url::Url::parse(value) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            problems.push(format!(
+                "{name} must be a valid http or https URL, got '{value}': {err}"
+            ));
+            return None;
+        }
+    };
+
+    if parsed.host_str().is_none() {
+        problems.push(format!(
+            "{name} must be a valid http or https URL with a host, got '{value}'"
+        ));
+        return None;
+    }
+
+    match parsed.scheme() {
+        "http" | "https" => Some(value.to_owned()),
+        scheme => {
+            problems.push(format!(
+                "{name} must use http or https, got scheme '{scheme}'"
+            ));
+            None
+        }
+    }
+}
+
 fn parse_comma_separated_paths(
     name: &str,
     value: Result<String, VarError>,
@@ -820,8 +883,13 @@ mod tests {
                 "/metrics".to_owned(),
             ]
         );
+        assert_eq!(config.upstream_url, None);
         assert!(config.egress_allowed_hosts.is_empty());
         assert_eq!(config.egress_timeout_ms, DEFAULT_EGRESS_TIMEOUT_MS);
+        assert_eq!(
+            config.egress_response_idle_timeout_ms,
+            DEFAULT_EGRESS_RESPONSE_IDLE_TIMEOUT_MS
+        );
         assert_eq!(
             config.egress_connect_timeout_ms,
             DEFAULT_EGRESS_CONNECT_TIMEOUT_MS
@@ -920,8 +988,13 @@ mod tests {
                 "/metrics".to_owned(),
             ]
         );
+        assert_eq!(config.upstream_url, None);
         assert!(config.egress_allowed_hosts.is_empty());
         assert_eq!(config.egress_timeout_ms, DEFAULT_EGRESS_TIMEOUT_MS);
+        assert_eq!(
+            config.egress_response_idle_timeout_ms,
+            DEFAULT_EGRESS_RESPONSE_IDLE_TIMEOUT_MS
+        );
         assert_eq!(
             config.egress_connect_timeout_ms,
             DEFAULT_EGRESS_CONNECT_TIMEOUT_MS
@@ -1354,6 +1427,7 @@ mod tests {
                 Ok(" API.EXAMPLE.TEST,upstream.example.test,,auth.example.test ".to_owned())
             }
             "EGRESS_TIMEOUT_MS" => Ok("15000".to_owned()),
+            "EGRESS_RESPONSE_IDLE_TIMEOUT_MS" => Ok("4000".to_owned()),
             "EGRESS_CONNECT_TIMEOUT_MS" => Ok("3000".to_owned()),
             "EGRESS_MAX_RESPONSE_BYTES" => Ok("2097152".to_owned()),
             "EGRESS_MAX_REQUEST_BODY_BYTES" => Ok("65536".to_owned()),
@@ -1371,6 +1445,7 @@ mod tests {
             ]
         );
         assert_eq!(config.egress_timeout_ms, 15_000);
+        assert_eq!(config.egress_response_idle_timeout_ms, 4_000);
         assert_eq!(config.egress_connect_timeout_ms, 3_000);
         assert_eq!(config.egress_max_response_bytes, 2_097_152);
         assert_eq!(config.egress_max_request_body_bytes, 65_536);
@@ -1378,10 +1453,64 @@ mod tests {
     }
 
     #[test]
+    fn upstream_url_parses_optional_http_origin() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_URL" => Ok("  https://upstream.example.test:8443/base/path  ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.upstream_url,
+            Some("https://upstream.example.test:8443/base/path".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_upstream_url_is_none() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_URL" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.upstream_url, None);
+    }
+
+    #[test]
+    fn invalid_upstream_url_values_are_rejected() {
+        for (value, expected) in [
+            (
+                "not a url",
+                "UPSTREAM_URL must be a valid http or https URL",
+            ),
+            (
+                "mailto:ops@example.test",
+                "UPSTREAM_URL must be a valid http or https URL with a host",
+            ),
+            (
+                "ftp://upstream.example.test",
+                "UPSTREAM_URL must use http or https",
+            ),
+        ] {
+            let error = Config::from_env_vars(|name| match name {
+                "UPSTREAM_URL" => Ok(value.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect_err("config should reject invalid upstream URL");
+
+            let message = error.to_string();
+            assert!(message.contains(expected), "{message}");
+            assert_eq!(error.problems.len(), 1);
+        }
+    }
+
+    #[test]
     fn invalid_egress_config_values_are_rejected() {
         let error = Config::from_env_vars(|name| match name {
             "EGRESS_ALLOWED_HOSTS" => Ok("api.example.test:443,bad_host".to_owned()),
             "EGRESS_TIMEOUT_MS" => Ok("slow".to_owned()),
+            "EGRESS_RESPONSE_IDLE_TIMEOUT_MS" => Ok("idle".to_owned()),
             "EGRESS_CONNECT_TIMEOUT_MS" => Ok("slower".to_owned()),
             "EGRESS_MAX_RESPONSE_BYTES" => Ok("large".to_owned()),
             "EGRESS_MAX_REQUEST_BODY_BYTES" => Ok("larger".to_owned()),
@@ -1393,11 +1522,13 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("EGRESS_ALLOWED_HOSTS entries must be hostnames without ports"));
         assert!(message.contains("EGRESS_TIMEOUT_MS must be a valid millisecond duration"));
+        assert!(message
+            .contains("EGRESS_RESPONSE_IDLE_TIMEOUT_MS must be a valid millisecond duration"));
         assert!(message.contains("EGRESS_CONNECT_TIMEOUT_MS must be a valid millisecond duration"));
         assert!(message.contains("EGRESS_MAX_RESPONSE_BYTES must be a valid byte size"));
         assert!(message.contains("EGRESS_MAX_REQUEST_BODY_BYTES must be a valid byte size"));
         assert!(message.contains("EGRESS_DENY_PRIVATE_IPS must be a valid boolean"));
-        assert_eq!(error.problems.len(), 7);
+        assert_eq!(error.problems.len(), 8);
     }
 
     #[test]

@@ -3,9 +3,12 @@ use std::{
     error::Error,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     time::Duration,
 };
 
+use bytes::Bytes;
+use futures_util::{stream, Stream, StreamExt};
 use reqwest::{header::HeaderMap, Method, StatusCode, Url};
 use tokio::net::lookup_host;
 
@@ -25,6 +28,7 @@ pub enum EgressError {
     SchemeNotAllowed(String),
     RequestBodyTooLarge { size: usize, max: usize },
     ResponseTooLarge { max: usize },
+    ResponseIdleTimeout { timeout: Duration },
     Http(reqwest::Error),
 }
 
@@ -49,6 +53,11 @@ impl fmt::Display for EgressError {
             Self::ResponseTooLarge { max } => {
                 write!(formatter, "egress response body exceeded {max} bytes")
             }
+            Self::ResponseIdleTimeout { timeout } => write!(
+                formatter,
+                "egress response body was idle for {}ms",
+                timeout.as_millis()
+            ),
             Self::Http(err) => write!(formatter, "egress HTTP error: {err}"),
         }
     }
@@ -69,10 +78,21 @@ impl From<reqwest::Error> for EgressError {
     }
 }
 
+impl EgressError {
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            Self::ResponseIdleTimeout { .. } => true,
+            Self::Http(err) => err.is_timeout(),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EgressConfig {
     pub allowed_hosts: HashSet<String>,
     pub timeout: Duration,
+    pub response_idle_timeout: Duration,
     pub connect_timeout: Duration,
     pub max_response_bytes: usize,
     pub max_request_body_bytes: usize,
@@ -84,6 +104,7 @@ impl Default for EgressConfig {
         Self {
             allowed_hosts: HashSet::new(),
             timeout: DEFAULT_TIMEOUT,
+            response_idle_timeout: DEFAULT_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
@@ -122,6 +143,7 @@ impl EgressConfig {
         Self {
             allowed_hosts,
             timeout: Duration::from_millis(config.egress_timeout_ms),
+            response_idle_timeout: Duration::from_millis(config.egress_response_idle_timeout_ms),
             connect_timeout: Duration::from_millis(config.egress_connect_timeout_ms),
             max_response_bytes: config.egress_max_response_bytes,
             max_request_body_bytes: config.egress_max_request_body_bytes,
@@ -157,6 +179,24 @@ pub struct EgressResponse {
     #[allow(dead_code)] // Retained for callers that need upstream response headers.
     pub headers: HeaderMap,
     pub body: Vec<u8>,
+}
+
+pub type EgressBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, EgressError>> + Send>>;
+
+pub struct EgressStreamResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: EgressBodyStream,
+}
+
+impl fmt::Debug for EgressStreamResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EgressStreamResponse")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]
@@ -207,6 +247,34 @@ impl EgressClient {
         );
 
         self.send_with_client(client, method, parsed, headers, body)
+            .await
+    }
+
+    pub async fn stream_request_with_headers(
+        &self,
+        method: Method,
+        url: &str,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+    ) -> Result<EgressStreamResponse, EgressError> {
+        let parsed = self.checked_url(url)?;
+        let host = checked_host(&parsed, &self.config.allowed_hosts)?;
+        let port = checked_port(&parsed)?;
+        let resolved = resolve_host(&host, port).await?;
+        let pinned_addr = checked_socket_addr(&host, &resolved, self.config.deny_private_ips)?;
+        enforce_request_body_size(
+            body.as_ref().map_or(0, Vec::len),
+            self.config.max_request_body_bytes,
+        )?;
+        let client = self.pinned_client(&host, pinned_addr)?;
+
+        tracing::debug!(
+            host = %host,
+            pinned_addr = %pinned_addr,
+            "egress streaming request pinned to checked address"
+        );
+
+        self.send_stream_with_client(client, method, parsed, headers, body)
             .await
     }
 
@@ -276,6 +344,76 @@ impl EgressClient {
             status,
             headers,
             body,
+        })
+    }
+
+    async fn send_stream_with_client(
+        &self,
+        client: reqwest::Client,
+        method: Method,
+        url: Url,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+    ) -> Result<EgressStreamResponse, EgressError> {
+        let mut request = client.request(method, url).headers(headers);
+
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+
+        let response = request.send().await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let max_response_bytes = self.config.max_response_bytes;
+        let response_idle_timeout = self.config.response_idle_timeout;
+        let body = Box::pin(response.bytes_stream());
+        let body = stream::unfold((body, 0usize, false), move |state| async move {
+            let (mut body, mut streamed_bytes, done) = state;
+            if done {
+                return None;
+            }
+
+            match tokio::time::timeout(response_idle_timeout, body.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    if streamed_bytes.saturating_add(chunk.len()) > max_response_bytes {
+                        tracing::warn!(
+                            max = max_response_bytes,
+                            "egress blocked oversized response"
+                        );
+                        return Some((
+                            Err(EgressError::ResponseTooLarge {
+                                max: max_response_bytes,
+                            }),
+                            (body, streamed_bytes, true),
+                        ));
+                    }
+
+                    streamed_bytes += chunk.len();
+                    Some((Ok(chunk), (body, streamed_bytes, false)))
+                }
+                Ok(Some(Err(err))) => {
+                    Some((Err(EgressError::from(err)), (body, streamed_bytes, true)))
+                }
+                Ok(None) => None,
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = response_idle_timeout.as_millis(),
+                        "egress streaming response body idle timeout"
+                    );
+                    Some((
+                        Err(EgressError::ResponseIdleTimeout {
+                            timeout: response_idle_timeout,
+                        }),
+                        (body, streamed_bytes, true),
+                    ))
+                }
+            }
+        });
+
+        Ok(EgressStreamResponse {
+            status,
+            headers,
+            body: Box::pin(body),
         })
     }
 }
@@ -412,8 +550,9 @@ fn redacted_url(url: &Url) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::ErrorKind, net::IpAddr};
+    use std::{io::ErrorKind, net::IpAddr, time::Duration};
 
+    use futures_util::StreamExt;
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
@@ -744,6 +883,219 @@ mod tests {
         server.await.expect("test server task should finish");
     }
 
+    #[tokio::test]
+    async fn stream_request_returns_after_headers_before_full_body() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener local address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one connection");
+            read_one_request(&stream).await;
+            write_all(
+                &stream,
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n",
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            write_all(&stream, b"5\r\nworld\r\n0\r\n\r\n").await;
+        });
+        let client = EgressClient::new(EgressConfig {
+            allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
+            max_response_bytes: 10,
+            deny_private_ips: false,
+            ..EgressConfig::default()
+        })
+        .expect("client should build");
+        let url = format!("http://127.0.0.1:{}/stream", addr.port());
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            client.stream_request_with_headers(Method::GET, &url, HeaderMap::new(), None),
+        )
+        .await
+        .expect("streaming response should return before full body is sent")
+        .expect("streaming request should succeed");
+
+        assert_eq!(response.status, StatusCode::OK);
+
+        let mut body = response.body;
+        let first = tokio::time::timeout(Duration::from_millis(200), body.next())
+            .await
+            .expect("first chunk should be available")
+            .expect("stream should yield a first chunk")
+            .expect("first chunk should be ok");
+        assert_eq!(&first[..], b"hello");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), body.next())
+                .await
+                .is_err(),
+            "second chunk should not be buffered before the upstream sends it"
+        );
+
+        let second = tokio::time::timeout(Duration::from_secs(1), body.next())
+            .await
+            .expect("second chunk should arrive")
+            .expect("stream should yield a second chunk")
+            .expect("second chunk should be ok");
+        assert_eq!(&second[..], b"world");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), body.next())
+                .await
+                .expect("stream end should arrive")
+                .is_none()
+        );
+        server.await.expect("test server task should finish");
+    }
+
+    #[tokio::test]
+    async fn stream_response_body_size_is_enforced_while_consuming() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener local address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one connection");
+            read_one_request(&stream).await;
+            write_all(
+                &stream,
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n",
+            )
+            .await;
+        });
+        let client = EgressClient::new(EgressConfig {
+            allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
+            max_response_bytes: 5,
+            deny_private_ips: false,
+            ..EgressConfig::default()
+        })
+        .expect("client should build");
+        let url = format!("http://127.0.0.1:{}/stream", addr.port());
+        let response = client
+            .stream_request_with_headers(Method::GET, &url, HeaderMap::new(), None)
+            .await
+            .expect("headers should be returned before oversized body is consumed");
+
+        let mut body = response.body;
+        let mut saw_limit_error = false;
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(_) => {}
+                Err(EgressError::ResponseTooLarge { max }) => {
+                    assert_eq!(max, 5);
+                    saw_limit_error = true;
+                    break;
+                }
+                Err(err) => panic!("unexpected stream error: {err}"),
+            }
+        }
+
+        assert!(
+            saw_limit_error,
+            "stream should fail once the cap is exceeded"
+        );
+        server.await.expect("test server task should finish");
+    }
+
+    #[tokio::test]
+    async fn stream_response_body_idle_timeout_is_enforced_while_consuming() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener local address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one connection");
+            read_one_request(&stream).await;
+            write_all(
+                &stream,
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nhi\r\n",
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let client = EgressClient::new(EgressConfig {
+            allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
+            timeout: Duration::from_secs(5),
+            response_idle_timeout: Duration::from_millis(100),
+            max_response_bytes: 10,
+            deny_private_ips: false,
+            ..EgressConfig::default()
+        })
+        .expect("client should build");
+        let url = format!("http://127.0.0.1:{}/stream", addr.port());
+        let response = client
+            .stream_request_with_headers(Method::GET, &url, HeaderMap::new(), None)
+            .await
+            .expect("headers should be returned before stalled body is consumed");
+
+        let mut body = response.body;
+        let first = tokio::time::timeout(Duration::from_millis(200), body.next())
+            .await
+            .expect("first chunk should arrive")
+            .expect("stream should yield a first chunk")
+            .expect("first chunk should be ok");
+        assert_eq!(&first[..], b"hi");
+
+        let error = tokio::time::timeout(Duration::from_millis(500), body.next())
+            .await
+            .expect("idle timeout error should arrive before the outer test timeout")
+            .expect("stream should yield an idle timeout error")
+            .expect_err("stalled stream should fail");
+        assert!(matches!(
+            error,
+            EgressError::ResponseIdleTimeout { timeout }
+                if timeout == Duration::from_millis(100)
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_request_reuses_allowlist_and_private_ip_checks() {
+        let client = EgressClient::new(EgressConfig::default()).expect("client should build");
+        let error = client
+            .stream_request_with_headers(Method::GET, "http://127.0.0.1:1/", HeaderMap::new(), None)
+            .await
+            .expect_err("non-allowlisted stream host should deny");
+
+        assert!(matches!(
+            error,
+            EgressError::HostNotAllowed(host) if host == "127.0.0.1"
+        ));
+
+        let client = EgressClient::new(EgressConfig {
+            allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
+            deny_private_ips: true,
+            ..EgressConfig::default()
+        })
+        .expect("client should build");
+        let error = client
+            .stream_request_with_headers(Method::GET, "http://127.0.0.1:1/", HeaderMap::new(), None)
+            .await
+            .expect_err("private stream host should deny");
+
+        assert!(matches!(
+            error,
+            EgressError::PrivateIpBlocked(blocked) if blocked == ip("127.0.0.1")
+        ));
+    }
+
     async fn read_one_request(stream: &TcpStream) {
         let mut buffer = [0; 1024];
 
@@ -832,8 +1184,10 @@ mod tests {
                 "/version".to_owned(),
                 "/metrics".to_owned(),
             ],
+            upstream_url: None,
             egress_allowed_hosts: Vec::new(),
             egress_timeout_ms: 30_000,
+            egress_response_idle_timeout_ms: 30_000,
             egress_connect_timeout_ms: 10_000,
             egress_max_response_bytes: 5_242_880,
             egress_max_request_body_bytes: 1_048_576,

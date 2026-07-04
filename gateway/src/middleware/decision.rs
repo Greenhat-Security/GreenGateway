@@ -19,3 +19,9 @@ pub struct PolicyDecision {
     pub permission: Option<String>,
     pub path_prefix: Option<String>,
 }
+
+#[derive(Clone, Debug)]
+pub struct UpstreamOutcome {
+    pub latency_ms: u64,
+    pub status: Option<u16>,
+}
