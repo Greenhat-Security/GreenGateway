@@ -36,6 +36,9 @@ export function ShadowReviewView() {
   const [canWritePolicy, setCanWritePolicy] = useState(false);
   const [mutatingRuleId, setMutatingRuleId] = useState<string | null>(null);
   const [scanTruncated, setScanTruncated] = useState(false);
+  const [confirmingPromoteId, setConfirmingPromoteId] = useState<string | null>(
+    null,
+  );
 
   useEffect(() => {
     let isCurrent = true;
@@ -94,7 +97,14 @@ export function ShadowReviewView() {
     mutationError?.kind !== 'forbidden';
 
   async function promoteRule(ruleId: string) {
-    await mutateRule(ruleId, { action: 'deny' }, 'Rule promoted to deny.');
+    const succeeded = await mutateRule(
+      ruleId,
+      { action: 'deny' },
+      'Rule promoted to deny.',
+    );
+    if (succeeded) {
+      setConfirmingPromoteId(null);
+    }
   }
 
   async function disableRule(ruleId: string) {
@@ -105,9 +115,9 @@ export function ShadowReviewView() {
     ruleId: string,
     patch: PolicyRulePatch,
     successMessage: string,
-  ) {
+  ): Promise<boolean> {
     if (!canWritePolicy || mutatingRuleId !== null) {
-      return;
+      return false;
     }
 
     setMutatingRuleId(ruleId);
@@ -126,12 +136,14 @@ export function ShadowReviewView() {
         current.filter((summary) => summary.rule_id !== ruleId),
       );
       setMutationNotice(successMessage);
+      return true;
     } catch (error) {
       const reviewError = toShadowReviewError(error);
       if (reviewError.kind === 'forbidden') {
         setCanWritePolicy(false);
       }
       setMutationError(reviewError);
+      return false;
     } finally {
       setMutatingRuleId(null);
     }
@@ -180,10 +192,12 @@ export function ShadowReviewView() {
             {summaries.map((summary) => (
               <ShadowReviewEntry
                 canWritePolicy={canWritePolicy}
+                confirmingPromoteId={confirmingPromoteId}
                 isMutating={mutatingRuleId === summary.rule_id}
                 isMutationBusy={mutatingRuleId !== null}
                 key={summary.rule_id}
                 summary={summary}
+                onConfirmingPromoteChange={setConfirmingPromoteId}
                 onDisable={() => {
                   void disableRule(summary.rule_id);
                 }}
@@ -202,15 +216,19 @@ export function ShadowReviewView() {
 function ShadowReviewEntry({
   summary,
   canWritePolicy,
+  confirmingPromoteId,
   isMutating,
   isMutationBusy,
+  onConfirmingPromoteChange,
   onPromote,
   onDisable,
 }: {
   summary: PolicyRuleShadowReviewSummary;
   canWritePolicy: boolean;
+  confirmingPromoteId: string | null;
   isMutating: boolean;
   isMutationBusy: boolean;
+  onConfirmingPromoteChange: (ruleId: string | null) => void;
   onPromote: () => void;
   onDisable: () => void;
 }) {
@@ -285,16 +303,15 @@ function ShadowReviewEntry({
         </div>
 
         <div className="policy-history-actions shadow-review-actions">
-          <button
-            type="button"
-            className="primary-button"
-            aria-label={`Promote ${summary.rule_id} to deny`}
-            title={canWritePolicy ? undefined : 'Requires admin:policy:write'}
-            disabled={!canWritePolicy || isMutationBusy}
-            onClick={onPromote}
-          >
-            {isMutating ? 'Promoting' : 'Promote'}
-          </button>
+          <ShadowRulePromoteControl
+            ruleId={summary.rule_id}
+            canWritePolicy={canWritePolicy}
+            confirmingPromoteId={confirmingPromoteId}
+            isMutating={isMutating}
+            isMutationBusy={isMutationBusy}
+            onConfirmingPromoteChange={onConfirmingPromoteChange}
+            onPromote={onPromote}
+          />
           <button
             type="button"
             className="secondary-button"
@@ -308,6 +325,60 @@ function ShadowReviewEntry({
         </div>
       </div>
     </li>
+  );
+}
+
+function ShadowRulePromoteControl({
+  ruleId,
+  canWritePolicy,
+  confirmingPromoteId,
+  isMutating,
+  isMutationBusy,
+  onConfirmingPromoteChange,
+  onPromote,
+}: {
+  ruleId: string;
+  canWritePolicy: boolean;
+  confirmingPromoteId: string | null;
+  isMutating: boolean;
+  isMutationBusy: boolean;
+  onConfirmingPromoteChange: (ruleId: string | null) => void;
+  onPromote: () => void;
+}) {
+  if (confirmingPromoteId === ruleId) {
+    return (
+      <div className="rule-delete-confirmation">
+        <button
+          type="button"
+          className="primary-button row-action-button"
+          aria-label={`Confirm promote ${ruleId} to deny`}
+          disabled={!canWritePolicy || isMutationBusy}
+          onClick={onPromote}
+        >
+          {isMutating ? 'Promoting' : 'Confirm'}
+        </button>
+        <button
+          type="button"
+          className="secondary-button row-action-button"
+          onClick={() => onConfirmingPromoteChange(null)}
+        >
+          Cancel
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      className="primary-button"
+      aria-label={`Promote ${ruleId} to deny`}
+      title={canWritePolicy ? undefined : 'Requires admin:policy:write'}
+      disabled={!canWritePolicy || isMutationBusy}
+      onClick={() => onConfirmingPromoteChange(ruleId)}
+    >
+      Promote
+    </button>
   );
 }
 

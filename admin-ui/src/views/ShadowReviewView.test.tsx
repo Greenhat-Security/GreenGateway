@@ -59,7 +59,7 @@ describe('ShadowReviewView', () => {
     expect(screen.getByText('Jul 4, 2026, 4:10 PM UTC')).toBeTruthy();
   });
 
-  it('promotes a shadow rule with a freshly fetched current policy ETag', async () => {
+  it('requires confirming before promoting a shadow rule, with a freshly fetched current policy ETag', async () => {
     const fetcher = shadowReviewFetchMock({
       policy: policyDocument(),
       policyEtags: ['"etag-stale"', '"etag-current"'],
@@ -77,11 +77,45 @@ describe('ShadowReviewView', () => {
       }),
     );
 
+    expect(fetcher.patchRuleIds).toEqual([]);
+    const confirmButton = await screen.findByRole('button', {
+      name: 'Confirm promote shadow-reports to deny',
+    });
+
+    fireEvent.click(confirmButton);
+
     await waitFor(() => {
       expect(fetcher.patchHeaders).toEqual(['"etag-current"']);
     });
     expect(fetcher.patchBodies).toEqual([{ action: 'deny' }]);
     expect(fetcher.patchRuleIds).toEqual(['shadow-reports']);
+  });
+
+  it('cancels a pending promote confirmation without patching the rule', async () => {
+    const fetcher = shadowReviewFetchMock({
+      policy: policyDocument(),
+      review: shadowReviewResponse({
+        rules: [shadowSummary({ rule_id: 'shadow-reports' })],
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderShadowReviewView();
+
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'Promote shadow-reports to deny',
+      }),
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+
+    expect(
+      await screen.findByRole('button', {
+        name: 'Promote shadow-reports to deny',
+      }),
+    ).toBeTruthy();
+    expect(fetcher.patchRuleIds).toEqual([]);
   });
 
   it('demotes a shadow rule by disabling it with a freshly fetched current policy ETag', async () => {
