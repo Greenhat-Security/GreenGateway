@@ -11,6 +11,7 @@ import {
   updateTrafficEndpointReview,
 } from '../lib/traffic';
 import {
+  EndpointSignalBadge,
   EndpointLifecycleBadges,
   MethodBadge,
   ReviewBadge,
@@ -417,6 +418,7 @@ function EndpointCell({ endpoint }: { endpoint: TrafficEndpoint }) {
         </Link>
       </div>
       <EndpointLifecycleBadges endpoint={endpoint} />
+      <EndpointSignalBadge endpoint={endpoint} />
     </div>
   );
 }

@@ -12,6 +12,7 @@ import {
   fetchTrafficEndpointDetail,
 } from '../lib/traffic';
 import {
+  EndpointSignalBadge,
   EndpointLifecycleBadges,
   MethodBadge,
   ReviewBadge,
@@ -224,6 +225,7 @@ function EndpointSummary({
           </div>
           <div className="endpoint-badges">
             <EndpointLifecycleBadges endpoint={endpoint} />
+            <EndpointSignalBadge endpoint={endpoint} />
             <ReviewBadge reviewed={endpoint.reviewed} />
           </div>
         </div>

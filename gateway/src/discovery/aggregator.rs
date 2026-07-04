@@ -32,11 +32,11 @@ use std::{
 };
 
 use rusqlite::{params, Connection};
-use serde_json::Value;
+use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
-    audit::{redact::hash_args, AuditEvent, AuditSink},
+    audit::{event, redact::hash_args, AuditEvent, AuditEventSender, AuditSink},
     discovery::{
         path_template::{template_stateless, PathTemplateLearner},
         signals::{
@@ -155,6 +155,7 @@ ON CONFLICT(method, endpoint_template) DO UPDATE SET
 pub struct EndpointAggregatorSinkConfig {
     pub path: PathBuf,
     pub payload_capture_enabled: bool,
+    pub signal_event_sender: Option<AuditEventSender>,
     pub signal_detector_config: SignalDetectorConfig,
 }
 
@@ -338,6 +339,7 @@ impl EndpointAggregatorSink {
 
         let shared = Arc::new(EndpointAggregatorShared {
             path: config.path,
+            signal_event_sender: config.signal_event_sender,
             connection: Mutex::new(connection),
             state: Mutex::new(state),
         });
@@ -395,6 +397,7 @@ impl Drop for EndpointAggregatorSink {
 
 struct EndpointAggregatorShared {
     path: PathBuf,
+    signal_event_sender: Option<AuditEventSender>,
     connection: Mutex<Connection>,
     state: Mutex<AggregatorState>,
 }
@@ -432,7 +435,10 @@ impl EndpointAggregatorShared {
         };
 
         match result {
-            Ok(()) => state.mark_flushed(&deleted_keys, &dirty_keys, pending_signals.len()),
+            Ok(opened_signals) => {
+                state.mark_flushed(&deleted_keys, &dirty_keys, pending_signals.len());
+                self.emit_signal_opened_events(&opened_signals);
+            }
             Err(err) => {
                 tracing::error!(
                     path = %self.path.display(),
@@ -442,6 +448,38 @@ impl EndpointAggregatorShared {
                     error = %err,
                     "failed to flush SQLite discovery aggregates; keeping dirty state for retry"
                 );
+            }
+        }
+    }
+
+    fn emit_signal_opened_events(&self, signals: &[signals::Signal]) {
+        let Some(sender) = &self.signal_event_sender else {
+            return;
+        };
+
+        for signal in signals {
+            let payload = json!({
+                "id": &signal.id,
+                "signal_type": &signal.signal_type,
+                "target": &signal.target,
+                "explanation": &signal.explanation,
+                "evidence": &signal.evidence,
+                "state": signal.state.as_str(),
+                "created_at": &signal.created_at,
+                "updated_at": &signal.updated_at,
+                "transitioned_at": &signal.transitioned_at,
+                "transitioned_by": &signal.transitioned_by,
+            });
+            let event = AuditEvent::new(
+                event::SIGNAL_OPENED,
+                "discovery-signal",
+                "127.0.0.1",
+                None,
+                payload,
+            );
+
+            if sender.send(event).is_err() {
+                tracing::trace!("no active audit event stream subscribers for signal.opened");
             }
         }
     }
@@ -1517,7 +1555,7 @@ fn write_flush(
     dirty_aggregates: &[EndpointAggregate],
     pending_signals: &[NewSignal],
     payload_capture_enabled: bool,
-) -> Result<(), EndpointAggregatorFlushError> {
+) -> Result<Vec<signals::Signal>, EndpointAggregatorFlushError> {
     let transaction = connection.transaction()?;
 
     for key in deleted_keys {
@@ -1528,10 +1566,10 @@ fn write_flush(
         upsert_aggregate(&transaction, aggregate, payload_capture_enabled)?;
     }
 
-    signals::insert_signals(&transaction, pending_signals)?;
+    let opened_signals = signals::insert_signals(&transaction, pending_signals)?;
 
     transaction.commit()?;
-    Ok(())
+    Ok(opened_signals)
 }
 
 fn delete_key(
@@ -2848,6 +2886,7 @@ mod tests {
             EndpointAggregatorSinkConfig {
                 path: path.to_owned(),
                 payload_capture_enabled: false,
+                signal_event_sender: None,
                 signal_detector_config,
             },
             StdDuration::from_secs(60),
@@ -2863,6 +2902,7 @@ mod tests {
             EndpointAggregatorSinkConfig {
                 path: path.to_owned(),
                 payload_capture_enabled: false,
+                signal_event_sender: None,
                 signal_detector_config: SignalDetectorConfig::default(),
             },
             flush_interval,
@@ -2875,6 +2915,7 @@ mod tests {
             EndpointAggregatorSinkConfig {
                 path: path.to_owned(),
                 payload_capture_enabled: true,
+                signal_event_sender: None,
                 signal_detector_config: SignalDetectorConfig::default(),
             },
             StdDuration::from_secs(60),

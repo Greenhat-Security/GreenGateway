@@ -182,12 +182,13 @@ impl AuditSink for CompositeSink {
     }
 }
 
-pub fn build_sink(
+fn build_sink(
     audit_log_file: Option<&str>,
     audit_sqlite_path: Option<&str>,
     audit_sqlite_retention_days: Option<u32>,
     discovery_sqlite_path: Option<&str>,
     payload_capture_enabled: bool,
+    signal_event_sender: Option<AuditEventSender>,
     signal_detector_config: SignalDetectorConfig,
 ) -> Result<Arc<dyn AuditSink>, Box<dyn Error>> {
     let sinks = build_sink_members(
@@ -196,6 +197,7 @@ pub fn build_sink(
         audit_sqlite_retention_days,
         discovery_sqlite_path,
         payload_capture_enabled,
+        signal_event_sender,
         signal_detector_config,
     )?;
 
@@ -214,6 +216,7 @@ fn build_sink_members(
     audit_sqlite_retention_days: Option<u32>,
     discovery_sqlite_path: Option<&str>,
     payload_capture_enabled: bool,
+    signal_event_sender: Option<AuditEventSender>,
     signal_detector_config: SignalDetectorConfig,
 ) -> Result<Vec<Arc<dyn AuditSink>>, Box<dyn Error>> {
     let stdout: Arc<dyn AuditSink> = Arc::new(StdoutSink::new());
@@ -248,6 +251,7 @@ fn build_sink_members(
             Arc::new(EndpointAggregatorSink::new(EndpointAggregatorSinkConfig {
                 path: PathBuf::from(path),
                 payload_capture_enabled,
+                signal_event_sender,
                 signal_detector_config,
             })?) as Arc<dyn AuditSink>,
         );
@@ -266,6 +270,7 @@ pub fn build_sink_from_config(config: &Config) -> Result<ConfiguredAuditSink, Bo
         config.audit_sqlite_retention_days,
         config.discovery_sqlite_path.as_deref(),
         config.payload_capture_enabled,
+        Some(broadcast_sender.clone()),
         config.signal_detector_config(),
     )?;
     let sink = Arc::new(CompositeSink::new(vec![
@@ -441,6 +446,7 @@ pub mod tests {
             None,
             None,
             false,
+            None,
             SignalDetectorConfig::default(),
         )
         .expect("sink members should build");
@@ -452,6 +458,7 @@ pub mod tests {
             None,
             Some("   "),
             false,
+            None,
             SignalDetectorConfig::default(),
         )
         .expect("sink members should build");
@@ -467,6 +474,7 @@ pub mod tests {
             None,
             Some(path.to_str().expect("test path should be valid UTF-8")),
             false,
+            None,
             SignalDetectorConfig::default(),
         )
         .expect("sink members should build");

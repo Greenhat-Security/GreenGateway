@@ -430,6 +430,8 @@ struct TrafficEndpointListParams {
 struct SignalListParams {
     state: Option<String>,
     signal_type: Option<String>,
+    target_kind: Option<String>,
+    target_key: Option<String>,
     limit: Option<String>,
     cursor: Option<String>,
 }
@@ -2809,10 +2811,13 @@ async fn traffic_endpoint_list_endpoint(
     let Some(Extension(principal)) = principal else {
         return unauthorized();
     };
-    if let Err(error) = authorized_traffic_state(&state, &principal, ADMIN_TRAFFIC_READ_PERMISSION)
-    {
-        return traffic_admin_authz_error_response(error);
-    }
+    let rbac_state =
+        match authorized_traffic_state(&state, &principal, ADMIN_TRAFFIC_READ_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return traffic_admin_authz_error_response(error),
+        };
+    let include_open_signals =
+        rbac_state.principal_has_permission(&principal, ADMIN_SIGNALS_READ_PERMISSION);
 
     let Some(discovery_store) = state.discovery_store.as_ref() else {
         return discovery_not_configured();
@@ -2822,7 +2827,12 @@ async fn traffic_endpoint_list_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    match list_traffic_endpoint_page(discovery_store, &query, state.rbac_state.as_ref()) {
+    match list_traffic_endpoint_page(
+        discovery_store,
+        &query,
+        Some(rbac_state),
+        include_open_signals,
+    ) {
         Ok(page) => (StatusCode::OK, Json(page)).into_response(),
         Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter }) => {
             bad_request(&format!("invalid query parameter: {parameter}"))
@@ -2844,10 +2854,13 @@ async fn traffic_endpoint_detail_endpoint(
     let Some(Extension(principal)) = principal else {
         return unauthorized();
     };
-    if let Err(error) = authorized_traffic_state(&state, &principal, ADMIN_TRAFFIC_READ_PERMISSION)
-    {
-        return traffic_admin_authz_error_response(error);
-    }
+    let rbac_state =
+        match authorized_traffic_state(&state, &principal, ADMIN_TRAFFIC_READ_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return traffic_admin_authz_error_response(error),
+        };
+    let include_open_signals =
+        rbac_state.principal_has_permission(&principal, ADMIN_SIGNALS_READ_PERMISSION);
 
     let Some(discovery_store) = state.discovery_store.as_ref() else {
         return discovery_not_configured();
@@ -2857,10 +2870,11 @@ async fn traffic_endpoint_detail_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    let mut endpoint = match discovery_store.get_endpoint(
+    let mut endpoint = match discovery_store.get_endpoint_with_open_signal_summaries(
         &params.method,
         &params.endpoint_template,
         params.new_since_hours,
+        include_open_signals,
     ) {
         Ok(Some(endpoint)) => endpoint,
         Ok(None) => return not_found("traffic endpoint was not found"),
@@ -2870,7 +2884,7 @@ async fn traffic_endpoint_detail_endpoint(
         }
     };
     endpoint.covered_by_rule = endpoint_covered_by_active_direct_rule(
-        state.rbac_state.as_ref(),
+        Some(rbac_state),
         &params.method,
         &params.endpoint_template,
     );
@@ -3114,6 +3128,8 @@ impl SignalListParams {
         Ok(discovery::signals::SignalListFilters {
             state,
             signal_type: empty_string_as_none(self.signal_type),
+            target_kind: empty_string_as_none(self.target_kind),
+            target_key: empty_string_as_none(self.target_key),
             limit,
             cursor: self.cursor,
         })
@@ -3718,9 +3734,11 @@ fn list_traffic_endpoint_page(
     discovery_store: &discovery::query::DiscoveryQueryStore,
     query: &TrafficEndpointListQuery,
     rbac_state: Option<&middleware::rbac::RbacState>,
+    include_open_signals: bool,
 ) -> Result<discovery::query::EndpointListPage, discovery::query::DiscoveryQueryError> {
     let Some(covered_by_rule) = query.covered_by_rule else {
-        let mut page = discovery_store.list_endpoints(&query.filters)?;
+        let mut page = discovery_store
+            .list_endpoints_with_open_signal_summaries(&query.filters, include_open_signals)?;
         enrich_endpoint_summaries_with_rule_coverage(&mut page.endpoints, rbac_state);
         return Ok(page);
     };
@@ -3734,7 +3752,8 @@ fn list_traffic_endpoint_page(
 
     loop {
         scan_filters.cursor = cursor;
-        let mut page = discovery_store.list_endpoints(&scan_filters)?;
+        let mut page = discovery_store
+            .list_endpoints_with_open_signal_summaries(&scan_filters, include_open_signals)?;
         enrich_endpoint_summaries_with_rule_coverage(&mut page.endpoints, rbac_state);
 
         if let Some(endpoint) = page.endpoints.into_iter().next() {
@@ -9692,6 +9711,119 @@ paths:
     }
 
     #[tokio::test]
+    async fn audit_events_stream_delivers_signal_opened_events_from_discovery() {
+        let discovery_db = TempDb::new("signal-opened-stream");
+        let (upstream_addr, _upstream_rx) = spawn_capture_upstream().await;
+        let mut config = proxy_config(upstream_addr);
+        config.auth_enabled = false;
+        config.discovery_sqlite_path = Some(discovery_db.path.to_string_lossy().into_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let (audit_log, audit_event_sender) =
+            audit::AuditLog::from_config(&config).expect("audit log should build");
+        let router = app(config, recorder.handle(), audit_log, audit_event_sender)
+            .expect("app should build");
+
+        let stream_response = router
+            .clone()
+            .oneshot(audit_query_request(
+                &format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type=signal.opened"),
+                Some(test_principal(&["admin"])),
+            ))
+            .await
+            .expect("stream request should complete");
+        assert_eq!(stream_response.status(), StatusCode::OK);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/signal-stream-opened")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("data request should complete");
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let body = read_sse_until(stream_response.into_body(), |body| {
+            body.contains(r#""event_type":"signal.opened""#)
+                && body.contains(r#""signal_type":"new_endpoint_seen""#)
+                && body.contains(r#""endpoint_template":"/signal-stream-opened""#)
+        })
+        .await;
+
+        assert!(body.contains("event: signal.opened"));
+        assert!(body.contains(r#""state":"open""#));
+        assert!(body.contains(r#""target":"#));
+        assert!(body.contains(r#""kind":"endpoint""#));
+        assert!(body.contains(r#""explanation":"New endpoint observed: GET /signal-stream-opened"#));
+    }
+
+    #[tokio::test]
+    async fn audit_events_stream_delivers_signal_lifecycle_transitions() {
+        let discovery_db = TempDb::new("signal-transition-stream");
+        create_signal_schema(&discovery_db.path);
+        insert_signal(
+            &discovery_db.path,
+            SignalSeed {
+                id: "sig-stream-ack",
+                signal_type: "new_endpoint_seen",
+                method: "GET",
+                endpoint_template: "/stream/{id}",
+                explanation:
+                    "New endpoint observed: GET /stream/{id} was first seen at 2024-06-01T00:00:00Z.",
+                evidence: json!({
+                    "first_seen": "2024-06-01T00:00:00Z",
+                    "initial_call_count": 1
+                }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+            },
+        );
+        let policy = TempPolicyFile::new(&signals_policy_document_string());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let (audit_log, audit_event_sender) = test_audit_log_with_broadcast();
+        let mut config = signals_admin_config(Some(&discovery_db.path), &policy);
+        config
+            .rbac_exempt_paths
+            .push(AUDIT_EVENTS_STREAM_ROUTE.to_owned());
+        let router = app(config, recorder.handle(), audit_log, audit_event_sender)
+            .expect("app should build");
+
+        let stream_response = router
+            .clone()
+            .oneshot(audit_query_request(
+                &format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type=signal.lifecycle_changed"),
+                Some(test_principal(&["admin"])),
+            ))
+            .await
+            .expect("stream request should complete");
+        assert_eq!(stream_response.status(), StatusCode::OK);
+
+        let transition_response = router
+            .oneshot(signals_admin_json_request(
+                Method::POST,
+                "/v1/admin/signals/sig-stream-ack/acknowledge",
+                Some(test_principal(&["signals-writer"])),
+            ))
+            .await
+            .expect("signals transition request should complete");
+        assert_eq!(transition_response.status(), StatusCode::OK);
+
+        let body = read_sse_until(stream_response.into_body(), |body| {
+            body.contains(r#""event_type":"signal.lifecycle_changed""#)
+                && body.contains(r#""id":"sig-stream-ack""#)
+        })
+        .await;
+
+        assert!(body.contains("event: signal.lifecycle_changed"));
+        assert!(body.contains(r#""signal_type":"new_endpoint_seen""#));
+        assert!(body.contains(r#""state":"acknowledged""#));
+        assert!(body.contains(r#""transitioned_by":"user-123""#));
+    }
+
+    #[tokio::test]
     async fn shadow_would_deny_events_are_queryable_and_streamable() {
         let db = TempDb::new("shadow-would-deny");
         let policy = TempPolicyFile::new(
@@ -10070,6 +10202,297 @@ paths:
         )
         .await;
         assert_eq!(detail["endpoint"]["schema_mismatch_count"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn traffic_endpoint_inventory_includes_open_signal_summary_without_signal_n_plus_one() {
+        let discovery_db = TempDb::new("traffic-open-signals");
+        create_discovery_schema(&discovery_db.path);
+        for index in 0..25 {
+            let endpoint_template = format!("/bulk/{index}");
+            insert_discovery_endpoint(
+                &discovery_db.path,
+                SeedEndpoint {
+                    method: "GET",
+                    endpoint_template: &endpoint_template,
+                    first_seen: "2024-06-01T00:00:00Z",
+                    last_seen: "2024-06-01T01:00:00Z",
+                    call_count: 1,
+                    latency_count: 1,
+                    latency_p50_ms: 10,
+                    latency_p95_ms: 10,
+                    latency_p99_ms: 10,
+                    distinct_principal_count: 1,
+                    status_counts: &[(200, 1)],
+                },
+            );
+            let signal_id = format!("sig-bulk-{index}");
+            insert_signal(
+                &discovery_db.path,
+                SignalSeed {
+                    id: &signal_id,
+                    signal_type: "new_endpoint_seen",
+                    method: "GET",
+                    endpoint_template: &endpoint_template,
+                    explanation: "New endpoint observed during signal summary query-count test.",
+                    evidence: json!({ "first_seen": "2024-06-01T00:00:00Z" }),
+                    state: "open",
+                    created_at: "2024-06-01T00:00:00Z",
+                    transitioned_at: None,
+                    transitioned_by: None,
+                },
+            );
+        }
+        insert_signal(
+            &discovery_db.path,
+            SignalSeed {
+                id: "sig-bulk-extra-type",
+                signal_type: "schema_mismatch",
+                method: "GET",
+                endpoint_template: "/bulk/0",
+                explanation: "Schema mismatch for GET /bulk/0.",
+                evidence: json!({ "reason": "body_shape_changed" }),
+                state: "open",
+                created_at: "2024-06-01T00:10:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+            },
+        );
+        insert_signal(
+            &discovery_db.path,
+            SignalSeed {
+                id: "sig-bulk-acknowledged",
+                signal_type: "principal_new_to_endpoint",
+                method: "GET",
+                endpoint_template: "/bulk/1",
+                explanation: "Acknowledged signal should not count as open.",
+                evidence: json!({ "principal": "alice" }),
+                state: "acknowledged",
+                created_at: "2024-06-01T00:15:00Z",
+                transitioned_at: Some("2024-06-01T00:16:00Z"),
+                transitioned_by: Some("reviewer"),
+            },
+        );
+
+        let store = discovery::query::DiscoveryQueryStore::open(&discovery_db.path)
+            .expect("discovery query store should open");
+        let page = store
+            .list_endpoints(&discovery::query::EndpointListFilters {
+                method: Some("GET".to_owned()),
+                endpoint_template_contains: None,
+                endpoint_template_prefix: None,
+                first_seen_after: None,
+                first_seen_before: None,
+                last_seen_after: None,
+                last_seen_before: None,
+                min_call_count: None,
+                new_since_hours: discovery::query::DEFAULT_NEW_SINCE_HOURS,
+                is_new: None,
+                reviewed: None,
+                sort: discovery::query::EndpointSort::LastSeen,
+                limit: 50,
+                cursor: None,
+            })
+            .expect("endpoint page should load");
+        assert_eq!(page.endpoints.len(), 25);
+        assert_eq!(
+            store.open_signal_summary_query_count_for_test(),
+            1,
+            "endpoint page should load all open-signal summaries with one set-based query"
+        );
+        let first = page
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_template == "/bulk/0")
+            .expect("/bulk/0 endpoint should be present");
+        let first_open_signals = first
+            .open_signals
+            .as_ref()
+            .expect("open signal summary should be loaded by default");
+        assert_eq!(first_open_signals.count, 2);
+        assert_eq!(
+            first_open_signals.signal_types,
+            vec!["new_endpoint_seen".to_owned(), "schema_mismatch".to_owned()]
+        );
+        assert!(page.endpoints.iter().all(|endpoint| {
+            endpoint.endpoint_template == "/bulk/0"
+                || endpoint
+                    .open_signals
+                    .as_ref()
+                    .expect("open signal summary should be loaded by default")
+                    .count
+                    == 1
+        }));
+
+        let (router, _policy) = traffic_admin_router(Some(&discovery_db.path), None);
+        let list = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?method=GET&endpoint_template_prefix=/bulk&sort=last_seen&limit=50",
+            Some(test_principal(&["traffic-and-signals-reader"])),
+        )
+        .await;
+        let bulk_zero = list["endpoints"]
+            .as_array()
+            .expect("endpoints should be an array")
+            .iter()
+            .find(|endpoint| endpoint["endpoint_template"] == json!("/bulk/0"))
+            .expect("/bulk/0 should be returned");
+        assert_eq!(bulk_zero["open_signals"]["count"], json!(2));
+        assert_eq!(
+            bulk_zero["open_signals"]["signal_types"],
+            json!(["new_endpoint_seen", "schema_mismatch"])
+        );
+
+        let detail = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoint?method=GET&endpoint_template=%2Fbulk%2F0",
+            Some(test_principal(&["traffic-and-signals-reader"])),
+        )
+        .await;
+        assert_eq!(detail["endpoint"]["open_signals"]["count"], json!(2));
+        assert_eq!(
+            detail["endpoint"]["open_signals"]["signal_types"],
+            json!(["new_endpoint_seen", "schema_mismatch"])
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_endpoint_inventory_omits_open_signal_summary_without_signals_read() {
+        let discovery_db = TempDb::new("traffic-open-signals-hidden");
+        create_discovery_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/hidden-signals",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 10,
+                latency_p95_ms: 10,
+                latency_p99_ms: 10,
+                distinct_principal_count: 1,
+                status_counts: &[(200, 1)],
+            },
+        );
+        insert_signal(
+            &discovery_db.path,
+            SignalSeed {
+                id: "sig-hidden",
+                signal_type: "security_anomaly",
+                method: "GET",
+                endpoint_template: "/hidden-signals",
+                explanation: "Signal type should not leak to traffic-only readers.",
+                evidence: json!({ "category": "authorization" }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+            },
+        );
+
+        let (router, _policy) = traffic_admin_router(Some(&discovery_db.path), None);
+        let list = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?method=GET&endpoint_template_prefix=/hidden",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert!(
+            list["endpoints"][0].get("open_signals").is_none(),
+            "open_signals should be absent from list responses for traffic-only readers: {list}"
+        );
+
+        let detail = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoint?method=GET&endpoint_template=%2Fhidden-signals",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert!(
+            detail["endpoint"].get("open_signals").is_none(),
+            "open_signals should be absent from detail responses for traffic-only readers: {detail}"
+        );
+    }
+
+    #[test]
+    fn endpoint_queries_can_skip_open_signal_summary_lookup() {
+        let discovery_db = TempDb::new("traffic-open-signals-query-skipped");
+        create_discovery_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/skip-signals",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 10,
+                latency_p95_ms: 10,
+                latency_p99_ms: 10,
+                distinct_principal_count: 1,
+                status_counts: &[(200, 1)],
+            },
+        );
+        insert_signal(
+            &discovery_db.path,
+            SignalSeed {
+                id: "sig-skip",
+                signal_type: "security_anomaly",
+                method: "GET",
+                endpoint_template: "/skip-signals",
+                explanation: "Signal type should not be queried when hidden.",
+                evidence: json!({ "category": "authorization" }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+            },
+        );
+
+        let store = discovery::query::DiscoveryQueryStore::open(&discovery_db.path)
+            .expect("discovery query store should open");
+        let page = store
+            .list_endpoints_with_open_signal_summaries(
+                &discovery::query::EndpointListFilters {
+                    method: Some("GET".to_owned()),
+                    endpoint_template_contains: None,
+                    endpoint_template_prefix: Some("/skip".to_owned()),
+                    first_seen_after: None,
+                    first_seen_before: None,
+                    last_seen_after: None,
+                    last_seen_before: None,
+                    min_call_count: None,
+                    new_since_hours: discovery::query::DEFAULT_NEW_SINCE_HOURS,
+                    is_new: None,
+                    reviewed: None,
+                    sort: discovery::query::EndpointSort::LastSeen,
+                    limit: 50,
+                    cursor: None,
+                },
+                false,
+            )
+            .expect("endpoint page should load");
+        assert_eq!(page.endpoints.len(), 1);
+        assert!(page.endpoints[0].open_signals.is_none());
+        assert_eq!(
+            store.open_signal_summary_query_count_for_test(),
+            0,
+            "endpoint page should not run the open-signal summary query when summaries are hidden"
+        );
+
+        let detail = store
+            .get_endpoint_with_open_signal_summaries("GET", "/skip-signals", 24, false)
+            .expect("endpoint detail should load")
+            .expect("endpoint should exist");
+        assert!(detail.open_signals.is_none());
+        assert_eq!(
+            store.open_signal_summary_query_count_for_test(),
+            0,
+            "endpoint detail should not run the open-signal summary query when summaries are hidden"
+        );
     }
 
     #[tokio::test]
@@ -10603,6 +11026,18 @@ paths:
         assert_eq!(
             signal_ids(&acknowledged),
             vec!["sig-acknowledged".to_owned()]
+        );
+
+        let target_key = query_encode("GET /widgets/{id}");
+        let target_filtered = signals_json(
+            &router,
+            &format!("/v1/admin/signals?target_kind=endpoint&target_key={target_key}"),
+            Some(test_principal(&["signals-reader"])),
+        )
+        .await;
+        assert_eq!(
+            signal_ids(&target_filtered),
+            vec!["sig-open-older".to_owned()]
         );
 
         let forbidden = router
@@ -11640,6 +12075,12 @@ paths:
                 "traffic-reader": {
                     "permissions": [ADMIN_TRAFFIC_READ_PERMISSION]
                 },
+                "traffic-and-signals-reader": {
+                    "permissions": [
+                        ADMIN_TRAFFIC_READ_PERMISSION,
+                        ADMIN_SIGNALS_READ_PERMISSION
+                    ]
+                },
                 "traffic-writer": {
                     "permissions": [
                         ADMIN_TRAFFIC_READ_PERMISSION,
@@ -12541,6 +12982,7 @@ O2gecI9QwDJNpm29J9wJB2F8
                 discovery::aggregator::EndpointAggregatorSinkConfig {
                     path: path.clone(),
                     payload_capture_enabled: false,
+                    signal_event_sender: None,
                     signal_detector_config: discovery::signals::SignalDetectorConfig::default(),
                 },
             )
@@ -12823,6 +13265,7 @@ O2gecI9QwDJNpm29J9wJB2F8
             discovery::aggregator::EndpointAggregatorSinkConfig {
                 path: discovery_path.clone(),
                 payload_capture_enabled: false,
+                signal_event_sender: None,
                 signal_detector_config: discovery::signals::SignalDetectorConfig::default(),
             },
         )

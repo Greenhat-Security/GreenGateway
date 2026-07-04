@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fmt,
     path::{Path, PathBuf},
@@ -52,6 +52,7 @@ pub struct DiscoveryQueryStore {
 struct DiscoveryQueryCounts {
     observed_endpoints: AtomicU64,
     inferred_request_schema: AtomicU64,
+    open_signal_summaries: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +105,8 @@ pub struct EndpointSummary {
     pub reviewed_at: Option<String>,
     pub reviewed_by: Option<String>,
     pub covered_by_rule: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_signals: Option<OpenSignalSummary>,
     pub latency: EndpointLatencySummary,
     pub status_counts: Vec<StatusCount>,
 }
@@ -122,6 +125,8 @@ pub struct EndpointAggregateDetail {
     pub reviewed_at: Option<String>,
     pub reviewed_by: Option<String>,
     pub covered_by_rule: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_signals: Option<OpenSignalSummary>,
     pub latency: EndpointLatencyDetail,
     pub status_counts: Vec<StatusCount>,
     pub updated_at: String,
@@ -155,6 +160,12 @@ pub struct EndpointLatencyDetail {
 pub struct StatusCount {
     pub status: u16,
     pub count: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct OpenSignalSummary {
+    pub count: u64,
+    pub signal_types: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -344,6 +355,14 @@ impl DiscoveryQueryStore {
         &self,
         filters: &EndpointListFilters,
     ) -> Result<EndpointListPage, DiscoveryQueryError> {
+        self.list_endpoints_with_open_signal_summaries(filters, true)
+    }
+
+    pub fn list_endpoints_with_open_signal_summaries(
+        &self,
+        filters: &EndpointListFilters,
+        include_open_signals: bool,
+    ) -> Result<EndpointListPage, DiscoveryQueryError> {
         let cursor = filters
             .cursor
             .as_deref()
@@ -400,6 +419,11 @@ impl DiscoveryQueryStore {
         };
 
         let connection = self.connection_guard();
+        let open_signal_summaries = if include_open_signals {
+            self.open_signal_summaries_for_rows(&connection, &rows)?
+        } else {
+            HashMap::new()
+        };
         let endpoints = rows
             .into_iter()
             .map(|row| {
@@ -409,7 +433,17 @@ impl DiscoveryQueryStore {
                     &row.method,
                     &row.endpoint_template,
                 )?;
-                Ok(row.into_summary(status_counts, &new_since_cutoff))
+                let open_signals = if include_open_signals {
+                    Some(
+                        open_signal_summaries
+                            .get(&(row.method.clone(), row.endpoint_template.clone()))
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    None
+                };
+                Ok(row.into_summary(status_counts, open_signals, &new_since_cutoff))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -424,6 +458,21 @@ impl DiscoveryQueryStore {
         method: &str,
         endpoint_template: &str,
         new_since_hours: u64,
+    ) -> Result<Option<EndpointAggregateDetail>, DiscoveryQueryError> {
+        self.get_endpoint_with_open_signal_summaries(
+            method,
+            endpoint_template,
+            new_since_hours,
+            true,
+        )
+    }
+
+    pub fn get_endpoint_with_open_signal_summaries(
+        &self,
+        method: &str,
+        endpoint_template: &str,
+        new_since_hours: u64,
+        include_open_signals: bool,
     ) -> Result<Option<EndpointAggregateDetail>, DiscoveryQueryError> {
         let new_since_cutoff = new_since_cutoff(new_since_hours);
         let connection = self.connection_guard();
@@ -473,7 +522,25 @@ impl DiscoveryQueryStore {
 
         let status_counts =
             load_status_counts(&connection, &self.path, &row.method, &row.endpoint_template)?;
-        Ok(Some(row.into_detail(status_counts, &new_since_cutoff)?))
+        let open_signals = if include_open_signals {
+            let summaries = self.open_signal_summaries_for_keys(
+                &connection,
+                &[(row.method.clone(), row.endpoint_template.clone())],
+            )?;
+            Some(
+                summaries
+                    .get(&(row.method.clone(), row.endpoint_template.clone()))
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
+        Ok(Some(row.into_detail(
+            status_counts,
+            open_signals,
+            &new_since_cutoff,
+        )?))
     }
 
     pub fn inferred_request_schema(
@@ -555,6 +622,42 @@ impl DiscoveryQueryStore {
                 .inferred_request_schema
                 .load(AtomicOrdering::Relaxed),
         )
+    }
+
+    #[cfg(test)]
+    pub fn open_signal_summary_query_count_for_test(&self) -> u64 {
+        self.query_counts
+            .open_signal_summaries
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    fn open_signal_summaries_for_rows(
+        &self,
+        connection: &Connection,
+        rows: &[RawEndpointAggregate],
+    ) -> Result<HashMap<(String, String), OpenSignalSummary>, DiscoveryQueryError> {
+        let endpoint_keys = rows
+            .iter()
+            .map(|row| (row.method.clone(), row.endpoint_template.clone()))
+            .collect::<Vec<_>>();
+        self.open_signal_summaries_for_keys(connection, &endpoint_keys)
+    }
+
+    fn open_signal_summaries_for_keys(
+        &self,
+        connection: &Connection,
+        endpoint_keys: &[(String, String)],
+    ) -> Result<HashMap<(String, String), OpenSignalSummary>, DiscoveryQueryError> {
+        if endpoint_keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        #[cfg(test)]
+        self.query_counts
+            .open_signal_summaries
+            .fetch_add(1, AtomicOrdering::Relaxed);
+
+        load_open_signal_summaries(connection, &self.path, endpoint_keys)
     }
 
     pub fn set_endpoint_review(
@@ -1092,6 +1195,7 @@ impl RawEndpointAggregate {
     fn into_summary(
         self,
         status_counts: Vec<StatusCount>,
+        open_signals: Option<OpenSignalSummary>,
         new_since_cutoff: &str,
     ) -> EndpointSummary {
         let latency = self.latency_summary();
@@ -1111,6 +1215,7 @@ impl RawEndpointAggregate {
             reviewed_at: review.reviewed_at,
             reviewed_by: review.reviewed_by,
             covered_by_rule: false,
+            open_signals,
             latency,
             status_counts,
         }
@@ -1119,6 +1224,7 @@ impl RawEndpointAggregate {
     fn into_detail(
         self,
         status_counts: Vec<StatusCount>,
+        open_signals: Option<OpenSignalSummary>,
         new_since_cutoff: &str,
     ) -> Result<EndpointAggregateDetail, DiscoveryQueryError> {
         let samples =
@@ -1151,6 +1257,7 @@ impl RawEndpointAggregate {
             reviewed_at: review.reviewed_at,
             reviewed_by: review.reviewed_by,
             covered_by_rule: false,
+            open_signals,
             latency,
             status_counts,
             updated_at: self.updated_at,
@@ -1429,6 +1536,14 @@ fn build_signal_list_query(
         clauses.push("signal_type = ?");
         params.push(SqlValue::Text(signal_type.clone()));
     }
+    if let Some(target_kind) = &filters.target_kind {
+        clauses.push("target_kind = ?");
+        params.push(SqlValue::Text(target_kind.clone()));
+    }
+    if let Some(target_key) = &filters.target_key {
+        clauses.push("target_key = ?");
+        params.push(SqlValue::Text(target_key.clone()));
+    }
     if let Some(cursor) = cursor {
         clauses.push(
             "(julianday(created_at) < julianday(?) OR (julianday(created_at) = julianday(?) AND id > ?))",
@@ -1619,6 +1734,81 @@ fn load_status_counts(
             source,
         })?;
     Ok(rows)
+}
+
+fn load_open_signal_summaries(
+    connection: &Connection,
+    path: &Path,
+    endpoint_keys: &[(String, String)],
+) -> Result<HashMap<(String, String), OpenSignalSummary>, DiscoveryQueryError> {
+    let values_sql = std::iter::repeat_n("(?, ?, ?)", endpoint_keys.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        WITH requested(method, endpoint_template, target_key) AS (
+            VALUES {values_sql}
+        )
+        SELECT
+            r.method,
+            r.endpoint_template,
+            s.signal_type,
+            COUNT(s.id)
+        FROM requested r
+        JOIN discovery_signals s
+            ON s.target_kind = ?
+            AND s.target_key = r.target_key
+            AND s.state = ?
+        GROUP BY r.method, r.endpoint_template, s.signal_type
+        ORDER BY r.method ASC, r.endpoint_template ASC, s.signal_type ASC
+        "#
+    );
+    let mut params = Vec::with_capacity(endpoint_keys.len() * 3 + 2);
+    for (method, endpoint_template) in endpoint_keys {
+        params.push(SqlValue::Text(method.clone()));
+        params.push(SqlValue::Text(endpoint_template.clone()));
+        params.push(SqlValue::Text(signals::endpoint_target_key(
+            method,
+            endpoint_template,
+        )));
+    }
+    params.push(SqlValue::Text(signals::ENDPOINT_TARGET_KIND.to_owned()));
+    params.push(SqlValue::Text(
+        SignalLifecycleState::Open.as_str().to_owned(),
+    ));
+
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|source| DiscoveryQueryError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let rows = statement
+        .query_map(params_from_iter(params.iter()), |row| {
+            let count: i64 = row.get(3)?;
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                row.get::<_, String>(2)?,
+                non_negative_i64_to_u64(count),
+            ))
+        })
+        .map_err(|source| DiscoveryQueryError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    let mut summaries = HashMap::<(String, String), OpenSignalSummary>::new();
+    for row in rows {
+        let (key, signal_type, count) = row.map_err(|source| DiscoveryQueryError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let summary = summaries.entry(key).or_default();
+        summary.count += count;
+        summary.signal_types.push(signal_type);
+    }
+
+    Ok(summaries)
 }
 
 fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {

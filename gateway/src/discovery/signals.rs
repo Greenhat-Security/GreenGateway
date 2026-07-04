@@ -132,6 +132,8 @@ pub struct SignalListPage {
 pub struct SignalListFilters {
     pub state: Option<SignalLifecycleState>,
     pub signal_type: Option<String>,
+    pub target_kind: Option<String>,
+    pub target_key: Option<String>,
     pub limit: usize,
     pub cursor: Option<String>,
 }
@@ -169,6 +171,24 @@ impl NewSignal {
             evidence,
             state: SignalLifecycleState::Open,
             created_at: created_at.into(),
+        }
+    }
+
+    fn as_signal(&self) -> Signal {
+        Signal {
+            id: self.id.clone(),
+            signal_type: self.signal_type.clone(),
+            target: SignalTarget {
+                kind: self.target_kind.clone(),
+                identity: self.target_identity.clone(),
+            },
+            explanation: self.explanation.clone(),
+            evidence: self.evidence.clone(),
+            state: self.state,
+            created_at: self.created_at.clone(),
+            updated_at: self.created_at.clone(),
+            transitioned_at: None,
+            transitioned_by: None,
         }
     }
 }
@@ -604,14 +624,15 @@ pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
 pub fn insert_signals(
     connection: &Connection,
     signals: &[NewSignal],
-) -> Result<(), SignalStorageError> {
+) -> Result<Vec<Signal>, SignalStorageError> {
     let mut statement = connection.prepare_cached(INSERT_SIGNAL_SQL)?;
+    let mut inserted_signals = Vec::new();
 
     for signal in signals {
         let target_identity_json = serde_json::to_string(&signal.target_identity)?;
         let evidence_json = serde_json::to_string(&signal.evidence)?;
 
-        statement.execute(params![
+        let inserted = statement.execute(params![
             signal.id.as_str(),
             signal.signal_type.as_str(),
             signal.target_kind.as_str(),
@@ -622,9 +643,12 @@ pub fn insert_signals(
             signal.state.as_str(),
             signal.created_at.as_str(),
         ])?;
+        if inserted > 0 {
+            inserted_signals.push(signal.as_signal());
+        }
     }
 
-    Ok(())
+    Ok(inserted_signals)
 }
 
 pub fn endpoint_target_key(method: &str, endpoint_template: &str) -> String {
