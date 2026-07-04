@@ -7,8 +7,25 @@ use std::{
 
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
 use crate::metrics::LOCK_POISON_RECOVERIES_TOTAL;
+
+pub const DEFAULT_NEW_SINCE_HOURS: u64 = 24;
+/// 100 years, comfortably inside `OffsetDateTime`'s representable range and
+/// far beyond any meaningful "new since" window; guards against overflow in
+/// `TimeDuration::hours` for pathological caller-supplied values.
+pub const MAX_NEW_SINCE_HOURS: u64 = 876_000;
+
+const CREATE_REVIEW_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS discovery_endpoint_reviews (
+    method TEXT NOT NULL,
+    endpoint_template TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL,
+    reviewed_by TEXT,
+    PRIMARY KEY (method, endpoint_template)
+);
+"#;
 
 #[derive(Clone)]
 pub struct DiscoveryQueryStore {
@@ -23,6 +40,7 @@ pub enum EndpointSort {
     FirstSeen,
 }
 
+#[derive(Clone)]
 pub struct EndpointListFilters {
     pub method: Option<String>,
     pub endpoint_template_contains: Option<String>,
@@ -32,6 +50,9 @@ pub struct EndpointListFilters {
     pub last_seen_after: Option<String>,
     pub last_seen_before: Option<String>,
     pub min_call_count: Option<i64>,
+    pub new_since_hours: u64,
+    pub is_new: Option<bool>,
+    pub reviewed: Option<bool>,
     pub sort: EndpointSort,
     pub limit: usize,
     pub cursor: Option<String>,
@@ -56,6 +77,11 @@ pub struct EndpointSummary {
     pub last_seen: String,
     pub call_count: u64,
     pub distinct_principal_count: u64,
+    pub is_new: bool,
+    pub reviewed: bool,
+    pub reviewed_at: Option<String>,
+    pub reviewed_by: Option<String>,
+    pub covered_by_rule: bool,
     pub latency: EndpointLatencySummary,
     pub status_counts: Vec<StatusCount>,
 }
@@ -68,9 +94,21 @@ pub struct EndpointAggregateDetail {
     pub last_seen: String,
     pub call_count: u64,
     pub distinct_principal_count: u64,
+    pub is_new: bool,
+    pub reviewed: bool,
+    pub reviewed_at: Option<String>,
+    pub reviewed_by: Option<String>,
+    pub covered_by_rule: bool,
     pub latency: EndpointLatencyDetail,
     pub status_counts: Vec<StatusCount>,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct EndpointReviewState {
+    pub reviewed: bool,
+    pub reviewed_at: Option<String>,
+    pub reviewed_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -174,6 +212,10 @@ impl DiscoveryQueryStore {
             path: path.clone(),
             source,
         })?;
+        configure_connection(&connection).map_err(|source| DiscoveryQueryError::Sqlite {
+            path: path.clone(),
+            source,
+        })?;
 
         Ok(Self {
             path,
@@ -235,7 +277,8 @@ impl DiscoveryQueryStore {
             }
         }
 
-        let (sql, params) = build_endpoint_list_query(filters, cursor.as_ref());
+        let new_since_cutoff = new_since_cutoff(filters.new_since_hours);
+        let (sql, params) = build_endpoint_list_query(filters, cursor.as_ref(), &new_since_cutoff);
         let raw_rows = {
             let connection = self.connection_guard();
             let mut statement =
@@ -286,7 +329,7 @@ impl DiscoveryQueryStore {
                     &row.method,
                     &row.endpoint_template,
                 )?;
-                Ok(row.into_summary(status_counts))
+                Ok(row.into_summary(status_counts, &new_since_cutoff))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -300,7 +343,9 @@ impl DiscoveryQueryStore {
         &self,
         method: &str,
         endpoint_template: &str,
+        new_since_hours: u64,
     ) -> Result<Option<EndpointAggregateDetail>, DiscoveryQueryError> {
+        let new_since_cutoff = new_since_cutoff(new_since_hours);
         let connection = self.connection_guard();
         let mut statement = connection
             .prepare(
@@ -317,8 +362,12 @@ impl DiscoveryQueryStore {
                     latency_p99_ms,
                     latency_samples_json,
                     distinct_principal_count,
-                    updated_at
+                    updated_at,
+                    r.reviewed_at,
+                    r.reviewed_by
                 FROM discovery_endpoint_aggregates
+                LEFT JOIN discovery_endpoint_reviews r
+                    USING (method, endpoint_template)
                 WHERE method = ?1 AND endpoint_template = ?2
                 "#,
             )
@@ -343,7 +392,84 @@ impl DiscoveryQueryStore {
 
         let status_counts =
             load_status_counts(&connection, &self.path, &row.method, &row.endpoint_template)?;
-        Ok(Some(row.into_detail(status_counts)?))
+        Ok(Some(row.into_detail(status_counts, &new_since_cutoff)?))
+    }
+
+    pub fn set_endpoint_review(
+        &self,
+        method: &str,
+        endpoint_template: &str,
+        reviewed: bool,
+        reviewed_by: Option<&str>,
+    ) -> Result<Option<EndpointReviewState>, DiscoveryQueryError> {
+        let connection = self.connection_guard();
+        let exists = connection
+            .query_row(
+                r#"
+                SELECT 1
+                FROM discovery_endpoint_aggregates
+                WHERE method = ?1 AND endpoint_template = ?2
+                "#,
+                params![method, endpoint_template],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|source| DiscoveryQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        if reviewed {
+            let reviewed_at = utc_timestamp_rfc3339();
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO discovery_endpoint_reviews (
+                        method,
+                        endpoint_template,
+                        reviewed_at,
+                        reviewed_by
+                    ) VALUES (?1, ?2, ?3, ?4)
+                    ON CONFLICT(method, endpoint_template) DO UPDATE SET
+                        reviewed_at = excluded.reviewed_at,
+                        reviewed_by = excluded.reviewed_by
+                    "#,
+                    params![method, endpoint_template, reviewed_at, reviewed_by],
+                )
+                .map_err(|source| DiscoveryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
+
+            Ok(Some(EndpointReviewState {
+                reviewed: true,
+                reviewed_at: Some(reviewed_at),
+                reviewed_by: reviewed_by.map(str::to_owned),
+            }))
+        } else {
+            connection
+                .execute(
+                    r#"
+                    DELETE FROM discovery_endpoint_reviews
+                    WHERE method = ?1 AND endpoint_template = ?2
+                    "#,
+                    params![method, endpoint_template],
+                )
+                .map_err(|source| DiscoveryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
+
+            Ok(Some(EndpointReviewState {
+                reviewed: false,
+                reviewed_at: None,
+                reviewed_by: None,
+            }))
+        }
     }
 
     pub fn list_principals(
@@ -448,6 +574,8 @@ struct RawEndpointAggregate {
     latency_samples_json: String,
     distinct_principal_count: i64,
     updated_at: String,
+    reviewed_at: Option<String>,
+    reviewed_by: Option<String>,
 }
 
 impl RawEndpointAggregate {
@@ -465,6 +593,8 @@ impl RawEndpointAggregate {
             latency_samples_json: row.get(9)?,
             distinct_principal_count: row.get(10)?,
             updated_at: row.get(11)?,
+            reviewed_at: row.get(12)?,
+            reviewed_by: row.get(13)?,
         })
     }
 
@@ -477,16 +607,27 @@ impl RawEndpointAggregate {
         }
     }
 
-    fn into_summary(self, status_counts: Vec<StatusCount>) -> EndpointSummary {
+    fn into_summary(
+        self,
+        status_counts: Vec<StatusCount>,
+        new_since_cutoff: &str,
+    ) -> EndpointSummary {
         let latency = self.latency_summary();
+        let is_new = is_new_since(&self.first_seen, new_since_cutoff);
+        let review = self.review_state();
 
         EndpointSummary {
             method: self.method,
             endpoint_template: self.endpoint_template,
+            is_new,
             first_seen: self.first_seen,
             last_seen: self.last_seen,
             call_count: non_negative_i64_to_u64(self.call_count),
             distinct_principal_count: non_negative_i64_to_u64(self.distinct_principal_count),
+            reviewed: review.reviewed,
+            reviewed_at: review.reviewed_at,
+            reviewed_by: review.reviewed_by,
+            covered_by_rule: false,
             latency,
             status_counts,
         }
@@ -495,6 +636,7 @@ impl RawEndpointAggregate {
     fn into_detail(
         self,
         status_counts: Vec<StatusCount>,
+        new_since_cutoff: &str,
     ) -> Result<EndpointAggregateDetail, DiscoveryQueryError> {
         let samples =
             serde_json::from_str::<Vec<u64>>(&self.latency_samples_json).map_err(|source| {
@@ -503,6 +645,8 @@ impl RawEndpointAggregate {
                     source,
                 }
             })?;
+        let is_new = is_new_since(&self.first_seen, new_since_cutoff);
+        let review = self.review_state();
         let latency = EndpointLatencyDetail {
             count: non_negative_i64_to_u64(self.latency_count),
             p50_ms: non_negative_i64_to_u64(self.latency_p50_ms),
@@ -514,14 +658,27 @@ impl RawEndpointAggregate {
         Ok(EndpointAggregateDetail {
             method: self.method,
             endpoint_template: self.endpoint_template,
+            is_new,
             first_seen: self.first_seen,
             last_seen: self.last_seen,
             call_count: non_negative_i64_to_u64(self.call_count),
             distinct_principal_count: non_negative_i64_to_u64(self.distinct_principal_count),
+            reviewed: review.reviewed,
+            reviewed_at: review.reviewed_at,
+            reviewed_by: review.reviewed_by,
+            covered_by_rule: false,
             latency,
             status_counts,
             updated_at: self.updated_at,
         })
+    }
+
+    fn review_state(&self) -> EndpointReviewState {
+        EndpointReviewState {
+            reviewed: self.reviewed_at.is_some(),
+            reviewed_at: self.reviewed_at.clone(),
+            reviewed_by: self.reviewed_by.clone(),
+        }
     }
 }
 
@@ -588,6 +745,7 @@ impl EndpointSort {
 fn build_endpoint_list_query(
     filters: &EndpointListFilters,
     cursor: Option<&EndpointCursor>,
+    new_since_cutoff: &str,
 ) -> (String, Vec<SqlValue>) {
     let mut sql = String::from(
         r#"
@@ -603,8 +761,12 @@ fn build_endpoint_list_query(
             a.latency_p99_ms,
             a.latency_samples_json,
             a.distinct_principal_count,
-            a.updated_at
+            a.updated_at,
+            r.reviewed_at,
+            r.reviewed_by
         FROM discovery_endpoint_aggregates a
+        LEFT JOIN discovery_endpoint_reviews r
+            USING (method, endpoint_template)
         "#,
     );
     let mut clauses = Vec::new();
@@ -647,6 +809,21 @@ fn build_endpoint_list_query(
     if let Some(min_call_count) = filters.min_call_count {
         clauses.push("a.call_count >= ?");
         params.push(SqlValue::Integer(min_call_count));
+    }
+    if let Some(is_new) = filters.is_new {
+        if is_new {
+            clauses.push("julianday(a.first_seen) >= julianday(?)");
+        } else {
+            clauses.push("julianday(a.first_seen) < julianday(?)");
+        }
+        params.push(SqlValue::Text(new_since_cutoff.to_owned()));
+    }
+    if let Some(reviewed) = filters.reviewed {
+        if reviewed {
+            clauses.push("r.reviewed_at IS NOT NULL");
+        } else {
+            clauses.push("r.reviewed_at IS NULL");
+        }
     }
     if let Some(cursor) = cursor {
         let expression = filters.sort.order_expression();
@@ -784,6 +961,40 @@ fn load_status_counts(
             source,
         })?;
     Ok(rows)
+}
+
+fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        r#"
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
+        "#,
+    )?;
+    connection.execute_batch(CREATE_REVIEW_SCHEMA_SQL)
+}
+
+fn new_since_cutoff(new_since_hours: u64) -> String {
+    let hours = i64::try_from(new_since_hours).unwrap_or(i64::MAX);
+    (OffsetDateTime::now_utc() - TimeDuration::hours(hours))
+        .format(&Rfc3339)
+        .expect("UTC timestamp should format as RFC 3339")
+}
+
+fn is_new_since(first_seen: &str, new_since_cutoff: &str) -> bool {
+    let Ok(first_seen) = OffsetDateTime::parse(first_seen, &Rfc3339) else {
+        return false;
+    };
+    let Ok(new_since_cutoff) = OffsetDateTime::parse(new_since_cutoff, &Rfc3339) else {
+        return false;
+    };
+
+    first_seen >= new_since_cutoff
+}
+
+fn utc_timestamp_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .expect("current UTC timestamp should format as RFC 3339")
 }
 
 fn encode_cursor<T: Serialize>(cursor: &T) -> Result<String, DiscoveryQueryError> {

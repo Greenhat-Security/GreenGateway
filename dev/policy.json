@@ -42,6 +42,16 @@
       "permission": "admin:policy:write"
     },
     {
+      "methods": ["GET"],
+      "path_prefix": "/v1/admin/traffic",
+      "permission": "admin:traffic:read"
+    },
+    {
+      "methods": ["POST"],
+      "path_prefix": "/v1/admin/traffic/endpoints/review",
+      "permission": "admin:traffic:write"
+    },
+    {
       "methods": ["POST"],
       "path_prefix": "/__dev-echo",
       "permission": "dev:proxy:echo"
