@@ -1,6 +1,6 @@
 <div align="center">
 
-![GreenGateway (GG)](docs/images/greengateway-cover.png)
+![GreenGateway (GG)](docs/images/gg-cover.png)
 
 # GreenGateway (GG)
 

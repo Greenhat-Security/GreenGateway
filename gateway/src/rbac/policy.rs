@@ -12,6 +12,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::rule::{
+    valid_auth_method_name, Rule, AUTH_METHOD_BEARER_TOKEN, AUTH_METHOD_SESSION_COOKIE,
+};
 use crate::config::Config;
 
 const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
@@ -21,6 +24,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "enforcement_mode",
     "roles",
     "routes",
+    "rules",
 ];
 #[allow(dead_code)]
 const TEMP_FILE_CREATE_ATTEMPTS: u8 = 16;
@@ -73,6 +77,9 @@ pub struct Policy {
     /// Ordered route-to-permission rules. First matching rule wins.
     #[serde(default)]
     pub routes: Vec<RouteRule>,
+    /// Ordered direct firewall rules. First matching rule wins.
+    #[serde(default)]
+    pub rules: Vec<Rule>,
 }
 
 /// Permissions granted by one role.
@@ -182,15 +189,40 @@ impl Policy {
     }
 
     fn validate(&self) -> Result<(), PolicyError> {
-        if self.schema_version.starts_with("0.") {
-            Ok(())
-        } else {
-            Err(PolicyError::Invalid(format!(
+        if !self.schema_version.starts_with("0.") {
+            return Err(PolicyError::Invalid(format!(
                 "policy schema_version must start with \"0.\", got '{}'",
                 self.schema_version
-            )))
+            )));
+        }
+
+        validate_rules(&self.rules)?;
+
+        Ok(())
+    }
+}
+
+fn validate_rules(rules: &[Rule]) -> Result<(), PolicyError> {
+    for (rule_index, rule) in rules.iter().enumerate() {
+        if !rule.path.starts_with('/') {
+            return Err(PolicyError::Invalid(format!(
+                "rules[{rule_index}].path must start with '/', got '{}'",
+                rule.path
+            )));
+        }
+
+        for auth_method in &rule.principal.auth_methods {
+            if !valid_auth_method_name(auth_method) {
+                return Err(PolicyError::Invalid(format!(
+                    "rules[{rule_index}].principal.auth_methods contains unknown auth method \
+                     '{auth_method}', expected '{AUTH_METHOD_BEARER_TOKEN}' or \
+                     '{AUTH_METHOD_SESSION_COOKIE}'"
+                )));
+            }
         }
     }
+
+    Ok(())
 }
 
 impl fmt::Display for PolicyError {
@@ -418,6 +450,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
+    use crate::rbac::{PrincipalMatcher, RuleAction};
 
     #[test]
     fn valid_policy_from_file_parses() {
@@ -442,6 +475,7 @@ mod tests {
             vec!["data:read".to_owned()]
         );
         assert!(policy.routes.is_empty());
+        assert!(policy.rules.is_empty());
     }
 
     #[test]
@@ -662,6 +696,204 @@ mod tests {
     }
 
     #[test]
+    fn rules_section_parses_and_round_trips_as_ordered_first_match_rules() {
+        let file = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "rules": [
+                    {
+                        "methods": ["GET", "HEAD"],
+                        "path": "/api/users/{id}",
+                        "principal": {
+                            "roles": ["admin", "support"],
+                            "auth_methods": ["bearer_token"],
+                            "principal_ids": ["user-123"]
+                        },
+                        "action": "allow"
+                    },
+                    {
+                        "methods": ["POST"],
+                        "path": "/api/**",
+                        "principal": {
+                            "roles": ["writer"],
+                            "auth_methods": ["session_cookie"]
+                        },
+                        "action": "shadow"
+                    },
+                    {
+                        "path": "/admin/**",
+                        "principal": {},
+                        "action": "deny"
+                    }
+                ]
+            }"#,
+        );
+
+        let policy = Policy::from_file(file.path()).expect("rules section should parse");
+
+        assert_eq!(policy.rules.len(), 3);
+        assert_eq!(
+            policy.rules[0].methods,
+            vec!["GET".to_owned(), "HEAD".to_owned()]
+        );
+        assert_eq!(policy.rules[0].path, "/api/users/{id}");
+        assert_eq!(
+            policy.rules[0].principal,
+            PrincipalMatcher {
+                roles: vec!["admin".to_owned(), "support".to_owned()],
+                auth_methods: vec!["bearer_token".to_owned()],
+                principal_ids: vec!["user-123".to_owned()],
+            }
+        );
+        assert_eq!(policy.rules[0].action, RuleAction::Allow);
+        assert_eq!(policy.rules[1].action, RuleAction::Shadow);
+        assert_eq!(policy.rules[2].action, RuleAction::Deny);
+        assert!(policy.rules[2].methods.is_empty());
+        assert!(policy.rules[2].principal.is_unconstrained());
+
+        let round_trip_value =
+            serde_json::to_value(&policy).expect("policy with rules should serialize");
+        let round_tripped: Policy =
+            serde_json::from_value(round_trip_value).expect("serialized policy should parse");
+
+        assert_eq!(round_tripped, policy);
+    }
+
+    #[test]
+    fn malformed_rules_are_rejected_by_parser_and_schema() {
+        let cases = [
+            (
+                "unknown rule field",
+                json!({
+                    "schema_version": "0.1.0",
+                    "rules": [
+                        {
+                            "path": "/admin/**",
+                            "action": "deny",
+                            "priority": 10
+                        }
+                    ]
+                }),
+                "unknown field `priority`",
+            ),
+            (
+                "invalid action",
+                json!({
+                    "schema_version": "0.1.0",
+                    "rules": [
+                        {
+                            "path": "/admin/**",
+                            "action": "audit"
+                        }
+                    ]
+                }),
+                "unknown variant `audit`",
+            ),
+            (
+                "malformed principal matcher field",
+                json!({
+                    "schema_version": "0.1.0",
+                    "rules": [
+                        {
+                            "path": "/admin/**",
+                            "principal": {
+                                "roles": "admin"
+                            },
+                            "action": "deny"
+                        }
+                    ]
+                }),
+                "invalid type",
+            ),
+        ];
+        let validator = policy_schema_validator();
+
+        for (name, value, expected_error) in cases {
+            assert!(
+                !validator.is_valid(&value),
+                "published schema should reject {name}"
+            );
+
+            let document =
+                serde_json::to_string(&value).expect("malformed policy case should serialize");
+            let file = TempPolicyFile::new(&document);
+            let error = Policy::from_file(file.path())
+                .expect_err("malformed rule should fail parser or validation");
+
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error for {name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_rule_auth_method_is_rejected_by_parser_and_schema() {
+        let value = json!({
+            "schema_version": "0.1.0",
+            "rules": [
+                {
+                    "path": "/admin/**",
+                    "principal": {
+                        "auth_methods": ["api_key"]
+                    },
+                    "action": "deny"
+                }
+            ]
+        });
+        let validator = policy_schema_validator();
+
+        assert!(
+            !validator.is_valid(&value),
+            "published schema should reject unknown auth_methods entries"
+        );
+
+        let document =
+            serde_json::to_string(&value).expect("malformed policy case should serialize");
+        let file = TempPolicyFile::new(&document);
+        let error =
+            Policy::from_file(file.path()).expect_err("unknown auth method should fail validation");
+
+        assert!(matches!(error, PolicyError::Invalid(_)));
+        assert!(
+            error.to_string().contains("unknown auth method 'api_key'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn non_absolute_rule_path_is_rejected_by_parser_and_schema() {
+        let value = json!({
+            "schema_version": "0.1.0",
+            "rules": [
+                {
+                    "path": "admin/**",
+                    "action": "deny"
+                }
+            ]
+        });
+        let validator = policy_schema_validator();
+
+        assert!(
+            !validator.is_valid(&value),
+            "published schema should reject non-absolute rule paths"
+        );
+
+        let document =
+            serde_json::to_string(&value).expect("malformed policy case should serialize");
+        let file = TempPolicyFile::new(&document);
+        let error = Policy::from_file(file.path()).expect_err("non-absolute rule path should fail");
+
+        assert!(matches!(error, PolicyError::Invalid(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("rules[0].path must start with '/'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn unreachable_route_path_prefix_detection_names_non_absolute_prefixes() {
         let routes = vec![
             route("/data", "data:read"),
@@ -815,6 +1047,7 @@ mod tests {
         assert_eq!(policy.enforcement_mode, EnforcementMode::Enforce);
         assert!(policy.roles.is_empty());
         assert!(policy.routes.is_empty());
+        assert!(policy.rules.is_empty());
         assert_schema_accepts(&policy_schema_validator(), &value);
     }
 
@@ -852,6 +1085,43 @@ mod tests {
 
         assert_schema_accepts(&validator, &top_level_policy);
         assert_schema_accepts(&validator, &route_override_policy);
+    }
+
+    #[test]
+    fn published_schema_accepts_policy_with_rules() {
+        let validator = policy_schema_validator();
+        let policy = json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "rules": [
+                {
+                    "methods": ["GET", "HEAD"],
+                    "path": "/api/users/{id}",
+                    "principal": {
+                        "roles": ["admin", "support"],
+                        "auth_methods": ["bearer_token"],
+                        "principal_ids": ["user-123"]
+                    },
+                    "action": "allow"
+                },
+                {
+                    "methods": ["POST"],
+                    "path": "/api/**",
+                    "principal": {
+                        "roles": ["writer"],
+                        "auth_methods": ["session_cookie"]
+                    },
+                    "action": "shadow"
+                },
+                {
+                    "path": "/admin/**",
+                    "principal": {},
+                    "action": "deny"
+                }
+            ]
+        });
+
+        assert_schema_accepts(&validator, &policy);
     }
 
     #[test]
@@ -980,6 +1250,7 @@ mod tests {
                     enforcement_mode: None,
                 },
             ],
+            rules: Vec::new(),
         }
     }
 
