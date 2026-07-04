@@ -12,6 +12,7 @@ use crate::{
         AuditEvent, AuditEventSender, AUDIT_EVENTS_DROPPED_TOTAL,
     },
     config::Config,
+    discovery::aggregator::{EndpointAggregatorSink, EndpointAggregatorSinkConfig},
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
 };
 
@@ -184,7 +185,30 @@ pub fn build_sink(
     audit_log_file: Option<&str>,
     audit_sqlite_path: Option<&str>,
     audit_sqlite_retention_days: Option<u32>,
+    discovery_sqlite_path: Option<&str>,
 ) -> Result<Arc<dyn AuditSink>, Box<dyn Error>> {
+    let sinks = build_sink_members(
+        audit_log_file,
+        audit_sqlite_path,
+        audit_sqlite_retention_days,
+        discovery_sqlite_path,
+    )?;
+
+    let sink = if sinks.len() == 1 {
+        Arc::clone(&sinks[0])
+    } else {
+        Arc::new(CompositeSink::new(sinks))
+    };
+
+    Ok(sink)
+}
+
+fn build_sink_members(
+    audit_log_file: Option<&str>,
+    audit_sqlite_path: Option<&str>,
+    audit_sqlite_retention_days: Option<u32>,
+    discovery_sqlite_path: Option<&str>,
+) -> Result<Vec<Arc<dyn AuditSink>>, Box<dyn Error>> {
     let stdout: Arc<dyn AuditSink> = Arc::new(StdoutSink::new());
     let mut sinks = vec![stdout];
 
@@ -209,13 +233,18 @@ pub fn build_sink(
         );
     }
 
-    let sink = if sinks.len() == 1 {
-        Arc::clone(&sinks[0])
-    } else {
-        Arc::new(CompositeSink::new(sinks))
-    };
+    if let Some(path) = discovery_sqlite_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        sinks.push(
+            Arc::new(EndpointAggregatorSink::new(EndpointAggregatorSinkConfig {
+                path: PathBuf::from(path),
+            })?) as Arc<dyn AuditSink>,
+        );
+    }
 
-    Ok(sink)
+    Ok(sinks)
 }
 
 pub fn build_sink_from_config(config: &Config) -> Result<ConfiguredAuditSink, Box<dyn Error>> {
@@ -224,6 +253,7 @@ pub fn build_sink_from_config(config: &Config) -> Result<ConfiguredAuditSink, Bo
         config.audit_log_file.as_deref(),
         config.audit_sqlite_path.as_deref(),
         config.audit_sqlite_retention_days,
+        config.discovery_sqlite_path.as_deref(),
     )?;
     let sink = Arc::new(CompositeSink::new(vec![
         base_sink,
@@ -239,6 +269,7 @@ pub mod tests {
     use serde_json::{json, Value};
     use std::{
         fs,
+        path::PathBuf,
         sync::MutexGuard,
         time::{Duration, Instant},
     };
@@ -387,6 +418,36 @@ pub mod tests {
 
         fs::remove_file(&path)
             .unwrap_or_else(|err| panic!("failed to remove {}: {err}", path.display()));
+    }
+
+    #[test]
+    fn discovery_aggregator_member_is_only_added_when_path_is_configured() {
+        let without_path =
+            build_sink_members(None, None, None, None).expect("sink members should build");
+        assert_eq!(without_path.len(), 1);
+
+        let blank_path =
+            build_sink_members(None, None, None, Some("   ")).expect("sink members should build");
+        assert_eq!(blank_path.len(), 1);
+
+        let path = std::env::temp_dir().join(format!(
+            "greengateway-discovery-sink-config-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let with_path = build_sink_members(
+            None,
+            None,
+            None,
+            Some(path.to_str().expect("test path should be valid UTF-8")),
+        )
+        .expect("sink members should build");
+        assert_eq!(with_path.len(), 2);
+        drop(with_path);
+
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{}", path.display(), suffix));
+            let _ = fs::remove_file(path);
+        }
     }
 
     pub fn test_event(event_type: &str) -> AuditEvent {

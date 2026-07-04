@@ -2,4 +2,5 @@
 
 #![allow(dead_code)]
 
+pub mod aggregator;
 pub mod path_template;

@@ -56,6 +56,16 @@ Default: empty, which disables SQLite pruning.
 
 Format and validation: must parse as a `u32` day count when set. This value is only applied when `AUDIT_SQLITE_PATH` is also set; if the path is unset, the parsed retention value is accepted but has no effect.
 
+### DISCOVERY_SQLITE_PATH
+
+Optional SQLite endpoint discovery inventory store path.
+
+Default: empty, which disables endpoint aggregation.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. When set, the gateway opens or creates the database at startup, creates discovery aggregate tables and indexes if needed, and consumes `http.request_observed` audit events into per-method, per-endpoint-template aggregates on the audit writer thread. This keeps aggregation out of the request hot path.
+
+This uses a separate config surface from `AUDIT_SQLITE_PATH` because audit history and derived endpoint inventory often have different retention and lifecycle requirements. Operators that prefer a single SQLite file may explicitly set `DISCOVERY_SQLITE_PATH` to the same path as `AUDIT_SQLITE_PATH`; the discovery tables use their own `discovery_` prefixes.
+
 ### POLICY_FILE
 
 Optional RBAC policy JSON file path.
