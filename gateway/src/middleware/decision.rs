@@ -12,12 +12,13 @@ pub enum PolicyDecisionOutcome {
     WouldDeny,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyDecision {
     pub outcome: PolicyDecisionOutcome,
     pub reason: &'static str,
     pub permission: Option<String>,
     pub path_prefix: Option<String>,
+    pub matched_rule_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]

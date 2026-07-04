@@ -130,6 +130,7 @@
       }
     },
     "rule_action": {
+      "description": "Direct rules run before, and take precedence over, the routes/permission model: the first matching rule is the sole authority for the request, and routes are never consulted once a rule matches. 'allow' forwards the request unconditionally (no downstream permission check). 'deny' blocks with 403. 'shadow' also forwards the request unconditionally (like 'allow') but records a would-deny observation event instead of an allowed one, for policy-authoring dry runs. Because both 'allow' and 'shadow' bypass the routes/permission model entirely, an overly broad rule (e.g. an unconstrained principal matcher on a sensitive path) can unintentionally grant access that the routes-based permission model would have denied — scope rule principal/path matchers carefully.",
       "enum": [
         "allow",
         "deny",
@@ -144,6 +145,10 @@
         "action"
       ],
       "properties": {
+        "id": {
+          "type": "string",
+          "description": "Optional stable identifier for audit and observation attribution. When omitted, live evaluation reports the rule's array index."
+        },
         "methods": {
           "type": "array",
           "description": "HTTP methods this rule matches. Empty or [\"*\"] means any method.",

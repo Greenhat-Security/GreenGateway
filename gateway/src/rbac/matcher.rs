@@ -244,6 +244,7 @@ mod tests {
     #[test]
     fn example_rule_matches_one_user_segment_for_role() {
         let matcher = RuleMatcher::new(&[Rule {
+            id: None,
             methods: vec!["GET".to_owned()],
             path: "/api/users/*".to_owned(),
             principal: PrincipalMatcher {
@@ -617,6 +618,7 @@ mod tests {
             action_strategy(),
         )
             .prop_map(|(methods, path, principal, action)| Rule {
+                id: None,
                 methods,
                 path,
                 principal,
@@ -723,6 +725,7 @@ mod tests {
 
     fn rule(methods: &[&str], path: &str, action: RuleAction) -> Rule {
         Rule {
+            id: None,
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
             path: path.to_owned(),
             principal: PrincipalMatcher::default(),
