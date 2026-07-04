@@ -1509,6 +1509,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_returns_actionable_error_for_invalid_policy_file() {
+        let policy = TempPolicyFile::new(r#"{ "schema_version": "#);
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+
+        let error = match app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        ) {
+            Ok(_) => panic!("app startup should reject invalid policy file"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(
+            message.contains("failed to parse policy file"),
+            "unexpected startup error: {message}"
+        );
+        assert!(
+            message.contains(&policy.path.to_string_lossy().into_owned()),
+            "startup error should name the policy file: {message}"
+        );
+        assert!(
+            !message.contains("panicked"),
+            "startup error should not be a panic: {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn admin_ui_shell_is_served_without_principal() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let response = app(
