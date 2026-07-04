@@ -102,6 +102,7 @@ mod tests {
             enforcement_mode: EnforcementMode::Enforce,
             roles,
             routes: Vec::new(),
+            rules: Vec::new(),
         }
     }
 

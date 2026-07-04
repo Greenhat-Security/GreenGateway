@@ -37,6 +37,13 @@
       "items": {
         "$ref": "#/$defs/route_rule"
       }
+    },
+    "rules": {
+      "type": "array",
+      "description": "Ordered direct firewall rules. Rules are evaluated in array order, and the first matching rule wins. This section is additive alongside routes and does not replace route-to-permission rules.",
+      "items": {
+        "$ref": "#/$defs/rule"
+      }
     }
   },
   "$defs": {
@@ -84,6 +91,72 @@
         "enforcement_mode": {
           "$ref": "#/$defs/enforcement_mode",
           "description": "Optional rule-level override for whether deny decisions block or emit authz.would_deny and forward."
+        }
+      }
+    },
+    "principal_matcher": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional principal constraints for a rule. Non-empty fields are ANDed together: roles AND auth_methods AND principal_ids must all match when configured. Within each field, any listed value matches. An empty object or omitted principal matcher means any principal, authenticated or not.",
+      "properties": {
+        "roles": {
+          "type": "array",
+          "description": "Role names this rule matches. Empty or omitted means any role set.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "auth_methods": {
+          "type": "array",
+          "description": "Authentication methods this rule matches. Empty or omitted means any authentication method.",
+          "items": {
+            "enum": [
+              "bearer_token",
+              "session_cookie"
+            ]
+          }
+        },
+        "principal_ids": {
+          "type": "array",
+          "description": "Exact principal user_id values this rule matches. Empty or omitted means any principal id.",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "rule_action": {
+      "enum": [
+        "allow",
+        "deny",
+        "shadow"
+      ]
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "action"
+      ],
+      "properties": {
+        "methods": {
+          "type": "array",
+          "description": "HTTP methods this rule matches. Empty or [\"*\"] means any method.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path pattern matched against the whole request path. Syntax is segment-based and anchored, never substring-based. Literal segments match exactly and case-sensitively. * matches exactly one non-empty path segment. ** matches zero or more complete path segments. {name} matches exactly one non-empty segment and names the capture for future rule-preview/discovery UI; capture names use ASCII letters, digits, and _, and must start with a letter or _."
+        },
+        "principal": {
+          "$ref": "#/$defs/principal_matcher"
+        },
+        "action": {
+          "$ref": "#/$defs/rule_action"
         }
       }
     }

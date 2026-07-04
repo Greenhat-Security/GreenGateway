@@ -748,6 +748,7 @@ mod tests {
                 })
                 .collect::<HashMap<_, _>>(),
             routes: routes.to_vec(),
+            rules: Vec::new(),
         }
     }
 
