@@ -7,17 +7,41 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
-Phase 3 (core gateway) is underway. Landed so far:
+Phase 4 (traffic discovery) is underway. Landed so far:
 
-### Added — Phase 3 (core gateway, in progress)
+### Added — Phase 4 (traffic discovery, in progress)
 
-- A catch-all reverse proxy to a configured `UPSTREAM_URL` — all HTTP verbs,
-  streamed responses and binary bodies, hop-by-hop header stripping,
-  request-id propagation, a 502/504 error taxonomy, and upstream latency
-  recorded on every observation event.
+- Endpoint path templating: normalizes concrete request paths into stable
+  endpoint shapes (`/users/123` → `/users/{id}`), with well-known-ID
+  recognition (numeric/UUID/hex-hash/ULID) plus a stateful, cardinality-bounded
+  learner for slug-style segments.
+- A background endpoint-discovery aggregator (`DISCOVERY_SQLITE_PATH`),
+  running entirely on the existing off-hot-path audit-log-writer thread: per
+  `(method, endpoint_template)` call counts, first/last-seen, latency
+  percentiles (p50/p95/p99) via a bounded reservoir, status-code
+  distribution, and distinct-principal counts.
+
+Each phase is versioned as it completes (`0.1` for Phase 1, `0.2` for Phase 2,
+`0.3` for Phase 3, … `1.0` once all 7 phases land) — see the
+[pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44)
+for full phase-by-phase status.
+
+## [0.3.0] - 2026-07-03
+
+### Added — Phase 3 (core gateway)
+
+- A reverse proxy to a configured upstream — all HTTP verbs, streamed
+  responses and binary bodies, hop-by-hop header stripping, request-id
+  propagation, a 502/504 error taxonomy, and upstream latency recorded on
+  every observation event.
 - Reserved-prefix protection: gateway-owned routes always take precedence
   over the reverse proxy, with a remappable admin surface path via
-  `ADMIN_PREFIX`.
+  `ADMIN_PREFIX`, and an optional second listener (`ADMIN_LISTEN_ADDR`) to
+  keep the control plane off the data path entirely.
+- Multi-upstream routing: a routing table with longest-prefix and
+  host-based upstream selection, per-upstream timeouts, per-upstream
+  request header add/strip rules, custom TLS trust bundles, and per-upstream
+  health reporting.
 - Egress-allowlist auto-seeding: a configured upstream's host is
   automatically trusted for egress without needing to be duplicated in
   `EGRESS_ALLOWED_HOSTS`; private-IP blocking remains a separate,
@@ -26,16 +50,27 @@ Phase 3 (core gateway) is underway. Landed so far:
   per-rule override that observes would-be denials without blocking, and an
   `AUTH_MODE: observe` option to authenticate without blocking while rolling
   out credentials.
+- Firewall rules as data: a fuzz-tested rule matcher (anchored glob and
+  `{param}` path segments, first-match-wins), a hardened rule schema, and an
+  `action: shadow` per-rule override, wired into the live request path
+  alongside the existing route-permission RBAC engine.
 - Hot-reloadable RBAC policy: file-watch and `SIGHUP` triggers, atomic
   validate-before-swap (an invalid edit is rejected and the last-known-good
   policy keeps serving, with zero dropped requests), and an atomic
-  temp-file-plus-rename persistence primitive for future policy-editing
-  APIs.
-
-Each phase is versioned as it completes (`0.1` for Phase 1, `0.2` for Phase 2,
-… `1.0` once all 7 phases land) — see the
-[pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44)
-for full phase-by-phase status.
+  temp-file-plus-rename persistence primitive underpinning the policy-editing
+  APIs below.
+- A complete policy administration API under `/v1/admin/policy*`: whole-policy
+  read/replace/validate guarded by ETag/`If-Match` against concurrent edits;
+  granular per-rule create/update/delete/reorder operations that emit a
+  `policy.changed` audit trail; rule preview (evaluate a candidate rule
+  against historical audit traffic before committing it, reusing the same
+  fuzz-tested matcher); and per-rule historical hit counts.
+- Policy-driven egress controls: wildcard host globs and CIDR-scoped
+  private-IP exceptions on top of the existing SSRF-hardened client, with a
+  fresh per-request DNS resolve to close rebinding windows.
+- Policy-driven rate-limit overrides: per-principal and per-endpoint limiter
+  rules with principal-first keying, falling back to the existing global
+  read/write lanes when no override matches.
 
 ## [0.2.0] - 2026-07-03
 
