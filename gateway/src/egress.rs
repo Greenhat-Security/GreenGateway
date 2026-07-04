@@ -132,6 +132,11 @@ impl EgressConfig {
             &mut allowed_hosts,
             &mut auto_seeded_hosts,
         );
+        auto_seed_endpoint_host(
+            config.upstream_url.as_deref(),
+            &mut allowed_hosts,
+            &mut auto_seeded_hosts,
+        );
 
         if !auto_seeded_hosts.is_empty() {
             tracing::debug!(
@@ -691,6 +696,50 @@ mod tests {
         let egress = EgressConfig::from_config(&config);
 
         assert!(egress.allowed_hosts.contains("idp.example.test"));
+    }
+
+    #[test]
+    fn from_config_auto_seeds_upstream_host_into_allowlist() {
+        let mut config = test_config();
+        config.upstream_url = Some("https://upstream.example.test:8443/base".to_owned());
+
+        let egress = EgressConfig::from_config(&config);
+
+        assert!(egress.allowed_hosts.contains("upstream.example.test"));
+        assert!(config.egress_allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn from_config_merges_explicit_and_auto_seeded_upstream_hosts() {
+        let mut config = test_config();
+        config.egress_allowed_hosts = vec!["api.example.test".to_owned()];
+        config.upstream_url = Some("https://upstream.example.test/base".to_owned());
+
+        let egress = EgressConfig::from_config(&config);
+
+        assert_eq!(egress.allowed_hosts.len(), 2);
+        assert!(egress.allowed_hosts.contains("api.example.test"));
+        assert!(egress.allowed_hosts.contains("upstream.example.test"));
+    }
+
+    #[tokio::test]
+    async fn auto_seeded_upstream_host_still_blocks_private_ips_by_default() {
+        let mut config = test_config();
+        config.upstream_url = Some("http://127.0.0.1:1/".to_owned());
+        let egress_config = EgressConfig::from_config(&config);
+        assert!(egress_config.allowed_hosts.contains("127.0.0.1"));
+        assert!(egress_config.deny_private_ips);
+        let client = EgressClient::new(egress_config).expect("client should build");
+
+        let error = client
+            .stream_request_with_headers(Method::GET, "http://127.0.0.1:1/", HeaderMap::new(), None)
+            .await
+            .expect_err("auto-seeded private upstream should still be blocked");
+
+        assert!(matches!(
+            error,
+            EgressError::PrivateIpBlocked(blocked) if blocked == ip("127.0.0.1")
+        ));
     }
 
     #[test]

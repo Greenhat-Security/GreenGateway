@@ -272,7 +272,7 @@ Optional `http` or `https` upstream origin for the catch-all reverse proxy fallb
 
 Default: empty, which disables proxying and leaves unmatched paths on axum's default `404`.
 
-Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be a valid `http` or `https` URL with a host. The proxy uses only the configured scheme, host, and port; each incoming request's path and query are forwarded unchanged. The upstream host must still be present in `EGRESS_ALLOWED_HOSTS` for the egress client to allow the outbound request.
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be a valid `http` or `https` URL with a host. The proxy uses only the configured scheme, host, and port; each incoming request's path and query are forwarded unchanged. The upstream host is automatically trusted for gateway-originated egress, so operators do not need to duplicate it in `EGRESS_ALLOWED_HOSTS`. Private resolved IP ranges are still blocked by default unless `EGRESS_DENY_PRIVATE_IPS=false` is explicitly configured.
 
 ## Gateway-Owned Paths And Proxy Collisions
 
@@ -296,7 +296,7 @@ Default: empty list, which denies all egress requests.
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, lowercase entries, and require each entry to be an ASCII hostname without a port. Configure only hostnames, not URLs. The egress client still blocks private resolved IP ranges by default even when a hostname is allowlisted.
 
-Infrastructure endpoint hosts configured elsewhere, including `JWT_JWKS_URL` and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows a JWKS-only deployment to validate tokens without duplicating the identity-provider host here.
+Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to their configured upstream or validate tokens without duplicating those hosts here.
 
 ### EGRESS_TIMEOUT_MS
 
