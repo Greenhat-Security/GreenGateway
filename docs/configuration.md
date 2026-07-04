@@ -284,13 +284,43 @@ Default: empty, which disables proxying and leaves unmatched paths on axum's def
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be a valid `http` or `https` URL with a host. The proxy uses only the configured scheme, host, and port; each incoming request's path and query are forwarded unchanged. The upstream host is automatically trusted for gateway-originated egress, so operators do not need to duplicate it in `EGRESS_ALLOWED_HOSTS`. Private resolved IP ranges are still blocked by default unless `EGRESS_DENY_PRIVATE_IPS=false` is explicitly configured.
 
+`UPSTREAM_URL` and `UPSTREAM_ROUTES` are mutually exclusive when `UPSTREAM_ROUTES` contains at least one entry. This keeps proxy startup deterministic and avoids an implicit precedence rule between the legacy catch-all upstream and the routing table.
+
+### UPSTREAM_ROUTES
+
+Optional ordered routing table for the reverse proxy fallback, encoded as a JSON array.
+
+Default: empty, which disables route-table proxying. `UPSTREAM_URL` continues to provide the legacy catch-all proxy when this value is unset or an empty array.
+
+Format and validation: unset, empty, or whitespace-only values become an empty route table. Non-empty values must be a JSON array of objects. Each object has optional `path_prefix`, optional `host`, and required `upstream_url` fields. Unknown fields are rejected. `upstream_url` uses the same validation as `UPSTREAM_URL`: it must be a valid `http` or `https` URL with a host. `path_prefix`, when present, must be a URI path starting with `/`. `host`, when present, must be a hostname without a port and is normalized to lowercase. Each entry must set at least one of `path_prefix` or `host`; an entry with only `path_prefix: "/"` is rejected because it would be an unconditional catch-all. Use `UPSTREAM_URL` for the legacy catch-all behavior or add a host to make the root prefix host-specific.
+
+Matching semantics: a route with both `host` and `path_prefix` requires both to match. Host matching is exact against the request `Host` header after lowercasing and ignoring any port. Path matching uses the gateway's segment-boundary-aware prefix matcher, so `/api` matches `/api` and `/api/users` but not `/apiary`. Among matching routes, the longest `path_prefix` wins. For equal prefix lengths, a host-qualified route wins over a path-only route. Remaining exact ties use declaration order, with the first route winning; exact duplicate `host` plus `path_prefix` matcher keys are rejected at startup.
+
+Every distinct routing-table upstream origin is health-checked and auto-seeded into the egress allowlist. Duplicate route entries pointing at the same upstream origin share one health-check loop.
+
+Example:
+
+```json
+[
+  {
+    "path_prefix": "/api",
+    "upstream_url": "https://api.internal.example"
+  },
+  {
+    "host": "app.example.test",
+    "path_prefix": "/",
+    "upstream_url": "https://app.internal.example"
+  }
+]
+```
+
 ### UPSTREAM_TIMEOUT_MS
 
 Optional total timeout override for configured upstream proxy requests, in milliseconds.
 
 Default: empty, which inherits `EGRESS_TIMEOUT_MS`.
 
-Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. This applies only to requests sent to `UPSTREAM_URL`, including the background upstream reachability check; other gateway-originated egress, such as JWKS fetches, continues to use `EGRESS_TIMEOUT_MS`.
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. This applies only to requests sent to configured upstream proxy targets, including `UPSTREAM_URL`, `UPSTREAM_ROUTES`, and the background upstream reachability checks; other gateway-originated egress, such as JWKS fetches, continues to use `EGRESS_TIMEOUT_MS`.
 
 ### UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS
 
@@ -298,7 +328,7 @@ Optional idle timeout override between streamed upstream response body chunks, i
 
 Default: empty, which inherits `EGRESS_RESPONSE_IDLE_TIMEOUT_MS`.
 
-Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. This applies only to streaming proxy responses from `UPSTREAM_URL`.
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. This applies only to streaming proxy responses from configured upstream proxy targets.
 
 ### UPSTREAM_CONNECT_TIMEOUT_MS
 
@@ -306,7 +336,7 @@ Optional TCP/TLS connection timeout override for configured upstream proxy reque
 
 Default: empty, which inherits `EGRESS_CONNECT_TIMEOUT_MS`.
 
-Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. This applies only to requests sent to `UPSTREAM_URL`, including the background upstream reachability check.
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. This applies only to requests sent to configured upstream proxy targets, including the background upstream reachability checks.
 
 ## Gateway-Owned Paths And Proxy Collisions
 
@@ -332,7 +362,7 @@ Default: empty list, which denies all egress requests.
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, lowercase entries, and require each entry to be an ASCII hostname without a port. Configure only hostnames, not URLs. The egress client still blocks private resolved IP ranges by default even when a hostname is allowlisted.
 
-Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to their configured upstream or validate tokens without duplicating those hosts here.
+Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, every `UPSTREAM_ROUTES[].upstream_url`, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to configured upstreams or validate tokens without duplicating those hosts here.
 
 ### EGRESS_TIMEOUT_MS
 

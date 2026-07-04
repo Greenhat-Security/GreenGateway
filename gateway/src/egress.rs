@@ -161,6 +161,13 @@ impl EgressConfig {
             &mut allowed_hosts,
             &mut auto_seeded_hosts,
         );
+        for route in &config.upstream_routes {
+            auto_seed_endpoint_host(
+                Some(route.upstream_url.as_str()),
+                &mut allowed_hosts,
+                &mut auto_seeded_hosts,
+            );
+        }
 
         if !auto_seeded_hosts.is_empty() {
             tracing::debug!(
@@ -1061,6 +1068,30 @@ mod tests {
     }
 
     #[test]
+    fn from_config_auto_seeds_all_route_upstream_hosts_into_allowlist() {
+        let mut config = test_config();
+        config.upstream_routes = vec![
+            crate::config::UpstreamRouteConfig {
+                path_prefix: Some("/api".to_owned()),
+                host: None,
+                upstream_url: "https://api-upstream.example.test/base".to_owned(),
+            },
+            crate::config::UpstreamRouteConfig {
+                path_prefix: Some("/assets".to_owned()),
+                host: None,
+                upstream_url: "http://assets-upstream.example.test".to_owned(),
+            },
+        ];
+
+        let egress = EgressConfig::from_config(&config);
+
+        assert!(egress.allowed_hosts.contains("api-upstream.example.test"));
+        assert!(egress
+            .allowed_hosts
+            .contains("assets-upstream.example.test"));
+    }
+
+    #[test]
     fn from_config_merges_explicit_and_auto_seeded_upstream_hosts() {
         let mut config = test_config();
         config.egress_allowed_hosts = vec!["api.example.test".to_owned()];
@@ -1614,6 +1645,7 @@ mod tests {
                 "/metrics".to_owned(),
             ],
             upstream_url: None,
+            upstream_routes: Vec::new(),
             upstream_timeout_ms: None,
             upstream_response_idle_timeout_ms: None,
             upstream_connect_timeout_ms: None,
