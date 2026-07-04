@@ -290,6 +290,11 @@ fn app_with_process_started_at(
             None
         }
     };
+    if let (Some(policy_file), Some(rbac_state)) =
+        (config.policy_file.as_ref(), rbac_state.as_ref())
+    {
+        middleware::rbac::spawn_policy_reload_tasks(policy_file.clone(), rbac_state.clone())?;
+    }
     let status_state = StatusAdminState {
         config: config.clone(),
         rbac: rbac_status,
