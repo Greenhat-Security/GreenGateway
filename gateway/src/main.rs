@@ -911,6 +911,27 @@ mod tests {
         (audit_log, sender)
     }
 
+    fn audit_log_with_sqlite_and_broadcast(
+        sqlite_path: &PathBuf,
+    ) -> (audit::AuditLog, audit::AuditEventSender) {
+        let (sender, _) = tokio::sync::broadcast::channel(16);
+        let sqlite_sink = Arc::new(
+            audit::sqlite_sink::SqliteSink::new(audit::sqlite_sink::SqliteSinkConfig {
+                path: sqlite_path.clone(),
+                retention_days: None,
+            })
+            .expect("SQLite sink should create audit schema"),
+        ) as Arc<dyn audit::AuditSink>;
+        let broadcast_sink =
+            Arc::new(audit::sink::BroadcastSink::new(sender.clone())) as Arc<dyn audit::AuditSink>;
+        let audit_log = audit::AuditLog::new(Arc::new(audit::sink::CompositeSink::new(vec![
+            sqlite_sink,
+            broadcast_sink,
+        ])) as Arc<dyn audit::AuditSink>);
+
+        (audit_log, sender)
+    }
+
     async fn preflight_response_to_path(
         config: config::Config,
         path: &str,
@@ -1485,6 +1506,88 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shadow_would_deny_events_are_queryable_and_streamable() {
+        let db = TempDb::new("shadow-would-deny");
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "enforcement_mode": "shadow",
+                "roles": {},
+                "routes": [
+                    {
+                        "path_prefix": "/__test",
+                        "permission": "test:read"
+                    }
+                ]
+            }"#,
+        );
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.audit_sqlite_path = Some(db.path.to_string_lossy().into_owned());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.rbac_exempt_paths.push("/v1/admin".to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let (audit_log, audit_event_sender) = audit_log_with_sqlite_and_broadcast(&db.path);
+        let router = app(config, recorder.handle(), audit_log, audit_event_sender)
+            .expect("app should build");
+        let request_id = "request-shadow-would-deny";
+        let stream_response = router
+            .clone()
+            .oneshot(audit_query_request(
+                &format!(
+                    "{AUDIT_EVENTS_STREAM_ROUTE}?event_type=authz.would_deny&path=/__test/principal"
+                ),
+                Some(test_principal(&["admin"])),
+            ))
+            .await
+            .expect("stream request should complete");
+        assert_eq!(stream_response.status(), StatusCode::OK);
+
+        let shadow_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .header(REQUEST_ID_HEADER, request_id)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("shadow request should complete");
+        assert_eq!(shadow_response.status(), StatusCode::NO_CONTENT);
+
+        let stream_body = read_sse_until(stream_response.into_body(), |body| {
+            body.contains(r#""event_type":"authz.would_deny""#)
+                && body.contains(&format!(r#""request_id":"{request_id}""#))
+        })
+        .await;
+        assert!(stream_body.contains("event: authz.would_deny"));
+        assert!(stream_body.contains(r#""path":"/__test/principal""#));
+        assert!(stream_body.contains(r#""path_prefix":"/__test""#));
+        assert!(stream_body.contains(r#""permission":"test:read""#));
+        assert!(stream_body.contains(r#""reason":"missing_principal""#));
+
+        let body = wait_for_audit_query_event(
+            router,
+            "/v1/admin/audit?event_type=authz.would_deny",
+            request_id,
+        )
+        .await;
+        let event = body["events"]
+            .as_array()
+            .expect("events should be an array")
+            .iter()
+            .find(|event| event["request_id"] == json!(request_id))
+            .expect("queried would-deny event should be present");
+        assert_eq!(event["event_type"], json!("authz.would_deny"));
+        assert_eq!(event["payload"]["path"], json!("/__test/principal"));
+        assert_eq!(event["payload"]["path_prefix"], json!("/__test"));
+        assert_eq!(event["payload"]["permission"], json!("test:read"));
+        assert_eq!(event["payload"]["reason"], json!("missing_principal"));
+    }
+
     #[test]
     fn stalled_sse_consumer_does_not_slow_audit_emit_burst() {
         const BURST_EVENTS: usize = 20_000;
@@ -2001,6 +2104,34 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         event_ids_from_body(&json_body(response).await)
+    }
+
+    async fn wait_for_audit_query_event(router: Router, uri: &str, request_id: &str) -> Value {
+        let started = Instant::now();
+
+        loop {
+            let response = router
+                .clone()
+                .oneshot(audit_query_request(uri, Some(test_principal(&["admin"]))))
+                .await
+                .expect("audit query request should complete");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            let found = body["events"]
+                .as_array()
+                .expect("events should be an array")
+                .iter()
+                .any(|event| event["request_id"] == json!(request_id));
+            if found {
+                return body;
+            }
+
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "audit query did not return event with request_id {request_id}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     fn event_ids_from_body(body: &Value) -> Vec<String> {

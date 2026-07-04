@@ -18,18 +18,20 @@ use crate::{
     client_ip::{canonical_client_ip, request_id},
     config::Config,
     path_match::path_prefix_matches,
-    rbac::{DefaultAction, Policy, PolicyEngine, RouteRule},
+    rbac::{DefaultAction, EnforcementMode, Policy, PolicyEngine, RouteRule},
 };
 
-use super::decision::PolicyDecision;
+use super::decision::{PolicyDecision, PolicyDecisionOutcome};
 
 const AUTHZ_ALLOWED: &str = "authz.allowed";
 const AUTHZ_DENIED: &str = "authz.denied";
+const AUTHZ_WOULD_DENY: &str = "authz.would_deny";
 
 #[derive(Clone)]
 pub struct RbacState {
     pub engine: Arc<PolicyEngine>,
     pub default_action: DefaultAction,
+    pub enforcement_mode: EnforcementMode,
     pub routes: Arc<Vec<RouteRule>>,
     pub exempt_paths: Vec<String>,
     pub trust_proxy_headers: bool,
@@ -52,6 +54,7 @@ impl RbacState {
     pub fn from_policy(policy: Policy, config: &Config, audit: AuditLog) -> Self {
         Self {
             default_action: policy.default_action.clone(),
+            enforcement_mode: policy.enforcement_mode,
             routes: Arc::new(policy.routes.clone()),
             engine: Arc::new(PolicyEngine::new(policy)),
             exempt_paths: config.rbac_exempt_paths.clone(),
@@ -76,7 +79,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         return with_policy_decision(
             forbidden(),
             PolicyDecision {
-                allowed: false,
+                outcome: PolicyDecisionOutcome::Denied,
                 reason: "unsafe_path",
                 permission: None,
                 path_prefix: None,
@@ -102,7 +105,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 .principal_has_permission(principal, &rule.permission)
         }) {
             emit_allowed(&state, &context, principal.as_ref(), Some(rule), None);
-            let decision = decision_for_rule(true, "matched_rule", rule);
+            let decision = decision_for_rule(PolicyDecisionOutcome::Allowed, "matched_rule", rule);
             let response = next.run(req).await;
             return with_policy_decision(response, decision);
         }
@@ -112,14 +115,29 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         } else {
             "missing_principal"
         };
-        emit_denied(&state, &context, principal.as_ref(), reason, Some(rule));
-        return with_policy_decision(forbidden(), decision_for_rule(false, reason, rule));
+        return match effective_enforcement_mode(&state, rule) {
+            EnforcementMode::Enforce => {
+                emit_denied(&state, &context, principal.as_ref(), reason, Some(rule));
+                with_policy_decision(
+                    forbidden(),
+                    decision_for_rule(PolicyDecisionOutcome::Denied, reason, rule),
+                )
+            }
+            EnforcementMode::Shadow => {
+                emit_would_deny(&state, &context, principal.as_ref(), reason, Some(rule));
+                let response = next.run(req).await;
+                with_policy_decision(
+                    response,
+                    decision_for_rule(PolicyDecisionOutcome::WouldDeny, reason, rule),
+                )
+            }
+        };
     }
 
     match state.default_action {
         DefaultAction::Allow => {
             let decision = PolicyDecision {
-                allowed: true,
+                outcome: PolicyDecisionOutcome::Allowed,
                 reason: "default_allow",
                 permission: None,
                 path_prefix: None,
@@ -134,19 +152,38 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
             let response = next.run(req).await;
             with_policy_decision(response, decision)
         }
-        DefaultAction::Deny => {
-            emit_denied(&state, &context, principal.as_ref(), "default_deny", None);
-            with_policy_decision(
-                forbidden(),
-                PolicyDecision {
-                    allowed: false,
-                    reason: "default_deny",
-                    permission: None,
-                    path_prefix: None,
-                },
-            )
-        }
+        DefaultAction::Deny => match state.enforcement_mode {
+            EnforcementMode::Enforce => {
+                emit_denied(&state, &context, principal.as_ref(), "default_deny", None);
+                with_policy_decision(
+                    forbidden(),
+                    PolicyDecision {
+                        outcome: PolicyDecisionOutcome::Denied,
+                        reason: "default_deny",
+                        permission: None,
+                        path_prefix: None,
+                    },
+                )
+            }
+            EnforcementMode::Shadow => {
+                emit_would_deny(&state, &context, principal.as_ref(), "default_deny", None);
+                let response = next.run(req).await;
+                with_policy_decision(
+                    response,
+                    PolicyDecision {
+                        outcome: PolicyDecisionOutcome::WouldDeny,
+                        reason: "default_deny",
+                        permission: None,
+                        path_prefix: None,
+                    },
+                )
+            }
+        },
     }
+}
+
+fn effective_enforcement_mode(state: &RbacState, rule: &RouteRule) -> EnforcementMode {
+    rule.enforcement_mode.unwrap_or(state.enforcement_mode)
 }
 
 fn matching_route<'a>(
@@ -222,6 +259,27 @@ fn emit_denied(
     reason: &'static str,
     rule: Option<&RouteRule>,
 ) {
+    emit_denial_event(state, context, principal, reason, rule, AUTHZ_DENIED);
+}
+
+fn emit_would_deny(
+    state: &RbacState,
+    context: &AuditContext,
+    principal: Option<&auth::Principal>,
+    reason: &'static str,
+    rule: Option<&RouteRule>,
+) {
+    emit_denial_event(state, context, principal, reason, rule, AUTHZ_WOULD_DENY);
+}
+
+fn emit_denial_event(
+    state: &RbacState,
+    context: &AuditContext,
+    principal: Option<&auth::Principal>,
+    reason: &'static str,
+    rule: Option<&RouteRule>,
+    event_type: &'static str,
+) {
     let actor = principal.map(actor_from_principal);
     let payload = match rule {
         Some(rule) => json!({
@@ -239,7 +297,7 @@ fn emit_denied(
     };
 
     state.audit.emit(AuditEvent::new(
-        AUTHZ_DENIED,
+        event_type,
         &context.request_id,
         &context.source_ip,
         actor,
@@ -255,9 +313,13 @@ fn forbidden() -> Response {
         .into_response()
 }
 
-fn decision_for_rule(allowed: bool, reason: &'static str, rule: &RouteRule) -> PolicyDecision {
+fn decision_for_rule(
+    outcome: PolicyDecisionOutcome,
+    reason: &'static str,
+    rule: &RouteRule,
+) -> PolicyDecision {
     PolicyDecision {
-        allowed,
+        outcome,
         reason,
         permission: Some(rule.permission.clone()),
         path_prefix: Some(rule.path_prefix.clone()),
@@ -446,6 +508,215 @@ mod tests {
         let event = captured_event(&capture, AUTHZ_DENIED).await;
         assert_eq!(event.payload["reason"], json!("missing_principal"));
         assert!(event.actor.is_none());
+    }
+
+    #[tokio::test]
+    async fn global_shadow_mode_forwards_matched_rule_denial_and_emits_would_deny() {
+        let (state, capture) = test_state(
+            test_policy_with_enforcement(
+                DefaultAction::Deny,
+                EnforcementMode::Shadow,
+                &[("reader", &["data:read"])],
+                &[route(&[], "/admin", "admin:read")],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, "/admin/settings"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.outcome, PolicyDecisionOutcome::WouldDeny);
+        assert_eq!(decision.reason, "missing_permission");
+        assert_eq!(decision.path_prefix.as_deref(), Some("/admin"));
+        assert_eq!(decision.permission.as_deref(), Some("admin:read"));
+
+        let event = captured_event(&capture, AUTHZ_WOULD_DENY).await;
+        assert_eq!(event.payload["reason"], json!("missing_permission"));
+        assert_eq!(event.payload["path_prefix"], json!("/admin"));
+        assert_eq!(event.payload["permission"], json!("admin:read"));
+        assert_eq!(event.payload["path"], json!("/admin/settings"));
+        assert!(!capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == AUTHZ_DENIED));
+    }
+
+    #[tokio::test]
+    async fn global_shadow_mode_forwards_default_deny_and_emits_would_deny() {
+        let (state, capture) = test_state(
+            test_policy_with_enforcement(
+                DefaultAction::Deny,
+                EnforcementMode::Shadow,
+                &[("reader", &["data:read"])],
+                &[],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, "/unmatched"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.outcome, PolicyDecisionOutcome::WouldDeny);
+        assert_eq!(decision.reason, "default_deny");
+        assert!(decision.path_prefix.is_none());
+        assert!(decision.permission.is_none());
+
+        let event = captured_event(&capture, AUTHZ_WOULD_DENY).await;
+        assert_eq!(event.payload["reason"], json!("default_deny"));
+        assert_eq!(event.payload["path"], json!("/unmatched"));
+        assert!(event.payload.get("path_prefix").is_none());
+        assert!(event.payload.get("permission").is_none());
+        assert!(!capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == AUTHZ_DENIED));
+    }
+
+    #[tokio::test]
+    async fn rule_shadow_override_forwards_only_that_rule_when_global_mode_enforces() {
+        let (state, capture) = test_state(
+            test_policy(
+                DefaultAction::Deny,
+                &[("reader", &["data:read"])],
+                &[
+                    route_with_enforcement(
+                        &[],
+                        "/shadow",
+                        "shadow:read",
+                        Some(EnforcementMode::Shadow),
+                    ),
+                    route(&[], "/strict", "strict:read"),
+                ],
+            ),
+            &[],
+        );
+        let router = test_router(state, Some(test_principal(&["reader"])));
+
+        let shadow_response = router
+            .clone()
+            .oneshot(request(Method::GET, "/shadow/item"))
+            .await
+            .expect("request should complete");
+        assert_eq!(shadow_response.status(), StatusCode::OK);
+        assert_eq!(
+            shadow_response
+                .extensions()
+                .get::<PolicyDecision>()
+                .expect("policy decision should be attached")
+                .outcome,
+            PolicyDecisionOutcome::WouldDeny
+        );
+
+        let strict_response = router
+            .oneshot(request(Method::GET, "/strict/item"))
+            .await
+            .expect("request should complete");
+        assert_eq!(strict_response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            strict_response
+                .extensions()
+                .get::<PolicyDecision>()
+                .expect("policy decision should be attached")
+                .outcome,
+            PolicyDecisionOutcome::Denied
+        );
+
+        let would_deny = captured_event(&capture, AUTHZ_WOULD_DENY).await;
+        assert_eq!(would_deny.payload["path_prefix"], json!("/shadow"));
+        assert_eq!(would_deny.payload["permission"], json!("shadow:read"));
+        let denied = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(denied.payload["path_prefix"], json!("/strict"));
+        assert_eq!(denied.payload["permission"], json!("strict:read"));
+    }
+
+    #[tokio::test]
+    async fn rule_enforce_override_blocks_when_global_mode_is_shadow() {
+        let (state, capture) = test_state(
+            test_policy_with_enforcement(
+                DefaultAction::Deny,
+                EnforcementMode::Shadow,
+                &[("reader", &["data:read"])],
+                &[route_with_enforcement(
+                    &[],
+                    "/strict",
+                    "strict:read",
+                    Some(EnforcementMode::Enforce),
+                )],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, "/strict/item"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<PolicyDecision>()
+                .expect("policy decision should be attached")
+                .outcome,
+            PolicyDecisionOutcome::Denied
+        );
+
+        let event = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(event.payload["path_prefix"], json!("/strict"));
+        assert_eq!(event.payload["permission"], json!("strict:read"));
+        assert!(!capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == AUTHZ_WOULD_DENY));
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_does_not_change_allowed_matched_rule_path() {
+        let (state, capture) = test_state(
+            test_policy_with_enforcement(
+                DefaultAction::Deny,
+                EnforcementMode::Shadow,
+                &[("reader", &["data:read"])],
+                &[route(&[], "/data", "data:read")],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, "/data/items"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<PolicyDecision>()
+                .expect("policy decision should be attached")
+                .outcome,
+            PolicyDecisionOutcome::Allowed
+        );
+        let event = captured_event(&capture, AUTHZ_ALLOWED).await;
+        assert_eq!(event.payload["path_prefix"], json!("/data"));
+        assert_eq!(event.payload["permission"], json!("data:read"));
+        assert!(!capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == AUTHZ_WOULD_DENY));
     }
 
     #[test]
@@ -638,12 +909,14 @@ mod tests {
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
         let default_action = policy.default_action.clone();
+        let enforcement_mode = policy.enforcement_mode;
         let routes = Arc::new(policy.routes.clone());
 
         (
             RbacState {
                 engine: Arc::new(PolicyEngine::new(policy)),
                 default_action,
+                enforcement_mode,
                 routes,
                 exempt_paths: exempt_paths.iter().map(|path| (*path).to_owned()).collect(),
                 trust_proxy_headers: false,
@@ -658,10 +931,20 @@ mod tests {
         roles: &[(&str, &[&str])],
         routes: &[RouteRule],
     ) -> Policy {
+        test_policy_with_enforcement(default_action, EnforcementMode::Enforce, roles, routes)
+    }
+
+    fn test_policy_with_enforcement(
+        default_action: DefaultAction,
+        enforcement_mode: EnforcementMode,
+        roles: &[(&str, &[&str])],
+        routes: &[RouteRule],
+    ) -> Policy {
         Policy {
             schema_version: "0.1.0".to_owned(),
             id: Some("test-policy".to_owned()),
             default_action,
+            enforcement_mode,
             roles: roles
                 .iter()
                 .map(|(role, permissions)| {
@@ -681,10 +964,20 @@ mod tests {
     }
 
     fn route(methods: &[&str], path_prefix: &str, permission: &str) -> RouteRule {
+        route_with_enforcement(methods, path_prefix, permission, None)
+    }
+
+    fn route_with_enforcement(
+        methods: &[&str],
+        path_prefix: &str,
+        permission: &str,
+        enforcement_mode: Option<EnforcementMode>,
+    ) -> RouteRule {
         RouteRule {
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
             path_prefix: path_prefix.to_owned(),
             permission: permission.to_owned(),
+            enforcement_mode,
         }
     }
 

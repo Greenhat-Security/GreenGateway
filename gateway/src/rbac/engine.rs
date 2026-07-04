@@ -30,7 +30,7 @@ mod tests {
     use crate::auth::{AuthMethod, Principal};
 
     use super::*;
-    use crate::rbac::policy::{DefaultAction, RoleEntry};
+    use crate::rbac::policy::{DefaultAction, EnforcementMode, RoleEntry};
 
     #[test]
     fn admin_wildcard_grants_any_permission() {
@@ -99,6 +99,7 @@ mod tests {
             schema_version: "0.1.0".to_owned(),
             id: Some("test-policy".to_owned()),
             default_action: DefaultAction::Deny,
+            enforcement_mode: EnforcementMode::Enforce,
             roles,
             routes: Vec::new(),
         }
