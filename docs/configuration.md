@@ -270,6 +270,14 @@ Default: `30000`
 
 Format and validation: must parse as a `u64` millisecond duration. The timeout applies to the whole request, including connection, sending, and response body streaming.
 
+### EGRESS_RESPONSE_IDLE_TIMEOUT_MS
+
+Idle timeout between streamed egress response body chunks, in milliseconds.
+
+Default: `30000`
+
+Format and validation: must parse as a `u64` millisecond duration. For streaming proxy responses, this timeout starts before the first body chunk and resets after every successfully received chunk. If the upstream response body is idle for longer than this window, the stream is aborted and treated as a gateway timeout.
+
 ### EGRESS_CONNECT_TIMEOUT_MS
 
 TCP/TLS connection timeout for each egress HTTP request, in milliseconds.

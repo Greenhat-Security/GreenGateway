@@ -15,7 +15,7 @@ use axum::{
     routing::{any, get},
     Extension, Json, Router,
 };
-use futures_util::{stream, Stream};
+use futures_util::{stream, Stream, StreamExt};
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::{Deserialize, Serialize};
@@ -550,9 +550,38 @@ async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -
     };
     let upstream_latency_ms = duration_millis(upstream_started.elapsed());
     let upstream_status = upstream.status;
-    let mut response = Response::new(Body::from_stream(upstream.body));
+    let upstream_headers = strip_hop_by_hop_headers(&upstream.headers);
+    let mut upstream_body = upstream.body;
+    let first_chunk = match upstream_body.next().await {
+        Some(Ok(chunk)) => Some(chunk),
+        Some(Err(err)) => {
+            let latency_ms = duration_millis(upstream_started.elapsed());
+            tracing::warn!(error = %err, "proxied upstream response body failed");
+            let mut response = proxy_error_response(&err);
+            response
+                .extensions_mut()
+                .insert(middleware::decision::UpstreamOutcome {
+                    latency_ms,
+                    status: None,
+                });
+            if let Some(request_id) = request_id {
+                response
+                    .headers_mut()
+                    .insert(request_id_header(), request_id);
+            }
+            return response;
+        }
+        None => None,
+    };
+    let response_body = match first_chunk {
+        Some(chunk) => Body::from_stream(
+            stream::once(async move { Ok::<_, egress::EgressError>(chunk) }).chain(upstream_body),
+        ),
+        None => Body::empty(),
+    };
+    let mut response = Response::new(response_body);
     *response.status_mut() = upstream_status;
-    *response.headers_mut() = strip_hop_by_hop_headers(&upstream.headers);
+    *response.headers_mut() = upstream_headers;
     response
         .extensions_mut()
         .insert(middleware::decision::UpstreamOutcome {
@@ -609,6 +638,7 @@ fn is_hop_by_hop_header(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
             | "host"
+            | "content-length"
     )
 }
 
@@ -1020,6 +1050,7 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant},
     };
+    use tokio::io::AsyncWriteExt;
     use tower::ServiceExt;
 
     fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
@@ -1072,6 +1103,7 @@ mod tests {
             upstream_url: None,
             egress_allowed_hosts: Vec::new(),
             egress_timeout_ms: 30_000,
+            egress_response_idle_timeout_ms: 30_000,
             egress_connect_timeout_ms: 10_000,
             egress_max_response_bytes: 5_242_880,
             egress_max_request_body_bytes: 1_048_576,
@@ -1506,6 +1538,7 @@ mod tests {
                         .header("proxy-authorization", "Basic stripped")
                         .header("te", "trailers")
                         .header("upgrade", "websocket")
+                        .header(header::CONTENT_LENGTH, "0")
                         .header("x-hop-by-connection", "strip me")
                         .header("x-end-to-end", "keep me")
                         .body(Body::from(body.clone()))
@@ -1524,6 +1557,7 @@ mod tests {
                 "keep-alive",
                 "proxy-authenticate",
                 "transfer-encoding",
+                "content-length",
                 "x-upstream-hop",
             ] {
                 assert!(
@@ -1564,6 +1598,13 @@ mod tests {
                 upstream.headers.get("x-end-to-end"),
                 Some(&HeaderValue::from_static("keep me"))
             );
+            if !body.is_empty() {
+                assert_ne!(
+                    upstream.headers.get(header::CONTENT_LENGTH),
+                    Some(&HeaderValue::from_static("0")),
+                    "upstream request should not forward the stale client content-length"
+                );
+            }
             assert_eq!(
                 upstream.headers.get(REQUEST_ID_HEADER),
                 Some(&response_request_id)
@@ -1691,6 +1732,54 @@ mod tests {
             )
             .await
             .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"gateway_timeout"}"#
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_returns_504_when_streaming_upstream_body_idles_before_first_chunk() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let upstream_addr = listener
+            .local_addr()
+            .expect("listener address should be available");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one connection");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("test server should write response headers");
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let mut config = proxy_config(upstream_addr);
+        config.egress_timeout_ms = 5_000;
+        config.egress_response_idle_timeout_ms = 100;
+        config.egress_connect_timeout_ms = 100;
+        let router = proxy_router(config, test_audit_log());
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.oneshot(
+                Request::builder()
+                    .uri("/slow-body")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            ),
+        )
+        .await
+        .expect("proxy should return idle timeout response")
+        .expect("proxy request should complete");
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(

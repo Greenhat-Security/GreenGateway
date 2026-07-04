@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
+use futures_util::{stream, Stream, StreamExt};
 use reqwest::{header::HeaderMap, Method, StatusCode, Url};
 use tokio::net::lookup_host;
 
@@ -28,6 +28,7 @@ pub enum EgressError {
     SchemeNotAllowed(String),
     RequestBodyTooLarge { size: usize, max: usize },
     ResponseTooLarge { max: usize },
+    ResponseIdleTimeout { timeout: Duration },
     Http(reqwest::Error),
 }
 
@@ -52,6 +53,11 @@ impl fmt::Display for EgressError {
             Self::ResponseTooLarge { max } => {
                 write!(formatter, "egress response body exceeded {max} bytes")
             }
+            Self::ResponseIdleTimeout { timeout } => write!(
+                formatter,
+                "egress response body was idle for {}ms",
+                timeout.as_millis()
+            ),
             Self::Http(err) => write!(formatter, "egress HTTP error: {err}"),
         }
     }
@@ -74,7 +80,11 @@ impl From<reqwest::Error> for EgressError {
 
 impl EgressError {
     pub fn is_timeout(&self) -> bool {
-        matches!(self, Self::Http(err) if err.is_timeout())
+        match self {
+            Self::ResponseIdleTimeout { .. } => true,
+            Self::Http(err) => err.is_timeout(),
+            _ => false,
+        }
     }
 }
 
@@ -82,6 +92,7 @@ impl EgressError {
 pub struct EgressConfig {
     pub allowed_hosts: HashSet<String>,
     pub timeout: Duration,
+    pub response_idle_timeout: Duration,
     pub connect_timeout: Duration,
     pub max_response_bytes: usize,
     pub max_request_body_bytes: usize,
@@ -93,6 +104,7 @@ impl Default for EgressConfig {
         Self {
             allowed_hosts: HashSet::new(),
             timeout: DEFAULT_TIMEOUT,
+            response_idle_timeout: DEFAULT_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
@@ -131,6 +143,7 @@ impl EgressConfig {
         Self {
             allowed_hosts,
             timeout: Duration::from_millis(config.egress_timeout_ms),
+            response_idle_timeout: Duration::from_millis(config.egress_response_idle_timeout_ms),
             connect_timeout: Duration::from_millis(config.egress_connect_timeout_ms),
             max_response_bytes: config.egress_max_response_bytes,
             max_request_body_bytes: config.egress_max_request_body_bytes,
@@ -352,21 +365,49 @@ impl EgressClient {
         let status = response.status();
         let headers = response.headers().clone();
         let max_response_bytes = self.config.max_response_bytes;
-        let mut streamed_bytes = 0usize;
-        let body = response.bytes_stream().map(move |chunk| {
-            let chunk = chunk.map_err(EgressError::from)?;
-            if streamed_bytes.saturating_add(chunk.len()) > max_response_bytes {
-                tracing::warn!(
-                    max = max_response_bytes,
-                    "egress blocked oversized response"
-                );
-                return Err(EgressError::ResponseTooLarge {
-                    max: max_response_bytes,
-                });
+        let response_idle_timeout = self.config.response_idle_timeout;
+        let body = Box::pin(response.bytes_stream());
+        let body = stream::unfold((body, 0usize, false), move |state| async move {
+            let (mut body, mut streamed_bytes, done) = state;
+            if done {
+                return None;
             }
 
-            streamed_bytes += chunk.len();
-            Ok(chunk)
+            match tokio::time::timeout(response_idle_timeout, body.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    if streamed_bytes.saturating_add(chunk.len()) > max_response_bytes {
+                        tracing::warn!(
+                            max = max_response_bytes,
+                            "egress blocked oversized response"
+                        );
+                        return Some((
+                            Err(EgressError::ResponseTooLarge {
+                                max: max_response_bytes,
+                            }),
+                            (body, streamed_bytes, true),
+                        ));
+                    }
+
+                    streamed_bytes += chunk.len();
+                    Some((Ok(chunk), (body, streamed_bytes, false)))
+                }
+                Ok(Some(Err(err))) => {
+                    Some((Err(EgressError::from(err)), (body, streamed_bytes, true)))
+                }
+                Ok(None) => None,
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = response_idle_timeout.as_millis(),
+                        "egress streaming response body idle timeout"
+                    );
+                    Some((
+                        Err(EgressError::ResponseIdleTimeout {
+                            timeout: response_idle_timeout,
+                        }),
+                        (body, streamed_bytes, true),
+                    ))
+                }
+            }
         });
 
         Ok(EgressStreamResponse {
@@ -969,6 +1010,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_response_body_idle_timeout_is_enforced_while_consuming() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener local address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one connection");
+            read_one_request(&stream).await;
+            write_all(
+                &stream,
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nhi\r\n",
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let client = EgressClient::new(EgressConfig {
+            allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
+            timeout: Duration::from_secs(5),
+            response_idle_timeout: Duration::from_millis(100),
+            max_response_bytes: 10,
+            deny_private_ips: false,
+            ..EgressConfig::default()
+        })
+        .expect("client should build");
+        let url = format!("http://127.0.0.1:{}/stream", addr.port());
+        let response = client
+            .stream_request_with_headers(Method::GET, &url, HeaderMap::new(), None)
+            .await
+            .expect("headers should be returned before stalled body is consumed");
+
+        let mut body = response.body;
+        let first = tokio::time::timeout(Duration::from_millis(200), body.next())
+            .await
+            .expect("first chunk should arrive")
+            .expect("stream should yield a first chunk")
+            .expect("first chunk should be ok");
+        assert_eq!(&first[..], b"hi");
+
+        let error = tokio::time::timeout(Duration::from_millis(500), body.next())
+            .await
+            .expect("idle timeout error should arrive before the outer test timeout")
+            .expect("stream should yield an idle timeout error")
+            .expect_err("stalled stream should fail");
+        assert!(matches!(
+            error,
+            EgressError::ResponseIdleTimeout { timeout }
+                if timeout == Duration::from_millis(100)
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn stream_request_reuses_allowlist_and_private_ip_checks() {
         let client = EgressClient::new(EgressConfig::default()).expect("client should build");
         let error = client
@@ -1089,6 +1187,7 @@ mod tests {
             upstream_url: None,
             egress_allowed_hosts: Vec::new(),
             egress_timeout_ms: 30_000,
+            egress_response_idle_timeout_ms: 30_000,
             egress_connect_timeout_ms: 10_000,
             egress_max_response_bytes: 5_242_880,
             egress_max_request_body_bytes: 1_048_576,

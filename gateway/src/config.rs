@@ -32,6 +32,7 @@ const DEFAULT_CSRF_COOKIE_NAME: &str = "csrf_token";
 const DEFAULT_CSRF_HEADER_NAME: &str = "x-csrf-token";
 const DEFAULT_CSRF_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_EGRESS_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_EGRESS_RESPONSE_IDLE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_EGRESS_CONNECT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_EGRESS_MAX_RESPONSE_BYTES: usize = 5_242_880;
 const DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
@@ -53,6 +54,7 @@ const EGRESS_CONNECT_TIMEOUT_MS: &str = "EGRESS_CONNECT_TIMEOUT_MS";
 const EGRESS_DENY_PRIVATE_IPS: &str = "EGRESS_DENY_PRIVATE_IPS";
 const EGRESS_MAX_REQUEST_BODY_BYTES: &str = "EGRESS_MAX_REQUEST_BODY_BYTES";
 const EGRESS_MAX_RESPONSE_BYTES: &str = "EGRESS_MAX_RESPONSE_BYTES";
+const EGRESS_RESPONSE_IDLE_TIMEOUT_MS: &str = "EGRESS_RESPONSE_IDLE_TIMEOUT_MS";
 const EGRESS_TIMEOUT_MS: &str = "EGRESS_TIMEOUT_MS";
 const JWT_AUDIENCE: &str = "JWT_AUDIENCE";
 const JWT_ISSUER: &str = "JWT_ISSUER";
@@ -106,6 +108,7 @@ pub struct Config {
     pub upstream_url: Option<String>,
     pub egress_allowed_hosts: Vec<String>,
     pub egress_timeout_ms: u64,
+    pub egress_response_idle_timeout_ms: u64,
     pub egress_connect_timeout_ms: u64,
     pub egress_max_response_bytes: usize,
     pub egress_max_request_body_bytes: usize,
@@ -311,6 +314,13 @@ impl Config {
             "millisecond duration",
             &mut problems,
         );
+        let egress_response_idle_timeout_ms = parse_var(
+            EGRESS_RESPONSE_IDLE_TIMEOUT_MS,
+            get_var(EGRESS_RESPONSE_IDLE_TIMEOUT_MS),
+            DEFAULT_EGRESS_RESPONSE_IDLE_TIMEOUT_MS,
+            "millisecond duration",
+            &mut problems,
+        );
         let egress_connect_timeout_ms = parse_var(
             EGRESS_CONNECT_TIMEOUT_MS,
             get_var(EGRESS_CONNECT_TIMEOUT_MS),
@@ -374,6 +384,7 @@ impl Config {
                 upstream_url,
                 egress_allowed_hosts,
                 egress_timeout_ms,
+                egress_response_idle_timeout_ms,
                 egress_connect_timeout_ms,
                 egress_max_response_bytes,
                 egress_max_request_body_bytes,
@@ -876,6 +887,10 @@ mod tests {
         assert!(config.egress_allowed_hosts.is_empty());
         assert_eq!(config.egress_timeout_ms, DEFAULT_EGRESS_TIMEOUT_MS);
         assert_eq!(
+            config.egress_response_idle_timeout_ms,
+            DEFAULT_EGRESS_RESPONSE_IDLE_TIMEOUT_MS
+        );
+        assert_eq!(
             config.egress_connect_timeout_ms,
             DEFAULT_EGRESS_CONNECT_TIMEOUT_MS
         );
@@ -976,6 +991,10 @@ mod tests {
         assert_eq!(config.upstream_url, None);
         assert!(config.egress_allowed_hosts.is_empty());
         assert_eq!(config.egress_timeout_ms, DEFAULT_EGRESS_TIMEOUT_MS);
+        assert_eq!(
+            config.egress_response_idle_timeout_ms,
+            DEFAULT_EGRESS_RESPONSE_IDLE_TIMEOUT_MS
+        );
         assert_eq!(
             config.egress_connect_timeout_ms,
             DEFAULT_EGRESS_CONNECT_TIMEOUT_MS
@@ -1408,6 +1427,7 @@ mod tests {
                 Ok(" API.EXAMPLE.TEST,upstream.example.test,,auth.example.test ".to_owned())
             }
             "EGRESS_TIMEOUT_MS" => Ok("15000".to_owned()),
+            "EGRESS_RESPONSE_IDLE_TIMEOUT_MS" => Ok("4000".to_owned()),
             "EGRESS_CONNECT_TIMEOUT_MS" => Ok("3000".to_owned()),
             "EGRESS_MAX_RESPONSE_BYTES" => Ok("2097152".to_owned()),
             "EGRESS_MAX_REQUEST_BODY_BYTES" => Ok("65536".to_owned()),
@@ -1425,6 +1445,7 @@ mod tests {
             ]
         );
         assert_eq!(config.egress_timeout_ms, 15_000);
+        assert_eq!(config.egress_response_idle_timeout_ms, 4_000);
         assert_eq!(config.egress_connect_timeout_ms, 3_000);
         assert_eq!(config.egress_max_response_bytes, 2_097_152);
         assert_eq!(config.egress_max_request_body_bytes, 65_536);
@@ -1489,6 +1510,7 @@ mod tests {
         let error = Config::from_env_vars(|name| match name {
             "EGRESS_ALLOWED_HOSTS" => Ok("api.example.test:443,bad_host".to_owned()),
             "EGRESS_TIMEOUT_MS" => Ok("slow".to_owned()),
+            "EGRESS_RESPONSE_IDLE_TIMEOUT_MS" => Ok("idle".to_owned()),
             "EGRESS_CONNECT_TIMEOUT_MS" => Ok("slower".to_owned()),
             "EGRESS_MAX_RESPONSE_BYTES" => Ok("large".to_owned()),
             "EGRESS_MAX_REQUEST_BODY_BYTES" => Ok("larger".to_owned()),
@@ -1500,11 +1522,13 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("EGRESS_ALLOWED_HOSTS entries must be hostnames without ports"));
         assert!(message.contains("EGRESS_TIMEOUT_MS must be a valid millisecond duration"));
+        assert!(message
+            .contains("EGRESS_RESPONSE_IDLE_TIMEOUT_MS must be a valid millisecond duration"));
         assert!(message.contains("EGRESS_CONNECT_TIMEOUT_MS must be a valid millisecond duration"));
         assert!(message.contains("EGRESS_MAX_RESPONSE_BYTES must be a valid byte size"));
         assert!(message.contains("EGRESS_MAX_REQUEST_BODY_BYTES must be a valid byte size"));
         assert!(message.contains("EGRESS_DENY_PRIVATE_IPS must be a valid boolean"));
-        assert_eq!(error.problems.len(), 7);
+        assert_eq!(error.problems.len(), 8);
     }
 
     #[test]
