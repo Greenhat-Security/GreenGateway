@@ -1163,6 +1163,7 @@ mod tests {
             session_cookie_name: String::new(),
             validation_allowed_content_types: vec!["application/json".to_owned()],
             auth_enabled: true,
+            auth_mode: crate::config::AuthMode::Required,
             auth_cookie_name: "session".to_owned(),
             auth_exempt_paths: vec![
                 "/health".to_owned(),
