@@ -82,6 +82,37 @@ export type PolicyRulePreviewResponse = {
   samples: PolicyRulePreviewSample[];
 };
 
+export type PolicyRuleShadowReviewPrincipal = {
+  user_id: string;
+  roles: string[];
+};
+
+export type PolicyRuleShadowReviewSample = {
+  event_id: string;
+  timestamp: string;
+  method: string;
+  path: string;
+  actor: {
+    user_id: string;
+    auth_mode: string;
+    roles?: string[];
+  } | null;
+};
+
+export type PolicyRuleShadowReviewSummary = {
+  rule_id: string;
+  rule: PolicyRule;
+  would_deny_count: number;
+  affected_principals: PolicyRuleShadowReviewPrincipal[];
+  samples: PolicyRuleShadowReviewSample[];
+};
+
+export type PolicyRuleShadowReviewResponse = {
+  scanned_event_count: number;
+  scan_truncated: boolean;
+  rules: PolicyRuleShadowReviewSummary[];
+};
+
 type PolicyRuleHitsResponse =
   | {
       rules: Array<{
@@ -199,6 +230,12 @@ export async function fetchPolicyRuleHits(): Promise<Record<string, number>> {
   }
 
   return response;
+}
+
+export async function fetchPolicyRuleShadowReview(): Promise<PolicyRuleShadowReviewResponse> {
+  return adminFetchJson<PolicyRuleShadowReviewResponse>(
+    adminApiUrl('/policy/rules/shadow-review'),
+  );
 }
 
 export function policyRuleId(rule: PolicyRule, index: number): string {

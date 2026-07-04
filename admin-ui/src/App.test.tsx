@@ -270,4 +270,88 @@ describe('AdminShell', () => {
       }),
     ).toBeTruthy();
   });
+
+  it('registers the shadow review route, title, navigation entry, and dashboard link', async () => {
+    vi.stubGlobal('fetch', policyShadowReviewFetchMock());
+
+    render(
+      <MemoryRouter initialEntries={['/policy/shadow-review']}>
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: 'Shadow review' })).toBeTruthy();
+    expect(
+      screen.getByRole('heading', {
+        level: 1,
+        name: 'Shadow review',
+      }),
+    ).toBeTruthy();
+    expect(
+      await screen.findByRole('heading', {
+        level: 2,
+        name: 'Shadow review queue',
+      }),
+    ).toBeTruthy();
+
+    cleanup();
+    vi.stubGlobal('fetch', policyShadowReviewFetchMock());
+
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    expect(
+      screen.getByText('Review would-deny events from shadow rules'),
+    ).toBeTruthy();
+  });
 });
+
+function policyShadowReviewFetchMock() {
+  return vi.fn((input: RequestInfo | URL) => {
+    const url = new URL(String(input), 'http://localhost');
+    if (url.pathname === '/v1/admin/policy') {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            schema_version: '0.1.0',
+            id: 'test-policy',
+            default_action: 'deny',
+            enforcement_mode: 'enforce',
+            roles: {},
+            routes: [],
+            rules: [],
+          }),
+          {
+            status: 200,
+            headers: {
+              'Content-Type': 'application/json',
+              ETag: '"etag-initial"',
+            },
+          },
+        ),
+      );
+    }
+    if (url.pathname === '/v1/admin/policy/rules/shadow-review') {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            scanned_event_count: 0,
+            scan_truncated: false,
+            rules: [],
+          }),
+          {
+            status: 200,
+            headers: {
+              'Content-Type': 'application/json',
+            },
+          },
+        ),
+      );
+    }
+
+    return Promise.reject(new Error(`unexpected fetch: ${url.pathname}`));
+  });
+}

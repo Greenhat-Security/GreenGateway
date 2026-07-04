@@ -19,6 +19,7 @@ import { LogExplorer } from './views/LogExplorer';
 import { PolicyHistoryView } from './views/PolicyHistoryView';
 import { RuleEditor } from './views/RuleEditor';
 import { RuleTable } from './views/RuleTable';
+import { ShadowReviewView } from './views/ShadowReviewView';
 import { SignalsView } from './views/SignalsView';
 import { StatusPage } from './views/StatusPage';
 import { TrafficEndpointDetail } from './views/TrafficEndpointDetail';
@@ -78,6 +79,9 @@ export function AdminShell() {
           <NavLink to="/policy/history" className={navItemClassName}>
             History
           </NavLink>
+          <NavLink to="/policy/shadow-review" className={navItemClassName}>
+            Shadow review
+          </NavLink>
           <NavLink to="/signals" className={navItemClassName}>
             Signals
           </NavLink>
@@ -121,6 +125,7 @@ export function AdminShell() {
           <Route path="/traffic/detail" element={<TrafficEndpointDetail />} />
           <Route path="/rules" element={<RuleTable />} />
           <Route path="/policy/history" element={<PolicyHistoryView />} />
+          <Route path="/policy/shadow-review" element={<ShadowReviewView />} />
           <Route path="/signals" element={<SignalsView />} />
           <Route path="/policy/rules/editor" element={<RuleEditor />} />
           <Route path="/live" element={<LiveTail />} />
@@ -158,6 +163,10 @@ function Dashboard() {
           <Link to="/policy/history">
             <span>Policy history</span>
             <small>Version timeline and rollback</small>
+          </Link>
+          <Link to="/policy/shadow-review">
+            <span>Shadow review</span>
+            <small>Review would-deny events from shadow rules</small>
           </Link>
           <Link to="/signals">
             <span>Signals</span>
@@ -299,6 +308,9 @@ function pageTitleForPath(pathname: string): string {
   }
   if (pathname === '/policy/history') {
     return 'Policy history';
+  }
+  if (pathname === '/policy/shadow-review') {
+    return 'Shadow review';
   }
   if (pathname === '/signals') {
     return 'Signals';
