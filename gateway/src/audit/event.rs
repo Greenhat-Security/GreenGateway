@@ -3,6 +3,7 @@ use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const SCHEMA_VERSION: &str = "0.1.0";
+pub const POLICY_CHANGED: &str = "policy.changed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {

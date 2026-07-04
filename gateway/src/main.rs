@@ -9,19 +9,21 @@ use std::{
 
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request as AxumRequest, State},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{any, get},
+    routing::{any, get, post},
     Extension, Json, Router,
 };
+use bytes::Bytes;
 use futures_util::{stream, Stream, StreamExt};
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tower_http::{
     cors::CorsLayer,
@@ -34,6 +36,7 @@ mod audit;
 mod auth;
 mod client_ip;
 mod config;
+mod discovery;
 mod egress;
 mod metrics;
 mod middleware;
@@ -49,7 +52,11 @@ const DEFAULT_ADMIN_API_PREFIX: &str = "/v1/admin";
 const AUDIT_ADMIN_ROUTE: &str = "/v1/admin/audit";
 const AUDIT_EVENTS_STREAM_ROUTE: &str = "/v1/admin/events/stream";
 const STATUS_ADMIN_ROUTE: &str = "/v1/admin/status";
+const POLICY_ADMIN_ROUTE: &str = "/v1/admin/policy";
+const POLICY_VALIDATE_ADMIN_ROUTE: &str = "/v1/admin/policy/validate";
 const AUDIT_ADMIN_ROLE: &str = "admin";
+const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
+const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
 const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
@@ -126,6 +133,8 @@ struct AdminRoutes {
     audit_route: String,
     events_stream_route: String,
     status_route: String,
+    policy_route: String,
+    policy_validate_route: String,
 }
 
 impl GatewayRoutes {
@@ -171,6 +180,8 @@ impl AdminRoutes {
             audit_route: format!("{api_prefix}/audit"),
             events_stream_route: format!("{api_prefix}/events/stream"),
             status_route: format!("{api_prefix}/status"),
+            policy_route: format!("{api_prefix}/policy"),
+            policy_validate_route: format!("{api_prefix}/policy/validate"),
             api_prefix,
         }
     }
@@ -188,6 +199,15 @@ struct StatusAdminState {
     rbac: RbacStatus,
     egress_allowed_hosts_count: usize,
     process_started_at: Instant,
+}
+
+#[derive(Clone)]
+struct PolicyAdminState {
+    policy_file: Option<PathBuf>,
+    rbac_state: Option<middleware::rbac::RbacState>,
+    audit: audit::AuditLog,
+    trust_proxy_headers: bool,
+    max_body_size: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -313,6 +333,23 @@ struct AuditEventStreamParams {
 struct AuditQueryResponse {
     events: Vec<audit::AuditEvent>,
     next_cursor: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct PolicyValidationResponse {
+    valid: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<String>,
+}
+
+enum PolicyAdminAuthzError {
+    NotConfigured,
+    Forbidden,
+}
+
+enum IfMatchError {
+    Missing,
+    InvalidHeader,
 }
 
 #[derive(Serialize)]
@@ -538,6 +575,13 @@ fn gateway_app_with_process_started_at(
         egress_allowed_hosts_count,
         process_started_at,
     };
+    let policy_admin_state = PolicyAdminState {
+        policy_file: config.policy_file.as_ref().map(PathBuf::from),
+        rbac_state: rbac_state.clone(),
+        audit: audit_log.clone(),
+        trust_proxy_headers: config.trust_proxy_headers,
+        max_body_size: config.max_body_size,
+    };
 
     if config.auth_enabled && validator.is_none() {
         tracing::warn!(
@@ -577,13 +621,25 @@ fn gateway_app_with_process_started_at(
         Ok(GatewayApp::Split {
             data: apply_middleware(data_router(app_state.clone()), &middleware_stack),
             admin: apply_middleware(
-                admin_router(&routes, app_state, audit_admin_state, status_state),
+                admin_router(
+                    &routes,
+                    app_state,
+                    audit_admin_state,
+                    status_state,
+                    policy_admin_state,
+                ),
                 &middleware_stack,
             ),
         })
     } else {
         Ok(GatewayApp::Unified(apply_middleware(
-            unified_router(&routes, app_state, audit_admin_state, status_state),
+            unified_router(
+                &routes,
+                app_state,
+                audit_admin_state,
+                status_state,
+                policy_admin_state,
+            ),
             &middleware_stack,
         )))
     }
@@ -594,6 +650,7 @@ fn unified_router(
     app_state: AppState,
     audit_admin_state: AuditAdminState,
     status_state: StatusAdminState,
+    policy_admin_state: PolicyAdminState,
 ) -> Router {
     let router = Router::new()
         .route("/health", get(health))
@@ -604,7 +661,13 @@ fn unified_router(
         .route(routes.admin.ui_asset_route.as_str(), get(admin_ui_asset));
 
     let router = with_proxy_fallback_if_configured(router, &app_state).with_state(app_state);
-    let router = add_admin_api_routes(router, routes, audit_admin_state, status_state);
+    let router = add_admin_api_routes(
+        router,
+        routes,
+        audit_admin_state,
+        status_state,
+        policy_admin_state,
+    );
 
     #[cfg(test)]
     let router = router.route(
@@ -629,6 +692,7 @@ fn admin_router(
     app_state: AppState,
     audit_admin_state: AuditAdminState,
     status_state: StatusAdminState,
+    policy_admin_state: PolicyAdminState,
 ) -> Router {
     let router = Router::new()
         .route(routes.admin.ui_prefix.as_str(), get(admin_ui_index))
@@ -636,7 +700,13 @@ fn admin_router(
         .route(routes.admin.ui_asset_route.as_str(), get(admin_ui_asset))
         .with_state(app_state);
 
-    add_admin_api_routes(router, routes, audit_admin_state, status_state)
+    add_admin_api_routes(
+        router,
+        routes,
+        audit_admin_state,
+        status_state,
+        policy_admin_state,
+    )
 }
 
 fn with_proxy_fallback_if_configured(
@@ -655,6 +725,7 @@ fn add_admin_api_routes(
     routes: &GatewayRoutes,
     audit_admin_state: AuditAdminState,
     status_state: StatusAdminState,
+    policy_admin_state: PolicyAdminState,
 ) -> Router {
     router
         .merge(
@@ -670,6 +741,18 @@ fn add_admin_api_routes(
             Router::new()
                 .route(routes.admin.status_route.as_str(), get(status_endpoint))
                 .with_state(status_state),
+        )
+        .merge(
+            Router::new()
+                .route(
+                    routes.admin.policy_route.as_str(),
+                    get(policy_get_endpoint).put(policy_put_endpoint),
+                )
+                .route(
+                    routes.admin.policy_validate_route.as_str(),
+                    post(policy_validate_endpoint),
+                )
+                .with_state(policy_admin_state),
         )
 }
 
@@ -1466,6 +1549,147 @@ async fn status_endpoint(
     Json(StatusResponse::from_state(&state)).into_response()
 }
 
+async fn policy_get_endpoint(
+    State(state): State<PolicyAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(POLICY_ADMIN_ROUTE);
+
+    let Some(principal) = request.extensions().get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    let rbac_state = match authorized_policy_state(&state, principal, ADMIN_POLICY_READ_PERMISSION)
+    {
+        Ok(rbac_state) => rbac_state,
+        Err(error) => return policy_admin_authz_error_response(error),
+    };
+
+    let policy = rbac_state.current_policy();
+    let etag = match policy_etag(&policy) {
+        Ok(etag) => etag,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to compute policy ETag");
+            return internal_server_error("policy ETag computation failed");
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [(header::ETAG, etag_header_value(&etag))],
+        Json(policy),
+    )
+        .into_response()
+}
+
+async fn policy_put_endpoint(
+    State(state): State<PolicyAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(POLICY_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    let rbac_state =
+        match authorized_policy_state(&state, &principal, ADMIN_POLICY_WRITE_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return policy_admin_authz_error_response(error),
+        };
+    let Some(policy_file) = state.policy_file.as_deref() else {
+        return policy_not_configured();
+    };
+
+    let body = match read_request_body(body, state.max_body_size).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let candidate = match parse_policy_body(&body) {
+        Ok(policy) => policy,
+        Err(errors) => return policy_validation_failed(errors),
+    };
+
+    let _policy_write_guard = match rbac_state.policy_write_guard() {
+        Ok(guard) => guard,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to acquire policy write lock");
+            return internal_server_error("policy write lock failed");
+        }
+    };
+
+    let before_policy = rbac_state.current_policy();
+    let current_etag = match policy_etag(&before_policy) {
+        Ok(etag) => etag,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to compute current policy ETag");
+            return internal_server_error("policy ETag computation failed");
+        }
+    };
+
+    match if_match_matches(&parts.headers, &current_etag) {
+        Ok(true) => {}
+        Ok(false) => return precondition_failed("If-Match does not match the current policy ETag"),
+        Err(error) => return if_match_error_response(error),
+    }
+
+    if let Err(err) = candidate.persist_to_file(policy_file) {
+        tracing::error!(policy_file = %policy_file.display(), error = %err, "failed to persist policy");
+        return internal_server_error("policy persist failed");
+    }
+
+    if let Err(err) = middleware::rbac::reload_policy_from_file(rbac_state, policy_file) {
+        tracing::error!(policy_file = %policy_file.display(), error = %err, "failed to reload persisted policy");
+        return internal_server_error("policy reload failed");
+    }
+
+    let after_policy = rbac_state.current_policy();
+    emit_policy_changed(&state, &parts, &principal, &before_policy, &after_policy);
+
+    let new_etag = match policy_etag(&after_policy) {
+        Ok(etag) => etag,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to compute updated policy ETag");
+            return internal_server_error("policy ETag computation failed");
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [(header::ETAG, etag_header_value(&new_etag))],
+        Json(after_policy),
+    )
+        .into_response()
+}
+
+async fn policy_validate_endpoint(
+    State(state): State<PolicyAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(POLICY_VALIDATE_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_policy_state(&state, principal, ADMIN_POLICY_READ_PERMISSION) {
+        return policy_admin_authz_error_response(error);
+    }
+
+    let body = match read_request_body(body, state.max_body_size).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+
+    match parse_policy_body(&body) {
+        Ok(_) => Json(PolicyValidationResponse {
+            valid: true,
+            errors: Vec::new(),
+        })
+        .into_response(),
+        Err(errors) => policy_validation_failed(errors),
+    }
+}
+
 async fn admin_ui_index(State(state): State<AppState>) -> Response {
     record_request(ADMIN_UI_ROUTE);
     admin_ui_index_response(&state.routes.admin)
@@ -1779,6 +2003,196 @@ fn parse_before_id(value: Option<String>) -> Result<Option<i64>, &'static str> {
     Ok(Some(before_id))
 }
 
+fn authorized_policy_state<'a>(
+    state: &'a PolicyAdminState,
+    principal: &auth::Principal,
+    permission: &str,
+) -> Result<&'a middleware::rbac::RbacState, PolicyAdminAuthzError> {
+    let Some(rbac_state) = state.rbac_state.as_ref() else {
+        return Err(PolicyAdminAuthzError::NotConfigured);
+    };
+
+    if !rbac_state.principal_has_permission(principal, permission) {
+        return Err(PolicyAdminAuthzError::Forbidden);
+    }
+
+    Ok(rbac_state)
+}
+
+fn policy_admin_authz_error_response(error: PolicyAdminAuthzError) -> Response {
+    match error {
+        PolicyAdminAuthzError::NotConfigured => policy_not_configured(),
+        PolicyAdminAuthzError::Forbidden => forbidden(),
+    }
+}
+
+async fn read_request_body(body: Body, max_body_size: usize) -> Result<Bytes, Response> {
+    axum::body::to_bytes(body, max_body_size)
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "policy request body could not be read");
+            payload_too_large(max_body_size)
+        })
+}
+
+fn parse_policy_body(body: &Bytes) -> Result<rbac::Policy, Vec<String>> {
+    let value = serde_json::from_slice::<Value>(body)
+        .map_err(|err| vec![format!("invalid JSON: {err}")])?;
+
+    rbac::Policy::validate_json_value(value).map_err(|err| vec![policy_error_message(&err)])
+}
+
+fn policy_error_message(error: &rbac::policy::PolicyError) -> String {
+    match error {
+        rbac::policy::PolicyError::Invalid(message) => message.clone(),
+        _ => error.to_string(),
+    }
+}
+
+fn policy_etag(policy: &rbac::Policy) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(policy)?;
+    sort_json_value(&mut value);
+    let bytes = serde_json::to_vec(&value)?;
+    let digest = Sha256::digest(&bytes);
+
+    Ok(format!("\"sha256:{}\"", hex::encode(digest)))
+}
+
+fn sort_json_value(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                sort_json_value(value);
+            }
+        }
+        Value::Object(map) => {
+            let mut entries = std::mem::take(map).into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            for (_, value) in &mut entries {
+                sort_json_value(value);
+            }
+            map.extend(entries);
+        }
+        _ => {}
+    }
+}
+
+fn etag_header_value(etag: &str) -> HeaderValue {
+    HeaderValue::from_str(etag).expect("policy ETag should be a valid HTTP header value")
+}
+
+fn if_match_matches(headers: &HeaderMap, current_etag: &str) -> Result<bool, IfMatchError> {
+    let mut saw_if_match = false;
+
+    for value in headers.get_all(header::IF_MATCH) {
+        saw_if_match = true;
+        let value = value.to_str().map_err(|_| IfMatchError::InvalidHeader)?;
+        if value
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| candidate == current_etag)
+        {
+            return Ok(true);
+        }
+    }
+
+    if saw_if_match {
+        Ok(false)
+    } else {
+        Err(IfMatchError::Missing)
+    }
+}
+
+fn if_match_error_response(error: IfMatchError) -> Response {
+    match error {
+        IfMatchError::Missing => precondition_required("If-Match header is required"),
+        IfMatchError::InvalidHeader => bad_request("If-Match header must be valid ASCII"),
+    }
+}
+
+fn policy_validation_failed(errors: Vec<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(PolicyValidationResponse {
+            valid: false,
+            errors,
+        }),
+    )
+        .into_response()
+}
+
+fn emit_policy_changed(
+    state: &PolicyAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    before: &rbac::Policy,
+    after: &rbac::Policy,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip = client_ip::canonical_client_ip(
+        &parts.headers,
+        &parts.extensions,
+        state.trust_proxy_headers,
+    );
+    let actor = Some(auth::actor_from_principal(principal));
+    let payload = json!({
+        "before": policy_audit_summary(before),
+        "after": policy_audit_summary(after),
+        "changed_sections": changed_policy_sections(before, after),
+    });
+
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::POLICY_CHANGED,
+        request_id,
+        source_ip,
+        actor,
+        payload,
+    ));
+}
+
+fn policy_audit_summary(policy: &rbac::Policy) -> Value {
+    json!({
+        "id": policy.id,
+        "roles": policy.roles.len(),
+        "routes": policy.routes.len(),
+        "rules": policy.rules.len(),
+        "egress_hosts": policy.egress.hosts.len(),
+        "egress_cidrs": policy.egress.cidrs.len(),
+        "egress_ports": policy.egress.ports.len(),
+    })
+}
+
+fn changed_policy_sections(before: &rbac::Policy, after: &rbac::Policy) -> Vec<&'static str> {
+    let mut sections = Vec::new();
+
+    if before.schema_version != after.schema_version {
+        sections.push("schema_version");
+    }
+    if before.id != after.id {
+        sections.push("id");
+    }
+    if before.default_action != after.default_action {
+        sections.push("default_action");
+    }
+    if before.enforcement_mode != after.enforcement_mode {
+        sections.push("enforcement_mode");
+    }
+    if before.roles != after.roles {
+        sections.push("roles");
+    }
+    if before.routes != after.routes {
+        sections.push("routes");
+    }
+    if before.rules != after.rules {
+        sections.push("rules");
+    }
+    if before.egress != after.egress {
+        sections.push("egress");
+    }
+
+    sections
+}
+
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -1803,6 +2217,36 @@ fn forbidden() -> Response {
 fn bad_request(error: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: error.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn policy_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "policy API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn precondition_required(error: &str) -> Response {
+    (
+        StatusCode::PRECONDITION_REQUIRED,
+        Json(ErrorResponse {
+            error: error.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn precondition_failed(error: &str) -> Response {
+    (
+        StatusCode::PRECONDITION_FAILED,
         Json(ErrorResponse {
             error: error.to_owned(),
         }),
@@ -2877,6 +3321,11 @@ mod tests {
             AUDIT_EVENTS_STREAM_ROUTE
         );
         assert_eq!(default_routes.status_route, STATUS_ADMIN_ROUTE);
+        assert_eq!(default_routes.policy_route, POLICY_ADMIN_ROUTE);
+        assert_eq!(
+            default_routes.policy_validate_route,
+            POLICY_VALIDATE_ADMIN_ROUTE
+        );
 
         let custom_routes = AdminRoutes::from_prefix("/ops");
         assert_eq!(custom_routes.ui_prefix, "/ops");
@@ -2884,6 +3333,11 @@ mod tests {
         assert_eq!(custom_routes.audit_route, "/v1/ops/audit");
         assert_eq!(custom_routes.events_stream_route, "/v1/ops/events/stream");
         assert_eq!(custom_routes.status_route, "/v1/ops/status");
+        assert_eq!(custom_routes.policy_route, "/v1/ops/policy");
+        assert_eq!(
+            custom_routes.policy_validate_route,
+            "/v1/ops/policy/validate"
+        );
     }
 
     #[tokio::test]
@@ -4704,6 +5158,642 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_get_returns_current_policy_with_stable_etag_and_requires_read_permission() {
+        let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = policy_etag_header(&response);
+        assert!(etag.starts_with("\"sha256:"));
+        assert!(etag.ends_with('"'));
+        let body = json_body(response).await;
+        assert_eq!(body["id"], json!("initial-policy"));
+
+        let second_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("second policy GET should complete");
+        assert_eq!(second_response.status(), StatusCode::OK);
+        assert_eq!(policy_etag_header(&second_response), etag);
+
+        let read_only_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("read-only policy GET should complete");
+        assert_eq!(read_only_response.status(), StatusCode::OK);
+
+        let forbidden_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("forbidden policy GET should complete");
+        assert_eq!(forbidden_response.status(), StatusCode::FORBIDDEN);
+
+        let unauthenticated_response = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                None,
+                None,
+                None,
+            ))
+            .await
+            .expect("unauthenticated policy GET should complete");
+        assert_eq!(unauthenticated_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn policy_put_with_valid_if_match_updates_live_policy_and_emits_audit_event() {
+        let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = policy_admin_router(Some(&policy), audit_log);
+
+        let before_new_reader = router
+            .clone()
+            .oneshot(audit_query_request(
+                "/__test/principal",
+                Some(test_principal(&["new-reader"])),
+            ))
+            .await
+            .expect("pre-update test request should complete");
+        assert_eq!(before_new_reader.status(), StatusCode::FORBIDDEN);
+
+        let get_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete");
+        let current_etag = policy_etag_header(&get_response);
+
+        let candidate = policy_document_string("updated-policy", "test:new");
+        let put_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(candidate),
+                Some(&current_etag),
+            ))
+            .await
+            .expect("policy PUT should complete");
+        assert_eq!(put_response.status(), StatusCode::OK);
+        let new_etag = policy_etag_header(&put_response);
+        assert_ne!(new_etag, current_etag);
+        let put_body = json_body(put_response).await;
+        assert_eq!(put_body["id"], json!("updated-policy"));
+
+        let after_new_reader = router
+            .clone()
+            .oneshot(audit_query_request(
+                "/__test/principal",
+                Some(test_principal(&["new-reader"])),
+            ))
+            .await
+            .expect("post-update new-reader request should complete");
+        assert_eq!(after_new_reader.status(), StatusCode::OK);
+
+        let after_old_reader = router
+            .oneshot(audit_query_request(
+                "/__test/principal",
+                Some(test_principal(&["old-reader"])),
+            ))
+            .await
+            .expect("post-update old-reader request should complete");
+        assert_eq!(after_old_reader.status(), StatusCode::FORBIDDEN);
+
+        assert_eventually(Duration::from_secs(1), || {
+            capture
+                .events()
+                .iter()
+                .any(|event| event.event_type == audit::event::POLICY_CHANGED)
+        });
+        let events = capture.events();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == audit::event::POLICY_CHANGED)
+            .expect("policy.changed event should be captured");
+        let actor = event.actor.as_ref().expect("actor should be set");
+        assert_eq!(actor.user_id, "user-123");
+        assert_eq!(actor.roles, Some(vec!["admin".to_owned()]));
+        assert_eq!(event.payload["before"]["id"], json!("initial-policy"));
+        assert_eq!(event.payload["after"]["id"], json!("updated-policy"));
+        assert_eq!(event.payload["before"]["routes"], json!(4));
+        assert_eq!(event.payload["after"]["routes"], json!(4));
+        assert_eq!(event.payload["changed_sections"], json!(["id", "routes"]));
+    }
+
+    #[tokio::test]
+    async fn policy_put_with_stale_if_match_returns_precondition_failed_without_changes() {
+        let initial_policy = policy_document_string("initial-policy", "test:old");
+        let policy = TempPolicyFile::new(&initial_policy);
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+        let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+
+        let get_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete");
+        let current_etag = policy_etag_header(&get_response);
+
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(policy_document_string("updated-policy", "test:new")),
+                Some("\"sha256:stale\""),
+            ))
+            .await
+            .expect("stale policy PUT should complete");
+
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy file should read"),
+            before_contents
+        );
+
+        let after_get = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET after stale PUT should complete");
+        assert_eq!(after_get.status(), StatusCode::OK);
+        assert_eq!(policy_etag_header(&after_get), current_etag);
+        assert_eq!(json_body(after_get).await["id"], json!("initial-policy"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_policy_puts_with_same_if_match_allow_only_one_update() {
+        let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+
+        let get_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete");
+        let current_etag = policy_etag_header(&get_response);
+
+        let first_policy = policy_document("concurrent-policy-a", "test:new");
+        let second_policy = policy_document("concurrent-policy-b", "test:new");
+        let first_candidate =
+            serde_json::to_string_pretty(&first_policy).expect("test policy should serialize");
+        let second_candidate =
+            serde_json::to_string_pretty(&second_policy).expect("test policy should serialize");
+        let body_barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let first_task = tokio::spawn({
+            let router = router.clone();
+            let current_etag = current_etag.clone();
+            let body_barrier = Arc::clone(&body_barrier);
+
+            async move {
+                router
+                    .oneshot(synchronized_policy_put_request(
+                        first_candidate,
+                        &current_etag,
+                        body_barrier,
+                    ))
+                    .await
+                    .expect("first policy PUT should complete")
+            }
+        });
+        let second_task = tokio::spawn({
+            let router = router.clone();
+            let current_etag = current_etag.clone();
+            let body_barrier = Arc::clone(&body_barrier);
+
+            async move {
+                router
+                    .oneshot(synchronized_policy_put_request(
+                        second_candidate,
+                        &current_etag,
+                        body_barrier,
+                    ))
+                    .await
+                    .expect("second policy PUT should complete")
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), body_barrier.wait())
+            .await
+            .expect("both policy PUT bodies should reach the release barrier");
+
+        let (first_response, second_response) = tokio::join!(first_task, second_task);
+        let first_response = first_response.expect("first policy PUT task should join");
+        let second_response = second_response.expect("second policy PUT task should join");
+
+        let first_status = first_response.status();
+        let first_etag =
+            (first_status == StatusCode::OK).then(|| policy_etag_header(&first_response));
+        let first_body = if first_status == StatusCode::OK {
+            Some(json_body(first_response).await)
+        } else {
+            assert_eq!(first_status, StatusCode::PRECONDITION_FAILED);
+            assert_eq!(
+                body_string(first_response).await,
+                r#"{"error":"If-Match does not match the current policy ETag"}"#
+            );
+            None
+        };
+
+        let second_status = second_response.status();
+        let second_etag =
+            (second_status == StatusCode::OK).then(|| policy_etag_header(&second_response));
+        let second_body = if second_status == StatusCode::OK {
+            Some(json_body(second_response).await)
+        } else {
+            assert_eq!(second_status, StatusCode::PRECONDITION_FAILED);
+            assert_eq!(
+                body_string(second_response).await,
+                r#"{"error":"If-Match does not match the current policy ETag"}"#
+            );
+            None
+        };
+
+        assert_eq!(
+            [first_status, second_status]
+                .iter()
+                .filter(|status| **status == StatusCode::OK)
+                .count(),
+            1
+        );
+        assert_eq!(
+            [first_status, second_status]
+                .iter()
+                .filter(|status| **status == StatusCode::PRECONDITION_FAILED)
+                .count(),
+            1
+        );
+
+        let (winning_id, winning_etag, winning_body, mut winning_policy) =
+            if first_status == StatusCode::OK {
+                (
+                    "concurrent-policy-a",
+                    first_etag.expect("successful PUT should include ETag"),
+                    first_body.expect("successful PUT should include JSON body"),
+                    first_policy,
+                )
+            } else {
+                (
+                    "concurrent-policy-b",
+                    second_etag.expect("successful PUT should include ETag"),
+                    second_body.expect("successful PUT should include JSON body"),
+                    second_policy,
+                )
+            };
+
+        assert_ne!(winning_etag, current_etag);
+        assert_eq!(winning_body["id"], json!(winning_id));
+        winning_policy["rules"] = json!([]);
+
+        let persisted_policy: Value = serde_json::from_str(
+            &fs::read_to_string(&policy.path).expect("policy file should read"),
+        )
+        .expect("persisted policy should be JSON");
+        assert_eq!(persisted_policy, winning_policy);
+
+        let live_response = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET after concurrent PUTs should complete");
+        assert_eq!(live_response.status(), StatusCode::OK);
+        assert_eq!(policy_etag_header(&live_response), winning_etag);
+        assert_eq!(json_body(live_response).await, winning_policy);
+    }
+
+    #[tokio::test]
+    async fn policy_put_with_invalid_policy_returns_errors_without_persisting_or_swapping() {
+        let initial_policy = policy_document_string("initial-policy", "test:old");
+        let policy = TempPolicyFile::new(&initial_policy);
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+        let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+
+        let get_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete");
+        let current_etag = policy_etag_header(&get_response);
+
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(r#"{ "schema_version": "1.0.0" }"#.to_owned()),
+                Some(&current_etag),
+            ))
+            .await
+            .expect("invalid policy PUT should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["valid"], json!(false));
+        assert!(
+            body["errors"][0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("schema_version must start with"),
+            "unexpected validation body: {body}"
+        );
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy file should read"),
+            before_contents
+        );
+
+        let after_get = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET after invalid PUT should complete");
+        assert_eq!(policy_etag_header(&after_get), current_etag);
+        assert_eq!(json_body(after_get).await["id"], json!("initial-policy"));
+    }
+
+    #[tokio::test]
+    async fn policy_put_missing_if_match_is_rejected_without_changes() {
+        let initial_policy = policy_document_string("initial-policy", "test:old");
+        let policy = TempPolicyFile::new(&initial_policy);
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+        let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+
+        let response = router
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(policy_document_string("updated-policy", "test:new")),
+                None,
+            ))
+            .await
+            .expect("missing If-Match policy PUT should complete");
+
+        assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"If-Match header is required"}"#
+        );
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy file should read"),
+            before_contents
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_put_requires_write_permission() {
+        let initial_policy = policy_document_string("initial-policy", "test:old");
+        let policy = TempPolicyFile::new(&initial_policy);
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+        let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+
+        let get_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete");
+        let current_etag = policy_etag_header(&get_response);
+
+        let response = router
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(policy_document_string("updated-policy", "test:new")),
+                Some(&current_etag),
+            ))
+            .await
+            .expect("read-only policy PUT should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy file should read"),
+            before_contents
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_validate_accepts_valid_candidate_without_changing_live_policy_or_file() {
+        let initial_policy = policy_document_string("initial-policy", "test:old");
+        let policy = TempPolicyFile::new(&initial_policy);
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = policy_admin_router(Some(&policy), audit_log);
+        let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+
+        let get_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete");
+        let current_etag = policy_etag_header(&get_response);
+
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(policy_document_string("validated-only", "test:new")),
+                None,
+            ))
+            .await
+            .expect("policy validate should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await, json!({ "valid": true }));
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy file should read"),
+            before_contents
+        );
+        assert!(!capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == audit::event::POLICY_CHANGED));
+
+        let after_get = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET after validate should complete");
+        assert_eq!(policy_etag_header(&after_get), current_etag);
+        assert_eq!(json_body(after_get).await["id"], json!("initial-policy"));
+    }
+
+    #[tokio::test]
+    async fn policy_validate_invalid_candidate_returns_errors_without_changes() {
+        let initial_policy = policy_document_string("initial-policy", "test:old");
+        let policy = TempPolicyFile::new(&initial_policy);
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+        let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+
+        let response = router
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(r#"{ "schema_version": "1.0.0" }"#.to_owned()),
+                None,
+            ))
+            .await
+            .expect("invalid policy validate should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["valid"], json!(false));
+        assert!(
+            body["errors"][0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("schema_version must start with"),
+            "unexpected validation body: {body}"
+        );
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy file should read"),
+            before_contents
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_admin_endpoints_return_not_found_when_policy_file_is_unset() {
+        let router = policy_admin_router(None, test_audit_log());
+
+        let get_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET without policy file should complete");
+        assert_eq!(get_response.status(), StatusCode::NOT_FOUND);
+
+        let put_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(policy_document_string("updated-policy", "test:new")),
+                Some("\"sha256:anything\""),
+            ))
+            .await
+            .expect("policy PUT without policy file should complete");
+        assert_eq!(put_response.status(), StatusCode::NOT_FOUND);
+
+        let validate_response = router
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(policy_document_string("updated-policy", "test:new")),
+                None,
+            ))
+            .await
+            .expect("policy validate without policy file should complete");
+        assert_eq!(validate_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn status_uptime_increases_between_requests() {
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
@@ -5504,6 +6594,154 @@ mod tests {
         }
 
         request
+    }
+
+    fn policy_admin_config(policy: Option<&TempPolicyFile>) -> config::Config {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        if let Some(policy) = policy {
+            config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+            config.rbac_exempt_paths.push(POLICY_ADMIN_ROUTE.to_owned());
+        }
+
+        config
+    }
+
+    fn policy_admin_router(policy: Option<&TempPolicyFile>, audit_log: audit::AuditLog) -> Router {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        app(
+            policy_admin_config(policy),
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+    }
+
+    fn policy_admin_request(
+        method: Method,
+        uri: &str,
+        principal: Option<auth::Principal>,
+        body: Option<String>,
+        if_match: Option<&str>,
+    ) -> Request<Body> {
+        policy_admin_request_with_body(
+            method,
+            uri,
+            principal,
+            Body::from(body.unwrap_or_default()),
+            if_match,
+        )
+    }
+
+    fn synchronized_policy_put_request(
+        body: String,
+        if_match: &str,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Request<Body> {
+        let chunks = stream::once(async move {
+            barrier.wait().await;
+            Ok::<Bytes, Infallible>(Bytes::from(body))
+        });
+
+        policy_admin_request_with_body(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Body::from_stream(chunks),
+            Some(if_match),
+        )
+    }
+
+    fn policy_admin_request_with_body(
+        method: Method,
+        uri: &str,
+        principal: Option<auth::Principal>,
+        body: Body,
+        if_match: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method(method.clone()).uri(uri);
+
+        if matches!(method, Method::POST | Method::PUT) {
+            builder = builder
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test-token");
+        }
+        if let Some(if_match) = if_match {
+            builder = builder.header(header::IF_MATCH, if_match);
+        }
+
+        let mut request = builder.body(body).expect("request should build");
+        if let Some(principal) = principal {
+            request.extensions_mut().insert(principal);
+        }
+
+        request
+    }
+
+    fn policy_etag_header(response: &Response) -> String {
+        response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("policy response should include an ETag")
+            .to_owned()
+    }
+
+    fn policy_document_string(id: &str, test_permission: &str) -> String {
+        serde_json::to_string_pretty(&policy_document(id, test_permission))
+            .expect("test policy should serialize")
+    }
+
+    fn policy_document(id: &str, test_permission: &str) -> Value {
+        json!({
+            "schema_version": "0.1.0",
+            "id": id,
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "admin": {
+                    "permissions": [
+                        ADMIN_POLICY_READ_PERMISSION,
+                        ADMIN_POLICY_WRITE_PERMISSION
+                    ]
+                },
+                "policy-reader": {
+                    "permissions": [ADMIN_POLICY_READ_PERMISSION]
+                },
+                "reader": {
+                    "permissions": []
+                },
+                "old-reader": {
+                    "permissions": ["test:old"]
+                },
+                "new-reader": {
+                    "permissions": ["test:new"]
+                }
+            },
+            "routes": [
+                {
+                    "methods": ["GET"],
+                    "path_prefix": POLICY_ADMIN_ROUTE,
+                    "permission": ADMIN_POLICY_READ_PERMISSION
+                },
+                {
+                    "methods": ["PUT"],
+                    "path_prefix": POLICY_ADMIN_ROUTE,
+                    "permission": ADMIN_POLICY_WRITE_PERMISSION
+                },
+                {
+                    "methods": ["POST"],
+                    "path_prefix": POLICY_VALIDATE_ADMIN_ROUTE,
+                    "permission": ADMIN_POLICY_READ_PERMISSION
+                },
+                {
+                    "methods": ["GET"],
+                    "path_prefix": "/__test",
+                    "permission": test_permission
+                }
+            ]
+        })
     }
 
     async fn status_json(router: Router, principal: Option<auth::Principal>) -> Value {
