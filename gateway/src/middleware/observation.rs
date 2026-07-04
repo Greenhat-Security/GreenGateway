@@ -27,6 +27,7 @@ use crate::{
         openapi::{OpenApiRequestShape, SchemaCoverage},
         query::{
             DiscoveryQueryStore, InferredJsonBodyKey, InferredQueryParam, InferredRequestSchema,
+            ObservedEndpoint,
         },
     },
 };
@@ -35,6 +36,11 @@ use super::decision::{AuthOutcome, PolicyDecision, PolicyDecisionOutcome, Upstre
 
 const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
 pub(crate) const MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT: u64 = 5;
+/// Inferred-schema conformance is advisory and based on captured samples. Cache
+/// discovery lookups briefly so endpoint/sample updates become visible within
+/// this window without scanning SQLite or reparsing historical samples on every
+/// request.
+const INFERRED_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct ObservationState {
@@ -73,6 +79,29 @@ pub struct SchemaConformanceState {
     min_inferred_sample_count: u64,
     skip_exact_paths: Vec<String>,
     skip_path_prefixes: Vec<String>,
+    inferred_cache: Arc<InferredSchemaCache>,
+}
+
+struct InferredSchemaCache {
+    ttl: Duration,
+    inner: Mutex<InferredSchemaCacheInner>,
+}
+
+#[derive(Default)]
+struct InferredSchemaCacheInner {
+    observed_endpoints: Option<CacheEntry<Arc<Vec<ObservedEndpoint>>>>,
+    schemas: BTreeMap<EndpointSchemaCacheKey, CacheEntry<Option<Arc<InferredRequestSchema>>>>,
+}
+
+struct CacheEntry<T> {
+    value: T,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct EndpointSchemaCacheKey {
+    method: String,
+    endpoint_template: String,
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +314,20 @@ impl SchemaConformanceState {
         query_store: Option<Arc<DiscoveryQueryStore>>,
         payload_capture_enabled: bool,
     ) -> Option<Self> {
+        Self::from_parts_with_cache_ttl(
+            coverage,
+            query_store,
+            payload_capture_enabled,
+            INFERRED_SCHEMA_CACHE_TTL,
+        )
+    }
+
+    fn from_parts_with_cache_ttl(
+        coverage: SchemaCoverage,
+        query_store: Option<Arc<DiscoveryQueryStore>>,
+        payload_capture_enabled: bool,
+        inferred_cache_ttl: Duration,
+    ) -> Option<Self> {
         (coverage.spec_configured() || (payload_capture_enabled && query_store.is_some()))
             .then_some(Self {
                 coverage,
@@ -293,6 +336,7 @@ impl SchemaConformanceState {
                 min_inferred_sample_count: MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT,
                 skip_exact_paths: Vec::new(),
                 skip_path_prefixes: Vec::new(),
+                inferred_cache: Arc::new(InferredSchemaCache::new(inferred_cache_ttl)),
             })
     }
 
@@ -302,6 +346,21 @@ impl SchemaConformanceState {
         query_store: Option<Arc<DiscoveryQueryStore>>,
         payload_capture_enabled: bool,
     ) -> Self {
+        Self::new_for_test_with_cache_ttl(
+            coverage,
+            query_store,
+            payload_capture_enabled,
+            INFERRED_SCHEMA_CACHE_TTL,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_for_test_with_cache_ttl(
+        coverage: SchemaCoverage,
+        query_store: Option<Arc<DiscoveryQueryStore>>,
+        payload_capture_enabled: bool,
+        inferred_cache_ttl: Duration,
+    ) -> Self {
         Self {
             coverage,
             query_store,
@@ -309,6 +368,7 @@ impl SchemaConformanceState {
             min_inferred_sample_count: MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT,
             skip_exact_paths: Vec::new(),
             skip_path_prefixes: Vec::new(),
+            inferred_cache: Arc::new(InferredSchemaCache::new(inferred_cache_ttl)),
         }
     }
 
@@ -351,23 +411,10 @@ impl SchemaConformanceState {
         &self,
         method: &str,
         path: &str,
-    ) -> Option<InferredRequestSchema> {
+    ) -> Option<Arc<InferredRequestSchema>> {
         let query_store = self.query_store.as_ref()?;
-        let endpoints = query_store.observed_endpoints().ok()?;
-        let endpoint_template = endpoints
-            .into_iter()
-            .filter(|endpoint| endpoint.method == method)
-            .filter_map(|endpoint| {
-                endpoint_template_match_score(&endpoint.endpoint_template, path)
-                    .map(|score| (score, endpoint.endpoint_template))
-            })
-            .max_by(|(left, _), (right, _)| left.cmp(right))
-            .map(|(_, endpoint_template)| endpoint_template)?;
-
-        query_store
-            .inferred_request_schema(method, &endpoint_template)
-            .ok()
-            .flatten()
+        self.inferred_cache
+            .schema_for_request(query_store, method, path)
     }
 
     fn should_skip_path(&self, path: &str) -> bool {
@@ -376,6 +423,124 @@ impl SchemaConformanceState {
                 .skip_path_prefixes
                 .iter()
                 .any(|prefix| path_prefix_matches(path, prefix))
+    }
+}
+
+impl InferredSchemaCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            inner: Mutex::new(InferredSchemaCacheInner::default()),
+        }
+    }
+
+    fn schema_for_request(
+        &self,
+        query_store: &DiscoveryQueryStore,
+        method: &str,
+        path: &str,
+    ) -> Option<Arc<InferredRequestSchema>> {
+        let endpoints = self.observed_endpoints(query_store);
+        let endpoint_template = endpoints
+            .iter()
+            .filter(|endpoint| endpoint.method == method)
+            .filter_map(|endpoint| {
+                endpoint_template_match_score(&endpoint.endpoint_template, path)
+                    .map(|score| (score, endpoint.endpoint_template.as_str()))
+            })
+            .max_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, endpoint_template)| endpoint_template)?;
+
+        self.schema_for_endpoint(query_store, method, endpoint_template)
+    }
+
+    fn observed_endpoints(&self, query_store: &DiscoveryQueryStore) -> Arc<Vec<ObservedEndpoint>> {
+        let now = Instant::now();
+        if let Some(endpoints) = self.cached_observed_endpoints(now) {
+            return endpoints;
+        }
+
+        let endpoints = Arc::new(query_store.observed_endpoints().unwrap_or_default());
+        self.store_observed_endpoints(Arc::clone(&endpoints), Instant::now());
+        endpoints
+    }
+
+    fn cached_observed_endpoints(&self, now: Instant) -> Option<Arc<Vec<ObservedEndpoint>>> {
+        let inner = self.inner_guard();
+        inner
+            .observed_endpoints
+            .as_ref()
+            .and_then(|entry| entry.fresh_value(now))
+    }
+
+    fn store_observed_endpoints(&self, endpoints: Arc<Vec<ObservedEndpoint>>, now: Instant) {
+        let mut inner = self.inner_guard();
+        inner.observed_endpoints = Some(CacheEntry::new(endpoints, now + self.ttl));
+    }
+
+    fn schema_for_endpoint(
+        &self,
+        query_store: &DiscoveryQueryStore,
+        method: &str,
+        endpoint_template: &str,
+    ) -> Option<Arc<InferredRequestSchema>> {
+        let key = EndpointSchemaCacheKey {
+            method: method.to_owned(),
+            endpoint_template: endpoint_template.to_owned(),
+        };
+        let now = Instant::now();
+        if let Some(schema) = self.cached_schema(&key, now) {
+            return schema;
+        }
+
+        let schema = query_store
+            .inferred_request_schema(method, endpoint_template)
+            .ok()
+            .flatten()
+            .map(Arc::new);
+        self.store_schema(key, schema.clone(), Instant::now());
+        schema
+    }
+
+    fn cached_schema(
+        &self,
+        key: &EndpointSchemaCacheKey,
+        now: Instant,
+    ) -> Option<Option<Arc<InferredRequestSchema>>> {
+        let inner = self.inner_guard();
+        inner
+            .schemas
+            .get(key)
+            .and_then(|entry| entry.fresh_value(now))
+    }
+
+    fn store_schema(
+        &self,
+        key: EndpointSchemaCacheKey,
+        schema: Option<Arc<InferredRequestSchema>>,
+        now: Instant,
+    ) {
+        let mut inner = self.inner_guard();
+        inner
+            .schemas
+            .insert(key, CacheEntry::new(schema, now + self.ttl));
+    }
+
+    fn inner_guard(&self) -> std::sync::MutexGuard<'_, InferredSchemaCacheInner> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+impl<T: Clone> CacheEntry<T> {
+    fn new(value: T, expires_at: Instant) -> Self {
+        Self { value, expires_at }
+    }
+
+    fn fresh_value(&self, now: Instant) -> Option<T> {
+        (now < self.expires_at).then(|| self.value.clone())
     }
 }
 
@@ -1175,6 +1340,127 @@ paths:
         assert!(low_event.payload.get("schema_mismatch").is_none());
     }
 
+    #[test]
+    fn inferred_conformance_reuses_lookup_for_repeated_same_endpoint_checks() {
+        let db = TempDb::new("observation-inferred-cache-reuse");
+        for index in 0..250 {
+            let endpoint_template = format!("/noise/{index}");
+            seed_endpoint(&db.path, "POST", &endpoint_template);
+        }
+        seed_endpoint(&db.path, "POST", "/users");
+        seed_payload_shape_samples(
+            &db.path,
+            "POST",
+            "/users",
+            &vec![
+                json!({
+                    "json_body": {
+                        "top_level_keys": [
+                            { "name": "display_name", "redacted": false }
+                        ]
+                    }
+                });
+                MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT as usize
+            ],
+        );
+        let store = Arc::new(DiscoveryQueryStore::open(&db.path).expect("query store should open"));
+        let conformance = SchemaConformanceState::new_for_test(
+            SchemaCoverage::default(),
+            Some(Arc::clone(&store)),
+            true,
+        );
+
+        let first = conformance
+            .prepare_check("POST", "/users", None)
+            .expect("inferred conformance check should be prepared");
+        assert!(first.needs_body_capture());
+        assert_eq!(store.query_counts_for_test(), (1, 1));
+
+        for _ in 0..10 {
+            let check = conformance
+                .prepare_check("POST", "/users", None)
+                .expect("cached inferred conformance check should be prepared");
+            assert!(check.needs_body_capture());
+        }
+
+        assert_eq!(
+            store.query_counts_for_test(),
+            (1, 1),
+            "repeated checks for the same inferred endpoint must not rescan endpoints or reparse stored samples"
+        );
+    }
+
+    #[test]
+    fn inferred_conformance_refreshes_cached_schema_after_ttl() {
+        let db = TempDb::new("observation-inferred-cache-refresh");
+        seed_endpoint(&db.path, "POST", "/users");
+        seed_payload_shape_samples(
+            &db.path,
+            "POST",
+            "/users",
+            &vec![
+                json!({
+                    "json_body": {
+                        "top_level_keys": [
+                            { "name": "display_name", "redacted": false }
+                        ]
+                    }
+                });
+                MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT as usize
+            ],
+        );
+        let store = Arc::new(DiscoveryQueryStore::open(&db.path).expect("query store should open"));
+        let ttl = Duration::from_millis(50);
+        let conformance = SchemaConformanceState::new_for_test_with_cache_ttl(
+            SchemaCoverage::default(),
+            Some(Arc::clone(&store)),
+            true,
+            ttl,
+        );
+        let display_name_shape = captured_payload_shape(
+            None,
+            Some("application/json"),
+            Some(r#"{"display_name":"Alice"}"#.as_bytes()),
+        )
+        .expect("display_name shape should capture");
+
+        let first = conformance
+            .prepare_check("POST", "/users", None)
+            .expect("initial inferred conformance check should be prepared");
+        assert!(!first.schema_mismatch(Some(&display_name_shape)));
+        assert_eq!(store.query_counts_for_test(), (1, 1));
+
+        replace_payload_shape_samples(
+            &db.path,
+            "POST",
+            "/users",
+            &vec![
+                json!({
+                    "json_body": {
+                        "top_level_keys": [
+                            { "name": "nickname", "redacted": false }
+                        ]
+                    }
+                });
+                MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT as usize
+            ],
+        );
+
+        let cached = conformance
+            .prepare_check("POST", "/users", None)
+            .expect("cached inferred conformance check should be prepared");
+        assert!(!cached.schema_mismatch(Some(&display_name_shape)));
+        assert_eq!(store.query_counts_for_test(), (1, 1));
+
+        std::thread::sleep(ttl + Duration::from_millis(25));
+
+        let refreshed = conformance
+            .prepare_check("POST", "/users", None)
+            .expect("refreshed inferred conformance check should be prepared");
+        assert!(refreshed.schema_mismatch(Some(&display_name_shape)));
+        assert_eq!(store.query_counts_for_test(), (2, 2));
+    }
+
     #[tokio::test]
     async fn no_schema_available_omits_schema_mismatch_and_shape_capture_handle() {
         let (state, capture) = test_observation_state();
@@ -1952,6 +2238,36 @@ paths:
                 )
                 .expect("payload shape sample should insert");
         }
+    }
+
+    fn replace_payload_shape_samples(
+        path: &PathBuf,
+        method: &str,
+        endpoint_template: &str,
+        shapes: &[serde_json::Value],
+    ) {
+        let connection = Connection::open(path).expect("test database should open");
+        connection
+            .execute(
+                r#"
+                DELETE FROM discovery_payload_shape_samples
+                WHERE method = ?1 AND endpoint_template = ?2
+                "#,
+                params![method, endpoint_template],
+            )
+            .expect("payload shape samples should delete");
+        connection
+            .execute(
+                r#"
+                DELETE FROM discovery_payload_shape_stats
+                WHERE method = ?1 AND endpoint_template = ?2
+                "#,
+                params![method, endpoint_template],
+            )
+            .expect("payload shape stats should delete");
+        drop(connection);
+
+        seed_payload_shape_samples(path, method, endpoint_template, shapes);
     }
 
     struct TempDb {

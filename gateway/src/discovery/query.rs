@@ -7,6 +7,9 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
@@ -36,6 +39,15 @@ CREATE TABLE IF NOT EXISTS discovery_endpoint_reviews (
 pub struct DiscoveryQueryStore {
     path: PathBuf,
     connection: std::sync::Arc<Mutex<Connection>>,
+    #[cfg(test)]
+    query_counts: std::sync::Arc<DiscoveryQueryCounts>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct DiscoveryQueryCounts {
+    observed_endpoints: AtomicU64,
+    inferred_request_schema: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,10 +280,17 @@ impl DiscoveryQueryStore {
         Ok(Self {
             path,
             connection: std::sync::Arc::new(Mutex::new(connection)),
+            #[cfg(test)]
+            query_counts: std::sync::Arc::new(DiscoveryQueryCounts::default()),
         })
     }
 
     pub fn observed_endpoints(&self) -> Result<Vec<ObservedEndpoint>, DiscoveryQueryError> {
+        #[cfg(test)]
+        self.query_counts
+            .observed_endpoints
+            .fetch_add(1, AtomicOrdering::Relaxed);
+
         let connection = self.connection_guard();
         let mut statement = match connection.prepare(
             r#"
@@ -449,38 +468,46 @@ impl DiscoveryQueryStore {
         method: &str,
         endpoint_template: &str,
     ) -> Result<Option<InferredRequestSchema>, DiscoveryQueryError> {
-        let connection = self.connection_guard();
-        let mut statement = match connection.prepare(
-            r#"
-            SELECT shape_json
-            FROM discovery_payload_shape_samples
-            WHERE method = ?1 AND endpoint_template = ?2
-            ORDER BY sample_slot
-            "#,
-        ) {
-            Ok(statement) => statement,
-            Err(source) if is_missing_payload_shape_sample_table(&source) => return Ok(None),
-            Err(source) => {
-                return Err(DiscoveryQueryError::Sqlite {
+        #[cfg(test)]
+        self.query_counts
+            .inferred_request_schema
+            .fetch_add(1, AtomicOrdering::Relaxed);
+
+        let shape_jsons = {
+            let connection = self.connection_guard();
+            let mut statement = match connection.prepare(
+                r#"
+                SELECT shape_json
+                FROM discovery_payload_shape_samples
+                WHERE method = ?1 AND endpoint_template = ?2
+                ORDER BY sample_slot
+                "#,
+            ) {
+                Ok(statement) => statement,
+                Err(source) if is_missing_payload_shape_sample_table(&source) => return Ok(None),
+                Err(source) => {
+                    return Err(DiscoveryQueryError::Sqlite {
+                        path: self.path.clone(),
+                        source,
+                    })
+                }
+            };
+
+            let rows = statement
+                .query_map(params![method, endpoint_template], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|source| DiscoveryQueryError::Sqlite {
                     path: self.path.clone(),
                     source,
-                })
-            }
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| DiscoveryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            rows
         };
-
-        let shape_jsons = statement
-            .query_map(params![method, endpoint_template], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|source| DiscoveryQueryError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| DiscoveryQueryError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
 
         if shape_jsons.is_empty() {
             return Ok(None);
@@ -503,6 +530,18 @@ impl DiscoveryQueryStore {
             endpoint_template,
             &shapes,
         )))
+    }
+
+    #[cfg(test)]
+    pub fn query_counts_for_test(&self) -> (u64, u64) {
+        (
+            self.query_counts
+                .observed_endpoints
+                .load(AtomicOrdering::Relaxed),
+            self.query_counts
+                .inferred_request_schema
+                .load(AtomicOrdering::Relaxed),
+        )
     }
 
     pub fn set_endpoint_review(
