@@ -1,14 +1,18 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { Buffer } from 'node:buffer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 
+import { ADMIN_TOKEN_STORAGE_KEY } from '../lib/auth';
 import { AuditEvent } from '../lib/audit';
+import type { PolicyDocument } from '../lib/policy';
 import { DiscoverySignal, SignalListResponse } from '../lib/signals';
 import { SignalsView } from './SignalsView';
 
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
 });
 
 describe('SignalsView', () => {
@@ -142,6 +146,108 @@ describe('SignalsView', () => {
     );
   });
 
+  it('navigates to a shadow prefilled rule editor from an endpoint signal', async () => {
+    const fetcher = signalsFetchMock({
+      pages: [
+        {
+          signals: [
+            signal({
+              id: 'sig-create-rule',
+              target: endpointTarget('POST', '/reports/{id}'),
+            }),
+          ],
+          next_cursor: null,
+        },
+      ],
+      policy: policyDocument({
+        roles: {
+          writer: { permissions: ['admin:policy:write'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderSignalsView('/signals', { token: jwtWithRoles(['writer']) });
+
+    expect(await screen.findByText('POST /reports/{id}')).toBeTruthy();
+    const createRuleButton = screen.getByRole('button', {
+      name: 'Create rule for signal sig-create-rule',
+    }) as HTMLButtonElement;
+    expect(createRuleButton.disabled).toBe(false);
+
+    fireEvent.click(createRuleButton);
+
+    expect(screen.getByTestId('location').textContent).toBe(
+      '/policy/rules/editor?prefill_method=POST&prefill_path=%2Freports%2F%7Bid%7D&prefill_action=shadow',
+    );
+  });
+
+  it('disables signal rule creation for a read-only policy principal', async () => {
+    const fetcher = signalsFetchMock({
+      pages: [
+        {
+          signals: [
+            signal({
+              id: 'sig-readonly',
+              target: endpointTarget('GET', '/readonly'),
+            }),
+          ],
+          next_cursor: null,
+        },
+      ],
+      policy: policyDocument({
+        roles: {
+          reader: { permissions: ['admin:policy:read'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderSignalsView('/signals', { token: jwtWithRoles(['reader']) });
+
+    expect(await screen.findByText('GET /readonly')).toBeTruthy();
+    const createRuleButton = screen.getByRole('button', {
+      name: 'Create rule for signal sig-readonly',
+    }) as HTMLButtonElement;
+
+    expect(createRuleButton.disabled).toBe(true);
+    expect(createRuleButton.getAttribute('title')).toBe(
+      'Requires admin:policy:write',
+    );
+  });
+
+  it('does not render a create-rule action for a non-endpoint signal target', async () => {
+    const fetcher = signalsFetchMock({
+      pages: [
+        {
+          signals: [
+            signal({
+              id: 'sig-principal',
+              target: {
+                kind: 'principal',
+                identity: { user_id: 'alice' },
+              },
+            }),
+          ],
+          next_cursor: null,
+        },
+      ],
+      policy: policyDocument({
+        roles: {
+          writer: { permissions: ['admin:policy:write'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderSignalsView('/signals', { token: jwtWithRoles(['writer']) });
+
+    expect(await screen.findByText(/principal/)).toBeTruthy();
+    expect(
+      screen.queryByRole('button', { name: 'Create rule for signal sig-principal' }),
+    ).toBeNull();
+  });
+
   it('prepends live signal.opened SSE events', async () => {
     const fetcher = signalsFetchMock({
       pages: [{ signals: [], next_cursor: null }],
@@ -174,20 +280,45 @@ describe('SignalsView', () => {
   });
 });
 
-function renderSignalsView(initialPath = '/signals') {
+function renderSignalsView(
+  initialPath = '/signals',
+  {
+    token = null,
+  }: {
+    token?: string | null;
+  } = {},
+) {
+  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  if (token !== null) {
+    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+  }
+
   render(
     <MemoryRouter initialEntries={[initialPath]}>
       <SignalsView />
+      <LocationProbe />
     </MemoryRouter>,
+  );
+}
+
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <div data-testid="location">
+      {location.pathname}
+      {location.search}
+    </div>
   );
 }
 
 function signalsFetchMock({
   pages,
   transitions = [],
+  policy = policyDocument(),
 }: {
   pages: SignalListResponse[];
   transitions?: DiscoverySignal[];
+  policy?: PolicyDocument;
 }) {
   const encoder = new TextEncoder();
   let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
@@ -200,6 +331,9 @@ function signalsFetchMock({
   });
   const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost');
+    if (url.pathname === '/v1/admin/policy' && !init?.method) {
+      return Promise.resolve(jsonResponse(200, policy, { ETag: '"policy-etag"' }));
+    }
     if (url.pathname === '/v1/admin/events/stream') {
       return Promise.resolve(
         new Response(stream, {
@@ -241,11 +375,16 @@ function emptyPage(): SignalListResponse {
   return { signals: [], next_cursor: null };
 }
 
-function jsonResponse(status: number, body: unknown): Response {
+function jsonResponse(
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       'Content-Type': 'application/json',
+      ...headers,
     },
   });
 }
@@ -296,4 +435,31 @@ function endpointTarget(method: string, endpointTemplate: string) {
       endpoint_template: endpointTemplate,
     },
   };
+}
+
+function policyDocument(
+  overrides: Partial<PolicyDocument> = {},
+): PolicyDocument {
+  return {
+    schema_version: '0.1.0',
+    id: 'signals-test-policy',
+    default_action: 'deny',
+    enforcement_mode: 'enforce',
+    roles: {},
+    routes: [],
+    rules: [],
+    ...overrides,
+  };
+}
+
+function jwtWithRoles(roles: string[]): string {
+  return [
+    base64UrlJson({ alg: 'none', typ: 'JWT' }),
+    base64UrlJson({ sub: 'test-user', roles }),
+    'signature',
+  ].join('.');
+}
+
+function base64UrlJson(value: unknown): string {
+  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
 }

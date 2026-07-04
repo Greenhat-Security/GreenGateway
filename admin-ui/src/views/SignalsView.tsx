@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
 import { AuditEvent, JsonObject } from '../lib/audit';
@@ -7,13 +7,16 @@ import {
   buildAuditEventStreamUrl,
   subscribeToAuditEvents,
 } from '../lib/eventStream';
+import { currentTokenCanWritePolicy, fetchPolicy } from '../lib/policy';
 import {
   DiscoverySignal,
+  EndpointSignalTarget,
   SignalFilters,
   SignalState,
   acknowledgeSignal,
   dismissSignal,
   displaySignalTarget,
+  endpointTargetForSignal,
   emptySignalFilters,
   fetchSignals,
   signalMatchesFilters,
@@ -47,6 +50,7 @@ type SignalLifecyclePayload = {
 const SIGNAL_RECONNECT_DELAY_MS = 750;
 
 export function SignalsView() {
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const initialFilters = useMemo(
     () => signalFiltersFromSearchParams(searchParams),
@@ -64,6 +68,7 @@ export function SignalsView() {
   const [transitionError, setTransitionError] =
     useState<SignalsLoadError | null>(null);
   const [toasts, setToasts] = useState<SignalToast[]>([]);
+  const [canCreateRules, setCanCreateRules] = useState(false);
 
   useEffect(() => {
     setFilters(initialFilters);
@@ -162,6 +167,29 @@ export function SignalsView() {
     };
   }, [appliedFilters]);
 
+  useEffect(() => {
+    let isCurrent = true;
+
+    async function loadPolicyWritePermission() {
+      try {
+        const response = await fetchPolicy();
+        if (isCurrent) {
+          setCanCreateRules(currentTokenCanWritePolicy(response.policy));
+        }
+      } catch {
+        if (isCurrent) {
+          setCanCreateRules(false);
+        }
+      }
+    }
+
+    void loadPolicyWritePermission();
+
+    return () => {
+      isCurrent = false;
+    };
+  }, []);
+
   function updateFilter(name: keyof SignalFilters, value: string) {
     setFilters((current) => ({ ...current, [name]: value }));
   }
@@ -217,6 +245,19 @@ export function SignalsView() {
     } finally {
       setTransitioningId(null);
     }
+  }
+
+  function createRuleFromSignal(signal: DiscoverySignal) {
+    if (!canCreateRules) {
+      return;
+    }
+
+    const endpointTarget = endpointTargetForSignal(signal);
+    if (!endpointTarget) {
+      return;
+    }
+
+    navigate(ruleEditorPathForSignalEndpoint(endpointTarget));
   }
 
   function handleSignalStreamEvent(
@@ -384,70 +425,90 @@ export function SignalsView() {
                   </tr>
                 </thead>
                 <tbody>
-                  {signals.map((signal, index) => (
-                    <tr
-                      className={`event-row ${index % 2 === 1 ? 'is-even' : ''}`}
-                      key={signal.id}
-                    >
-                      <td>
-                        <div className="signal-primary-cell">
-                          <span className="badge neutral">{signal.signal_type}</span>
-                          <span>{signal.explanation}</span>
-                        </div>
-                      </td>
-                      <td className="endpoint-template">
-                        {displaySignalTarget(signal)}
-                      </td>
-                      <td>
-                        <span className={`badge ${signalStateBadgeClass(signal.state)}`}>
-                          {signal.state}
-                        </span>
-                      </td>
-                      <td>
-                        <pre
-                          className="signal-evidence"
-                          data-testid={`signal-evidence-${signal.id}`}
-                        >
-                          {JSON.stringify(signal.evidence, null, 2)}
-                        </pre>
-                      </td>
-                      <td>
-                        <time
-                          className="timestamp-cell"
-                          dateTime={signal.updated_at}
-                          title={signal.updated_at}
-                        >
-                          {signal.updated_at}
-                        </time>
-                      </td>
-                      <td>
-                        <div className="signal-actions">
-                          <button
-                            type="button"
-                            className="secondary-button row-action-button"
-                            aria-label={`Acknowledge signal ${signal.id}`}
-                            disabled={transitioningId === signal.id}
-                            onClick={() => {
-                              void transitionSignal(signal, 'acknowledge');
-                            }}
+                  {signals.map((signal, index) => {
+                    const endpointTarget = endpointTargetForSignal(signal);
+                    const isTransitioning = transitioningId === signal.id;
+                    return (
+                      <tr
+                        className={`event-row ${index % 2 === 1 ? 'is-even' : ''}`}
+                        key={signal.id}
+                      >
+                        <td>
+                          <div className="signal-primary-cell">
+                            <span className="badge neutral">{signal.signal_type}</span>
+                            <span>{signal.explanation}</span>
+                          </div>
+                        </td>
+                        <td className="endpoint-template">
+                          {displaySignalTarget(signal)}
+                        </td>
+                        <td>
+                          <span className={`badge ${signalStateBadgeClass(signal.state)}`}>
+                            {signal.state}
+                          </span>
+                        </td>
+                        <td>
+                          <pre
+                            className="signal-evidence"
+                            data-testid={`signal-evidence-${signal.id}`}
                           >
-                            Acknowledge
-                          </button>
-                          <button
-                            type="button"
-                            className="secondary-button row-action-button"
-                            aria-label={`Dismiss signal ${signal.id}`}
-                            disabled={transitioningId === signal.id}
-                            onClick={() => {
-                              void transitionSignal(signal, 'dismiss');
-                            }}
+                            {JSON.stringify(signal.evidence, null, 2)}
+                          </pre>
+                        </td>
+                        <td>
+                          <time
+                            className="timestamp-cell"
+                            dateTime={signal.updated_at}
+                            title={signal.updated_at}
                           >
-                            Dismiss
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
+                            {signal.updated_at}
+                          </time>
+                        </td>
+                        <td>
+                          <div className="signal-actions">
+                            {endpointTarget ? (
+                              <button
+                                type="button"
+                                className="secondary-button row-action-button"
+                                aria-label={`Create rule for signal ${signal.id}`}
+                                title={
+                                  canCreateRules
+                                    ? undefined
+                                    : 'Requires admin:policy:write'
+                                }
+                                disabled={!canCreateRules || isTransitioning}
+                                onClick={() => createRuleFromSignal(signal)}
+                              >
+                                Create rule
+                              </button>
+                            ) : null}
+                            <button
+                              type="button"
+                              className="secondary-button row-action-button"
+                              aria-label={`Acknowledge signal ${signal.id}`}
+                              disabled={isTransitioning}
+                              onClick={() => {
+                                void transitionSignal(signal, 'acknowledge');
+                              }}
+                            >
+                              Acknowledge
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-button row-action-button"
+                              aria-label={`Dismiss signal ${signal.id}`}
+                              disabled={isTransitioning}
+                              onClick={() => {
+                                void transitionSignal(signal, 'dismiss');
+                              }}
+                            >
+                              Dismiss
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -600,6 +661,17 @@ function appendTrimmed(
   if (trimmed.length > 0) {
     params.set(name, trimmed);
   }
+}
+
+function ruleEditorPathForSignalEndpoint(
+  endpointTarget: EndpointSignalTarget,
+): string {
+  const params = new URLSearchParams();
+  params.set('prefill_method', endpointTarget.method);
+  params.set('prefill_path', endpointTarget.endpoint_template);
+  params.set('prefill_action', 'shadow');
+
+  return `/policy/rules/editor?${params.toString()}`;
 }
 
 function signalStateBadgeClass(state: SignalState): string {

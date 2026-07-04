@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
 import { AuditEvent } from '../lib/audit';
@@ -8,6 +8,11 @@ import {
   buildAuditEventStreamUrl,
   subscribeToAuditEvents,
 } from '../lib/eventStream';
+import {
+  currentTokenCanWritePolicy,
+  fetchPolicy,
+  isAuthMethodName,
+} from '../lib/policy';
 
 export const LIVE_TAIL_EVENT_LIMIT = 500;
 export const LIVE_TAIL_RECONNECT_DELAY_MS = 500;
@@ -29,6 +34,7 @@ const emptyFilters: AuditEventStreamFilters = {
 };
 
 export function LiveTail() {
+  const navigate = useNavigate();
   const [filters, setFilters] = useState<AuditEventStreamFilters>(emptyFilters);
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [expandedEventIds, setExpandedEventIds] = useState<Set<string>>(
@@ -38,6 +44,7 @@ export function LiveTail() {
     useState<ConnectionState>('connecting');
   const [error, setError] = useState<LiveTailError | null>(null);
   const [isPaused, setIsPaused] = useState(false);
+  const [canCreateRules, setCanCreateRules] = useState(false);
   const isPausedRef = useRef(false);
 
   useEffect(() => {
@@ -129,6 +136,29 @@ export function LiveTail() {
     };
   }, [filters]);
 
+  useEffect(() => {
+    let isCurrent = true;
+
+    async function loadPolicyWritePermission() {
+      try {
+        const response = await fetchPolicy();
+        if (isCurrent) {
+          setCanCreateRules(currentTokenCanWritePolicy(response.policy));
+        }
+      } catch {
+        if (isCurrent) {
+          setCanCreateRules(false);
+        }
+      }
+    }
+
+    void loadPolicyWritePermission();
+
+    return () => {
+      isCurrent = false;
+    };
+  }, []);
+
   function updateFilter(name: keyof AuditEventStreamFilters, value: string) {
     setFilters((current) => ({ ...current, [name]: value }));
     setEvents([]);
@@ -161,6 +191,14 @@ export function LiveTail() {
       }
       return next;
     });
+  }
+
+  function createRuleFromEvent(event: AuditEvent) {
+    if (!canCreateRules) {
+      return;
+    }
+
+    navigate(ruleEditorPathForAuditEvent(event));
   }
 
   const visibleConnectionState = isPaused ? 'paused' : connectionState;
@@ -248,6 +286,7 @@ export function LiveTail() {
                   <th>Path</th>
                   <th>Status</th>
                   <th>Request ID</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -275,10 +314,28 @@ export function LiveTail() {
                         <td>{displayPayloadField(event, 'path')}</td>
                         <td>{displayPayloadField(event, 'status')}</td>
                         <td>{event.request_id}</td>
+                        <td>
+                          <div className="signal-actions">
+                            <button
+                              type="button"
+                              className="secondary-button row-action-button"
+                              aria-label={createRuleEventLabel(event)}
+                              title={
+                                canCreateRules
+                                  ? undefined
+                                  : 'Requires admin:policy:write'
+                              }
+                              disabled={!canCreateRules}
+                              onClick={() => createRuleFromEvent(event)}
+                            >
+                              Create rule
+                            </button>
+                          </div>
+                        </td>
                       </tr>
                       {isExpanded ? (
                         <tr className="event-json-row">
-                          <td colSpan={7}>
+                          <td colSpan={8}>
                             <pre data-testid={`event-json-${event.event_id}`}>
                               {JSON.stringify(event, null, 2)}
                             </pre>
@@ -389,4 +446,53 @@ function displayPayloadField(event: AuditEvent, field: string): string {
   }
 
   return '-';
+}
+
+function createRuleEventLabel(event: AuditEvent): string {
+  const method = payloadStringField(event, 'method');
+  const path = payloadStringField(event, 'path');
+  if (method && path) {
+    return `Create rule from ${method} ${path}`;
+  }
+
+  return `Create rule from event ${event.event_id}`;
+}
+
+function ruleEditorPathForAuditEvent(event: AuditEvent): string {
+  const params = new URLSearchParams();
+  appendTrimmed(params, 'prefill_method', payloadStringField(event, 'method'));
+  appendTrimmed(params, 'prefill_path', payloadStringField(event, 'path'));
+
+  const actor = event.actor;
+  if (actor) {
+    const role = actor.roles?.find((value) => value.trim().length > 0) ?? null;
+    appendTrimmed(params, 'prefill_role', role);
+    if (isAuthMethodName(actor.auth_mode)) {
+      params.set('prefill_auth_method', actor.auth_mode);
+    }
+    appendTrimmed(params, 'prefill_principal_id', actor.user_id);
+  }
+
+  const query = params.toString();
+  return query.length > 0
+    ? `/policy/rules/editor?${query}`
+    : '/policy/rules/editor';
+}
+
+function payloadStringField(event: AuditEvent, field: string): string | null {
+  const value = event.payload[field];
+  return typeof value === 'string' && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
+function appendTrimmed(
+  params: URLSearchParams,
+  name: string,
+  value: string | null,
+) {
+  const trimmed = value?.trim();
+  if (trimmed && trimmed.length > 0) {
+    params.set(name, trimmed);
+  }
 }

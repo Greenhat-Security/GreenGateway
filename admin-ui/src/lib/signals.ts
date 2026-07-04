@@ -24,6 +24,11 @@ export type DiscoverySignal = {
   transitioned_by: string | null;
 };
 
+export type EndpointSignalTarget = {
+  method: string;
+  endpoint_template: string;
+};
+
 export type SignalListResponse = {
   signals: DiscoverySignal[];
   next_cursor: string | null;
@@ -132,27 +137,40 @@ export function signalMatchesFilters(
 }
 
 export function targetKeyForSignal(signal: DiscoverySignal): string | null {
-  if (signal.target.kind === 'endpoint') {
-    const method = signal.target.identity.method;
-    const endpointTemplate = signal.target.identity.endpoint_template;
-    if (typeof method === 'string' && typeof endpointTemplate === 'string') {
-      return endpointSignalTargetKey(method, endpointTemplate);
-    }
+  const endpointTarget = endpointTargetForSignal(signal);
+  if (endpointTarget) {
+    return endpointSignalTargetKey(
+      endpointTarget.method,
+      endpointTarget.endpoint_template,
+    );
   }
 
   return null;
 }
 
 export function displaySignalTarget(signal: DiscoverySignal): string {
-  if (signal.target.kind === 'endpoint') {
-    const method = signal.target.identity.method;
-    const endpointTemplate = signal.target.identity.endpoint_template;
-    if (typeof method === 'string' && typeof endpointTemplate === 'string') {
-      return `${method} ${endpointTemplate}`;
-    }
+  const endpointTarget = endpointTargetForSignal(signal);
+  if (endpointTarget) {
+    return `${endpointTarget.method} ${endpointTarget.endpoint_template}`;
   }
 
   return `${signal.target.kind} ${JSON.stringify(signal.target.identity)}`;
+}
+
+export function endpointTargetForSignal(
+  signal: DiscoverySignal,
+): EndpointSignalTarget | null {
+  if (signal.target.kind !== 'endpoint') {
+    return null;
+  }
+
+  const method = signal.target.identity.method;
+  const endpointTemplate = signal.target.identity.endpoint_template;
+  if (typeof method === 'string' && typeof endpointTemplate === 'string') {
+    return { method, endpoint_template: endpointTemplate };
+  }
+
+  return null;
 }
 
 function transitionSignal(

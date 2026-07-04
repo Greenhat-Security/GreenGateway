@@ -1,5 +1,5 @@
 import { AdminApiError, adminFetchJson } from './api';
-import { authHeaders } from './auth';
+import { authHeaders, decodeJwtRolesClaim, getStoredToken } from './auth';
 import { adminApiUrl } from './config';
 
 export type PolicyDefaultAction = 'allow' | 'deny';
@@ -209,11 +209,45 @@ export function isPolicyRuleEnabled(rule: PolicyRule): boolean {
   return rule.enabled !== false;
 }
 
+export function currentTokenCanWritePolicy(policy: PolicyDocument): boolean {
+  const token = getStoredToken();
+  if (!token) {
+    return false;
+  }
+
+  const roles = decodeJwtRolesClaim(token);
+  if (roles === null) {
+    return false;
+  }
+
+  return roles.some((roleName) =>
+    roleGrantsPolicyWrite(policy.roles?.[roleName]),
+  );
+}
+
+export function isAuthMethodName(value: string): value is AuthMethodName {
+  return value === 'bearer_token' || value === 'session_cookie';
+}
+
+export function isPolicyRuleAction(value: string): value is PolicyRuleAction {
+  return value === 'allow' || value === 'deny' || value === 'shadow';
+}
+
 function normalizePolicy(policy: PolicyDocument): PolicyDocument {
   return {
     ...policy,
     rules: policy.rules ?? [],
   };
+}
+
+function roleGrantsPolicyWrite(role: unknown): boolean {
+  if (!isJsonObject(role) || !Array.isArray(role.permissions)) {
+    return false;
+  }
+
+  return role.permissions.some(
+    (permission) => permission === 'admin:policy:write' || permission === '*',
+  );
 }
 
 function isPolicyRuleHitsListResponse(
@@ -277,4 +311,8 @@ function errorMessage(body: unknown, response: Response): string {
   }
 
   return response.statusText || `Request failed with status ${response.status}`;
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
