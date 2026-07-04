@@ -7,3 +7,4 @@ pub mod openapi;
 pub mod path_template;
 pub mod query;
 pub mod signals;
+pub mod suggestions;

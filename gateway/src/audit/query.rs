@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fmt,
     path::PathBuf,
@@ -13,11 +13,12 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     audit::{Actor, AuditEvent},
-    discovery::path_template::template_stateless,
+    discovery::{path_template::template_stateless, query::ObservedEndpoint},
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
 };
 
 pub const MAX_ENDPOINT_AUDIT_SCAN_ROWS: usize = 100_000;
+pub const MAX_RULE_SUGGESTION_AUDIT_SCAN_ROWS: usize = 100_000;
 pub const ENDPOINT_AUDIT_MATCH_STRATEGY: &str = "stateless_path_template";
 pub const ENDPOINT_AUDIT_MATCH_LIMITATIONS: &str =
     "Matches literal paths and immediate well-known identifier templates such as /users/{id}; statefully learned slug templates such as /catalog/{param} are not reverse-mapped from raw audit paths.";
@@ -62,6 +63,34 @@ pub struct RequestObservation {
     pub status: Option<i64>,
     pub matched_rule_id: Option<String>,
     pub payload_json: String,
+}
+
+pub struct RoleEndpointObservationFilters {
+    pub endpoints: Vec<ObservedEndpoint>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub max_scan_rows: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleEndpointObservation {
+    pub method: String,
+    pub endpoint_template: String,
+    pub role: String,
+    pub observation_count: u64,
+    pub error_count: u64,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RoleEndpointObservationMatrix {
+    pub observations: Vec<RoleEndpointObservation>,
+    pub scanned_event_count: u64,
+    pub scan_truncated: bool,
+    pub skipped_unauthenticated_observations: u64,
+    pub skipped_without_roles_observations: u64,
+    pub skipped_denied_observations: u64,
 }
 
 pub struct AuditQueryPage {
@@ -353,6 +382,108 @@ impl AuditQueryStore {
         }
 
         Ok(())
+    }
+
+    pub fn observed_role_endpoint_matrix(
+        &self,
+        filters: &RoleEndpointObservationFilters,
+    ) -> Result<RoleEndpointObservationMatrix, AuditQueryError> {
+        if filters.endpoints.is_empty() {
+            return Ok(RoleEndpointObservationMatrix::default());
+        }
+
+        let endpoint_keys = filters
+            .endpoints
+            .iter()
+            .map(|endpoint| (endpoint.method.clone(), endpoint.endpoint_template.clone()))
+            .collect::<BTreeSet<_>>();
+        let mut aggregates = BTreeMap::<(String, String, String), RoleEndpointObservation>::new();
+        let mut result = RoleEndpointObservationMatrix::default();
+
+        self.scan_request_observations(
+            &RequestObservationFilters {
+                from: filters.from.clone(),
+                to: filters.to.clone(),
+                methods: Vec::new(),
+                path_exact: None,
+                path_prefix: None,
+                before_id: None,
+            },
+            |observation| {
+                if result.scanned_event_count
+                    >= u64::try_from(filters.max_scan_rows).unwrap_or(u64::MAX)
+                {
+                    result.scan_truncated = true;
+                    return false;
+                }
+                result.scanned_event_count = result.scanned_event_count.saturating_add(1);
+
+                let endpoint_template = template_stateless(&observation.path);
+                let endpoint_key = (observation.method.clone(), endpoint_template.clone());
+                if !endpoint_keys.contains(&endpoint_key) {
+                    return true;
+                }
+
+                if baseline_policy_decision(&observation.payload_json).as_deref() == Some("denied")
+                {
+                    result.skipped_denied_observations =
+                        result.skipped_denied_observations.saturating_add(1);
+                    return true;
+                }
+
+                let Some(actor) = observation.actor else {
+                    result.skipped_unauthenticated_observations = result
+                        .skipped_unauthenticated_observations
+                        .saturating_add(1);
+                    return true;
+                };
+                let roles = actor
+                    .roles
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|role| !role.is_empty())
+                    .collect::<BTreeSet<_>>();
+                if roles.is_empty() {
+                    result.skipped_without_roles_observations =
+                        result.skipped_without_roles_observations.saturating_add(1);
+                    return true;
+                }
+
+                for role in roles {
+                    let key = (
+                        observation.method.clone(),
+                        endpoint_template.clone(),
+                        role.clone(),
+                    );
+                    let entry = aggregates
+                        .entry(key)
+                        .or_insert_with(|| RoleEndpointObservation {
+                            method: observation.method.clone(),
+                            endpoint_template: endpoint_template.clone(),
+                            role: role.clone(),
+                            observation_count: 0,
+                            error_count: 0,
+                            first_seen: observation.timestamp.clone(),
+                            last_seen: observation.timestamp.clone(),
+                        });
+                    entry.observation_count = entry.observation_count.saturating_add(1);
+                    if observation.status.is_some_and(is_error_status) {
+                        entry.error_count = entry.error_count.saturating_add(1);
+                    }
+                    if timestamp_before(&observation.timestamp, &entry.first_seen) {
+                        entry.first_seen = observation.timestamp.clone();
+                    }
+                    if timestamp_after(&observation.timestamp, &entry.last_seen) {
+                        entry.last_seen = observation.timestamp.clone();
+                    }
+                }
+
+                true
+            },
+        )?;
+
+        result.observations = aggregates.into_values().collect();
+        Ok(result)
     }
 
     pub fn rule_hit_counts(&self) -> Result<HashMap<String, u64>, AuditQueryError> {
@@ -832,6 +963,41 @@ fn payload_status(payload: &Value) -> Option<i64> {
                 None
             }
         })
+}
+
+fn baseline_policy_decision(payload_json: &str) -> Option<String> {
+    serde_json::from_str::<Value>(payload_json)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("policy_decision")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+fn is_error_status(status: i64) -> bool {
+    (400..=599).contains(&status)
+}
+
+fn timestamp_before(left: &str, right: &str) -> bool {
+    match (
+        OffsetDateTime::parse(left, &Rfc3339),
+        OffsetDateTime::parse(right, &Rfc3339),
+    ) {
+        (Ok(left), Ok(right)) => left < right,
+        _ => left < right,
+    }
+}
+
+fn timestamp_after(left: &str, right: &str) -> bool {
+    match (
+        OffsetDateTime::parse(left, &Rfc3339),
+        OffsetDateTime::parse(right, &Rfc3339),
+    ) {
+        (Ok(left), Ok(right)) => left > right,
+        _ => left > right,
+    }
 }
 
 fn request_observation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRequestObservationRow> {

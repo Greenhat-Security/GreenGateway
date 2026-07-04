@@ -4641,6 +4641,8 @@ mod tests {
                 discovery::signals::DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
             volume_outlier_signal_threshold:
                 discovery::signals::DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+            rule_suggestion_baseline_window_hours:
+                discovery::suggestions::DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
             openapi_spec_path: None,
             policy_file: None,
             cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
