@@ -61,6 +61,7 @@ const POLICY_ROLLBACK_ADMIN_ROUTE_PREFIX: &str = "/v1/admin/policy/rollback";
 const POLICY_ROLLBACK_ADMIN_ROUTE: &str = "/v1/admin/policy/rollback/{version}";
 const POLICY_RULE_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/preview";
 const POLICY_RULE_HITS_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/hits";
+const POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/shadow-review";
 const POLICY_VALIDATE_ADMIN_ROUTE: &str = "/v1/admin/policy/validate";
 const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
@@ -171,6 +172,7 @@ struct AdminRoutes {
     policy_rollback_route: String,
     policy_rule_preview_route: String,
     policy_rule_hits_route: String,
+    policy_rule_shadow_review_route: String,
     policy_validate_route: String,
     policy_rules_route: String,
     policy_rule_route: String,
@@ -237,6 +239,7 @@ impl AdminRoutes {
             policy_rollback_route: format!("{api_prefix}/policy/rollback/{{version}}"),
             policy_rule_preview_route: format!("{api_prefix}/policy/rules/preview"),
             policy_rule_hits_route: format!("{api_prefix}/policy/rules/hits"),
+            policy_rule_shadow_review_route: format!("{api_prefix}/policy/rules/shadow-review"),
             policy_validate_route: format!("{api_prefix}/policy/validate"),
             policy_rules_route: format!("{api_prefix}/policy/rules"),
             policy_rule_route: format!("{api_prefix}/policy/rules/{{id}}"),
@@ -604,6 +607,22 @@ struct PolicyRuleHitsResponse {
 struct PolicyRuleHitCount {
     rule_id: String,
     hits: u64,
+}
+
+#[derive(Serialize)]
+struct PolicyRuleShadowReviewResponse {
+    rules: Vec<PolicyRuleShadowReviewSummary>,
+    scanned_event_count: u64,
+    scan_truncated: bool,
+}
+
+#[derive(Serialize)]
+struct PolicyRuleShadowReviewSummary {
+    rule_id: String,
+    rule: rbac::Rule,
+    would_deny_count: u64,
+    affected_principals: Vec<audit::query::ShadowRuleAffectedPrincipal>,
+    samples: Vec<audit::query::ShadowRuleWouldDenySample>,
 }
 
 #[derive(Serialize)]
@@ -1214,6 +1233,10 @@ fn add_admin_api_routes(
                 .route(
                     routes.admin.policy_rule_hits_route.as_str(),
                     get(policy_rule_hits_endpoint),
+                )
+                .route(
+                    routes.admin.policy_rule_shadow_review_route.as_str(),
+                    get(policy_rule_shadow_review_endpoint),
                 )
                 .route(
                     routes.admin.policy_validate_route.as_str(),
@@ -2676,6 +2699,73 @@ async fn policy_rule_hits_endpoint(
                 let rule_id = rule.id.clone().unwrap_or_else(|| rule_index.to_string());
                 let hits = counts.get(&rule_id).copied().unwrap_or(0);
                 PolicyRuleHitCount { rule_id, hits }
+            })
+            .collect(),
+    })
+    .into_response()
+}
+
+async fn policy_rule_shadow_review_endpoint(
+    State(state): State<PolicyAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE);
+
+    let Some(principal) = request.extensions().get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    let rbac_state = match authorized_policy_state(&state, principal, ADMIN_POLICY_READ_PERMISSION)
+    {
+        Ok(rbac_state) => rbac_state,
+        Err(error) => return policy_admin_authz_error_response(error),
+    };
+    let policy = rbac_state.current_policy();
+    let shadow_rules = policy
+        .rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| rule.enabled && rule.action == rbac::RuleAction::Shadow)
+        .map(|(rule_index, rule)| {
+            (
+                rule.id.clone().unwrap_or_else(|| rule_index.to_string()),
+                rule.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let rule_ids = shadow_rules
+        .iter()
+        .map(|(rule_id, _)| rule_id.clone())
+        .collect::<Vec<_>>();
+
+    let review = match state.query_store.as_ref() {
+        Some(query_store) => match query_store.shadow_rule_would_deny_summaries(&rule_ids) {
+            Ok(review) => review,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to query shadow rule review summaries");
+                return internal_server_error("shadow rule review query failed");
+            }
+        },
+        None => audit::query::ShadowRuleWouldDenySummarySet::default(),
+    };
+
+    Json(PolicyRuleShadowReviewResponse {
+        scanned_event_count: review.scanned_event_count,
+        scan_truncated: review.scan_truncated,
+        rules: shadow_rules
+            .into_iter()
+            .map(|(rule_id, rule)| {
+                let summary = review.summaries.get(&rule_id);
+                PolicyRuleShadowReviewSummary {
+                    rule_id,
+                    rule,
+                    would_deny_count: summary.map(|summary| summary.would_deny_count).unwrap_or(0),
+                    affected_principals: summary
+                        .map(|summary| summary.affected_principals.clone())
+                        .unwrap_or_default(),
+                    samples: summary
+                        .map(|summary| summary.samples.clone())
+                        .unwrap_or_default(),
+                }
             })
             .collect(),
     })
@@ -6347,6 +6437,10 @@ mod tests {
             POLICY_RULE_HITS_ADMIN_ROUTE
         );
         assert_eq!(
+            default_routes.policy_rule_shadow_review_route,
+            POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE
+        );
+        assert_eq!(
             default_routes.policy_validate_route,
             POLICY_VALIDATE_ADMIN_ROUTE
         );
@@ -6409,6 +6503,10 @@ mod tests {
         assert_eq!(
             custom_routes.policy_rule_hits_route,
             "/v1/ops/policy/rules/hits"
+        );
+        assert_eq!(
+            custom_routes.policy_rule_shadow_review_route,
+            "/v1/ops/policy/rules/shadow-review"
         );
         assert_eq!(
             custom_routes.policy_validate_route,
@@ -10339,6 +10437,148 @@ mod tests {
         assert_eq!(rule_hit(&body, "deny-blocked"), Some(0));
     }
 
+    #[tokio::test]
+    async fn policy_rule_shadow_review_returns_enabled_shadow_rules_with_would_deny_summaries() {
+        let db = TempDb::new("policy-shadow-review");
+        create_audit_schema(&db.path);
+        insert_authz_event(
+            &db.path,
+            SeedAuthzEvent {
+                event_id: "shadow-reports-1",
+                event_type: "authz.would_deny",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: Some("analyst-1"),
+                roles: &["analyst"],
+                method: "GET",
+                request_path: "/reports/1",
+                matched_rule_id: Some("shadow-reports"),
+            },
+        );
+        insert_authz_event(
+            &db.path,
+            SeedAuthzEvent {
+                event_id: "allow-reports-1",
+                event_type: "authz.would_deny",
+                timestamp: "2024-06-01T12:00:01Z",
+                actor_user_id: Some("analyst-2"),
+                roles: &["analyst"],
+                method: "GET",
+                request_path: "/allow/1",
+                matched_rule_id: Some("allow-reports"),
+            },
+        );
+        insert_authz_event(
+            &db.path,
+            SeedAuthzEvent {
+                event_id: "disabled-shadow-1",
+                event_type: "authz.would_deny",
+                timestamp: "2024-06-01T12:00:02Z",
+                actor_user_id: Some("analyst-3"),
+                roles: &["analyst"],
+                method: "GET",
+                request_path: "/disabled/1",
+                matched_rule_id: Some("shadow-disabled"),
+            },
+        );
+        insert_authz_event(
+            &db.path,
+            SeedAuthzEvent {
+                event_id: "shadow-reports-2",
+                event_type: "authz.would_deny",
+                timestamp: "2024-06-01T12:00:03Z",
+                actor_user_id: Some("analyst-2"),
+                roles: &["analyst", "manager"],
+                method: "DELETE",
+                request_path: "/reports/2",
+                matched_rule_id: Some("shadow-reports"),
+            },
+        );
+        let policy = TempPolicyFile::new(&shadow_review_policy_document());
+        let router =
+            policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+
+        let response = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy shadow review should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            shadow_review_rule_ids(&body),
+            vec!["shadow-reports".to_owned(), "shadow-exports".to_owned()]
+        );
+        let reports = shadow_review_rule(&body, "shadow-reports")
+            .expect("shadow reports rule should be present");
+        assert_eq!(reports["rule"]["action"], json!("shadow"));
+        assert_eq!(reports["would_deny_count"], json!(2));
+        assert_eq!(
+            reports["affected_principals"],
+            json!([
+                {
+                    "user_id": "analyst-2",
+                    "roles": ["analyst", "manager"]
+                },
+                {
+                    "user_id": "analyst-1",
+                    "roles": ["analyst"]
+                }
+            ])
+        );
+        assert_eq!(reports["samples"][0]["method"], json!("DELETE"));
+        assert_eq!(reports["samples"][0]["path"], json!("/reports/2"));
+        assert_eq!(
+            reports["samples"][0]["actor"]["user_id"],
+            json!("analyst-2")
+        );
+
+        let exports = shadow_review_rule(&body, "shadow-exports")
+            .expect("shadow exports rule should be present");
+        assert_eq!(exports["would_deny_count"], json!(0));
+        assert_eq!(exports["affected_principals"], json!([]));
+        assert_eq!(exports["samples"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn policy_rule_shadow_review_returns_zero_counts_when_sqlite_is_unset() {
+        let policy = TempPolicyFile::new(&shadow_review_policy_document());
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+
+        let response = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy shadow review should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            shadow_review_rule_ids(&body),
+            vec!["shadow-reports".to_owned(), "shadow-exports".to_owned()]
+        );
+        assert_eq!(
+            shadow_review_rule(&body, "shadow-reports")
+                .and_then(|rule| rule["would_deny_count"].as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            shadow_review_rule(&body, "shadow-exports")
+                .and_then(|rule| rule["would_deny_count"].as_u64()),
+            Some(0)
+        );
+    }
+
     #[test]
     fn policy_rule_preview_moderate_scale_completes_under_two_seconds() {
         let db = TempDb::new("rule-preview-performance");
@@ -10446,6 +10686,7 @@ mod tests {
         assert_eq!(preview_response.status(), StatusCode::NOT_FOUND);
 
         let hits_response = router
+            .clone()
             .oneshot(policy_admin_request(
                 Method::GET,
                 POLICY_RULE_HITS_ADMIN_ROUTE,
@@ -10456,6 +10697,18 @@ mod tests {
             .await
             .expect("policy hits without policy file should complete");
         assert_eq!(hits_response.status(), StatusCode::NOT_FOUND);
+
+        let shadow_review_response = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy shadow review without policy file should complete");
+        assert_eq!(shadow_review_response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -14734,6 +14987,64 @@ paths:
         .to_string()
     }
 
+    fn shadow_review_policy_document() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "id": "shadow-review-policy",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "admin": {
+                    "permissions": [
+                        ADMIN_POLICY_READ_PERMISSION,
+                        ADMIN_POLICY_WRITE_PERMISSION
+                    ]
+                },
+                "policy-reader": {
+                    "permissions": [ADMIN_POLICY_READ_PERMISSION]
+                },
+                "reader": {
+                    "permissions": []
+                }
+            },
+            "routes": [],
+            "rules": [
+                {
+                    "id": "shadow-reports",
+                    "methods": ["GET", "DELETE"],
+                    "path": "/reports/**",
+                    "principal": {
+                        "roles": ["analyst"]
+                    },
+                    "action": "shadow"
+                },
+                {
+                    "id": "allow-reports",
+                    "methods": ["GET"],
+                    "path": "/allow/**",
+                    "action": "allow"
+                },
+                {
+                    "id": "shadow-disabled",
+                    "enabled": false,
+                    "methods": ["GET"],
+                    "path": "/disabled/**",
+                    "action": "shadow"
+                },
+                {
+                    "id": "shadow-exports",
+                    "methods": ["POST"],
+                    "path": "/exports/**",
+                    "principal": {
+                        "roles": ["manager"]
+                    },
+                    "action": "shadow"
+                }
+            ]
+        })
+        .to_string()
+    }
+
     fn captured_policy_change(
         capture: &audit::sink::tests::CaptureSink,
         action: &str,
@@ -14899,6 +15210,27 @@ paths:
             .iter()
             .find(|rule| rule["rule_id"] == json!(rule_id))
             .and_then(|rule| rule["hits"].as_u64())
+    }
+
+    fn shadow_review_rule_ids(body: &Value) -> Vec<String> {
+        body["rules"]
+            .as_array()
+            .expect("shadow review rules should be an array")
+            .iter()
+            .map(|rule| {
+                rule["rule_id"]
+                    .as_str()
+                    .expect("shadow review rule id should be a string")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn shadow_review_rule<'a>(body: &'a Value, rule_id: &str) -> Option<&'a Value> {
+        body["rules"]
+            .as_array()?
+            .iter()
+            .find(|rule| rule["rule_id"] == json!(rule_id))
     }
 
     fn event_ids_from_body(body: &Value) -> Vec<String> {
@@ -15786,6 +16118,17 @@ O2gecI9QwDJNpm29J9wJB2F8
         matched_rule_id: Option<&'a str>,
     }
 
+    struct SeedAuthzEvent<'a> {
+        event_id: &'a str,
+        event_type: &'a str,
+        timestamp: &'a str,
+        actor_user_id: Option<&'a str>,
+        roles: &'a [&'a str],
+        method: &'a str,
+        request_path: &'a str,
+        matched_rule_id: Option<&'a str>,
+    }
+
     fn insert_audit_event(path: &PathBuf, event: SeedAuditEvent<'_>) {
         let connection = Connection::open(path).expect("test database should open");
         let actor_json = json!({
@@ -15889,6 +16232,66 @@ O2gecI9QwDJNpm29J9wJB2F8
                 ],
             )
             .expect("observation event should insert");
+    }
+
+    fn insert_authz_event(path: &PathBuf, event: SeedAuthzEvent<'_>) {
+        let connection = Connection::open(path).expect("test database should open");
+        let roles = event
+            .roles
+            .iter()
+            .map(|role| json!(role))
+            .collect::<Vec<_>>();
+        let actor_json = event.actor_user_id.map(|user_id| {
+            json!({
+                "user_id": user_id,
+                "roles": roles,
+                "auth_mode": "bearer_token"
+            })
+            .to_string()
+        });
+        let mut payload = json!({
+            "method": event.method,
+            "path": event.request_path,
+            "reason": "matched_rule"
+        });
+        if let Some(matched_rule_id) = event.matched_rule_id {
+            payload["matched_rule_id"] = json!(matched_rule_id);
+        }
+        let payload_json = payload.to_string();
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO audit_events (
+                    event_id,
+                    event_type,
+                    timestamp,
+                    schema_version,
+                    request_id,
+                    source_ip,
+                    actor_user_id,
+                    actor_json,
+                    payload_method,
+                    payload_path,
+                    payload_status,
+                    payload_matched_rule_id,
+                    payload_json
+                ) VALUES (?1, ?2, ?3, '0.1.0', ?4, '203.0.113.10', ?5, ?6, ?7, ?8, NULL, ?9, ?10)
+                "#,
+                params![
+                    event.event_id,
+                    event.event_type,
+                    event.timestamp,
+                    format!("request-{}", event.event_id),
+                    event.actor_user_id,
+                    actor_json,
+                    event.method,
+                    event.request_path,
+                    event.matched_rule_id,
+                    payload_json,
+                ],
+            )
+            .expect("authz event should insert");
     }
 
     fn bulk_insert_preview_events(path: &PathBuf, event_count: usize) {

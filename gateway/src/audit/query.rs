@@ -19,6 +19,9 @@ use crate::{
 
 pub const MAX_ENDPOINT_AUDIT_SCAN_ROWS: usize = 100_000;
 pub const MAX_RULE_SUGGESTION_AUDIT_SCAN_ROWS: usize = 100_000;
+pub const MAX_SHADOW_REVIEW_AUDIT_SCAN_ROWS: usize = 100_000;
+pub const MAX_SHADOW_REVIEW_AFFECTED_PRINCIPALS: usize = 20;
+pub const MAX_SHADOW_REVIEW_SAMPLE_EVENTS: usize = 10;
 pub const ENDPOINT_AUDIT_MATCH_STRATEGY: &str = "stateless_path_template";
 pub const ENDPOINT_AUDIT_MATCH_LIMITATIONS: &str =
     "Matches literal paths and immediate well-known identifier templates such as /users/{id}; statefully learned slug templates such as /catalog/{param} are not reverse-mapped from raw audit paths.";
@@ -91,6 +94,35 @@ pub struct RoleEndpointObservationMatrix {
     pub skipped_unauthenticated_observations: u64,
     pub skipped_without_roles_observations: u64,
     pub skipped_denied_observations: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ShadowRuleWouldDenySummarySet {
+    pub summaries: HashMap<String, ShadowRuleWouldDenySummary>,
+    pub scanned_event_count: u64,
+    pub scan_truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ShadowRuleWouldDenySummary {
+    pub would_deny_count: u64,
+    pub affected_principals: Vec<ShadowRuleAffectedPrincipal>,
+    pub samples: Vec<ShadowRuleWouldDenySample>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ShadowRuleAffectedPrincipal {
+    pub user_id: String,
+    pub roles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ShadowRuleWouldDenySample {
+    pub event_id: String,
+    pub timestamp: String,
+    pub method: String,
+    pub path: String,
+    pub actor: Option<Actor>,
 }
 
 pub struct AuditQueryPage {
@@ -520,6 +552,102 @@ impl AuditQueryStore {
         Ok(rows)
     }
 
+    pub fn shadow_rule_would_deny_summaries(
+        &self,
+        rule_ids: &[String],
+    ) -> Result<ShadowRuleWouldDenySummarySet, AuditQueryError> {
+        self.shadow_rule_would_deny_summaries_with_scan_limit(
+            rule_ids,
+            MAX_SHADOW_REVIEW_AUDIT_SCAN_ROWS,
+        )
+    }
+
+    fn shadow_rule_would_deny_summaries_with_scan_limit(
+        &self,
+        rule_ids: &[String],
+        max_scan_rows: usize,
+    ) -> Result<ShadowRuleWouldDenySummarySet, AuditQueryError> {
+        let rule_ids = rule_ids.iter().cloned().collect::<BTreeSet<_>>();
+        if rule_ids.is_empty() {
+            return Ok(ShadowRuleWouldDenySummarySet::default());
+        }
+
+        let mut sql = String::from(
+            r#"
+            SELECT
+                event_id,
+                timestamp,
+                actor_json,
+                payload_method,
+                payload_path,
+                payload_matched_rule_id
+            FROM audit_events
+            WHERE event_type = 'authz.would_deny'
+              AND payload_method IS NOT NULL
+              AND payload_path IS NOT NULL
+              AND payload_matched_rule_id IS NOT NULL
+              AND payload_matched_rule_id IN (
+            "#,
+        );
+        sql.push_str(
+            &std::iter::repeat_n("?", rule_ids.len())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        sql.push_str(") ORDER BY id DESC LIMIT ?");
+
+        let mut params = rule_ids
+            .iter()
+            .cloned()
+            .map(SqlValue::Text)
+            .collect::<Vec<_>>();
+        params.push(SqlValue::Integer(query_limit(max_scan_rows)));
+
+        let rows = {
+            let connection = self.connection_guard();
+            let mut statement =
+                connection
+                    .prepare(&sql)
+                    .map_err(|source| AuditQueryError::Sqlite {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            let rows = statement
+                .query_map(params_from_iter(params.iter()), shadow_would_deny_row)
+                .map_err(|source| AuditQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| AuditQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            rows
+        };
+
+        let scan_truncated = rows.len() > max_scan_rows;
+        let mut result = ShadowRuleWouldDenySummarySet::default();
+        let mut accumulators = HashMap::<String, ShadowRuleWouldDenyAccumulator>::new();
+        for row in rows.into_iter().take(max_scan_rows) {
+            result.scanned_event_count = result.scanned_event_count.saturating_add(1);
+            let actor = row.actor()?;
+            let entry = accumulators.entry(row.matched_rule_id.clone()).or_default();
+            entry.would_deny_count = entry.would_deny_count.saturating_add(1);
+            if let Some(actor) = actor.as_ref() {
+                entry.add_affected_principal(actor);
+            }
+            entry.add_sample(row, actor);
+        }
+        result.scan_truncated = scan_truncated;
+        result.summaries = accumulators
+            .into_iter()
+            .map(|(rule_id, accumulator)| (rule_id, accumulator.into_summary()))
+            .collect();
+
+        Ok(result)
+    }
+
     fn connection_guard(&self) -> MutexGuard<'_, Connection> {
         match self.connection.lock() {
             Ok(guard) => guard,
@@ -741,6 +869,23 @@ struct RawRequestObservationRow {
     payload_json: String,
 }
 
+struct RawShadowWouldDenyRow {
+    event_id: String,
+    timestamp: String,
+    actor_json: Option<String>,
+    method: String,
+    path: String,
+    matched_rule_id: String,
+}
+
+#[derive(Default)]
+struct ShadowRuleWouldDenyAccumulator {
+    would_deny_count: u64,
+    affected_principals: Vec<ShadowRuleAffectedPrincipal>,
+    seen_principal_keys: BTreeSet<(String, Vec<String>)>,
+    samples: Vec<ShadowRuleWouldDenySample>,
+}
+
 impl RawAuditEventRow {
     fn into_event(self) -> Result<AuditEvent, AuditQueryError> {
         let actor = self
@@ -801,6 +946,61 @@ impl RawRequestObservationRow {
             matched_rule_id: self.matched_rule_id,
             payload_json: self.payload_json,
         })
+    }
+}
+
+impl RawShadowWouldDenyRow {
+    fn actor(&self) -> Result<Option<Actor>, AuditQueryError> {
+        self.actor_json
+            .as_deref()
+            .map(|json| {
+                serde_json::from_str::<Actor>(json).map_err(|source| AuditQueryError::ActorJson {
+                    event_id: self.event_id.clone(),
+                    source,
+                })
+            })
+            .transpose()
+    }
+}
+
+impl ShadowRuleWouldDenyAccumulator {
+    fn add_affected_principal(&mut self, actor: &Actor) {
+        if self.affected_principals.len() >= MAX_SHADOW_REVIEW_AFFECTED_PRINCIPALS {
+            return;
+        }
+
+        let roles = sorted_actor_roles(actor);
+        let key = (actor.user_id.clone(), roles.clone());
+        if !self.seen_principal_keys.insert(key) {
+            return;
+        }
+
+        self.affected_principals.push(ShadowRuleAffectedPrincipal {
+            user_id: actor.user_id.clone(),
+            roles,
+        });
+    }
+
+    fn add_sample(&mut self, row: RawShadowWouldDenyRow, actor: Option<Actor>) {
+        if self.samples.len() >= MAX_SHADOW_REVIEW_SAMPLE_EVENTS {
+            return;
+        }
+
+        self.samples.push(ShadowRuleWouldDenySample {
+            event_id: row.event_id,
+            timestamp: row.timestamp,
+            method: row.method,
+            path: row.path,
+            actor,
+        });
+    }
+
+    fn into_summary(self) -> ShadowRuleWouldDenySummary {
+        ShadowRuleWouldDenySummary {
+            would_deny_count: self.would_deny_count,
+            affected_principals: self.affected_principals,
+            samples: self.samples,
+        }
     }
 }
 
@@ -1015,6 +1215,24 @@ fn request_observation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawReque
         matched_rule_id: row.get(10)?,
         payload_json: row.get(11)?,
     })
+}
+
+fn shadow_would_deny_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawShadowWouldDenyRow> {
+    Ok(RawShadowWouldDenyRow {
+        event_id: row.get(0)?,
+        timestamp: row.get(1)?,
+        actor_json: row.get(2)?,
+        method: row.get(3)?,
+        path: row.get(4)?,
+        matched_rule_id: row.get(5)?,
+    })
+}
+
+fn sorted_actor_roles(actor: &Actor) -> Vec<String> {
+    let mut roles = actor.roles.clone().unwrap_or_default();
+    roles.sort();
+    roles.dedup();
+    roles
 }
 
 #[cfg(test)]
@@ -1353,6 +1571,169 @@ mod tests {
         assert_eq!(counts.get("authz-duplicate"), None);
     }
 
+    #[test]
+    fn shadow_rule_would_deny_summaries_group_counts_principals_and_samples() {
+        let db = TempDb::new("shadow-rule-review");
+        create_schema(&db.path);
+        insert_authz_event(
+            &db.path,
+            SeedAuthzEvent {
+                event_id: "rule-a-1",
+                event_type: "authz.would_deny",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: Some("user-1"),
+                actor_roles: &["reader"],
+                method: "GET",
+                path: "/reports/1",
+                matched_rule_id: Some("shadow-reports"),
+            },
+        );
+        insert_authz_event(
+            &db.path,
+            SeedAuthzEvent {
+                event_id: "rule-b-1",
+                event_type: "authz.would_deny",
+                timestamp: "2024-06-01T12:00:01Z",
+                actor_user_id: Some("user-3"),
+                actor_roles: &["support"],
+                method: "POST",
+                path: "/exports",
+                matched_rule_id: Some("shadow-exports"),
+            },
+        );
+        insert_authz_event(
+            &db.path,
+            SeedAuthzEvent {
+                event_id: "rule-a-2",
+                event_type: "authz.would_deny",
+                timestamp: "2024-06-01T12:00:02Z",
+                actor_user_id: Some("user-2"),
+                actor_roles: &["reader", "admin"],
+                method: "DELETE",
+                path: "/reports/2",
+                matched_rule_id: Some("shadow-reports"),
+            },
+        );
+        insert_authz_event(
+            &db.path,
+            SeedAuthzEvent {
+                event_id: "rule-a-3",
+                event_type: "authz.would_deny",
+                timestamp: "2024-06-01T12:00:03Z",
+                actor_user_id: Some("user-1"),
+                actor_roles: &["reader"],
+                method: "PATCH",
+                path: "/reports/3",
+                matched_rule_id: Some("shadow-reports"),
+            },
+        );
+
+        let review = AuditQueryStore::open(&db.path)
+            .expect("query store should open")
+            .shadow_rule_would_deny_summaries(&[
+                "shadow-reports".to_owned(),
+                "shadow-exports".to_owned(),
+            ])
+            .expect("shadow review should query");
+
+        assert_eq!(review.scanned_event_count, 4);
+        assert!(!review.scan_truncated);
+        let reports = review
+            .summaries
+            .get("shadow-reports")
+            .expect("shadow reports summary should be present");
+        assert_eq!(reports.would_deny_count, 3);
+        assert_eq!(reports.affected_principals.len(), 2);
+        assert_eq!(reports.affected_principals[0].user_id, "user-1");
+        assert_eq!(reports.affected_principals[0].roles, vec!["reader"]);
+        assert_eq!(reports.affected_principals[1].user_id, "user-2");
+        assert_eq!(
+            reports.affected_principals[1].roles,
+            vec!["admin", "reader"]
+        );
+        assert_eq!(
+            reports
+                .samples
+                .iter()
+                .map(|sample| sample.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rule-a-3", "rule-a-2", "rule-a-1"]
+        );
+        assert_eq!(reports.samples[0].method, "PATCH");
+        assert_eq!(reports.samples[0].path, "/reports/3");
+        assert_eq!(
+            reports.samples[0]
+                .actor
+                .as_ref()
+                .map(|actor| actor.user_id.as_str()),
+            Some("user-1")
+        );
+
+        let exports = review
+            .summaries
+            .get("shadow-exports")
+            .expect("shadow exports summary should be present");
+        assert_eq!(exports.would_deny_count, 1);
+    }
+
+    #[test]
+    fn shadow_rule_would_deny_summaries_ignore_other_events_and_route_denials() {
+        let db = TempDb::new("shadow-rule-review-exclusions");
+        create_schema(&db.path);
+        insert_authz_event(
+            &db.path,
+            SeedAuthzEvent {
+                event_id: "valid-shadow",
+                event_type: "authz.would_deny",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: Some("user-1"),
+                actor_roles: &["reader"],
+                method: "GET",
+                path: "/reports/1",
+                matched_rule_id: Some("shadow-reports"),
+            },
+        );
+        insert_authz_event(
+            &db.path,
+            SeedAuthzEvent {
+                event_id: "allowed-shadow-rule",
+                event_type: "authz.allowed",
+                timestamp: "2024-06-01T12:00:01Z",
+                actor_user_id: Some("user-1"),
+                actor_roles: &["reader"],
+                method: "GET",
+                path: "/reports/2",
+                matched_rule_id: Some("shadow-reports"),
+            },
+        );
+        insert_authz_event(
+            &db.path,
+            SeedAuthzEvent {
+                event_id: "route-would-deny",
+                event_type: "authz.would_deny",
+                timestamp: "2024-06-01T12:00:02Z",
+                actor_user_id: Some("user-2"),
+                actor_roles: &["reader"],
+                method: "GET",
+                path: "/reports/3",
+                matched_rule_id: None,
+            },
+        );
+
+        let review = AuditQueryStore::open(&db.path)
+            .expect("query store should open")
+            .shadow_rule_would_deny_summaries(&["shadow-reports".to_owned()])
+            .expect("shadow review should query");
+
+        assert_eq!(review.scanned_event_count, 1);
+        let reports = review
+            .summaries
+            .get("shadow-reports")
+            .expect("shadow reports summary should be present");
+        assert_eq!(reports.would_deny_count, 1);
+        assert_eq!(reports.samples[0].event_id, "valid-shadow");
+    }
+
     /// Run with:
     /// `cargo test --workspace -- --ignored million_row_filtered_queries_complete_under_500ms --nocapture`
     #[test]
@@ -1596,6 +1977,71 @@ mod tests {
                 ],
             )
             .expect("observation event should insert");
+    }
+
+    struct SeedAuthzEvent<'a> {
+        event_id: &'a str,
+        event_type: &'a str,
+        timestamp: &'a str,
+        actor_user_id: Option<&'a str>,
+        actor_roles: &'a [&'a str],
+        method: &'a str,
+        path: &'a str,
+        matched_rule_id: Option<&'a str>,
+    }
+
+    fn insert_authz_event(path: &PathBuf, event: SeedAuthzEvent<'_>) {
+        let connection = Connection::open(path).expect("test database should open");
+        let actor_json = event.actor_user_id.map(|user_id| {
+            json!({
+                "user_id": user_id,
+                "roles": event.actor_roles,
+                "auth_mode": "bearer_token"
+            })
+            .to_string()
+        });
+        let mut payload = json!({
+            "method": event.method,
+            "path": event.path,
+            "reason": "matched_rule"
+        });
+        if let Some(matched_rule_id) = event.matched_rule_id {
+            payload["matched_rule_id"] = json!(matched_rule_id);
+        }
+        let payload_json = payload.to_string();
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO audit_events (
+                    event_id,
+                    event_type,
+                    timestamp,
+                    schema_version,
+                    request_id,
+                    source_ip,
+                    actor_user_id,
+                    actor_json,
+                    payload_method,
+                    payload_path,
+                    payload_status,
+                    payload_matched_rule_id,
+                    payload_json
+                ) VALUES (?1, ?2, ?3, '0.1.0', 'request-test', '203.0.113.10', ?4, ?5, ?6, ?7, NULL, ?8, ?9)
+                "#,
+                params![
+                    event.event_id,
+                    event.event_type,
+                    event.timestamp,
+                    event.actor_user_id,
+                    actor_json,
+                    event.method,
+                    event.path,
+                    event.matched_rule_id,
+                    payload_json
+                ],
+            )
+            .expect("authz event should insert");
     }
 
     fn bulk_insert_benchmark_events(path: &PathBuf, event_count: usize) {

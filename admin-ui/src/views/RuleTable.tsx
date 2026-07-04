@@ -366,7 +366,7 @@ function DefaultActionBanner({ action }: { action: PolicyDefaultAction }) {
   );
 }
 
-function MethodList({ methods }: { methods: string[] }) {
+export function MethodList({ methods }: { methods: string[] }) {
   if (methods.length === 0 || methods.some((method) => method.trim() === '*')) {
     return <span className="badge neutral">Any method</span>;
   }
@@ -572,7 +572,7 @@ function sameOrder(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
-function formatPrincipal(principal: PolicyRule['principal']): string {
+export function formatPrincipal(principal: PolicyRule['principal']): string {
   const roles = principal?.roles ?? [];
   const authMethods = principal?.auth_methods ?? [];
   const principalIds = principal?.principal_ids ?? [];
