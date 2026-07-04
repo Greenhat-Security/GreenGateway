@@ -1508,6 +1508,7 @@ mod tests {
             "rules": [
                 {
                     "id": "support-user-read",
+                    "enabled": false,
                     "methods": ["GET", "HEAD"],
                     "path": "/api/users/{id}",
                     "principal": {

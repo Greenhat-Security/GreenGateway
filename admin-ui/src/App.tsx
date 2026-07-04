@@ -16,6 +16,7 @@ import {
 import { adminBasePath } from './lib/config';
 import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
+import { RuleTable } from './views/RuleTable';
 import { SignalsView } from './views/SignalsView';
 import { StatusPage } from './views/StatusPage';
 import { TrafficEndpointDetail } from './views/TrafficEndpointDetail';
@@ -69,6 +70,9 @@ export function AdminShell() {
           <NavLink to="/traffic" className={navItemClassName}>
             Traffic
           </NavLink>
+          <NavLink to="/rules" className={navItemClassName}>
+            Rules
+          </NavLink>
           <NavLink to="/signals" className={navItemClassName}>
             Signals
           </NavLink>
@@ -107,6 +111,7 @@ export function AdminShell() {
           <Route path="/logs" element={<LogExplorer />} />
           <Route path="/traffic" element={<TrafficInventory />} />
           <Route path="/traffic/detail" element={<TrafficEndpointDetail />} />
+          <Route path="/rules" element={<RuleTable />} />
           <Route path="/signals" element={<SignalsView />} />
           <Route path="/live" element={<LiveTail />} />
           <Route path="/status" element={<StatusPage />} />
@@ -135,6 +140,10 @@ function Dashboard() {
           <Link to="/traffic">
             <span>Traffic inventory</span>
             <small>Discovered endpoints and rule coverage</small>
+          </Link>
+          <Link to="/rules">
+            <span>Rule table</span>
+            <small>Ordered firewall policy and hit counts</small>
           </Link>
           <Link to="/signals">
             <span>Signals</span>
@@ -266,6 +275,9 @@ function pageTitleForPath(pathname: string): string {
   }
   if (pathname === '/traffic/detail') {
     return 'Traffic detail';
+  }
+  if (pathname === '/rules') {
+    return 'Rule table';
   }
   if (pathname === '/signals') {
     return 'Signals';

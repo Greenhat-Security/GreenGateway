@@ -70,6 +70,7 @@ pub(crate) fn path_pattern_matches(pattern: &str, path: &str) -> bool {
 #[derive(Debug, Clone)]
 struct CompiledRule {
     rule_index: usize,
+    enabled: bool,
     methods: MethodMatcher,
     path: PathPattern,
     principal: PrincipalMatcher,
@@ -80,6 +81,7 @@ impl CompiledRule {
     fn new(rule_index: usize, rule: &Rule) -> Self {
         Self {
             rule_index,
+            enabled: rule.enabled,
             methods: MethodMatcher::new(&rule.methods),
             path: PathPattern::new(&rule.path),
             principal: rule.principal.clone(),
@@ -88,7 +90,10 @@ impl CompiledRule {
     }
 
     fn matches(&self, method: &str, path: &str, principal: Option<&Principal>) -> bool {
-        self.methods.matches(method) && self.path.matches(path) && self.principal.matches(principal)
+        self.enabled
+            && self.methods.matches(method)
+            && self.path.matches(path)
+            && self.principal.matches(principal)
     }
 }
 
@@ -259,6 +264,7 @@ mod tests {
     fn example_rule_matches_one_user_segment_for_role() {
         let matcher = RuleMatcher::new(&[Rule {
             id: None,
+            enabled: true,
             methods: vec!["GET".to_owned()],
             path: "/api/users/*".to_owned(),
             principal: PrincipalMatcher {
@@ -380,6 +386,24 @@ mod tests {
     }
 
     #[test]
+    fn disabled_rules_are_skipped_by_first_match_evaluation() {
+        let mut disabled_deny = rule(&["GET"], "/admin/**", RuleAction::Deny);
+        disabled_deny.enabled = false;
+        let matcher = RuleMatcher::new(&[
+            disabled_deny,
+            rule(&["GET"], "/admin/settings", RuleAction::Allow),
+        ]);
+
+        assert_eq!(
+            matcher.evaluate("GET", "/admin/settings", None),
+            Some(RuleDecision {
+                rule_index: 1,
+                action: RuleAction::Allow,
+            })
+        );
+    }
+
+    #[test]
     fn malformed_capture_segments_never_match() {
         let matcher = RuleMatcher::new(&[rule(&[], "/api/{bad-name}", RuleAction::Allow)]);
 
@@ -473,6 +497,7 @@ mod tests {
         principal: Option<&Principal>,
     ) -> bool {
         reference_method_matches(&rule.methods, method)
+            && rule.enabled
             && reference_pattern_matches(&rule.path, path)
             && rule.principal.matches(principal)
     }
@@ -626,13 +651,15 @@ mod tests {
 
     fn rule_strategy() -> impl Strategy<Value = Rule> {
         (
+            any::<bool>(),
             prop::collection::vec(configured_method_strategy(), 0..4),
             path_pattern_strategy(),
             principal_matcher_strategy(),
             action_strategy(),
         )
-            .prop_map(|(methods, path, principal, action)| Rule {
+            .prop_map(|(enabled, methods, path, principal, action)| Rule {
                 id: None,
+                enabled,
                 methods,
                 path,
                 principal,
@@ -740,6 +767,7 @@ mod tests {
     fn rule(methods: &[&str], path: &str, action: RuleAction) -> Rule {
         Rule {
             id: None,
+            enabled: true,
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
             path: path.to_owned(),
             principal: PrincipalMatcher::default(),

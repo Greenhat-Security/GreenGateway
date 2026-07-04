@@ -2118,6 +2118,7 @@ paths:
     fn direct_rule(id: Option<&str>, methods: &[&str], path: &str, action: RuleAction) -> Rule {
         Rule {
             id: id.map(str::to_owned),
+            enabled: true,
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
             path: path.to_owned(),
             principal: PrincipalMatcher::default(),

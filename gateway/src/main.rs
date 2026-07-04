@@ -607,6 +607,7 @@ struct RuleSuggestionAcceptResponse {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RulePatch {
+    enabled: Option<bool>,
     methods: Option<Vec<String>>,
     path: Option<String>,
     principal: Option<rbac::PrincipalMatcher>,
@@ -2191,7 +2192,7 @@ async fn policy_rule_patch_endpoint(
     };
     if patch.is_empty() {
         return bad_request(
-            "rule patch must include at least one of methods, path, principal, action",
+            "rule patch must include at least one of enabled, methods, path, principal, action",
         );
     }
 
@@ -4163,6 +4164,7 @@ fn policy_error_message(error: &rbac::policy::PolicyError) -> String {
 impl RulePatch {
     fn is_empty(&self) -> bool {
         self.methods.is_none()
+            && self.enabled.is_none()
             && self.path.is_none()
             && self.principal.is_none()
             && self.action.is_none()
@@ -4170,6 +4172,9 @@ impl RulePatch {
 }
 
 fn apply_rule_patch(rule: &mut rbac::Rule, patch: RulePatch) {
+    if let Some(enabled) = patch.enabled {
+        rule.enabled = enabled;
+    }
     if let Some(methods) = patch.methods {
         rule.methods = methods;
     }
@@ -4189,6 +4194,9 @@ fn changed_rule_fields(before: &rbac::Rule, after: &rbac::Rule) -> Vec<&'static 
 
     if before.methods != after.methods {
         fields.push("methods");
+    }
+    if before.enabled != after.enabled {
+        fields.push("enabled");
     }
     if before.path != after.path {
         fields.push("path");
@@ -8663,6 +8671,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_rule_patch_can_disable_rule_and_live_evaluation_skips_it() {
+        let initial_policy = policy_document_with_rules_string(
+            "initial-policy",
+            json!([
+                {
+                    "id": "deny-probe",
+                    "methods": ["GET"],
+                    "path": "/__test/principal",
+                    "action": "deny"
+                },
+                {
+                    "id": "allow-probe",
+                    "methods": ["GET"],
+                    "path": "/__test/principal",
+                    "action": "allow"
+                }
+            ]),
+        );
+        let policy = TempPolicyFile::new(&initial_policy);
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = policy_admin_router(Some(&policy), audit_log);
+
+        let before_probe = router
+            .clone()
+            .oneshot(audit_query_request(
+                "/__test/principal",
+                Some(test_principal(&["admin"])),
+            ))
+            .await
+            .expect("pre-disable probe should complete");
+        assert_eq!(before_probe.status(), StatusCode::FORBIDDEN);
+
+        let (current_etag, _) = current_policy(&router).await;
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PATCH,
+                &format!("{POLICY_RULES_ADMIN_ROUTE}/deny-probe"),
+                Some(test_principal(&["admin"])),
+                Some(json!({ "enabled": false }).to_string()),
+                Some(&current_etag),
+            ))
+            .await
+            .expect("rule enabled PATCH should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let new_etag = policy_etag_header(&response);
+        assert_ne!(new_etag, current_etag);
+        let patched_rule = json_body(response).await;
+        assert_eq!(patched_rule["id"], json!("deny-probe"));
+        assert_eq!(patched_rule["enabled"], json!(false));
+        assert_eq!(patched_rule["action"], json!("deny"));
+
+        let after_probe = router
+            .clone()
+            .oneshot(audit_query_request(
+                "/__test/principal",
+                Some(test_principal(&["admin"])),
+            ))
+            .await
+            .expect("post-disable probe should complete");
+        assert_eq!(after_probe.status(), StatusCode::OK);
+        assert_eq!(json_body(after_probe).await["user_id"], json!("user-123"));
+
+        let (_, live_policy) = current_policy(&router).await;
+        assert_eq!(live_policy["rules"][0]["enabled"], json!(false));
+
+        let event = captured_policy_change(&capture, "rule_updated");
+        assert_policy_change_actor(&event);
+        assert_eq!(
+            event.payload["diff_summary"],
+            json!({
+                "action": "rule_updated",
+                "rule_id": "deny-probe",
+                "changed_fields": ["enabled"]
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn policy_rule_patch_and_delete_unknown_id_return_not_found() {
         let initial_policy = policy_document_with_rules_string(
             "initial-policy",
@@ -9509,6 +9599,7 @@ mod tests {
         let request = PolicyRulePreviewRequest {
             rule: rbac::Rule {
                 id: None,
+                enabled: true,
                 methods: vec!["GET".to_owned()],
                 path: "/load/{id}".to_owned(),
                 principal: rbac::PrincipalMatcher {

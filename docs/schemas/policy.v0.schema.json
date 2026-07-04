@@ -156,6 +156,11 @@
           "type": "string",
           "description": "Optional stable identifier for audit and observation attribution. When omitted, live evaluation reports the rule's array index."
         },
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether this direct firewall rule participates in live request evaluation. Omitted rules default to true for backward compatibility. A false rule is skipped entirely as if it were absent, so evaluation falls through to the next rule or the policy default."
+        },
         "methods": {
           "type": "array",
           "description": "HTTP methods this rule matches. Empty or [\"*\"] means any method.",
