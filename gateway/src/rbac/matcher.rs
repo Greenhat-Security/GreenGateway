@@ -67,6 +67,26 @@ pub(crate) fn path_pattern_matches(pattern: &str, path: &str) -> bool {
     PathPattern::new(pattern).matches(path)
 }
 
+/// Returns the first path segment that looks like a capture (contains `{`
+/// or `}`) but does not parse as a valid one, if any. `PathSegment::new`
+/// silently compiles such a segment to `PathSegment::Never`, which never
+/// matches any request — reused here so policy validation can reject a
+/// malformed pattern up front instead of persisting a rule that can never
+/// fire.
+pub(crate) fn find_malformed_capture_segment(pattern: &str) -> Option<&str> {
+    let tail = pattern.strip_prefix('/')?;
+    if tail.is_empty() {
+        return None;
+    }
+
+    tail.split('/').find(|segment| {
+        *segment != "*"
+            && *segment != "**"
+            && has_capture_delimiter(segment)
+            && !is_capture_segment(segment)
+    })
+}
+
 #[derive(Debug, Clone)]
 struct CompiledRule {
     rule_index: usize,
@@ -408,6 +428,32 @@ mod tests {
         let matcher = RuleMatcher::new(&[rule(&[], "/api/{bad-name}", RuleAction::Allow)]);
 
         assert_eq!(matcher.evaluate("GET", "/api/alice", None), None);
+    }
+
+    #[test]
+    fn find_malformed_capture_segment_flags_capture_like_but_invalid_segments() {
+        let malformed = [
+            "/api/{bad-name}",
+            "/api/{}",
+            "/api/{id}extra",
+            "/api/{123}",
+            "/api/prefix{id}",
+        ];
+        for pattern in malformed {
+            assert!(
+                find_malformed_capture_segment(pattern).is_some(),
+                "expected {pattern:?} to be flagged as malformed"
+            );
+        }
+
+        let valid = ["/api/{id}", "/api/*", "/api/**", "/api/{_id}", "/", "/api"];
+        for pattern in valid {
+            assert_eq!(
+                find_malformed_capture_segment(pattern),
+                None,
+                "expected {pattern:?} to be accepted"
+            );
+        }
     }
 
     proptest! {

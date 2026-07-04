@@ -277,6 +277,14 @@ fn validate_rules(rules: &[Rule]) -> Result<(), PolicyError> {
                 rule.path
             )));
         }
+        if let Some(segment) = super::matcher::find_malformed_capture_segment(&rule.path) {
+            return Err(PolicyError::Invalid(format!(
+                "rules[{rule_index}].path segment '{segment}' looks like a capture but is not \
+                 valid (capture names must start with a letter or underscore and contain only \
+                 ASCII letters, digits, and underscores, e.g. '{{id}}'); as written this rule \
+                 would never match any request"
+            )));
+        }
 
         validate_principal_matcher(&rule.principal, &format!("rules[{rule_index}].principal"))?;
     }
@@ -302,6 +310,14 @@ fn validate_rate_limits(rate_limits: &[RateLimitRule]) -> Result<(), PolicyError
             if !path.starts_with('/') {
                 return Err(PolicyError::Invalid(format!(
                     "rate_limits[{rule_index}].path must start with '/', got '{path}'"
+                )));
+            }
+            if let Some(segment) = super::matcher::find_malformed_capture_segment(path) {
+                return Err(PolicyError::Invalid(format!(
+                    "rate_limits[{rule_index}].path segment '{segment}' looks like a capture but \
+                     is not valid (capture names must start with a letter or underscore and \
+                     contain only ASCII letters, digits, and underscores, e.g. '{{id}}'); as \
+                     written this override would never match any request"
                 )));
             }
         }
@@ -1139,6 +1155,52 @@ mod tests {
             let file = TempPolicyFile::new(&document);
             let error = Policy::from_file(file.path())
                 .expect_err("malformed rule should fail parser or validation");
+
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error for {name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_path_capture_segment_is_rejected() {
+        let cases = [
+            (
+                "rule path",
+                json!({
+                    "schema_version": "0.1.0",
+                    "rules": [
+                        {
+                            "path": "/api/{bad-name}",
+                            "action": "deny"
+                        }
+                    ]
+                }),
+                "rules[0].path segment '{bad-name}'",
+            ),
+            (
+                "rate limit override path",
+                json!({
+                    "schema_version": "0.1.0",
+                    "rate_limits": [
+                        {
+                            "path": "/api/{bad-name}",
+                            "requests_per_second": 10.0,
+                            "burst": 20
+                        }
+                    ]
+                }),
+                "rate_limits[0].path segment '{bad-name}'",
+            ),
+        ];
+
+        for (name, value, expected_error) in cases {
+            let document =
+                serde_json::to_string(&value).expect("malformed policy case should serialize");
+            let file = TempPolicyFile::new(&document);
+            let error = Policy::from_file(file.path())
+                .expect_err("malformed path capture segment should fail validation");
 
             assert!(
                 error.to_string().contains(expected_error),
