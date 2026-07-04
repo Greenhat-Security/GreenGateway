@@ -70,6 +70,7 @@ This is what's actually built, working, and covered by CI as of Phases 1-3 and t
 | **Live event feed** | Server-Sent Events at `GET /v1/admin/events/stream`, backed by an in-process broadcast sink with backpressure handling |
 | **Policy administration** | A complete policy CRUD API: whole-policy read/replace/validate (ETag-guarded against concurrent edits), granular per-rule create/update/delete/reorder operations with an audit trail, and rule preview — evaluate a candidate rule against historical traffic before committing it, plus per-rule historical hit counts — all through protected, permission-gated `/v1/admin/policy*` APIs |
 | **Endpoint discovery** | Path templating that normalizes concrete request paths into stable endpoint shapes (`/users/123` → `/users/{id}`) with cardinality-explosion guards, and a background aggregator that rolls per-endpoint call counts, status distribution, latency percentiles, and distinct-principal counts into a queryable SQLite store — entirely off the request hot path |
+| **Traffic endpoint inventory** | Optional SQLite discovery aggregation (`DISCOVERY_SQLITE_PATH`) with admin APIs for listing endpoint templates and viewing per-endpoint principals, time-series counts, and recent raw events |
 | **Admin UI** | An embedded Vite + React + TypeScript app, built into the binary and served at `/admin` (or `ADMIN_PREFIX`): a log explorer, a live tail, and a status page reporting real running-config values |
 | **Local dev harness** | Checked-in JWKS/RBAC fixtures, a `docker-compose.dev.yml` profile that brings up a fully authenticated gateway with a sample echo upstream in one command, and a traffic-generator/CI smoke test |
 
@@ -81,7 +82,7 @@ Everything below is roadmap and vision beyond what's listed in [What's Real Toda
 
 | Phase | Capability | Status |
 | --- | --- | --- |
-| 4 | **Traffic discovery** — automatic endpoint inventory, schema conformance checks against observed traffic, anomaly signals | In progress — endpoint-shape path templating and a background per-endpoint stats aggregator (call counts, status distribution, latency percentiles, distinct principals) are done and running on every observed request; the traffic inventory API, discovery UI, schema conformance checks, and anomaly signals remain |
+| 4 | **Traffic discovery** — automatic endpoint inventory, schema conformance checks against observed traffic, anomaly signals | In progress — endpoint-shape path templating, a background per-endpoint stats aggregator, and the traffic inventory admin API (list/detail endpoints with per-principal breakdowns, time-series counts, and recent events) are done; the discovery UI, schema conformance checks, and anomaly signals remain |
 | 5 | **Visual firewall-style rule builder** — inspect discovered traffic, create rules in one click, review policy in shadow mode, roll back through versioned policy history | Not started |
 | 6 | **Native MCP support** — speak the real MCP protocol instead of a bespoke REST facade, with a dynamic tool registry, JSON Schema validation, and OpenAPI-to-tools generation | Not started |
 | 7 | **Identity directory & broader IdP integration** — pluggable OIDC/cookie-session identity providers beyond the current JWT/JWKS validator, plus a Layer-7-firewall-style directory of every user and bot that has traversed the gateway | Not started |
@@ -108,7 +109,7 @@ The HTTP half of the proxy layer above is real today — multi-upstream routing 
 
 ## Quick Start
 
-GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI shell at `/admin`, and a working reverse proxy — either a single catch-all `UPSTREAM_URL` or a full multi-upstream routing table (see [What's Real Today](#whats-real-today)). The traffic-discovery and rule-builder capabilities described in [Planned Scope](#planned-scope) are still pre-alpha roadmap work.
+GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI shell at `/admin`, a working reverse proxy — either a single catch-all `UPSTREAM_URL` or a full multi-upstream routing table — and optional traffic endpoint inventory when `DISCOVERY_SQLITE_PATH` is set (see [What's Real Today](#whats-real-today)). The remaining discovery UI and rule-builder capabilities described in [Planned Scope](#planned-scope) are still pre-alpha roadmap work.
 
 For the full list of environment variables, see [docs/configuration.md](docs/configuration.md). As more variables land, that document and [.env.example](.env.example) are kept in sync with the code by an automated test.
 
