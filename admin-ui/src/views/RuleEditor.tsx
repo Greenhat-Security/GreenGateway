@@ -1,4 +1,11 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import {
+  FormEvent,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
@@ -118,6 +125,7 @@ export function RuleEditor() {
   const [previewWindowHours, setPreviewWindowHours] = useState(
     DEFAULT_PREVIEW_WINDOW_HOURS,
   );
+  const previewGenerationRef = useRef(0);
 
   useEffect(() => {
     let isCurrent = true;
@@ -207,8 +215,18 @@ export function RuleEditor() {
   );
   const pathError = validatePathPattern(form.path);
 
+  // Invalidate stale preview promises before passive effect cleanup runs.
+  useLayoutEffect(() => {
+    previewGenerationRef.current += 1;
+    return () => {
+      previewGenerationRef.current += 1;
+    };
+  }, [candidateKey, candidateRule, form.path, pathError, previewWindowHours]);
+
   useEffect(() => {
-    let isCurrent = true;
+    const previewGeneration = previewGenerationRef.current;
+    const isCurrentPreview = () =>
+      previewGenerationRef.current === previewGeneration;
     const normalizedPath = form.path.trim();
     if (normalizedPath.length === 0) {
       setPreviewState({
@@ -247,7 +265,7 @@ export function RuleEditor() {
           },
           signal,
         );
-        if (!isCurrent) {
+        if (!isCurrentPreview()) {
           return;
         }
         setPreviewState({ kind: 'ready', response });
@@ -255,7 +273,7 @@ export function RuleEditor() {
         if (signal.aborted || isAbortError(error)) {
           return;
         }
-        if (!isCurrent) {
+        if (!isCurrentPreview()) {
           return;
         }
         setPreviewState(toPreviewError(error));
@@ -263,7 +281,6 @@ export function RuleEditor() {
     }
 
     return () => {
-      isCurrent = false;
       window.clearTimeout(timer);
       controller.abort();
     };

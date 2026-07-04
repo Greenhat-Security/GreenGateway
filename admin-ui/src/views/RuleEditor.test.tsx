@@ -73,10 +73,10 @@ describe('RuleEditor', () => {
     vi.useFakeTimers();
     fillPreviewCandidate();
 
-    await vi.advanceTimersByTimeAsync(RULE_PREVIEW_DEBOUNCE_MS - 1);
+    await advanceTimersByTime(RULE_PREVIEW_DEBOUNCE_MS - 1);
     expect(previewRequests(fetchMock)).toHaveLength(0);
 
-    await vi.advanceTimersByTimeAsync(1);
+    await advanceTimersByTime(1);
 
     expect(previewRequests(fetchMock)).toHaveLength(1);
     vi.useRealTimers();
@@ -133,13 +133,13 @@ describe('RuleEditor', () => {
     fireEvent.change(screen.getByLabelText('Path pattern'), {
       target: { value: '/api/slow/{id}' },
     });
-    await vi.advanceTimersByTimeAsync(RULE_PREVIEW_DEBOUNCE_MS);
+    await advanceTimersByTime(RULE_PREVIEW_DEBOUNCE_MS);
     expect(previewCalls).toHaveLength(1);
 
     fireEvent.change(screen.getByLabelText('Path pattern'), {
       target: { value: '/api/fast/{id}' },
     });
-    await vi.advanceTimersByTimeAsync(RULE_PREVIEW_DEBOUNCE_MS);
+    await advanceTimersByTime(RULE_PREVIEW_DEBOUNCE_MS);
     expect(previewCalls).toHaveLength(2);
     vi.useRealTimers();
 
@@ -300,7 +300,7 @@ describe('RuleEditor', () => {
       target: { value: '/api/**' },
     });
 
-    await vi.advanceTimersByTimeAsync(RULE_PREVIEW_DEBOUNCE_MS);
+    await advanceTimersByTime(RULE_PREVIEW_DEBOUNCE_MS);
     vi.useRealTimers();
 
     expect(await screen.findByText('Live preview unavailable')).toBeTruthy();
@@ -339,6 +339,12 @@ function renderRuleEditor(initialEntry = '/policy/rules/editor') {
       <RuleEditor />
     </MemoryRouter>,
   );
+}
+
+async function advanceTimersByTime(milliseconds: number) {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(milliseconds);
+  });
 }
 
 type PolicyBackedFetchOptions = {
