@@ -63,6 +63,10 @@ const SCHEMA_COVERAGE_ADMIN_ROUTE: &str = "/v1/admin/schema/coverage";
 const SIGNALS_ADMIN_ROUTE: &str = "/v1/admin/signals";
 const SIGNAL_ACKNOWLEDGE_ADMIN_ROUTE: &str = "/v1/admin/signals/{id}/acknowledge";
 const SIGNAL_DISMISS_ADMIN_ROUTE: &str = "/v1/admin/signals/{id}/dismiss";
+const SUGGESTIONS_ADMIN_ROUTE: &str = "/v1/admin/suggestions";
+const SUGGESTIONS_GENERATE_ADMIN_ROUTE: &str = "/v1/admin/suggestions/generate";
+const SUGGESTION_ACCEPT_ADMIN_ROUTE: &str = "/v1/admin/suggestions/{id}/accept";
+const SUGGESTION_DISMISS_ADMIN_ROUTE: &str = "/v1/admin/suggestions/{id}/dismiss";
 const SCHEMA_INFERRED_ADMIN_ROUTE: &str = "/v1/admin/schema/inferred";
 const TRAFFIC_ENDPOINTS_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints";
 const TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoint";
@@ -73,6 +77,8 @@ const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
 const ADMIN_SCHEMA_READ_PERMISSION: &str = "admin:schema:read";
 const ADMIN_SIGNALS_READ_PERMISSION: &str = "admin:signals:read";
 const ADMIN_SIGNALS_WRITE_PERMISSION: &str = "admin:signals:write";
+const ADMIN_SUGGESTIONS_READ_PERMISSION: &str = "admin:suggestions:read";
+const ADMIN_SUGGESTIONS_WRITE_PERMISSION: &str = "admin:suggestions:write";
 const ADMIN_TRAFFIC_READ_PERMISSION: &str = "admin:traffic:read";
 const ADMIN_TRAFFIC_WRITE_PERMISSION: &str = "admin:traffic:write";
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
@@ -165,6 +171,10 @@ struct AdminRoutes {
     signals_route: String,
     signal_acknowledge_route: String,
     signal_dismiss_route: String,
+    suggestions_route: String,
+    suggestions_generate_route: String,
+    suggestion_accept_route: String,
+    suggestion_dismiss_route: String,
     schema_inferred_route: String,
     traffic_endpoints_route: String,
     traffic_endpoint_detail_route: String,
@@ -225,6 +235,10 @@ impl AdminRoutes {
             signals_route: format!("{api_prefix}/signals"),
             signal_acknowledge_route: format!("{api_prefix}/signals/{{id}}/acknowledge"),
             signal_dismiss_route: format!("{api_prefix}/signals/{{id}}/dismiss"),
+            suggestions_route: format!("{api_prefix}/suggestions"),
+            suggestions_generate_route: format!("{api_prefix}/suggestions/generate"),
+            suggestion_accept_route: format!("{api_prefix}/suggestions/{{id}}/accept"),
+            suggestion_dismiss_route: format!("{api_prefix}/suggestions/{{id}}/dismiss"),
             schema_inferred_route: format!("{api_prefix}/schema/inferred"),
             traffic_endpoints_route: format!("{api_prefix}/traffic/endpoints"),
             traffic_endpoint_detail_route: format!("{api_prefix}/traffic/endpoint"),
@@ -275,6 +289,12 @@ struct SignalsAdminState {
 }
 
 #[derive(Clone)]
+struct SuggestionsAdminState {
+    suggestion_engine: Option<Arc<discovery::suggestions::RuleSuggestionEngine>>,
+    policy: PolicyAdminState,
+}
+
+#[derive(Clone)]
 struct TrafficAdminState {
     discovery_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
     audit_query_store: Option<Arc<audit::query::AuditQueryStore>>,
@@ -291,6 +311,7 @@ struct AdminApiStates {
     policy: PolicyAdminState,
     schema: SchemaAdminState,
     signals: SignalsAdminState,
+    suggestions: SuggestionsAdminState,
     traffic: TrafficAdminState,
 }
 
@@ -437,6 +458,14 @@ struct SignalListParams {
 }
 
 #[derive(Deserialize)]
+struct RuleSuggestionListParams {
+    state: Option<String>,
+    suggestion_type: Option<String>,
+    limit: Option<String>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct TrafficEndpointDetailParams {
     method: Option<String>,
     endpoint_template: Option<String>,
@@ -569,6 +598,12 @@ struct RulesReorderedResponse {
     order: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct RuleSuggestionAcceptResponse {
+    suggestion: discovery::suggestions::RuleSuggestion,
+    rule: rbac::Rule,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RulePatch {
@@ -599,6 +634,11 @@ enum TrafficAdminAuthzError {
 }
 
 enum SignalsAdminAuthzError {
+    NotConfigured,
+    Forbidden,
+}
+
+enum SuggestionsAdminAuthzError {
     NotConfigured,
     Forbidden,
 }
@@ -802,6 +842,18 @@ fn gateway_app_with_process_started_at(
         .map(discovery::query::DiscoveryQueryStore::open)
         .transpose()?
         .map(Arc::new);
+    let rule_suggestion_engine = config
+        .discovery_sqlite_path
+        .as_deref()
+        .map(|path| {
+            discovery::suggestions::RuleSuggestionEngine::open(
+                path,
+                config.audit_sqlite_path.as_deref(),
+                config.rule_suggestion_config(),
+            )
+        })
+        .transpose()?
+        .map(Arc::new);
     let observation_state =
         middleware::observation::ObservationState::from_config(&config, audit_log.clone())
             .with_conformance(
@@ -923,6 +975,10 @@ fn gateway_app_with_process_started_at(
         audit: audit_log.clone(),
         trust_proxy_headers: config.trust_proxy_headers,
     };
+    let suggestions_admin_state = SuggestionsAdminState {
+        suggestion_engine: rule_suggestion_engine,
+        policy: policy_admin_state.clone(),
+    };
     let traffic_admin_state = TrafficAdminState {
         discovery_store: discovery_query_store,
         audit_query_store: audit_admin_state.query_store.clone(),
@@ -937,6 +993,7 @@ fn gateway_app_with_process_started_at(
         policy: policy_admin_state,
         schema: schema_admin_state,
         signals: signals_admin_state,
+        suggestions: suggestions_admin_state,
         traffic: traffic_admin_state,
     };
 
@@ -1062,6 +1119,26 @@ fn add_admin_api_routes(
                     post(signal_dismiss_endpoint),
                 )
                 .with_state(admin_api_states.signals),
+        )
+        .merge(
+            Router::new()
+                .route(
+                    routes.admin.suggestions_route.as_str(),
+                    get(rule_suggestions_list_endpoint),
+                )
+                .route(
+                    routes.admin.suggestions_generate_route.as_str(),
+                    post(rule_suggestions_generate_endpoint),
+                )
+                .route(
+                    routes.admin.suggestion_accept_route.as_str(),
+                    post(rule_suggestion_accept_endpoint),
+                )
+                .route(
+                    routes.admin.suggestion_dismiss_route.as_str(),
+                    post(rule_suggestion_dismiss_endpoint),
+                )
+                .with_state(admin_api_states.suggestions),
         )
         .merge(
             Router::new()
@@ -2072,76 +2149,16 @@ async fn policy_rule_post_endpoint(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let mut rule = match parse_rule_body(&body) {
+    let rule = match parse_rule_body(&body) {
         Ok(rule) => rule,
         Err(errors) => return policy_validation_failed(errors),
     };
 
-    let _policy_write_guard = match rbac_state.policy_write_guard() {
-        Ok(guard) => guard,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to acquire policy write lock");
-            return internal_server_error("policy write lock failed");
-        }
-    };
-
-    let before_policy = rbac_state.current_policy();
-    let current_etag = match require_matching_if_match(&parts.headers, &before_policy) {
-        Ok(etag) => etag,
-        Err(response) => return *response,
-    };
-
-    if let Some(rule_id) = rule.id.as_deref() {
-        if policy_rule_ids(&before_policy)
-            .iter()
-            .any(|existing_id| existing_id == rule_id)
-        {
-            return bad_request(&format!("rule id '{rule_id}' already exists"));
-        }
-    } else {
-        rule.id = Some(generate_unique_rule_id(&before_policy));
-    }
-
-    let rule_id = rule
-        .id
-        .clone()
-        .unwrap_or_else(|| before_policy.rules.len().to_string());
-    let position = before_policy.rules.len();
-    let mut candidate = before_policy.clone();
-    candidate.rules.push(rule);
-    let candidate = match validate_policy_candidate(&candidate) {
-        Ok(candidate) => candidate,
-        Err(response) => return *response,
-    };
-    let created_rule = candidate.rules[position].clone();
-
-    let diff_summary = json!({
-        "action": "rule_created",
-        "rule_id": rule_id,
-        "position": position,
-    });
-    let (after_policy, new_etag) = match persist_policy_mutation(
-        PolicyMutationCommitContext {
-            state: &state,
-            rbac_state,
-            policy_file,
-            parts: &parts,
-            principal: &principal,
-        },
-        &before_policy,
-        &candidate,
-        diff_summary,
-    ) {
-        Ok(result) => result,
-        Err(response) => return *response,
-    };
-
-    debug_assert_ne!(current_etag, new_etag);
-    let created_rule = after_policy
-        .rules
-        .get(position)
-        .cloned()
-        .unwrap_or(created_rule);
+    let (created_rule, new_etag) =
+        match create_policy_rule(&state, &parts, &principal, rbac_state, policy_file, rule) {
+            Ok(result) => result,
+            Err(response) => return *response,
+        };
 
     (
         StatusCode::CREATED,
@@ -2801,6 +2818,224 @@ async fn signal_transition_endpoint(
     (StatusCode::OK, Json(signal)).into_response()
 }
 
+async fn rule_suggestions_list_endpoint(
+    State(state): State<SuggestionsAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+    Query(params): Query<RuleSuggestionListParams>,
+) -> Response {
+    record_request(SUGGESTIONS_ADMIN_ROUTE);
+
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+    if let Err(error) =
+        authorized_suggestions_state(&state, &principal, ADMIN_SUGGESTIONS_READ_PERMISSION)
+    {
+        return suggestions_admin_authz_error_response(error);
+    }
+
+    let Some(suggestion_engine) = state.suggestion_engine.as_ref() else {
+        return suggestions_discovery_not_configured();
+    };
+    let filters = match params.into_filters() {
+        Ok(filters) => filters,
+        Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
+    };
+
+    match suggestion_engine.list_suggestion_page(&filters) {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(discovery::suggestions::RuleSuggestionError::InvalidCursor { parameter }) => {
+            bad_request(&format!("invalid query parameter: {parameter}"))
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to query rule suggestions");
+            internal_server_error("suggestions query failed")
+        }
+    }
+}
+
+async fn rule_suggestions_generate_endpoint(
+    State(state): State<SuggestionsAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(SUGGESTIONS_GENERATE_ADMIN_ROUTE);
+
+    let (parts, _body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    let rbac_state = match authorized_suggestions_state(
+        &state,
+        &principal,
+        ADMIN_SUGGESTIONS_WRITE_PERMISSION,
+    ) {
+        Ok(rbac_state) => rbac_state,
+        Err(error) => return suggestions_admin_authz_error_response(error),
+    };
+
+    let Some(suggestion_engine) = state.suggestion_engine.as_ref() else {
+        return suggestions_discovery_not_configured();
+    };
+    let policy = rbac_state.current_policy();
+
+    match suggestion_engine.generate(&policy) {
+        Ok(run) => (StatusCode::OK, Json(run)).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to generate rule suggestions");
+            internal_server_error("suggestion generation failed")
+        }
+    }
+}
+
+async fn rule_suggestion_accept_endpoint(
+    State(state): State<SuggestionsAdminState>,
+    Path(id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(SUGGESTION_ACCEPT_ADMIN_ROUTE);
+
+    let (parts, _body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) =
+        authorized_suggestions_state(&state, &principal, ADMIN_SUGGESTIONS_WRITE_PERMISSION)
+    {
+        return suggestions_admin_authz_error_response(error);
+    }
+    let rbac_state =
+        match authorized_policy_state(&state.policy, &principal, ADMIN_POLICY_WRITE_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return policy_admin_authz_error_response(error),
+        };
+    let Some(policy_file) = state.policy.policy_file.as_deref() else {
+        return policy_not_configured();
+    };
+
+    let id = id.trim();
+    if id.is_empty() {
+        return bad_request("invalid suggestion id");
+    }
+    let Some(suggestion_engine) = state.suggestion_engine.as_ref() else {
+        return suggestions_discovery_not_configured();
+    };
+    let suggestion = match suggestion_engine.get_suggestion(id) {
+        Ok(Some(suggestion)) => suggestion,
+        Ok(None) => return not_found("suggestion was not found"),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to load rule suggestion");
+            return internal_server_error("suggestion query failed");
+        }
+    };
+    if suggestion.state != discovery::suggestions::RuleSuggestionLifecycleState::Open {
+        return conflict("suggestion is not open");
+    }
+
+    let (rule, new_etag) = match create_policy_rule(
+        &state.policy,
+        &parts,
+        &principal,
+        rbac_state,
+        policy_file,
+        suggestion.proposed_rule.clone(),
+    ) {
+        Ok(result) => result,
+        Err(response) => return *response,
+    };
+
+    let suggestion = match suggestion_engine.transition_suggestion(
+        id,
+        discovery::suggestions::RuleSuggestionLifecycleState::Accepted,
+        Some(&principal.user_id),
+    ) {
+        Ok(Some(suggestion)) => suggestion,
+        Ok(None) => return not_found("suggestion was not found"),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to accept rule suggestion");
+            return internal_server_error("suggestion transition failed");
+        }
+    };
+    emit_suggestion_lifecycle_changed(&state, &parts, &principal, &suggestion);
+
+    (
+        StatusCode::CREATED,
+        [(header::ETAG, etag_header_value(&new_etag))],
+        Json(RuleSuggestionAcceptResponse { suggestion, rule }),
+    )
+        .into_response()
+}
+
+async fn rule_suggestion_dismiss_endpoint(
+    State(state): State<SuggestionsAdminState>,
+    Path(id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    rule_suggestion_transition_endpoint(
+        state,
+        request,
+        id,
+        discovery::suggestions::RuleSuggestionLifecycleState::Dismissed,
+        SUGGESTION_DISMISS_ADMIN_ROUTE,
+    )
+    .await
+}
+
+async fn rule_suggestion_transition_endpoint(
+    state: SuggestionsAdminState,
+    request: AxumRequest,
+    id: String,
+    lifecycle_state: discovery::suggestions::RuleSuggestionLifecycleState,
+    route: &'static str,
+) -> Response {
+    record_request(route);
+
+    let (parts, _body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) =
+        authorized_suggestions_state(&state, &principal, ADMIN_SUGGESTIONS_WRITE_PERMISSION)
+    {
+        return suggestions_admin_authz_error_response(error);
+    }
+
+    let id = id.trim();
+    if id.is_empty() {
+        return bad_request("invalid suggestion id");
+    }
+
+    let Some(suggestion_engine) = state.suggestion_engine.as_ref() else {
+        return suggestions_discovery_not_configured();
+    };
+    match suggestion_engine.get_suggestion(id) {
+        Ok(Some(suggestion)) => {
+            if suggestion.state != discovery::suggestions::RuleSuggestionLifecycleState::Open {
+                return conflict("suggestion is not open");
+            }
+        }
+        Ok(None) => return not_found("suggestion was not found"),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to load rule suggestion");
+            return internal_server_error("suggestion query failed");
+        }
+    }
+    let suggestion = match suggestion_engine.transition_suggestion(
+        id,
+        lifecycle_state,
+        Some(&principal.user_id),
+    ) {
+        Ok(Some(suggestion)) => suggestion,
+        Ok(None) => return not_found("suggestion was not found"),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to transition rule suggestion");
+            return internal_server_error("suggestion transition failed");
+        }
+    };
+    emit_suggestion_lifecycle_changed(&state, &parts, &principal, &suggestion);
+
+    (StatusCode::OK, Json(suggestion)).into_response()
+}
+
 async fn traffic_endpoint_list_endpoint(
     State(state): State<TrafficAdminState>,
     principal: Option<Extension<auth::Principal>>,
@@ -3136,6 +3371,26 @@ impl SignalListParams {
     }
 }
 
+impl RuleSuggestionListParams {
+    fn into_filters(
+        self,
+    ) -> Result<discovery::suggestions::RuleSuggestionListFilters, &'static str> {
+        let state = self
+            .state
+            .as_deref()
+            .map(discovery::suggestions::RuleSuggestionLifecycleState::parse)
+            .transpose()?;
+        let limit = parse_limit(self.limit)?;
+
+        Ok(discovery::suggestions::RuleSuggestionListFilters {
+            state,
+            suggestion_type: empty_string_as_none(self.suggestion_type),
+            limit,
+            cursor: self.cursor,
+        })
+    }
+}
+
 struct TrafficEndpointDetailQuery {
     method: String,
     endpoint_template: String,
@@ -3441,6 +3696,22 @@ fn authorized_signals_state<'a>(
     Ok(rbac_state)
 }
 
+fn authorized_suggestions_state<'a>(
+    state: &'a SuggestionsAdminState,
+    principal: &auth::Principal,
+    permission: &str,
+) -> Result<&'a middleware::rbac::RbacState, SuggestionsAdminAuthzError> {
+    let Some(rbac_state) = state.policy.rbac_state.as_ref() else {
+        return Err(SuggestionsAdminAuthzError::NotConfigured);
+    };
+
+    if !rbac_state.principal_has_permission(principal, permission) {
+        return Err(SuggestionsAdminAuthzError::Forbidden);
+    }
+
+    Ok(rbac_state)
+}
+
 fn policy_admin_authz_error_response(error: PolicyAdminAuthzError) -> Response {
     match error {
         PolicyAdminAuthzError::NotConfigured => policy_not_configured(),
@@ -3459,6 +3730,13 @@ fn signals_admin_authz_error_response(error: SignalsAdminAuthzError) -> Response
     match error {
         SignalsAdminAuthzError::NotConfigured => signals_rbac_not_configured(),
         SignalsAdminAuthzError::Forbidden => forbidden(),
+    }
+}
+
+fn suggestions_admin_authz_error_response(error: SuggestionsAdminAuthzError) -> Response {
+    match error {
+        SuggestionsAdminAuthzError::NotConfigured => suggestions_rbac_not_configured(),
+        SuggestionsAdminAuthzError::Forbidden => forbidden(),
     }
 }
 
@@ -3961,6 +4239,76 @@ fn require_matching_if_match(
     }
 }
 
+fn create_policy_rule(
+    state: &PolicyAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    rbac_state: &middleware::rbac::RbacState,
+    policy_file: &std::path::Path,
+    mut rule: rbac::Rule,
+) -> ResponseResult<(rbac::Rule, String)> {
+    let _policy_write_guard = match rbac_state.policy_write_guard() {
+        Ok(guard) => guard,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to acquire policy write lock");
+            return Err(Box::new(internal_server_error("policy write lock failed")));
+        }
+    };
+
+    let before_policy = rbac_state.current_policy();
+    let current_etag = require_matching_if_match(&parts.headers, &before_policy)?;
+
+    if let Some(rule_id) = rule.id.as_deref() {
+        if policy_rule_ids(&before_policy)
+            .iter()
+            .any(|existing_id| existing_id == rule_id)
+        {
+            return Err(Box::new(bad_request(&format!(
+                "rule id '{rule_id}' already exists"
+            ))));
+        }
+    } else {
+        rule.id = Some(generate_unique_rule_id(&before_policy));
+    }
+
+    let rule_id = rule
+        .id
+        .clone()
+        .unwrap_or_else(|| before_policy.rules.len().to_string());
+    let position = before_policy.rules.len();
+    let mut candidate = before_policy.clone();
+    candidate.rules.push(rule);
+    let candidate = validate_policy_candidate(&candidate)?;
+    let created_rule = candidate.rules[position].clone();
+
+    let diff_summary = json!({
+        "action": "rule_created",
+        "rule_id": rule_id,
+        "position": position,
+    });
+    let (after_policy, new_etag) = persist_policy_mutation(
+        PolicyMutationCommitContext {
+            state,
+            rbac_state,
+            policy_file,
+            parts,
+            principal,
+        },
+        &before_policy,
+        &candidate,
+        diff_summary,
+    )?;
+
+    debug_assert_ne!(current_etag, new_etag);
+    let created_rule = after_policy
+        .rules
+        .get(position)
+        .cloned()
+        .unwrap_or(created_rule);
+
+    Ok((created_rule, new_etag))
+}
+
 fn persist_policy_mutation(
     context: PolicyMutationCommitContext<'_>,
     before_policy: &rbac::Policy,
@@ -4324,6 +4672,40 @@ fn emit_signal_lifecycle_changed(
     ));
 }
 
+fn emit_suggestion_lifecycle_changed(
+    state: &SuggestionsAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    suggestion: &discovery::suggestions::RuleSuggestion,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip = client_ip::canonical_client_ip(
+        &parts.headers,
+        &parts.extensions,
+        state.policy.trust_proxy_headers,
+    );
+    let actor = Some(auth::actor_from_principal(principal));
+    let payload = json!({
+        "id": &suggestion.id,
+        "suggestion_type": &suggestion.suggestion_type,
+        "method": &suggestion.method,
+        "path_pattern": &suggestion.path_pattern,
+        "proposed_rule": &suggestion.proposed_rule,
+        "state": suggestion.state.as_str(),
+        "transitioned_at": &suggestion.transitioned_at,
+        "transitioned_by": &suggestion.transitioned_by,
+        "source_signal_id": &suggestion.source_signal_id,
+    });
+
+    state.policy.audit.emit(audit::AuditEvent::new(
+        audit::event::SUGGESTION_LIFECYCLE_CHANGED,
+        request_id,
+        source_ip,
+        actor,
+        payload,
+    ));
+}
+
 fn policy_change_payload(before: &rbac::Policy, after: &rbac::Policy) -> Value {
     json!({
         "before": policy_audit_summary(before),
@@ -4457,6 +4839,16 @@ fn signals_rbac_not_configured() -> Response {
         .into_response()
 }
 
+fn suggestions_rbac_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "suggestions API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
 fn schema_discovery_not_configured() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -4524,6 +4916,16 @@ fn signals_discovery_not_configured() -> Response {
         .into_response()
 }
 
+fn suggestions_discovery_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "suggestions API requires DISCOVERY_SQLITE_PATH to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
 fn precondition_required(error: &str) -> Response {
     (
         StatusCode::PRECONDITION_REQUIRED,
@@ -4537,6 +4939,16 @@ fn precondition_required(error: &str) -> Response {
 fn precondition_failed(error: &str) -> Response {
     (
         StatusCode::PRECONDITION_FAILED,
+        Json(ErrorResponse {
+            error: error.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn conflict(error: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
         Json(ErrorResponse {
             error: error.to_owned(),
         }),
@@ -5653,6 +6065,19 @@ mod tests {
             default_routes.schema_inferred_route,
             SCHEMA_INFERRED_ADMIN_ROUTE
         );
+        assert_eq!(default_routes.suggestions_route, SUGGESTIONS_ADMIN_ROUTE);
+        assert_eq!(
+            default_routes.suggestions_generate_route,
+            SUGGESTIONS_GENERATE_ADMIN_ROUTE
+        );
+        assert_eq!(
+            default_routes.suggestion_accept_route,
+            SUGGESTION_ACCEPT_ADMIN_ROUTE
+        );
+        assert_eq!(
+            default_routes.suggestion_dismiss_route,
+            SUGGESTION_DISMISS_ADMIN_ROUTE
+        );
         assert_eq!(
             default_routes.traffic_endpoints_route,
             TRAFFIC_ENDPOINTS_ADMIN_ROUTE
@@ -5698,6 +6123,19 @@ mod tests {
         assert_eq!(
             custom_routes.schema_inferred_route,
             "/v1/ops/schema/inferred"
+        );
+        assert_eq!(custom_routes.suggestions_route, "/v1/ops/suggestions");
+        assert_eq!(
+            custom_routes.suggestions_generate_route,
+            "/v1/ops/suggestions/generate"
+        );
+        assert_eq!(
+            custom_routes.suggestion_accept_route,
+            "/v1/ops/suggestions/{id}/accept"
+        );
+        assert_eq!(
+            custom_routes.suggestion_dismiss_route,
+            "/v1/ops/suggestions/{id}/dismiss"
         );
         assert_eq!(
             custom_routes.traffic_endpoints_route,
@@ -11176,6 +11614,624 @@ paths:
         assert_eq!(signal_ids(&dismissed_page), vec!["sig-dismiss".to_owned()]);
     }
 
+    #[tokio::test]
+    async fn suggestions_admin_list_filters_paginates_and_requires_read_permission() {
+        let discovery_db = TempDb::new("suggestions-list");
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-open-newer",
+                suggestion_type: "baseline_allow",
+                method: "POST",
+                path_pattern: "/widgets",
+                role: Some("writer"),
+                action: "allow",
+                rationale: "Observed writer calls to POST /widgets.",
+                evidence: json!({ "observation_count": 3 }),
+                state: "open",
+                created_at: "2024-06-03T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: None,
+            },
+        );
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-dismissed",
+                suggestion_type: "signal_shadow_error_rate_spike",
+                method: "GET",
+                path_pattern: "/widgets/{id}",
+                role: None,
+                action: "shadow",
+                rationale: "Open error-rate signal targets GET /widgets/{id}.",
+                evidence: json!({ "source_signal_id": "sig-error" }),
+                state: "dismissed",
+                created_at: "2024-06-02T00:00:00Z",
+                transitioned_at: Some("2024-06-02T01:00:00Z"),
+                transitioned_by: Some("reviewer"),
+                source_signal_id: Some("sig-error"),
+            },
+        );
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-open-older",
+                suggestion_type: "baseline_allow",
+                method: "GET",
+                path_pattern: "/widgets/{id}",
+                role: Some("reader"),
+                action: "allow",
+                rationale: "Observed reader calls to GET /widgets/{id}.",
+                evidence: json!({ "observation_count": 5 }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: None,
+            },
+        );
+        let (router, _policy) = suggestions_admin_router(Some(&discovery_db.path), None);
+
+        let first_page = suggestions_json(
+            &router,
+            "/v1/admin/suggestions?state=open&suggestion_type=baseline_allow&limit=1",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(
+            suggestion_ids(&first_page),
+            vec!["sug-open-newer".to_owned()]
+        );
+        assert!(first_page["next_cursor"].as_str().is_some());
+        assert_eq!(first_page["suggestions"][0]["state"], json!("open"));
+        assert_eq!(
+            first_page["suggestions"][0]["proposed_rule"],
+            json!({
+                "methods": ["POST"],
+                "path": "/widgets",
+                "principal": {
+                    "roles": ["writer"],
+                    "auth_methods": [],
+                    "principal_ids": []
+                },
+                "action": "allow"
+            })
+        );
+        assert_eq!(
+            first_page["suggestions"][0]["rationale"],
+            json!("Observed writer calls to POST /widgets.")
+        );
+        assert_eq!(
+            first_page["suggestions"][0]["evidence"],
+            json!({ "observation_count": 3 })
+        );
+
+        let cursor = first_page["next_cursor"]
+            .as_str()
+            .expect("first page should include next cursor");
+        let second_page = suggestions_json(
+            &router,
+            &format!(
+                "/v1/admin/suggestions?state=open&suggestion_type=baseline_allow&limit=1&cursor={cursor}"
+            ),
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(
+            suggestion_ids(&second_page),
+            vec!["sug-open-older".to_owned()]
+        );
+        assert!(second_page["next_cursor"].is_null());
+
+        let dismissed = suggestions_json(
+            &router,
+            "/v1/admin/suggestions?state=dismissed",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(suggestion_ids(&dismissed), vec!["sug-dismissed".to_owned()]);
+
+        let forbidden = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::GET,
+                "/v1/admin/suggestions",
+                Some(test_principal(&["reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("suggestions request should complete");
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let unauthenticated = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::GET,
+                "/v1/admin/suggestions",
+                None,
+                None,
+                None,
+            ))
+            .await
+            .expect("suggestions request should complete");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn suggestions_admin_generate_is_explicit_and_list_does_not_refresh() {
+        let discovery_db = TempDb::new("suggestions-generate-discovery");
+        let audit_db = TempDb::new("suggestions-generate-audit");
+        seed_suggestion_generation_observation(
+            &discovery_db.path,
+            &audit_db.path,
+            "first",
+            "GET",
+            "/generated/{id}",
+            "reader",
+            "2024-06-01T12:00:00Z",
+        );
+        let (router, _policy) =
+            suggestions_admin_router(Some(&discovery_db.path), Some(&audit_db.path));
+
+        let initially_empty = suggestions_json(
+            &router,
+            "/v1/admin/suggestions",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(suggestion_ids(&initially_empty), Vec::<String>::new());
+
+        let generated = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/generate",
+                Some(test_principal(&["suggestions-writer"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("suggestion generation request should complete");
+        assert_eq!(generated.status(), StatusCode::OK);
+        let generated_body = json_body(generated).await;
+        assert_eq!(generated_body["inserted_count"], json!(1));
+
+        seed_suggestion_generation_observation(
+            &discovery_db.path,
+            &audit_db.path,
+            "second",
+            "POST",
+            "/generated/{id}",
+            "writer",
+            "2024-06-01T12:01:00Z",
+        );
+        let after_list_only = suggestions_json(
+            &router,
+            "/v1/admin/suggestions",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(suggestion_ids(&after_list_only).len(), 1);
+
+        let regenerated = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/generate",
+                Some(test_principal(&["suggestions-writer"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("second generation request should complete");
+        assert_eq!(regenerated.status(), StatusCode::OK);
+        let regenerated_body = json_body(regenerated).await;
+        assert_eq!(regenerated_body["inserted_count"], json!(1));
+
+        let refreshed = suggestions_json(
+            &router,
+            "/v1/admin/suggestions?state=open",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(suggestion_ids(&refreshed).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn suggestions_admin_accept_creates_real_rule_requires_both_permissions_and_audits() {
+        let discovery_db = TempDb::new("suggestions-accept");
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-accept",
+                suggestion_type: "baseline_allow",
+                method: "GET",
+                path_pattern: "/accepted/{id}",
+                role: Some("accepted-reader"),
+                action: "allow",
+                rationale: "Observed accepted-reader calls to GET /accepted/{id}.",
+                evidence: json!({ "observation_count": 4 }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: None,
+            },
+        );
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let router = suggestions_admin_router_with_policy(
+            Some(&discovery_db.path),
+            None,
+            &policy,
+            audit_log,
+        );
+
+        let current_etag = suggestions_policy_etag(&router).await;
+
+        let suggestion_only = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-accept/accept",
+                Some(test_principal(&["suggestions-writer"])),
+                None,
+                Some(&current_etag),
+            ))
+            .await
+            .expect("suggestion-only accept request should complete");
+        assert_eq!(suggestion_only.status(), StatusCode::FORBIDDEN);
+
+        let policy_only = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-accept/accept",
+                Some(test_principal(&["policy-writer"])),
+                None,
+                Some(&current_etag),
+            ))
+            .await
+            .expect("policy-only accept request should complete");
+        assert_eq!(policy_only.status(), StatusCode::FORBIDDEN);
+
+        let accepted = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-accept/accept",
+                Some(test_principal(&["suggestions-policy-writer"])),
+                None,
+                Some(&current_etag),
+            ))
+            .await
+            .expect("accept request should complete");
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        let accepted_etag = policy_etag_header(&accepted);
+        let accepted_body = json_body(accepted).await;
+        assert_eq!(accepted_body["suggestion"]["state"], json!("accepted"));
+        assert_eq!(accepted_body["rule"]["path"], json!("/accepted/{id}"));
+        assert_eq!(accepted_body["rule"]["action"], json!("allow"));
+        assert_eq!(
+            accepted_body["rule"]["principal"]["roles"],
+            json!(["accepted-reader"])
+        );
+        assert!(accepted_body["rule"]["id"].as_str().is_some());
+
+        let policy_response = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete");
+        assert_eq!(policy_response.status(), StatusCode::OK);
+        assert_eq!(policy_etag_header(&policy_response), accepted_etag);
+        let policy_body = json_body(policy_response).await;
+        assert_eq!(policy_body["rules"].as_array().unwrap().len(), 1);
+        assert_eq!(policy_body["rules"][0], accepted_body["rule"]);
+
+        let accepted_page = suggestions_json(
+            &router,
+            "/v1/admin/suggestions?state=accepted",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(
+            suggestion_ids(&accepted_page),
+            vec!["sug-accept".to_owned()]
+        );
+        assert_eq!(
+            accepted_page["suggestions"][0]["transitioned_by"],
+            json!("user-123")
+        );
+
+        assert_eventually(Duration::from_secs(1), || {
+            let events = capture.events();
+            events
+                .iter()
+                .any(|event| event.event_type == audit::event::POLICY_CHANGED)
+                && events
+                    .iter()
+                    .any(|event| event.event_type == audit::event::SUGGESTION_LIFECYCLE_CHANGED)
+        });
+        let events = capture.events();
+        let policy_event = events
+            .iter()
+            .find(|event| event.event_type == audit::event::POLICY_CHANGED)
+            .expect("policy.changed should be emitted");
+        assert_eq!(
+            policy_event.payload["diff_summary"]["action"],
+            json!("rule_created")
+        );
+        let suggestion_event = events
+            .iter()
+            .find(|event| event.event_type == audit::event::SUGGESTION_LIFECYCLE_CHANGED)
+            .expect("suggestion lifecycle event should be emitted");
+        assert_eq!(suggestion_event.payload["id"], json!("sug-accept"));
+        assert_eq!(suggestion_event.payload["state"], json!("accepted"));
+    }
+
+    #[tokio::test]
+    async fn suggestions_admin_accept_surfaces_policy_etag_conflict_without_transition() {
+        let discovery_db = TempDb::new("suggestions-accept-conflict");
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-stale",
+                suggestion_type: "baseline_allow",
+                method: "GET",
+                path_pattern: "/stale/{id}",
+                role: Some("stale-reader"),
+                action: "allow",
+                rationale: "Observed stale-reader calls to GET /stale/{id}.",
+                evidence: json!({ "observation_count": 2 }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: None,
+            },
+        );
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let router = suggestions_admin_router_with_policy(
+            Some(&discovery_db.path),
+            None,
+            &policy,
+            test_audit_log(),
+        );
+        let stale_etag = suggestions_policy_etag(&router).await;
+
+        let manual_rule = json!({
+            "methods": ["POST"],
+            "path": "/manual",
+            "action": "deny"
+        })
+        .to_string();
+        let manual_response = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                POLICY_RULES_ADMIN_ROUTE,
+                Some(test_principal(&["policy-writer"])),
+                Some(manual_rule),
+                Some(&stale_etag),
+            ))
+            .await
+            .expect("manual policy rule create should complete");
+        assert_eq!(manual_response.status(), StatusCode::CREATED);
+
+        let conflict = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-stale/accept",
+                Some(test_principal(&["suggestions-policy-writer"])),
+                None,
+                Some(&stale_etag),
+            ))
+            .await
+            .expect("stale accept request should complete");
+        assert_eq!(conflict.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            body_string(conflict).await,
+            r#"{"error":"If-Match does not match the current policy ETag"}"#
+        );
+
+        let open_page = suggestions_json(
+            &router,
+            "/v1/admin/suggestions?state=open",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(suggestion_ids(&open_page), vec!["sug-stale".to_owned()]);
+        assert!(open_page["suggestions"][0]["transitioned_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn suggestions_admin_dismiss_transitions_requires_write_only_and_audits() {
+        let discovery_db = TempDb::new("suggestions-dismiss");
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-dismiss",
+                suggestion_type: "signal_shadow_schema_mismatch",
+                method: "PATCH",
+                path_pattern: "/dismiss/{id}",
+                role: None,
+                action: "shadow",
+                rationale: "Open schema mismatch signal targets PATCH /dismiss/{id}.",
+                evidence: json!({ "source_signal_id": "sig-schema" }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: Some("sig-schema"),
+            },
+        );
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let router = suggestions_admin_router_with_policy(
+            Some(&discovery_db.path),
+            None,
+            &policy,
+            audit_log,
+        );
+
+        let unauthenticated = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-dismiss/dismiss",
+                None,
+                None,
+                None,
+            ))
+            .await
+            .expect("dismiss request should complete");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let read_only = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-dismiss/dismiss",
+                Some(test_principal(&["suggestions-reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("dismiss request should complete");
+        assert_eq!(read_only.status(), StatusCode::FORBIDDEN);
+
+        let dismissed = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-dismiss/dismiss",
+                Some(test_principal(&["suggestions-writer"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("dismiss request should complete");
+        assert_eq!(dismissed.status(), StatusCode::OK);
+        let dismissed_body = json_body(dismissed).await;
+        assert_eq!(dismissed_body["state"], json!("dismissed"));
+        assert_eq!(dismissed_body["transitioned_by"], json!("user-123"));
+        assert!(dismissed_body["transitioned_at"].as_str().is_some());
+
+        let dismissed_page = suggestions_json(
+            &router,
+            "/v1/admin/suggestions?state=dismissed",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(
+            suggestion_ids(&dismissed_page),
+            vec!["sug-dismiss".to_owned()]
+        );
+
+        assert_eventually(Duration::from_secs(1), || {
+            capture
+                .events()
+                .iter()
+                .any(|event| event.event_type == audit::event::SUGGESTION_LIFECYCLE_CHANGED)
+        });
+        let event = capture
+            .events()
+            .into_iter()
+            .find(|event| event.event_type == audit::event::SUGGESTION_LIFECYCLE_CHANGED)
+            .expect("suggestion lifecycle event should be emitted");
+        assert_eq!(event.payload["id"], json!("sug-dismiss"));
+        assert_eq!(event.payload["state"], json!("dismissed"));
+    }
+
+    #[tokio::test]
+    async fn suggestions_admin_dismiss_rejects_non_open_suggestion_without_overwriting_state() {
+        let discovery_db = TempDb::new("suggestions-dismiss-non-open");
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-already-dismissed",
+                suggestion_type: "signal_shadow_schema_mismatch",
+                method: "PATCH",
+                path_pattern: "/dismiss/{id}",
+                role: None,
+                action: "shadow",
+                rationale: "Open schema mismatch signal targets PATCH /dismiss/{id}.",
+                evidence: json!({ "source_signal_id": "sig-schema" }),
+                state: "dismissed",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: Some("2024-06-02T00:00:00Z"),
+                transitioned_by: Some("original-dismisser"),
+                source_signal_id: Some("sig-schema"),
+            },
+        );
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let router = suggestions_admin_router_with_policy(
+            Some(&discovery_db.path),
+            None,
+            &policy,
+            audit_log,
+        );
+
+        let response = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-already-dismissed/dismiss",
+                Some(test_principal(&["suggestions-writer"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("dismiss request should complete");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let page = suggestions_json(
+            &router,
+            "/v1/admin/suggestions?state=dismissed",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        let suggestion = page["suggestions"]
+            .as_array()
+            .expect("suggestions array should exist")
+            .iter()
+            .find(|suggestion| suggestion["id"] == json!("sug-already-dismissed"))
+            .expect("suggestion should still exist");
+        assert_eq!(
+            suggestion["transitioned_by"],
+            json!("original-dismisser"),
+            "rejected dismiss must not overwrite the original transition metadata"
+        );
+        assert_eq!(suggestion["transitioned_at"], json!("2024-06-02T00:00:00Z"));
+
+        assert!(
+            capture
+                .events()
+                .iter()
+                .all(|event| event.event_type != audit::event::SUGGESTION_LIFECYCLE_CHANGED),
+            "a rejected dismiss must not emit a lifecycle-changed audit event"
+        );
+    }
+
     #[test]
     fn endpoint_rule_coverage_without_rbac_is_false() {
         assert!(!endpoint_covered_by_active_direct_rule(
@@ -12207,6 +13263,175 @@ paths:
         .expect("signals policy should serialize")
     }
 
+    fn suggestions_admin_config(
+        discovery_path: Option<&PathBuf>,
+        audit_path: Option<&PathBuf>,
+        policy: &TempPolicyFile,
+    ) -> config::Config {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.discovery_sqlite_path =
+            discovery_path.map(|path| path.to_string_lossy().into_owned());
+        config.audit_sqlite_path = audit_path.map(|path| path.to_string_lossy().into_owned());
+        config.rule_suggestion_baseline_window_hours = 876_000;
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config
+            .rbac_exempt_paths
+            .push("/v1/admin/suggestions".to_owned());
+        config.rbac_exempt_paths.push(POLICY_ADMIN_ROUTE.to_owned());
+        config
+    }
+
+    fn suggestions_admin_router(
+        discovery_path: Option<&PathBuf>,
+        audit_path: Option<&PathBuf>,
+    ) -> (Router, TempPolicyFile) {
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let router = suggestions_admin_router_with_policy(
+            discovery_path,
+            audit_path,
+            &policy,
+            test_audit_log(),
+        );
+
+        (router, policy)
+    }
+
+    fn suggestions_admin_router_with_policy(
+        discovery_path: Option<&PathBuf>,
+        audit_path: Option<&PathBuf>,
+        policy: &TempPolicyFile,
+        audit_log: audit::AuditLog,
+    ) -> Router {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        app(
+            suggestions_admin_config(discovery_path, audit_path, policy),
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+    }
+
+    fn suggestions_admin_request(
+        method: Method,
+        uri: &str,
+        principal: Option<auth::Principal>,
+        body: Option<String>,
+        if_match: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method(method.clone()).uri(uri);
+        if matches!(method, Method::POST | Method::PUT | Method::PATCH) {
+            builder = builder
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test-token");
+        }
+        if let Some(if_match) = if_match {
+            builder = builder.header(header::IF_MATCH, if_match);
+        }
+
+        let mut request = builder
+            .body(Body::from(body.unwrap_or_default()))
+            .expect("request should build");
+        if let Some(principal) = principal {
+            request.extensions_mut().insert(principal);
+        }
+
+        request
+    }
+
+    async fn suggestions_json(
+        router: &Router,
+        uri: &str,
+        principal: Option<auth::Principal>,
+    ) -> Value {
+        let response = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::GET,
+                uri,
+                principal,
+                None,
+                None,
+            ))
+            .await
+            .expect("suggestions request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await
+    }
+
+    fn suggestion_ids(body: &Value) -> Vec<String> {
+        body["suggestions"]
+            .as_array()
+            .expect("suggestions should be an array")
+            .iter()
+            .map(|suggestion| {
+                suggestion["id"]
+                    .as_str()
+                    .expect("suggestion id should be a string")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    async fn suggestions_policy_etag(router: &Router) -> String {
+        let response = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        policy_etag_header(&response)
+    }
+
+    fn suggestions_policy_document_string() -> String {
+        serde_json::to_string_pretty(&json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "suggestions-reader": {
+                    "permissions": [ADMIN_SUGGESTIONS_READ_PERMISSION]
+                },
+                "suggestions-writer": {
+                    "permissions": [
+                        ADMIN_SUGGESTIONS_READ_PERMISSION,
+                        ADMIN_SUGGESTIONS_WRITE_PERMISSION
+                    ]
+                },
+                "policy-reader": {
+                    "permissions": [ADMIN_POLICY_READ_PERMISSION]
+                },
+                "policy-writer": {
+                    "permissions": [
+                        ADMIN_POLICY_READ_PERMISSION,
+                        ADMIN_POLICY_WRITE_PERMISSION
+                    ]
+                },
+                "suggestions-policy-writer": {
+                    "permissions": [
+                        ADMIN_SUGGESTIONS_READ_PERMISSION,
+                        ADMIN_SUGGESTIONS_WRITE_PERMISSION,
+                        ADMIN_POLICY_READ_PERMISSION,
+                        ADMIN_POLICY_WRITE_PERMISSION
+                    ]
+                },
+                "reader": {
+                    "permissions": []
+                }
+            },
+            "rules": []
+        }))
+        .expect("suggestions policy should serialize")
+    }
+
     fn audit_events_router() -> (Router, audit::AuditLog) {
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
@@ -13020,6 +14245,173 @@ O2gecI9QwDJNpm29J9wJB2F8
                 "#,
             )
             .expect("signal schema should create");
+    }
+
+    fn create_rule_suggestion_schema(path: &PathBuf) {
+        let connection = Connection::open(path).expect("test discovery database should open");
+        discovery::suggestions::configure_connection(&connection)
+            .expect("rule suggestion schema should create");
+    }
+
+    struct RuleSuggestionSeed<'a> {
+        id: &'a str,
+        suggestion_type: &'a str,
+        method: &'a str,
+        path_pattern: &'a str,
+        role: Option<&'a str>,
+        action: &'a str,
+        rationale: &'a str,
+        evidence: Value,
+        state: &'a str,
+        created_at: &'a str,
+        transitioned_at: Option<&'a str>,
+        transitioned_by: Option<&'a str>,
+        source_signal_id: Option<&'a str>,
+    }
+
+    fn insert_rule_suggestion(path: &PathBuf, suggestion: RuleSuggestionSeed<'_>) {
+        let connection = Connection::open(path).expect("test discovery database should open");
+        let principal = match suggestion.role {
+            Some(role) => json!({
+                "roles": [role],
+                "auth_methods": [],
+                "principal_ids": []
+            }),
+            None => json!({
+                "roles": [],
+                "auth_methods": [],
+                "principal_ids": []
+            }),
+        };
+        let proposed_rule_json = json!({
+            "methods": [suggestion.method],
+            "path": suggestion.path_pattern,
+            "principal": principal,
+            "action": suggestion.action
+        })
+        .to_string();
+        let principal_key = suggestion
+            .role
+            .map(|role| format!("role:{role}"))
+            .unwrap_or_else(|| "principal:any".to_owned());
+        let evidence_json = serde_json::to_string(&suggestion.evidence)
+            .expect("suggestion evidence should serialize");
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_rule_suggestions (
+                    id,
+                    suggestion_type,
+                    method,
+                    path_pattern,
+                    principal_key,
+                    proposed_rule_json,
+                    rationale,
+                    evidence_json,
+                    state,
+                    created_at,
+                    updated_at,
+                    transitioned_at,
+                    transitioned_by,
+                    source_signal_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13)
+                "#,
+                params![
+                    suggestion.id,
+                    suggestion.suggestion_type,
+                    suggestion.method,
+                    suggestion.path_pattern,
+                    principal_key,
+                    proposed_rule_json,
+                    suggestion.rationale,
+                    evidence_json,
+                    suggestion.state,
+                    suggestion.created_at,
+                    suggestion.transitioned_at,
+                    suggestion.transitioned_by,
+                    suggestion.source_signal_id,
+                ],
+            )
+            .expect("rule suggestion should insert");
+    }
+
+    fn seed_suggestion_generation_observation(
+        discovery_path: &PathBuf,
+        audit_path: &PathBuf,
+        event_id: &str,
+        method: &str,
+        endpoint_template: &str,
+        role: &str,
+        timestamp: &str,
+    ) {
+        create_discovery_schema(discovery_path);
+        insert_discovery_endpoint(
+            discovery_path,
+            SeedEndpoint {
+                method,
+                endpoint_template,
+                first_seen: timestamp,
+                last_seen: timestamp,
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 10,
+                latency_p95_ms: 10,
+                latency_p99_ms: 10,
+                distinct_principal_count: 1,
+                status_counts: &[(200, 1)],
+            },
+        );
+        create_audit_schema(audit_path);
+        let connection = Connection::open(audit_path).expect("test audit database should open");
+        let actor_json = json!({
+            "user_id": format!("user-{event_id}"),
+            "roles": [role],
+            "auth_mode": "bearer_token"
+        })
+        .to_string();
+        let payload_json = json!({
+            "method": method,
+            "path": concrete_path_for_template(endpoint_template),
+            "status": 200,
+            "policy_decision": "allowed"
+        })
+        .to_string();
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO audit_events (
+                    event_id,
+                    event_type,
+                    timestamp,
+                    schema_version,
+                    request_id,
+                    source_ip,
+                    actor_user_id,
+                    actor_json,
+                    payload_method,
+                    payload_path,
+                    payload_status,
+                    payload_json
+                ) VALUES (?1, 'http.request_observed', ?2, '0.1.0', ?3, '203.0.113.10', ?4, ?5, ?6, ?7, 200, ?8)
+                "#,
+                params![
+                    event_id,
+                    timestamp,
+                    format!("request-{event_id}"),
+                    format!("user-{event_id}"),
+                    actor_json,
+                    method,
+                    concrete_path_for_template(endpoint_template),
+                    payload_json,
+                ],
+            )
+            .expect("audit observation should insert");
+    }
+
+    fn concrete_path_for_template(endpoint_template: &str) -> String {
+        endpoint_template.replace("{id}", "123")
     }
 
     fn seed_list_discovery_endpoints(path: &PathBuf) {

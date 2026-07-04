@@ -6,8 +6,8 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
@@ -144,6 +144,20 @@ pub struct RuleSuggestion {
     pub source_signal_id: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct RuleSuggestionListPage {
+    pub suggestions: Vec<RuleSuggestion>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct RuleSuggestionListFilters {
+    pub state: Option<RuleSuggestionLifecycleState>,
+    pub suggestion_type: Option<String>,
+    pub limit: usize,
+    pub cursor: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuleSuggestionConfig {
     pub baseline_window_hours: u64,
@@ -157,14 +171,14 @@ impl Default for RuleSuggestionConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct RuleSuggestionRun {
     pub inserted_count: usize,
     pub baseline: BaselineSuggestionRun,
     pub anomaly: AnomalySuggestionRun,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BaselineSuggestionRun {
     pub available: bool,
     pub omitted_reason: Option<String>,
@@ -193,7 +207,7 @@ impl Default for BaselineSuggestionRun {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct AnomalySuggestionRun {
     pub open_signal_count: usize,
     pub skipped_policy_covered: usize,
@@ -245,6 +259,30 @@ impl RuleSuggestionEngine {
 
     pub fn list_suggestions(&self) -> Result<Vec<RuleSuggestion>, RuleSuggestionError> {
         self.suggestion_store.list_suggestions()
+    }
+
+    pub fn list_suggestion_page(
+        &self,
+        filters: &RuleSuggestionListFilters,
+    ) -> Result<RuleSuggestionListPage, RuleSuggestionError> {
+        self.suggestion_store.list_suggestion_page(filters)
+    }
+
+    pub fn get_suggestion(
+        &self,
+        suggestion_id: &str,
+    ) -> Result<Option<RuleSuggestion>, RuleSuggestionError> {
+        self.suggestion_store.get_suggestion(suggestion_id)
+    }
+
+    pub fn transition_suggestion(
+        &self,
+        suggestion_id: &str,
+        state: RuleSuggestionLifecycleState,
+        transitioned_by: Option<&str>,
+    ) -> Result<Option<RuleSuggestion>, RuleSuggestionError> {
+        self.suggestion_store
+            .transition_suggestion(suggestion_id, state, transitioned_by)
     }
 
     fn baseline_suggestions(
@@ -442,6 +480,9 @@ pub enum RuleSuggestionError {
     InvalidState {
         state: String,
     },
+    InvalidCursor {
+        parameter: &'static str,
+    },
 }
 
 impl fmt::Display for RuleSuggestionError {
@@ -466,6 +507,9 @@ impl fmt::Display for RuleSuggestionError {
                     "invalid rule suggestion state in database: {state}"
                 )
             }
+            Self::InvalidCursor { parameter } => {
+                write!(formatter, "invalid rule suggestion cursor: {parameter}")
+            }
         }
     }
 }
@@ -478,6 +522,7 @@ impl Error for RuleSuggestionError {
             Self::Sqlite { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
             Self::InvalidState { .. } => None,
+            Self::InvalidCursor { .. } => None,
         }
     }
 }
@@ -637,35 +682,36 @@ impl RuleSuggestionStore {
     }
 
     fn list_suggestions(&self) -> Result<Vec<RuleSuggestion>, RuleSuggestionError> {
+        Ok(self
+            .list_suggestion_page(&RuleSuggestionListFilters {
+                state: None,
+                suggestion_type: None,
+                limit: usize::MAX,
+                cursor: None,
+            })?
+            .suggestions)
+    }
+
+    fn list_suggestion_page(
+        &self,
+        filters: &RuleSuggestionListFilters,
+    ) -> Result<RuleSuggestionListPage, RuleSuggestionError> {
+        let cursor = filters
+            .cursor
+            .as_deref()
+            .map(|value| decode_cursor::<RuleSuggestionCursor>("cursor", value))
+            .transpose()?;
+        let (sql, params) = build_rule_suggestion_list_query(filters, cursor.as_ref());
         let connection = self.connection_guard();
-        let mut statement = connection
-            .prepare(
-                r#"
-                SELECT
-                    id,
-                    suggestion_type,
-                    method,
-                    path_pattern,
-                    principal_key,
-                    proposed_rule_json,
-                    rationale,
-                    evidence_json,
-                    state,
-                    created_at,
-                    updated_at,
-                    transitioned_at,
-                    transitioned_by,
-                    source_signal_id
-                FROM discovery_rule_suggestions
-                ORDER BY julianday(created_at) ASC, id ASC
-                "#,
-            )
-            .map_err(|source| RuleSuggestionError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut statement =
+            connection
+                .prepare(&sql)
+                .map_err(|source| RuleSuggestionError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
         let rows = statement
-            .query_map([], RawRuleSuggestion::from_row)
+            .query_map(params_from_iter(params.iter()), RawRuleSuggestion::from_row)
             .map_err(|source| RuleSuggestionError::Sqlite {
                 path: self.path.clone(),
                 source,
@@ -676,9 +722,78 @@ impl RuleSuggestionStore {
                 source,
             })?;
 
-        rows.into_iter()
+        let mut rows = rows;
+        let has_more = rows.len() > filters.limit;
+        if has_more {
+            rows.truncate(filters.limit);
+        }
+
+        let next_cursor = if has_more {
+            rows.last()
+                .map(|row| {
+                    encode_cursor(&RuleSuggestionCursor {
+                        created_at: row.created_at.clone(),
+                        id: row.id.clone(),
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
+        let suggestions = rows
+            .into_iter()
             .map(RawRuleSuggestion::into_suggestion)
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(RuleSuggestionListPage {
+            suggestions,
+            next_cursor,
+        })
+    }
+
+    fn get_suggestion(
+        &self,
+        suggestion_id: &str,
+    ) -> Result<Option<RuleSuggestion>, RuleSuggestionError> {
+        let connection = self.connection_guard();
+        load_suggestion_by_id(&connection, &self.path, suggestion_id)
+    }
+
+    fn transition_suggestion(
+        &self,
+        suggestion_id: &str,
+        state: RuleSuggestionLifecycleState,
+        transitioned_by: Option<&str>,
+    ) -> Result<Option<RuleSuggestion>, RuleSuggestionError> {
+        let transitioned_at = utc_timestamp_rfc3339();
+        let connection = self.connection_guard();
+        let updated = connection
+            .execute(
+                r#"
+                UPDATE discovery_rule_suggestions
+                SET state = ?2,
+                    updated_at = ?3,
+                    transitioned_at = ?3,
+                    transitioned_by = ?4
+                WHERE id = ?1
+                "#,
+                params![
+                    suggestion_id,
+                    state.as_str(),
+                    transitioned_at,
+                    transitioned_by,
+                ],
+            )
+            .map_err(|source| RuleSuggestionError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        if updated == 0 {
+            return Ok(None);
+        }
+
+        load_suggestion_by_id(&connection, &self.path, suggestion_id)
     }
 
     fn connection_guard(&self) -> MutexGuard<'_, Connection> {
@@ -783,8 +898,118 @@ struct SignalSuggestionTarget {
     principal: PrincipalMatcher,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RuleSuggestionCursor {
+    created_at: String,
+    id: String,
+}
+
 pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(CREATE_RULE_SUGGESTION_SCHEMA_SQL)
+}
+
+fn load_suggestion_by_id(
+    connection: &Connection,
+    path: &Path,
+    suggestion_id: &str,
+) -> Result<Option<RuleSuggestion>, RuleSuggestionError> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT
+                id,
+                suggestion_type,
+                method,
+                path_pattern,
+                principal_key,
+                proposed_rule_json,
+                rationale,
+                evidence_json,
+                state,
+                created_at,
+                updated_at,
+                transitioned_at,
+                transitioned_by,
+                source_signal_id
+            FROM discovery_rule_suggestions
+            WHERE id = ?1
+            "#,
+        )
+        .map_err(|source| RuleSuggestionError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut rows = statement
+        .query_map(params![suggestion_id], RawRuleSuggestion::from_row)
+        .map_err(|source| RuleSuggestionError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    let Some(row) = rows.next() else {
+        return Ok(None);
+    };
+    let raw = row.map_err(|source| RuleSuggestionError::Sqlite {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    raw.into_suggestion().map(Some)
+}
+
+fn build_rule_suggestion_list_query(
+    filters: &RuleSuggestionListFilters,
+    cursor: Option<&RuleSuggestionCursor>,
+) -> (String, Vec<SqlValue>) {
+    let mut sql = String::from(
+        r#"
+        SELECT
+            id,
+            suggestion_type,
+            method,
+            path_pattern,
+            principal_key,
+            proposed_rule_json,
+            rationale,
+            evidence_json,
+            state,
+            created_at,
+            updated_at,
+            transitioned_at,
+            transitioned_by,
+            source_signal_id
+        FROM discovery_rule_suggestions
+        "#,
+    );
+    let mut clauses = Vec::new();
+    let mut params = Vec::new();
+
+    if let Some(state) = filters.state {
+        clauses.push("state = ?");
+        params.push(SqlValue::Text(state.as_str().to_owned()));
+    }
+    if let Some(suggestion_type) = &filters.suggestion_type {
+        clauses.push("suggestion_type = ?");
+        params.push(SqlValue::Text(suggestion_type.clone()));
+    }
+    if let Some(cursor) = cursor {
+        clauses.push(
+            "(julianday(created_at) < julianday(?) OR (julianday(created_at) = julianday(?) AND id > ?))",
+        );
+        params.push(SqlValue::Text(cursor.created_at.clone()));
+        params.push(SqlValue::Text(cursor.created_at.clone()));
+        params.push(SqlValue::Text(cursor.id.clone()));
+    }
+
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+
+    sql.push_str(" ORDER BY julianday(created_at) DESC, id ASC LIMIT ?");
+    params.push(SqlValue::Integer(query_limit(filters.limit)));
+
+    (sql, params)
 }
 
 fn policy_has_covering_action(
@@ -967,6 +1192,26 @@ fn lookback_cutoff(lookback_hours: u64) -> String {
     (OffsetDateTime::now_utc() - TimeDuration::hours(hours))
         .format(&Rfc3339)
         .expect("UTC timestamp should format as RFC 3339")
+}
+
+fn encode_cursor<T: Serialize>(cursor: &T) -> Result<String, RuleSuggestionError> {
+    let json = serde_json::to_vec(cursor).map_err(|source| RuleSuggestionError::Json {
+        context: "cursor",
+        source,
+    })?;
+    Ok(hex::encode(json))
+}
+
+fn decode_cursor<T: DeserializeOwned>(
+    parameter: &'static str,
+    value: &str,
+) -> Result<T, RuleSuggestionError> {
+    let bytes = hex::decode(value).map_err(|_| RuleSuggestionError::InvalidCursor { parameter })?;
+    serde_json::from_slice(&bytes).map_err(|_| RuleSuggestionError::InvalidCursor { parameter })
+}
+
+fn query_limit(limit: usize) -> i64 {
+    i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
 }
 
 fn utc_timestamp_rfc3339() -> String {
