@@ -134,6 +134,7 @@ mod tests {
                 .map(str::to_owned)
                 .collect(),
             auth_enabled: true,
+            auth_mode: crate::config::AuthMode::Required,
             auth_cookie_name: "session".to_owned(),
             auth_exempt_paths: vec![
                 "/health".to_owned(),

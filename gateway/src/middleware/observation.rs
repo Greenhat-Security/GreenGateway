@@ -684,6 +684,7 @@ mod tests {
             .layer(from_fn_with_state(
                 auth::AuthState {
                     validator: Some(validator),
+                    mode: crate::config::AuthMode::Required,
                     cookie_name: "session".to_owned(),
                     exempt_paths: Vec::new(),
                     audit: audit.clone(),

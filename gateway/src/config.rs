@@ -22,6 +22,7 @@ const DEFAULT_RATE_LIMIT_WRITE_RPS: f64 = 10.0;
 const DEFAULT_RATE_LIMIT_WRITE_BURST: u32 = 20;
 const DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES: &[&str] = &["application/json"];
 const DEFAULT_AUTH_ENABLED: bool = true;
+const DEFAULT_AUTH_MODE: AuthMode = AuthMode::Required;
 const DEFAULT_AUTH_COOKIE_NAME: &str = "session";
 pub const DEFAULT_ADMIN_PREFIX: &str = "/admin";
 const DEFAULT_EXEMPT_PROBE_PATHS: &[&str] = &["/health", "/version", "/metrics"];
@@ -44,6 +45,7 @@ const AUDIT_SQLITE_RETENTION_DAYS: &str = "AUDIT_SQLITE_RETENTION_DAYS";
 const AUTH_COOKIE_NAME: &str = "AUTH_COOKIE_NAME";
 const AUTH_ENABLED: &str = "AUTH_ENABLED";
 const AUTH_EXEMPT_PATHS: &str = "AUTH_EXEMPT_PATHS";
+const AUTH_MODE: &str = "AUTH_MODE";
 const CORS_ALLOW_ORIGINS: &str = "CORS_ALLOW_ORIGINS";
 const CSRF_COOKIE_DOMAIN: &str = "CSRF_COOKIE_DOMAIN";
 const CSRF_COOKIE_NAME: &str = "CSRF_COOKIE_NAME";
@@ -94,6 +96,7 @@ pub struct Config {
     pub session_cookie_name: String,
     pub validation_allowed_content_types: Vec<String>,
     pub auth_enabled: bool,
+    pub auth_mode: AuthMode,
     pub auth_cookie_name: String,
     pub auth_exempt_paths: Vec<String>,
     pub jwt_jwks_url: Option<String>,
@@ -115,6 +118,24 @@ pub struct Config {
     pub egress_max_response_bytes: usize,
     pub egress_max_request_body_bytes: usize,
     pub egress_deny_private_ips: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    Required,
+    Observe,
+}
+
+impl FromStr for AuthMode {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "required" => Ok(Self::Required),
+            "observe" => Ok(Self::Observe),
+            _ => Err("expected `required` or `observe`"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +260,13 @@ impl Config {
             get_var(AUTH_ENABLED),
             DEFAULT_AUTH_ENABLED,
             "boolean",
+            &mut problems,
+        );
+        let auth_mode = parse_var(
+            AUTH_MODE,
+            get_var(AUTH_MODE),
+            DEFAULT_AUTH_MODE,
+            "auth mode",
             &mut problems,
         );
         let auth_cookie_name = parse_cookie_name(
@@ -377,6 +405,7 @@ impl Config {
                 session_cookie_name,
                 validation_allowed_content_types,
                 auth_enabled,
+                auth_mode,
                 auth_cookie_name,
                 auth_exempt_paths,
                 jwt_jwks_url,
@@ -906,6 +935,7 @@ mod tests {
             vec!["application/json".to_owned()]
         );
         assert!(config.auth_enabled);
+        assert_eq!(config.auth_mode, AuthMode::Required);
         assert_eq!(config.auth_cookie_name, "session");
         assert_eq!(
             config.auth_exempt_paths,
@@ -1012,6 +1042,7 @@ mod tests {
             vec!["application/json".to_owned()]
         );
         assert!(config.auth_enabled);
+        assert_eq!(config.auth_mode, AuthMode::Required);
         assert_eq!(config.auth_cookie_name, "session");
         assert_eq!(
             config.auth_exempt_paths,
@@ -1368,6 +1399,7 @@ mod tests {
     fn auth_config_parses() {
         let config = Config::from_env_vars(|name| match name {
             "AUTH_ENABLED" => Ok("false".to_owned()),
+            "AUTH_MODE" => Ok("observe".to_owned()),
             "AUTH_COOKIE_NAME" => Ok("gateway_session".to_owned()),
             "AUTH_EXEMPT_PATHS" => Ok(" /health, /ready ,, /metrics ".to_owned()),
             _ => Err(VarError::NotPresent),
@@ -1375,6 +1407,7 @@ mod tests {
         .expect("config should parse");
 
         assert!(!config.auth_enabled);
+        assert_eq!(config.auth_mode, AuthMode::Observe);
         assert_eq!(config.auth_cookie_name, "gateway_session");
         assert_eq!(
             config.auth_exempt_paths,
@@ -1384,6 +1417,20 @@ mod tests {
                 "/metrics".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn auth_mode_parses_required_and_defaults_to_required() {
+        let explicit = Config::from_env_vars(|name| match name {
+            "AUTH_MODE" => Ok("required".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+        assert_eq!(explicit.auth_mode, AuthMode::Required);
+
+        let defaulted =
+            Config::from_env_vars(|_| Err(VarError::NotPresent)).expect("config should parse");
+        assert_eq!(defaulted.auth_mode, AuthMode::Required);
     }
 
     #[test]
@@ -1421,6 +1468,7 @@ mod tests {
     fn invalid_auth_config_values_are_rejected() {
         let error = Config::from_env_vars(|name| match name {
             "AUTH_ENABLED" => Ok("maybe".to_owned()),
+            "AUTH_MODE" => Ok("optional".to_owned()),
             "AUTH_COOKIE_NAME" => Ok("session token".to_owned()),
             "AUTH_EXEMPT_PATHS" => Ok("/health,admin".to_owned()),
             _ => Err(VarError::NotPresent),
@@ -1429,9 +1477,11 @@ mod tests {
 
         let message = error.to_string();
         assert!(message.contains("AUTH_ENABLED must be a valid boolean"));
+        assert!(message.contains("AUTH_MODE must be a valid auth mode"));
+        assert!(message.contains("expected `required` or `observe`"));
         assert!(message.contains("AUTH_COOKIE_NAME must be a non-empty RFC 6265 cookie name"));
         assert!(message.contains("AUTH_EXEMPT_PATHS entries must be URI paths"));
-        assert_eq!(error.problems.len(), 3);
+        assert_eq!(error.problems.len(), 4);
     }
 
     #[test]

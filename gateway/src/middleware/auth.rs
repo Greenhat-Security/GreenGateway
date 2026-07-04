@@ -22,7 +22,7 @@ use crate::{
     audit::{AuditEvent, AuditLog},
     auth::{actor_from_principal, AuthError, Principal, SessionCredential, SessionValidator},
     client_ip::{canonical_client_ip, request_id},
-    config::Config,
+    config::{AuthMode, Config},
     path_match::path_prefix_matches,
 };
 
@@ -34,6 +34,7 @@ const AUTH_FAILURE: &str = "auth.failure";
 #[derive(Clone)]
 pub struct AuthState {
     pub validator: Option<Arc<dyn SessionValidator>>,
+    pub mode: AuthMode,
     pub cookie_name: String,
     pub exempt_paths: Vec<String>,
     pub audit: AuditLog,
@@ -60,6 +61,7 @@ impl AuthState {
     ) -> Self {
         Self {
             validator,
+            mode: config.auth_mode,
             cookie_name: config.auth_cookie_name.clone(),
             exempt_paths: config.auth_exempt_paths.clone(),
             audit,
@@ -84,27 +86,21 @@ pub async fn auth_middleware(
 
     let audit = audit_context(&req, path, state.trust_proxy_headers);
     let Some(credential) = extract_credential(req.headers(), &state.cookie_name) else {
-        let reason = "missing_credential";
-        emit_failure(&state, &audit, reason);
-        return unauthorized_with_auth_outcome(reason);
+        return auth_failure_response(&state, &audit, "missing_credential", req, next).await;
     };
 
     let Some(validator) = state.validator.as_ref().map(Arc::clone) else {
-        let reason = "no_validator_configured";
-        emit_failure(&state, &audit, reason);
-        return unauthorized_with_auth_outcome(reason);
+        return auth_failure_response(&state, &audit, "no_validator_configured", req, next).await;
     };
 
     match &credential {
         SessionCredential::Cookie(_) if !validator.supports_cookie() => {
-            let reason = "cookie_auth_unsupported";
-            emit_failure(&state, &audit, reason);
-            return unauthorized_with_auth_outcome(reason);
+            return auth_failure_response(&state, &audit, "cookie_auth_unsupported", req, next)
+                .await;
         }
         SessionCredential::Bearer(_) if !validator.supports_bearer() => {
-            let reason = "bearer_auth_unsupported";
-            emit_failure(&state, &audit, reason);
-            return unauthorized_with_auth_outcome(reason);
+            return auth_failure_response(&state, &audit, "bearer_auth_unsupported", req, next)
+                .await;
         }
         _ => {}
     }
@@ -122,13 +118,11 @@ pub async fn auth_middleware(
             response
         }
         Err(AuthError::InvalidSession(reason)) => {
-            emit_failure(&state, &audit, &reason);
-            unauthorized_with_auth_outcome(reason)
+            auth_failure_response(&state, &audit, reason, req, next).await
         }
         Err(AuthError::Upstream(reason)) => {
             let reason = format!("upstream_error: {reason}");
-            emit_failure(&state, &audit, &reason);
-            unauthorized_with_auth_outcome(reason)
+            auth_failure_response(&state, &audit, reason, req, next).await
         }
     }
 }
@@ -204,6 +198,32 @@ fn emit_failure(state: &AuthState, context: &AuditContext, reason: &str) {
         ),
         context.user_agent.as_deref(),
     ));
+}
+
+async fn auth_failure_response(
+    state: &AuthState,
+    context: &AuditContext,
+    reason: impl Into<String>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let reason = reason.into();
+    emit_failure(state, context, &reason);
+
+    match state.mode {
+        AuthMode::Required => unauthorized_with_auth_outcome(reason),
+        AuthMode::Observe => forward_with_auth_outcome(req, next, reason).await,
+    }
+}
+
+async fn forward_with_auth_outcome(req: Request, next: Next, reason: String) -> Response {
+    let mut response = next.run(req).await;
+    response.extensions_mut().insert(AuthOutcome {
+        principal: None,
+        authenticated: false,
+        reason: Some(reason),
+    });
+    response
 }
 
 fn auth_mode(credential: &SessionCredential) -> &'static str {
@@ -339,12 +359,20 @@ mod tests {
     }
 
     fn test_state(validator: Option<Arc<dyn SessionValidator>>) -> (AuthState, CaptureSink) {
+        test_state_with_mode(AuthMode::Required, validator)
+    }
+
+    fn test_state_with_mode(
+        mode: AuthMode,
+        validator: Option<Arc<dyn SessionValidator>>,
+    ) -> (AuthState, CaptureSink) {
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
 
         (
             AuthState {
                 validator,
+                mode,
                 cookie_name: "session".to_owned(),
                 exempt_paths: vec![
                     "/health".to_owned(),
@@ -513,6 +541,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_required_mode_blocks_missing_credential_like_default() {
+        let (state, capture) = test_state_with_mode(
+            AuthMode::Required,
+            Some(validator(MockOutcome::Principal(test_principal()))),
+        );
+
+        let response = test_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/administrator")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(WWW_AUTHENTICATE),
+            Some(&HeaderValue::from_static("Bearer"))
+        );
+        assert_eq!(body_string(response).await, r#"{"error":"unauthorized"}"#);
+
+        let event = captured_event(&capture, AUTH_FAILURE).await;
+        assert_eq!(event.payload["reason"], json!("missing_credential"));
+    }
+
+    #[tokio::test]
+    async fn observe_mode_missing_credential_forwards_and_tags_failure() {
+        let (state, capture) = test_state_with_mode(
+            AuthMode::Observe,
+            Some(validator(MockOutcome::Principal(test_principal()))),
+        );
+
+        let response = test_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/administrator")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
+        let outcome = response
+            .extensions()
+            .get::<AuthOutcome>()
+            .cloned()
+            .expect("response should carry auth outcome");
+        assert!(!outcome.authenticated);
+        assert!(outcome.principal.is_none());
+        assert_eq!(outcome.reason.as_deref(), Some("missing_credential"));
+        assert_eq!(body_string(response).await, "ok");
+
+        let event = captured_event(&capture, AUTH_FAILURE).await;
+        assert_eq!(event.payload["reason"], json!("missing_credential"));
+        assert_eq!(event.payload["path"], json!("/administrator"));
+        assert!(event.actor.is_none());
+    }
+
+    #[tokio::test]
     async fn valid_bearer_credential_injects_principal_and_emits_success() {
         let (state, capture) =
             test_state(Some(validator(MockOutcome::Principal(test_principal()))));
@@ -529,6 +620,48 @@ mod tests {
             .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+        let body = to_json(response).await;
+        assert_eq!(body, json!({ "user_id": "user-123" }));
+
+        let event = captured_event(&capture, AUTH_SUCCESS).await;
+        assert!(event.actor.is_some());
+        assert_eq!(event.payload["auth_mode"], json!("bearer_token"));
+        assert_eq!(event.payload["user_id"], json!("user-123"));
+    }
+
+    #[tokio::test]
+    async fn observe_mode_valid_bearer_credential_injects_principal_and_emits_success() {
+        let (state, capture) = test_state_with_mode(
+            AuthMode::Observe,
+            Some(validator(MockOutcome::Principal(test_principal()))),
+        );
+
+        let response = test_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header(AUTHORIZATION, "Bearer token-123")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let outcome = response
+            .extensions()
+            .get::<AuthOutcome>()
+            .cloned()
+            .expect("response should carry auth outcome");
+        assert!(outcome.authenticated);
+        assert_eq!(
+            outcome
+                .principal
+                .as_ref()
+                .map(|principal| principal.user_id.as_str()),
+            Some("user-123")
+        );
+        assert!(outcome.reason.is_none());
         let body = to_json(response).await;
         assert_eq!(body, json!({ "user_id": "user-123" }));
 
@@ -558,6 +691,44 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = body_string(response).await;
         assert_eq!(body, r#"{"error":"unauthorized"}"#);
+        assert!(!body.contains("expired refresh window"));
+
+        let event = captured_event(&capture, AUTH_FAILURE).await;
+        assert_eq!(event.payload["reason"], json!("expired refresh window"));
+    }
+
+    #[tokio::test]
+    async fn observe_mode_invalid_credential_forwards_without_leaking_internal_reason() {
+        let (state, capture) = test_state_with_mode(
+            AuthMode::Observe,
+            Some(validator(MockOutcome::InvalidSession(
+                "expired refresh window",
+            ))),
+        );
+
+        let response = test_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/administrator")
+                    .header(AUTHORIZATION, "Bearer token-123")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
+        let outcome = response
+            .extensions()
+            .get::<AuthOutcome>()
+            .cloned()
+            .expect("response should carry auth outcome");
+        assert!(!outcome.authenticated);
+        assert!(outcome.principal.is_none());
+        assert_eq!(outcome.reason.as_deref(), Some("expired refresh window"));
+        let body = body_string(response).await;
+        assert_eq!(body, "ok");
         assert!(!body.contains("expired refresh window"));
 
         let event = captured_event(&capture, AUTH_FAILURE).await;

@@ -7,4 +7,4 @@ This starter policy sets `default_action` to `"allow"` and `enforcement_mode` to
 
 As deployment hardening progresses, add `routes` rules for sensitive paths, grant the matching permissions through `roles`, and eventually change `default_action` to `"deny"` once expected traffic is covered by explicit policy. To preview authorization denials before blocking traffic, set `enforcement_mode` to `"shadow"` globally or on an individual route rule; shadow denials forward the request and emit `authz.would_deny` audit events.
 
-The [pinned roadmap issue (#44)](https://github.com/Greenhat-Security/GreenGateway/issues/44) tracks later tightening steps, including observe-only auth mode. Observe-only auth is planned follow-up work and is not enabled by this starter policy today.
+Observe-only auth is configured gateway-wide with `AUTH_MODE=observe`; it is not part of the RBAC policy document and is not enabled by this starter policy.
