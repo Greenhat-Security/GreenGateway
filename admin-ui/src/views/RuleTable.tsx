@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
+import { decodeJwtRolesClaim, getStoredToken } from '../lib/auth';
 import {
   PolicyDefaultAction,
   PolicyDocument,
@@ -33,6 +34,8 @@ type RuleRow = {
   index: number;
 };
 
+const POLICY_WRITE_PERMISSION = 'admin:policy:write';
+
 export function RuleTable() {
   const [policy, setPolicy] = useState<PolicyDocument | null>(null);
   const [etag, setEtag] = useState<string | null>(null);
@@ -42,7 +45,7 @@ export function RuleTable() {
   const [mutationError, setMutationError] = useState<PolicyLoadError | null>(
     null,
   );
-  const [canWritePolicy, setCanWritePolicy] = useState(true);
+  const [canWritePolicy, setCanWritePolicy] = useState(false);
   const [mutatingRuleId, setMutatingRuleId] = useState<string | null>(null);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(
     null,
@@ -56,6 +59,7 @@ export function RuleTable() {
       setIsLoading(true);
       setLoadError(null);
       setMutationError(null);
+      setCanWritePolicy(false);
 
       try {
         const [policyResult, hitCounts] = await Promise.all([
@@ -66,6 +70,7 @@ export function RuleTable() {
           return;
         }
 
+        setCanWritePolicy(currentTokenCanWritePolicy(policyResult.policy));
         setPolicy(policyResult.policy);
         setEtag(policyResult.etag);
         setHits(hitCounts);
@@ -77,6 +82,7 @@ export function RuleTable() {
         setPolicy(null);
         setEtag(null);
         setHits({});
+        setCanWritePolicy(false);
         setLoadError(toPolicyLoadError(error));
       } finally {
         if (isCurrent) {
@@ -101,6 +107,10 @@ export function RuleTable() {
       })) ?? []
     );
   }, [policy]);
+  const showWritePermissionNotice =
+    policy !== null &&
+    !canWritePolicy &&
+    mutationError?.kind !== 'forbidden';
 
   async function toggleRule(row: RuleRow) {
     const currentEtag = etag;
@@ -232,6 +242,7 @@ export function RuleTable() {
         {policy ? <DefaultActionBanner action={policy.default_action} /> : null}
 
         {loadError ? <PolicyErrorMessage error={loadError} /> : null}
+        {showWritePermissionNotice ? <PolicyWritePermissionNotice /> : null}
         {mutationError ? <PolicyMutationErrorMessage error={mutationError} /> : null}
 
         {isLoading ? (
@@ -338,6 +349,30 @@ export function RuleTable() {
         ) : null}
       </section>
     </main>
+  );
+}
+
+function currentTokenCanWritePolicy(policy: PolicyDocument): boolean {
+  const token = getStoredToken();
+  if (!token) {
+    return false;
+  }
+
+  const roles = decodeJwtRolesClaim(token);
+  if (roles === null) {
+    return false;
+  }
+
+  return roles.some((roleName) => roleGrantsPolicyWrite(policy.roles?.[roleName]));
+}
+
+function roleGrantsPolicyWrite(role: unknown): boolean {
+  if (!isJsonObject(role) || !Array.isArray(role.permissions)) {
+    return false;
+  }
+
+  return role.permissions.some(
+    (permission) => permission === POLICY_WRITE_PERMISSION || permission === '*',
   );
 }
 
@@ -501,6 +536,15 @@ function PolicyErrorMessage({ error }: { error: PolicyLoadError }) {
   );
 }
 
+function PolicyWritePermissionNotice() {
+  return (
+    <div className="error-panel alert warning" role="alert">
+      <h3>Policy write permission required</h3>
+      <p>This token can read policy rules but does not include admin:policy:write.</p>
+    </div>
+  );
+}
+
 function PolicyMutationErrorMessage({ error }: { error: PolicyLoadError }) {
   if (error.kind === 'forbidden') {
     return (
@@ -642,4 +686,8 @@ function toPolicyLoadError(error: unknown): PolicyLoadError {
   }
 
   return { kind: 'network', message: 'Network request failed.' };
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
