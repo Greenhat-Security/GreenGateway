@@ -337,6 +337,7 @@ impl RuleSuggestionEngine {
 
             let proposed_rule = Rule {
                 id: None,
+                enabled: true,
                 methods: vec![observation.method.clone()],
                 path: observation.endpoint_template.clone(),
                 principal,
@@ -411,6 +412,7 @@ impl RuleSuggestionEngine {
 
             let proposed_rule = Rule {
                 id: None,
+                enabled: true,
                 methods: vec![target.method.clone()],
                 path: target.path_pattern.clone(),
                 principal: target.principal,
@@ -1357,6 +1359,7 @@ mod tests {
         let mut policy = empty_policy();
         policy.rules.push(Rule {
             id: Some("existing-reader-allow".to_owned()),
+            enabled: true,
             methods: vec!["GET".to_owned()],
             path: "/invoices/{id}".to_owned(),
             principal: PrincipalMatcher {
@@ -1483,6 +1486,7 @@ mod tests {
         let mut policy = empty_policy();
         policy.rules.push(Rule {
             id: Some("shadow-alice".to_owned()),
+            enabled: true,
             methods: vec!["GET".to_owned()],
             path: "/invoices/{id}".to_owned(),
             principal: PrincipalMatcher {

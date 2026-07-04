@@ -91,6 +91,11 @@ pub struct Rule {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Whether this rule participates in live evaluation. Omitted legacy rules
+    /// default to enabled.
+    #[serde(default = "default_rule_enabled")]
+    #[serde(skip_serializing_if = "is_default_rule_enabled")]
+    pub enabled: bool,
     /// HTTP methods this rule matches. Empty or ["*"] matches any method.
     #[serde(default)]
     pub methods: Vec<String>,
@@ -121,6 +126,14 @@ impl Rule {
     }
 }
 
+pub fn default_rule_enabled() -> bool {
+    true
+}
+
+fn is_default_rule_enabled(value: &bool) -> bool {
+    *value
+}
+
 pub fn valid_auth_method_name(value: &str) -> bool {
     matches!(value, AUTH_METHOD_BEARER_TOKEN | AUTH_METHOD_SESSION_COOKIE)
 }
@@ -139,6 +152,18 @@ fn constraint_matches(values: &[String], matches_value: impl Fn(&str) -> bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rule_deserialization_defaults_enabled_to_true() {
+        let rule: Rule = serde_json::from_value(json!({
+            "path": "/legacy",
+            "action": "deny"
+        }))
+        .expect("legacy rule without enabled should deserialize");
+
+        assert!(rule.enabled);
+    }
 
     #[test]
     fn empty_principal_matcher_matches_any_principal_or_none() {
@@ -187,6 +212,7 @@ mod tests {
     fn rule_matcher_supports_method_wildcards() {
         let rule = Rule {
             id: None,
+            enabled: true,
             methods: vec!["GET".to_owned(), "HEAD".to_owned()],
             path: "/data".to_owned(),
             principal: PrincipalMatcher::default(),
@@ -199,6 +225,7 @@ mod tests {
 
         let wildcard_rule = Rule {
             id: None,
+            enabled: true,
             methods: vec!["*".to_owned()],
             path: "/data".to_owned(),
             principal: PrincipalMatcher::default(),
@@ -212,6 +239,7 @@ mod tests {
     fn rule_matcher_supports_literals_globs_and_params() {
         let user_item = Rule {
             id: None,
+            enabled: true,
             methods: Vec::new(),
             path: "/api/users/{id}".to_owned(),
             principal: PrincipalMatcher::default(),
@@ -219,6 +247,7 @@ mod tests {
         };
         let one_asset_segment = Rule {
             id: None,
+            enabled: true,
             methods: Vec::new(),
             path: "/assets/*".to_owned(),
             principal: PrincipalMatcher::default(),
@@ -226,6 +255,7 @@ mod tests {
         };
         let any_admin_depth = Rule {
             id: None,
+            enabled: true,
             methods: Vec::new(),
             path: "/admin/**".to_owned(),
             principal: PrincipalMatcher::default(),
@@ -244,6 +274,7 @@ mod tests {
     fn rule_matcher_is_anchored_to_whole_path() {
         let rule = Rule {
             id: None,
+            enabled: true,
             methods: Vec::new(),
             path: "/api/users/{id}".to_owned(),
             principal: PrincipalMatcher::default(),
