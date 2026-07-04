@@ -1,6 +1,7 @@
 import { AdminApiError } from './api';
 import { AuditEvent } from './audit';
 import { authHeaders } from './auth';
+import { adminApiUrl } from './config';
 
 export type AuditEventStreamFilters = {
   eventType: string;
@@ -21,9 +22,11 @@ export function buildAuditEventStreamUrl(
   appendTrimmed(params, 'path', filters.path);
 
   const query = params.toString();
-  return query.length > 0
-    ? `/v1/admin/events/stream?${query}`
-    : '/v1/admin/events/stream';
+  return adminApiUrl(
+    query.length > 0
+      ? `/events/stream?${query}`
+      : '/events/stream',
+  );
 }
 
 export async function subscribeToAuditEvents(
