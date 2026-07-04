@@ -6,7 +6,7 @@
 
 ### A universal MCP + API gateway you self-host
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPL_v3-blue.svg?style=flat-square)](LICENSE)
+[![License: Source-available](https://img.shields.io/badge/License-Source--available-blue.svg?style=flat-square)](LICENSE)
 [![Status](https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square)](#project-status)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-DEA584?style=flat-square&logo=rust&logoColor=black)](gateway)
 [![Roadmap](https://img.shields.io/badge/roadmap-7%20phases-blueviolet?style=flat-square)](https://github.com/Greenhat-Security/GreenGateway/issues/44)
@@ -21,7 +21,7 @@
 
 ---
 
-> **Community project by [Greenhat-Security](https://github.com/Greenhat-Security).** GreenGateway (GG) is pre-alpha, self-hosted, and licensed under GPL-3.0. It is not production ready. See [Project Status](#project-status) before evaluating it for anything real.
+> **Community project by [Greenhat-Security](https://github.com/Greenhat-Security).** GreenGateway (GG) is pre-alpha, self-hosted, and source-available under the Apache License 2.0 with the Commons Clause. It is not production ready. See [Project Status](#project-status) before evaluating it for anything real.
 
 ## Table of Contents
 
@@ -41,7 +41,7 @@
 
 ## What GreenGateway Is
 
-GreenGateway — GG for short — is an open-source, self-hosted universal MCP and API gateway for teams that want authentication, authorization, traffic visibility, and a visual firewall in front of any API or MCP server, without hand-rolling that control plane themselves.
+GreenGateway — GG for short — is a source-available, self-hosted universal MCP and API gateway for teams that want authentication, authorization, traffic visibility, and a visual firewall in front of any API or MCP server, without hand-rolling that control plane themselves.
 
 It is designed to sit between clients and existing HTTP backends or MCP servers, learn what is being used, and turn that traffic into enforceable, reviewable rules.
 
@@ -209,7 +209,9 @@ Security-relevant changes — auth, RBAC, egress controls, audit behavior, secre
 
 ## License
 
-GreenGateway is licensed under [GPL-3.0](LICENSE).
+This project is source-available under the [Apache License 2.0 with the Commons Clause](LICENSE). You may use, fork, and modify the software for personal or internal business use. You may not sell, resell, host, offer, or provide this software, or a substantially similar derivative, as a paid product, hosted SaaS, support offering, or commercial service without a separate commercial license from the copyright holder.
+
+Commercial SaaS, resale, paid hosting, managed service, or paid support usage requires a separate written commercial license. See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
 
 ---
 
