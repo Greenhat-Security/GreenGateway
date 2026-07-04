@@ -70,6 +70,7 @@ const JWT_JWKS_TIMEOUT_MS: &str = "JWT_JWKS_TIMEOUT_MS";
 const JWT_JWKS_URL: &str = "JWT_JWKS_URL";
 const JWT_REQUIRE_JTI: &str = "JWT_REQUIRE_JTI";
 const MAX_BODY_SIZE: &str = "MAX_BODY_SIZE";
+const OPENAPI_SPEC_PATH: &str = "OPENAPI_SPEC_PATH";
 const POLICY_FILE: &str = "POLICY_FILE";
 const RBAC_EXEMPT_PATHS: &str = "RBAC_EXEMPT_PATHS";
 const RATE_LIMIT_READ_RPS: &str = "RATE_LIMIT_READ_RPS";
@@ -96,6 +97,7 @@ pub struct Config {
     pub audit_sqlite_path: Option<String>,
     pub audit_sqlite_retention_days: Option<u32>,
     pub discovery_sqlite_path: Option<String>,
+    pub openapi_spec_path: Option<PathBuf>,
     pub policy_file: Option<String>,
     pub cors_allow_origins: Vec<String>,
     pub max_body_size: usize,
@@ -156,6 +158,8 @@ pub struct UpstreamRouteConfig {
     pub strip_request_headers: Vec<String>,
     #[serde(default)]
     pub tls_ca_bundle_path: Option<PathBuf>,
+    #[serde(default)]
+    pub openapi_spec_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +235,8 @@ impl Config {
             get_var(DISCOVERY_SQLITE_PATH),
             &mut problems,
         );
+        let openapi_spec_path =
+            parse_optional_path(OPENAPI_SPEC_PATH, get_var(OPENAPI_SPEC_PATH), &mut problems);
         let policy_file = parse_optional_string(POLICY_FILE, get_var(POLICY_FILE), &mut problems);
         let cors_allow_origins = parse_comma_separated_header_values(
             CORS_ALLOW_ORIGINS,
@@ -474,6 +480,7 @@ impl Config {
                 audit_sqlite_path,
                 audit_sqlite_retention_days,
                 discovery_sqlite_path,
+                openapi_spec_path,
                 policy_file,
                 cors_allow_origins,
                 max_body_size,
@@ -598,6 +605,14 @@ fn parse_optional_string(
     } else {
         Some(value.to_owned())
     }
+}
+
+fn parse_optional_path(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Option<PathBuf> {
+    parse_optional_string(name, value, problems).map(PathBuf::from)
 }
 
 fn parse_optional_var<T>(
@@ -934,6 +949,11 @@ fn validate_upstream_routes(
             route.tls_ca_bundle_path,
             problems,
         );
+        let openapi_spec_path = normalize_route_openapi_spec_path(
+            &format!("{route_name}.openapi_spec_path"),
+            route.openapi_spec_path,
+            problems,
+        );
 
         if path_prefix.is_none() && host.is_none() {
             problems.push(format!(
@@ -965,6 +985,7 @@ fn validate_upstream_routes(
             add_request_headers,
             strip_request_headers,
             tls_ca_bundle_path,
+            openapi_spec_path,
         });
     }
 
@@ -1079,6 +1100,20 @@ fn normalize_route_header_name(
 }
 
 fn normalize_route_tls_ca_bundle_path(
+    name: &str,
+    value: Option<PathBuf>,
+    problems: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let value = value?;
+    if value.as_os_str().is_empty() {
+        problems.push(format!("{name} must be a non-empty filesystem path"));
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn normalize_route_openapi_spec_path(
     name: &str,
     value: Option<PathBuf>,
     problems: &mut Vec<String>,
@@ -1767,6 +1802,31 @@ mod tests {
     }
 
     #[test]
+    fn openapi_spec_path_parses_optional_path() {
+        let config = Config::from_env_vars(|name| match name {
+            "OPENAPI_SPEC_PATH" => Ok("  /etc/greengateway/openapi.yaml  ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.openapi_spec_path,
+            Some(PathBuf::from("/etc/greengateway/openapi.yaml"))
+        );
+    }
+
+    #[test]
+    fn empty_openapi_spec_path_is_none() {
+        let config = Config::from_env_vars(|name| match name {
+            "OPENAPI_SPEC_PATH" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.openapi_spec_path, None);
+    }
+
+    #[test]
     fn policy_file_parses_optional_path() {
         let config = Config::from_env_vars(|name| match name {
             "POLICY_FILE" => Ok("  /etc/greengateway/policy.json  ".to_owned()),
@@ -2145,7 +2205,8 @@ mod tests {
                             " X-Route-Header ": "route-value"
                         },
                         "strip_request_headers": [" X-Client-Secret "],
-                        "tls_ca_bundle_path": "certs/internal-ca.pem"
+                        "tls_ca_bundle_path": "certs/internal-ca.pem",
+                        "openapi_spec_path": "specs/api.yaml"
                     },
                     {
                         "path_prefix": "/assets",
@@ -2174,6 +2235,7 @@ mod tests {
                     )]),
                     strip_request_headers: vec!["x-client-secret".to_owned()],
                     tls_ca_bundle_path: Some(PathBuf::from("certs/internal-ca.pem")),
+                    openapi_spec_path: Some(PathBuf::from("specs/api.yaml")),
                 },
                 UpstreamRouteConfig {
                     path_prefix: Some("/assets".to_owned()),
@@ -2185,9 +2247,31 @@ mod tests {
                     add_request_headers: HashMap::new(),
                     strip_request_headers: Vec::new(),
                     tls_ca_bundle_path: None,
+                    openapi_spec_path: None,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn invalid_upstream_route_openapi_spec_path_is_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[
+                    {
+                        "path_prefix": "/api",
+                        "upstream_url": "https://api.example.test",
+                        "openapi_spec_path": ""
+                    }
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid route OpenAPI spec path");
+
+        let message = error.to_string();
+        assert!(message
+            .contains("UPSTREAM_ROUTES[0].openapi_spec_path must be a non-empty filesystem path"));
+        assert_eq!(error.problems.len(), 1);
     }
 
     #[test]
