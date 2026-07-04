@@ -49,13 +49,13 @@ It is designed to sit between clients and existing HTTP backends or MCP servers,
 
 **GreenGateway is pre-alpha and under active initial development.** It is not production ready yet.
 
-Development follows a 7-phase roadmap. **Phases 1 through 3 are complete, and Phase 4 (traffic discovery) is underway** — a real security middleware stack, authentication, a hot-reloadable RBAC engine (including shadow-enforcement, observe-only auth modes, and data-driven direct firewall rules), an egress firewall with policy-driven overrides, a full audit/observability pipeline, a streaming reverse proxy with multi-upstream routing and per-upstream settings, and a complete policy administration API (read/replace/validate, granular rule operations, and rule preview against historical traffic) all exist and run today (see [What's Real Today](#whats-real-today)). **The rest of Phase 4, and all of Phases 5 through 7, are still largely roadmap and vision**, not shipped functionality — endpoint path templating and a per-endpoint stats aggregator exist, but the traffic inventory API, discovery UI, schema awareness, anomaly signals, native MCP protocol support, and the visual firewall rule builder do not exist yet.
+Development follows a 7-phase roadmap. **Phases 1 through 4 are complete** — a real security middleware stack, authentication, a hot-reloadable RBAC engine (including shadow-enforcement, observe-only auth modes, and data-driven direct firewall rules), an egress firewall with policy-driven overrides, a full audit/observability pipeline, a streaming reverse proxy with multi-upstream routing and per-upstream settings, a complete policy administration API (read/replace/validate, granular rule operations, and rule preview against historical traffic), and full traffic discovery — endpoint inventory, a discovery UI, OpenAPI-based and inferred schema conformance checking, and a deterministic anomaly-signal engine with detectors, admin API, SSE surfacing, and UI — all exist and run today (see [What's Real Today](#whats-real-today)). **Phases 5 through 7 are still roadmap and vision**, not shipped functionality — the visual firewall rule builder, native MCP protocol support, and the broader identity directory do not exist yet.
 
 Progress is tracked in the pinned roadmap issue: [Roadmap / project plan (#44)](https://github.com/Greenhat-Security/GreenGateway/issues/44).
 
 ## What's Real Today
 
-This is what's actually built, working, and covered by CI as of Phases 1-3 and the shipped part of Phase 4:
+This is what's actually built, working, and covered by CI as of Phases 1 through 4:
 
 | Area | What's implemented |
 | --- | --- |
@@ -71,7 +71,9 @@ This is what's actually built, working, and covered by CI as of Phases 1-3 and t
 | **Policy administration** | A complete policy CRUD API: whole-policy read/replace/validate (ETag-guarded against concurrent edits), granular per-rule create/update/delete/reorder operations with an audit trail, and rule preview — evaluate a candidate rule against historical traffic before committing it, plus per-rule historical hit counts — all through protected, permission-gated `/v1/admin/policy*` APIs |
 | **Endpoint discovery** | Path templating that normalizes concrete request paths into stable endpoint shapes (`/users/123` → `/users/{id}`) with cardinality-explosion guards, and a background aggregator that rolls per-endpoint call counts, status distribution, latency percentiles, and distinct-principal counts into a queryable SQLite store — entirely off the request hot path |
 | **Traffic endpoint inventory** | Optional SQLite discovery aggregation (`DISCOVERY_SQLITE_PATH`) with admin APIs for listing endpoint templates, viewing per-endpoint principals, time-series counts, recent raw events, review state, "new since" lifecycle flags, and active-policy direct-rule coverage |
-| **Admin UI** | An embedded Vite + React + TypeScript app, built into the binary and served at `/admin` (or `ADMIN_PREFIX`): a log explorer, a live tail, and a status page reporting real running-config values |
+| **Schema awareness** | Optional OpenAPI 3.x ingestion per upstream matched against observed endpoints (undocumented endpoints, unused operations); opt-in, off-by-default, redaction-aware payload-shape sampling (`PAYLOAD_CAPTURE_ENABLED`); request-shape inference from captured samples when no spec is configured; and request-time conformance checking that flags missing required query params/JSON body keys or undocumented calls, rolling up a `schema_mismatch_count` per endpoint |
+| **Anomaly signals** | A deterministic (not ML) signal engine with lifecycle (open/acknowledged/dismissed) and structured evidence, evaluated entirely off the request hot path: `new_endpoint_seen`, `schema_mismatch`, `error_rate_spike`, `principal_new_to_endpoint`, and `volume_outlier`, each with configurable thresholds; an admin API to list/filter/acknowledge/dismiss; and live `signal.opened`/`signal.lifecycle_changed` events on the SSE feed |
+| **Admin UI** | An embedded Vite + React + TypeScript app, built into the binary and served at `/admin` (or `ADMIN_PREFIX`): a log explorer, live tail, a traffic inventory table and per-endpoint drill-down (with schema-mismatch and signal badges), a signals view (filter, evidence, acknowledge/dismiss, live updates), and a status page reporting real running-config values |
 | **Local dev harness** | Checked-in JWKS/RBAC fixtures, a `docker-compose.dev.yml` profile that brings up a fully authenticated gateway with a sample echo upstream in one command, and a traffic-generator/CI smoke test |
 
 None of this requires a real backend to try — the dev harness in [Quick Start](#quick-start) is self-contained.
@@ -82,7 +84,6 @@ Everything below is roadmap and vision beyond what's listed in [What's Real Toda
 
 | Phase | Capability | Status |
 | --- | --- | --- |
-| 4 | **Traffic discovery** — automatic endpoint inventory, schema conformance checks against observed traffic, anomaly signals | In progress — endpoint-shape path templating, a background per-endpoint stats aggregator, and the traffic inventory admin API (list/detail endpoints with per-principal breakdowns, lifecycle review state, active-policy direct-rule coverage, time-series counts, and recent events) are done; the discovery UI, schema conformance checks, and anomaly signals remain |
 | 5 | **Visual firewall-style rule builder** — inspect discovered traffic, create rules in one click, review policy in shadow mode, roll back through versioned policy history | Not started |
 | 6 | **Native MCP support** — speak the real MCP protocol instead of a bespoke REST facade, with a dynamic tool registry, JSON Schema validation, and OpenAPI-to-tools generation | Not started |
 | 7 | **Identity directory & broader IdP integration** — pluggable OIDC/cookie-session identity providers beyond the current JWT/JWKS validator, plus a Layer-7-firewall-style directory of every user and bot that has traversed the gateway | Not started |
@@ -109,7 +110,7 @@ The HTTP half of the proxy layer above is real today — multi-upstream routing 
 
 ## Quick Start
 
-GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI shell at `/admin`, a working reverse proxy — either a single catch-all `UPSTREAM_URL` or a full multi-upstream routing table — and optional traffic endpoint inventory when `DISCOVERY_SQLITE_PATH` is set (see [What's Real Today](#whats-real-today)). The remaining discovery UI and rule-builder capabilities described in [Planned Scope](#planned-scope) are still pre-alpha roadmap work.
+GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI at `/admin` (traffic inventory, signals, log explorer, live tail, status), a working reverse proxy — either a single catch-all `UPSTREAM_URL` or a full multi-upstream routing table — and optional traffic discovery (endpoint inventory, schema awareness, anomaly signals) when `DISCOVERY_SQLITE_PATH` is set (see [What's Real Today](#whats-real-today)). The visual rule-builder and remaining capabilities described in [Planned Scope](#planned-scope) are still pre-alpha roadmap work.
 
 For the full list of environment variables, see [docs/configuration.md](docs/configuration.md). As more variables land, that document and [.env.example](.env.example) are kept in sync with the code by an automated test.
 

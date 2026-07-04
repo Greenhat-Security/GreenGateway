@@ -7,9 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
-Phase 4 (traffic discovery) is underway. Landed so far:
+Each phase is versioned as it completes (`0.1` for Phase 1, `0.2` for Phase 2,
+`0.3` for Phase 3, `0.4` for Phase 4, … `1.0` once all 7 phases land) — see the
+[pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44)
+for full phase-by-phase status.
 
-### Added — Phase 4 (traffic discovery, in progress)
+## [0.4.0] - 2026-07-04
+
+### Added — Phase 4 (traffic discovery)
 
 - Endpoint path templating: normalizes concrete request paths into stable
   endpoint shapes (`/users/123` → `/users/{id}`), with well-known-ID
@@ -20,11 +25,53 @@ Phase 4 (traffic discovery) is underway. Landed so far:
   `(method, endpoint_template)` call counts, first/last-seen, latency
   percentiles (p50/p95/p99) via a bounded reservoir, status-code
   distribution, and distinct-principal counts.
-
-Each phase is versioned as it completes (`0.1` for Phase 1, `0.2` for Phase 2,
-`0.3` for Phase 3, … `1.0` once all 7 phases land) — see the
-[pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44)
-for full phase-by-phase status.
+- Traffic inventory admin API: `GET /v1{ADMIN_PREFIX}/traffic/endpoints`
+  (filter/sort/paginate) and `GET /v1{ADMIN_PREFIX}/traffic/endpoint` (detail,
+  with audit-enriched time-series and recent events when `AUDIT_SQLITE_PATH`
+  is also configured), plus `POST /v1{ADMIN_PREFIX}/traffic/endpoints/review`
+  to mark/clear a persisted per-endpoint review flag. Endpoint lifecycle
+  fields — `is_new` (configurable window), `reviewed`, and `covered_by_rule`
+  (evaluated live against the active RBAC policy) — are independent booleans,
+  not a single enum.
+- Discovery UI: an embedded traffic inventory table (filters, cursor
+  pagination, new/uncovered/reviewed badges, mark/clear review action) and a
+  per-endpoint drill-down page (status/latency charts, principal breakdown,
+  audit time-series and recent events with honest truncation/omission
+  disclosure when audit enrichment isn't available).
+- Schema awareness: optional OpenAPI 3.x ingestion per upstream, matched
+  against observed endpoints to surface undocumented endpoints and unused
+  spec operations; opt-in (`PAYLOAD_CAPTURE_ENABLED`), off-by-default,
+  redaction-aware sampled request-shape capture with no request/response
+  bodies stored unless explicitly enabled; request-shape inference (query
+  params, JSON body top-level structure) from captured samples when no spec
+  is configured; and request-time conformance checking — spec-based when a
+  spec is configured, inference-based otherwise once enough samples exist —
+  flagging missing required query params/JSON body keys or undocumented
+  calls as `schema_mismatch` on the observation event, rolled up into a
+  persisted `schema_mismatch_count` per endpoint. Conformance checking uses a
+  short-TTL in-memory cache for the inferred-schema lookup path so it never
+  re-scans the discovery database or re-parses historical samples on every
+  request.
+- Anomaly signals v1: a deterministic (not ML) signal engine — evaluated
+  entirely on the background aggregator thread, never inline in request
+  handling — with a generic `Signal` model (type, target, explanation,
+  structured evidence, lifecycle: open/acknowledged/dismissed) and
+  duplicate-prevention via a unique `(signal_type, target_kind, target_key)`
+  constraint. Five detectors ship: `new_endpoint_seen`, `schema_mismatch`,
+  `error_rate_spike` (recent-vs-baseline delta), `principal_new_to_endpoint`
+  (a principal's first call to an endpoint with existing history from other
+  principals), and `volume_outlier` (windowed baseline deviation) — each with
+  its own configurable, validated threshold. An admin API
+  (`GET /v1{ADMIN_PREFIX}/signals`, `POST .../acknowledge`,
+  `POST .../dismiss`) requires the dedicated `admin:signals:read`/
+  `admin:signals:write` permissions; a summarized `open_signals` field on the
+  traffic inventory endpoints requires the same `admin:signals:read`
+  permission in addition to `admin:traffic:read`, computed via a single
+  set-based query per page rather than one query per endpoint. `signal.opened`
+  and `signal.lifecycle_changed` events are pushed on the existing SSE feed,
+  and a new admin UI Signals view (filter, evidence display,
+  acknowledge/dismiss, live updates) plus signal badges on the traffic
+  inventory surface all of the above.
 
 ## [0.3.0] - 2026-07-03
 
