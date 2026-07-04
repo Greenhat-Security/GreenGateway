@@ -94,22 +94,21 @@ impl RateLimitState {
             .store(Arc::new(RateLimitPolicyState::from_policy(Some(policy))));
     }
 
-    fn limiter_for(
-        &self,
-        lane: Lane,
-        method: &Method,
-        path: &str,
-        principal: Option<&auth::Principal>,
-    ) -> RateLimiter {
-        let policy = self.policy.load();
-        if let Some(limiter) = policy.matching_limiter(method.as_str(), path, principal) {
-            return limiter;
-        }
-
+    fn global_limiter(&self, lane: Lane) -> RateLimiter {
         match lane {
             Lane::Read => self.read.clone(),
             Lane::Write => self.write.clone(),
         }
+    }
+
+    fn policy_limiter(
+        &self,
+        method: &Method,
+        path: &str,
+        principal: Option<&auth::Principal>,
+    ) -> Option<RateLimiter> {
+        let policy = self.policy.load();
+        policy.matching_limiter(method.as_str(), path, principal)
     }
 }
 
@@ -209,6 +208,22 @@ pub async fn rate_limit_request(
     next: Next,
 ) -> Response {
     let lane = lane_for(req.method());
+    let path = req.uri().path().to_owned();
+    let client_ip = canonical_client_ip(req.headers(), req.extensions(), state.trust_proxy_headers);
+    let key = unauthenticated_rate_limit_key(req.headers(), &state.session_cookie_name, &client_ip);
+    let limiter = state.global_limiter(lane);
+
+    check_rate_limit(limiter, &key, &client_ip, lane, &path, req, next).await
+}
+
+pub async fn policy_rate_limit_request(
+    State(state): State<RateLimitState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let lane = lane_for(req.method());
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
     let client_ip = canonical_client_ip(req.headers(), req.extensions(), state.trust_proxy_headers);
     let key = rate_limit_key(
         req.extensions(),
@@ -216,24 +231,50 @@ pub async fn rate_limit_request(
         &state.session_cookie_name,
         &client_ip,
     );
-    let limiter = state.limiter_for(
-        lane,
-        req.method(),
-        req.uri().path(),
-        req.extensions().get::<auth::Principal>(),
-    );
+    let Some(limiter) = req
+        .extensions()
+        .get::<auth::Principal>()
+        .and_then(|principal| state.policy_limiter(&method, &path, Some(principal)))
+    else {
+        return next.run(req).await;
+    };
 
-    if !limiter.check(&key) {
+    check_rate_limit(limiter, &key, &client_ip, lane, &path, req, next).await
+}
+
+async fn check_rate_limit(
+    limiter: RateLimiter,
+    key: &str,
+    client_ip: &str,
+    lane: Lane,
+    path: &str,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !limiter.check(key) {
         tracing::warn!(
             client_ip = %client_ip,
             lane = lane.as_str(),
-            path = req.uri().path(),
+            path,
             "rate limit exceeded"
         );
         return too_many_requests();
     }
 
     next.run(req).await
+}
+
+fn unauthenticated_rate_limit_key(
+    headers: &HeaderMap,
+    session_cookie_name: &str,
+    client_ip: &str,
+) -> String {
+    if let Some(session) = session_cookie(headers, session_cookie_name) {
+        // DefaultHasher is sufficient for a non-cryptographic rate-limit fingerprint.
+        return format!("session:{:016x}", hash_str(session));
+    }
+
+    format!("ip:{client_ip}")
 }
 
 fn rate_limit_key(
@@ -383,7 +424,18 @@ mod tests {
         Router::new()
             .fallback(any(ok))
             .layer(from_fn_with_state(state, rate_limit_request))
+    }
+
+    fn test_router_with_policy_layer(state: RateLimitState) -> Router {
+        async fn ok() -> &'static str {
+            "ok"
+        }
+
+        Router::new()
+            .fallback(any(ok))
+            .layer(from_fn_with_state(state.clone(), policy_rate_limit_request))
             .layer(from_fn(inject_test_principal))
+            .layer(from_fn_with_state(state, rate_limit_request))
     }
 
     async fn inject_test_principal(mut req: Request, next: Next) -> Response {
@@ -515,7 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn per_principal_override_selection_uses_matching_principal() {
-        let router = test_router(test_state_with_rate_limits(
+        let router = test_router_with_policy_layer(test_state_with_rate_limits(
             100.0,
             100,
             100.0,
@@ -545,7 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn per_endpoint_override_selection_uses_method_and_path_pattern() {
-        let router = test_router(test_state_with_rate_limits(
+        let router = test_router_with_policy_layer(test_state_with_rate_limits(
             100.0,
             100,
             100.0,
@@ -560,26 +612,54 @@ mod tests {
         ));
 
         assert_eq!(
-            request_status(&router, Method::GET, "/api/widgets/123", None, None).await,
+            request_status(
+                &router,
+                Method::GET,
+                "/api/widgets/123",
+                Some("user-a"),
+                None
+            )
+            .await,
             StatusCode::OK
         );
         assert_eq!(
-            request_status(&router, Method::GET, "/api/widgets/123", None, None).await,
+            request_status(
+                &router,
+                Method::GET,
+                "/api/widgets/123",
+                Some("user-a"),
+                None
+            )
+            .await,
             StatusCode::TOO_MANY_REQUESTS
         );
         assert_eq!(
-            request_status(&router, Method::POST, "/api/widgets/123", None, None).await,
+            request_status(
+                &router,
+                Method::POST,
+                "/api/widgets/123",
+                Some("user-a"),
+                None
+            )
+            .await,
             StatusCode::OK
         );
         assert_eq!(
-            request_status(&router, Method::GET, "/api/widgets/123/details", None, None).await,
+            request_status(
+                &router,
+                Method::GET,
+                "/api/widgets/123/details",
+                Some("user-a"),
+                None
+            )
+            .await,
             StatusCode::OK
         );
     }
 
     #[tokio::test]
     async fn first_matching_rate_limit_override_wins() {
-        let router = test_router(test_state_with_rate_limits(
+        let router = test_router_with_policy_layer(test_state_with_rate_limits(
             100.0,
             100,
             100.0,
@@ -591,22 +671,22 @@ mod tests {
         ));
 
         assert_eq!(
-            request_status(&router, Method::GET, "/first/item", None, None).await,
+            request_status(&router, Method::GET, "/first/item", Some("user-a"), None).await,
             StatusCode::OK
         );
         assert_eq!(
-            request_status(&router, Method::GET, "/first/item", None, None).await,
+            request_status(&router, Method::GET, "/first/item", Some("user-a"), None).await,
             StatusCode::OK
         );
         assert_eq!(
-            request_status(&router, Method::GET, "/first/item", None, None).await,
+            request_status(&router, Method::GET, "/first/item", Some("user-a"), None).await,
             StatusCode::TOO_MANY_REQUESTS
         );
     }
 
     #[tokio::test]
     async fn falls_back_to_global_env_lanes_when_no_rate_limit_override_matches() {
-        let router = test_router(test_state_with_rate_limits(
+        let router = test_router_with_policy_layer(test_state_with_rate_limits(
             0.0,
             1,
             0.0,
@@ -632,7 +712,13 @@ mod tests {
 
     #[tokio::test]
     async fn principal_first_keying_gives_shared_ip_principals_independent_buckets() {
-        let router = test_router(test_state(1, 1));
+        let router = test_router_with_policy_layer(test_state_with_rate_limits(
+            100.0,
+            100,
+            100.0,
+            100,
+            vec![rate_limit_rule(&[], &["GET"], Some("/keyed"), 0.000_001, 1)],
+        ));
 
         assert_eq!(
             request_status(&router, Method::GET, "/keyed", Some("user-a"), None).await,
@@ -652,7 +738,7 @@ mod tests {
         );
         assert_eq!(
             request_status(&router, Method::GET, "/keyed", None, None).await,
-            StatusCode::TOO_MANY_REQUESTS
+            StatusCode::OK
         );
     }
 
@@ -709,14 +795,14 @@ mod tests {
             test_state_with_rate_limits(100.0, 100, 100.0, 100, initial_policy.rate_limits.clone());
         let rbac_state = RbacState::new(initial_policy, Vec::new(), false, test_audit_log())
             .with_rate_limit_state(rate_limit_state.clone());
-        let router = test_router(rate_limit_state);
+        let router = test_router_with_policy_layer(rate_limit_state);
 
         assert_eq!(
-            request_status(&router, Method::GET, "/reload", None, None).await,
+            request_status(&router, Method::GET, "/reload", Some("user-a"), None).await,
             StatusCode::OK
         );
         assert_eq!(
-            request_status(&router, Method::GET, "/reload", None, None).await,
+            request_status(&router, Method::GET, "/reload", Some("user-a"), None).await,
             StatusCode::TOO_MANY_REQUESTS
         );
 
@@ -731,15 +817,15 @@ mod tests {
         reload_policy_from_file(&rbac_state, file.path()).expect("valid reload should succeed");
 
         assert_eq!(
-            request_status(&router, Method::GET, "/reload", None, None).await,
+            request_status(&router, Method::GET, "/reload", Some("user-a"), None).await,
             StatusCode::OK
         );
         assert_eq!(
-            request_status(&router, Method::GET, "/reload", None, None).await,
+            request_status(&router, Method::GET, "/reload", Some("user-a"), None).await,
             StatusCode::OK
         );
         assert_eq!(
-            request_status(&router, Method::GET, "/reload", None, None).await,
+            request_status(&router, Method::GET, "/reload", Some("user-a"), None).await,
             StatusCode::TOO_MANY_REQUESTS
         );
     }
@@ -761,11 +847,16 @@ mod tests {
             1_000_000,
         )]);
         let file = TempPolicyFile::new(&policy_json(&old_policy));
-        let rate_limit_state =
-            test_state_with_rate_limits(100.0, 100, 100.0, 100, old_policy.rate_limits.clone());
+        let rate_limit_state = test_state_with_rate_limits(
+            1_000_000.0,
+            1_000_000,
+            1_000_000.0,
+            1_000_000,
+            old_policy.rate_limits.clone(),
+        );
         let rbac_state = RbacState::new(old_policy, Vec::new(), false, test_audit_log())
             .with_rate_limit_state(rate_limit_state.clone());
-        let router = test_router(rate_limit_state);
+        let router = test_router_with_policy_layer(rate_limit_state);
 
         let reload_state = rbac_state.clone();
         let reload_path = file.path().to_owned();
@@ -798,7 +889,7 @@ mod tests {
             request_tasks.push(tokio::spawn(async move {
                 tokio::time::timeout(
                     Duration::from_secs(5),
-                    request_status(&router, Method::GET, "/swap/item", None, None),
+                    request_status(&router, Method::GET, "/swap/item", Some("user-a"), None),
                 )
                 .await
                 .expect("request should not hang")

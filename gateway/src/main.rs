@@ -464,7 +464,9 @@ fn app_with_process_started_at(
 
     // Later axum layers run earlier at runtime. Attach RBAC before auth, then
     // auth before CSRF, so requests flow through CSRF, auth, RBAC, then the
-    // route handler.
+    // route handler. The coarse global rate limiter remains outside auth for
+    // early IP/session DoS protection; policy overrides run inside auth so
+    // principal-aware buckets are based on real authenticated principals.
     let router = if let Some(rbac_state) = rbac_state {
         router.layer(axum::middleware::from_fn_with_state(
             rbac_state,
@@ -473,6 +475,11 @@ fn app_with_process_started_at(
     } else {
         router
     };
+
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        rate_limit_state.clone(),
+        middleware::rate_limit::policy_rate_limit_request,
+    ));
 
     let router = if config.auth_enabled {
         router.layer(axum::middleware::from_fn_with_state(
@@ -3421,6 +3428,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_rate_limit_uses_real_authenticated_principal_buckets_in_app_stack() {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "deny",
+                "enforcement_mode": "enforce",
+                "roles": {
+                    "member": { "permissions": ["test:read"] }
+                },
+                "routes": [
+                    {
+                        "path_prefix": "/__test",
+                        "permission": "test:read"
+                    }
+                ],
+                "rate_limits": [
+                    {
+                        "principal": {
+                            "auth_methods": ["bearer_token"]
+                        },
+                        "methods": ["GET"],
+                        "path": "/__test/principal",
+                        "requests_per_second": 0.000001,
+                        "burst": 1
+                    }
+                ]
+            }"#,
+        );
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.jwt_jwks_url = Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+        let user_a_token = signed_token("user-a", &["member"]);
+        let user_b_token = signed_token("user-b", &["member"]);
+
+        let first_user_a = authenticated_principal_probe(&router, &user_a_token).await;
+        assert_eq!(first_user_a.status(), StatusCode::OK);
+        assert_eq!(json_body(first_user_a).await["user_id"], json!("user-a"));
+
+        let second_user_a = authenticated_principal_probe(&router, &user_a_token).await;
+        assert_eq!(second_user_a.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            body_string(second_user_a).await,
+            r#"{"error":"too many requests"}"#
+        );
+
+        let first_user_b = authenticated_principal_probe(&router, &user_b_token).await;
+        assert_eq!(first_user_b.status(), StatusCode::OK);
+        assert_eq!(json_body(first_user_b).await["user_id"], json!("user-b"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_requests_without_policy_override_use_global_rate_limit_in_app_stack() {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "roles": {},
+                "rate_limits": [
+                    {
+                        "methods": ["GET"],
+                        "path": "/elsewhere",
+                        "requests_per_second": 100.0,
+                        "burst": 100
+                    }
+                ]
+            }"#,
+        );
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.rate_limit_read_rps = 0.0;
+        config.rate_limit_read_burst = 1;
+        config.jwt_jwks_url = Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+        let token = signed_token("user-a", &["member"]);
+
+        let first = authenticated_principal_probe(&router, &token).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(json_body(first).await["user_id"], json!("user-a"));
+
+        let second = authenticated_principal_probe(&router, &token).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_requests_still_use_pre_auth_global_rate_limit_in_app_stack() {
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "roles": {},
+                "rate_limits": [
+                    {
+                        "methods": ["GET"],
+                        "path": "/__test/principal",
+                        "requests_per_second": 100.0,
+                        "burst": 100
+                    }
+                ]
+            }"#,
+        );
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.rate_limit_read_rps = 0.0;
+        config.rate_limit_read_burst = 1;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let first = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+
+        let second = router
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
     async fn cors_allows_allowlisted_origin() {
         let response = preflight_response(
             test_config(vec!["http://localhost:3000"]),
@@ -3802,6 +3966,23 @@ mod tests {
         .expect("body should be UTF-8")
     }
 
+    async fn authenticated_principal_probe(
+        router: &Router,
+        token: &str,
+    ) -> axum::response::Response {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete")
+    }
+
     fn assert_content_type_starts_with(headers: &http::HeaderMap, expected: &str) {
         let content_type = headers
             .get(header::CONTENT_TYPE)
@@ -3880,14 +4061,18 @@ O2gecI9QwDJNpm29J9wJB2F8
     }
 
     fn signed_admin_token() -> String {
+        signed_token("user-123", &["admin"])
+    }
+
+    fn signed_token(user_id: &str, roles: &[&str]) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TEST_JWT_KID.to_owned());
         let claims = json!({
-            "sub": "user-123",
-            "email": "User@Example.COM",
+            "sub": user_id,
+            "email": format!("{user_id}@example.test"),
             "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
-            "jti": "session-123",
-            "roles": ["admin"]
+            "jti": format!("{user_id}-session"),
+            "roles": roles
         });
 
         encode(
