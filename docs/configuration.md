@@ -274,6 +274,30 @@ Default: empty, which disables proxying and leaves unmatched paths on axum's def
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be a valid `http` or `https` URL with a host. The proxy uses only the configured scheme, host, and port; each incoming request's path and query are forwarded unchanged. The upstream host is automatically trusted for gateway-originated egress, so operators do not need to duplicate it in `EGRESS_ALLOWED_HOSTS`. Private resolved IP ranges are still blocked by default unless `EGRESS_DENY_PRIVATE_IPS=false` is explicitly configured.
 
+### UPSTREAM_TIMEOUT_MS
+
+Optional total timeout override for configured upstream proxy requests, in milliseconds.
+
+Default: empty, which inherits `EGRESS_TIMEOUT_MS`.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. This applies only to requests sent to `UPSTREAM_URL`, including the background upstream reachability check; other gateway-originated egress, such as JWKS fetches, continues to use `EGRESS_TIMEOUT_MS`.
+
+### UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS
+
+Optional idle timeout override between streamed upstream response body chunks, in milliseconds.
+
+Default: empty, which inherits `EGRESS_RESPONSE_IDLE_TIMEOUT_MS`.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. This applies only to streaming proxy responses from `UPSTREAM_URL`.
+
+### UPSTREAM_CONNECT_TIMEOUT_MS
+
+Optional TCP/TLS connection timeout override for configured upstream proxy requests, in milliseconds.
+
+Default: empty, which inherits `EGRESS_CONNECT_TIMEOUT_MS`.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. This applies only to requests sent to `UPSTREAM_URL`, including the background upstream reachability check.
+
 ## Gateway-Owned Paths And Proxy Collisions
 
 GreenGateway separates its control plane from proxied data-plane traffic. Gateway-owned paths are matched before the reverse proxy fallback, and unmatched paths under gateway-owned control-plane prefixes are not forwarded to the upstream. If an upstream also serves content at one of these paths, that upstream content is unreachable through GreenGateway at the colliding path; move the gateway admin surface with `ADMIN_PREFIX` if the upstream genuinely needs that namespace.
