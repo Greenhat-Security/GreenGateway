@@ -1,4 +1,6 @@
 use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     path::{Path, PathBuf},
@@ -16,6 +18,9 @@ pub const DEFAULT_NEW_SINCE_HOURS: u64 = 24;
 /// far beyond any meaningful "new since" window; guards against overflow in
 /// `TimeDuration::hours` for pathological caller-supplied values.
 pub const MAX_NEW_SINCE_HOURS: u64 = 876_000;
+/// A field is inferred as likely required when it appears in at least this
+/// fraction of the payload-shape reservoir samples for an endpoint.
+pub const INFERRED_SCHEMA_REQUIRED_THRESHOLD: f64 = 0.95;
 
 const CREATE_REVIEW_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS discovery_endpoint_reviews (
@@ -203,6 +208,47 @@ impl Error for DiscoveryQueryError {
 pub struct ObservedEndpoint {
     pub method: String,
     pub endpoint_template: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct InferredRequestSchema {
+    pub method: String,
+    pub endpoint_template: String,
+    pub sample_count: u64,
+    pub required_threshold: f64,
+    pub query_params: Vec<InferredQueryParam>,
+    pub json_body_keys: Vec<InferredJsonBodyKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct InferredQueryParam {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_hash: Option<String>,
+    pub redacted: bool,
+    pub present_count: u64,
+    pub frequency: f64,
+    pub required: bool,
+    pub value_types: Vec<InferredValueTypeCount>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InferredValueTypeCount {
+    pub value_type: String,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct InferredJsonBodyKey {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_hash: Option<String>,
+    pub redacted: bool,
+    pub present_count: u64,
+    pub frequency: f64,
+    pub required: bool,
 }
 
 impl DiscoveryQueryStore {
@@ -395,6 +441,67 @@ impl DiscoveryQueryStore {
         Ok(Some(row.into_detail(status_counts, &new_since_cutoff)?))
     }
 
+    pub fn inferred_request_schema(
+        &self,
+        method: &str,
+        endpoint_template: &str,
+    ) -> Result<Option<InferredRequestSchema>, DiscoveryQueryError> {
+        let connection = self.connection_guard();
+        let mut statement = match connection.prepare(
+            r#"
+            SELECT shape_json
+            FROM discovery_payload_shape_samples
+            WHERE method = ?1 AND endpoint_template = ?2
+            ORDER BY sample_slot
+            "#,
+        ) {
+            Ok(statement) => statement,
+            Err(source) if is_missing_payload_shape_sample_table(&source) => return Ok(None),
+            Err(source) => {
+                return Err(DiscoveryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })
+            }
+        };
+
+        let shape_jsons = statement
+            .query_map(params![method, endpoint_template], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|source| DiscoveryQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| DiscoveryQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        if shape_jsons.is_empty() {
+            return Ok(None);
+        }
+
+        let shapes = shape_jsons
+            .iter()
+            .map(|shape_json| {
+                serde_json::from_str::<CapturedPayloadShapeSample>(shape_json).map_err(|source| {
+                    DiscoveryQueryError::Json {
+                        context: "payload shape sample",
+                        source,
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Some(infer_request_schema(
+            method,
+            endpoint_template,
+            &shapes,
+        )))
+    }
+
     pub fn set_endpoint_review(
         &self,
         method: &str,
@@ -576,6 +683,229 @@ struct RawEndpointAggregate {
     updated_at: String,
     reviewed_at: Option<String>,
     reviewed_by: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CapturedPayloadShapeSample {
+    #[serde(default)]
+    query_params: Vec<CapturedQueryParamSample>,
+    json_body: Option<CapturedJsonBodyShapeSample>,
+}
+
+#[derive(Deserialize)]
+struct CapturedQueryParamSample {
+    #[serde(flatten)]
+    field: CapturedFieldNameSample,
+    value_type: String,
+}
+
+#[derive(Deserialize)]
+struct CapturedJsonBodyShapeSample {
+    #[serde(default)]
+    top_level_keys: Vec<CapturedFieldNameSample>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+struct CapturedFieldNameSample {
+    name: Option<String>,
+    name_hash: Option<String>,
+    redacted: bool,
+}
+
+impl CapturedFieldNameSample {
+    fn is_identified(&self) -> bool {
+        self.name.is_some() || self.name_hash.is_some()
+    }
+}
+
+#[derive(Default)]
+struct QueryParamInference {
+    present_count: u64,
+    value_type_counts: BTreeMap<String, u64>,
+}
+
+#[derive(Default)]
+struct FieldPresenceInference {
+    present_count: u64,
+}
+
+fn infer_request_schema(
+    method: &str,
+    endpoint_template: &str,
+    shapes: &[CapturedPayloadShapeSample],
+) -> InferredRequestSchema {
+    let sample_count = u64::try_from(shapes.len()).unwrap_or(u64::MAX);
+    let mut query_params = BTreeMap::<CapturedFieldNameSample, QueryParamInference>::new();
+    let mut json_body_keys = BTreeMap::<CapturedFieldNameSample, FieldPresenceInference>::new();
+
+    for shape in shapes {
+        let mut sample_query_params = BTreeMap::<CapturedFieldNameSample, BTreeSet<String>>::new();
+        for param in &shape.query_params {
+            if !param.field.is_identified() {
+                continue;
+            }
+            sample_query_params
+                .entry(param.field.clone())
+                .or_default()
+                .insert(param.value_type.clone());
+        }
+        for (field, value_types) in sample_query_params {
+            let inference = query_params.entry(field).or_default();
+            inference.present_count = inference.present_count.saturating_add(1);
+            for value_type in value_types {
+                *inference.value_type_counts.entry(value_type).or_insert(0) += 1;
+            }
+        }
+
+        let mut sample_body_keys = BTreeSet::<CapturedFieldNameSample>::new();
+        if let Some(json_body) = shape.json_body.as_ref() {
+            for field in &json_body.top_level_keys {
+                if field.is_identified() {
+                    sample_body_keys.insert(field.clone());
+                }
+            }
+        }
+        for field in sample_body_keys {
+            let inference = json_body_keys.entry(field).or_default();
+            inference.present_count = inference.present_count.saturating_add(1);
+        }
+    }
+
+    let mut query_params = query_params
+        .into_iter()
+        .map(|(field, inference)| inferred_query_param(field, inference, sample_count))
+        .collect::<Vec<_>>();
+    query_params.sort_by(compare_inferred_query_params);
+
+    let mut json_body_keys = json_body_keys
+        .into_iter()
+        .map(|(field, inference)| inferred_json_body_key(field, inference, sample_count))
+        .collect::<Vec<_>>();
+    json_body_keys.sort_by(compare_inferred_json_body_keys);
+
+    InferredRequestSchema {
+        method: method.to_owned(),
+        endpoint_template: endpoint_template.to_owned(),
+        sample_count,
+        required_threshold: INFERRED_SCHEMA_REQUIRED_THRESHOLD,
+        query_params,
+        json_body_keys,
+    }
+}
+
+fn inferred_query_param(
+    field: CapturedFieldNameSample,
+    inference: QueryParamInference,
+    sample_count: u64,
+) -> InferredQueryParam {
+    let frequency = inferred_frequency(inference.present_count, sample_count);
+    let mut value_types = inference
+        .value_type_counts
+        .into_iter()
+        .map(|(value_type, count)| InferredValueTypeCount { value_type, count })
+        .collect::<Vec<_>>();
+    value_types.sort_by(compare_value_type_counts);
+
+    InferredQueryParam {
+        name: field.name,
+        name_hash: field.name_hash,
+        redacted: field.redacted,
+        present_count: inference.present_count,
+        frequency,
+        required: frequency >= INFERRED_SCHEMA_REQUIRED_THRESHOLD,
+        value_types,
+    }
+}
+
+fn inferred_json_body_key(
+    field: CapturedFieldNameSample,
+    inference: FieldPresenceInference,
+    sample_count: u64,
+) -> InferredJsonBodyKey {
+    let frequency = inferred_frequency(inference.present_count, sample_count);
+
+    InferredJsonBodyKey {
+        name: field.name,
+        name_hash: field.name_hash,
+        redacted: field.redacted,
+        present_count: inference.present_count,
+        frequency,
+        required: frequency >= INFERRED_SCHEMA_REQUIRED_THRESHOLD,
+    }
+}
+
+fn inferred_frequency(present_count: u64, sample_count: u64) -> f64 {
+    if sample_count == 0 {
+        0.0
+    } else {
+        present_count as f64 / sample_count as f64
+    }
+}
+
+fn compare_inferred_query_params(
+    left: &InferredQueryParam,
+    right: &InferredQueryParam,
+) -> Ordering {
+    right.present_count.cmp(&left.present_count).then_with(|| {
+        compare_field_names(
+            left.redacted,
+            &left.name,
+            &left.name_hash,
+            right.redacted,
+            &right.name,
+            &right.name_hash,
+        )
+    })
+}
+
+fn compare_inferred_json_body_keys(
+    left: &InferredJsonBodyKey,
+    right: &InferredJsonBodyKey,
+) -> Ordering {
+    right.present_count.cmp(&left.present_count).then_with(|| {
+        compare_field_names(
+            left.redacted,
+            &left.name,
+            &left.name_hash,
+            right.redacted,
+            &right.name,
+            &right.name_hash,
+        )
+    })
+}
+
+fn compare_field_names(
+    left_redacted: bool,
+    left_name: &Option<String>,
+    left_name_hash: &Option<String>,
+    right_redacted: bool,
+    right_name: &Option<String>,
+    right_name_hash: &Option<String>,
+) -> Ordering {
+    left_redacted
+        .cmp(&right_redacted)
+        .then_with(|| {
+            left_name
+                .as_deref()
+                .unwrap_or("")
+                .cmp(right_name.as_deref().unwrap_or(""))
+        })
+        .then_with(|| {
+            left_name_hash
+                .as_deref()
+                .unwrap_or("")
+                .cmp(right_name_hash.as_deref().unwrap_or(""))
+        })
+}
+
+fn compare_value_type_counts(
+    left: &InferredValueTypeCount,
+    right: &InferredValueTypeCount,
+) -> Ordering {
+    right
+        .count
+        .cmp(&left.count)
+        .then_with(|| left.value_type.cmp(&right.value_type))
 }
 
 impl RawEndpointAggregate {
@@ -1045,11 +1375,21 @@ fn is_missing_discovery_table(error: &rusqlite::Error) -> bool {
     }
 }
 
+fn is_missing_payload_shape_sample_table(error: &rusqlite::Error) -> bool {
+    match error {
+        rusqlite::Error::SqliteFailure(_, Some(message)) => {
+            message.contains("no such table: discovery_payload_shape_samples")
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::PathBuf};
 
     use rusqlite::{params, Connection};
+    use serde_json::json;
 
     use super::*;
 
@@ -1077,6 +1417,186 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn infers_request_schema_from_payload_shape_samples() {
+        let db = TempDb::new("query-inferred-schema");
+        seed_payload_shape_samples(
+            &db.path,
+            "POST",
+            "/users/{id}",
+            &[
+                json!({
+                    "query_params": [
+                        { "name": "page", "redacted": false, "value_type": "number" },
+                        { "name": "filter", "redacted": false, "value_type": "string" }
+                    ],
+                    "json_body": {
+                        "top_level_keys": [
+                            { "name": "display_name", "redacted": false },
+                            { "name_hash": "sha256:redacted-token-key", "redacted": true }
+                        ]
+                    }
+                }),
+                json!({
+                    "query_params": [
+                        { "name": "page", "redacted": false, "value_type": "number" }
+                    ],
+                    "json_body": {
+                        "top_level_keys": [
+                            { "name": "display_name", "redacted": false },
+                            { "name_hash": "sha256:redacted-token-key", "redacted": true }
+                        ]
+                    }
+                }),
+                json!({
+                    "query_params": [
+                        { "name": "page", "redacted": false, "value_type": "string" },
+                        { "name": "filter", "redacted": false, "value_type": "string" }
+                    ],
+                    "json_body": {
+                        "top_level_keys": [
+                            { "name": "display_name", "redacted": false },
+                            { "name_hash": "sha256:redacted-token-key", "redacted": true }
+                        ]
+                    }
+                }),
+                json!({
+                    "query_params": [
+                        { "name": "page", "redacted": false, "value_type": "number" },
+                        { "name": "debug", "redacted": false, "value_type": "string" }
+                    ],
+                    "json_body": {
+                        "top_level_keys": [
+                            { "name": "display_name", "redacted": false }
+                        ]
+                    }
+                }),
+            ],
+        );
+        let store = DiscoveryQueryStore::open(&db.path).expect("discovery query store should open");
+
+        let schema = store
+            .inferred_request_schema("POST", "/users/{id}")
+            .expect("inferred schema should query")
+            .expect("inferred schema should exist");
+
+        assert_eq!(schema.method, "POST");
+        assert_eq!(schema.endpoint_template, "/users/{id}");
+        assert_eq!(schema.sample_count, 4);
+        assert_eq!(
+            schema.required_threshold,
+            INFERRED_SCHEMA_REQUIRED_THRESHOLD
+        );
+        assert_eq!(schema.query_params.len(), 3);
+        assert_eq!(schema.query_params[0].name.as_deref(), Some("page"));
+        assert_eq!(schema.query_params[0].present_count, 4);
+        assert_eq!(schema.query_params[0].frequency, 1.0);
+        assert!(schema.query_params[0].required);
+        assert_eq!(
+            schema.query_params[0].value_types,
+            vec![
+                InferredValueTypeCount {
+                    value_type: "number".to_owned(),
+                    count: 3,
+                },
+                InferredValueTypeCount {
+                    value_type: "string".to_owned(),
+                    count: 1,
+                },
+            ]
+        );
+        assert_eq!(schema.query_params[1].name.as_deref(), Some("filter"));
+        assert_eq!(schema.query_params[1].present_count, 2);
+        assert_eq!(schema.query_params[1].frequency, 0.5);
+        assert!(!schema.query_params[1].required);
+        assert_eq!(schema.query_params[2].name.as_deref(), Some("debug"));
+        assert_eq!(schema.query_params[2].present_count, 1);
+        assert!(!schema.query_params[2].required);
+
+        assert_eq!(schema.json_body_keys.len(), 2);
+        assert_eq!(
+            schema.json_body_keys[0].name.as_deref(),
+            Some("display_name")
+        );
+        assert_eq!(schema.json_body_keys[0].name_hash, None);
+        assert_eq!(schema.json_body_keys[0].present_count, 4);
+        assert!(schema.json_body_keys[0].required);
+        assert_eq!(schema.json_body_keys[1].name, None);
+        assert_eq!(
+            schema.json_body_keys[1].name_hash.as_deref(),
+            Some("sha256:redacted-token-key")
+        );
+        assert!(schema.json_body_keys[1].redacted);
+        assert_eq!(schema.json_body_keys[1].present_count, 3);
+        assert_eq!(schema.json_body_keys[1].frequency, 0.75);
+        assert!(!schema.json_body_keys[1].required);
+    }
+
+    #[test]
+    fn inferred_request_schema_keeps_redacted_fields_hash_identified() {
+        let db = TempDb::new("query-inferred-redacted");
+        seed_payload_shape_samples(
+            &db.path,
+            "POST",
+            "/login",
+            &[json!({
+                "query_params": [
+                    { "name_hash": "sha256:redacted-query-key", "redacted": true, "value_type": "string" }
+                ],
+                "json_body": {
+                    "top_level_keys": [
+                        { "name_hash": "sha256:redacted-body-key", "redacted": true }
+                    ]
+                }
+            })],
+        );
+        let store = DiscoveryQueryStore::open(&db.path).expect("discovery query store should open");
+
+        let schema = store
+            .inferred_request_schema("POST", "/login")
+            .expect("inferred schema should query")
+            .expect("inferred schema should exist");
+
+        assert_eq!(schema.query_params[0].name, None);
+        assert_eq!(
+            schema.query_params[0].name_hash.as_deref(),
+            Some("sha256:redacted-query-key")
+        );
+        assert!(schema.query_params[0].redacted);
+        assert_eq!(schema.json_body_keys[0].name, None);
+        assert_eq!(
+            schema.json_body_keys[0].name_hash.as_deref(),
+            Some("sha256:redacted-body-key")
+        );
+        assert!(schema.json_body_keys[0].redacted);
+        let serialized = serde_json::to_string(&schema).expect("schema should serialize");
+        assert!(!serialized.contains("password"));
+        assert!(!serialized.contains("token"));
+        assert!(!serialized.contains("secret"));
+    }
+
+    #[test]
+    fn inferred_request_schema_returns_none_without_samples_for_endpoint() {
+        let db = TempDb::new("query-inferred-none");
+        seed_payload_shape_samples(
+            &db.path,
+            "GET",
+            "/users",
+            &[json!({
+                "query_params": [
+                    { "name": "page", "redacted": false, "value_type": "number" }
+                ]
+            })],
+        );
+        let store = DiscoveryQueryStore::open(&db.path).expect("discovery query store should open");
+
+        let schema = store
+            .inferred_request_schema("POST", "/users")
+            .expect("inferred schema should query");
+
+        assert!(schema.is_none());
     }
 
     fn seed_endpoint(path: &PathBuf, method: &str, endpoint_template: &str) {
@@ -1123,6 +1643,80 @@ mod tests {
                 params![method, endpoint_template],
             )
             .expect("endpoint aggregate should insert");
+    }
+
+    fn seed_payload_shape_samples(
+        path: &PathBuf,
+        method: &str,
+        endpoint_template: &str,
+        shapes: &[serde_json::Value],
+    ) {
+        let connection = Connection::open(path).expect("test database should open");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS discovery_payload_shape_stats (
+                    method TEXT NOT NULL,
+                    endpoint_template TEXT NOT NULL,
+                    shape_observation_count INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (method, endpoint_template)
+                );
+
+                CREATE TABLE IF NOT EXISTS discovery_payload_shape_samples (
+                    method TEXT NOT NULL,
+                    endpoint_template TEXT NOT NULL,
+                    sample_slot INTEGER NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    shape_hash TEXT NOT NULL,
+                    shape_json TEXT NOT NULL,
+                    PRIMARY KEY (method, endpoint_template, sample_slot)
+                );
+                "#,
+            )
+            .expect("payload shape schema should create");
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_payload_shape_stats (
+                    method,
+                    endpoint_template,
+                    shape_observation_count,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, '2024-06-01T12:00:00Z')
+                "#,
+                params![
+                    method,
+                    endpoint_template,
+                    i64::try_from(shapes.len()).expect("shape count should fit i64")
+                ],
+            )
+            .expect("payload shape stats should insert");
+
+        for (index, shape) in shapes.iter().enumerate() {
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO discovery_payload_shape_samples (
+                        method,
+                        endpoint_template,
+                        sample_slot,
+                        observed_at,
+                        shape_hash,
+                        shape_json
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#,
+                    params![
+                        method,
+                        endpoint_template,
+                        i64::try_from(index).expect("sample slot should fit i64"),
+                        format!("2024-06-01T12:00:0{index}Z"),
+                        format!("sha256:test-shape-{index}"),
+                        shape.to_string(),
+                    ],
+                )
+                .expect("payload shape sample should insert");
+        }
     }
 
     struct TempDb {
