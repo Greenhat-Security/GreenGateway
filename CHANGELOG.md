@@ -12,6 +12,48 @@ Each phase is versioned as it completes (`0.1` for Phase 1, `0.2` for Phase 2,
 [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44)
 for full phase-by-phase status.
 
+## [0.5.0] - 2026-07-04
+
+### Added — Phase 5 (visual rule builder)
+
+- Rule suggestions from observed traffic: a suggestion engine (evaluated
+  off the request hot path) generating baseline `allow` suggestions from the
+  observed role/endpoint matrix and anomaly-derived `deny`/`shadow`
+  suggestions from open discovery signals, deduplicated against existing
+  policy coverage. An admin API (`GET /v1{ADMIN_PREFIX}/suggestions`,
+  `POST .../accept`, `POST .../dismiss`) requires `admin:suggestions:read`/
+  `admin:suggestions:write`; accepting a suggestion additionally requires
+  `admin:policy:write` since it creates a real policy rule.
+- Visual rule builder UI: an ordered rule table (drag-reorder, enable/disable
+  toggles, per-rule hit counts, action color coding, default-action banner)
+  and a rule editor (visual matcher builder for method/path/principal/action
+  with inventory-backed path hints, a debounced live preview against
+  historical traffic before saving) — full rule lifecycle (create, edit,
+  reorder, disable, delete) without touching JSON. One-click "create rule"
+  actions from a traffic inventory endpoint, a live-tail event, or an
+  anomaly signal pre-fill the editor's matcher fields; signal-originated
+  rules default to `shadow` so their impact can be previewed before
+  enforcing.
+- Policy versioning, diff, and rollback: every policy mutation (rule
+  create/patch/delete/reorder, full-document replace, and rollback itself)
+  appends an append-only version record (actor, timestamp, structured diff)
+  to a dedicated SQLite store; `GET /v1{ADMIN_PREFIX}/policy/history` and
+  `POST /v1{ADMIN_PREFIX}/policy/rollback/{version}` expose it, with a
+  version-history timeline UI (human-readable per-action diff sentences,
+  one-click rollback validated against the current live policy ETag). A
+  history-store write failure never turns an already-successful policy
+  mutation into an error response — it's surfaced as a non-fatal
+  `X-GreenGateway-Policy-History-Warning` response header instead.
+- Shadow-mode review workflow: a review queue over the direct-firewall-rule
+  engine's live `action: shadow` enforcement (rules are evaluated before the
+  route-permission model; a matching shadow rule forwards the request and
+  emits a real `authz.would_deny` audit event carrying the matched rule's
+  id). `GET /v1{ADMIN_PREFIX}/policy/rules/shadow-review` aggregates, per
+  currently-enabled shadow rule, a would-deny count, distinct affected
+  principals, and sample requests in a single bounded scan; the UI adds
+  one-click Promote (shadow → deny, gated behind an explicit confirmation
+  step since it starts enforcing real blocks) and Disable actions.
+
 ### Fixed
 
 - Firewall rules and rate-limit overrides with a path segment that looks like
