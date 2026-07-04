@@ -331,14 +331,19 @@ fn app_with_process_started_at(
         .map(audit::query::AuditQueryStore::open)
         .transpose()?
         .map(Arc::new);
-    let egress_config = egress::EgressConfig::from_config(&config);
-    let egress_allowed_hosts_count = egress_config.allowed_hosts.len();
+    let loaded_policy = rbac::Policy::from_config(&config)?;
+    let egress_config = match loaded_policy.as_ref() {
+        Some(policy) => {
+            egress::EgressConfig::from_config_and_policy(&config, Some(&policy.egress))?
+        }
+        None => egress::EgressConfig::from_config(&config),
+    };
+    let egress_allowed_hosts_count = egress_config.allowed_host_rule_count();
     let egress_client = Arc::new(egress::EgressClient::new(egress_config)?);
     let proxy_state = ProxyState::from_config(&config, Arc::clone(&egress_client));
     let routes = GatewayRoutes::from_config(&config);
     let validator = auth::JwtValidator::from_config(&config, egress_client)?
         .map(|validator| Arc::new(validator) as Arc<dyn auth::SessionValidator>);
-    let loaded_policy = rbac::Policy::from_config(&config)?;
     let rbac_status = RbacStatus {
         policy_loaded: loaded_policy.is_some(),
         policy_id: loaded_policy.as_ref().and_then(|policy| policy.id.clone()),

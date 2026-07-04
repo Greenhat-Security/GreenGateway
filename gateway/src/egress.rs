@@ -9,10 +9,11 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::{stream, Stream, StreamExt};
+use ipnet::IpNet;
 use reqwest::{header::HeaderMap, Method, StatusCode, Url};
 use tokio::net::lookup_host;
 
-use crate::config::Config;
+use crate::{config::Config, rbac::EgressPolicy};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -22,7 +23,9 @@ const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 #[derive(Debug)]
 pub enum EgressError {
     HostNotAllowed(String),
+    PortNotAllowed(u16),
     PrivateIpBlocked(IpAddr),
+    InvalidPolicy(String),
     DnsResolutionFailed(String),
     InvalidUrl(String),
     SchemeNotAllowed(String),
@@ -36,7 +39,11 @@ impl fmt::Display for EgressError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HostNotAllowed(host) => write!(formatter, "egress host is not allowed: {host}"),
+            Self::PortNotAllowed(port) => write!(formatter, "egress port is not allowed: {port}"),
             Self::PrivateIpBlocked(ip) => write!(formatter, "egress private IP is blocked: {ip}"),
+            Self::InvalidPolicy(message) => {
+                write!(formatter, "egress policy is invalid: {message}")
+            }
             Self::DnsResolutionFailed(host) => {
                 write!(formatter, "egress DNS resolution failed for {host}")
             }
@@ -88,9 +95,23 @@ impl EgressError {
     }
 }
 
+/// Effective outbound egress controls.
+///
+/// `allowed_hosts` contains exact bootstrap hosts from `EGRESS_ALLOWED_HOSTS`
+/// and auto-seeded infrastructure endpoint URLs. `allowed_host_globs`,
+/// `private_ip_allow_cidrs`, and `allowed_ports` are layered from the optional
+/// policy `egress` section. Host patterns are additive: an outbound request
+/// must match either an exact bootstrap host or a policy host pattern. If
+/// `allowed_ports` is non-empty, the URL's destination port must be listed.
+/// If `deny_private_ips` is true, any private resolved address still blocks
+/// the request unless that private IP is explicitly covered by one of the
+/// policy CIDRs; policy CIDRs do not disable private-IP blocking globally.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EgressConfig {
     pub allowed_hosts: HashSet<String>,
+    pub allowed_host_globs: Vec<String>,
+    pub private_ip_allow_cidrs: Vec<IpNet>,
+    pub allowed_ports: HashSet<u16>,
     pub timeout: Duration,
     pub response_idle_timeout: Duration,
     pub connect_timeout: Duration,
@@ -103,6 +124,9 @@ impl Default for EgressConfig {
     fn default() -> Self {
         Self {
             allowed_hosts: HashSet::new(),
+            allowed_host_globs: Vec::new(),
+            private_ip_allow_cidrs: Vec::new(),
+            allowed_ports: HashSet::new(),
             timeout: DEFAULT_TIMEOUT,
             response_idle_timeout: DEFAULT_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -147,6 +171,9 @@ impl EgressConfig {
 
         Self {
             allowed_hosts,
+            allowed_host_globs: Vec::new(),
+            private_ip_allow_cidrs: Vec::new(),
+            allowed_ports: HashSet::new(),
             timeout: Duration::from_millis(config.egress_timeout_ms),
             response_idle_timeout: Duration::from_millis(config.egress_response_idle_timeout_ms),
             connect_timeout: Duration::from_millis(config.egress_connect_timeout_ms),
@@ -154,6 +181,36 @@ impl EgressConfig {
             max_request_body_bytes: config.egress_max_request_body_bytes,
             deny_private_ips: config.egress_deny_private_ips,
         }
+    }
+
+    pub fn from_config_and_policy(
+        config: &Config,
+        policy: Option<&EgressPolicy>,
+    ) -> Result<Self, EgressError> {
+        let mut effective = Self::from_config(config);
+        if let Some(policy) = policy {
+            effective.apply_policy(policy)?;
+        }
+
+        Ok(effective)
+    }
+
+    pub fn allowed_host_rule_count(&self) -> usize {
+        self.allowed_hosts.len() + self.allowed_host_globs.len()
+    }
+
+    fn apply_policy(&mut self, policy: &EgressPolicy) -> Result<(), EgressError> {
+        self.allowed_host_globs
+            .extend(policy.hosts.iter().map(|host| host.to_ascii_lowercase()));
+        for cidr in &policy.cidrs {
+            self.private_ip_allow_cidrs
+                .push(cidr.parse::<IpNet>().map_err(|err| {
+                    EgressError::InvalidPolicy(format!("CIDR '{cidr}' is invalid: {err}"))
+                })?);
+        }
+        self.allowed_ports.extend(policy.ports.iter().copied());
+
+        Ok(())
     }
 }
 
@@ -235,10 +292,20 @@ impl EgressClient {
         body: Option<Vec<u8>>,
     ) -> Result<EgressResponse, EgressError> {
         let parsed = self.checked_url(url)?;
-        let host = checked_host(&parsed, &self.config.allowed_hosts)?;
+        let host = checked_host(
+            &parsed,
+            &self.config.allowed_hosts,
+            &self.config.allowed_host_globs,
+        )?;
         let port = checked_port(&parsed)?;
+        checked_policy_port(port, &self.config.allowed_ports)?;
         let resolved = resolve_host(&host, port).await?;
-        let pinned_addr = checked_socket_addr(&host, &resolved, self.config.deny_private_ips)?;
+        let pinned_addr = checked_socket_addr(
+            &host,
+            &resolved,
+            self.config.deny_private_ips,
+            &self.config.private_ip_allow_cidrs,
+        )?;
         enforce_request_body_size(
             body.as_ref().map_or(0, Vec::len),
             self.config.max_request_body_bytes,
@@ -263,10 +330,20 @@ impl EgressClient {
         body: Option<Vec<u8>>,
     ) -> Result<EgressStreamResponse, EgressError> {
         let parsed = self.checked_url(url)?;
-        let host = checked_host(&parsed, &self.config.allowed_hosts)?;
+        let host = checked_host(
+            &parsed,
+            &self.config.allowed_hosts,
+            &self.config.allowed_host_globs,
+        )?;
         let port = checked_port(&parsed)?;
+        checked_policy_port(port, &self.config.allowed_ports)?;
         let resolved = resolve_host(&host, port).await?;
-        let pinned_addr = checked_socket_addr(&host, &resolved, self.config.deny_private_ips)?;
+        let pinned_addr = checked_socket_addr(
+            &host,
+            &resolved,
+            self.config.deny_private_ips,
+            &self.config.private_ip_allow_cidrs,
+        )?;
         enforce_request_body_size(
             body.as_ref().map_or(0, Vec::len),
             self.config.max_request_body_bytes,
@@ -474,7 +551,11 @@ fn base_client_builder(config: &EgressConfig) -> reqwest::ClientBuilder {
         .redirect(reqwest::redirect::Policy::none())
 }
 
-fn checked_host(url: &Url, allowed_hosts: &HashSet<String>) -> Result<String, EgressError> {
+fn checked_host(
+    url: &Url,
+    allowed_hosts: &HashSet<String>,
+    allowed_host_globs: &[String],
+) -> Result<String, EgressError> {
     let host = url
         .host_str()
         .ok_or_else(|| EgressError::InvalidUrl("missing host".to_owned()))?
@@ -484,7 +565,11 @@ fn checked_host(url: &Url, allowed_hosts: &HashSet<String>) -> Result<String, Eg
     // infrastructure endpoints. They still fail closed today because the
     // resolver is given the bracketed form, so IPv6 literal JWKS and endpoint
     // URLs remain unsupported for now.
-    if allowed_hosts.contains(&host) {
+    if allowed_hosts.contains(&host)
+        || allowed_host_globs
+            .iter()
+            .any(|pattern| host_glob_matches(pattern, &host))
+    {
         Ok(host)
     } else {
         tracing::warn!(host = %host, "egress blocked non-allowlisted host");
@@ -492,9 +577,31 @@ fn checked_host(url: &Url, allowed_hosts: &HashSet<String>) -> Result<String, Eg
     }
 }
 
+fn host_glob_matches(pattern: &str, host: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        host.len() > suffix.len()
+            && host.ends_with(suffix)
+            && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+    } else {
+        host == pattern
+    }
+}
+
 fn checked_port(url: &Url) -> Result<u16, EgressError> {
     url.port_or_known_default()
         .ok_or_else(|| EgressError::InvalidUrl("missing port for URL scheme".to_owned()))
+}
+
+fn checked_policy_port(port: u16, allowed_ports: &HashSet<u16>) -> Result<(), EgressError> {
+    if allowed_ports.is_empty() || allowed_ports.contains(&port) {
+        Ok(())
+    } else {
+        tracing::warn!(port, "egress blocked non-allowlisted port");
+        Err(EgressError::PortNotAllowed(port))
+    }
 }
 
 async fn resolve_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, EgressError> {
@@ -514,6 +621,7 @@ fn checked_socket_addr(
     host: &str,
     resolved: &[SocketAddr],
     deny_private_ips: bool,
+    private_ip_allow_cidrs: &[IpNet],
 ) -> Result<SocketAddr, EgressError> {
     if resolved.is_empty() {
         return Err(EgressError::DnsResolutionFailed(host.to_owned()));
@@ -523,18 +631,22 @@ fn checked_socket_addr(
         if let Some(blocked) = resolved
             .iter()
             .map(SocketAddr::ip)
-            .find(|ip| is_private_ip(*ip))
+            .find(|ip| is_private_ip(*ip) && !ip_matches_policy_cidr(*ip, private_ip_allow_cidrs))
         {
             tracing::warn!(
                 host,
                 ip = %blocked,
-                "egress blocked private resolved address"
+                "egress blocked private resolved address outside policy CIDRs"
             );
             return Err(EgressError::PrivateIpBlocked(blocked));
         }
     }
 
     Ok(resolved[0])
+}
+
+fn ip_matches_policy_cidr(ip: IpAddr, private_ip_allow_cidrs: &[IpNet]) -> bool {
+    private_ip_allow_cidrs.iter().any(|cidr| cidr.contains(&ip))
 }
 
 fn enforce_request_body_size(size: usize, max: usize) -> Result<(), EgressError> {
@@ -673,14 +785,241 @@ mod tests {
     }
 
     #[test]
+    fn host_glob_matching_supports_exact_and_leading_wildcard_patterns() {
+        assert!(host_glob_matches("api.example.test", "api.example.test"));
+        assert!(host_glob_matches("API.EXAMPLE.TEST", "api.example.test"));
+        assert!(!host_glob_matches("api.example.test", "other.example.test"));
+
+        assert!(host_glob_matches("*.example.test", "api.example.test"));
+        assert!(host_glob_matches("*.example.test", "v1.api.example.test"));
+        assert!(!host_glob_matches("*.example.test", "example.test"));
+        assert!(!host_glob_matches("*.example.test", "badexample.test"));
+    }
+
+    #[test]
+    fn policy_host_globs_extend_exact_env_allowlist() {
+        let allowed_hosts = HashSet::from(["api.example.test".to_owned()]);
+        let allowed_host_globs = vec!["*.svc.example.test".to_owned()];
+
+        for url in [
+            "https://api.example.test/resource",
+            "https://worker.svc.example.test/resource",
+            "https://v1.worker.svc.example.test/resource",
+        ] {
+            let url = Url::parse(url).expect("URL should parse");
+            checked_host(&url, &allowed_hosts, &allowed_host_globs)
+                .expect("exact env host or policy glob should allow");
+        }
+
+        let url = Url::parse("https://svc.example.test/resource").expect("URL should parse");
+        let error = checked_host(&url, &allowed_hosts, &allowed_host_globs)
+            .expect_err("wildcard should not match the suffix itself");
+
+        assert!(matches!(
+            error,
+            EgressError::HostNotAllowed(host) if host == "svc.example.test"
+        ));
+    }
+
+    #[test]
+    fn cidr_matching_covers_ipv4_edges() {
+        let cidrs = vec!["192.168.1.0/24".parse().expect("CIDR should parse")];
+
+        assert!(ip_matches_policy_cidr(ip("192.168.1.0"), &cidrs));
+        assert!(ip_matches_policy_cidr(ip("192.168.1.255"), &cidrs));
+        assert!(!ip_matches_policy_cidr(ip("192.168.0.255"), &cidrs));
+        assert!(!ip_matches_policy_cidr(ip("192.168.2.0"), &cidrs));
+    }
+
+    #[test]
+    fn cidr_matching_covers_ipv6_edges() {
+        let cidrs = vec!["2001:db8:abcd::/48".parse().expect("CIDR should parse")];
+
+        assert!(ip_matches_policy_cidr(ip("2001:db8:abcd::"), &cidrs));
+        assert!(ip_matches_policy_cidr(
+            ip("2001:db8:abcd:ffff:ffff:ffff:ffff:ffff"),
+            &cidrs
+        ));
+        assert!(!ip_matches_policy_cidr(
+            ip("2001:db8:abcc:ffff:ffff:ffff:ffff:ffff"),
+            &cidrs
+        ));
+        assert!(!ip_matches_policy_cidr(ip("2001:db8:abce::"), &cidrs));
+    }
+
+    #[test]
+    fn policy_ports_restrict_only_when_non_empty() {
+        checked_policy_port(8080, &HashSet::new())
+            .expect("empty policy port set should preserve prior behavior");
+
+        let allowed_ports = HashSet::from([443, 8443]);
+        checked_policy_port(443, &allowed_ports).expect("listed port should be allowed");
+        let error =
+            checked_policy_port(8080, &allowed_ports).expect_err("unlisted port should be denied");
+
+        assert!(matches!(error, EgressError::PortNotAllowed(8080)));
+    }
+
+    #[tokio::test]
+    async fn request_to_disallowed_policy_port_is_blocked() {
+        let client = EgressClient::new(EgressConfig {
+            allowed_hosts: HashSet::from(["api.example.test".to_owned()]),
+            allowed_ports: HashSet::from([443]),
+            ..EgressConfig::default()
+        })
+        .expect("client should build");
+
+        let error = client
+            .request(Method::GET, "https://api.example.test:8443/resource")
+            .await
+            .expect_err("unlisted destination port should be denied");
+
+        assert!(matches!(error, EgressError::PortNotAllowed(8443)));
+    }
+
+    #[tokio::test]
+    async fn request_to_any_port_is_allowed_when_policy_ports_are_empty() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener local address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one connection");
+            read_one_request(&stream).await;
+            write_all(
+                &stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            )
+            .await;
+        });
+        let client = EgressClient::new(EgressConfig {
+            allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
+            deny_private_ips: false,
+            max_response_bytes: 2,
+            ..EgressConfig::default()
+        })
+        .expect("client should build");
+
+        let response = client
+            .request(Method::GET, &format!("http://127.0.0.1:{}/", addr.port()))
+            .await
+            .expect("empty policy ports should not restrict the request port");
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, b"ok");
+        server.await.expect("test server task should finish");
+    }
+
+    #[test]
+    fn policy_cidr_exempts_only_matching_private_resolved_ips() {
+        let allowed_cidrs = vec!["10.0.0.0/8".parse().expect("CIDR should parse")];
+        let resolved = vec![socket("10.1.2.3:443")];
+        let pinned = checked_socket_addr("internal.example.test", &resolved, true, &allowed_cidrs)
+            .expect("private IP covered by policy CIDR should be allowed");
+
+        assert_eq!(pinned, socket("10.1.2.3:443"));
+
+        let resolved = vec![socket("192.168.1.10:443")];
+        let error = checked_socket_addr("internal.example.test", &resolved, true, &allowed_cidrs)
+            .expect_err("private IP outside policy CIDR should still be blocked");
+
+        assert!(matches!(
+            error,
+            EgressError::PrivateIpBlocked(blocked) if blocked == ip("192.168.1.10")
+        ));
+    }
+
+    #[test]
+    fn no_policy_egress_section_preserves_env_only_config() {
+        let mut config = test_config();
+        config.egress_allowed_hosts = vec!["API.EXAMPLE.TEST".to_owned()];
+
+        let env_only = EgressConfig::from_config(&config);
+        let no_policy = EgressConfig::from_config_and_policy(&config, None)
+            .expect("no policy should build egress config");
+        let empty_policy =
+            EgressConfig::from_config_and_policy(&config, Some(&EgressPolicy::default()))
+                .expect("empty policy should build egress config");
+
+        assert_eq!(env_only, no_policy);
+        assert_eq!(env_only, empty_policy);
+        assert_eq!(
+            env_only.allowed_hosts,
+            HashSet::from(["api.example.test".to_owned()])
+        );
+        assert!(env_only.allowed_host_globs.is_empty());
+        assert!(env_only.private_ip_allow_cidrs.is_empty());
+        assert!(env_only.allowed_ports.is_empty());
+    }
+
+    #[test]
+    fn policy_egress_is_startup_snapshot_until_config_is_rebuilt() {
+        let config = test_config();
+        let initial_policy = EgressPolicy {
+            hosts: vec!["*.initial.example.test".to_owned()],
+            cidrs: vec!["10.0.0.0/8".to_owned()],
+            ports: vec![443],
+        };
+        let updated_policy = EgressPolicy {
+            hosts: vec!["*.updated.example.test".to_owned()],
+            cidrs: vec!["192.168.0.0/16".to_owned()],
+            ports: vec![8443],
+        };
+
+        let startup_config = EgressConfig::from_config_and_policy(&config, Some(&initial_policy))
+            .expect("initial policy should build egress config");
+
+        assert!(host_glob_matches(
+            &startup_config.allowed_host_globs[0],
+            "api.initial.example.test"
+        ));
+        assert!(!startup_config
+            .allowed_host_globs
+            .iter()
+            .any(|pattern| host_glob_matches(pattern, "api.updated.example.test")));
+        assert!(startup_config.allowed_ports.contains(&443));
+        assert!(!startup_config.allowed_ports.contains(&8443));
+        assert!(ip_matches_policy_cidr(
+            ip("10.1.2.3"),
+            &startup_config.private_ip_allow_cidrs
+        ));
+        assert!(!ip_matches_policy_cidr(
+            ip("192.168.1.10"),
+            &startup_config.private_ip_allow_cidrs
+        ));
+
+        let rebuilt_config = EgressConfig::from_config_and_policy(&config, Some(&updated_policy))
+            .expect("updated policy should build egress config");
+
+        assert!(rebuilt_config
+            .allowed_host_globs
+            .iter()
+            .any(|pattern| host_glob_matches(pattern, "api.updated.example.test")));
+        assert!(rebuilt_config.allowed_ports.contains(&8443));
+        assert!(ip_matches_policy_cidr(
+            ip("192.168.1.10"),
+            &rebuilt_config.private_ip_allow_cidrs
+        ));
+    }
+
+    #[test]
     fn empty_allowlist_denies_everything() {
         let client = EgressClient::new(EgressConfig::default()).expect("client should build");
         let url = client
             .checked_url("https://api.example.test/resource")
             .expect("URL should parse");
 
-        let error = checked_host(&url, &client.config.allowed_hosts)
-            .expect_err("empty allowlist should deny");
+        let error = checked_host(
+            &url,
+            &client.config.allowed_hosts,
+            &client.config.allowed_host_globs,
+        )
+        .expect_err("empty allowlist should deny");
 
         assert!(matches!(
             error,
@@ -747,7 +1086,7 @@ mod tests {
         let allowed_hosts = HashSet::from(["api.example.test".to_owned()]);
         let url = Url::parse("https://other.example.test/resource").expect("URL should parse");
         let error =
-            checked_host(&url, &allowed_hosts).expect_err("non-allowlisted host should deny");
+            checked_host(&url, &allowed_hosts, &[]).expect_err("non-allowlisted host should deny");
 
         assert!(matches!(
             error,
@@ -798,7 +1137,7 @@ mod tests {
             socket("10.0.0.1:443"),
             socket("1.1.1.1:443"),
         ];
-        let error = checked_socket_addr("api.example.test", &resolved, true)
+        let error = checked_socket_addr("api.example.test", &resolved, true, &[])
             .expect_err("mixed public and private answers should deny");
 
         assert!(matches!(
@@ -810,7 +1149,7 @@ mod tests {
     #[test]
     fn all_public_resolved_ips_select_exact_pinned_addr() {
         let resolved = vec![socket("93.184.216.34:443"), socket("1.1.1.1:443")];
-        let pinned = checked_socket_addr("api.example.test", &resolved, true)
+        let pinned = checked_socket_addr("api.example.test", &resolved, true, &[])
             .expect("public resolved addresses should be allowed");
 
         assert_eq!(pinned, socket("93.184.216.34:443"));
@@ -819,7 +1158,7 @@ mod tests {
     #[test]
     fn private_resolved_ip_is_allowed_when_private_deny_is_disabled() {
         let resolved = vec![socket("10.0.0.1:443")];
-        let pinned = checked_socket_addr("internal.example.test", &resolved, false)
+        let pinned = checked_socket_addr("internal.example.test", &resolved, false, &[])
             .expect("private address should be allowed when private deny is disabled");
 
         assert_eq!(pinned, socket("10.0.0.1:443"));
@@ -827,7 +1166,7 @@ mod tests {
 
     #[test]
     fn empty_resolution_fails_closed() {
-        let error = checked_socket_addr("api.example.test", &[], true)
+        let error = checked_socket_addr("api.example.test", &[], true, &[])
             .expect_err("empty resolution should deny");
 
         assert!(matches!(

@@ -177,7 +177,10 @@ mod tests {
         audit::{sink::tests::CaptureSink, AuditSink},
         auth::{AuthError, AuthMethod, Principal, SessionCredential, SessionValidator},
         middleware::{auth, rbac},
-        rbac::{policy::RoleEntry, DefaultAction, EnforcementMode, Policy, RouteRule},
+        rbac::{
+            policy::{EgressPolicy, RoleEntry},
+            DefaultAction, EnforcementMode, Policy, RouteRule,
+        },
     };
 
     #[derive(Clone)]
@@ -749,6 +752,7 @@ mod tests {
                 .collect::<HashMap<_, _>>(),
             routes: routes.to_vec(),
             rules: Vec::new(),
+            egress: EgressPolicy::default(),
         }
     }
 

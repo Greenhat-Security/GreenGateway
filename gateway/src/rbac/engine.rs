@@ -30,7 +30,7 @@ mod tests {
     use crate::auth::{AuthMethod, Principal};
 
     use super::*;
-    use crate::rbac::policy::{DefaultAction, EnforcementMode, RoleEntry};
+    use crate::rbac::policy::{DefaultAction, EgressPolicy, EnforcementMode, RoleEntry};
 
     #[test]
     fn admin_wildcard_grants_any_permission() {
@@ -103,6 +103,7 @@ mod tests {
             roles,
             routes: Vec::new(),
             rules: Vec::new(),
+            egress: EgressPolicy::default(),
         }
     }
 

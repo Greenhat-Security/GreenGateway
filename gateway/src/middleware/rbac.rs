@@ -529,7 +529,7 @@ mod tests {
     use crate::{
         audit::{sink::tests::CaptureSink, AuditSink},
         auth::{AuthMethod, Principal},
-        rbac::policy::RoleEntry,
+        rbac::policy::{EgressPolicy, RoleEntry},
     };
 
     #[tokio::test]
@@ -1418,6 +1418,7 @@ mod tests {
                 .collect::<HashMap<_, _>>(),
             routes: routes.to_vec(),
             rules: Vec::new(),
+            egress: EgressPolicy::default(),
         }
     }
 
