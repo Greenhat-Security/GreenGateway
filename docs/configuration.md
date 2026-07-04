@@ -298,6 +298,19 @@ Default: empty, which disables route-table proxying. `UPSTREAM_URL` continues to
 
 Format and validation: unset, empty, or whitespace-only values become an empty route table. Non-empty values must be a JSON array of objects. Each object has optional `path_prefix`, optional `host`, and required `upstream_url` fields. Unknown fields are rejected. `upstream_url` uses the same validation as `UPSTREAM_URL`: it must be a valid `http` or `https` URL with a host. `path_prefix`, when present, must be a URI path starting with `/`. `host`, when present, must be a hostname without a port and is normalized to lowercase. Each entry must set at least one of `path_prefix` or `host`; an entry with only `path_prefix: "/"` is rejected because it would be an unconditional catch-all. Use `UPSTREAM_URL` for the legacy catch-all behavior or add a host to make the root prefix host-specific.
 
+Route entries may also set these optional per-upstream fields:
+
+- `timeout_ms`: total timeout for this route's upstream requests, in milliseconds. When unset, the route inherits `UPSTREAM_TIMEOUT_MS` if configured, otherwise `EGRESS_TIMEOUT_MS`.
+- `response_idle_timeout_ms`: maximum idle time between streamed response chunks for this route, in milliseconds. When unset, the route inherits `UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS` if configured, otherwise `EGRESS_RESPONSE_IDLE_TIMEOUT_MS`.
+- `connect_timeout_ms`: TCP/TLS connection timeout for this route, in milliseconds. When unset, the route inherits `UPSTREAM_CONNECT_TIMEOUT_MS` if configured, otherwise `EGRESS_CONNECT_TIMEOUT_MS`.
+- `add_request_headers`: object mapping header names to values added to requests sent to this route's upstream after the gateway strips hop-by-hop headers and propagates `x-request-id`.
+- `strip_request_headers`: array of request header names removed before sending to this route's upstream after the gateway strips hop-by-hop headers and propagates `x-request-id`.
+- `tls_ca_bundle_path`: filesystem path to a PEM CA bundle whose certificates are added to this route's TLS trust store.
+
+Per-route header validation rejects invalid header names or values, rejects adding hop-by-hop or gateway-managed headers such as `connection`, `host`, and `content-length`, and rejects adding or stripping `x-request-id`. The gateway owns request-id propagation so audit and tracing correlation cannot be disabled by route configuration. A route also cannot add and strip the same header.
+
+`tls_ca_bundle_path` is the supported mechanism for upstreams served by private or internal certificate authorities. Certificate verification remains strict by default, and no route inherits a custom CA unless it explicitly configures one. GreenGateway does not expose a per-route skip-verify option; use a local test CA bundle for development instead of disabling verification.
+
 Matching semantics: a route with both `host` and `path_prefix` requires both to match. Host matching is exact against the request `Host` header after lowercasing and ignoring any port. Path matching uses the gateway's segment-boundary-aware prefix matcher, so `/api` matches `/api` and `/api/users` but not `/apiary`. Among matching routes, the longest `path_prefix` wins. For equal prefix lengths, a host-qualified route wins over a path-only route. Remaining exact ties use declaration order, with the first route winning; exact duplicate `host` plus `path_prefix` matcher keys are rejected at startup.
 
 Every distinct routing-table upstream origin is health-checked and auto-seeded into the egress allowlist. Duplicate route entries pointing at the same upstream origin share one health-check loop.
@@ -308,7 +321,15 @@ Example:
 [
   {
     "path_prefix": "/api",
-    "upstream_url": "https://api.internal.example"
+    "upstream_url": "https://api.internal.example",
+    "timeout_ms": 1500,
+    "add_request_headers": {
+      "x-gateway-upstream": "api"
+    },
+    "strip_request_headers": [
+      "x-client-secret"
+    ],
+    "tls_ca_bundle_path": "/etc/greengateway/internal-ca.pem"
   },
   {
     "host": "app.example.test",

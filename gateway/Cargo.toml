@@ -35,4 +35,6 @@ uuid.workspace = true
 [dev-dependencies]
 jsonschema.workspace = true
 proptest.workspace = true
+rcgen.workspace = true
+tokio-rustls.workspace = true
 tower.workspace = true

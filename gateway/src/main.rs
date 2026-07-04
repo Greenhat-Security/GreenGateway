@@ -1,7 +1,8 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -80,16 +81,32 @@ enum ProxyRoutes {
     RoutingTable { routes: Vec<ProxyRoute> },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ProxyRoute {
     path_prefix: Option<String>,
     host: Option<String>,
     upstream_origin: String,
+    request_header_policy: RouteRequestHeaderPolicy,
+    egress_client: Arc<egress::EgressClient>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RouteRequestHeaderPolicy {
+    add_request_headers: Vec<(HeaderName, HeaderValue)>,
+    strip_request_headers: Vec<HeaderName>,
+}
+
+#[derive(Clone)]
+struct MatchedUpstream {
+    upstream_origin: String,
+    request_header_policy: RouteRequestHeaderPolicy,
+    egress_client: Arc<egress::EgressClient>,
 }
 
 #[derive(Clone)]
 struct UpstreamHealthTarget {
     origin: String,
+    egress_client: Arc<egress::EgressClient>,
     health: UpstreamHealthState,
 }
 
@@ -481,8 +498,8 @@ fn gateway_app_with_process_started_at(
         proxy_egress_config
     };
     let egress_client = Arc::new(egress::EgressClient::new(egress_config)?);
-    let proxy_egress_client = Arc::new(egress::EgressClient::new(proxy_egress_config)?);
-    let proxy_state = ProxyState::from_config(&config, proxy_egress_client);
+    let proxy_egress_client = Arc::new(egress::EgressClient::new(proxy_egress_config.clone())?);
+    let proxy_state = ProxyState::from_config(&config, &proxy_egress_config, proxy_egress_client)?;
     if let Some(proxy) = proxy_state.as_ref() {
         proxy.spawn_upstream_health_checks();
     }
@@ -889,80 +906,93 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
 impl ProxyState {
     fn from_config(
         config: &config::Config,
+        default_egress_config: &egress::EgressConfig,
         egress_client: Arc<egress::EgressClient>,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, egress::EgressError> {
         if let Some(upstream_url) = config.upstream_url.as_deref() {
             let upstream_origin = upstream_origin_from_url(upstream_url, "UPSTREAM_URL");
 
-            return Some(Self {
+            return Ok(Some(Self {
                 routes: ProxyRoutes::Legacy {
                     upstream_origin: upstream_origin.clone(),
                 },
-                upstream_health: upstream_health_targets([upstream_origin]),
+                upstream_health: upstream_health_targets([(
+                    upstream_origin,
+                    Arc::clone(&egress_client),
+                )]),
                 egress_client,
                 max_request_body_bytes: config.egress_max_request_body_bytes,
-            });
+            }));
         }
 
         if config.upstream_routes.is_empty() {
-            return None;
+            return Ok(None);
         }
 
+        let mut route_clients = HashMap::new();
         let routes: Vec<_> = config
             .upstream_routes
             .iter()
             .enumerate()
-            .map(|(index, route)| ProxyRoute {
-                path_prefix: route.path_prefix.clone(),
-                host: route.host.as_ref().map(|host| host.to_ascii_lowercase()),
-                upstream_origin: upstream_origin_from_url(
-                    &route.upstream_url,
-                    &format!("UPSTREAM_ROUTES[{index}].upstream_url"),
-                ),
-            })
-            .collect();
-        let upstream_health =
-            upstream_health_targets(routes.iter().map(|route| route.upstream_origin.clone()));
+            .map(|(index, route)| {
+                let egress_client = route_egress_client(
+                    route,
+                    default_egress_config,
+                    &egress_client,
+                    &mut route_clients,
+                )?;
 
-        Some(Self {
+                Ok(ProxyRoute {
+                    path_prefix: route.path_prefix.clone(),
+                    host: route.host.as_ref().map(|host| host.to_ascii_lowercase()),
+                    upstream_origin: upstream_origin_from_url(
+                        &route.upstream_url,
+                        &format!("UPSTREAM_ROUTES[{index}].upstream_url"),
+                    ),
+                    request_header_policy: route_request_header_policy(route),
+                    egress_client,
+                })
+            })
+            .collect::<Result<_, egress::EgressError>>()?;
+        let upstream_health = upstream_health_targets(routes.iter().map(|route| {
+            (
+                route.upstream_origin.clone(),
+                Arc::clone(&route.egress_client),
+            )
+        }));
+
+        Ok(Some(Self {
             routes: ProxyRoutes::RoutingTable { routes },
             upstream_health,
             egress_client,
             max_request_body_bytes: config.egress_max_request_body_bytes,
-        })
+        }))
     }
 
+    #[cfg(test)]
     fn upstream_origin_for_request(&self, path: &str, headers: &HeaderMap) -> Option<&str> {
         match &self.routes {
             ProxyRoutes::Legacy { upstream_origin } => Some(upstream_origin),
             ProxyRoutes::RoutingTable { routes } => {
-                let request_host = request_host_without_port(headers);
-                let request_host = request_host.as_deref();
-                let mut best = None::<(&ProxyRoute, usize, bool)>;
+                routing_route_for_request(routes, path, headers)
+                    .map(|route| route.upstream_origin.as_str())
+            }
+        }
+    }
 
-                for route in routes {
-                    if !route.matches(path, request_host) {
-                        continue;
-                    }
-
-                    let prefix_len = route.path_prefix.as_deref().map_or(0, str::len);
-                    let host_specific = route.host.is_some();
-                    let should_replace = match best {
-                        Some((_, best_prefix_len, best_host_specific)) => {
-                            prefix_len > best_prefix_len
-                                || (prefix_len == best_prefix_len
-                                    && host_specific
-                                    && !best_host_specific)
-                        }
-                        None => true,
-                    };
-
-                    if should_replace {
-                        best = Some((route, prefix_len, host_specific));
-                    }
-                }
-
-                best.map(|(route, _, _)| route.upstream_origin.as_str())
+    fn upstream_for_request(&self, path: &str, headers: &HeaderMap) -> Option<MatchedUpstream> {
+        match &self.routes {
+            ProxyRoutes::Legacy { upstream_origin } => Some(MatchedUpstream {
+                upstream_origin: upstream_origin.clone(),
+                request_header_policy: RouteRequestHeaderPolicy::default(),
+                egress_client: Arc::clone(&self.egress_client),
+            }),
+            ProxyRoutes::RoutingTable { routes } => {
+                routing_route_for_request(routes, path, headers).map(|route| MatchedUpstream {
+                    upstream_origin: route.upstream_origin.clone(),
+                    request_header_policy: route.request_header_policy.clone(),
+                    egress_client: Arc::clone(&route.egress_client),
+                })
             }
         }
     }
@@ -1011,7 +1041,7 @@ impl ProxyState {
 
         for target in &self.upstream_health {
             let health = target.health.clone();
-            let egress_client = Arc::clone(&self.egress_client);
+            let egress_client = Arc::clone(&target.egress_client);
             let upstream_url = target.origin.clone();
 
             handle.spawn(async move {
@@ -1034,6 +1064,133 @@ impl ProxyState {
             });
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RouteEgressClientKey {
+    timeout_ms: Option<u64>,
+    response_idle_timeout_ms: Option<u64>,
+    connect_timeout_ms: Option<u64>,
+    tls_ca_bundle_path: Option<PathBuf>,
+}
+
+impl RouteEgressClientKey {
+    fn from_route(route: &config::UpstreamRouteConfig) -> Self {
+        Self {
+            timeout_ms: route.timeout_ms,
+            response_idle_timeout_ms: route.response_idle_timeout_ms,
+            connect_timeout_ms: route.connect_timeout_ms,
+            tls_ca_bundle_path: route.tls_ca_bundle_path.clone(),
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        self.timeout_ms.is_none()
+            && self.response_idle_timeout_ms.is_none()
+            && self.connect_timeout_ms.is_none()
+            && self.tls_ca_bundle_path.is_none()
+    }
+
+    fn apply_to_config(
+        &self,
+        config: &mut egress::EgressConfig,
+    ) -> Result<(), egress::EgressError> {
+        config.apply_timeout_overrides(
+            self.timeout_ms,
+            self.response_idle_timeout_ms,
+            self.connect_timeout_ms,
+        );
+        if let Some(path) = &self.tls_ca_bundle_path {
+            config.apply_tls_ca_bundle_path(path.clone())?;
+        }
+
+        Ok(())
+    }
+}
+
+fn route_egress_client(
+    route: &config::UpstreamRouteConfig,
+    default_config: &egress::EgressConfig,
+    default_client: &Arc<egress::EgressClient>,
+    route_clients: &mut HashMap<RouteEgressClientKey, Arc<egress::EgressClient>>,
+) -> Result<Arc<egress::EgressClient>, egress::EgressError> {
+    let key = RouteEgressClientKey::from_route(route);
+    if key.is_default() {
+        return Ok(Arc::clone(default_client));
+    }
+    if let Some(client) = route_clients.get(&key) {
+        return Ok(Arc::clone(client));
+    }
+
+    let mut config = default_config.clone();
+    key.apply_to_config(&mut config)?;
+    let client = Arc::new(egress::EgressClient::new(config)?);
+    route_clients.insert(key, Arc::clone(&client));
+
+    Ok(client)
+}
+
+fn route_request_header_policy(route: &config::UpstreamRouteConfig) -> RouteRequestHeaderPolicy {
+    let mut add_request_headers = route
+        .add_request_headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                HeaderName::from_bytes(name.as_bytes())
+                    .expect("validated route add header name should parse"),
+                HeaderValue::from_str(value)
+                    .expect("validated route add header value should parse"),
+            )
+        })
+        .collect::<Vec<_>>();
+    add_request_headers.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+
+    let mut strip_request_headers = route
+        .strip_request_headers
+        .iter()
+        .map(|name| {
+            HeaderName::from_bytes(name.as_bytes())
+                .expect("validated route strip header name should parse")
+        })
+        .collect::<Vec<_>>();
+    strip_request_headers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+    RouteRequestHeaderPolicy {
+        add_request_headers,
+        strip_request_headers,
+    }
+}
+
+fn routing_route_for_request<'a>(
+    routes: &'a [ProxyRoute],
+    path: &str,
+    headers: &HeaderMap,
+) -> Option<&'a ProxyRoute> {
+    let request_host = request_host_without_port(headers);
+    let request_host = request_host.as_deref();
+    let mut best = None::<(&ProxyRoute, usize, bool)>;
+
+    for route in routes {
+        if !route.matches(path, request_host) {
+            continue;
+        }
+
+        let prefix_len = route.path_prefix.as_deref().map_or(0, str::len);
+        let host_specific = route.host.is_some();
+        let should_replace = match best {
+            Some((_, best_prefix_len, best_host_specific)) => {
+                prefix_len > best_prefix_len
+                    || (prefix_len == best_prefix_len && host_specific && !best_host_specific)
+            }
+            None => true,
+        };
+
+        if should_replace {
+            best = Some((route, prefix_len, host_specific));
+        }
+    }
+
+    best.map(|(route, _, _)| route)
 }
 
 impl ProxyRoute {
@@ -1061,15 +1218,16 @@ fn upstream_origin_from_url(upstream_url: &str, source: &str) -> String {
 }
 
 fn upstream_health_targets(
-    upstream_origins: impl IntoIterator<Item = String>,
+    upstream_origins: impl IntoIterator<Item = (String, Arc<egress::EgressClient>)>,
 ) -> Vec<UpstreamHealthTarget> {
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
 
-    for origin in upstream_origins {
+    for (origin, egress_client) in upstream_origins {
         if seen.insert(origin.clone()) {
             targets.push(UpstreamHealthTarget {
                 origin,
+                egress_client,
                 health: UpstreamHealthState::new(),
             });
         }
@@ -1105,18 +1263,16 @@ async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let Some(upstream_origin) =
-        proxy.upstream_origin_for_request(request.uri().path(), request.headers())
-    else {
+    let Some(upstream) = proxy.upstream_for_request(request.uri().path(), request.headers()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let upstream_origin = upstream_origin.to_owned();
     let (parts, body) = request.into_parts();
-    let target_url = proxy_target_url(&upstream_origin, &parts.uri);
+    let target_url = proxy_target_url(&upstream.upstream_origin, &parts.uri);
     let mut headers = strip_hop_by_hop_headers(&parts.headers);
     if let Some(request_id) = parts.headers.get(REQUEST_ID_HEADER) {
         headers.insert(request_id_header(), request_id.clone());
     }
+    apply_route_request_header_policy(&mut headers, &upstream.request_header_policy);
     let request_id = parts.headers.get(REQUEST_ID_HEADER).cloned();
     let body = match axum::body::to_bytes(body, proxy.max_request_body_bytes).await {
         Ok(body) if body.is_empty() => None,
@@ -1132,7 +1288,7 @@ async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -
     };
 
     let upstream_started = Instant::now();
-    let upstream = match proxy
+    let upstream = match upstream
         .egress_client
         .stream_request_with_headers(parts.method, &target_url, headers, body)
         .await
@@ -1222,6 +1378,22 @@ fn strip_hop_by_hop_headers(headers: &HeaderMap) -> HeaderMap {
     }
 
     forwarded
+}
+
+fn apply_route_request_header_policy(headers: &mut HeaderMap, policy: &RouteRequestHeaderPolicy) {
+    for name in &policy.strip_request_headers {
+        if name.as_str() == REQUEST_ID_HEADER {
+            continue;
+        }
+        headers.remove(name);
+    }
+
+    for (name, value) in &policy.add_request_headers {
+        if is_hop_by_hop_header(name) || name.as_str() == REQUEST_ID_HEADER {
+            continue;
+        }
+        headers.insert(name.clone(), value.clone());
+    }
 }
 
 fn connection_named_headers(headers: &HeaderMap) -> HashSet<HeaderName> {
@@ -1697,13 +1869,21 @@ mod tests {
     use rusqlite::{params, Connection};
     use serde_json::Value;
     use std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         fs,
+        net::{IpAddr, Ipv4Addr},
         path::PathBuf,
         sync::Arc,
         time::{Duration, Instant},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::{
+        rustls::{
+            pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+            ServerConfig,
+        },
+        TlsAcceptor,
+    };
     use tower::ServiceExt;
 
     fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
@@ -1836,6 +2016,156 @@ mod tests {
         let addr = spawn_router(router).await;
 
         (addr, receiver)
+    }
+
+    struct TlsCaptureUpstream {
+        addr: std::net::SocketAddr,
+        ca_pem: String,
+        captured: tokio::sync::mpsc::Receiver<CapturedRequest>,
+    }
+
+    async fn spawn_tls_capture_upstream() -> TlsCaptureUpstream {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let (ca_pem, server_cert_der, server_key_der) = test_ca_signed_server_certificate();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(server_cert_der)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key_der)),
+            )
+            .expect("test TLS server config should build");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test TLS upstream should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test TLS upstream address should be available");
+        let (sender, captured) = tokio::sync::mpsc::channel(16);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let sender = sender.clone();
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    capture_tls_http_request(&mut stream, sender).await;
+                });
+            }
+        });
+
+        TlsCaptureUpstream {
+            addr,
+            ca_pem,
+            captured,
+        }
+    }
+
+    fn test_ca_signed_server_certificate() -> (String, Vec<u8>, Vec<u8>) {
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "GreenGateway Test CA");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().expect("test CA key should generate");
+        let ca = ca_params
+            .self_signed(&ca_key)
+            .expect("test CA certificate should build");
+
+        let mut server_params = rcgen::CertificateParams::default();
+        server_params.distinguished_name = rcgen::DistinguishedName::new();
+        server_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "127.0.0.1");
+        server_params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let server_key = rcgen::KeyPair::generate().expect("test server key should generate");
+        let server = server_params
+            .signed_by(&server_key, &ca, &ca_key)
+            .expect("test server certificate should build");
+
+        (
+            ca.pem(),
+            server.der().as_ref().to_vec(),
+            server_key.serialize_der(),
+        )
+    }
+
+    async fn capture_tls_http_request(
+        stream: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        sender: tokio::sync::mpsc::Sender<CapturedRequest>,
+    ) {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .expect("test TLS upstream should read request");
+            if read == 0 {
+                return;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index;
+            }
+            assert!(
+                buffer.len() <= 16 * 1024,
+                "test TLS upstream request headers should stay bounded"
+            );
+        };
+        let raw_headers = std::str::from_utf8(&buffer[..header_end])
+            .expect("test TLS request headers should be UTF-8");
+        let mut lines = raw_headers.split("\r\n");
+        let request_line = lines
+            .next()
+            .expect("test TLS request should include request line");
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts
+            .next()
+            .and_then(|method| Method::from_bytes(method.as_bytes()).ok())
+            .expect("test TLS request method should parse");
+        let path_and_query = request_parts
+            .next()
+            .expect("test TLS request should include path")
+            .to_owned();
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            let (name, value) = line
+                .split_once(':')
+                .unwrap_or_else(|| panic!("test TLS request header should contain ':': {line}"));
+            let name = HeaderName::from_bytes(name.trim().as_bytes())
+                .expect("test TLS request header name should parse");
+            let value = HeaderValue::from_str(value.trim())
+                .expect("test TLS request header value should parse");
+            headers.append(name, value);
+        }
+        let _ = sender
+            .send(CapturedRequest {
+                method,
+                path_and_query,
+                headers,
+                body: Vec::new(),
+            })
+            .await;
+
+        stream
+            .write_all(
+                b"HTTP/1.1 201 Created\r\nContent-Length: 12\r\nConnection: close\r\n\r\ntls upstream",
+            )
+            .await
+            .expect("test TLS upstream should write response");
+        stream
+            .shutdown()
+            .await
+            .expect("test TLS upstream should close response");
     }
 
     async fn spawn_router(router: Router) -> std::net::SocketAddr {
@@ -2185,6 +2515,20 @@ mod tests {
         request.method == Method::HEAD && request.path_and_query == "/" && request.body.is_empty()
     }
 
+    async fn delayed_upstream(State(delay): State<Duration>) -> Response {
+        tokio::time::sleep(delay).await;
+        (StatusCode::CREATED, "slow upstream").into_response()
+    }
+
+    async fn spawn_delayed_upstream(delay: Duration) -> std::net::SocketAddr {
+        spawn_router(
+            Router::new()
+                .fallback(any(delayed_upstream))
+                .with_state(delay),
+        )
+        .await
+    }
+
     async fn delayed_stream_upstream() -> Response {
         let chunks = futures_util::stream::unfold(0, |index| async move {
             match index {
@@ -2252,6 +2596,15 @@ mod tests {
         route(Some(path_prefix), Some(host), upstream_addr)
     }
 
+    fn https_path_route(
+        path_prefix: &str,
+        upstream_addr: std::net::SocketAddr,
+    ) -> config::UpstreamRouteConfig {
+        let mut route = path_route(path_prefix, upstream_addr);
+        route.upstream_url = format!("https://127.0.0.1:{}/ignored-base", upstream_addr.port());
+        route
+    }
+
     fn route(
         path_prefix: Option<&str>,
         host: Option<&str>,
@@ -2261,6 +2614,12 @@ mod tests {
             path_prefix: path_prefix.map(str::to_owned),
             host: host.map(str::to_owned),
             upstream_url: format!("http://127.0.0.1:{}/ignored-base", upstream_addr.port()),
+            timeout_ms: None,
+            response_idle_timeout_ms: None,
+            connect_timeout_ms: None,
+            add_request_headers: HashMap::new(),
+            strip_request_headers: Vec::new(),
+            tls_ca_bundle_path: None,
         }
     }
 
@@ -3180,6 +3539,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routing_table_applies_distinct_timeout_per_upstream_route() {
+        let short_addr = spawn_delayed_upstream(Duration::from_millis(250)).await;
+        let long_addr = spawn_delayed_upstream(Duration::from_millis(250)).await;
+        let mut short_route = path_route("/short", short_addr);
+        short_route.timeout_ms = Some(75);
+        let mut long_route = path_route("/long", long_addr);
+        long_route.timeout_ms = Some(1_000);
+        let router = proxy_router(
+            routing_proxy_config(vec![short_route, long_route]),
+            test_audit_log(),
+        );
+
+        let short_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/short/slow")
+                    .body(Body::empty())
+                    .expect("short-timeout request should build"),
+            )
+            .await
+            .expect("short-timeout proxy request should complete");
+        assert_eq!(short_response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            body_string(short_response).await,
+            r#"{"error":"gateway_timeout"}"#
+        );
+
+        let long_response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/long/slow")
+                    .body(Body::empty())
+                    .expect("long-timeout request should build"),
+            )
+            .await
+            .expect("long-timeout proxy request should complete");
+        assert_eq!(long_response.status(), StatusCode::CREATED);
+        assert_eq!(body_string(long_response).await, "slow upstream");
+    }
+
+    #[tokio::test]
+    async fn routing_table_adds_configured_request_headers_per_route() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut route = path_route("/api", upstream_addr);
+        route.add_request_headers =
+            HashMap::from([("x-route-added".to_owned(), "route-added-value".to_owned())]);
+        let router = proxy_router(routing_proxy_config(vec![route]), test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/headers")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let upstream =
+            next_proxied_request(&mut captured, "upstream should receive proxied request").await;
+        assert_eq!(
+            upstream.headers.get("x-route-added"),
+            Some(&HeaderValue::from_static("route-added-value"))
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_table_strips_configured_request_headers_without_breaking_request_id() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut route = path_route("/api", upstream_addr);
+        route.strip_request_headers = vec!["x-client-secret".to_owned()];
+        let router = proxy_router(routing_proxy_config(vec![route]), test_audit_log());
+        let request_id = HeaderValue::from_static("route-strip-request-id");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/headers")
+                    .header(REQUEST_ID_HEADER, request_id.clone())
+                    .header("x-client-secret", "remove-me")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers().get(REQUEST_ID_HEADER), Some(&request_id));
+        let upstream =
+            next_proxied_request(&mut captured, "upstream should receive proxied request").await;
+        assert!(!upstream.headers.contains_key("x-client-secret"));
+        assert_eq!(upstream.headers.get(REQUEST_ID_HEADER), Some(&request_id));
+    }
+
+    #[tokio::test]
+    async fn routing_table_tls_ca_bundle_is_applied_only_to_configured_route() {
+        let mut trusted_upstream = spawn_tls_capture_upstream().await;
+        let mut untrusted_upstream = spawn_tls_capture_upstream().await;
+        let ca_bundle_path =
+            std::env::temp_dir().join(format!("greengateway-test-ca-{}.pem", uuid::Uuid::new_v4()));
+        fs::write(&ca_bundle_path, trusted_upstream.ca_pem.as_bytes())
+            .expect("test CA bundle should be written");
+
+        let mut trusted_route = https_path_route("/trusted", trusted_upstream.addr);
+        trusted_route.tls_ca_bundle_path = Some(ca_bundle_path.clone());
+        trusted_route.timeout_ms = Some(1_000);
+        let mut untrusted_route = https_path_route("/untrusted", untrusted_upstream.addr);
+        untrusted_route.timeout_ms = Some(1_000);
+        let router = proxy_router(
+            routing_proxy_config(vec![trusted_route, untrusted_route]),
+            test_audit_log(),
+        );
+
+        let trusted_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/trusted/tls")
+                    .body(Body::empty())
+                    .expect("trusted TLS request should build"),
+            )
+            .await
+            .expect("trusted TLS proxy request should complete");
+        assert_eq!(trusted_response.status(), StatusCode::CREATED);
+        assert_eq!(body_string(trusted_response).await, "tls upstream");
+        let trusted_request = next_proxied_request(
+            &mut trusted_upstream.captured,
+            "trusted TLS upstream should receive request",
+        )
+        .await;
+        assert_eq!(trusted_request.path_and_query, "/trusted/tls");
+
+        let untrusted_response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/untrusted/tls")
+                    .body(Body::empty())
+                    .expect("untrusted TLS request should build"),
+            )
+            .await
+            .expect("untrusted TLS proxy request should complete");
+        assert_eq!(untrusted_response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body_string(untrusted_response).await,
+            r#"{"error":"bad_gateway"}"#
+        );
+        assert_upstream_receives_no_request(
+            &mut untrusted_upstream.captured,
+            "untrusted TLS route should fail during handshake before HTTP request",
+        )
+        .await;
+
+        let _ = fs::remove_file(ca_bundle_path);
+    }
+
+    #[tokio::test]
     async fn routing_table_uses_longest_matching_path_prefix() {
         let (short_addr, mut short_captured) = spawn_capture_upstream().await;
         let (long_addr, mut long_captured) = spawn_capture_upstream().await;
@@ -3279,6 +3796,10 @@ mod tests {
 
     #[test]
     fn routing_table_equal_specificity_uses_declaration_order() {
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::default())
+                .expect("egress client should build"),
+        );
         let proxy = ProxyState {
             routes: ProxyRoutes::RoutingTable {
                 routes: vec![
@@ -3286,19 +3807,20 @@ mod tests {
                         path_prefix: Some("/api".to_owned()),
                         host: None,
                         upstream_origin: "https://first.example.test".to_owned(),
+                        request_header_policy: RouteRequestHeaderPolicy::default(),
+                        egress_client: Arc::clone(&egress_client),
                     },
                     ProxyRoute {
                         path_prefix: Some("/api".to_owned()),
                         host: None,
                         upstream_origin: "https://second.example.test".to_owned(),
+                        request_header_policy: RouteRequestHeaderPolicy::default(),
+                        egress_client: Arc::clone(&egress_client),
                     },
                 ],
             },
             upstream_health: Vec::new(),
-            egress_client: Arc::new(
-                egress::EgressClient::new(egress::EgressConfig::default())
-                    .expect("egress client should build"),
-            ),
+            egress_client,
             max_request_body_bytes: 1_048_576,
         };
 

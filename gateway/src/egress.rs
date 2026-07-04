@@ -1,8 +1,9 @@
 use std::{
     collections::HashSet,
     error::Error,
-    fmt,
+    fmt, fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
     pin::Pin,
     time::Duration,
 };
@@ -32,6 +33,7 @@ pub enum EgressError {
     RequestBodyTooLarge { size: usize, max: usize },
     ResponseTooLarge { max: usize },
     ResponseIdleTimeout { timeout: Duration },
+    InvalidTlsCaBundle { path: PathBuf, message: String },
     Http(reqwest::Error),
 }
 
@@ -64,6 +66,11 @@ impl fmt::Display for EgressError {
                 formatter,
                 "egress response body was idle for {}ms",
                 timeout.as_millis()
+            ),
+            Self::InvalidTlsCaBundle { path, message } => write!(
+                formatter,
+                "egress TLS CA bundle '{}' is invalid: {message}",
+                path.display()
             ),
             Self::Http(err) => write!(formatter, "egress HTTP error: {err}"),
         }
@@ -106,7 +113,7 @@ impl EgressError {
 /// If `deny_private_ips` is true, any private resolved address still blocks
 /// the request unless that private IP is explicitly covered by one of the
 /// policy CIDRs; policy CIDRs do not disable private-IP blocking globally.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct EgressConfig {
     pub allowed_hosts: HashSet<String>,
     pub allowed_host_globs: Vec<String>,
@@ -118,7 +125,51 @@ pub struct EgressConfig {
     pub max_response_bytes: usize,
     pub max_request_body_bytes: usize,
     pub deny_private_ips: bool,
+    pub tls_ca_bundle_path: Option<PathBuf>,
+    pub tls_root_certificates: Vec<reqwest::Certificate>,
 }
+
+impl fmt::Debug for EgressConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EgressConfig")
+            .field("allowed_hosts", &self.allowed_hosts)
+            .field("allowed_host_globs", &self.allowed_host_globs)
+            .field("private_ip_allow_cidrs", &self.private_ip_allow_cidrs)
+            .field("allowed_ports", &self.allowed_ports)
+            .field("timeout", &self.timeout)
+            .field("response_idle_timeout", &self.response_idle_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("max_request_body_bytes", &self.max_request_body_bytes)
+            .field("deny_private_ips", &self.deny_private_ips)
+            .field("tls_ca_bundle_path", &self.tls_ca_bundle_path)
+            .field(
+                "tls_root_certificate_count",
+                &self.tls_root_certificates.len(),
+            )
+            .finish()
+    }
+}
+
+impl PartialEq for EgressConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.allowed_hosts == other.allowed_hosts
+            && self.allowed_host_globs == other.allowed_host_globs
+            && self.private_ip_allow_cidrs == other.private_ip_allow_cidrs
+            && self.allowed_ports == other.allowed_ports
+            && self.timeout == other.timeout
+            && self.response_idle_timeout == other.response_idle_timeout
+            && self.connect_timeout == other.connect_timeout
+            && self.max_response_bytes == other.max_response_bytes
+            && self.max_request_body_bytes == other.max_request_body_bytes
+            && self.deny_private_ips == other.deny_private_ips
+            && self.tls_ca_bundle_path == other.tls_ca_bundle_path
+            && self.tls_root_certificates.len() == other.tls_root_certificates.len()
+    }
+}
+
+impl Eq for EgressConfig {}
 
 impl Default for EgressConfig {
     fn default() -> Self {
@@ -133,6 +184,8 @@ impl Default for EgressConfig {
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             deny_private_ips: true,
+            tls_ca_bundle_path: None,
+            tls_root_certificates: Vec::new(),
         }
     }
 }
@@ -187,6 +240,8 @@ impl EgressConfig {
             max_response_bytes: config.egress_max_response_bytes,
             max_request_body_bytes: config.egress_max_request_body_bytes,
             deny_private_ips: config.egress_deny_private_ips,
+            tls_ca_bundle_path: None,
+            tls_root_certificates: Vec::new(),
         }
     }
 
@@ -230,6 +285,47 @@ impl EgressConfig {
         if let Some(timeout_ms) = config.upstream_connect_timeout_ms {
             self.connect_timeout = Duration::from_millis(timeout_ms);
         }
+    }
+
+    pub fn apply_timeout_overrides(
+        &mut self,
+        timeout_ms: Option<u64>,
+        response_idle_timeout_ms: Option<u64>,
+        connect_timeout_ms: Option<u64>,
+    ) {
+        if let Some(timeout_ms) = timeout_ms {
+            self.timeout = Duration::from_millis(timeout_ms);
+        }
+        if let Some(timeout_ms) = response_idle_timeout_ms {
+            self.response_idle_timeout = Duration::from_millis(timeout_ms);
+        }
+        if let Some(timeout_ms) = connect_timeout_ms {
+            self.connect_timeout = Duration::from_millis(timeout_ms);
+        }
+    }
+
+    pub fn apply_tls_ca_bundle_path(&mut self, path: PathBuf) -> Result<(), EgressError> {
+        let bytes = fs::read(&path).map_err(|err| EgressError::InvalidTlsCaBundle {
+            path: path.clone(),
+            message: err.to_string(),
+        })?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&bytes).map_err(|err| {
+            EgressError::InvalidTlsCaBundle {
+                path: path.clone(),
+                message: err.to_string(),
+            }
+        })?;
+
+        if certificates.is_empty() {
+            return Err(EgressError::InvalidTlsCaBundle {
+                path,
+                message: "PEM bundle did not contain any certificates".to_owned(),
+            });
+        }
+
+        self.tls_ca_bundle_path = Some(path);
+        self.tls_root_certificates = certificates;
+        Ok(())
     }
 }
 
@@ -564,10 +660,16 @@ fn nat64_embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
 }
 
 fn base_client_builder(config: &EgressConfig) -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(config.timeout)
         .connect_timeout(config.connect_timeout)
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+
+    for certificate in &config.tls_root_certificates {
+        builder = builder.add_root_certificate(certificate.clone());
+    }
+
+    builder
 }
 
 fn checked_host(
@@ -686,7 +788,7 @@ fn redacted_url(url: &Url) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::ErrorKind, net::IpAddr, time::Duration};
+    use std::{collections::HashMap, io::ErrorKind, net::IpAddr, path::PathBuf, time::Duration};
 
     use futures_util::StreamExt;
     use tokio::net::{TcpListener, TcpStream};
@@ -1075,11 +1177,23 @@ mod tests {
                 path_prefix: Some("/api".to_owned()),
                 host: None,
                 upstream_url: "https://api-upstream.example.test/base".to_owned(),
+                timeout_ms: None,
+                response_idle_timeout_ms: None,
+                connect_timeout_ms: None,
+                add_request_headers: HashMap::new(),
+                strip_request_headers: Vec::new(),
+                tls_ca_bundle_path: None,
             },
             crate::config::UpstreamRouteConfig {
                 path_prefix: Some("/assets".to_owned()),
                 host: None,
                 upstream_url: "http://assets-upstream.example.test".to_owned(),
+                timeout_ms: None,
+                response_idle_timeout_ms: None,
+                connect_timeout_ms: None,
+                add_request_headers: HashMap::new(),
+                strip_request_headers: Vec::new(),
+                tls_ca_bundle_path: None,
             },
         ];
 
@@ -1295,6 +1409,56 @@ mod tests {
 
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body, b"pinned");
+        server.await.expect("test server task should finish");
+    }
+
+    #[tokio::test]
+    async fn pinned_client_uses_checked_socket_addr_with_custom_tls_roots() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener local address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one connection");
+            read_one_request(&stream).await;
+            write_all(
+                &stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\ncustom tls",
+            )
+            .await;
+        });
+        let certified = rcgen::generate_simple_self_signed(vec!["egress-pinned.test".to_owned()])
+            .expect("test root certificate should generate");
+        let tls_root_certificates =
+            reqwest::Certificate::from_pem_bundle(certified.cert.pem().as_bytes())
+                .expect("test root certificate should parse");
+        let config = EgressConfig {
+            allowed_hosts: HashSet::from(["egress-pinned.test".to_owned()]),
+            max_response_bytes: 10,
+            deny_private_ips: false,
+            tls_ca_bundle_path: Some(PathBuf::from("test-ca.pem")),
+            tls_root_certificates,
+            ..EgressConfig::default()
+        };
+        let client = EgressClient::new(config).expect("client should build");
+        let pinned_client = client
+            .pinned_client("egress-pinned.test", addr)
+            .expect("pinned client should build");
+        let url = Url::parse(&format!("http://egress-pinned.test:{}/", addr.port()))
+            .expect("test URL should parse");
+
+        let response = client
+            .send_with_client(pinned_client, Method::GET, url, HeaderMap::new(), None)
+            .await
+            .expect("pinned request should reach the test server");
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, b"custom tls");
         server.await.expect("test server task should finish");
     }
 
