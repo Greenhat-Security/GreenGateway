@@ -16,7 +16,7 @@ use crate::{
     config::Config,
 };
 
-use super::decision::{AuthOutcome, PolicyDecision, UpstreamOutcome};
+use super::decision::{AuthOutcome, PolicyDecision, PolicyDecisionOutcome, UpstreamOutcome};
 
 const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
 
@@ -140,8 +140,11 @@ fn auth_outcome_label(auth_outcome: Option<&AuthOutcome>) -> &'static str {
 
 fn policy_decision_label(policy_decision: Option<&PolicyDecision>) -> &'static str {
     match policy_decision {
-        Some(decision) if decision.allowed => "allowed",
-        Some(_) => "denied",
+        Some(decision) => match decision.outcome {
+            PolicyDecisionOutcome::Allowed => "allowed",
+            PolicyDecisionOutcome::Denied => "denied",
+            PolicyDecisionOutcome::WouldDeny => "would_deny",
+        },
         None => "not_evaluated",
     }
 }
@@ -174,7 +177,7 @@ mod tests {
         audit::{sink::tests::CaptureSink, AuditSink},
         auth::{AuthError, AuthMethod, Principal, SessionCredential, SessionValidator},
         middleware::{auth, rbac},
-        rbac::{policy::RoleEntry, DefaultAction, Policy, RouteRule},
+        rbac::{policy::RoleEntry, DefaultAction, EnforcementMode, Policy, RouteRule},
     };
 
     #[derive(Clone)]
@@ -187,6 +190,7 @@ mod tests {
     enum FakePolicyLayer {
         Allowed,
         Denied,
+        WouldDeny,
     }
 
     #[derive(Clone)]
@@ -334,6 +338,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observed_would_deny_policy_marker_is_distinct_from_allowed() {
+        let (state, capture) = test_observation_state();
+
+        let response = base_router()
+            .layer(from_fn_with_state(
+                FakePolicyLayer::WouldDeny,
+                fake_policy_layer,
+            ))
+            .layer(from_fn_with_state(state, observation_middleware))
+            .oneshot(request(Method::GET, "/", "request-policy-would-deny"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let event = one_observation_event(&capture).await;
+        assert_eq!(event.payload["status"], json!(200));
+        assert_eq!(event.payload["policy_decision"], json!("would_deny"));
+        assert_eq!(event.payload["policy_reason"], json!("missing_permission"));
+        assert_eq!(event.payload["permission"], json!("data:read"));
+        assert_eq!(event.payload["path_prefix"], json!("/data"));
+    }
+
+    #[tokio::test]
     async fn observation_correlates_with_real_auth_and_rbac_allowed_events() {
         let (audit, capture) = test_audit_log();
         let router = auth_rbac_observation_router(
@@ -384,6 +411,108 @@ mod tests {
         assert_eq!(observed.payload["auth_outcome"], json!("authenticated"));
         assert_eq!(observed.payload["policy_decision"], json!("allowed"));
         assert_eq!(observed.payload["permission"], json!("data:read"));
+        assert_eq!(
+            observed.actor.as_ref().map(|actor| actor.user_id.as_str()),
+            Some("user-123")
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_correlates_with_real_default_allow_decision() {
+        let (audit, capture) = test_audit_log();
+        let router = auth_rbac_observation_router(
+            audit,
+            validator(Ok(test_principal(&["reader"]))),
+            test_policy(DefaultAction::Allow, &[], &[]),
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/data/items")
+                    .header(crate::REQUEST_ID_HEADER, "request-real-default-allow")
+                    .header(AUTHORIZATION, "Bearer token-123")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eventually(Duration::from_secs(1), || capture.events().len() >= 3);
+        let events = capture.events();
+        let authz = events
+            .iter()
+            .find(|event| event.event_type == "authz.allowed")
+            .expect("authz allowed event should be captured");
+        assert_eq!(authz.payload["reason"], json!("default_allow"));
+        assert_eq!(authz.request_id, "request-real-default-allow");
+
+        let observed = events
+            .iter()
+            .find(|event| event.event_type == HTTP_REQUEST_OBSERVED)
+            .expect("observation event should be captured");
+        assert_eq!(observed.payload["auth_outcome"], json!("authenticated"));
+        assert_eq!(observed.payload["policy_decision"], json!("allowed"));
+        assert_eq!(observed.payload["policy_reason"], json!("default_allow"));
+        assert!(observed.payload.get("permission").is_none());
+        assert_eq!(
+            observed.actor.as_ref().map(|actor| actor.user_id.as_str()),
+            Some("user-123")
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_correlates_with_real_shadow_would_deny_decision() {
+        let (audit, capture) = test_audit_log();
+        let router = auth_rbac_observation_router(
+            audit,
+            validator(Ok(test_principal(&["reader"]))),
+            test_policy_with_enforcement(
+                DefaultAction::Deny,
+                EnforcementMode::Shadow,
+                &[("reader", &["data:read"])],
+                &[route(&["GET"], "/data", "admin:read")],
+            ),
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/data/items")
+                    .header(crate::REQUEST_ID_HEADER, "request-real-shadow-would-deny")
+                    .header(AUTHORIZATION, "Bearer token-123")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eventually(Duration::from_secs(1), || capture.events().len() >= 3);
+        let events = capture.events();
+        for event_type in ["auth.success", "authz.would_deny", HTTP_REQUEST_OBSERVED] {
+            let event = events
+                .iter()
+                .find(|event| event.event_type == event_type)
+                .expect("expected event should be captured");
+            assert_eq!(event.request_id, "request-real-shadow-would-deny");
+        }
+
+        let observed = events
+            .iter()
+            .find(|event| event.event_type == HTTP_REQUEST_OBSERVED)
+            .expect("observation event should be captured");
+        assert_eq!(observed.payload["auth_outcome"], json!("authenticated"));
+        assert_eq!(observed.payload["policy_decision"], json!("would_deny"));
+        assert_eq!(
+            observed.payload["policy_reason"],
+            json!("missing_permission")
+        );
+        assert_eq!(observed.payload["permission"], json!("admin:read"));
+        assert_eq!(observed.payload["path_prefix"], json!("/data"));
         assert_eq!(
             observed.actor.as_ref().map(|actor| actor.user_id.as_str()),
             Some("user-123")
@@ -488,7 +617,7 @@ mod tests {
             FakePolicyLayer::Allowed => {
                 let mut response = next.run(req).await;
                 response.extensions_mut().insert(PolicyDecision {
-                    allowed: true,
+                    outcome: PolicyDecisionOutcome::Allowed,
                     reason: "matched_rule",
                     permission: Some("data:read".to_owned()),
                     path_prefix: Some("/data".to_owned()),
@@ -498,7 +627,17 @@ mod tests {
             FakePolicyLayer::Denied => {
                 let mut response = StatusCode::FORBIDDEN.into_response();
                 response.extensions_mut().insert(PolicyDecision {
-                    allowed: false,
+                    outcome: PolicyDecisionOutcome::Denied,
+                    reason: "missing_permission",
+                    permission: Some("data:read".to_owned()),
+                    path_prefix: Some("/data".to_owned()),
+                });
+                response
+            }
+            FakePolicyLayer::WouldDeny => {
+                let mut response = next.run(req).await;
+                response.extensions_mut().insert(PolicyDecision {
+                    outcome: PolicyDecisionOutcome::WouldDeny,
                     reason: "missing_permission",
                     permission: Some("data:read".to_owned()),
                     path_prefix: Some("/data".to_owned()),
@@ -533,6 +672,7 @@ mod tests {
             .layer(from_fn_with_state(
                 rbac::RbacState {
                     default_action: policy.default_action.clone(),
+                    enforcement_mode: policy.enforcement_mode,
                     routes: Arc::new(policy.routes.clone()),
                     engine: Arc::new(crate::rbac::PolicyEngine::new(policy)),
                     exempt_paths: Vec::new(),
@@ -586,10 +726,20 @@ mod tests {
         roles: &[(&str, &[&str])],
         routes: &[RouteRule],
     ) -> Policy {
+        test_policy_with_enforcement(default_action, EnforcementMode::Enforce, roles, routes)
+    }
+
+    fn test_policy_with_enforcement(
+        default_action: DefaultAction,
+        enforcement_mode: EnforcementMode,
+        roles: &[(&str, &[&str])],
+        routes: &[RouteRule],
+    ) -> Policy {
         Policy {
             schema_version: "0.1.0".to_owned(),
             id: Some("test-policy".to_owned()),
             default_action,
+            enforcement_mode,
             roles: roles
                 .iter()
                 .map(|(role, permissions)| {
@@ -613,6 +763,7 @@ mod tests {
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
             path_prefix: path_prefix.to_owned(),
             permission: permission.to_owned(),
+            enforcement_mode: None,
         }
     }
 
