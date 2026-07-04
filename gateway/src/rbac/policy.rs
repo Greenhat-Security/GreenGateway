@@ -1,11 +1,15 @@
 use std::{
     collections::HashMap,
     error::Error,
+    ffi::OsString,
     fmt, fs, io,
+    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Config;
@@ -18,9 +22,14 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "roles",
     "routes",
 ];
+#[allow(dead_code)]
+const TEMP_FILE_CREATE_ATTEMPTS: u8 = 16;
+
+#[allow(dead_code)]
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Action to apply when no route rule matches.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DefaultAction {
     Allow,
@@ -35,7 +44,7 @@ impl Default for DefaultAction {
 }
 
 /// Enforcement behavior for authorization denials.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EnforcementMode {
     #[default]
@@ -44,10 +53,11 @@ pub enum EnforcementMode {
 }
 
 /// RBAC policy document.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Policy {
     pub schema_version: String,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Governs routes not matched by any rule.
     ///
@@ -66,7 +76,7 @@ pub struct Policy {
 }
 
 /// Permissions granted by one role.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleEntry {
     #[serde(default)]
@@ -74,7 +84,7 @@ pub struct RoleEntry {
 }
 
 /// Permission required for requests matching a path prefix and optional method set.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteRule {
     /// HTTP methods this rule matches. Empty or ["*"] matches any method.
@@ -86,6 +96,7 @@ pub struct RouteRule {
     pub permission: String,
     /// Optional per-rule enforcement override. Unset inherits the policy default.
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub enforcement_mode: Option<EnforcementMode>,
 }
 
@@ -98,6 +109,17 @@ pub enum PolicyError {
     Parse {
         path: Option<PathBuf>,
         source: serde_json::Error,
+    },
+    #[allow(dead_code)]
+    Serialize {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    #[allow(dead_code)]
+    Write {
+        path: PathBuf,
+        temp_path: Option<PathBuf>,
+        source: io::Error,
     },
     Invalid(String),
 }
@@ -122,6 +144,28 @@ impl Policy {
             Some(path) => Self::from_file(path).map(Some),
             None => Ok(None),
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn persist_to_file(&self, path: impl AsRef<Path>) -> Result<(), PolicyError> {
+        self.persist_to_file_with_rename(path.as_ref(), |temp_path, target_path| {
+            fs::rename(temp_path, target_path)
+        })
+    }
+
+    #[allow(dead_code)]
+    fn persist_to_file_with_rename<F>(&self, path: &Path, rename: F) -> Result<(), PolicyError>
+    where
+        F: FnOnce(&Path, &Path) -> io::Result<()>,
+    {
+        let mut contents =
+            serde_json::to_vec_pretty(self).map_err(|source| PolicyError::Serialize {
+                path: path.to_owned(),
+                source,
+            })?;
+        contents.push(b'\n');
+
+        persist_policy_bytes_with_rename(path, &contents, rename)
     }
 
     fn from_json_value(value: Value, path: Option<&Path>) -> Result<Self, PolicyError> {
@@ -170,6 +214,30 @@ impl fmt::Display for PolicyError {
             Self::Parse { path: None, source } => {
                 write!(formatter, "failed to parse policy JSON: {source}")
             }
+            Self::Serialize { path, source } => write!(
+                formatter,
+                "failed to serialize policy for {}: {source}",
+                path.display()
+            ),
+            Self::Write {
+                path,
+                temp_path: Some(temp_path),
+                source,
+            } => write!(
+                formatter,
+                "failed to write policy file {} via temporary file {}: {source}",
+                path.display(),
+                temp_path.display()
+            ),
+            Self::Write {
+                path,
+                temp_path: None,
+                source,
+            } => write!(
+                formatter,
+                "failed to write policy file {}: {source}",
+                path.display()
+            ),
             Self::Invalid(message) => write!(formatter, "invalid policy: {message}"),
         }
     }
@@ -180,8 +248,118 @@ impl Error for PolicyError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
+            Self::Serialize { source, .. } => Some(source),
+            Self::Write { source, .. } => Some(source),
             Self::Invalid(_) => None,
         }
+    }
+}
+
+#[allow(dead_code)]
+fn persist_policy_bytes_with_rename<F>(
+    path: &Path,
+    contents: &[u8],
+    rename: F,
+) -> Result<(), PolicyError>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    let (temp_path, mut temp_file) = create_temp_policy_file(path)?;
+
+    if let Err(source) = write_policy_file_contents(&mut temp_file, contents) {
+        drop(temp_file);
+        remove_temp_policy_file(path, &temp_path);
+        return Err(policy_write_error(path, Some(&temp_path), source));
+    }
+
+    drop(temp_file);
+
+    if let Err(source) = rename(&temp_path, path) {
+        remove_temp_policy_file(path, &temp_path);
+        return Err(policy_write_error(path, Some(&temp_path), source));
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn create_temp_policy_file(path: &Path) -> Result<(PathBuf, fs::File), PolicyError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Some(file_name) = path.file_name() else {
+        return Err(policy_write_error(
+            path,
+            None,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "policy file path must include a file name",
+            ),
+        ));
+    };
+
+    for _ in 0..TEMP_FILE_CREATE_ATTEMPTS {
+        let temp_path = parent.join(temp_policy_file_name(file_name));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(policy_write_error(path, Some(&temp_path), source)),
+        }
+    }
+
+    Err(policy_write_error(
+        path,
+        None,
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not create a unique temporary policy file",
+        ),
+    ))
+}
+
+#[allow(dead_code)]
+fn temp_policy_file_name(file_name: &std::ffi::OsStr) -> OsString {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut temp_file_name = OsString::from(".");
+    temp_file_name.push(file_name);
+    temp_file_name.push(format!(".{}.{}.{}.tmp", std::process::id(), now, counter));
+    temp_file_name
+}
+
+#[allow(dead_code)]
+fn write_policy_file_contents(file: &mut fs::File, contents: &[u8]) -> io::Result<()> {
+    file.write_all(contents)?;
+    file.flush()?;
+    file.sync_all()
+}
+
+#[allow(dead_code)]
+fn policy_write_error(path: &Path, temp_path: Option<&Path>, source: io::Error) -> PolicyError {
+    PolicyError::Write {
+        path: path.to_owned(),
+        temp_path: temp_path.map(Path::to_owned),
+        source,
+    }
+}
+
+#[allow(dead_code)]
+fn remove_temp_policy_file(path: &Path, temp_path: &Path) {
+    if let Err(err) = fs::remove_file(temp_path) {
+        tracing::warn!(
+            policy_file = %path.display(),
+            temp_policy_file = %temp_path.display(),
+            error = %err,
+            "failed to clean up temporary policy file"
+        );
     }
 }
 
@@ -230,6 +408,7 @@ fn unreachable_route_path_prefixes(routes: &[RouteRule]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         fs,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
@@ -529,6 +708,72 @@ mod tests {
     }
 
     #[test]
+    fn persist_to_file_round_trips_policy_document() {
+        let file = TempPolicyFile::new(r#"{ "schema_version": "0.1.0" }"#);
+        let policy = rich_policy();
+
+        policy
+            .persist_to_file(file.path())
+            .expect("policy should persist atomically");
+
+        let loaded = Policy::from_file(file.path()).expect("persisted policy should parse");
+        let contents = fs::read_to_string(file.path())
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.path().display()));
+        let value: Value = serde_json::from_str(&contents)
+            .unwrap_or_else(|err| panic!("persisted policy should be JSON: {err}"));
+
+        assert_eq!(loaded, policy);
+        assert_schema_accepts(&policy_schema_validator(), &value);
+    }
+
+    #[test]
+    fn persist_to_file_rename_failure_leaves_existing_policy_and_cleans_temp_file() {
+        let file = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "deny",
+                "roles": {
+                    "reader": { "permissions": ["data:read"] }
+                }
+            }"#,
+        );
+        let original_contents = fs::read_to_string(file.path())
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.path().display()));
+        let policy = rich_policy();
+
+        let error = policy
+            .persist_to_file_with_rename(file.path(), |_temp_path, _target_path| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "simulated atomic rename failure",
+                ))
+            })
+            .expect_err("rename failure should reject persistence");
+        let temp_path = match &error {
+            PolicyError::Write {
+                temp_path: Some(temp_path),
+                ..
+            } => temp_path.clone(),
+            other => panic!("unexpected persistence error: {other:?}"),
+        };
+
+        assert!(
+            error.to_string().contains("failed to write policy file"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(file.path())
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.path().display())),
+            original_contents
+        );
+        assert!(
+            !temp_path.exists(),
+            "temporary policy file should be removed after rename failure: {}",
+            temp_path.display()
+        );
+    }
+
+    #[test]
     fn published_schema_accepts_valid_policy_and_rejects_bad_schema_version() {
         let validator = policy_schema_validator();
         let valid_policy = json!({
@@ -698,6 +943,43 @@ mod tests {
             path_prefix: path_prefix.to_owned(),
             permission: permission.to_owned(),
             enforcement_mode: None,
+        }
+    }
+
+    fn rich_policy() -> Policy {
+        Policy {
+            schema_version: "0.1.0".to_owned(),
+            id: Some("persisted-policy".to_owned()),
+            default_action: DefaultAction::Allow,
+            enforcement_mode: EnforcementMode::Shadow,
+            roles: HashMap::from([
+                (
+                    "admin".to_owned(),
+                    RoleEntry {
+                        permissions: vec!["*".to_owned()],
+                    },
+                ),
+                (
+                    "reader".to_owned(),
+                    RoleEntry {
+                        permissions: vec!["data:read".to_owned(), "reports:read".to_owned()],
+                    },
+                ),
+            ]),
+            routes: vec![
+                RouteRule {
+                    methods: vec!["GET".to_owned(), "HEAD".to_owned()],
+                    path_prefix: "/data".to_owned(),
+                    permission: "data:read".to_owned(),
+                    enforcement_mode: Some(EnforcementMode::Enforce),
+                },
+                RouteRule {
+                    methods: Vec::new(),
+                    path_prefix: "/reports".to_owned(),
+                    permission: "reports:read".to_owned(),
+                    enforcement_mode: None,
+                },
+            ],
         }
     }
 

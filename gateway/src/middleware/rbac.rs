@@ -1154,6 +1154,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_watch_reload_applies_policy_persisted_atomically() {
+        let file = TempPolicyFile::new(&default_policy_document("deny"));
+        let initial_policy =
+            Policy::from_file(file.path()).expect("initial policy should parse before test");
+        let (state, _capture) = test_state(initial_policy, &[]);
+        spawn_policy_reload_tasks(file.path().to_owned(), state.clone())
+            .expect("policy file watcher should start");
+        let router = test_router(state, None);
+
+        let response = router
+            .clone()
+            .oneshot(request(Method::GET, "/unmatched"))
+            .await
+            .expect("request should complete before persisted reload");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let persisted_policy = test_policy(DefaultAction::Allow, &[], &[]);
+        persisted_policy
+            .persist_to_file(file.path())
+            .expect("policy should persist atomically");
+
+        wait_for_status(router, "/unmatched", StatusCode::OK).await;
+    }
+
+    #[tokio::test]
     async fn file_watch_invalid_update_keeps_old_policy_and_accepts_later_valid_update() {
         let file = TempPolicyFile::new(&default_policy_document("allow"));
         let initial_policy =
