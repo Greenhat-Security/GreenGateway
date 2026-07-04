@@ -10,6 +10,11 @@ import {
   fetchTrafficEndpoints,
   updateTrafficEndpointReview,
 } from '../lib/traffic';
+import {
+  EndpointLifecycleBadges,
+  MethodBadge,
+  ReviewBadge,
+} from './trafficBadges';
 
 type TrafficLoadError = {
   kind:
@@ -326,11 +331,7 @@ export function TrafficInventory() {
                         </td>
                         <td>
                           <div className="review-cell">
-                            <span
-                              className={`badge ${endpoint.reviewed ? 'success' : 'neutral'}`}
-                            >
-                              {endpoint.reviewed ? 'Reviewed' : 'Unreviewed'}
-                            </span>
+                            <ReviewBadge reviewed={endpoint.reviewed} />
                             <button
                               type="button"
                               className="secondary-button row-action-button"
@@ -406,19 +407,26 @@ function EndpointCell({ endpoint }: { endpoint: TrafficEndpoint }) {
   return (
     <div className="traffic-endpoint-cell">
       <div className="endpoint-title">
-        <span className="badge neutral">{endpoint.method}</span>
-        <span className="endpoint-template">{endpoint.endpoint_template}</span>
+        <MethodBadge method={endpoint.method} />
+        <Link
+          className="endpoint-template endpoint-detail-link"
+          to={trafficEndpointDetailPath(endpoint)}
+          aria-label={`View detail for ${endpoint.method} ${endpoint.endpoint_template}`}
+        >
+          {endpoint.endpoint_template}
+        </Link>
       </div>
-      {endpoint.is_new || !endpoint.covered_by_rule ? (
-        <div className="endpoint-badges" aria-label="Endpoint lifecycle">
-          {endpoint.is_new ? <span className="badge success">NEW</span> : null}
-          {!endpoint.covered_by_rule ? (
-            <span className="badge warning">UNCOVERED</span>
-          ) : null}
-        </div>
-      ) : null}
+      <EndpointLifecycleBadges endpoint={endpoint} />
     </div>
   );
+}
+
+function trafficEndpointDetailPath(endpoint: TrafficEndpoint): string {
+  const params = new URLSearchParams();
+  params.set('method', endpoint.method);
+  params.set('endpoint_template', endpoint.endpoint_template);
+
+  return `/traffic/detail?${params.toString()}`;
 }
 
 function TrafficErrorMessage({ error }: { error: TrafficLoadError }) {

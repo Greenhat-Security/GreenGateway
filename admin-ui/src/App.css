@@ -418,6 +418,7 @@ h3 {
 .primary-button:focus-visible,
 .secondary-button:focus-visible,
 .expand-button:focus-visible,
+.endpoint-detail-link:focus-visible,
 .filter-toggle:focus-visible,
 input:focus-visible,
 select:focus-visible {
@@ -834,6 +835,135 @@ select:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.endpoint-detail-link {
+  color: var(--gh-sys-primary-text);
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.endpoint-detail-link:hover {
+  color: var(--gh-sys-primary-hover);
+  text-decoration: underline;
+}
+
+.traffic-detail-panel h3,
+.traffic-detail-panel h4 {
+  margin-bottom: 0;
+}
+
+.traffic-detail-heading .secondary-button {
+  flex: none;
+}
+
+.traffic-detail-section,
+.traffic-endpoint-summary,
+.traffic-audit-grid,
+.traffic-warning-list {
+  display: grid;
+  gap: var(--gh-ref-space-4);
+}
+
+.traffic-summary-grid,
+.traffic-chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--gh-ref-space-4);
+}
+
+.traffic-summary-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.traffic-stat-card,
+.traffic-chart-section {
+  display: grid;
+  align-content: start;
+  gap: var(--gh-ref-space-3);
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-comp-card-radius);
+  padding: var(--gh-ref-space-4);
+  background: var(--gh-sys-bg-raised);
+}
+
+.traffic-stat-card .stat-value {
+  font-size: var(--gh-type-h4);
+  line-height: var(--gh-lh-h4);
+}
+
+.traffic-metadata-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0 var(--gh-ref-space-4);
+  margin: 0;
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-comp-card-radius);
+  padding: 0 var(--gh-ref-space-4);
+  background: var(--gh-sys-bg-canvas);
+}
+
+.traffic-chart-heading,
+.traffic-bar-row {
+  display: flex;
+  align-items: center;
+  gap: var(--gh-ref-space-3);
+}
+
+.traffic-chart-heading {
+  justify-content: space-between;
+}
+
+.traffic-chart-heading h4 {
+  font-size: var(--gh-type-h5);
+  line-height: var(--gh-lh-h5);
+}
+
+.traffic-bar-list {
+  display: grid;
+  gap: var(--gh-ref-space-3);
+}
+
+.traffic-bar-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.traffic-bar-row.stacked {
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) auto;
+}
+
+.traffic-bar-label,
+.traffic-bar-value {
+  color: var(--gh-sys-fg-muted);
+  font-size: var(--gh-type-body-sm);
+  line-height: var(--gh-lh-body-sm);
+}
+
+.traffic-bar-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.traffic-bar-value {
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+
+.traffic-bar-track {
+  height: var(--gh-ref-space-3);
+  overflow: hidden;
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-ref-radius-full);
+  background: var(--gh-sys-bg-surface);
+}
+
+.traffic-bar-fill {
+  display: block;
+  width: var(--bar-value);
+  height: 100%;
+  border-radius: inherit;
+  background: var(--gh-sys-primary);
+}
+
 .numeric-cell,
 .timestamp-cell {
   font-variant-numeric: tabular-nums;
@@ -1145,6 +1275,9 @@ select:focus-visible {
 
 @media (max-width: 980px) {
   .content-grid,
+  .traffic-chart-grid,
+  .traffic-metadata-grid,
+  .traffic-summary-grid,
   .status-stat-grid,
   .status-card-grid {
     grid-template-columns: 1fr;

@@ -43,6 +43,15 @@ describe('TrafficInventory', () => {
     expect(screen.getByText('NEW')).toBeTruthy();
     expect(screen.getByText('UNCOVERED')).toBeTruthy();
     expect(screen.getByTitle('2026-07-04T10:00:00Z')).toBeTruthy();
+    expect(
+      screen
+        .getByRole('link', {
+          name: 'View detail for GET /users/{id}',
+        })
+        .getAttribute('href'),
+    ).toBe(
+      '/traffic/detail?method=GET&endpoint_template=%2Fusers%2F%7Bid%7D',
+    );
 
     const firstUrl = new URL(String(fetchMock.mock.calls[0][0]), 'http://localhost');
     expect(firstUrl.pathname).toBe('/v1/admin/traffic/endpoints');
