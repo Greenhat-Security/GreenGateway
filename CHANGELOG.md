@@ -62,7 +62,7 @@ for full phase-by-phase status.
 
 ## [0.1.0] - 2026-07-03
 
-### Added — Phase 1 (open-source-ready foundation)
+### Added — Phase 1 (source-available foundation)
 
 - Project scaffolding: README, CONTRIBUTING, CODE_OF_CONDUCT, SECURITY, issue/PR
   templates, `.gitignore`, `.editorconfig`, AGENTS.md, architecture docs, and
