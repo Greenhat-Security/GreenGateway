@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt,
     path::PathBuf,
@@ -6,11 +7,20 @@ use std::{
 };
 
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
+use serde::Serialize;
+use serde_json::Value;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     audit::{Actor, AuditEvent},
+    discovery::path_template::template_stateless,
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
 };
+
+const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
+pub const ENDPOINT_AUDIT_MATCH_STRATEGY: &str = "stateless_path_template";
+pub const ENDPOINT_AUDIT_MATCH_LIMITATIONS: &str =
+    "Matches literal paths and immediate well-known identifier templates such as /users/{id}; statefully learned slug templates such as /catalog/{param} are not reverse-mapped from raw audit paths.";
 
 pub struct AuditQueryStore {
     path: PathBuf,
@@ -31,6 +41,47 @@ pub struct AuditQueryFilters {
 pub struct AuditQueryPage {
     pub events: Vec<AuditEvent>,
     pub next_cursor: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointAuditBucket {
+    Hour,
+    Day,
+}
+
+pub struct EndpointAuditFilters {
+    pub method: String,
+    pub endpoint_template: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub bucket: EndpointAuditBucket,
+    pub recent_limit: usize,
+    pub recent_before_id: Option<i64>,
+}
+
+#[derive(Serialize)]
+pub struct EndpointAuditActivity {
+    pub time_series: Vec<EndpointTimeSeriesPoint>,
+    pub recent_events: Vec<EndpointRecentEvent>,
+    pub recent_events_next_cursor: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct EndpointTimeSeriesPoint {
+    pub bucket_start: String,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct EndpointRecentEvent {
+    pub id: i64,
+    pub event_id: String,
+    pub request_id: String,
+    pub timestamp: String,
+    pub method: String,
+    pub path: String,
+    pub status: Option<i64>,
+    pub actor: Option<String>,
 }
 
 #[derive(Debug)]
@@ -156,6 +207,70 @@ impl AuditQueryStore {
         })
     }
 
+    pub fn query_endpoint_activity(
+        &self,
+        filters: &EndpointAuditFilters,
+    ) -> Result<EndpointAuditActivity, AuditQueryError> {
+        let series_rows =
+            self.query_endpoint_audit_rows(filters.from.as_deref(), filters.to.as_deref(), None)?;
+        let time_series = endpoint_time_series(&series_rows, filters);
+
+        let recent_rows = self.query_endpoint_audit_rows(
+            filters.from.as_deref(),
+            filters.to.as_deref(),
+            filters.recent_before_id,
+        )?;
+        let mut recent_events = recent_rows
+            .into_iter()
+            .filter_map(|row| row.into_recent_event(filters))
+            .collect::<Vec<_>>();
+        let has_more = recent_events.len() > filters.recent_limit;
+        if has_more {
+            recent_events.truncate(filters.recent_limit);
+        }
+        let recent_events_next_cursor = has_more.then(|| {
+            recent_events
+                .last()
+                .expect("over-limit recent event query should leave at least one row")
+                .id
+        });
+
+        Ok(EndpointAuditActivity {
+            time_series,
+            recent_events,
+            recent_events_next_cursor,
+        })
+    }
+
+    fn query_endpoint_audit_rows(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        before_id: Option<i64>,
+    ) -> Result<Vec<EndpointAuditRow>, AuditQueryError> {
+        let (sql, params) = build_endpoint_audit_query(from, to, before_id);
+        let connection = self.connection_guard();
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|source| AuditQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let rows = statement
+            .query_map(params_from_iter(params.iter()), endpoint_audit_row)
+            .map_err(|source| AuditQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| AuditQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows)
+    }
+
     fn connection_guard(&self) -> MutexGuard<'_, Connection> {
         match self.connection.lock() {
             Ok(guard) => guard,
@@ -236,6 +351,45 @@ fn build_query(filters: &AuditQueryFilters) -> (String, Vec<SqlValue>) {
     (sql, params)
 }
 
+fn build_endpoint_audit_query(
+    from: Option<&str>,
+    to: Option<&str>,
+    before_id: Option<i64>,
+) -> (String, Vec<SqlValue>) {
+    let mut sql = String::from(
+        r#"
+        SELECT
+            id,
+            event_id,
+            timestamp,
+            request_id,
+            actor_user_id,
+            payload_path,
+            payload_status,
+            payload_json
+        FROM audit_events
+        WHERE event_type = ? AND payload_path IS NOT NULL
+        "#,
+    );
+    let mut params = vec![SqlValue::Text(HTTP_REQUEST_OBSERVED.to_owned())];
+
+    if let Some(from) = from {
+        sql.push_str(" AND julianday(timestamp) >= julianday(?)");
+        params.push(SqlValue::Text(from.to_owned()));
+    }
+    if let Some(to) = to {
+        sql.push_str(" AND julianday(timestamp) <= julianday(?)");
+        params.push(SqlValue::Text(to.to_owned()));
+    }
+    if let Some(before_id) = before_id {
+        sql.push_str(" AND id < ?");
+        params.push(SqlValue::Integer(before_id));
+    }
+
+    sql.push_str(" ORDER BY id DESC");
+    (sql, params)
+}
+
 fn query_limit(limit: usize) -> i64 {
     i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
 }
@@ -299,6 +453,132 @@ fn raw_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAuditEventRow> 
         actor_json: row.get(8)?,
         payload_json: row.get(9)?,
     })
+}
+
+struct EndpointAuditRow {
+    id: i64,
+    event_id: String,
+    timestamp: String,
+    request_id: String,
+    actor_user_id: Option<String>,
+    payload_path: String,
+    payload_status: Option<i64>,
+    payload_json: String,
+}
+
+impl EndpointAuditRow {
+    fn into_recent_event(self, filters: &EndpointAuditFilters) -> Option<EndpointRecentEvent> {
+        let payload = serde_json::from_str::<Value>(&self.payload_json).ok()?;
+        let method = payload.get("method")?.as_str()?.to_owned();
+        if !endpoint_audit_row_matches(&method, &self.payload_path, filters) {
+            return None;
+        }
+
+        Some(EndpointRecentEvent {
+            id: self.id,
+            event_id: self.event_id,
+            request_id: self.request_id,
+            timestamp: self.timestamp,
+            method,
+            path: self.payload_path,
+            status: self.payload_status.or_else(|| payload_status(&payload)),
+            actor: self.actor_user_id,
+        })
+    }
+}
+
+fn endpoint_audit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EndpointAuditRow> {
+    Ok(EndpointAuditRow {
+        id: row.get(0)?,
+        event_id: row.get(1)?,
+        timestamp: row.get(2)?,
+        request_id: row.get(3)?,
+        actor_user_id: row.get(4)?,
+        payload_path: row.get(5)?,
+        payload_status: row.get(6)?,
+        payload_json: row.get(7)?,
+    })
+}
+
+fn endpoint_time_series(
+    rows: &[EndpointAuditRow],
+    filters: &EndpointAuditFilters,
+) -> Vec<EndpointTimeSeriesPoint> {
+    let mut buckets = BTreeMap::<String, u64>::new();
+
+    for row in rows {
+        let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) else {
+            continue;
+        };
+        let Some(method) = payload.get("method").and_then(Value::as_str) else {
+            continue;
+        };
+        if !endpoint_audit_row_matches(method, &row.payload_path, filters) {
+            continue;
+        }
+        let Some(bucket_start) = bucket_start(&row.timestamp, filters.bucket) else {
+            continue;
+        };
+
+        *buckets.entry(bucket_start).or_insert(0) += 1;
+    }
+
+    buckets
+        .into_iter()
+        .map(|(bucket_start, count)| EndpointTimeSeriesPoint {
+            bucket_start,
+            count,
+        })
+        .collect()
+}
+
+fn endpoint_audit_row_matches(
+    method: &str,
+    concrete_path: &str,
+    filters: &EndpointAuditFilters,
+) -> bool {
+    method == filters.method && template_stateless(concrete_path) == filters.endpoint_template
+}
+
+fn bucket_start(timestamp: &str, bucket: EndpointAuditBucket) -> Option<String> {
+    let timestamp = OffsetDateTime::parse(timestamp, &Rfc3339).ok()?;
+    let month: u8 = timestamp.month().into();
+
+    Some(match bucket {
+        EndpointAuditBucket::Hour => format!(
+            "{:04}-{month:02}-{:02}T{:02}:00:00Z",
+            timestamp.year(),
+            timestamp.day(),
+            timestamp.hour()
+        ),
+        EndpointAuditBucket::Day => format!(
+            "{:04}-{month:02}-{:02}T00:00:00Z",
+            timestamp.year(),
+            timestamp.day()
+        ),
+    })
+}
+
+fn payload_status(payload: &Value) -> Option<i64> {
+    payload
+        .get("status")
+        .and_then(|status| {
+            status
+                .as_i64()
+                .or_else(|| status.as_u64().and_then(|value| i64::try_from(value).ok()))
+        })
+        .or_else(|| {
+            let value = payload.get("status")?.as_f64()?;
+            if value.is_finite()
+                && value.fract() == 0.0
+                && value >= i64::MIN as f64
+                && value <= i64::MAX as f64
+            {
+                Some(value as i64)
+            } else {
+                None
+            }
+        })
 }
 
 #[cfg(test)]

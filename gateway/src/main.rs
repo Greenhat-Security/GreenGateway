@@ -57,13 +57,17 @@ const POLICY_VALIDATE_ADMIN_ROUTE: &str = "/v1/admin/policy/validate";
 const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
 const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
+const TRAFFIC_ENDPOINTS_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints";
+const TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoint";
 const AUDIT_ADMIN_ROLE: &str = "admin";
 const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
 const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
+const ADMIN_TRAFFIC_READ_PERMISSION: &str = "admin:traffic:read";
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
 const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
 const MAX_AUDIT_QUERY_LIMIT: usize = 500;
+const DEFAULT_TRAFFIC_RECENT_EVENTS_LIMIT: usize = 20;
 const UPSTREAM_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(rust_embed::RustEmbed)]
@@ -141,6 +145,8 @@ struct AdminRoutes {
     policy_rules_route: String,
     policy_rule_route: String,
     policy_rules_order_route: String,
+    traffic_endpoints_route: String,
+    traffic_endpoint_detail_route: String,
 }
 
 impl GatewayRoutes {
@@ -191,6 +197,8 @@ impl AdminRoutes {
             policy_rules_route: format!("{api_prefix}/policy/rules"),
             policy_rule_route: format!("{api_prefix}/policy/rules/{{id}}"),
             policy_rules_order_route: format!("{api_prefix}/policy/rules/order"),
+            traffic_endpoints_route: format!("{api_prefix}/traffic/endpoints"),
+            traffic_endpoint_detail_route: format!("{api_prefix}/traffic/endpoint"),
             api_prefix,
         }
     }
@@ -217,6 +225,13 @@ struct PolicyAdminState {
     audit: audit::AuditLog,
     trust_proxy_headers: bool,
     max_body_size: usize,
+}
+
+#[derive(Clone)]
+struct TrafficAdminState {
+    discovery_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
+    audit_query_store: Option<Arc<audit::query::AuditQueryStore>>,
+    rbac_state: Option<middleware::rbac::RbacState>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -332,6 +347,34 @@ struct AuditQueryParams {
     before_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct TrafficEndpointListParams {
+    method: Option<String>,
+    endpoint_template: Option<String>,
+    endpoint_template_prefix: Option<String>,
+    first_seen_after: Option<String>,
+    first_seen_before: Option<String>,
+    last_seen_after: Option<String>,
+    last_seen_before: Option<String>,
+    min_call_count: Option<String>,
+    sort: Option<String>,
+    limit: Option<String>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TrafficEndpointDetailParams {
+    method: Option<String>,
+    endpoint_template: Option<String>,
+    principal_limit: Option<String>,
+    principal_cursor: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    bucket: Option<String>,
+    events_limit: Option<String>,
+    events_before_id: Option<String>,
+}
+
 #[derive(Clone, Deserialize)]
 struct AuditEventStreamParams {
     event_type: Option<String>,
@@ -342,6 +385,28 @@ struct AuditEventStreamParams {
 struct AuditQueryResponse {
     events: Vec<audit::AuditEvent>,
     next_cursor: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct TrafficEndpointDetailResponse {
+    endpoint: discovery::query::EndpointAggregateDetail,
+    principals: discovery::query::PrincipalPage,
+    audit: TrafficEndpointAuditEnrichment,
+}
+
+#[derive(Serialize)]
+struct TrafficEndpointAuditEnrichment {
+    available: bool,
+    match_strategy: &'static str,
+    match_limitations: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    omitted_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_series: Option<Vec<audit::query::EndpointTimeSeriesPoint>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recent_events: Option<Vec<audit::query::EndpointRecentEvent>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recent_events_next_cursor: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -555,6 +620,12 @@ fn gateway_app_with_process_started_at(
         .map(audit::query::AuditQueryStore::open)
         .transpose()?
         .map(Arc::new);
+    let discovery_query_store = config
+        .discovery_sqlite_path
+        .as_deref()
+        .map(discovery::query::DiscoveryQueryStore::open)
+        .transpose()?
+        .map(Arc::new);
     let loaded_policy = rbac::Policy::from_config(&config)?;
     let rate_limit_state = middleware::rate_limit::RateLimitState::from_config_and_policy(
         &config,
@@ -642,7 +713,7 @@ fn gateway_app_with_process_started_at(
         csrf_config,
         rate_limit_state,
         observation_state,
-        rbac_state,
+        rbac_state: rbac_state.clone(),
         auth_state,
     };
     let app_state = AppState {
@@ -653,6 +724,11 @@ fn gateway_app_with_process_started_at(
     let audit_admin_state = AuditAdminState {
         query_store: audit_query_store,
         event_sender: audit_event_sender,
+    };
+    let traffic_admin_state = TrafficAdminState {
+        discovery_store: discovery_query_store,
+        audit_query_store: audit_admin_state.query_store.clone(),
+        rbac_state,
     };
 
     if split_admin_listener {
@@ -665,6 +741,7 @@ fn gateway_app_with_process_started_at(
                     audit_admin_state,
                     status_state,
                     policy_admin_state,
+                    traffic_admin_state,
                 ),
                 &middleware_stack,
             ),
@@ -677,6 +754,7 @@ fn gateway_app_with_process_started_at(
                 audit_admin_state,
                 status_state,
                 policy_admin_state,
+                traffic_admin_state,
             ),
             &middleware_stack,
         )))
@@ -689,6 +767,7 @@ fn unified_router(
     audit_admin_state: AuditAdminState,
     status_state: StatusAdminState,
     policy_admin_state: PolicyAdminState,
+    traffic_admin_state: TrafficAdminState,
 ) -> Router {
     let router = Router::new()
         .route("/health", get(health))
@@ -705,6 +784,7 @@ fn unified_router(
         audit_admin_state,
         status_state,
         policy_admin_state,
+        traffic_admin_state,
     );
 
     #[cfg(test)]
@@ -731,6 +811,7 @@ fn admin_router(
     audit_admin_state: AuditAdminState,
     status_state: StatusAdminState,
     policy_admin_state: PolicyAdminState,
+    traffic_admin_state: TrafficAdminState,
 ) -> Router {
     let router = Router::new()
         .route(routes.admin.ui_prefix.as_str(), get(admin_ui_index))
@@ -744,6 +825,7 @@ fn admin_router(
         audit_admin_state,
         status_state,
         policy_admin_state,
+        traffic_admin_state,
     )
 }
 
@@ -764,6 +846,7 @@ fn add_admin_api_routes(
     audit_admin_state: AuditAdminState,
     status_state: StatusAdminState,
     policy_admin_state: PolicyAdminState,
+    traffic_admin_state: TrafficAdminState,
 ) -> Router {
     router
         .merge(
@@ -803,6 +886,18 @@ fn add_admin_api_routes(
                     put(policy_rules_order_put_endpoint),
                 )
                 .with_state(policy_admin_state),
+        )
+        .merge(
+            Router::new()
+                .route(
+                    routes.admin.traffic_endpoints_route.as_str(),
+                    get(traffic_endpoint_list_endpoint),
+                )
+                .route(
+                    routes.admin.traffic_endpoint_detail_route.as_str(),
+                    get(traffic_endpoint_detail_endpoint),
+                )
+                .with_state(traffic_admin_state),
         )
 }
 
@@ -2238,6 +2333,143 @@ async fn audit_query_endpoint(
     }
 }
 
+async fn traffic_endpoint_list_endpoint(
+    State(state): State<TrafficAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+    Query(params): Query<TrafficEndpointListParams>,
+) -> Response {
+    record_request(TRAFFIC_ENDPOINTS_ADMIN_ROUTE);
+
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+    if !traffic_principal_has_permission(&state, &principal) {
+        return forbidden();
+    }
+
+    let Some(discovery_store) = state.discovery_store.as_ref() else {
+        return discovery_not_configured();
+    };
+    let filters = match params.into_filters() {
+        Ok(filters) => filters,
+        Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
+    };
+
+    match discovery_store.list_endpoints(&filters) {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter }) => {
+            bad_request(&format!("invalid query parameter: {parameter}"))
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to query traffic endpoint inventory");
+            internal_server_error("traffic endpoint inventory query failed")
+        }
+    }
+}
+
+async fn traffic_endpoint_detail_endpoint(
+    State(state): State<TrafficAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+    Query(params): Query<TrafficEndpointDetailParams>,
+) -> Response {
+    record_request(TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE);
+
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+    if !traffic_principal_has_permission(&state, &principal) {
+        return forbidden();
+    }
+
+    let Some(discovery_store) = state.discovery_store.as_ref() else {
+        return discovery_not_configured();
+    };
+    let params = match params.into_query() {
+        Ok(params) => params,
+        Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
+    };
+
+    let endpoint = match discovery_store.get_endpoint(&params.method, &params.endpoint_template) {
+        Ok(Some(endpoint)) => endpoint,
+        Ok(None) => return not_found("traffic endpoint was not found"),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to query traffic endpoint detail");
+            return internal_server_error("traffic endpoint detail query failed");
+        }
+    };
+    let principals = match discovery_store.list_principals(
+        &params.method,
+        &params.endpoint_template,
+        &discovery::query::PrincipalPageFilters {
+            limit: params.principal_limit,
+            cursor: params.principal_cursor.clone(),
+        },
+    ) {
+        Ok(page) => page,
+        Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter }) => {
+            return bad_request(&format!("invalid query parameter: {parameter}"));
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to query traffic endpoint principals");
+            return internal_server_error("traffic endpoint principal query failed");
+        }
+    };
+
+    let audit = match state.audit_query_store.as_ref() {
+        Some(audit_query_store) => {
+            let filters = audit::query::EndpointAuditFilters {
+                method: params.method.clone(),
+                endpoint_template: params.endpoint_template.clone(),
+                from: params
+                    .from
+                    .clone()
+                    .or_else(|| Some(endpoint.first_seen.clone())),
+                to: params
+                    .to
+                    .clone()
+                    .or_else(|| Some(endpoint.last_seen.clone())),
+                bucket: params.bucket,
+                recent_limit: params.events_limit,
+                recent_before_id: params.events_before_id,
+            };
+            match audit_query_store.query_endpoint_activity(&filters) {
+                Ok(activity) => TrafficEndpointAuditEnrichment {
+                    available: true,
+                    match_strategy: audit::query::ENDPOINT_AUDIT_MATCH_STRATEGY,
+                    match_limitations: audit::query::ENDPOINT_AUDIT_MATCH_LIMITATIONS,
+                    omitted_reason: None,
+                    time_series: Some(activity.time_series),
+                    recent_events: Some(activity.recent_events),
+                    recent_events_next_cursor: activity.recent_events_next_cursor,
+                },
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to query traffic endpoint audit enrichment");
+                    return internal_server_error("traffic endpoint audit enrichment query failed");
+                }
+            }
+        }
+        None => TrafficEndpointAuditEnrichment {
+            available: false,
+            match_strategy: audit::query::ENDPOINT_AUDIT_MATCH_STRATEGY,
+            match_limitations: audit::query::ENDPOINT_AUDIT_MATCH_LIMITATIONS,
+            omitted_reason: Some("AUDIT_SQLITE_PATH not configured"),
+            time_series: None,
+            recent_events: None,
+            recent_events_next_cursor: None,
+        },
+    };
+
+    (
+        StatusCode::OK,
+        Json(TrafficEndpointDetailResponse {
+            endpoint,
+            principals,
+            audit,
+        }),
+    )
+        .into_response()
+}
+
 async fn audit_events_stream_endpoint(
     State(state): State<AuditAdminState>,
     principal: Option<Extension<auth::Principal>>,
@@ -2324,6 +2556,77 @@ impl AuditQueryParams {
     }
 }
 
+struct TrafficEndpointDetailQuery {
+    method: String,
+    endpoint_template: String,
+    principal_limit: usize,
+    principal_cursor: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    bucket: audit::query::EndpointAuditBucket,
+    events_limit: usize,
+    events_before_id: Option<i64>,
+}
+
+impl TrafficEndpointListParams {
+    fn into_filters(self) -> Result<discovery::query::EndpointListFilters, &'static str> {
+        let first_seen_after = validate_rfc3339("first_seen_after", self.first_seen_after)?;
+        let first_seen_before = validate_rfc3339("first_seen_before", self.first_seen_before)?;
+        let last_seen_after = validate_rfc3339("last_seen_after", self.last_seen_after)?;
+        let last_seen_before = validate_rfc3339("last_seen_before", self.last_seen_before)?;
+        let min_call_count =
+            parse_optional_non_negative_i64("min_call_count", self.min_call_count)?;
+        let sort = self
+            .sort
+            .as_deref()
+            .map(discovery::query::EndpointSort::parse)
+            .transpose()?
+            .unwrap_or(discovery::query::EndpointSort::LastSeen);
+        let limit = parse_limit(self.limit)?;
+
+        Ok(discovery::query::EndpointListFilters {
+            method: empty_string_as_none(self.method),
+            endpoint_template_contains: empty_string_as_none(self.endpoint_template),
+            endpoint_template_prefix: empty_string_as_none(self.endpoint_template_prefix),
+            first_seen_after,
+            first_seen_before,
+            last_seen_after,
+            last_seen_before,
+            min_call_count,
+            sort,
+            limit,
+            cursor: self.cursor,
+        })
+    }
+}
+
+impl TrafficEndpointDetailParams {
+    fn into_query(self) -> Result<TrafficEndpointDetailQuery, &'static str> {
+        let method = required_non_empty("method", self.method)?;
+        let endpoint_template = required_non_empty("endpoint_template", self.endpoint_template)?;
+        let principal_limit =
+            parse_limit_with_default(self.principal_limit, DEFAULT_AUDIT_QUERY_LIMIT)?;
+        let from = validate_rfc3339("from", self.from)?;
+        let to = validate_rfc3339("to", self.to)?;
+        let bucket = parse_endpoint_audit_bucket(self.bucket)?;
+        let events_limit =
+            parse_limit_with_default(self.events_limit, DEFAULT_TRAFFIC_RECENT_EVENTS_LIMIT)?;
+        let events_before_id = parse_before_id(self.events_before_id)?;
+
+        Ok(TrafficEndpointDetailQuery {
+            method,
+            endpoint_template,
+            principal_limit,
+            principal_cursor: self.principal_cursor,
+            from,
+            to,
+            bucket,
+            events_limit,
+            events_before_id,
+        })
+    }
+}
+
 impl AuditEventStreamParams {
     fn matches(&self, event: &audit::AuditEvent) -> bool {
         if let Some(event_type) = self.event_type.as_deref() {
@@ -2362,9 +2665,30 @@ fn parse_optional_i64(
         .transpose()
 }
 
+fn parse_optional_non_negative_i64(
+    parameter: &'static str,
+    value: Option<String>,
+) -> Result<Option<i64>, &'static str> {
+    let Some(value) = parse_optional_i64(parameter, value)? else {
+        return Ok(None);
+    };
+    if value < 0 {
+        return Err(parameter);
+    }
+
+    Ok(Some(value))
+}
+
 fn parse_limit(value: Option<String>) -> Result<usize, &'static str> {
+    parse_limit_with_default(value, DEFAULT_AUDIT_QUERY_LIMIT)
+}
+
+fn parse_limit_with_default(
+    value: Option<String>,
+    default_limit: usize,
+) -> Result<usize, &'static str> {
     let Some(value) = value else {
-        return Ok(DEFAULT_AUDIT_QUERY_LIMIT);
+        return Ok(default_limit);
     };
     let limit = value.parse::<usize>().map_err(|_| "limit")?;
     if limit == 0 {
@@ -2372,6 +2696,42 @@ fn parse_limit(value: Option<String>) -> Result<usize, &'static str> {
     }
 
     Ok(limit.min(MAX_AUDIT_QUERY_LIMIT))
+}
+
+fn required_non_empty(
+    parameter: &'static str,
+    value: Option<String>,
+) -> Result<String, &'static str> {
+    let Some(value) = value else {
+        return Err(parameter);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(parameter);
+    }
+
+    Ok(value.to_owned())
+}
+
+fn empty_string_as_none(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_owned())
+        }
+    })
+}
+
+fn parse_endpoint_audit_bucket(
+    value: Option<String>,
+) -> Result<audit::query::EndpointAuditBucket, &'static str> {
+    match value.as_deref().unwrap_or("hour") {
+        "hour" => Ok(audit::query::EndpointAuditBucket::Hour),
+        "day" => Ok(audit::query::EndpointAuditBucket::Day),
+        _ => Err("bucket"),
+    }
 }
 
 fn parse_before_id(value: Option<String>) -> Result<Option<i64>, &'static str> {
@@ -2400,6 +2760,15 @@ fn authorized_policy_state<'a>(
     }
 
     Ok(rbac_state)
+}
+
+fn traffic_principal_has_permission(
+    state: &TrafficAdminState,
+    principal: &auth::Principal,
+) -> bool {
+    state.rbac_state.as_ref().is_some_and(|rbac_state| {
+        rbac_state.principal_has_permission(principal, ADMIN_TRAFFIC_READ_PERMISSION)
+    })
 }
 
 fn policy_admin_authz_error_response(error: PolicyAdminAuthzError) -> Response {
@@ -2949,6 +3318,17 @@ fn policy_not_configured() -> Response {
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
             error: "policy API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn discovery_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "traffic endpoint inventory requires DISCOVERY_SQLITE_PATH to be configured"
+                .to_owned(),
         }),
     )
         .into_response()
@@ -4053,6 +4433,14 @@ mod tests {
             default_routes.policy_rules_order_route,
             POLICY_RULES_ORDER_ADMIN_ROUTE
         );
+        assert_eq!(
+            default_routes.traffic_endpoints_route,
+            TRAFFIC_ENDPOINTS_ADMIN_ROUTE
+        );
+        assert_eq!(
+            default_routes.traffic_endpoint_detail_route,
+            TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE
+        );
 
         let custom_routes = AdminRoutes::from_prefix("/ops");
         assert_eq!(custom_routes.ui_prefix, "/ops");
@@ -4070,6 +4458,14 @@ mod tests {
         assert_eq!(
             custom_routes.policy_rules_order_route,
             "/v1/ops/policy/rules/order"
+        );
+        assert_eq!(
+            custom_routes.traffic_endpoints_route,
+            "/v1/ops/traffic/endpoints"
+        );
+        assert_eq!(
+            custom_routes.traffic_endpoint_detail_route,
+            "/v1/ops/traffic/endpoint"
         );
     }
 
@@ -7580,6 +7976,400 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn traffic_endpoint_list_filters_sorts_and_paginates() {
+        let discovery_db = TempDb::new("traffic-list");
+        create_discovery_schema(&discovery_db.path);
+        seed_list_discovery_endpoints(&discovery_db.path);
+        let (router, _policy) = traffic_admin_router(Some(&discovery_db.path), None);
+
+        let call_count_page = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?method=GET&sort=call_count&limit=2",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            endpoint_templates(&call_count_page),
+            vec!["/reports/{id}".to_owned(), "/users/{id}".to_owned()]
+        );
+        let next_cursor = call_count_page["next_cursor"]
+            .as_str()
+            .expect("list response should include next cursor");
+
+        let second_page = traffic_json(
+            &router,
+            &format!("/v1/admin/traffic/endpoints?method=GET&sort=call_count&limit=2&cursor={next_cursor}"),
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            endpoint_templates(&second_page),
+            vec!["/admin/status".to_owned()]
+        );
+        assert!(second_page["next_cursor"].is_null());
+
+        let substring = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?endpoint_template=users&sort=last_seen",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            endpoint_templates(&substring),
+            vec!["/users/{id}".to_owned(), "/users".to_owned()]
+        );
+
+        let prefix = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?endpoint_template_prefix=/admin",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            endpoint_templates(&prefix),
+            vec!["/admin/status".to_owned()]
+        );
+
+        let last_seen_window = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?last_seen_after=2024-06-02T00:00:00Z&last_seen_before=2024-06-03T23:59:59Z",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            endpoint_templates(&last_seen_window),
+            vec!["/users/{id}".to_owned(), "/users".to_owned()]
+        );
+
+        let min_call_count = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?min_call_count=20&sort=call_count",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            endpoint_templates(&min_call_count),
+            vec!["/reports/{id}".to_owned(), "/users/{id}".to_owned()]
+        );
+
+        let first_seen = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?sort=first_seen",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            first_seen["endpoints"][0]["endpoint_template"],
+            json!("/admin/status")
+        );
+        assert_eq!(
+            first_seen["endpoints"][0]["status_counts"][0]["status"],
+            json!(204)
+        );
+        assert_eq!(first_seen["endpoints"][0]["latency"]["p95_ms"], json!(5));
+    }
+
+    #[tokio::test]
+    async fn traffic_endpoint_detail_paginates_principals() {
+        let discovery_db = TempDb::new("traffic-principals");
+        create_discovery_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/users/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-03T00:00:00Z",
+                call_count: 75,
+                latency_count: 75,
+                latency_p50_ms: 10,
+                latency_p95_ms: 30,
+                latency_p99_ms: 50,
+                distinct_principal_count: 75,
+                status_counts: &[(200, 75)],
+            },
+        );
+        for index in 0..75 {
+            insert_discovery_principal(
+                &discovery_db.path,
+                "GET",
+                "/users/{id}",
+                &format!("user-{index:03}"),
+                "2024-06-01T00:00:00Z",
+                &format!("2024-06-03T00:{:02}:00Z", index % 60),
+            );
+        }
+        let (router, _policy) = traffic_admin_router(Some(&discovery_db.path), None);
+        let template = query_encode("/users/{id}");
+
+        let first_page = traffic_json(
+            &router,
+            &format!("/v1/admin/traffic/endpoint?method=GET&endpoint_template={template}&principal_limit=10"),
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(first_page["endpoint"]["call_count"], json!(75));
+        let first_principals = principal_ids(&first_page);
+        assert_eq!(first_principals.len(), 10);
+        assert_eq!(first_principals[0], "user-059");
+        assert_eq!(first_principals[9], "user-050");
+        assert!(first_page["principals"]["next_cursor"].as_str().is_some());
+        assert_eq!(first_page["audit"]["available"], json!(false));
+        assert!(first_page["audit"].get("time_series").is_none());
+        assert!(first_page["audit"].get("recent_events").is_none());
+
+        let cursor = first_page["principals"]["next_cursor"]
+            .as_str()
+            .expect("principal page should include next cursor");
+        let second_page = traffic_json(
+            &router,
+            &format!("/v1/admin/traffic/endpoint?method=GET&endpoint_template={template}&principal_limit=10&principal_cursor={cursor}"),
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        let second_principals = principal_ids(&second_page);
+        assert_eq!(second_principals[0], "user-049");
+        assert_eq!(second_principals[9], "user-040");
+    }
+
+    #[tokio::test]
+    async fn traffic_endpoint_detail_enriches_from_audit_for_stateless_id_templates() {
+        let discovery_db = TempDb::new("traffic-detail-discovery");
+        let audit_db = TempDb::new("traffic-detail-audit");
+        emit_observed_events_to_discovery_and_audit(
+            &discovery_db.path,
+            &audit_db.path,
+            &[
+                observed_request_event(
+                    "GET",
+                    "/users/123",
+                    200,
+                    10,
+                    Some("alice"),
+                    "2024-06-01T00:05:00Z",
+                ),
+                observed_request_event(
+                    "GET",
+                    "/users/456",
+                    404,
+                    20,
+                    Some("bob"),
+                    "2024-06-01T00:40:00Z",
+                ),
+                observed_request_event(
+                    "GET",
+                    "/users/789",
+                    200,
+                    30,
+                    Some("alice"),
+                    "2024-06-01T01:10:00Z",
+                ),
+                observed_request_event(
+                    "POST",
+                    "/users/123",
+                    201,
+                    40,
+                    Some("alice"),
+                    "2024-06-01T01:20:00Z",
+                ),
+            ],
+        );
+        let (router, _policy) =
+            traffic_admin_router(Some(&discovery_db.path), Some(&audit_db.path));
+        let template = query_encode("/users/{id}");
+
+        let body = traffic_json(
+            &router,
+            &format!("/v1/admin/traffic/endpoint?method=GET&endpoint_template={template}&from=2024-06-01T00:00:00Z&to=2024-06-01T02:00:00Z&bucket=hour&events_limit=2"),
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+
+        assert_eq!(body["endpoint"]["call_count"], json!(3));
+        assert_eq!(body["endpoint"]["status_counts"][0]["status"], json!(200));
+        assert_eq!(body["endpoint"]["status_counts"][0]["count"], json!(2));
+        assert_eq!(
+            body["principals"]["principals"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(body["audit"]["available"], json!(true));
+        assert_eq!(
+            body["audit"]["match_strategy"],
+            json!(audit::query::ENDPOINT_AUDIT_MATCH_STRATEGY)
+        );
+        assert_eq!(
+            body["audit"]["time_series"],
+            json!([
+                { "bucket_start": "2024-06-01T00:00:00Z", "count": 2 },
+                { "bucket_start": "2024-06-01T01:00:00Z", "count": 1 }
+            ])
+        );
+        let recent_paths = body["audit"]["recent_events"]
+            .as_array()
+            .expect("recent events should be present")
+            .iter()
+            .map(|event| event["path"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recent_paths,
+            vec!["/users/789".to_owned(), "/users/456".to_owned()]
+        );
+        assert!(body["audit"]["recent_events_next_cursor"]
+            .as_i64()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn traffic_endpoint_detail_documents_learned_param_reverse_mapping_limit() {
+        let discovery_db = TempDb::new("traffic-learned-discovery");
+        let audit_db = TempDb::new("traffic-learned-audit");
+        emit_observed_events_to_discovery_and_audit(
+            &discovery_db.path,
+            &audit_db.path,
+            &["apple", "banana", "cherry", "date"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, slug)| {
+                    observed_request_event(
+                        "GET",
+                        &format!("/catalog/{slug}"),
+                        200,
+                        10,
+                        Some("alice"),
+                        &format!("2024-06-01T00:0{index}:00Z"),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let (router, _policy) =
+            traffic_admin_router(Some(&discovery_db.path), Some(&audit_db.path));
+        let template = query_encode("/catalog/{param}");
+
+        let body = traffic_json(
+            &router,
+            &format!("/v1/admin/traffic/endpoint?method=GET&endpoint_template={template}&from=2024-06-01T00:00:00Z&to=2024-06-01T01:00:00Z"),
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+
+        assert_eq!(body["endpoint"]["call_count"], json!(4));
+        assert_eq!(body["audit"]["available"], json!(true));
+        assert_eq!(body["audit"]["time_series"], json!([]));
+        assert_eq!(body["audit"]["recent_events"], json!([]));
+        assert!(body["audit"]["match_limitations"]
+            .as_str()
+            .expect("match limitation should be present")
+            .contains("learned slug templates"));
+    }
+
+    #[tokio::test]
+    async fn traffic_endpoint_inventory_requires_discovery_sqlite_path() {
+        let (router, _policy) = traffic_admin_router(None, None);
+        let principal = Some(test_principal(&["traffic-reader"]));
+
+        for uri in [
+            "/v1/admin/traffic/endpoints",
+            "/v1/admin/traffic/endpoint?method=GET&endpoint_template=%2Fusers%2F%7Bid%7D",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(traffic_admin_request(uri, principal.clone()))
+                .await
+                .expect("traffic request should complete");
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                body_string(response).await,
+                r#"{"error":"traffic endpoint inventory requires DISCOVERY_SQLITE_PATH to be configured"}"#
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn traffic_endpoint_detail_omits_audit_enrichment_when_audit_sqlite_path_is_unset() {
+        let discovery_db = TempDb::new("traffic-no-audit");
+        create_discovery_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/users/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 10,
+                latency_p95_ms: 10,
+                latency_p99_ms: 10,
+                distinct_principal_count: 0,
+                status_counts: &[(200, 1)],
+            },
+        );
+        let (router, _policy) = traffic_admin_router(Some(&discovery_db.path), None);
+        let template = query_encode("/users/{id}");
+
+        let body = traffic_json(
+            &router,
+            &format!("/v1/admin/traffic/endpoint?method=GET&endpoint_template={template}"),
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+
+        assert_eq!(body["endpoint"]["call_count"], json!(1));
+        assert_eq!(body["audit"]["available"], json!(false));
+        assert_eq!(
+            body["audit"]["omitted_reason"],
+            json!("AUDIT_SQLITE_PATH not configured")
+        );
+        assert!(body["audit"].get("time_series").is_none());
+        assert!(body["audit"].get("recent_events").is_none());
+    }
+
+    #[tokio::test]
+    async fn traffic_endpoint_admin_requires_traffic_read_permission() {
+        let discovery_db = TempDb::new("traffic-authz");
+        create_discovery_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/users/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 10,
+                latency_p95_ms: 10,
+                latency_p99_ms: 10,
+                distinct_principal_count: 0,
+                status_counts: &[(200, 1)],
+            },
+        );
+        let (router, _policy) = traffic_admin_router(Some(&discovery_db.path), None);
+        let detail_uri =
+            "/v1/admin/traffic/endpoint?method=GET&endpoint_template=%2Fusers%2F%7Bid%7D";
+
+        for uri in ["/v1/admin/traffic/endpoints", detail_uri] {
+            let unauthenticated = router
+                .clone()
+                .oneshot(traffic_admin_request(uri, None))
+                .await
+                .expect("traffic request should complete");
+            assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+            let forbidden_response = router
+                .clone()
+                .oneshot(traffic_admin_request(
+                    uri,
+                    Some(test_principal(&["reader"])),
+                ))
+                .await
+                .expect("traffic request should complete");
+            assert_eq!(forbidden_response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
     async fn auth_runs_before_rbac_for_non_exempt_routes() {
         let policy = TempPolicyFile::new(
             r#"{
@@ -7975,6 +8765,83 @@ mod tests {
         .expect("app should build")
     }
 
+    fn traffic_admin_config(
+        discovery_path: Option<&PathBuf>,
+        audit_path: Option<&PathBuf>,
+        policy: &TempPolicyFile,
+    ) -> config::Config {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.discovery_sqlite_path =
+            discovery_path.map(|path| path.to_string_lossy().into_owned());
+        config.audit_sqlite_path = audit_path.map(|path| path.to_string_lossy().into_owned());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config
+            .rbac_exempt_paths
+            .push(TRAFFIC_ENDPOINTS_ADMIN_ROUTE.to_owned());
+        config
+            .rbac_exempt_paths
+            .push(TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE.to_owned());
+        config
+    }
+
+    fn traffic_admin_router(
+        discovery_path: Option<&PathBuf>,
+        audit_path: Option<&PathBuf>,
+    ) -> (Router, TempPolicyFile) {
+        let policy = TempPolicyFile::new(&traffic_policy_document_string());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            traffic_admin_config(discovery_path, audit_path, &policy),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        (router, policy)
+    }
+
+    fn traffic_admin_request(uri: &str, principal: Option<auth::Principal>) -> Request<Body> {
+        let mut request = Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request should build");
+        if let Some(principal) = principal {
+            request.extensions_mut().insert(principal);
+        }
+
+        request
+    }
+
+    async fn traffic_json(router: &Router, uri: &str, principal: Option<auth::Principal>) -> Value {
+        let response = router
+            .clone()
+            .oneshot(traffic_admin_request(uri, principal))
+            .await
+            .expect("traffic request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await
+    }
+
+    fn traffic_policy_document_string() -> String {
+        serde_json::to_string_pretty(&json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "traffic-reader": {
+                    "permissions": [ADMIN_TRAFFIC_READ_PERMISSION]
+                },
+                "reader": {
+                    "permissions": []
+                }
+            }
+        }))
+        .expect("traffic policy should serialize")
+    }
+
     fn audit_events_router() -> (Router, audit::AuditLog) {
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
@@ -8364,6 +9231,46 @@ mod tests {
             .collect()
     }
 
+    fn endpoint_templates(body: &Value) -> Vec<String> {
+        body["endpoints"]
+            .as_array()
+            .expect("endpoints should be an array")
+            .iter()
+            .map(|endpoint| {
+                endpoint["endpoint_template"]
+                    .as_str()
+                    .expect("endpoint_template should be a string")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn principal_ids(body: &Value) -> Vec<String> {
+        body["principals"]["principals"]
+            .as_array()
+            .expect("principals should be an array")
+            .iter()
+            .map(|principal| {
+                principal["user_id"]
+                    .as_str()
+                    .expect("user_id should be a string")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn query_encode(value: &str) -> String {
+        value
+            .bytes()
+            .flat_map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    vec![char::from(byte)]
+                }
+                _ => format!("%{byte:02X}").chars().collect::<Vec<_>>(),
+            })
+            .collect()
+    }
+
     async fn json_body(response: axum::response::Response) -> Value {
         serde_json::from_slice(
             &axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -8509,6 +9416,229 @@ O2gecI9QwDJNpm29J9wJB2F8
             })
             .expect("SQLite sink should create audit schema"),
         );
+    }
+
+    fn create_discovery_schema(path: &PathBuf) {
+        drop(
+            discovery::aggregator::EndpointAggregatorSink::new(
+                discovery::aggregator::EndpointAggregatorSinkConfig { path: path.clone() },
+            )
+            .expect("discovery aggregator should create schema"),
+        );
+    }
+
+    fn seed_list_discovery_endpoints(path: &PathBuf) {
+        insert_discovery_endpoint(
+            path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/users/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-03T12:00:00Z",
+                call_count: 25,
+                latency_count: 25,
+                latency_p50_ms: 12,
+                latency_p95_ms: 40,
+                latency_p99_ms: 60,
+                distinct_principal_count: 2,
+                status_counts: &[(200, 20), (404, 5)],
+            },
+        );
+        insert_discovery_endpoint(
+            path,
+            SeedEndpoint {
+                method: "POST",
+                endpoint_template: "/users",
+                first_seen: "2024-06-02T00:00:00Z",
+                last_seen: "2024-06-02T12:00:00Z",
+                call_count: 5,
+                latency_count: 5,
+                latency_p50_ms: 20,
+                latency_p95_ms: 30,
+                latency_p99_ms: 30,
+                distinct_principal_count: 1,
+                status_counts: &[(201, 5)],
+            },
+        );
+        insert_discovery_endpoint(
+            path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/reports/{id}",
+                first_seen: "2024-05-30T00:00:00Z",
+                last_seen: "2024-05-31T12:00:00Z",
+                call_count: 100,
+                latency_count: 100,
+                latency_p50_ms: 50,
+                latency_p95_ms: 90,
+                latency_p99_ms: 120,
+                distinct_principal_count: 3,
+                status_counts: &[(200, 80), (500, 20)],
+            },
+        );
+        insert_discovery_endpoint(
+            path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/admin/status",
+                first_seen: "2024-06-04T00:00:00Z",
+                last_seen: "2024-06-04T12:00:00Z",
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 5,
+                latency_p95_ms: 5,
+                latency_p99_ms: 5,
+                distinct_principal_count: 1,
+                status_counts: &[(204, 1)],
+            },
+        );
+    }
+
+    struct SeedEndpoint<'a> {
+        method: &'a str,
+        endpoint_template: &'a str,
+        first_seen: &'a str,
+        last_seen: &'a str,
+        call_count: i64,
+        latency_count: i64,
+        latency_p50_ms: i64,
+        latency_p95_ms: i64,
+        latency_p99_ms: i64,
+        distinct_principal_count: i64,
+        status_counts: &'a [(i64, i64)],
+    }
+
+    fn insert_discovery_endpoint(path: &PathBuf, endpoint: SeedEndpoint<'_>) {
+        let connection = Connection::open(path).expect("test discovery database should open");
+        let latency_samples_json = serde_json::to_string(&[
+            endpoint.latency_p50_ms,
+            endpoint.latency_p95_ms,
+            endpoint.latency_p99_ms,
+        ])
+        .expect("latency samples should serialize");
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_endpoint_aggregates (
+                    method,
+                    endpoint_template,
+                    first_seen,
+                    last_seen,
+                    call_count,
+                    latency_count,
+                    latency_p50_ms,
+                    latency_p95_ms,
+                    latency_p99_ms,
+                    latency_samples_json,
+                    distinct_principal_count,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, '2024-06-05T00:00:00Z')
+                "#,
+                params![
+                    endpoint.method,
+                    endpoint.endpoint_template,
+                    endpoint.first_seen,
+                    endpoint.last_seen,
+                    endpoint.call_count,
+                    endpoint.latency_count,
+                    endpoint.latency_p50_ms,
+                    endpoint.latency_p95_ms,
+                    endpoint.latency_p99_ms,
+                    latency_samples_json,
+                    endpoint.distinct_principal_count,
+                ],
+            )
+            .expect("endpoint aggregate should insert");
+
+        for (status, count) in endpoint.status_counts {
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO discovery_endpoint_status_counts (
+                        method, endpoint_template, status, count
+                    ) VALUES (?1, ?2, ?3, ?4)
+                    "#,
+                    params![endpoint.method, endpoint.endpoint_template, status, count,],
+                )
+                .expect("endpoint status count should insert");
+        }
+    }
+
+    fn insert_discovery_principal(
+        path: &PathBuf,
+        method: &str,
+        endpoint_template: &str,
+        user_id: &str,
+        first_seen: &str,
+        last_seen: &str,
+    ) {
+        let connection = Connection::open(path).expect("test discovery database should open");
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_endpoint_principals (
+                    method, endpoint_template, user_id, first_seen, last_seen
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![method, endpoint_template, user_id, first_seen, last_seen],
+            )
+            .expect("endpoint principal should insert");
+    }
+
+    fn emit_observed_events_to_discovery_and_audit(
+        discovery_path: &PathBuf,
+        audit_path: &PathBuf,
+        events: &[audit::AuditEvent],
+    ) {
+        let discovery_sink = discovery::aggregator::EndpointAggregatorSink::new(
+            discovery::aggregator::EndpointAggregatorSinkConfig {
+                path: discovery_path.clone(),
+            },
+        )
+        .expect("discovery aggregator should build");
+        let audit_sink =
+            audit::sqlite_sink::SqliteSink::new(audit::sqlite_sink::SqliteSinkConfig {
+                path: audit_path.clone(),
+                retention_days: None,
+            })
+            .expect("audit SQLite sink should build");
+
+        for event in events {
+            audit::AuditSink::emit(&discovery_sink, event);
+            audit::AuditSink::emit(&audit_sink, event);
+        }
+        drop(discovery_sink);
+        drop(audit_sink);
+    }
+
+    fn observed_request_event(
+        method: &str,
+        path: &str,
+        status: u16,
+        latency_ms: u64,
+        user_id: Option<&str>,
+        timestamp: &str,
+    ) -> audit::AuditEvent {
+        let actor = user_id.map(|user_id| audit::Actor {
+            user_id: user_id.to_owned(),
+            roles: Some(vec!["reader".to_owned()]),
+            auth_mode: "bearer_token".to_owned(),
+        });
+        let mut event = audit::AuditEvent::new(
+            "http.request_observed",
+            "request-traffic-test",
+            "203.0.113.10",
+            actor,
+            json!({
+                "method": method,
+                "path": path,
+                "status": status,
+                "latency_ms": latency_ms
+            }),
+        );
+        event.timestamp = timestamp.to_owned();
+        event
     }
 
     fn seed_filter_events(path: &PathBuf) {

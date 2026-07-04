@@ -68,6 +68,7 @@ This is what's actually built, working, and covered by CI as of Phases 1-2 and t
 | **Audit pipeline** | A versioned audit-event envelope with SHA-256 redaction, delivered asynchronously off the request hot path |
 | **Queryable audit store** | A SQLite audit sink (batched writes, retention pruning) with an admin API — `GET /v1/admin/audit` — supporting time-range, event-type, actor, path, and status filters with keyset pagination |
 | **Live event feed** | Server-Sent Events at `GET /v1/admin/events/stream`, backed by an in-process broadcast sink with backpressure handling |
+| **Traffic endpoint inventory** | Optional SQLite discovery aggregation (`DISCOVERY_SQLITE_PATH`) with admin APIs for listing endpoint templates and viewing per-endpoint principals, time-series counts, and recent raw events |
 | **Admin UI** | An embedded Vite + React + TypeScript app, built into the binary and served at `/admin` (or `ADMIN_PREFIX`): a log explorer, a live tail, and a status page reporting real running-config values |
 | **Local dev harness** | Checked-in JWKS/RBAC fixtures, a `docker-compose.dev.yml` profile that brings up a fully authenticated gateway in one command, and a traffic-generator/CI smoke test |
 
@@ -80,7 +81,7 @@ Everything below is roadmap and vision beyond what's listed in [What's Real Toda
 | Phase | Capability | Status |
 | --- | --- | --- |
 | 3 | **Universal HTTP reverse proxy** — place GG in front of any HTTP backend, starting default-allow for discovery, then tightening through policy over time | In progress — the catch-all proxy, reserved-prefix protection, and policy modes (default-allow/shadow/observe) are done; multi-upstream routing, rules-as-data, a policy CRUD API, and upstream health checks are still pending |
-| 4 | **Traffic discovery** — automatic endpoint inventory, schema conformance checks against observed traffic, anomaly signals | Not started |
+| 4 | **Traffic discovery** — automatic endpoint inventory, schema conformance checks against observed traffic, anomaly signals | In progress — endpoint aggregation and the traffic inventory admin API are done; schema conformance and anomaly signals remain ahead |
 | 5 | **Visual firewall-style rule builder** — inspect discovered traffic, create rules in one click, review policy in shadow mode, roll back through versioned policy history | Not started |
 | 6 | **Native MCP support** — speak the real MCP protocol instead of a bespoke REST facade, with a dynamic tool registry, JSON Schema validation, and OpenAPI-to-tools generation | Not started |
 | 7 | **Identity directory & broader IdP integration** — pluggable OIDC/cookie-session identity providers beyond the current JWT/JWKS validator, plus a Layer-7-firewall-style directory of every user and bot that has traversed the gateway | Not started |
@@ -107,7 +108,7 @@ The HTTP half of the proxy layer above is real today — a catch-all proxy forwa
 
 ## Quick Start
 
-GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI shell at `/admin`, and a working reverse proxy once `UPSTREAM_URL` is configured (see [What's Real Today](#whats-real-today)). The traffic-discovery and rule-builder capabilities described in [Planned Scope](#planned-scope) are still pre-alpha roadmap work.
+GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI shell at `/admin`, a working reverse proxy once `UPSTREAM_URL` is configured, and optional traffic endpoint inventory when `DISCOVERY_SQLITE_PATH` is set (see [What's Real Today](#whats-real-today)). The remaining traffic-discovery work and rule-builder capabilities described in [Planned Scope](#planned-scope) are still pre-alpha roadmap work.
 
 For the full list of environment variables, see [docs/configuration.md](docs/configuration.md). As more variables land, that document and [.env.example](.env.example) are kept in sync with the code by an automated test.
 
