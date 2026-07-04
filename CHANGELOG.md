@@ -12,6 +12,15 @@ Each phase is versioned as it completes (`0.1` for Phase 1, `0.2` for Phase 2,
 [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44)
 for full phase-by-phase status.
 
+### Fixed
+
+- Firewall rules and rate-limit overrides with a path segment that looks like
+  a capture but isn't valid (e.g. `/api/{bad-name}`, an unterminated
+  `/api/{id`, or an empty `/api/{}`) are now rejected at policy-validation
+  time instead of being silently persisted as a rule that can never match any
+  request. Previously such a rule would save successfully and appear normal
+  in the admin UI while providing no actual coverage.
+
 ## [0.4.0] - 2026-07-04
 
 ### Added — Phase 4 (traffic discovery)
