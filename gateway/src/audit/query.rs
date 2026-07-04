@@ -17,7 +17,7 @@ use crate::{
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
 };
 
-const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
+pub const MAX_ENDPOINT_AUDIT_SCAN_ROWS: usize = 100_000;
 pub const ENDPOINT_AUDIT_MATCH_STRATEGY: &str = "stateless_path_template";
 pub const ENDPOINT_AUDIT_MATCH_LIMITATIONS: &str =
     "Matches literal paths and immediate well-known identifier templates such as /users/{id}; statefully learned slug templates such as /catalog/{param} are not reverse-mapped from raw audit paths.";
@@ -46,9 +46,11 @@ pub struct RequestObservationFilters {
     pub methods: Vec<String>,
     pub path_exact: Option<String>,
     pub path_prefix: Option<String>,
+    pub before_id: Option<i64>,
 }
 
 pub struct RequestObservation {
+    pub id: i64,
     pub event_id: String,
     pub timestamp: String,
     pub request_id: String,
@@ -86,11 +88,12 @@ pub struct EndpointAuditFilters {
 #[derive(Serialize)]
 pub struct EndpointAuditActivity {
     pub time_series: Vec<EndpointTimeSeriesPoint>,
+    pub time_series_truncated: bool,
     pub recent_events: Vec<EndpointRecentEvent>,
     pub recent_events_next_cursor: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EndpointTimeSeriesPoint {
     pub bucket_start: String,
     pub count: u64,
@@ -235,64 +238,73 @@ impl AuditQueryStore {
         &self,
         filters: &EndpointAuditFilters,
     ) -> Result<EndpointAuditActivity, AuditQueryError> {
-        let series_rows =
-            self.query_endpoint_audit_rows(filters.from.as_deref(), filters.to.as_deref(), None)?;
-        let time_series = endpoint_time_series(&series_rows, filters);
+        self.query_endpoint_activity_with_scan_limit(filters, MAX_ENDPOINT_AUDIT_SCAN_ROWS)
+    }
 
-        let recent_rows = self.query_endpoint_audit_rows(
-            filters.from.as_deref(),
-            filters.to.as_deref(),
-            filters.recent_before_id,
+    fn query_endpoint_activity_with_scan_limit(
+        &self,
+        filters: &EndpointAuditFilters,
+        max_scan_rows: usize,
+    ) -> Result<EndpointAuditActivity, AuditQueryError> {
+        let mut buckets = BTreeMap::<String, u64>::new();
+        let mut scanned_rows = 0_usize;
+        let mut time_series_truncated = false;
+        self.scan_request_observations(
+            &endpoint_request_observation_filters(filters, None),
+            |observation| {
+                if scanned_rows >= max_scan_rows {
+                    time_series_truncated = true;
+                    return false;
+                }
+                scanned_rows = scanned_rows.saturating_add(1);
+                if endpoint_observation_matches(&observation.method, &observation.path, filters) {
+                    if let Some(bucket_start) = bucket_start(&observation.timestamp, filters.bucket)
+                    {
+                        *buckets.entry(bucket_start).or_insert(0) += 1;
+                    }
+                }
+
+                true
+            },
         )?;
-        let mut recent_events = recent_rows
+        let time_series = buckets
             .into_iter()
-            .filter_map(|row| row.into_recent_event(filters))
-            .collect::<Vec<_>>();
+            .map(|(bucket_start, count)| EndpointTimeSeriesPoint {
+                bucket_start,
+                count,
+            })
+            .collect();
+
+        let mut recent_events = Vec::with_capacity(filters.recent_limit.saturating_add(1));
+        self.scan_request_observations(
+            &endpoint_request_observation_filters(filters, filters.recent_before_id),
+            |observation| {
+                if let Some(event) = endpoint_recent_event_from_observation(observation, filters) {
+                    recent_events.push(event);
+                    if recent_events.len() > filters.recent_limit {
+                        return false;
+                    }
+                }
+
+                true
+            },
+        )?;
         let has_more = recent_events.len() > filters.recent_limit;
+        let recent_events_next_cursor = if has_more && filters.recent_limit > 0 {
+            Some(recent_events[filters.recent_limit - 1].id)
+        } else {
+            None
+        };
         if has_more {
             recent_events.truncate(filters.recent_limit);
         }
-        let recent_events_next_cursor = has_more.then(|| {
-            recent_events
-                .last()
-                .expect("over-limit recent event query should leave at least one row")
-                .id
-        });
 
         Ok(EndpointAuditActivity {
             time_series,
+            time_series_truncated,
             recent_events,
             recent_events_next_cursor,
         })
-    }
-
-    fn query_endpoint_audit_rows(
-        &self,
-        from: Option<&str>,
-        to: Option<&str>,
-        before_id: Option<i64>,
-    ) -> Result<Vec<EndpointAuditRow>, AuditQueryError> {
-        let (sql, params) = build_endpoint_audit_query(from, to, before_id);
-        let connection = self.connection_guard();
-        let mut statement = connection
-            .prepare(&sql)
-            .map_err(|source| AuditQueryError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-
-        let rows = statement
-            .query_map(params_from_iter(params.iter()), endpoint_audit_row)
-            .map_err(|source| AuditQueryError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| AuditQueryError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(rows)
     }
 
     pub fn scan_request_observations(
@@ -456,49 +468,11 @@ fn build_query(filters: &AuditQueryFilters) -> (String, Vec<SqlValue>) {
     (sql, params)
 }
 
-fn build_endpoint_audit_query(
-    from: Option<&str>,
-    to: Option<&str>,
-    before_id: Option<i64>,
-) -> (String, Vec<SqlValue>) {
-    let mut sql = String::from(
-        r#"
-        SELECT
-            id,
-            event_id,
-            timestamp,
-            request_id,
-            actor_user_id,
-            payload_path,
-            payload_status,
-            payload_json
-        FROM audit_events
-        WHERE event_type = ? AND payload_path IS NOT NULL
-        "#,
-    );
-    let mut params = vec![SqlValue::Text(HTTP_REQUEST_OBSERVED.to_owned())];
-
-    if let Some(from) = from {
-        sql.push_str(" AND julianday(timestamp) >= julianday(?)");
-        params.push(SqlValue::Text(from.to_owned()));
-    }
-    if let Some(to) = to {
-        sql.push_str(" AND julianday(timestamp) <= julianday(?)");
-        params.push(SqlValue::Text(to.to_owned()));
-    }
-    if let Some(before_id) = before_id {
-        sql.push_str(" AND id < ?");
-        params.push(SqlValue::Integer(before_id));
-    }
-
-    sql.push_str(" ORDER BY id DESC");
-    (sql, params)
-}
-
 fn build_request_observation_query(filters: &RequestObservationFilters) -> (String, Vec<SqlValue>) {
     let mut sql = String::from(
         r#"
         SELECT
+            id,
             event_id,
             timestamp,
             request_id,
@@ -527,6 +501,10 @@ fn build_request_observation_query(filters: &RequestObservationFilters) -> (Stri
     if let Some(to) = &filters.to {
         clauses.push("julianday(timestamp) <= julianday(?)".to_owned());
         params.push(SqlValue::Text(to.clone()));
+    }
+    if let Some(before_id) = filters.before_id {
+        clauses.push("id < ?".to_owned());
+        params.push(SqlValue::Integer(before_id));
     }
 
     let methods = exact_method_filters(&filters.methods);
@@ -609,6 +587,7 @@ struct RawAuditEventRow {
 }
 
 struct RawRequestObservationRow {
+    id: i64,
     event_id: String,
     timestamp: String,
     request_id: String,
@@ -669,6 +648,7 @@ impl RawRequestObservationRow {
             .transpose()?;
 
         Ok(RequestObservation {
+            id: self.id,
             event_id: self.event_id,
             timestamp: self.timestamp,
             request_id: self.request_id,
@@ -699,84 +679,104 @@ fn raw_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAuditEventRow> 
     })
 }
 
-struct EndpointAuditRow {
-    id: i64,
-    event_id: String,
-    timestamp: String,
-    request_id: String,
-    actor_user_id: Option<String>,
-    payload_path: String,
-    payload_status: Option<i64>,
-    payload_json: String,
-}
+fn endpoint_request_observation_filters(
+    filters: &EndpointAuditFilters,
+    before_id: Option<i64>,
+) -> RequestObservationFilters {
+    let path_filter = endpoint_audit_path_filter(&filters.endpoint_template);
 
-impl EndpointAuditRow {
-    fn into_recent_event(self, filters: &EndpointAuditFilters) -> Option<EndpointRecentEvent> {
-        let payload = serde_json::from_str::<Value>(&self.payload_json).ok()?;
-        let method = payload.get("method")?.as_str()?.to_owned();
-        if !endpoint_audit_row_matches(&method, &self.payload_path, filters) {
-            return None;
-        }
-
-        Some(EndpointRecentEvent {
-            id: self.id,
-            event_id: self.event_id,
-            request_id: self.request_id,
-            timestamp: self.timestamp,
-            method,
-            path: self.payload_path,
-            status: self.payload_status.or_else(|| payload_status(&payload)),
-            actor: self.actor_user_id,
-        })
+    RequestObservationFilters {
+        from: filters.from.clone(),
+        to: filters.to.clone(),
+        methods: vec![filters.method.clone()],
+        path_exact: path_filter.exact,
+        path_prefix: path_filter.prefix,
+        before_id,
     }
 }
 
-fn endpoint_audit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EndpointAuditRow> {
-    Ok(EndpointAuditRow {
-        id: row.get(0)?,
-        event_id: row.get(1)?,
-        timestamp: row.get(2)?,
-        request_id: row.get(3)?,
-        actor_user_id: row.get(4)?,
-        payload_path: row.get(5)?,
-        payload_status: row.get(6)?,
-        payload_json: row.get(7)?,
+struct EndpointAuditPathFilter {
+    exact: Option<String>,
+    prefix: Option<String>,
+}
+
+fn endpoint_audit_path_filter(template: &str) -> EndpointAuditPathFilter {
+    let Some(tail) = template.strip_prefix('/') else {
+        return EndpointAuditPathFilter {
+            exact: None,
+            prefix: None,
+        };
+    };
+    if tail.is_empty() {
+        return EndpointAuditPathFilter {
+            exact: Some("/".to_owned()),
+            prefix: None,
+        };
+    }
+
+    let mut literal_segments = Vec::new();
+    let mut first_dynamic_segment = None;
+    for segment in tail.split('/') {
+        if segment == "*" || segment == "**" || segment.contains('{') || segment.contains('}') {
+            first_dynamic_segment = Some(segment);
+            break;
+        }
+        literal_segments.push(segment);
+    }
+
+    let Some(first_dynamic_segment) = first_dynamic_segment else {
+        return EndpointAuditPathFilter {
+            exact: Some(template.to_owned()),
+            prefix: None,
+        };
+    };
+    if literal_segments.is_empty() {
+        return EndpointAuditPathFilter {
+            exact: None,
+            prefix: None,
+        };
+    }
+
+    let literal_prefix = format!("/{}", literal_segments.join("/"));
+    let prefix = if first_dynamic_segment == "**" {
+        literal_prefix
+    } else {
+        format!("{literal_prefix}/")
+    };
+
+    EndpointAuditPathFilter {
+        exact: None,
+        prefix: Some(prefix),
+    }
+}
+
+fn endpoint_recent_event_from_observation(
+    observation: RequestObservation,
+    filters: &EndpointAuditFilters,
+) -> Option<EndpointRecentEvent> {
+    if !endpoint_observation_matches(&observation.method, &observation.path, filters) {
+        return None;
+    }
+
+    let status = observation.status.or_else(|| {
+        serde_json::from_str::<Value>(&observation.payload_json)
+            .ok()
+            .and_then(|payload| payload_status(&payload))
+    });
+
+    Some(EndpointRecentEvent {
+        id: observation.id,
+        event_id: observation.event_id,
+        request_id: observation.request_id,
+        timestamp: observation.timestamp,
+        method: observation.method,
+        path: observation.path,
+        status,
+        actor: observation.actor.map(|actor| actor.user_id),
     })
 }
 
-fn endpoint_time_series(
-    rows: &[EndpointAuditRow],
-    filters: &EndpointAuditFilters,
-) -> Vec<EndpointTimeSeriesPoint> {
-    let mut buckets = BTreeMap::<String, u64>::new();
-
-    for row in rows {
-        let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) else {
-            continue;
-        };
-        let Some(method) = payload.get("method").and_then(Value::as_str) else {
-            continue;
-        };
-        if !endpoint_audit_row_matches(method, &row.payload_path, filters) {
-            continue;
-        }
-        let Some(bucket_start) = bucket_start(&row.timestamp, filters.bucket) else {
-            continue;
-        };
-
-        *buckets.entry(bucket_start).or_insert(0) += 1;
-    }
-
-    buckets
-        .into_iter()
-        .map(|(bucket_start, count)| EndpointTimeSeriesPoint {
-            bucket_start,
-            count,
-        })
-        .collect()
-}
-
-fn endpoint_audit_row_matches(
+fn endpoint_observation_matches(
     method: &str,
     concrete_path: &str,
     filters: &EndpointAuditFilters,
@@ -827,17 +827,18 @@ fn payload_status(payload: &Value) -> Option<i64> {
 
 fn request_observation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRequestObservationRow> {
     Ok(RawRequestObservationRow {
-        event_id: row.get(0)?,
-        timestamp: row.get(1)?,
-        request_id: row.get(2)?,
-        source_ip: row.get(3)?,
-        user_agent: row.get(4)?,
-        actor_json: row.get(5)?,
-        method: row.get(6)?,
-        path: row.get(7)?,
-        status: row.get(8)?,
-        matched_rule_id: row.get(9)?,
-        payload_json: row.get(10)?,
+        id: row.get(0)?,
+        event_id: row.get(1)?,
+        timestamp: row.get(2)?,
+        request_id: row.get(3)?,
+        source_ip: row.get(4)?,
+        user_agent: row.get(5)?,
+        actor_json: row.get(6)?,
+        method: row.get(7)?,
+        path: row.get(8)?,
+        status: row.get(9)?,
+        matched_rule_id: row.get(10)?,
+        payload_json: row.get(11)?,
     })
 }
 
@@ -980,6 +981,7 @@ mod tests {
                     methods: vec!["get".to_owned()],
                     path_exact: None,
                     path_prefix: None,
+                    before_id: None,
                 },
                 |event| {
                     observed.push((event.event_id, event.method, event.status));
@@ -995,6 +997,121 @@ mod tests {
                 ("matching-get".to_owned(), "GET".to_owned(), Some(200)),
             ]
         );
+    }
+
+    #[test]
+    fn query_endpoint_activity_uses_sql_method_and_path_filters_before_scan_cap() {
+        let db = TempDb::new("endpoint-activity-pushdown");
+        create_schema(&db.path);
+        insert_observation_event(
+            &db.path,
+            SeedObservationEvent {
+                event_id: "target",
+                timestamp: "2024-06-01T00:05:00Z",
+                actor_user_id: "reader-1",
+                method: "GET",
+                path: "/users/123",
+                status: 200,
+                matched_rule_id: Some("allow-users"),
+            },
+        );
+        insert_observation_event(
+            &db.path,
+            SeedObservationEvent {
+                event_id: "wrong-method",
+                timestamp: "2024-06-01T00:06:00Z",
+                actor_user_id: "reader-1",
+                method: "POST",
+                path: "/users/456",
+                status: 201,
+                matched_rule_id: Some("allow-users"),
+            },
+        );
+        insert_observation_event(
+            &db.path,
+            SeedObservationEvent {
+                event_id: "wrong-path",
+                timestamp: "2024-06-01T00:07:00Z",
+                actor_user_id: "reader-1",
+                method: "GET",
+                path: "/admin/status",
+                status: 200,
+                matched_rule_id: Some("allow-admin"),
+            },
+        );
+
+        let activity = AuditQueryStore::open(&db.path)
+            .expect("query store should open")
+            .query_endpoint_activity_with_scan_limit(
+                &EndpointAuditFilters {
+                    method: "GET".to_owned(),
+                    endpoint_template: "/users/{id}".to_owned(),
+                    from: Some("2024-06-01T00:00:00Z".to_owned()),
+                    to: Some("2024-06-01T01:00:00Z".to_owned()),
+                    bucket: EndpointAuditBucket::Hour,
+                    recent_limit: 5,
+                    recent_before_id: None,
+                },
+                1,
+            )
+            .expect("endpoint activity should query");
+
+        assert_eq!(
+            activity.time_series,
+            vec![EndpointTimeSeriesPoint {
+                bucket_start: "2024-06-01T00:00:00Z".to_owned(),
+                count: 1,
+            }]
+        );
+        assert!(!activity.time_series_truncated);
+        assert_eq!(activity.recent_events.len(), 1);
+        assert_eq!(activity.recent_events[0].event_id, "target");
+    }
+
+    #[test]
+    fn query_endpoint_activity_flags_truncated_time_series_at_scan_cap() {
+        let db = TempDb::new("endpoint-activity-truncated");
+        create_schema(&db.path);
+        for index in 0..3 {
+            insert_observation_event(
+                &db.path,
+                SeedObservationEvent {
+                    event_id: &format!("target-{index}"),
+                    timestamp: &format!("2024-06-01T00:0{index}:00Z"),
+                    actor_user_id: "reader-1",
+                    method: "GET",
+                    path: &format!("/users/{index}"),
+                    status: 200,
+                    matched_rule_id: Some("allow-users"),
+                },
+            );
+        }
+
+        let activity = AuditQueryStore::open(&db.path)
+            .expect("query store should open")
+            .query_endpoint_activity_with_scan_limit(
+                &EndpointAuditFilters {
+                    method: "GET".to_owned(),
+                    endpoint_template: "/users/{id}".to_owned(),
+                    from: Some("2024-06-01T00:00:00Z".to_owned()),
+                    to: Some("2024-06-01T01:00:00Z".to_owned()),
+                    bucket: EndpointAuditBucket::Hour,
+                    recent_limit: 10,
+                    recent_before_id: None,
+                },
+                2,
+            )
+            .expect("endpoint activity should query");
+
+        assert_eq!(
+            activity.time_series,
+            vec![EndpointTimeSeriesPoint {
+                bucket_start: "2024-06-01T00:00:00Z".to_owned(),
+                count: 2,
+            }]
+        );
+        assert!(activity.time_series_truncated);
+        assert_eq!(activity.recent_events.len(), 3);
     }
 
     #[test]

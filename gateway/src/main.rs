@@ -411,6 +411,8 @@ struct TrafficEndpointAuditEnrichment {
     #[serde(skip_serializing_if = "Option::is_none")]
     omitted_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    time_series_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     time_series: Option<Vec<audit::query::EndpointTimeSeriesPoint>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recent_events: Option<Vec<audit::query::EndpointRecentEvent>>,
@@ -500,6 +502,11 @@ struct PolicyMutationCommitContext<'a> {
 }
 
 enum PolicyAdminAuthzError {
+    NotConfigured,
+    Forbidden,
+}
+
+enum TrafficAdminAuthzError {
     NotConfigured,
     Forbidden,
 }
@@ -2484,8 +2491,8 @@ async fn traffic_endpoint_list_endpoint(
     let Some(Extension(principal)) = principal else {
         return unauthorized();
     };
-    if !traffic_principal_has_permission(&state, &principal) {
-        return forbidden();
+    if let Err(error) = authorized_traffic_state(&state, &principal) {
+        return traffic_admin_authz_error_response(error);
     }
 
     let Some(discovery_store) = state.discovery_store.as_ref() else {
@@ -2518,8 +2525,8 @@ async fn traffic_endpoint_detail_endpoint(
     let Some(Extension(principal)) = principal else {
         return unauthorized();
     };
-    if !traffic_principal_has_permission(&state, &principal) {
-        return forbidden();
+    if let Err(error) = authorized_traffic_state(&state, &principal) {
+        return traffic_admin_authz_error_response(error);
     }
 
     let Some(discovery_store) = state.discovery_store.as_ref() else {
@@ -2579,6 +2586,7 @@ async fn traffic_endpoint_detail_endpoint(
                     match_strategy: audit::query::ENDPOINT_AUDIT_MATCH_STRATEGY,
                     match_limitations: audit::query::ENDPOINT_AUDIT_MATCH_LIMITATIONS,
                     omitted_reason: None,
+                    time_series_truncated: Some(activity.time_series_truncated),
                     time_series: Some(activity.time_series),
                     recent_events: Some(activity.recent_events),
                     recent_events_next_cursor: activity.recent_events_next_cursor,
@@ -2594,6 +2602,7 @@ async fn traffic_endpoint_detail_endpoint(
             match_strategy: audit::query::ENDPOINT_AUDIT_MATCH_STRATEGY,
             match_limitations: audit::query::ENDPOINT_AUDIT_MATCH_LIMITATIONS,
             omitted_reason: Some("AUDIT_SQLITE_PATH not configured"),
+            time_series_truncated: None,
             time_series: None,
             recent_events: None,
             recent_events_next_cursor: None,
@@ -2905,19 +2914,32 @@ fn authorized_policy_state<'a>(
     Ok(rbac_state)
 }
 
-fn traffic_principal_has_permission(
-    state: &TrafficAdminState,
+fn authorized_traffic_state<'a>(
+    state: &'a TrafficAdminState,
     principal: &auth::Principal,
-) -> bool {
-    state.rbac_state.as_ref().is_some_and(|rbac_state| {
-        rbac_state.principal_has_permission(principal, ADMIN_TRAFFIC_READ_PERMISSION)
-    })
+) -> Result<&'a middleware::rbac::RbacState, TrafficAdminAuthzError> {
+    let Some(rbac_state) = state.rbac_state.as_ref() else {
+        return Err(TrafficAdminAuthzError::NotConfigured);
+    };
+
+    if !rbac_state.principal_has_permission(principal, ADMIN_TRAFFIC_READ_PERMISSION) {
+        return Err(TrafficAdminAuthzError::Forbidden);
+    }
+
+    Ok(rbac_state)
 }
 
 fn policy_admin_authz_error_response(error: PolicyAdminAuthzError) -> Response {
     match error {
         PolicyAdminAuthzError::NotConfigured => policy_not_configured(),
         PolicyAdminAuthzError::Forbidden => forbidden(),
+    }
+}
+
+fn traffic_admin_authz_error_response(error: TrafficAdminAuthzError) -> Response {
+    match error {
+        TrafficAdminAuthzError::NotConfigured => traffic_rbac_not_configured(),
+        TrafficAdminAuthzError::Forbidden => forbidden(),
     }
 }
 
@@ -3035,6 +3057,7 @@ fn preview_rule(
             methods: request.rule.methods.clone(),
             path_exact: exact_preview_path_filter(&request.rule.path),
             path_prefix: prefix_preview_path_filter(&request.rule.path),
+            before_id: None,
         },
         |observation| {
             scanned_event_count = scanned_event_count.saturating_add(1);
@@ -3653,6 +3676,16 @@ fn policy_not_configured() -> Response {
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
             error: "policy API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn traffic_rbac_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "traffic endpoint inventory requires POLICY_FILE to be configured".to_owned(),
         }),
     )
         .into_response()
@@ -8882,6 +8915,7 @@ mod tests {
                 { "bucket_start": "2024-06-01T01:00:00Z", "count": 1 }
             ])
         );
+        assert_eq!(body["audit"]["time_series_truncated"], json!(false));
         let recent_paths = body["audit"]["recent_events"]
             .as_array()
             .expect("recent events should be present")
@@ -9001,6 +9035,58 @@ mod tests {
         );
         assert!(body["audit"].get("time_series").is_none());
         assert!(body["audit"].get("recent_events").is_none());
+    }
+
+    #[tokio::test]
+    async fn traffic_endpoint_admin_reports_rbac_not_configured() {
+        let discovery_db = TempDb::new("traffic-rbac-unconfigured");
+        create_discovery_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/users/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 10,
+                latency_p95_ms: 10,
+                latency_p99_ms: 10,
+                distinct_principal_count: 0,
+                status_counts: &[(200, 1)],
+            },
+        );
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.discovery_sqlite_path = Some(discovery_db.path.to_string_lossy().into_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+        let detail_uri =
+            "/v1/admin/traffic/endpoint?method=GET&endpoint_template=%2Fusers%2F%7Bid%7D";
+
+        for uri in ["/v1/admin/traffic/endpoints", detail_uri] {
+            let response = router
+                .clone()
+                .oneshot(traffic_admin_request(
+                    uri,
+                    Some(test_principal(&["traffic-reader"])),
+                ))
+                .await
+                .expect("traffic request should complete");
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                body_string(response).await,
+                r#"{"error":"traffic endpoint inventory requires POLICY_FILE to be configured"}"#
+            );
+        }
     }
 
     #[tokio::test]
