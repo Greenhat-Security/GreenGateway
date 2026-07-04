@@ -12,10 +12,16 @@ use std::{
 use http::{header, HeaderName, HeaderValue};
 use serde::Deserialize;
 
-use crate::discovery::signals::{
-    SignalDetectorConfig, DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
-    DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD, DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
-    DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+use crate::discovery::{
+    signals::{
+        SignalDetectorConfig, DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
+        DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
+        DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD, DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+    },
+    suggestions::{
+        RuleSuggestionConfig, DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
+        MAX_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
+    },
 };
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
@@ -85,6 +91,7 @@ const POLICY_FILE: &str = "POLICY_FILE";
 const PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD: &str =
     "PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD";
 const RBAC_EXEMPT_PATHS: &str = "RBAC_EXEMPT_PATHS";
+const RULE_SUGGESTION_BASELINE_WINDOW_HOURS: &str = "RULE_SUGGESTION_BASELINE_WINDOW_HOURS";
 const RATE_LIMIT_READ_RPS: &str = "RATE_LIMIT_READ_RPS";
 const RATE_LIMIT_READ_BURST: &str = "RATE_LIMIT_READ_BURST";
 const RATE_LIMIT_WRITE_RPS: &str = "RATE_LIMIT_WRITE_RPS";
@@ -117,6 +124,7 @@ pub struct Config {
     pub error_rate_spike_signal_threshold: f64,
     pub principal_new_to_endpoint_signal_threshold: u64,
     pub volume_outlier_signal_threshold: f64,
+    pub rule_suggestion_baseline_window_hours: u64,
     pub openapi_spec_path: Option<PathBuf>,
     pub policy_file: Option<String>,
     pub cors_allow_origins: Vec<String>,
@@ -325,6 +333,18 @@ impl Config {
                 &mut problems,
             ),
             DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+            &mut problems,
+        );
+        let rule_suggestion_baseline_window_hours = validate_rule_suggestion_baseline_window_hours(
+            RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
+            parse_var(
+                RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
+                get_var(RULE_SUGGESTION_BASELINE_WINDOW_HOURS),
+                DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
+                "hour count",
+                &mut problems,
+            ),
+            DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
             &mut problems,
         );
         let openapi_spec_path =
@@ -578,6 +598,7 @@ impl Config {
                 error_rate_spike_signal_threshold,
                 principal_new_to_endpoint_signal_threshold,
                 volume_outlier_signal_threshold,
+                rule_suggestion_baseline_window_hours,
                 openapi_spec_path,
                 policy_file,
                 cors_allow_origins,
@@ -629,6 +650,13 @@ impl Config {
             error_rate_spike_threshold: self.error_rate_spike_signal_threshold,
             principal_new_to_endpoint_threshold: self.principal_new_to_endpoint_signal_threshold,
             volume_outlier_threshold: self.volume_outlier_signal_threshold,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn rule_suggestion_config(&self) -> RuleSuggestionConfig {
+        RuleSuggestionConfig {
+            baseline_window_hours: self.rule_suggestion_baseline_window_hours,
         }
     }
 }
@@ -713,6 +741,22 @@ fn validate_signal_multiple_threshold(
     } else {
         problems.push(format!(
             "{name} must be a finite number greater than 1.0, got '{value}'"
+        ));
+        default
+    }
+}
+
+fn validate_rule_suggestion_baseline_window_hours(
+    name: &str,
+    value: u64,
+    default: u64,
+    problems: &mut Vec<String>,
+) -> u64 {
+    if (1..=MAX_RULE_SUGGESTION_BASELINE_WINDOW_HOURS).contains(&value) {
+        value
+    } else {
+        problems.push(format!(
+            "{name} must be between 1 and {MAX_RULE_SUGGESTION_BASELINE_WINDOW_HOURS}, got '{value}'"
         ));
         default
     }
@@ -1692,6 +1736,10 @@ mod tests {
             config.signal_detector_config(),
             SignalDetectorConfig::default()
         );
+        assert_eq!(
+            config.rule_suggestion_config(),
+            RuleSuggestionConfig::default()
+        );
         assert_eq!(config.policy_file, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
@@ -2068,6 +2116,41 @@ mod tests {
         assert!(message
             .contains("VOLUME_OUTLIER_SIGNAL_THRESHOLD must be a finite number greater than 1.0"));
         assert_eq!(error.problems.len(), 4);
+    }
+
+    #[test]
+    fn rule_suggestion_config_parses_from_env() {
+        let config = Config::from_env_vars(|name| match name {
+            "RULE_SUGGESTION_BASELINE_WINDOW_HOURS" => Ok("72".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("rule suggestion config should parse");
+
+        assert_eq!(
+            config.rule_suggestion_config(),
+            RuleSuggestionConfig {
+                baseline_window_hours: 72,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_rule_suggestion_baseline_window_is_rejected() {
+        for value in ["0", "876001"] {
+            let error = Config::from_env_vars(|name| match name {
+                "RULE_SUGGESTION_BASELINE_WINDOW_HOURS" => Ok(value.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect_err("invalid rule suggestion window should be rejected");
+
+            let message = error.to_string();
+            assert!(
+                message
+                    .contains("RULE_SUGGESTION_BASELINE_WINDOW_HOURS must be between 1 and 876000"),
+                "{message}"
+            );
+            assert_eq!(error.problems.len(), 1);
+        }
     }
 
     #[test]

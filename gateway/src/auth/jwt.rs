@@ -891,6 +891,8 @@ mQIDAQAB
                 crate::discovery::signals::DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
             volume_outlier_signal_threshold:
                 crate::discovery::signals::DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+            rule_suggestion_baseline_window_hours:
+                crate::discovery::suggestions::DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
             openapi_spec_path: None,
             policy_file: None,
             cors_allow_origins: Vec::new(),

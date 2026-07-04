@@ -44,6 +44,7 @@ use crate::{
             PrincipalNewToEndpointSignalObservation, SchemaMismatchSignalObservation,
             SignalDetectorConfig, SignalEvaluator, VolumeOutlierSignalObservation,
         },
+        suggestions,
     },
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
 };
@@ -1377,7 +1378,8 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
         "schema_mismatch_count",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    signals::configure_connection(connection)
+    signals::configure_connection(connection)?;
+    suggestions::configure_connection(connection)
 }
 
 fn ensure_discovery_endpoint_aggregate_column(
