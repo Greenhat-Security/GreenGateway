@@ -54,6 +54,8 @@ const AUDIT_EVENTS_STREAM_ROUTE: &str = "/v1/admin/events/stream";
 const STATUS_ADMIN_ROUTE: &str = "/v1/admin/status";
 const POLICY_ADMIN_ROUTE: &str = "/v1/admin/policy";
 const POLICY_HISTORY_ADMIN_ROUTE: &str = "/v1/admin/policy/history";
+const POLICY_HISTORY_WARNING_HEADER: &str = "x-greengateway-policy-history-warning";
+const POLICY_HISTORY_APPEND_FAILED_WARNING: &str = "policy_history_append_failed";
 #[cfg(test)]
 const POLICY_ROLLBACK_ADMIN_ROUTE_PREFIX: &str = "/v1/admin/policy/rollback";
 const POLICY_ROLLBACK_ADMIN_ROUTE: &str = "/v1/admin/policy/rollback/{version}";
@@ -630,6 +632,18 @@ struct RulePatch {
 }
 
 type ResponseResult<T> = Result<T, Box<Response>>;
+
+struct PolicyMutationCommitResult {
+    after_policy: rbac::Policy,
+    new_etag: String,
+    history_append_failed: bool,
+}
+
+struct PolicyRuleCreateResult {
+    rule: rbac::Rule,
+    new_etag: String,
+    history_append_failed: bool,
+}
 
 struct PolicyMutationCommitContext<'a> {
     state: &'a PolicyAdminState,
@@ -2135,9 +2149,8 @@ async fn policy_put_endpoint(
     let diff_summary = json!({
         "action": "policy_replaced",
     });
-    if let Err(response) = append_policy_version(&state, &principal, &after_policy, &diff_summary) {
-        return *response;
-    }
+    let history_append_failed =
+        append_policy_version_after_commit(&state, &principal, &after_policy, &diff_summary);
     emit_policy_rule_changed(
         &state,
         &parts,
@@ -2155,12 +2168,13 @@ async fn policy_put_endpoint(
         }
     };
 
-    (
+    let response = (
         StatusCode::OK,
         [(header::ETAG, etag_header_value(&new_etag))],
         Json(after_policy),
     )
-        .into_response()
+        .into_response();
+    with_policy_history_append_warning(response, history_append_failed)
 }
 
 async fn policy_history_endpoint(
@@ -2257,7 +2271,7 @@ async fn policy_rollback_endpoint(
         "action": "policy_rolled_back",
         "target_version": target.version,
     });
-    let (after_policy, new_etag) = match persist_policy_mutation(
+    let commit = match persist_policy_mutation(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
@@ -2273,12 +2287,13 @@ async fn policy_rollback_endpoint(
         Err(response) => return *response,
     };
 
-    (
+    let response = (
         StatusCode::OK,
-        [(header::ETAG, etag_header_value(&new_etag))],
-        Json(after_policy),
+        [(header::ETAG, etag_header_value(&commit.new_etag))],
+        Json(commit.after_policy),
     )
-        .into_response()
+        .into_response();
+    with_policy_history_append_warning(response, commit.history_append_failed)
 }
 
 async fn policy_validate_endpoint(
@@ -2331,18 +2346,19 @@ async fn policy_rule_post_endpoint(
         Err(errors) => return policy_validation_failed(errors),
     };
 
-    let (created_rule, new_etag) =
+    let created =
         match create_policy_rule(&state, &parts, &principal, rbac_state, policy_file, rule) {
             Ok(result) => result,
             Err(response) => return *response,
         };
 
-    (
+    let response = (
         StatusCode::CREATED,
-        [(header::ETAG, etag_header_value(&new_etag))],
-        Json(created_rule),
+        [(header::ETAG, etag_header_value(&created.new_etag))],
+        Json(created.rule),
     )
-        .into_response()
+        .into_response();
+    with_policy_history_append_warning(response, created.history_append_failed)
 }
 
 async fn policy_rule_patch_endpoint(
@@ -2407,7 +2423,7 @@ async fn policy_rule_patch_endpoint(
         "rule_id": rule_id,
         "changed_fields": changed_fields,
     });
-    let (after_policy, new_etag) = match persist_policy_mutation(
+    let commit = match persist_policy_mutation(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
@@ -2423,18 +2439,20 @@ async fn policy_rule_patch_endpoint(
         Err(response) => return *response,
     };
 
-    let updated_rule = after_policy
+    let updated_rule = commit
+        .after_policy
         .rules
         .get(rule_index)
         .cloned()
         .unwrap_or(updated_rule);
 
-    (
+    let response = (
         StatusCode::OK,
-        [(header::ETAG, etag_header_value(&new_etag))],
+        [(header::ETAG, etag_header_value(&commit.new_etag))],
         Json(updated_rule),
     )
-        .into_response()
+        .into_response();
+    with_policy_history_append_warning(response, commit.history_append_failed)
 }
 
 async fn policy_rule_delete_endpoint(
@@ -2481,7 +2499,7 @@ async fn policy_rule_delete_endpoint(
         "rule_id": rule_id,
         "position": rule_index,
     });
-    let (_after_policy, new_etag) = match persist_policy_mutation(
+    let commit = match persist_policy_mutation(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
@@ -2497,14 +2515,15 @@ async fn policy_rule_delete_endpoint(
         Err(response) => return *response,
     };
 
-    (
+    let response = (
         StatusCode::OK,
-        [(header::ETAG, etag_header_value(&new_etag))],
+        [(header::ETAG, etag_header_value(&commit.new_etag))],
         Json(RuleDeletedResponse {
             deleted_rule_id: rule_id,
         }),
     )
-        .into_response()
+        .into_response();
+    with_policy_history_append_warning(response, commit.history_append_failed)
 }
 
 async fn policy_rules_order_put_endpoint(
@@ -2558,7 +2577,7 @@ async fn policy_rules_order_put_endpoint(
         "action": "rules_reordered",
         "new_order": requested_order,
     });
-    let (after_policy, new_etag) = match persist_policy_mutation(
+    let commit = match persist_policy_mutation(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
@@ -2573,14 +2592,15 @@ async fn policy_rules_order_put_endpoint(
         Ok(result) => result,
         Err(response) => return *response,
     };
-    let order = policy_rule_ids(&after_policy);
+    let order = policy_rule_ids(&commit.after_policy);
 
-    (
+    let response = (
         StatusCode::OK,
-        [(header::ETAG, etag_header_value(&new_etag))],
+        [(header::ETAG, etag_header_value(&commit.new_etag))],
         Json(RulesReorderedResponse { order }),
     )
-        .into_response()
+        .into_response();
+    with_policy_history_append_warning(response, commit.history_append_failed)
 }
 
 async fn policy_rule_preview_endpoint(
@@ -3108,7 +3128,7 @@ async fn rule_suggestion_accept_endpoint(
         return conflict("suggestion is not open");
     }
 
-    let (rule, new_etag) = match create_policy_rule(
+    let created = match create_policy_rule(
         &state.policy,
         &parts,
         &principal,
@@ -3134,12 +3154,16 @@ async fn rule_suggestion_accept_endpoint(
     };
     emit_suggestion_lifecycle_changed(&state, &parts, &principal, &suggestion);
 
-    (
+    let response = (
         StatusCode::CREATED,
-        [(header::ETAG, etag_header_value(&new_etag))],
-        Json(RuleSuggestionAcceptResponse { suggestion, rule }),
+        [(header::ETAG, etag_header_value(&created.new_etag))],
+        Json(RuleSuggestionAcceptResponse {
+            suggestion,
+            rule: created.rule,
+        }),
     )
-        .into_response()
+        .into_response();
+    with_policy_history_append_warning(response, created.history_append_failed)
 }
 
 async fn rule_suggestion_dismiss_endpoint(
@@ -4444,7 +4468,7 @@ fn create_policy_rule(
     rbac_state: &middleware::rbac::RbacState,
     policy_file: &std::path::Path,
     mut rule: rbac::Rule,
-) -> ResponseResult<(rbac::Rule, String)> {
+) -> ResponseResult<PolicyRuleCreateResult> {
     let _policy_write_guard = match rbac_state.policy_write_guard() {
         Ok(guard) => guard,
         Err(err) => {
@@ -4484,7 +4508,7 @@ fn create_policy_rule(
         "rule_id": rule_id,
         "position": position,
     });
-    let (after_policy, new_etag) = persist_policy_mutation(
+    let commit = persist_policy_mutation(
         PolicyMutationCommitContext {
             state,
             rbac_state,
@@ -4497,14 +4521,19 @@ fn create_policy_rule(
         diff_summary,
     )?;
 
-    debug_assert_ne!(current_etag, new_etag);
-    let created_rule = after_policy
+    debug_assert_ne!(current_etag, commit.new_etag);
+    let created_rule = commit
+        .after_policy
         .rules
         .get(position)
         .cloned()
         .unwrap_or(created_rule);
 
-    Ok((created_rule, new_etag))
+    Ok(PolicyRuleCreateResult {
+        rule: created_rule,
+        new_etag: commit.new_etag,
+        history_append_failed: commit.history_append_failed,
+    })
 }
 
 fn persist_policy_mutation(
@@ -4512,7 +4541,7 @@ fn persist_policy_mutation(
     before_policy: &rbac::Policy,
     candidate: &rbac::Policy,
     diff_summary: Value,
-) -> ResponseResult<(rbac::Policy, String)> {
+) -> ResponseResult<PolicyMutationCommitResult> {
     if let Err(err) = candidate.persist_to_file(context.policy_file) {
         tracing::error!(policy_file = %context.policy_file.display(), error = %err, "failed to persist policy");
         return Err(Box::new(internal_server_error("policy persist failed")));
@@ -4526,12 +4555,12 @@ fn persist_policy_mutation(
     }
 
     let after_policy = context.rbac_state.current_policy();
-    append_policy_version(
+    let history_append_failed = append_policy_version_after_commit(
         context.state,
         context.principal,
         &after_policy,
         &diff_summary,
-    )?;
+    );
     emit_policy_rule_changed(
         context.state,
         context.parts,
@@ -4551,7 +4580,29 @@ fn persist_policy_mutation(
         }
     };
 
-    Ok((after_policy, new_etag))
+    Ok(PolicyMutationCommitResult {
+        after_policy,
+        new_etag,
+        history_append_failed,
+    })
+}
+
+fn append_policy_version_after_commit(
+    state: &PolicyAdminState,
+    principal: &auth::Principal,
+    policy: &rbac::Policy,
+    diff_summary: &Value,
+) -> bool {
+    match append_policy_version(state, principal, policy, diff_summary) {
+        Ok(()) => false,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "failed to append policy history version after policy mutation committed; returning mutation success with warning"
+            );
+            true
+        }
+    }
 }
 
 fn append_policy_version(
@@ -4559,18 +4610,15 @@ fn append_policy_version(
     principal: &auth::Principal,
     policy: &rbac::Policy,
     diff_summary: &Value,
-) -> ResponseResult<()> {
+) -> Result<(), String> {
     let Some(history_store) = state.history_store.as_ref() else {
-        return Err(Box::new(policy_history_not_configured()));
+        return Err("policy history store is not configured".to_owned());
     };
 
     history_store
         .append_version(&principal.user_id, diff_summary, policy)
         .map(|_| ())
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to append policy history version");
-            Box::new(internal_server_error("policy history append failed"))
-        })
+        .map_err(|err| err.to_string())
 }
 
 fn effective_rule_id(rule: &rbac::Rule, rule_index: usize) -> String {
@@ -4736,6 +4784,20 @@ fn sort_json_value(value: &mut Value) {
 
 fn etag_header_value(etag: &str) -> HeaderValue {
     HeaderValue::from_str(etag).expect("policy ETag should be a valid HTTP header value")
+}
+
+fn with_policy_history_append_warning(
+    mut response: Response,
+    history_append_failed: bool,
+) -> Response {
+    if history_append_failed {
+        response.headers_mut().insert(
+            HeaderName::from_static(POLICY_HISTORY_WARNING_HEADER),
+            HeaderValue::from_static(POLICY_HISTORY_APPEND_FAILED_WARNING),
+        );
+    }
+
+    response
 }
 
 fn if_match_matches(headers: &HeaderMap, current_etag: &str) -> Result<bool, IfMatchError> {
@@ -8516,6 +8578,110 @@ mod tests {
                 "list entries should omit policy snapshots"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn policy_put_succeeds_with_warning_when_history_append_fails_after_commit() {
+        let initial_policy = policy_document_string("initial-policy", "test:old");
+        let policy = TempPolicyFile::new(&initial_policy);
+        let history_db = TempDb::new("policy-history-append-failure");
+        let router = policy_admin_router_with_history(Some(&policy), &history_db);
+
+        let connection =
+            rusqlite::Connection::open(&history_db.path).expect("history db should open");
+        connection
+            .execute_batch("DROP TABLE policy_versions;")
+            .expect("history table should be droppable");
+        drop(connection);
+
+        let (current_etag, _) = current_policy(&router).await;
+        let candidate = policy_document_string("updated-policy", "test:new");
+        let expected_policy = serde_json::to_value(
+            rbac::Policy::validate_json_value(
+                serde_json::from_str::<Value>(&candidate).expect("candidate policy should be JSON"),
+            )
+            .expect("candidate policy should validate"),
+        )
+        .expect("validated candidate policy should serialize");
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(candidate),
+                Some(&current_etag),
+            ))
+            .await
+            .expect("policy PUT should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-greengateway-policy-history-warning")
+                .and_then(|value| value.to_str().ok()),
+            Some("policy_history_append_failed")
+        );
+        let new_etag = policy_etag_header(&response);
+        assert_ne!(new_etag, current_etag);
+        assert_eq!(json_body(response).await, expected_policy);
+
+        let (live_etag, live_policy) = current_policy(&router).await;
+        assert_eq!(live_etag, new_etag);
+        assert_eq!(live_policy, expected_policy);
+    }
+
+    #[tokio::test]
+    async fn policy_rule_create_succeeds_with_warning_when_history_append_fails_after_commit() {
+        let initial_policy = policy_document_string("initial-policy", "test:old");
+        let policy = TempPolicyFile::new(&initial_policy);
+        let history_db = TempDb::new("policy-history-rule-append-failure");
+        let router = policy_admin_router_with_history(Some(&policy), &history_db);
+
+        let connection =
+            rusqlite::Connection::open(&history_db.path).expect("history db should open");
+        connection
+            .execute_batch("DROP TABLE policy_versions;")
+            .expect("history table should be droppable");
+        drop(connection);
+
+        let (current_etag, _) = current_policy(&router).await;
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_RULES_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(
+                    json!({ "id": "created-rule", "path": "/created", "action": "allow" })
+                        .to_string(),
+                ),
+                Some(&current_etag),
+            ))
+            .await
+            .expect("rule POST should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-greengateway-policy-history-warning")
+                .and_then(|value| value.to_str().ok()),
+            Some("policy_history_append_failed")
+        );
+        let new_etag = policy_etag_header(&response);
+        assert_ne!(new_etag, current_etag);
+        let created_rule = json_body(response).await;
+        assert_eq!(created_rule["id"], json!("created-rule"));
+        assert_eq!(created_rule["path"], json!("/created"));
+        assert_eq!(created_rule["action"], json!("allow"));
+
+        let (live_etag, live_policy) = current_policy(&router).await;
+        assert_eq!(live_etag, new_etag);
+        assert_eq!(live_policy["rules"][0]["id"], json!("created-rule"));
+        assert_eq!(live_policy["rules"][0]["path"], json!("/created"));
+        assert_eq!(live_policy["rules"][0]["action"], json!("allow"));
     }
 
     #[tokio::test]
