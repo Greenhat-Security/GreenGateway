@@ -53,6 +53,8 @@ const AUDIT_ADMIN_ROUTE: &str = "/v1/admin/audit";
 const AUDIT_EVENTS_STREAM_ROUTE: &str = "/v1/admin/events/stream";
 const STATUS_ADMIN_ROUTE: &str = "/v1/admin/status";
 const POLICY_ADMIN_ROUTE: &str = "/v1/admin/policy";
+const POLICY_RULE_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/preview";
+const POLICY_RULE_HITS_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/hits";
 const POLICY_VALIDATE_ADMIN_ROUTE: &str = "/v1/admin/policy/validate";
 const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
@@ -68,6 +70,8 @@ const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
 const MAX_AUDIT_QUERY_LIMIT: usize = 500;
 const DEFAULT_TRAFFIC_RECENT_EVENTS_LIMIT: usize = 20;
+const DEFAULT_RULE_PREVIEW_SAMPLE_LIMIT: usize = 20;
+const MAX_RULE_PREVIEW_SAMPLE_LIMIT: usize = 100;
 const UPSTREAM_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(rust_embed::RustEmbed)]
@@ -141,6 +145,8 @@ struct AdminRoutes {
     events_stream_route: String,
     status_route: String,
     policy_route: String,
+    policy_rule_preview_route: String,
+    policy_rule_hits_route: String,
     policy_validate_route: String,
     policy_rules_route: String,
     policy_rule_route: String,
@@ -193,6 +199,8 @@ impl AdminRoutes {
             events_stream_route: format!("{api_prefix}/events/stream"),
             status_route: format!("{api_prefix}/status"),
             policy_route: format!("{api_prefix}/policy"),
+            policy_rule_preview_route: format!("{api_prefix}/policy/rules/preview"),
+            policy_rule_hits_route: format!("{api_prefix}/policy/rules/hits"),
             policy_validate_route: format!("{api_prefix}/policy/validate"),
             policy_rules_route: format!("{api_prefix}/policy/rules"),
             policy_rule_route: format!("{api_prefix}/policy/rules/{{id}}"),
@@ -222,6 +230,7 @@ struct StatusAdminState {
 struct PolicyAdminState {
     policy_file: Option<PathBuf>,
     rbac_state: Option<middleware::rbac::RbacState>,
+    query_store: Option<Arc<audit::query::AuditQueryStore>>,
     audit: audit::AuditLog,
     trust_proxy_headers: bool,
     max_body_size: usize,
@@ -414,6 +423,51 @@ struct PolicyValidationResponse {
     valid: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     errors: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PolicyRulePreviewRequest {
+    rule: rbac::Rule,
+    from: Option<String>,
+    to: Option<String>,
+    sample_limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct PolicyRulePreviewResponse {
+    match_count: u64,
+    scanned_event_count: u64,
+    sample_strategy: &'static str,
+    samples: Vec<PolicyRulePreviewSample>,
+}
+
+#[derive(Serialize)]
+struct PolicyRulePreviewSample {
+    event_id: String,
+    timestamp: String,
+    request_id: String,
+    source_ip: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_agent: Option<String>,
+    method: String,
+    path: String,
+    actor: Option<audit::Actor>,
+    status: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_decision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_rule_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PolicyRuleHitsResponse {
+    rules: Vec<PolicyRuleHitCount>,
+}
+
+#[derive(Serialize)]
+struct PolicyRuleHitCount {
+    rule_id: String,
+    hits: u64,
 }
 
 #[derive(Serialize)]
@@ -687,6 +741,7 @@ fn gateway_app_with_process_started_at(
     let policy_admin_state = PolicyAdminState {
         policy_file: config.policy_file.as_ref().map(PathBuf::from),
         rbac_state: rbac_state.clone(),
+        query_store: audit_query_store.clone(),
         audit: audit_log.clone(),
         trust_proxy_headers: config.trust_proxy_headers,
         max_body_size: config.max_body_size,
@@ -868,6 +923,14 @@ fn add_admin_api_routes(
                 .route(
                     routes.admin.policy_route.as_str(),
                     get(policy_get_endpoint).put(policy_put_endpoint),
+                )
+                .route(
+                    routes.admin.policy_rule_preview_route.as_str(),
+                    post(policy_rule_preview_endpoint),
+                )
+                .route(
+                    routes.admin.policy_rule_hits_route.as_str(),
+                    get(policy_rule_hits_endpoint),
                 )
                 .route(
                     routes.admin.policy_validate_route.as_str(),
@@ -2168,6 +2231,84 @@ async fn policy_rules_order_put_endpoint(
         .into_response()
 }
 
+async fn policy_rule_preview_endpoint(
+    State(state): State<PolicyAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(POLICY_RULE_PREVIEW_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_policy_state(&state, principal, ADMIN_POLICY_READ_PERMISSION) {
+        return policy_admin_authz_error_response(error);
+    }
+    let Some(query_store) = state.query_store.as_ref() else {
+        return service_unavailable(
+            "policy rule preview requires AUDIT_SQLITE_PATH to be configured",
+        );
+    };
+
+    let body = match read_request_body(body, state.max_body_size).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let preview_request = match parse_rule_preview_body(&body) {
+        Ok(request) => request,
+        Err(errors) => return policy_validation_failed(errors),
+    };
+
+    match preview_rule(query_store, preview_request) {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to preview policy rule");
+            internal_server_error("policy rule preview failed")
+        }
+    }
+}
+
+async fn policy_rule_hits_endpoint(
+    State(state): State<PolicyAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(POLICY_RULE_HITS_ADMIN_ROUTE);
+
+    let Some(principal) = request.extensions().get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    let rbac_state = match authorized_policy_state(&state, principal, ADMIN_POLICY_READ_PERMISSION)
+    {
+        Ok(rbac_state) => rbac_state,
+        Err(error) => return policy_admin_authz_error_response(error),
+    };
+    let policy = rbac_state.current_policy();
+    let counts = match state.query_store.as_ref() {
+        Some(query_store) => match query_store.rule_hit_counts() {
+            Ok(counts) => counts,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to query policy rule hit counts");
+                return internal_server_error("policy rule hit count query failed");
+            }
+        },
+        None => HashMap::new(),
+    };
+
+    Json(PolicyRuleHitsResponse {
+        rules: policy
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(rule_index, rule)| {
+                let rule_id = rule.id.clone().unwrap_or_else(|| rule_index.to_string());
+                let hits = counts.get(&rule_id).copied().unwrap_or(0);
+                PolicyRuleHitCount { rule_id, hits }
+            })
+            .collect(),
+    })
+    .into_response()
+}
+
 async fn admin_ui_index(State(state): State<AppState>) -> Response {
     record_request(ADMIN_UI_ROUTE);
     admin_ui_index_response(&state.routes.admin)
@@ -2548,8 +2689,10 @@ impl AuditQueryParams {
             to,
             event_type: self.event_type,
             actor: self.actor,
+            method: None,
             path: self.path,
             status,
+            matched_rule_id: None,
             limit,
             before_id,
         })
@@ -2833,6 +2976,198 @@ fn parse_rule_patch_body(body: &Bytes) -> Result<RulePatch, Vec<String>> {
 fn parse_rule_order_body(body: &Bytes) -> Result<Vec<String>, Vec<String>> {
     serde_json::from_slice::<Vec<String>>(body)
         .map_err(|err| vec![format!("invalid rule order JSON: {err}")])
+}
+
+fn parse_rule_preview_body(body: &Bytes) -> Result<PolicyRulePreviewRequest, Vec<String>> {
+    let request = serde_json::from_slice::<PolicyRulePreviewRequest>(body)
+        .map_err(|err| vec![format!("invalid JSON: {err}")])?;
+    validate_rule_preview_request(&request)?;
+    Ok(request)
+}
+
+fn validate_rule_preview_request(request: &PolicyRulePreviewRequest) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+
+    if let Err(parameter) = validate_rfc3339("from", request.from.clone()) {
+        errors.push(format!("invalid {parameter}: expected RFC 3339 timestamp"));
+    }
+    if let Err(parameter) = validate_rfc3339("to", request.to.clone()) {
+        errors.push(format!("invalid {parameter}: expected RFC 3339 timestamp"));
+    }
+    if !request.rule.path.starts_with('/') {
+        errors.push(format!(
+            "rule.path must start with '/', got '{}'",
+            request.rule.path
+        ));
+    }
+    for auth_method in &request.rule.principal.auth_methods {
+        if !rbac::rule::valid_auth_method_name(auth_method) {
+            errors.push(format!(
+                "rule.principal.auth_methods contains unknown auth method '{auth_method}', expected 'bearer_token' or 'session_cookie'"
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn preview_rule(
+    query_store: &audit::query::AuditQueryStore,
+    request: PolicyRulePreviewRequest,
+) -> Result<PolicyRulePreviewResponse, audit::query::AuditQueryError> {
+    let matcher = rbac::RuleMatcher::new(std::slice::from_ref(&request.rule));
+    let sample_limit = request
+        .sample_limit
+        .unwrap_or(DEFAULT_RULE_PREVIEW_SAMPLE_LIMIT)
+        .min(MAX_RULE_PREVIEW_SAMPLE_LIMIT);
+    let mut match_count = 0_u64;
+    let mut scanned_event_count = 0_u64;
+    let mut samples = Vec::with_capacity(sample_limit);
+
+    query_store.scan_request_observations(
+        &audit::query::RequestObservationFilters {
+            from: request.from,
+            to: request.to,
+            methods: request.rule.methods.clone(),
+            path_exact: exact_preview_path_filter(&request.rule.path),
+            path_prefix: prefix_preview_path_filter(&request.rule.path),
+        },
+        |observation| {
+            scanned_event_count = scanned_event_count.saturating_add(1);
+            let principal = observation
+                .actor
+                .as_ref()
+                .and_then(principal_from_audit_actor);
+
+            if matcher
+                .evaluate(&observation.method, &observation.path, principal.as_ref())
+                .is_some()
+            {
+                match_count = match_count.saturating_add(1);
+                if samples.len() < sample_limit {
+                    samples.push(preview_sample(observation));
+                }
+            }
+
+            true
+        },
+    )?;
+
+    Ok(PolicyRulePreviewResponse {
+        match_count,
+        scanned_event_count,
+        sample_strategy: "newest_matches",
+        samples,
+    })
+}
+
+fn exact_preview_path_filter(pattern: &str) -> Option<String> {
+    preview_path_filter(pattern).exact
+}
+
+fn prefix_preview_path_filter(pattern: &str) -> Option<String> {
+    preview_path_filter(pattern).prefix
+}
+
+struct PreviewPathFilter {
+    exact: Option<String>,
+    prefix: Option<String>,
+}
+
+fn preview_path_filter(pattern: &str) -> PreviewPathFilter {
+    let Some(tail) = pattern.strip_prefix('/') else {
+        return PreviewPathFilter {
+            exact: None,
+            prefix: None,
+        };
+    };
+    if tail.is_empty() {
+        return PreviewPathFilter {
+            exact: Some("/".to_owned()),
+            prefix: None,
+        };
+    }
+
+    let mut literal_segments = Vec::new();
+    let mut first_dynamic_segment = None;
+    for segment in tail.split('/') {
+        if segment == "*" || segment == "**" || segment.contains('{') || segment.contains('}') {
+            first_dynamic_segment = Some(segment);
+            break;
+        }
+        literal_segments.push(segment);
+    }
+
+    let Some(first_dynamic_segment) = first_dynamic_segment else {
+        return PreviewPathFilter {
+            exact: Some(pattern.to_owned()),
+            prefix: None,
+        };
+    };
+    if literal_segments.is_empty() {
+        return PreviewPathFilter {
+            exact: None,
+            prefix: None,
+        };
+    }
+
+    let literal_prefix = format!("/{}", literal_segments.join("/"));
+    let prefix = if first_dynamic_segment == "**" {
+        literal_prefix
+    } else {
+        format!("{literal_prefix}/")
+    };
+
+    PreviewPathFilter {
+        exact: None,
+        prefix: Some(prefix),
+    }
+}
+
+fn principal_from_audit_actor(actor: &audit::Actor) -> Option<auth::Principal> {
+    let auth_method = match actor.auth_mode.as_str() {
+        rbac::rule::AUTH_METHOD_BEARER_TOKEN => auth::AuthMethod::Bearer,
+        rbac::rule::AUTH_METHOD_SESSION_COOKIE => auth::AuthMethod::Cookie,
+        _ => return None,
+    };
+
+    Some(auth::Principal {
+        user_id: actor.user_id.clone(),
+        email: None,
+        org_id: None,
+        roles: actor.roles.clone().unwrap_or_default(),
+        session_id: "audit-history".to_owned(),
+        auth_method,
+    })
+}
+
+fn preview_sample(observation: audit::query::RequestObservation) -> PolicyRulePreviewSample {
+    let policy_decision = serde_json::from_str::<Value>(&observation.payload_json)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("policy_decision")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+
+    PolicyRulePreviewSample {
+        event_id: observation.event_id,
+        timestamp: observation.timestamp,
+        request_id: observation.request_id,
+        source_ip: observation.source_ip,
+        user_agent: observation.user_agent,
+        method: observation.method,
+        path: observation.path,
+        actor: observation.actor,
+        status: observation.status,
+        policy_decision,
+        matched_rule_id: observation.matched_rule_id,
+    }
 }
 
 fn policy_error_message(error: &rbac::policy::PolicyError) -> String {
@@ -4424,6 +4759,14 @@ mod tests {
         assert_eq!(default_routes.status_route, STATUS_ADMIN_ROUTE);
         assert_eq!(default_routes.policy_route, POLICY_ADMIN_ROUTE);
         assert_eq!(
+            default_routes.policy_rule_preview_route,
+            POLICY_RULE_PREVIEW_ADMIN_ROUTE
+        );
+        assert_eq!(
+            default_routes.policy_rule_hits_route,
+            POLICY_RULE_HITS_ADMIN_ROUTE
+        );
+        assert_eq!(
             default_routes.policy_validate_route,
             POLICY_VALIDATE_ADMIN_ROUTE
         );
@@ -4449,6 +4792,14 @@ mod tests {
         assert_eq!(custom_routes.events_stream_route, "/v1/ops/events/stream");
         assert_eq!(custom_routes.status_route, "/v1/ops/status");
         assert_eq!(custom_routes.policy_route, "/v1/ops/policy");
+        assert_eq!(
+            custom_routes.policy_rule_preview_route,
+            "/v1/ops/policy/rules/preview"
+        );
+        assert_eq!(
+            custom_routes.policy_rule_hits_route,
+            "/v1/ops/policy/rules/hits"
+        );
         assert_eq!(
             custom_routes.policy_validate_route,
             "/v1/ops/policy/validate"
@@ -7566,6 +7917,298 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_rule_preview_returns_matches_samples_and_does_not_mutate_policy() {
+        let db = TempDb::new("rule-preview");
+        create_audit_schema(&db.path);
+        seed_rule_preview_events(&db.path);
+        let initial_policy = policy_document_string("initial-policy", "test:old");
+        let policy = TempPolicyFile::new(&initial_policy);
+        let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = policy_admin_router_with_sqlite(Some(&policy), audit_log, Some(&db.path));
+
+        let get_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete");
+        let before_etag = policy_etag_header(&get_response);
+
+        let preview_body = json!({
+            "rule": {
+                "methods": ["GET"],
+                "path": "/api/items/{id}",
+                "principal": {
+                    "roles": ["reader"],
+                    "auth_methods": ["bearer_token"]
+                },
+                "action": "deny"
+            },
+            "from": "2024-06-01T12:00:00Z",
+            "to": "2024-06-01T12:00:05Z",
+            "sample_limit": 2
+        })
+        .to_string();
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_RULE_PREVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(preview_body),
+                None,
+            ))
+            .await
+            .expect("policy rule preview should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["match_count"], json!(2));
+        assert_eq!(body["scanned_event_count"], json!(3));
+        assert_eq!(body["sample_strategy"], json!("newest_matches"));
+        assert_eq!(body["samples"][0]["event_id"], json!("match-new"));
+        assert_eq!(body["samples"][0]["method"], json!("GET"));
+        assert_eq!(body["samples"][0]["path"], json!("/api/items/4"));
+        assert_eq!(body["samples"][0]["actor"]["user_id"], json!("reader-1"));
+        assert_eq!(body["samples"][0]["policy_decision"], json!("allowed"));
+        assert_eq!(body["samples"][1]["event_id"], json!("match-old"));
+
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy file should read"),
+            before_contents
+        );
+        assert!(!capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == audit::event::POLICY_CHANGED));
+
+        let after_get = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET after preview should complete");
+        assert_eq!(policy_etag_header(&after_get), before_etag);
+        assert_eq!(json_body(after_get).await["id"], json!("initial-policy"));
+    }
+
+    #[tokio::test]
+    async fn policy_rule_preview_zero_matches_returns_empty_samples() {
+        let db = TempDb::new("rule-preview-zero");
+        create_audit_schema(&db.path);
+        seed_rule_preview_events(&db.path);
+        let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+        let router =
+            policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+
+        let response = router
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_RULE_PREVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(
+                    json!({
+                        "rule": {
+                            "methods": ["DELETE"],
+                            "path": "/api/items/{id}",
+                            "action": "deny"
+                        },
+                        "from": "2024-06-01T12:00:00Z",
+                        "to": "2024-06-01T12:00:05Z"
+                    })
+                    .to_string(),
+                ),
+                None,
+            ))
+            .await
+            .expect("policy rule preview should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["match_count"], json!(0));
+        assert_eq!(body["samples"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn policy_rule_preview_requires_audit_sqlite_path() {
+        let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+
+        let response = router
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_RULE_PREVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(
+                    json!({
+                        "rule": {
+                            "methods": ["GET"],
+                            "path": "/api/items/{id}",
+                            "action": "deny"
+                        }
+                    })
+                    .to_string(),
+                ),
+                None,
+            ))
+            .await
+            .expect("policy rule preview should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json_body(response).await,
+            json!({ "error": "policy rule preview requires AUDIT_SQLITE_PATH to be configured" })
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_rule_preview_requires_policy_read_permission() {
+        let db = TempDb::new("rule-preview-forbidden");
+        create_audit_schema(&db.path);
+        let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+        let router =
+            policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+
+        let response = router
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_RULE_PREVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["reader"])),
+                Some(
+                    json!({
+                        "rule": {
+                            "methods": ["GET"],
+                            "path": "/api/items/{id}",
+                            "action": "deny"
+                        }
+                    })
+                    .to_string(),
+                ),
+                None,
+            ))
+            .await
+            .expect("policy rule preview should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn policy_rule_hits_count_real_rbac_observation_events() {
+        let db = TempDb::new("rule-hits-real-middleware");
+        let policy = TempPolicyFile::new(&direct_rule_policy_document());
+        let mut config = policy_admin_config_with_sqlite(Some(&policy), Some(&db.path));
+        config.rbac_exempt_paths.push(POLICY_ADMIN_ROUTE.to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let (audit_log, audit_event_sender) = audit_log_with_sqlite_and_broadcast(&db.path);
+        let router = app(config, recorder.handle(), audit_log, audit_event_sender)
+            .expect("app should build");
+
+        for _ in 0..2 {
+            let response = router
+                .clone()
+                .oneshot(audit_query_request(
+                    "/__test/principal",
+                    Some(test_principal(&["member"])),
+                ))
+                .await
+                .expect("direct allow request should complete");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let denied = router
+            .clone()
+            .oneshot(audit_query_request(
+                "/__test/blocked",
+                Some(test_principal(&["member"])),
+            ))
+            .await
+            .expect("direct deny request should complete");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let body = wait_for_rule_hits(router, |body| {
+            rule_hit(body, "allow-principal-probe") == Some(2)
+                && rule_hit(body, "deny-blocked") == Some(1)
+        })
+        .await;
+
+        assert_eq!(rule_hit(&body, "allow-principal-probe"), Some(2));
+        assert_eq!(rule_hit(&body, "deny-blocked"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn policy_rule_hits_return_zero_counts_when_sqlite_is_unset() {
+        let policy = TempPolicyFile::new(&direct_rule_policy_document());
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+
+        let response = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_RULE_HITS_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy rule hits should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(rule_hit(&body, "allow-principal-probe"), Some(0));
+        assert_eq!(rule_hit(&body, "deny-blocked"), Some(0));
+    }
+
+    #[test]
+    fn policy_rule_preview_moderate_scale_completes_under_two_seconds() {
+        let db = TempDb::new("rule-preview-performance");
+        create_audit_schema(&db.path);
+        let event_count = 50_000;
+        bulk_insert_preview_events(&db.path, event_count);
+        let store = audit::query::AuditQueryStore::open(&db.path).expect("query store should open");
+        let request = PolicyRulePreviewRequest {
+            rule: rbac::Rule {
+                id: None,
+                methods: vec!["GET".to_owned()],
+                path: "/load/{id}".to_owned(),
+                principal: rbac::PrincipalMatcher {
+                    roles: vec!["reader".to_owned()],
+                    auth_methods: vec!["bearer_token".to_owned()],
+                    principal_ids: Vec::new(),
+                },
+                action: rbac::RuleAction::Deny,
+            },
+            from: Some("2026-01-01T00:00:00Z".to_owned()),
+            to: Some("2026-01-02T00:00:00Z".to_owned()),
+            sample_limit: Some(5),
+        };
+
+        let started = Instant::now();
+        let response = preview_rule(&store, request).expect("preview should complete");
+        let elapsed = started.elapsed();
+        println!(
+            "previewed {event_count} synthetic events in {elapsed:?}; scanned={}, matched={}",
+            response.scanned_event_count, response.match_count
+        );
+
+        assert_eq!(response.match_count, 5_000);
+        assert_eq!(response.samples.len(), 5);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "50k-row preview took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn policy_admin_endpoints_return_not_found_when_policy_file_is_unset() {
         let router = policy_admin_router(None, test_audit_log());
 
@@ -7596,6 +8239,7 @@ mod tests {
         assert_eq!(put_response.status(), StatusCode::NOT_FOUND);
 
         let validate_response = router
+            .clone()
             .oneshot(policy_admin_request(
                 Method::POST,
                 POLICY_VALIDATE_ADMIN_ROUTE,
@@ -7606,6 +8250,40 @@ mod tests {
             .await
             .expect("policy validate without policy file should complete");
         assert_eq!(validate_response.status(), StatusCode::NOT_FOUND);
+
+        let preview_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_RULE_PREVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(
+                    json!({
+                        "rule": {
+                            "methods": ["GET"],
+                            "path": "/api/items/{id}",
+                            "action": "deny"
+                        }
+                    })
+                    .to_string(),
+                ),
+                None,
+            ))
+            .await
+            .expect("policy preview without policy file should complete");
+        assert_eq!(preview_response.status(), StatusCode::NOT_FOUND);
+
+        let hits_response = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_RULE_HITS_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy hits without policy file should complete");
+        assert_eq!(hits_response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -8882,9 +9560,13 @@ mod tests {
         request
     }
 
-    fn policy_admin_config(policy: Option<&TempPolicyFile>) -> config::Config {
+    fn policy_admin_config_with_sqlite(
+        policy: Option<&TempPolicyFile>,
+        sqlite_path: Option<&PathBuf>,
+    ) -> config::Config {
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
+        config.audit_sqlite_path = sqlite_path.map(|path| path.to_string_lossy().into_owned());
         if let Some(policy) = policy {
             config.policy_file = Some(policy.path.to_string_lossy().into_owned());
             config.rbac_exempt_paths.push(POLICY_ADMIN_ROUTE.to_owned());
@@ -8894,9 +9576,17 @@ mod tests {
     }
 
     fn policy_admin_router(policy: Option<&TempPolicyFile>, audit_log: audit::AuditLog) -> Router {
+        policy_admin_router_with_sqlite(policy, audit_log, None)
+    }
+
+    fn policy_admin_router_with_sqlite(
+        policy: Option<&TempPolicyFile>,
+        audit_log: audit::AuditLog,
+        sqlite_path: Option<&PathBuf>,
+    ) -> Router {
         let recorder = PrometheusBuilder::new().build_recorder();
         app(
-            policy_admin_config(policy),
+            policy_admin_config_with_sqlite(policy, sqlite_path),
             recorder.handle(),
             audit_log,
             test_audit_event_sender(),
@@ -9087,6 +9777,46 @@ mod tests {
         })
     }
 
+    fn direct_rule_policy_document() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "id": "direct-rule-policy",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "admin": {
+                    "permissions": [
+                        ADMIN_POLICY_READ_PERMISSION,
+                        ADMIN_POLICY_WRITE_PERMISSION
+                    ]
+                },
+                "member": {
+                    "permissions": []
+                }
+            },
+            "routes": [],
+            "rules": [
+                {
+                    "id": "allow-principal-probe",
+                    "methods": ["GET"],
+                    "path": "/__test/principal",
+                    "principal": {
+                        "roles": ["member"],
+                        "auth_methods": ["bearer_token"]
+                    },
+                    "action": "allow"
+                },
+                {
+                    "id": "deny-blocked",
+                    "methods": ["GET"],
+                    "path": "/__test/blocked",
+                    "action": "deny"
+                }
+            ]
+        })
+        .to_string()
+    }
+
     fn captured_policy_change(
         capture: &audit::sink::tests::CaptureSink,
         action: &str,
@@ -9215,6 +9945,43 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    async fn wait_for_rule_hits(router: Router, predicate: impl Fn(&Value) -> bool) -> Value {
+        let started = Instant::now();
+
+        loop {
+            let response = router
+                .clone()
+                .oneshot(policy_admin_request(
+                    Method::GET,
+                    POLICY_RULE_HITS_ADMIN_ROUTE,
+                    Some(test_principal(&["admin"])),
+                    None,
+                    None,
+                ))
+                .await
+                .expect("rule hits request should complete");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            if predicate(&body) {
+                return body;
+            }
+
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "rule hits did not reach expected counts"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn rule_hit(body: &Value, rule_id: &str) -> Option<u64> {
+        body["rules"]
+            .as_array()?
+            .iter()
+            .find(|rule| rule["rule_id"] == json!(rule_id))
+            .and_then(|rule| rule["hits"].as_u64())
     }
 
     fn event_ids_from_body(body: &Value) -> Vec<String> {
@@ -9688,6 +10455,79 @@ O2gecI9QwDJNpm29J9wJB2F8
         );
     }
 
+    fn seed_rule_preview_events(path: &PathBuf) {
+        for event in [
+            SeedObservationEvent {
+                event_id: "outside-window",
+                timestamp: "2024-06-01T11:59:59Z",
+                actor_user_id: "reader-1",
+                roles: &["reader"],
+                method: "GET",
+                request_path: "/api/items/0",
+                status: 200,
+                policy_decision: "allowed",
+                matched_rule_id: Some("existing-rule"),
+            },
+            SeedObservationEvent {
+                event_id: "match-old",
+                timestamp: "2024-06-01T12:00:01Z",
+                actor_user_id: "reader-1",
+                roles: &["reader"],
+                method: "GET",
+                request_path: "/api/items/1",
+                status: 200,
+                policy_decision: "allowed",
+                matched_rule_id: Some("existing-rule"),
+            },
+            SeedObservationEvent {
+                event_id: "wrong-method",
+                timestamp: "2024-06-01T12:00:02Z",
+                actor_user_id: "reader-1",
+                roles: &["reader"],
+                method: "POST",
+                request_path: "/api/items/2",
+                status: 201,
+                policy_decision: "allowed",
+                matched_rule_id: None,
+            },
+            SeedObservationEvent {
+                event_id: "wrong-role",
+                timestamp: "2024-06-01T12:00:03Z",
+                actor_user_id: "admin-1",
+                roles: &["admin"],
+                method: "GET",
+                request_path: "/api/items/3",
+                status: 200,
+                policy_decision: "allowed",
+                matched_rule_id: Some("existing-rule"),
+            },
+            SeedObservationEvent {
+                event_id: "match-new",
+                timestamp: "2024-06-01T12:00:04Z",
+                actor_user_id: "reader-1",
+                roles: &["reader"],
+                method: "GET",
+                request_path: "/api/items/4",
+                status: 200,
+                policy_decision: "allowed",
+                matched_rule_id: Some("existing-rule"),
+            },
+            SeedObservationEvent {
+                event_id: "wrong-path",
+                timestamp: "2024-06-01T12:00:05Z",
+                actor_user_id: "reader-1",
+                roles: &["reader"],
+                method: "GET",
+                request_path: "/api/other",
+                status: 404,
+                policy_decision: "denied",
+                matched_rule_id: Some("existing-rule"),
+            },
+        ] {
+            insert_observation_event(path, event);
+        }
+    }
+
     struct SeedAuditEvent<'a> {
         event_id: &'a str,
         event_type: &'a str,
@@ -9695,6 +10535,18 @@ O2gecI9QwDJNpm29J9wJB2F8
         actor_user_id: &'a str,
         path: &'a str,
         status: i64,
+    }
+
+    struct SeedObservationEvent<'a> {
+        event_id: &'a str,
+        timestamp: &'a str,
+        actor_user_id: &'a str,
+        roles: &'a [&'a str],
+        method: &'a str,
+        request_path: &'a str,
+        status: i64,
+        policy_decision: &'a str,
+        matched_rule_id: Option<&'a str>,
     }
 
     fn insert_audit_event(path: &PathBuf, event: SeedAuditEvent<'_>) {
@@ -9740,6 +10592,155 @@ O2gecI9QwDJNpm29J9wJB2F8
                 ],
             )
             .expect("event should insert");
+    }
+
+    fn insert_observation_event(path: &PathBuf, event: SeedObservationEvent<'_>) {
+        let connection = Connection::open(path).expect("test database should open");
+        let roles = event
+            .roles
+            .iter()
+            .map(|role| json!(role))
+            .collect::<Vec<_>>();
+        let actor_json = json!({
+            "user_id": event.actor_user_id,
+            "roles": roles,
+            "auth_mode": "bearer_token"
+        })
+        .to_string();
+        let mut payload = json!({
+            "method": event.method,
+            "path": event.request_path,
+            "status": event.status,
+            "policy_decision": event.policy_decision,
+            "policy_reason": "matched_rule"
+        });
+        if let Some(matched_rule_id) = event.matched_rule_id {
+            payload["matched_rule_id"] = json!(matched_rule_id);
+        }
+        let payload_json = payload.to_string();
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO audit_events (
+                    event_id,
+                    event_type,
+                    timestamp,
+                    schema_version,
+                    request_id,
+                    source_ip,
+                    actor_user_id,
+                    actor_json,
+                    payload_method,
+                    payload_path,
+                    payload_status,
+                    payload_matched_rule_id,
+                    payload_json
+                ) VALUES (?1, 'http.request_observed', ?2, '0.1.0', ?3, '203.0.113.10', ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "#,
+                params![
+                    event.event_id,
+                    event.timestamp,
+                    format!("request-{}", event.event_id),
+                    event.actor_user_id,
+                    actor_json,
+                    event.method,
+                    event.request_path,
+                    event.status,
+                    event.matched_rule_id,
+                    payload_json,
+                ],
+            )
+            .expect("observation event should insert");
+    }
+
+    fn bulk_insert_preview_events(path: &PathBuf, event_count: usize) {
+        let mut connection = Connection::open(path).expect("test database should open");
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA synchronous=OFF;
+                PRAGMA temp_store=MEMORY;
+                "#,
+            )
+            .expect("bulk insert pragmas should apply");
+
+        let chunk_size = 5_000;
+        for chunk_start in (0..event_count).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(event_count);
+            let transaction = connection
+                .transaction()
+                .expect("bulk insert transaction should start");
+
+            {
+                let mut statement = transaction
+                    .prepare_cached(
+                        r#"
+                        INSERT INTO audit_events (
+                            event_id,
+                            event_type,
+                            timestamp,
+                            schema_version,
+                            request_id,
+                            source_ip,
+                            actor_user_id,
+                            actor_json,
+                            payload_method,
+                            payload_path,
+                            payload_status,
+                            payload_matched_rule_id,
+                            payload_json
+                        ) VALUES (?1, 'http.request_observed', ?2, '0.1.0', ?3, '203.0.113.10', 'reader-1', ?4, ?5, ?6, 200, ?7, ?8)
+                        "#,
+                    )
+                    .expect("bulk insert statement should prepare");
+
+                for index in chunk_start..chunk_end {
+                    let method = if index % 2 == 0 { "GET" } else { "POST" };
+                    let request_path = if index % 10 == 0 {
+                        format!("/load/{index}")
+                    } else {
+                        format!("/other/{index}")
+                    };
+                    let matched_rule_id = (index % 10 == 0).then_some("existing-load-rule");
+                    let actor_json =
+                        r#"{"user_id":"reader-1","roles":["reader"],"auth_mode":"bearer_token"}"#;
+                    let payload_json = json!({
+                        "method": method,
+                        "path": &request_path,
+                        "status": 200,
+                        "policy_decision": "allowed",
+                        "matched_rule_id": matched_rule_id
+                    })
+                    .to_string();
+
+                    statement
+                        .execute(params![
+                            format!("preview-event-{index:05}"),
+                            preview_timestamp(index),
+                            format!("preview-request-{index:05}"),
+                            actor_json,
+                            method,
+                            request_path,
+                            matched_rule_id,
+                            payload_json,
+                        ])
+                        .expect("bulk preview event should insert");
+                }
+            }
+
+            transaction
+                .commit()
+                .expect("bulk insert transaction should commit");
+        }
+    }
+
+    fn preview_timestamp(index: usize) -> String {
+        let second = index % 60;
+        let minute = (index / 60) % 60;
+        let hour = (index / 3_600) % 24;
+
+        format!("2026-01-01T{hour:02}:{minute:02}:{second:02}Z")
     }
 
     struct TempDb {

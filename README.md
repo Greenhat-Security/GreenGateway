@@ -49,28 +49,30 @@ It is designed to sit between clients and existing HTTP backends or MCP servers,
 
 **GreenGateway is pre-alpha and under active initial development.** It is not production ready yet.
 
-Development follows a 7-phase roadmap. **Phases 1 and 2 are complete, and Phase 3 (core gateway) is underway** — a real security middleware stack, authentication, a hot-reloadable RBAC engine (including shadow-enforcement and observe-only auth modes), an egress firewall, a full audit/observability pipeline, and a working streaming reverse proxy to a configured upstream all exist and run today (see [What's Real Today](#whats-real-today)). **The rest of Phase 3, and all of Phases 4 through 7, are still roadmap and vision**, not shipped functionality — most notably multi-upstream routing, a policy CRUD API, traffic discovery, native MCP protocol support, and the visual firewall rule builder do not exist yet.
+Development follows a 7-phase roadmap. **Phases 1 through 3 are complete, and Phase 4 (traffic discovery) is underway** — a real security middleware stack, authentication, a hot-reloadable RBAC engine (including shadow-enforcement, observe-only auth modes, and data-driven direct firewall rules), an egress firewall with policy-driven overrides, a full audit/observability pipeline, a streaming reverse proxy with multi-upstream routing and per-upstream settings, and a complete policy administration API (read/replace/validate, granular rule operations, and rule preview against historical traffic) all exist and run today (see [What's Real Today](#whats-real-today)). **The rest of Phase 4, and all of Phases 5 through 7, are still largely roadmap and vision**, not shipped functionality — endpoint path templating and a per-endpoint stats aggregator exist, but the traffic inventory API, discovery UI, schema awareness, anomaly signals, native MCP protocol support, and the visual firewall rule builder do not exist yet.
 
 Progress is tracked in the pinned roadmap issue: [Roadmap / project plan (#44)](https://github.com/Greenhat-Security/GreenGateway/issues/44).
 
 ## What's Real Today
 
-This is what's actually built, working, and covered by CI as of Phases 1-2 and the shipped part of Phase 3:
+This is what's actually built, working, and covered by CI as of Phases 1-3 and the shipped part of Phase 4:
 
 | Area | What's implemented |
 | --- | --- |
-| **Gateway server** | Rust/axum binary exposing `GET /health`, `GET /version`, `GET /metrics` (Prometheus) |
-| **Security middleware** | Request-ID + tracing, config-driven CORS, security-header hardening, token-bucket rate limiting, body-size/content-type validation, double-submit CSRF — in an asserted, fixed order |
+| **Gateway server** | Rust/axum binary exposing `GET /health`, `GET /version`, `GET /metrics` (Prometheus), with an optional second listener (`ADMIN_LISTEN_ADDR`) to keep the control plane off the data path |
+| **Security middleware** | Request-ID + tracing, config-driven CORS, security-header hardening, token-bucket rate limiting (global lanes plus policy-driven per-principal/per-endpoint overrides), body-size/content-type validation, double-submit CSRF — in an asserted, fixed order |
 | **Authentication** | A `Principal` model with pluggable session validators, plus a JWKS-backed JWT validator (RS256, configurable roles claim, issuer/audience enforcement); fails closed by default, with an `AUTH_MODE=observe` option to authenticate without blocking while rolling out credentials |
-| **Authorization** | A deny-by-default RBAC policy engine with config-driven route-to-permission rules, segment-aware path matching, an `enforcement_mode: shadow` per-rule override that logs would-be denials without blocking, and hot reload (file-watch + `SIGHUP`) with validate-before-swap so an invalid edit never takes down the last-known-good policy |
-| **Reverse proxy** | A catch-all proxy to a configured `UPSTREAM_URL` — all HTTP verbs, streamed responses and binary bodies, hop-by-hop header stripping, request-id propagation, a 502/504 error taxonomy, and upstream latency recorded on every observation event. Gateway-owned routes (health/version/metrics, the admin UI and its API) always take precedence over the proxy, and the admin surface's own path is remappable via `ADMIN_PREFIX` |
-| **Egress firewall** | An SSRF-hardened outbound HTTP client: host allowlisting, private/special-use IP blocking (including IPv4-mapped-IPv6/NAT64), pinned-IP resolution |
+| **Authorization** | A deny-by-default RBAC policy engine with config-driven route-to-permission rules, data-driven direct firewall rules (fuzz-tested, anchored glob/`{param}` path matching, first-match-wins) with an `action: shadow` per-rule override that logs would-be denials without blocking, and hot reload (file-watch + `SIGHUP`) with validate-before-swap so an invalid edit never takes down the last-known-good policy |
+| **Reverse proxy** | A multi-upstream routing table (longest-prefix and host-based selection, per-upstream timeouts, request header add/strip rules, and custom TLS trust bundles), or a single catch-all `UPSTREAM_URL` for simple deployments — all HTTP verbs, streamed responses and binary bodies, hop-by-hop header stripping, request-id propagation, a 502/504 error taxonomy, per-upstream health reporting, and upstream latency recorded on every observation event. Gateway-owned routes (health/version/metrics, the admin UI and its API) always take precedence over the proxy, and the admin surface's own path is remappable via `ADMIN_PREFIX` |
+| **Egress firewall** | An SSRF-hardened outbound HTTP client: host allowlisting (including policy-driven wildcard host globs and CIDR-scoped private-IP exceptions), private/special-use IP blocking (including IPv4-mapped-IPv6/NAT64), pinned-IP resolution with a fresh, per-request DNS resolve to close rebinding windows |
 | **Audit pipeline** | A versioned audit-event envelope with SHA-256 redaction, delivered asynchronously off the request hot path |
 | **Queryable audit store** | A SQLite audit sink (batched writes, retention pruning) with an admin API — `GET /v1/admin/audit` — supporting time-range, event-type, actor, path, and status filters with keyset pagination |
 | **Live event feed** | Server-Sent Events at `GET /v1/admin/events/stream`, backed by an in-process broadcast sink with backpressure handling |
+| **Policy administration** | A complete policy CRUD API: whole-policy read/replace/validate (ETag-guarded against concurrent edits), granular per-rule create/update/delete/reorder operations with an audit trail, and rule preview — evaluate a candidate rule against historical traffic before committing it, plus per-rule historical hit counts — all through protected, permission-gated `/v1/admin/policy*` APIs |
+| **Endpoint discovery** | Path templating that normalizes concrete request paths into stable endpoint shapes (`/users/123` → `/users/{id}`) with cardinality-explosion guards, and a background aggregator that rolls per-endpoint call counts, status distribution, latency percentiles, and distinct-principal counts into a queryable SQLite store — entirely off the request hot path |
 | **Traffic endpoint inventory** | Optional SQLite discovery aggregation (`DISCOVERY_SQLITE_PATH`) with admin APIs for listing endpoint templates and viewing per-endpoint principals, time-series counts, and recent raw events |
 | **Admin UI** | An embedded Vite + React + TypeScript app, built into the binary and served at `/admin` (or `ADMIN_PREFIX`): a log explorer, a live tail, and a status page reporting real running-config values |
-| **Local dev harness** | Checked-in JWKS/RBAC fixtures, a `docker-compose.dev.yml` profile that brings up a fully authenticated gateway in one command, and a traffic-generator/CI smoke test |
+| **Local dev harness** | Checked-in JWKS/RBAC fixtures, a `docker-compose.dev.yml` profile that brings up a fully authenticated gateway with a sample echo upstream in one command, and a traffic-generator/CI smoke test |
 
 None of this requires a real backend to try — the dev harness in [Quick Start](#quick-start) is self-contained.
 
@@ -80,8 +82,7 @@ Everything below is roadmap and vision beyond what's listed in [What's Real Toda
 
 | Phase | Capability | Status |
 | --- | --- | --- |
-| 3 | **Universal HTTP reverse proxy** — place GG in front of any HTTP backend, starting default-allow for discovery, then tightening through policy over time | In progress — the catch-all proxy, reserved-prefix protection, and policy modes (default-allow/shadow/observe) are done; multi-upstream routing, rules-as-data, a policy CRUD API, and upstream health checks are still pending |
-| 4 | **Traffic discovery** — automatic endpoint inventory, schema conformance checks against observed traffic, anomaly signals | In progress — endpoint aggregation and the traffic inventory admin API are done; schema conformance and anomaly signals remain ahead |
+| 4 | **Traffic discovery** — automatic endpoint inventory, schema conformance checks against observed traffic, anomaly signals | In progress — endpoint-shape path templating, a background per-endpoint stats aggregator, and the traffic inventory admin API (list/detail endpoints with per-principal breakdowns, time-series counts, and recent events) are done; the discovery UI, schema conformance checks, and anomaly signals remain |
 | 5 | **Visual firewall-style rule builder** — inspect discovered traffic, create rules in one click, review policy in shadow mode, roll back through versioned policy history | Not started |
 | 6 | **Native MCP support** — speak the real MCP protocol instead of a bespoke REST facade, with a dynamic tool registry, JSON Schema validation, and OpenAPI-to-tools generation | Not started |
 | 7 | **Identity directory & broader IdP integration** — pluggable OIDC/cookie-session identity providers beyond the current JWT/JWKS validator, plus a Layer-7-firewall-style directory of every user and bot that has traversed the gateway | Not started |
@@ -104,11 +105,11 @@ GreenGateway
 your backend API or MCP server
 ```
 
-The HTTP half of the proxy layer above is real today — a catch-all proxy forwards to a configured `UPSTREAM_URL`. Rules-as-data (policy-driven routing/rule matching) and the MCP-protocol half are still ahead, targeted for the rest of Phase 3 and Phase 6 respectively — see [What's Real Today](#whats-real-today) for exactly what's implemented now.
+The HTTP half of the proxy layer above is real today — multi-upstream routing (or a single catch-all `UPSTREAM_URL`) forwards traffic, and rules-as-data (policy-driven RBAC and direct firewall rules, evaluated and hot-reloadable through a full CRUD API) governs what's allowed. The MCP-protocol half is still ahead, targeted for Phase 6 — see [What's Real Today](#whats-real-today) for exactly what's implemented now.
 
 ## Quick Start
 
-GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI shell at `/admin`, a working reverse proxy once `UPSTREAM_URL` is configured, and optional traffic endpoint inventory when `DISCOVERY_SQLITE_PATH` is set (see [What's Real Today](#whats-real-today)). The remaining traffic-discovery work and rule-builder capabilities described in [Planned Scope](#planned-scope) are still pre-alpha roadmap work.
+GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI shell at `/admin`, a working reverse proxy — either a single catch-all `UPSTREAM_URL` or a full multi-upstream routing table — and optional traffic endpoint inventory when `DISCOVERY_SQLITE_PATH` is set (see [What's Real Today](#whats-real-today)). The remaining discovery UI and rule-builder capabilities described in [Planned Scope](#planned-scope) are still pre-alpha roadmap work.
 
 For the full list of environment variables, see [docs/configuration.md](docs/configuration.md). As more variables land, that document and [.env.example](.env.example) are kept in sync with the code by an automated test.
 
