@@ -4,6 +4,7 @@ import { adminApiUrl } from './config';
 
 export type PolicyDefaultAction = 'allow' | 'deny';
 export type PolicyRuleAction = 'allow' | 'deny' | 'shadow';
+export type AuthMethodName = 'bearer_token' | 'session_cookie';
 
 export type PrincipalMatcher = {
   roles?: string[];
@@ -49,6 +50,38 @@ export type PolicyRulePatch = {
   action?: PolicyRuleAction;
 };
 
+export type PolicyRulePreviewSample = {
+  event_id: string;
+  timestamp: string;
+  request_id: string;
+  source_ip: string;
+  user_agent?: string;
+  method: string;
+  path: string;
+  actor: {
+    user_id?: string;
+    auth_mode?: string;
+    roles?: string[];
+  } | null;
+  status: number | null;
+  policy_decision?: string;
+  matched_rule_id?: string;
+};
+
+export type PolicyRulePreviewRequest = {
+  rule: PolicyRule;
+  from?: string;
+  to?: string;
+  sample_limit?: number;
+};
+
+export type PolicyRulePreviewResponse = {
+  match_count: number;
+  scanned_event_count: number;
+  sample_strategy: string;
+  samples: PolicyRulePreviewSample[];
+};
+
 type PolicyRuleHitsResponse =
   | {
       rules: Array<{
@@ -71,6 +104,37 @@ export async function fetchPolicy(): Promise<PolicyReadResult> {
     policy: normalizePolicy(response.value),
     etag: response.etag,
   };
+}
+
+export async function previewPolicyRule(
+  request: PolicyRulePreviewRequest,
+  signal?: AbortSignal,
+): Promise<PolicyRulePreviewResponse> {
+  return adminFetchJson<PolicyRulePreviewResponse>(
+    adminApiUrl('/policy/rules/preview'),
+    {
+      method: 'POST',
+      signal,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(request),
+    },
+  );
+}
+
+export async function createPolicyRule(
+  rule: PolicyRule,
+  etag: string,
+): Promise<PolicyMutationResult<PolicyRule>> {
+  return adminFetchJsonWithEtag<PolicyRule>(adminApiUrl('/policy/rules'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'If-Match': etag,
+    },
+    body: JSON.stringify(rule),
+  });
 }
 
 export async function patchPolicyRule(

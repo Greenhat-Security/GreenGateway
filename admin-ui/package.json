@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "screenshots": "playwright test --config=playwright.config.ts",
+    "screenshots": "playwright test",
     "test": "vitest --run",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview"

@@ -14,10 +14,24 @@ export type AdminFetchOptions = Omit<RequestInit, 'headers'> & {
   headers?: Record<string, string>;
 };
 
+export type AdminJsonResponse<T> = {
+  body: T;
+  headers: Headers;
+  status: number;
+};
+
 export async function adminFetchJson<T>(
   input: string,
   options: AdminFetchOptions = {},
 ): Promise<T> {
+  const response = await adminFetchJsonResponse<T>(input, options);
+  return response.body;
+}
+
+export async function adminFetchJsonResponse<T>(
+  input: string,
+  options: AdminFetchOptions = {},
+): Promise<AdminJsonResponse<T>> {
   const headers = {
     Accept: 'application/json',
     ...authHeaders(),
@@ -30,7 +44,11 @@ export async function adminFetchJson<T>(
     throw new AdminApiError(response.status, errorMessage(body, response));
   }
 
-  return body as T;
+  return {
+    body: body as T,
+    headers: response.headers,
+    status: response.status,
+  };
 }
 
 async function parseJsonBody(response: Response): Promise<unknown> {
