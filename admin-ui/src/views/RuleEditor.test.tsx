@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -112,6 +112,55 @@ describe('RuleEditor', () => {
       ),
     ).toBeTruthy();
     expect(screen.getByText('/api/users/123')).toBeTruthy();
+  });
+
+  it('keeps the newest preview when an older preview resolves last', async () => {
+    const previewCalls: Deferred<Response>[] = [];
+    const fetchMock = policyBackedFetch(policyFixture(), 'W/"policy-1"', {
+      previewResponse: () => {
+        const deferred = createDeferred<Response>();
+        previewCalls.push(deferred);
+        return deferred.promise;
+      },
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderRuleEditor();
+
+    await screen.findByLabelText('Path pattern');
+    vi.useFakeTimers();
+
+    fireEvent.change(screen.getByLabelText('Path pattern'), {
+      target: { value: '/api/slow/{id}' },
+    });
+    await vi.advanceTimersByTimeAsync(RULE_PREVIEW_DEBOUNCE_MS);
+    expect(previewCalls).toHaveLength(1);
+
+    fireEvent.change(screen.getByLabelText('Path pattern'), {
+      target: { value: '/api/fast/{id}' },
+    });
+    await vi.advanceTimersByTimeAsync(RULE_PREVIEW_DEBOUNCE_MS);
+    expect(previewCalls).toHaveLength(2);
+    vi.useRealTimers();
+
+    await act(async () => {
+      previewCalls[1].resolve(
+        jsonResponse(200, previewResponseFixture(8, '/api/fast/123')),
+      );
+    });
+    expect(await screen.findByText('/api/fast/123')).toBeTruthy();
+    expect(screen.getByText('8')).toBeTruthy();
+
+    await act(async () => {
+      previewCalls[0].resolve(
+        jsonResponse(200, previewResponseFixture(1, '/api/slow/123')),
+      );
+    });
+
+    expect(screen.getByText('/api/fast/123')).toBeTruthy();
+    expect(screen.getByText('8')).toBeTruthy();
+    expect(screen.queryByText('/api/slow/123')).toBeNull();
+    expect(screen.queryByText('1')).toBeNull();
   });
 
   it('creates a rule with the current policy ETag', async () => {
@@ -294,6 +343,10 @@ function renderRuleEditor(initialEntry = '/policy/rules/editor') {
 
 type PolicyBackedFetchOptions = {
   preview?: unknown;
+  previewResponse?: (
+    input: RequestInfo | URL,
+    init: RequestInit | undefined,
+  ) => Promise<Response>;
   previewStatus?: number;
   previewBody?: unknown;
   createRule?: Rule;
@@ -350,6 +403,9 @@ function policyBackedFetch(
       url.pathname === '/v1/admin/policy/rules/preview' &&
       method === 'POST'
     ) {
+      if (options.previewResponse) {
+        return options.previewResponse(input, init);
+      }
       return Promise.resolve(
         jsonResponse(
           options.previewStatus ?? 200,
@@ -417,6 +473,41 @@ function previewRequests(fetchMock: ReturnType<typeof vi.fn>) {
     ([input, init]) =>
       String(input).endsWith('/policy/rules/preview') && init?.method === 'POST',
   );
+}
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+};
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve: Deferred<T>['resolve'] | undefined;
+  let reject: Deferred<T>['reject'] | undefined;
+  const promise = new Promise<T>((innerResolve, innerReject) => {
+    resolve = innerResolve;
+    reject = innerReject;
+  });
+
+  if (!resolve || !reject) {
+    throw new Error('Failed to create deferred promise');
+  }
+
+  return { promise, resolve, reject };
+}
+
+function previewResponseFixture(matchCount: number, path: string) {
+  return {
+    match_count: matchCount,
+    scanned_event_count: 25,
+    sample_strategy: 'newest_matches',
+    samples: [
+      previewSample({
+        event_id: `evt-${matchCount}`,
+        path,
+      }),
+    ],
+  };
 }
 
 function policyFixture(overrides: Partial<Policy> = {}): Policy {

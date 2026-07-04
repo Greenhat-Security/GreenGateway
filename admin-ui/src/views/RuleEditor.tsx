@@ -208,6 +208,7 @@ export function RuleEditor() {
   const pathError = validatePathPattern(form.path);
 
   useEffect(() => {
+    let isCurrent = true;
     const normalizedPath = form.path.trim();
     if (normalizedPath.length === 0) {
       setPreviewState({
@@ -246,9 +247,15 @@ export function RuleEditor() {
           },
           signal,
         );
+        if (!isCurrent) {
+          return;
+        }
         setPreviewState({ kind: 'ready', response });
       } catch (error) {
         if (signal.aborted || isAbortError(error)) {
+          return;
+        }
+        if (!isCurrent) {
           return;
         }
         setPreviewState(toPreviewError(error));
@@ -256,6 +263,7 @@ export function RuleEditor() {
     }
 
     return () => {
+      isCurrent = false;
       window.clearTimeout(timer);
       controller.abort();
     };
