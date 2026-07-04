@@ -17,6 +17,8 @@ const ADMIN_ROUTES = [
   "/v1/admin/status",
   "/v1/admin/events/stream",
 ];
+const PROXY_ECHO_PREFIX = "/__dev-echo";
+const PROXY_ECHO_HEADER = "x-greengateway-proxy-smoke";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -147,6 +149,14 @@ function bearer(token) {
 
 function requestId(runId, round, label, index = 0) {
   return `${runId}-r${round}-${label}-${index}`;
+}
+
+function proxyEchoPath(round, marker) {
+  const query = new URLSearchParams({
+    marker,
+    source: "traffic-generator",
+  });
+  return `${PROXY_ECHO_PREFIX}/smoke/${round}?${query.toString()}`;
 }
 
 async function sendRequest({
@@ -453,6 +463,36 @@ async function generateTrafficRound({
     }).then(record);
   }
 
+  console.log("Proxied upstream calls");
+  const proxyMarker = requestId(runId, round, "proxy-echo");
+  const proxyPayload = {
+    marker: proxyMarker,
+    round,
+    runId,
+  };
+  const proxyPath = proxyEchoPath(round, proxyMarker);
+  const proxyResult = await sendRequest({
+    baseUrl,
+    method: "POST",
+    path: proxyPath,
+    headers: {
+      ...bearer(tokens.admin),
+      "content-type": "application/json",
+      [PROXY_ECHO_HEADER]: proxyMarker,
+    },
+    body: JSON.stringify(proxyPayload),
+    requestId: requestId(runId, round, "proxy-echo"),
+    label: "proxy-echo",
+    expected: 200,
+    smokeTest,
+  });
+  proxyResult.proxyEchoChecks = proxyEchoChecks(proxyResult, {
+    method: "POST",
+    path: `${PROXY_ECHO_PREFIX}/smoke/${round}`,
+    marker: proxyMarker,
+  });
+  record(proxyResult);
+
   console.log("Malformed body validation rejection");
   await sendRequest({
     baseUrl,
@@ -505,6 +545,49 @@ function rateLimitCooldownMs(rateLimit) {
     10000,
     Math.ceil((rateLimit.readBurst / rateLimit.readRps) * 1000) + 750,
   );
+}
+
+function proxyEchoChecks(result, expected) {
+  const body = result.body && typeof result.body === "object" ? result.body : null;
+  const headers = body?.headers && typeof body.headers === "object" ? body.headers : {};
+  const query = new URLSearchParams(typeof body?.query === "string" ? body.query : "");
+  const echoedPayload =
+    typeof body?.body === "string" ? parseJsonOrNull(body.body) : null;
+
+  return [
+    {
+      label: "method reached upstream",
+      passed: body?.method === expected.method,
+      detail: `got ${body?.method || "missing"}`,
+      failure: `proxy echo upstream saw method ${body?.method || "missing"}, expected ${expected.method}`,
+    },
+    {
+      label: "path and query reached upstream",
+      passed: body?.path === expected.path && query.get("marker") === expected.marker,
+      detail: `got ${body?.path || "missing"} marker ${query.get("marker") || "missing"}`,
+      failure: `proxy echo upstream saw path ${body?.path || "missing"} marker ${query.get("marker") || "missing"}`,
+    },
+    {
+      label: "custom header reached upstream",
+      passed: headers[PROXY_ECHO_HEADER] === expected.marker,
+      detail: `got ${headers[PROXY_ECHO_HEADER] || "missing"}`,
+      failure: `proxy echo upstream did not receive ${PROXY_ECHO_HEADER}`,
+    },
+    {
+      label: "body marker reached upstream",
+      passed: echoedPayload?.marker === expected.marker,
+      detail: `got ${echoedPayload?.marker || "missing"}`,
+      failure: "proxy echo upstream did not receive the JSON body marker",
+    },
+  ];
+}
+
+function parseJsonOrNull(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
 }
 
 async function fetchAuditEvents({ baseUrl, token, runId, fromTimestamp }) {
@@ -591,6 +674,16 @@ async function runSmokeAssertions({
     );
   }
 
+  const proxyEchoChecks = results.flatMap((result) => result.proxyEchoChecks || []);
+  if (proxyEchoChecks.length === 0) {
+    failures.push("proxy echo traffic did not run");
+  }
+  for (const check of proxyEchoChecks) {
+    if (!check.passed) {
+      failures.push(check.failure);
+    }
+  }
+
   if (!results.some((result) => result.label === "rate-limit-burst" && result.status === 429)) {
     failures.push("rate-limit burst did not produce a 429 response");
   }
@@ -619,6 +712,14 @@ async function runSmokeAssertions({
     statusFailures.length === 0,
     `${statusFailures.length} mismatch(es)`,
   );
+  printAssertion(
+    "proxy echo traffic ran",
+    proxyEchoChecks.length > 0,
+    `checks ${proxyEchoChecks.length}`,
+  );
+  for (const check of proxyEchoChecks) {
+    printAssertion(`proxy echo ${check.label}`, check.passed, check.detail);
+  }
   for (const status of [200, 401, 403, 415, 429]) {
     printAssertion(
       `http.request_observed status ${status}`,

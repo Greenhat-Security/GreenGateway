@@ -25,6 +25,11 @@
       "methods": ["GET"],
       "path_prefix": "/v1/admin/status",
       "permission": "admin:status:read"
+    },
+    {
+      "methods": ["POST"],
+      "path_prefix": "/__dev-echo",
+      "permission": "dev:proxy:echo"
     }
   ]
 }

@@ -181,7 +181,13 @@ For a seeded local development stack with JWT auth, RBAC, a JWKS sidecar, the em
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
-This dev stack serves the checked-in local JWKS fixture from `dev/jwks/`, loads `dev/policy.json`, and writes queryable audit events to an ephemeral SQLite database inside the gateway container. The admin UI shell remains available without a token at `http://localhost:8080/admin`; protected admin APIs require a dev JWT signed with `dev/jwks/dev-signing-key.pem`.
+This dev stack serves the checked-in local JWKS fixture from `dev/jwks/`, starts an internal-only echo upstream behind the gateway, loads `dev/policy.json`, and writes queryable audit events to an ephemeral SQLite database inside the gateway container. The admin UI shell remains available without a token at `http://localhost:8080/admin`; protected admin APIs and the seeded `/__dev-echo` proxy path require a dev JWT signed with `dev/jwks/dev-signing-key.pem`.
+
+To exercise the authenticated dev stack, including an end-to-end proxy request to the echo upstream, run:
+
+```sh
+node scripts/generate-traffic.mjs --smoke-test
+```
 
 ## Configuration
 
