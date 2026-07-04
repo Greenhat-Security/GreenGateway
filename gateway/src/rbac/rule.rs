@@ -72,11 +72,16 @@ impl PrincipalMatcher {
 /// Direct firewall rule model.
 ///
 /// Rules are stored in policy order and are intended to be evaluated with
-/// first-match-wins semantics. This PR only defines the policy data shape; live
-/// request-path integration lands in a later PR.
+/// first-match-wins semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
+    /// Optional stable identifier for audit/observation attribution and future
+    /// rule-management APIs. When omitted, live evaluation falls back to the
+    /// rule's array index.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// HTTP methods this rule matches. Empty or ["*"] matches any method.
     #[serde(default)]
     pub methods: Vec<String>,
@@ -172,6 +177,7 @@ mod tests {
     #[test]
     fn rule_matcher_supports_method_wildcards() {
         let rule = Rule {
+            id: None,
             methods: vec!["GET".to_owned(), "HEAD".to_owned()],
             path: "/data".to_owned(),
             principal: PrincipalMatcher::default(),
@@ -183,6 +189,7 @@ mod tests {
         assert!(!rule.matches("POST", "/data", None));
 
         let wildcard_rule = Rule {
+            id: None,
             methods: vec!["*".to_owned()],
             path: "/data".to_owned(),
             principal: PrincipalMatcher::default(),
@@ -195,18 +202,21 @@ mod tests {
     #[test]
     fn rule_matcher_supports_literals_globs_and_params() {
         let user_item = Rule {
+            id: None,
             methods: Vec::new(),
             path: "/api/users/{id}".to_owned(),
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
         let one_asset_segment = Rule {
+            id: None,
             methods: Vec::new(),
             path: "/assets/*".to_owned(),
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
         let any_admin_depth = Rule {
+            id: None,
             methods: Vec::new(),
             path: "/admin/**".to_owned(),
             principal: PrincipalMatcher::default(),
@@ -224,6 +234,7 @@ mod tests {
     #[test]
     fn rule_matcher_is_anchored_to_whole_path() {
         let rule = Rule {
+            id: None,
             methods: Vec::new(),
             path: "/api/users/{id}".to_owned(),
             principal: PrincipalMatcher::default(),

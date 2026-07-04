@@ -144,6 +144,10 @@
         "action"
       ],
       "properties": {
+        "id": {
+          "type": "string",
+          "description": "Optional stable identifier for audit and observation attribution. When omitted, live evaluation reports the rule's array index."
+        },
         "methods": {
           "type": "array",
           "description": "HTTP methods this rule matches. Empty or [\"*\"] means any method.",
