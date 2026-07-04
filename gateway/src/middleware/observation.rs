@@ -1410,7 +1410,12 @@ paths:
             ],
         );
         let store = Arc::new(DiscoveryQueryStore::open(&db.path).expect("query store should open"));
-        let ttl = Duration::from_millis(50);
+        // A generous TTL keeps this test reliable under parallel workspace test
+        // execution: the DB churn between the "still cached" and "refreshed"
+        // checks below (deleting and reseeding samples) can itself take tens of
+        // milliseconds under CPU contention, so a tight TTL risks the window
+        // expiring before the "still cached" assertion runs.
+        let ttl = Duration::from_millis(300);
         let conformance = SchemaConformanceState::new_for_test_with_cache_ttl(
             SchemaCoverage::default(),
             Some(Arc::clone(&store)),
@@ -1452,7 +1457,7 @@ paths:
         assert!(!cached.schema_mismatch(Some(&display_name_shape)));
         assert_eq!(store.query_counts_for_test(), (1, 1));
 
-        std::thread::sleep(ttl + Duration::from_millis(25));
+        std::thread::sleep(ttl + Duration::from_millis(150));
 
         let refreshed = conformance
             .prepare_check("POST", "/users", None)
