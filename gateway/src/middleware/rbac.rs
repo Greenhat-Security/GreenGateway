@@ -2,7 +2,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LockResult, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -43,6 +43,7 @@ const POLICY_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 #[derive(Clone)]
 pub struct RbacState {
     policy: Arc<ArcSwap<RbacPolicyState>>,
+    policy_write_lock: Arc<Mutex<()>>,
     rate_limit: Option<RateLimitState>,
     pub exempt_paths: Vec<String>,
     pub trust_proxy_headers: bool,
@@ -88,6 +89,7 @@ impl RbacState {
     ) -> Self {
         Self {
             policy: Arc::new(ArcSwap::from_pointee(RbacPolicyState::from_policy(policy))),
+            policy_write_lock: Arc::new(Mutex::new(())),
             rate_limit: None,
             exempt_paths,
             trust_proxy_headers,
@@ -111,6 +113,10 @@ impl RbacState {
 
     pub fn current_policy(&self) -> Policy {
         self.policy.load().engine.policy().clone()
+    }
+
+    pub(crate) fn policy_write_guard(&self) -> LockResult<MutexGuard<'_, ()>> {
+        self.policy_write_lock.lock()
     }
 
     pub fn principal_has_permission(&self, principal: &auth::Principal, permission: &str) -> bool {

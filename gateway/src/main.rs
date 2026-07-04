@@ -1243,6 +1243,14 @@ async fn policy_put_endpoint(
         Err(errors) => return policy_validation_failed(errors),
     };
 
+    let _policy_write_guard = match rbac_state.policy_write_guard() {
+        Ok(guard) => guard,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to acquire policy write lock");
+            return internal_server_error("policy write lock failed");
+        }
+    };
+
     let before_policy = rbac_state.current_policy();
     let current_etag = match policy_etag(&before_policy) {
         Ok(etag) => etag,
@@ -1269,6 +1277,8 @@ async fn policy_put_endpoint(
     }
 
     let after_policy = rbac_state.current_policy();
+    emit_policy_changed(&state, &parts, &principal, &before_policy, &after_policy);
+
     let new_etag = match policy_etag(&after_policy) {
         Ok(etag) => etag,
         Err(err) => {
@@ -1276,7 +1286,6 @@ async fn policy_put_endpoint(
             return internal_server_error("policy ETag computation failed");
         }
     };
-    emit_policy_changed(&state, &parts, &principal, &before_policy, &after_policy);
 
     (
         StatusCode::OK,
@@ -4265,6 +4274,158 @@ mod tests {
         assert_eq!(json_body(after_get).await["id"], json!("initial-policy"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_policy_puts_with_same_if_match_allow_only_one_update() {
+        let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+
+        let get_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete");
+        let current_etag = policy_etag_header(&get_response);
+
+        let first_policy = policy_document("concurrent-policy-a", "test:new");
+        let second_policy = policy_document("concurrent-policy-b", "test:new");
+        let first_candidate =
+            serde_json::to_string_pretty(&first_policy).expect("test policy should serialize");
+        let second_candidate =
+            serde_json::to_string_pretty(&second_policy).expect("test policy should serialize");
+        let body_barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let first_task = tokio::spawn({
+            let router = router.clone();
+            let current_etag = current_etag.clone();
+            let body_barrier = Arc::clone(&body_barrier);
+
+            async move {
+                router
+                    .oneshot(synchronized_policy_put_request(
+                        first_candidate,
+                        &current_etag,
+                        body_barrier,
+                    ))
+                    .await
+                    .expect("first policy PUT should complete")
+            }
+        });
+        let second_task = tokio::spawn({
+            let router = router.clone();
+            let current_etag = current_etag.clone();
+            let body_barrier = Arc::clone(&body_barrier);
+
+            async move {
+                router
+                    .oneshot(synchronized_policy_put_request(
+                        second_candidate,
+                        &current_etag,
+                        body_barrier,
+                    ))
+                    .await
+                    .expect("second policy PUT should complete")
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), body_barrier.wait())
+            .await
+            .expect("both policy PUT bodies should reach the release barrier");
+
+        let (first_response, second_response) = tokio::join!(first_task, second_task);
+        let first_response = first_response.expect("first policy PUT task should join");
+        let second_response = second_response.expect("second policy PUT task should join");
+
+        let first_status = first_response.status();
+        let first_etag =
+            (first_status == StatusCode::OK).then(|| policy_etag_header(&first_response));
+        let first_body = if first_status == StatusCode::OK {
+            Some(json_body(first_response).await)
+        } else {
+            assert_eq!(first_status, StatusCode::PRECONDITION_FAILED);
+            assert_eq!(
+                body_string(first_response).await,
+                r#"{"error":"If-Match does not match the current policy ETag"}"#
+            );
+            None
+        };
+
+        let second_status = second_response.status();
+        let second_etag =
+            (second_status == StatusCode::OK).then(|| policy_etag_header(&second_response));
+        let second_body = if second_status == StatusCode::OK {
+            Some(json_body(second_response).await)
+        } else {
+            assert_eq!(second_status, StatusCode::PRECONDITION_FAILED);
+            assert_eq!(
+                body_string(second_response).await,
+                r#"{"error":"If-Match does not match the current policy ETag"}"#
+            );
+            None
+        };
+
+        assert_eq!(
+            [first_status, second_status]
+                .iter()
+                .filter(|status| **status == StatusCode::OK)
+                .count(),
+            1
+        );
+        assert_eq!(
+            [first_status, second_status]
+                .iter()
+                .filter(|status| **status == StatusCode::PRECONDITION_FAILED)
+                .count(),
+            1
+        );
+
+        let (winning_id, winning_etag, winning_body, mut winning_policy) =
+            if first_status == StatusCode::OK {
+                (
+                    "concurrent-policy-a",
+                    first_etag.expect("successful PUT should include ETag"),
+                    first_body.expect("successful PUT should include JSON body"),
+                    first_policy,
+                )
+            } else {
+                (
+                    "concurrent-policy-b",
+                    second_etag.expect("successful PUT should include ETag"),
+                    second_body.expect("successful PUT should include JSON body"),
+                    second_policy,
+                )
+            };
+
+        assert_ne!(winning_etag, current_etag);
+        assert_eq!(winning_body["id"], json!(winning_id));
+        winning_policy["rules"] = json!([]);
+
+        let persisted_policy: Value = serde_json::from_str(
+            &fs::read_to_string(&policy.path).expect("policy file should read"),
+        )
+        .expect("persisted policy should be JSON");
+        assert_eq!(persisted_policy, winning_policy);
+
+        let live_response = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET after concurrent PUTs should complete");
+        assert_eq!(live_response.status(), StatusCode::OK);
+        assert_eq!(policy_etag_header(&live_response), winning_etag);
+        assert_eq!(json_body(live_response).await, winning_policy);
+    }
+
     #[tokio::test]
     async fn policy_put_with_invalid_policy_returns_errors_without_persisting_or_swapping() {
         let initial_policy = policy_document_string("initial-policy", "test:old");
@@ -5362,6 +5523,41 @@ mod tests {
         body: Option<String>,
         if_match: Option<&str>,
     ) -> Request<Body> {
+        policy_admin_request_with_body(
+            method,
+            uri,
+            principal,
+            Body::from(body.unwrap_or_default()),
+            if_match,
+        )
+    }
+
+    fn synchronized_policy_put_request(
+        body: String,
+        if_match: &str,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Request<Body> {
+        let chunks = stream::once(async move {
+            barrier.wait().await;
+            Ok::<Bytes, Infallible>(Bytes::from(body))
+        });
+
+        policy_admin_request_with_body(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Body::from_stream(chunks),
+            Some(if_match),
+        )
+    }
+
+    fn policy_admin_request_with_body(
+        method: Method,
+        uri: &str,
+        principal: Option<auth::Principal>,
+        body: Body,
+        if_match: Option<&str>,
+    ) -> Request<Body> {
         let mut builder = Request::builder().method(method.clone()).uri(uri);
 
         if matches!(method, Method::POST | Method::PUT) {
@@ -5373,9 +5569,7 @@ mod tests {
             builder = builder.header(header::IF_MATCH, if_match);
         }
 
-        let mut request = builder
-            .body(Body::from(body.unwrap_or_default()))
-            .expect("request should build");
+        let mut request = builder.body(body).expect("request should build");
         if let Some(principal) = principal {
             request.extensions_mut().insert(principal);
         }
