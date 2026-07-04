@@ -43,6 +43,16 @@
     },
     {
       "methods": ["GET"],
+      "path_prefix": "/v1/admin/signals",
+      "permission": "admin:signals:read"
+    },
+    {
+      "methods": ["POST"],
+      "path_prefix": "/v1/admin/signals",
+      "permission": "admin:signals:write"
+    },
+    {
+      "methods": ["GET"],
       "path_prefix": "/v1/admin/traffic",
       "permission": "admin:traffic:read"
     },

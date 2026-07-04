@@ -4,6 +4,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const SCHEMA_VERSION: &str = "0.1.0";
 pub const POLICY_CHANGED: &str = "policy.changed";
+pub const SIGNAL_LIFECYCLE_CHANGED: &str = "signal.lifecycle_changed";
 pub const TRAFFIC_ENDPOINT_REVIEW_CHANGED: &str = "traffic.endpoint_review_changed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
