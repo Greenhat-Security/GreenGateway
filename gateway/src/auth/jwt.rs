@@ -895,6 +895,7 @@ mQIDAQAB
                 crate::discovery::suggestions::DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
             openapi_spec_path: None,
             policy_file: None,
+            policy_history_sqlite_path: None,
             cors_allow_origins: Vec::new(),
             max_body_size: 1_048_576,
             rate_limit_read_rps: 50.0,
