@@ -185,6 +185,10 @@ impl Policy {
         }
     }
 
+    pub fn validate_json_value(value: Value) -> Result<Self, PolicyError> {
+        Self::from_json_value(value, None)
+    }
+
     #[allow(dead_code)]
     pub fn persist_to_file(&self, path: impl AsRef<Path>) -> Result<(), PolicyError> {
         self.persist_to_file_with_rename(path.as_ref(), |temp_path, target_path| {

@@ -12,6 +12,10 @@ impl PolicyEngine {
         Self { policy }
     }
 
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
     /// True if any principal role grants `permission`; a role holding "*" grants everything.
     pub fn principal_has_permission(&self, principal: &auth::Principal, permission: &str) -> bool {
         principal

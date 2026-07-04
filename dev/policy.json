@@ -27,6 +27,21 @@
       "permission": "admin:status:read"
     },
     {
+      "methods": ["GET"],
+      "path_prefix": "/v1/admin/policy",
+      "permission": "admin:policy:read"
+    },
+    {
+      "methods": ["PUT"],
+      "path_prefix": "/v1/admin/policy",
+      "permission": "admin:policy:write"
+    },
+    {
+      "methods": ["POST"],
+      "path_prefix": "/v1/admin/policy/validate",
+      "permission": "admin:policy:read"
+    },
+    {
       "methods": ["POST"],
       "path_prefix": "/__dev-echo",
       "permission": "dev:proxy:echo"

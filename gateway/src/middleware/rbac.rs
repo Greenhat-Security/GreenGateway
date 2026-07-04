@@ -94,6 +94,17 @@ impl RbacState {
         self.policy
             .store(Arc::new(RbacPolicyState::from_policy(policy)));
     }
+
+    pub fn current_policy(&self) -> Policy {
+        self.policy.load().engine.policy().clone()
+    }
+
+    pub fn principal_has_permission(&self, principal: &auth::Principal, permission: &str) -> bool {
+        self.policy
+            .load()
+            .engine
+            .principal_has_permission(principal, permission)
+    }
 }
 
 impl RbacPolicyState {
