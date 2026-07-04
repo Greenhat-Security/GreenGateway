@@ -97,16 +97,13 @@ pub struct Rule {
 }
 
 impl Rule {
-    /// Naive reference matcher for the documented rule syntax.
+    /// Returns true when this rule matches the request tuple.
     ///
-    /// PR2 will replace or harden this with the matcher engine, optimized
-    /// evaluation, and exhaustive glob/template edge-case tests. This function
-    /// exists only as a small correctness reference for the PR1 data model.
+    /// Policy-level evaluation should use `RuleMatcher` so path patterns are
+    /// parsed once per loaded policy instead of once per request.
     #[allow(dead_code)]
     pub fn matches(&self, method: &str, path: &str, principal: Option<&Principal>) -> bool {
-        method_matches(&self.methods, method)
-            && path_pattern_matches(&self.path, path)
-            && self.principal.matches(principal)
+        super::matcher::rule_matches(self, method, path, principal)
     }
 }
 
@@ -123,88 +120,6 @@ fn auth_method_policy_value(auth_method: &AuthMethod) -> &'static str {
 
 fn constraint_matches(values: &[String], matches_value: impl Fn(&str) -> bool) -> bool {
     values.is_empty() || values.iter().any(|value| matches_value(value))
-}
-
-fn method_matches(methods: &[String], method: &str) -> bool {
-    methods.is_empty()
-        || methods.iter().any(|configured| {
-            let configured = configured.trim();
-            configured == "*" || configured.eq_ignore_ascii_case(method)
-        })
-}
-
-fn path_pattern_matches(pattern: &str, path: &str) -> bool {
-    let Some(pattern_segments) = absolute_path_segments(pattern) else {
-        return false;
-    };
-    let Some(path_segments) = absolute_path_segments(path) else {
-        return false;
-    };
-
-    path_segments_match(&pattern_segments, &path_segments)
-}
-
-fn absolute_path_segments(value: &str) -> Option<Vec<&str>> {
-    if !value.starts_with('/') {
-        return None;
-    }
-
-    if value == "/" {
-        return Some(Vec::new());
-    }
-
-    Some(value[1..].split('/').collect())
-}
-
-fn path_segments_match(pattern: &[&str], path: &[&str]) -> bool {
-    let Some((head, pattern_tail)) = pattern.split_first() else {
-        return path.is_empty();
-    };
-
-    if *head == "**" {
-        return path_segments_match(pattern_tail, path)
-            || path
-                .split_first()
-                .is_some_and(|(_, path_tail)| path_segments_match(pattern, path_tail));
-    }
-
-    path.split_first().is_some_and(|(path_head, path_tail)| {
-        path_segment_matches(head, path_head) && path_segments_match(pattern_tail, path_tail)
-    })
-}
-
-fn path_segment_matches(pattern: &str, path: &str) -> bool {
-    match pattern {
-        "*" => !path.is_empty(),
-        _ if is_capture_segment(pattern) => !path.is_empty(),
-        _ if has_capture_delimiter(pattern) => false,
-        _ => pattern == path,
-    }
-}
-
-fn is_capture_segment(segment: &str) -> bool {
-    let Some(name) = segment
-        .strip_prefix('{')
-        .and_then(|value| value.strip_suffix('}'))
-    else {
-        return false;
-    };
-
-    is_valid_capture_name(name)
-}
-
-fn has_capture_delimiter(segment: &str) -> bool {
-    segment.contains('{') || segment.contains('}')
-}
-
-fn is_valid_capture_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-
-    (first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 #[cfg(test)]
@@ -255,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_rule_matcher_supports_method_wildcards() {
+    fn rule_matcher_supports_method_wildcards() {
         let rule = Rule {
             methods: vec!["GET".to_owned(), "HEAD".to_owned()],
             path: "/data".to_owned(),
@@ -278,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_rule_matcher_supports_literals_globs_and_params() {
+    fn rule_matcher_supports_literals_globs_and_params() {
         let user_item = Rule {
             methods: Vec::new(),
             path: "/api/users/{id}".to_owned(),
@@ -307,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_rule_matcher_is_anchored_to_whole_path() {
+    fn rule_matcher_is_anchored_to_whole_path() {
         let rule = Rule {
             methods: Vec::new(),
             path: "/api/users/{id}".to_owned(),
