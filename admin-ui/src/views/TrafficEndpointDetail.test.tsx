@@ -24,6 +24,14 @@ describe('TrafficEndpointDetail', () => {
             reviewed_at: '2026-07-04T10:30:00Z',
             reviewed_by: 'admin-user',
             covered_by_rule: false,
+            open_signals: {
+              count: 3,
+              signal_types: [
+                'new_endpoint_seen',
+                'schema_mismatch',
+                'volume_outlier',
+              ],
+            },
             latency: {
               count: 1234,
               p50_ms: 12,
@@ -56,6 +64,7 @@ describe('TrafficEndpointDetail', () => {
     expect(screen.getAllByText('90 ms').length).toBeGreaterThan(0);
     expect(screen.getByText('NEW')).toBeTruthy();
     expect(screen.getByText('UNCOVERED')).toBeTruthy();
+    expect(screen.getByText('3 open signals')).toBeTruthy();
     expect(screen.getByText('Reviewed')).toBeTruthy();
     expect(screen.getAllByText('200').length).toBeGreaterThan(0);
     expect(screen.getAllByText('500').length).toBeGreaterThan(0);
@@ -70,6 +79,15 @@ describe('TrafficEndpointDetail', () => {
     expect(
       screen.getByText(/Historical matched-rule data is not available/i),
     ).toBeTruthy();
+    expect(
+      screen
+        .getByRole('link', {
+          name: 'View 3 open signals for GET /users/{id}',
+        })
+        .getAttribute('href'),
+    ).toBe(
+      '/signals?state=open&target_kind=endpoint&target_key=GET+%2Fusers%2F%7Bid%7D',
+    );
 
     const firstUrl = new URL(String(fetchMock.mock.calls[0][0]), 'http://localhost');
     expect(firstUrl.pathname).toBe('/v1/admin/traffic/endpoint');
@@ -297,6 +315,10 @@ function trafficEndpoint() {
     reviewed_at: null as string | null,
     reviewed_by: null as string | null,
     covered_by_rule: true,
+    open_signals: {
+      count: 0,
+      signal_types: [] as string[],
+    },
     latency: {
       count: 100,
       p50_ms: 10,

@@ -784,10 +784,15 @@ select:focus-visible {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.signal-filter-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .filter-toggle-row,
 .endpoint-title,
 .endpoint-badges,
-.review-cell {
+.review-cell,
+.signal-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -844,6 +849,64 @@ select:focus-visible {
 .endpoint-detail-link:hover {
   color: var(--gh-sys-primary-hover);
   text-decoration: underline;
+}
+
+.signal-badge {
+  border: 1px solid color-mix(in srgb, var(--gh-sys-warning) 28%, transparent);
+  text-decoration: none;
+}
+
+.signal-badge:hover {
+  border-color: var(--gh-sys-warning);
+}
+
+.signal-target-filter {
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-ref-radius-md);
+  padding: var(--gh-ref-space-3) var(--gh-ref-space-4);
+  color: var(--gh-sys-fg-muted);
+  background: var(--gh-sys-bg-surface);
+  font-size: var(--gh-type-body-sm);
+}
+
+.signal-target-filter code {
+  color: var(--gh-sys-fg);
+  font-family: var(--gh-ref-font-mono);
+  overflow-wrap: anywhere;
+}
+
+.signal-toast-region {
+  display: grid;
+  gap: var(--gh-ref-space-2);
+}
+
+.signal-toast {
+  margin: 0;
+}
+
+.signal-primary-cell {
+  display: grid;
+  gap: var(--gh-ref-space-2);
+}
+
+.signal-primary-cell .badge {
+  width: fit-content;
+}
+
+.signal-evidence {
+  max-width: 320px;
+  max-height: 150px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-ref-radius-sm);
+  padding: var(--gh-ref-space-2);
+  color: var(--gh-sys-fg);
+  background: var(--gh-sys-bg-raised);
+  font-family: var(--gh-ref-font-mono);
+  font-size: var(--gh-type-caption);
+  line-height: var(--gh-lh-caption);
+  white-space: pre-wrap;
 }
 
 .traffic-detail-panel h3,
@@ -1332,7 +1395,8 @@ select:focus-visible {
 
   .token-row,
   .filter-grid,
-  .traffic-filter-grid {
+  .traffic-filter-grid,
+  .signal-filter-grid {
     grid-template-columns: 1fr;
   }
 

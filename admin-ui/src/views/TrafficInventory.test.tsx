@@ -22,6 +22,10 @@ describe('TrafficInventory', () => {
             distinct_principal_count: 3,
             is_new: true,
             covered_by_rule: false,
+            open_signals: {
+              count: 2,
+              signal_types: ['new_endpoint_seen', 'schema_mismatch'],
+            },
             status_counts: [
               { status: 200, count: 80 },
               { status: 500, count: 20 },
@@ -42,6 +46,7 @@ describe('TrafficInventory', () => {
     expect(screen.getByText('3')).toBeTruthy();
     expect(screen.getByText('NEW')).toBeTruthy();
     expect(screen.getByText('UNCOVERED')).toBeTruthy();
+    expect(screen.getByText('2 open signals')).toBeTruthy();
     expect(screen.getByTitle('2026-07-04T10:00:00Z')).toBeTruthy();
     expect(
       screen
@@ -51,6 +56,12 @@ describe('TrafficInventory', () => {
         .getAttribute('href'),
     ).toBe(
       '/traffic/detail?method=GET&endpoint_template=%2Fusers%2F%7Bid%7D',
+    );
+    const signalsLink = screen.getByRole('link', {
+      name: 'View 2 open signals for GET /users/{id}',
+    });
+    expect(signalsLink.getAttribute('href')).toBe(
+      '/signals?state=open&target_kind=endpoint&target_key=GET+%2Fusers%2F%7Bid%7D',
     );
 
     const firstUrl = new URL(String(fetchMock.mock.calls[0][0]), 'http://localhost');
@@ -348,6 +359,10 @@ function trafficEndpoint(
     reviewed_at: null,
     reviewed_by: null,
     covered_by_rule: true,
+    open_signals: {
+      count: 0,
+      signal_types: [],
+    },
     latency: {
       count: 1,
       p50_ms: 5,
