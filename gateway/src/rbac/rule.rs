@@ -6,6 +6,15 @@ pub const AUTH_METHOD_BEARER_TOKEN: &str = "bearer_token";
 pub const AUTH_METHOD_SESSION_COOKIE: &str = "session_cookie";
 
 /// Action applied by a first-match-wins firewall rule.
+///
+/// Direct rules run before, and take precedence over, the routes/permission
+/// model: once a rule matches, it is the sole authority for the request and
+/// routes are never consulted. `Allow` and `Shadow` both forward the request
+/// unconditionally (no downstream permission check) — `Shadow` differs only
+/// in recording a would-deny observation event instead of an allowed one, for
+/// policy-authoring dry runs. An overly broad rule (e.g. an unconstrained
+/// principal matcher on a sensitive path) can therefore grant access the
+/// routes-based permission model would have denied.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleAction {
