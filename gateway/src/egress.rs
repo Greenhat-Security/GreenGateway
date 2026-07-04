@@ -212,6 +212,18 @@ impl EgressConfig {
 
         Ok(())
     }
+
+    pub fn apply_upstream_timeout_overrides(&mut self, config: &Config) {
+        if let Some(timeout_ms) = config.upstream_timeout_ms {
+            self.timeout = Duration::from_millis(timeout_ms);
+        }
+        if let Some(timeout_ms) = config.upstream_response_idle_timeout_ms {
+            self.response_idle_timeout = Duration::from_millis(timeout_ms);
+        }
+        if let Some(timeout_ms) = config.upstream_connect_timeout_ms {
+            self.connect_timeout = Duration::from_millis(timeout_ms);
+        }
+    }
 }
 
 fn auto_seed_endpoint_host(
@@ -1061,6 +1073,32 @@ mod tests {
         assert!(egress.allowed_hosts.contains("upstream.example.test"));
     }
 
+    #[test]
+    fn upstream_timeout_overrides_only_replace_timeout_fields() {
+        let mut config = test_config();
+        config.egress_allowed_hosts = vec!["api.example.test".to_owned()];
+        config.upstream_timeout_ms = Some(1500);
+        config.upstream_response_idle_timeout_ms = Some(400);
+        config.upstream_connect_timeout_ms = Some(300);
+
+        let mut egress = EgressConfig::from_config(&config);
+        egress.apply_upstream_timeout_overrides(&config);
+
+        assert_eq!(egress.timeout, Duration::from_millis(1500));
+        assert_eq!(egress.response_idle_timeout, Duration::from_millis(400));
+        assert_eq!(egress.connect_timeout, Duration::from_millis(300));
+        assert_eq!(
+            egress.allowed_hosts,
+            HashSet::from(["api.example.test".to_owned()])
+        );
+        assert_eq!(egress.max_response_bytes, config.egress_max_response_bytes);
+        assert_eq!(
+            egress.max_request_body_bytes,
+            config.egress_max_request_body_bytes
+        );
+        assert!(egress.deny_private_ips);
+    }
+
     #[tokio::test]
     async fn auto_seeded_upstream_host_still_blocks_private_ips_by_default() {
         let mut config = test_config();
@@ -1575,6 +1613,9 @@ mod tests {
                 "/metrics".to_owned(),
             ],
             upstream_url: None,
+            upstream_timeout_ms: None,
+            upstream_response_idle_timeout_ms: None,
+            upstream_connect_timeout_ms: None,
             egress_allowed_hosts: Vec::new(),
             egress_timeout_ms: 30_000,
             egress_response_idle_timeout_ms: 30_000,

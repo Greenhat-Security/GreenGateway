@@ -52,6 +52,7 @@ const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
 const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
 const MAX_AUDIT_QUERY_LIMIT: usize = 500;
+const UPSTREAM_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../admin-ui/dist/"]
@@ -67,6 +68,8 @@ struct AppState {
 #[derive(Clone)]
 struct ProxyState {
     upstream_origin: String,
+    upstream_health_url: String,
+    upstream_health: UpstreamHealthState,
     egress_client: Arc<egress::EgressClient>,
     max_request_body_bytes: usize,
 }
@@ -164,6 +167,26 @@ impl MakeRequestId for MakeRequestUuid {
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream: Option<UpstreamHealthResponse>,
+}
+
+#[derive(Serialize)]
+struct UpstreamHealthResponse {
+    configured: bool,
+    reachable: Option<bool>,
+    last_checked: Option<String>,
+}
+
+#[derive(Clone)]
+struct UpstreamHealthState {
+    snapshot: Arc<tokio::sync::RwLock<UpstreamHealthSnapshot>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UpstreamHealthSnapshot {
+    reachable: Option<bool>,
+    last_checked: Option<OffsetDateTime>,
 }
 
 #[derive(Serialize)]
@@ -339,8 +362,17 @@ fn app_with_process_started_at(
         None => egress::EgressConfig::from_config(&config),
     };
     let egress_allowed_hosts_count = egress_config.allowed_host_rule_count();
+    let proxy_egress_config = {
+        let mut proxy_egress_config = egress_config.clone();
+        proxy_egress_config.apply_upstream_timeout_overrides(&config);
+        proxy_egress_config
+    };
     let egress_client = Arc::new(egress::EgressClient::new(egress_config)?);
-    let proxy_state = ProxyState::from_config(&config, Arc::clone(&egress_client));
+    let proxy_egress_client = Arc::new(egress::EgressClient::new(proxy_egress_config)?);
+    let proxy_state = ProxyState::from_config(&config, proxy_egress_client);
+    if let Some(proxy) = proxy_state.as_ref() {
+        proxy.spawn_upstream_health_checks();
+    }
     let routes = GatewayRoutes::from_config(&config);
     let validator = auth::JwtValidator::from_config(&config, egress_client)?
         .map(|validator| Arc::new(validator) as Arc<dyn auth::SessionValidator>);
@@ -542,9 +574,93 @@ fn request_id_header() -> HeaderName {
     HeaderName::from_static(REQUEST_ID_HEADER)
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     record_request("/health");
-    Json(HealthResponse { status: "ok" })
+    let upstream = match state.proxy.as_ref() {
+        Some(proxy) => Some(proxy.upstream_health.response().await),
+        None => None,
+    };
+
+    Json(HealthResponse {
+        status: "ok",
+        upstream,
+    })
+}
+
+impl UpstreamHealthState {
+    fn new() -> Self {
+        Self {
+            snapshot: Arc::new(tokio::sync::RwLock::new(UpstreamHealthSnapshot::default())),
+        }
+    }
+
+    async fn response(&self) -> UpstreamHealthResponse {
+        let snapshot = self.snapshot.read().await.clone();
+
+        UpstreamHealthResponse {
+            configured: true,
+            reachable: snapshot.reachable,
+            last_checked: snapshot.last_checked.map(rfc3339_timestamp),
+        }
+    }
+
+    async fn update(&self, reachable: bool) {
+        *self.snapshot.write().await = UpstreamHealthSnapshot {
+            reachable: Some(reachable),
+            last_checked: Some(OffsetDateTime::now_utc()),
+        };
+    }
+}
+
+async fn refresh_upstream_health(
+    health: &UpstreamHealthState,
+    egress_client: &egress::EgressClient,
+    upstream_url: &str,
+    first_check: bool,
+) -> bool {
+    match check_upstream_reachable(egress_client, upstream_url).await {
+        Ok(()) => {
+            health.update(true).await;
+            true
+        }
+        Err(err) => {
+            health.update(false).await;
+            if first_check {
+                tracing::warn!(
+                    upstream_url,
+                    error = %err,
+                    "startup upstream reachability check failed; continuing startup"
+                );
+            } else {
+                tracing::warn!(
+                    upstream_url,
+                    error = %err,
+                    "upstream reachability check failed"
+                );
+            }
+            false
+        }
+    }
+}
+
+async fn check_upstream_reachable(
+    egress_client: &egress::EgressClient,
+    upstream_url: &str,
+) -> Result<(), egress::EgressError> {
+    egress_client
+        .request(Method::HEAD, upstream_url)
+        .await
+        .map(|_| ())
+}
+
+fn rfc3339_timestamp(timestamp: OffsetDateTime) -> String {
+    match timestamp.format(&Rfc3339) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to format upstream health timestamp");
+            timestamp.unix_timestamp().to_string()
+        }
+    }
 }
 
 async fn version() -> Json<VersionResponse> {
@@ -576,9 +692,43 @@ impl ProxyState {
 
         Some(Self {
             upstream_origin: upstream.origin().ascii_serialization(),
+            upstream_health_url: upstream.origin().ascii_serialization(),
+            upstream_health: UpstreamHealthState::new(),
             egress_client,
             max_request_body_bytes: config.egress_max_request_body_bytes,
         })
+    }
+
+    fn spawn_upstream_health_checks(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                upstream_url = %self.upstream_health_url,
+                "upstream reachability checks were not started because no Tokio runtime is active"
+            );
+            return;
+        };
+        let health = self.upstream_health.clone();
+        let egress_client = Arc::clone(&self.egress_client);
+        let upstream_url = self.upstream_health_url.clone();
+
+        handle.spawn(async move {
+            let mut first_check = true;
+            let mut last_reachable = None;
+
+            loop {
+                let reachable =
+                    refresh_upstream_health(&health, &egress_client, &upstream_url, first_check)
+                        .await;
+
+                if last_reachable == Some(false) && reachable {
+                    tracing::info!(upstream_url = %upstream_url, "upstream reachability restored");
+                }
+
+                last_reachable = Some(reachable);
+                first_check = false;
+                tokio::time::sleep(UPSTREAM_HEALTH_CHECK_INTERVAL).await;
+            }
+        });
     }
 }
 
@@ -1238,6 +1388,9 @@ mod tests {
                 "/metrics".to_owned(),
             ],
             upstream_url: None,
+            upstream_timeout_ms: None,
+            upstream_response_idle_timeout_ms: None,
+            upstream_connect_timeout_ms: None,
             egress_allowed_hosts: Vec::new(),
             egress_timeout_ms: 30_000,
             egress_response_idle_timeout_ms: 30_000,
@@ -1383,12 +1536,47 @@ mod tests {
         captured: &mut tokio::sync::mpsc::Receiver<CapturedRequest>,
         context: &str,
     ) {
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), captured.recv())
+        let started = Instant::now();
+        let timeout = Duration::from_millis(100);
+
+        while started.elapsed() < timeout {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            match tokio::time::timeout(remaining, captured.recv()).await {
+                Ok(Some(request)) if is_upstream_health_probe(&request) => continue,
+                Ok(Some(request)) => panic!(
+                    "{context}: unexpected upstream request {} {}",
+                    request.method, request.path_and_query
+                ),
+                Ok(None) | Err(_) => return,
+            }
+        }
+    }
+
+    async fn next_proxied_request(
+        captured: &mut tokio::sync::mpsc::Receiver<CapturedRequest>,
+        context: &str,
+    ) -> CapturedRequest {
+        let started = Instant::now();
+
+        loop {
+            let request = tokio::time::timeout(Duration::from_secs(1), captured.recv())
                 .await
-                .is_err(),
-            "{context}"
-        );
+                .unwrap_or_else(|_| panic!("{context}: upstream did not receive request"))
+                .unwrap_or_else(|| panic!("{context}: upstream capture channel closed"));
+
+            if !is_upstream_health_probe(&request) {
+                return request;
+            }
+
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{context}: only upstream health probes were captured"
+            );
+        }
+    }
+
+    fn is_upstream_health_probe(request: &CapturedRequest) -> bool {
+        request.method == Method::HEAD && request.path_and_query == "/" && request.body.is_empty()
     }
 
     async fn delayed_stream_upstream() -> Response {
@@ -1471,8 +1659,42 @@ mod tests {
         preflight_response_to_path(config, "/health", origin).await
     }
 
+    async fn health_response(router: Router) -> axum::response::Response {
+        router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("health request should complete")
+    }
+
+    async fn wait_for_upstream_health(router: Router, reachable: bool) -> Value {
+        let started = Instant::now();
+
+        loop {
+            let response = health_response(router.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+
+            if body["upstream"]["reachable"] == json!(reachable)
+                && body["upstream"]["last_checked"].as_str().is_some()
+            {
+                return body;
+            }
+
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "upstream health did not become {reachable} before timeout: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     #[tokio::test]
-    async fn health_returns_ok() {
+    async fn health_without_upstream_returns_original_body() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let response = app(
             test_config(Vec::new()),
@@ -1492,6 +1714,62 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key(REQUEST_ID_HEADER));
+        assert_eq!(body_string(response).await, r#"{"status":"ok"}"#);
+    }
+
+    #[tokio::test]
+    async fn startup_upstream_health_check_reports_reachable_without_blocking_startup() {
+        let upstream_addr =
+            spawn_router(Router::new().route("/", get(|| async { StatusCode::NO_CONTENT }))).await;
+        let config = proxy_config(upstream_addr);
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = tokio::time::timeout(Duration::from_millis(100), async move {
+            app(
+                config,
+                recorder.handle(),
+                test_audit_log(),
+                test_audit_event_sender(),
+            )
+        })
+        .await
+        .expect("app startup should not wait for upstream health")
+        .expect("app should build");
+
+        let body = wait_for_upstream_health(router, true).await;
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["upstream"]["configured"], json!(true));
+        assert_eq!(body["upstream"]["reachable"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn startup_upstream_health_check_reports_unreachable_without_blocking_startup() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let upstream_addr = listener
+            .local_addr()
+            .expect("listener local address should be available");
+        drop(listener);
+        let mut config = proxy_config(upstream_addr);
+        config.upstream_timeout_ms = Some(100);
+        config.upstream_connect_timeout_ms = Some(100);
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = tokio::time::timeout(Duration::from_millis(100), async move {
+            app(
+                config,
+                recorder.handle(),
+                test_audit_log(),
+                test_audit_event_sender(),
+            )
+        })
+        .await
+        .expect("app startup should not wait for upstream health")
+        .expect("app should build");
+
+        let body = wait_for_upstream_health(router, false).await;
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["upstream"]["configured"], json!(true));
+        assert_eq!(body["upstream"]["reachable"], json!(false));
     }
 
     #[test]
@@ -1892,10 +2170,9 @@ mod tests {
                 format!("upstream {method} /api/items/42/?x=1&name=two%20words")
             );
 
-            let upstream = captured
-                .recv()
-                .await
-                .expect("upstream should receive proxied request");
+            let upstream =
+                next_proxied_request(&mut captured, "upstream should receive proxied request")
+                    .await;
             assert_eq!(upstream.method, method);
             assert_eq!(
                 upstream.path_and_query,
@@ -1963,10 +2240,8 @@ mod tests {
             body_string(response).await,
             "upstream GET /auto-seeded?ok=true"
         );
-        let upstream = captured
-            .recv()
-            .await
-            .expect("upstream should receive proxied request");
+        let upstream =
+            next_proxied_request(&mut captured, "upstream should receive proxied request").await;
         assert_eq!(upstream.path_and_query, "/auto-seeded?ok=true");
     }
 
@@ -2052,11 +2327,13 @@ mod tests {
             .local_addr()
             .expect("listener address should be available");
         let server = tokio::spawn(async move {
-            let (stream, _) = listener
-                .accept()
-                .await
-                .expect("test server should accept one connection");
-            drop(stream);
+            loop {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("test server should accept a connection");
+                drop(stream);
+            }
         });
         let mut config = proxy_config(upstream_addr);
         config.egress_timeout_ms = 1000;
@@ -2075,11 +2352,11 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(body_string(response).await, r#"{"error":"bad_gateway"}"#);
-        server.await.expect("reset server task should finish");
+        server.abort();
     }
 
     #[tokio::test]
-    async fn proxy_returns_504_for_timed_out_upstream_without_leaking_details() {
+    async fn proxy_uses_upstream_timeout_override_for_timed_out_upstream() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("test listener should bind");
@@ -2087,15 +2364,22 @@ mod tests {
             .local_addr()
             .expect("listener address should be available");
         let server = tokio::spawn(async move {
-            let (_stream, _) = listener
-                .accept()
-                .await
-                .expect("test server should accept one connection");
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            loop {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("test server should accept a connection");
+                tokio::spawn(async move {
+                    let _stream = stream;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                });
+            }
         });
         let mut config = proxy_config(upstream_addr);
-        config.egress_timeout_ms = 100;
-        config.egress_connect_timeout_ms = 100;
+        config.egress_timeout_ms = 5_000;
+        config.egress_connect_timeout_ms = 5_000;
+        config.upstream_timeout_ms = Some(100);
+        config.upstream_connect_timeout_ms = Some(100);
         let router = proxy_router(config, test_audit_log());
 
         let response = router
@@ -2125,22 +2409,27 @@ mod tests {
             .local_addr()
             .expect("listener address should be available");
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener
-                .accept()
-                .await
-                .expect("test server should accept one connection");
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .expect("test server should write response headers");
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            loop {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("test server should accept a connection");
+                tokio::spawn(async move {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .expect("test server should write response headers");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                });
+            }
         });
         let mut config = proxy_config(upstream_addr);
         config.egress_timeout_ms = 5_000;
-        config.egress_response_idle_timeout_ms = 100;
+        config.egress_response_idle_timeout_ms = 5_000;
         config.egress_connect_timeout_ms = 100;
+        config.upstream_response_idle_timeout_ms = Some(100);
         let router = proxy_router(config, test_audit_log());
 
         let response = tokio::time::timeout(
@@ -2180,7 +2469,9 @@ mod tests {
             .expect("health request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_string(response).await, r#"{"status":"ok"}"#);
+        let body = json_body(response).await;
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["upstream"]["configured"], json!(true));
         assert_upstream_receives_no_request(&mut captured, "health route should not be proxied")
             .await;
     }
@@ -2283,10 +2574,11 @@ mod tests {
 
         assert_eq!(old_admin_response.status(), StatusCode::CREATED);
         assert_eq!(body_string(old_admin_response).await, "upstream GET /admin");
-        let upstream = captured
-            .recv()
-            .await
-            .expect("old admin path should fall through to upstream");
+        let upstream = next_proxied_request(
+            &mut captured,
+            "old admin path should fall through to upstream",
+        )
+        .await;
         assert_eq!(upstream.method, Method::GET);
         assert_eq!(upstream.path_and_query, "/admin");
         assert_upstream_receives_no_request(

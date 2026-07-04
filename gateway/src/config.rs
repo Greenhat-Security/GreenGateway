@@ -74,6 +74,9 @@ const RATE_LIMIT_WRITE_BURST: &str = "RATE_LIMIT_WRITE_BURST";
 const ROLES_CLAIM: &str = "ROLES_CLAIM";
 const TRUST_PROXY_HEADERS: &str = "TRUST_PROXY_HEADERS";
 const SESSION_COOKIE_NAME: &str = "SESSION_COOKIE_NAME";
+const UPSTREAM_CONNECT_TIMEOUT_MS: &str = "UPSTREAM_CONNECT_TIMEOUT_MS";
+const UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS: &str = "UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS";
+const UPSTREAM_TIMEOUT_MS: &str = "UPSTREAM_TIMEOUT_MS";
 const UPSTREAM_URL: &str = "UPSTREAM_URL";
 const VALIDATION_ALLOWED_CONTENT_TYPES: &str = "VALIDATION_ALLOWED_CONTENT_TYPES";
 
@@ -111,6 +114,9 @@ pub struct Config {
     pub csrf_cookie_domain: Option<String>,
     pub csrf_exempt_paths: Vec<String>,
     pub upstream_url: Option<String>,
+    pub upstream_timeout_ms: Option<u64>,
+    pub upstream_response_idle_timeout_ms: Option<u64>,
+    pub upstream_connect_timeout_ms: Option<u64>,
     pub egress_allowed_hosts: Vec<String>,
     pub egress_timeout_ms: u64,
     pub egress_response_idle_timeout_ms: u64,
@@ -338,6 +344,24 @@ impl Config {
         );
         let upstream_url =
             parse_optional_upstream_url(UPSTREAM_URL, get_var(UPSTREAM_URL), &mut problems);
+        let upstream_timeout_ms = parse_optional_var(
+            UPSTREAM_TIMEOUT_MS,
+            get_var(UPSTREAM_TIMEOUT_MS),
+            "millisecond duration",
+            &mut problems,
+        );
+        let upstream_response_idle_timeout_ms = parse_optional_var(
+            UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS,
+            get_var(UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS),
+            "millisecond duration",
+            &mut problems,
+        );
+        let upstream_connect_timeout_ms = parse_optional_var(
+            UPSTREAM_CONNECT_TIMEOUT_MS,
+            get_var(UPSTREAM_CONNECT_TIMEOUT_MS),
+            "millisecond duration",
+            &mut problems,
+        );
         let egress_allowed_hosts = parse_comma_separated_hostnames(
             EGRESS_ALLOWED_HOSTS,
             get_var(EGRESS_ALLOWED_HOSTS),
@@ -420,6 +444,9 @@ impl Config {
                 csrf_cookie_domain,
                 csrf_exempt_paths,
                 upstream_url,
+                upstream_timeout_ms,
+                upstream_response_idle_timeout_ms,
+                upstream_connect_timeout_ms,
                 egress_allowed_hosts,
                 egress_timeout_ms,
                 egress_response_idle_timeout_ms,
@@ -965,6 +992,9 @@ mod tests {
             ]
         );
         assert_eq!(config.upstream_url, None);
+        assert_eq!(config.upstream_timeout_ms, None);
+        assert_eq!(config.upstream_response_idle_timeout_ms, None);
+        assert_eq!(config.upstream_connect_timeout_ms, None);
         assert!(config.egress_allowed_hosts.is_empty());
         assert_eq!(config.egress_timeout_ms, DEFAULT_EGRESS_TIMEOUT_MS);
         assert_eq!(
@@ -1072,6 +1102,9 @@ mod tests {
             ]
         );
         assert_eq!(config.upstream_url, None);
+        assert_eq!(config.upstream_timeout_ms, None);
+        assert_eq!(config.upstream_response_idle_timeout_ms, None);
+        assert_eq!(config.upstream_connect_timeout_ms, None);
         assert!(config.egress_allowed_hosts.is_empty());
         assert_eq!(config.egress_timeout_ms, DEFAULT_EGRESS_TIMEOUT_MS);
         assert_eq!(
@@ -1624,14 +1657,31 @@ mod tests {
     }
 
     #[test]
+    fn upstream_timeout_overrides_parse_as_optional_values() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_TIMEOUT_MS" => Ok("1500".to_owned()),
+            "UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS" => Ok("400".to_owned()),
+            "UPSTREAM_CONNECT_TIMEOUT_MS" => Ok("300".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.upstream_timeout_ms, Some(1500));
+        assert_eq!(config.upstream_response_idle_timeout_ms, Some(400));
+        assert_eq!(config.upstream_connect_timeout_ms, Some(300));
+    }
+
+    #[test]
     fn empty_upstream_url_is_none() {
         let config = Config::from_env_vars(|name| match name {
             "UPSTREAM_URL" => Ok("   ".to_owned()),
+            "UPSTREAM_TIMEOUT_MS" => Ok("   ".to_owned()),
             _ => Err(VarError::NotPresent),
         })
         .expect("config should parse");
 
         assert_eq!(config.upstream_url, None);
+        assert_eq!(config.upstream_timeout_ms, None);
     }
 
     #[test]
@@ -1660,6 +1710,26 @@ mod tests {
             assert!(message.contains(expected), "{message}");
             assert_eq!(error.problems.len(), 1);
         }
+    }
+
+    #[test]
+    fn invalid_upstream_timeout_overrides_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_TIMEOUT_MS" => Ok("slow".to_owned()),
+            "UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS" => Ok("idle".to_owned()),
+            "UPSTREAM_CONNECT_TIMEOUT_MS" => Ok("slower".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid upstream timeout settings");
+
+        let message = error.to_string();
+        assert!(message.contains("UPSTREAM_TIMEOUT_MS must be a valid millisecond duration"));
+        assert!(message
+            .contains("UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS must be a valid millisecond duration"));
+        assert!(
+            message.contains("UPSTREAM_CONNECT_TIMEOUT_MS must be a valid millisecond duration")
+        );
+        assert_eq!(error.problems.len(), 3);
     }
 
     #[test]
