@@ -1,5 +1,7 @@
 <div align="center">
 
+![GreenGateway (GG)](docs/images/greengateway-cover.png)
+
 # GreenGateway (GG)
 
 ### A universal MCP + API gateway you self-host
