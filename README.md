@@ -49,7 +49,7 @@ It is designed to sit between clients and existing HTTP backends or MCP servers,
 
 **GreenGateway is pre-alpha and under active initial development.** It is not production ready yet.
 
-Development follows a 7-phase roadmap. **Phases 1 through 3 are complete, and Phase 4 (traffic discovery) is underway** — a real security middleware stack, authentication, a hot-reloadable RBAC engine (including shadow-enforcement, observe-only auth modes, and data-driven direct firewall rules), an egress firewall with policy-driven overrides, a full audit/observability pipeline, a streaming reverse proxy with multi-upstream routing and per-upstream settings, and a complete policy administration API (read/replace/validate, granular rule operations, and rule preview against historical traffic) all exist and run today (see [What's Real Today](#whats-real-today)). **All of Phases 4 through 7 are still largely roadmap and vision**, not shipped functionality — endpoint path templating and a per-endpoint stats aggregator exist, but the traffic inventory API, discovery UI, schema awareness, anomaly signals, native MCP protocol support, and the visual firewall rule builder do not exist yet.
+Development follows a 7-phase roadmap. **Phases 1 through 3 are complete, and Phase 4 (traffic discovery) is underway** — a real security middleware stack, authentication, a hot-reloadable RBAC engine (including shadow-enforcement, observe-only auth modes, and data-driven direct firewall rules), an egress firewall with policy-driven overrides, a full audit/observability pipeline, a streaming reverse proxy with multi-upstream routing and per-upstream settings, and a complete policy administration API (read/replace/validate, granular rule operations, and rule preview against historical traffic) all exist and run today (see [What's Real Today](#whats-real-today)). **The rest of Phase 4, and all of Phases 5 through 7, are still largely roadmap and vision**, not shipped functionality — endpoint path templating and a per-endpoint stats aggregator exist, but the traffic inventory API, discovery UI, schema awareness, anomaly signals, native MCP protocol support, and the visual firewall rule builder do not exist yet.
 
 Progress is tracked in the pinned roadmap issue: [Roadmap / project plan (#44)](https://github.com/Greenhat-Security/GreenGateway/issues/44).
 
@@ -108,7 +108,7 @@ The HTTP half of the proxy layer above is real today — multi-upstream routing 
 
 ## Quick Start
 
-GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI shell at `/admin`, and a working reverse proxy once `UPSTREAM_URL` is configured (see [What's Real Today](#whats-real-today)). The traffic-discovery and rule-builder capabilities described in [Planned Scope](#planned-scope) are still pre-alpha roadmap work.
+GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI shell at `/admin`, and a working reverse proxy — either a single catch-all `UPSTREAM_URL` or a full multi-upstream routing table (see [What's Real Today](#whats-real-today)). The traffic-discovery and rule-builder capabilities described in [Planned Scope](#planned-scope) are still pre-alpha roadmap work.
 
 For the full list of environment variables, see [docs/configuration.md](docs/configuration.md). As more variables land, that document and [.env.example](.env.example) are kept in sync with the code by an automated test.
 
