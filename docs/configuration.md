@@ -66,6 +66,8 @@ Format and validation: unset, empty, or whitespace-only values become `None`. No
 
 This uses a separate config surface from `AUDIT_SQLITE_PATH` because audit history and derived endpoint inventory often have different retention and lifecycle requirements. Operators that prefer a single SQLite file may explicitly set `DISCOVERY_SQLITE_PATH` to the same path as `AUDIT_SQLITE_PATH`; the discovery tables use their own `discovery_` prefixes.
 
+Capacity caveat: distinct principal tracking is exact and currently has no cap, eviction, or retention setting. The `discovery_endpoint_principals` table stores one row per distinct authenticated `actor.user_id` per `(method, endpoint_template)` for the lifetime of the database, and the aggregator mirrors that set in memory while running. In long-running or high-cardinality deployments, size grows proportionally to distinct authenticated users multiplied by distinct endpoint templates; plan database and memory capacity accordingly before enabling this setting. Unauthenticated calls contribute to aggregate call counts but not to distinct principal rows.
+
 ### POLICY_FILE
 
 Optional RBAC policy JSON file path.

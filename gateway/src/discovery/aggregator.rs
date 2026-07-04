@@ -2,7 +2,7 @@
 //!
 //! The aggregator is an `AuditSink`, so request handlers only enqueue audit
 //! events on the existing bounded audit channel. This sink runs on the audit
-//! writer thread, keeps a small in-memory working set, and periodically flushes
+//! writer thread, keeps an in-memory working set, and periodically flushes
 //! endpoint inventory to SQLite.
 //!
 //! Aggregates are keyed by `(method, endpoint_template)`. Status counts are
@@ -12,6 +12,11 @@
 //! computed from a bounded deterministic reservoir sample, which keeps memory
 //! bounded while making percentiles approximate once an endpoint has more than
 //! `LATENCY_SAMPLE_LIMIT` observations.
+//!
+//! Known limitation: exact distinct-principal tracking is unbounded. Each
+//! distinct `actor.user_id` observed for a `(method, endpoint_template)` is kept
+//! in memory for the lifetime of the process and stored in
+//! `discovery_endpoint_principals` for the lifetime of the database.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -439,6 +444,12 @@ struct EndpointAggregate {
     status_counts: BTreeMap<u16, u64>,
     latency_count: u64,
     latency_samples: Vec<u64>,
+    /// Known limitation: exact principal entries are never capped or evicted.
+    /// This map grows one entry per distinct `actor.user_id` seen for this
+    /// endpoint for the lifetime of the process, and the matching
+    /// `discovery_endpoint_principals` rows grow for the lifetime of the
+    /// database. Future work should add TTL pruning or a configured
+    /// cardinality cap if exactness becomes too costly.
     principals: HashMap<String, PrincipalSeen>,
 }
 
@@ -1456,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_log_emit_latency_is_not_measurably_affected_by_aggregator_sink() {
+    fn audit_log_emit_latency_gross_regression_guard_for_aggregator_sink() {
         const EVENT_COUNT: usize = 5_000;
         let events = (0..EVENT_COUNT)
             .map(|index| {
@@ -1488,15 +1499,21 @@ mod tests {
             with_aggregator.total,
             with_aggregator.p99
         );
+
+        // Hot-path safety comes from `AuditLog::emit` using a non-blocking
+        // bounded-channel `try_send`; sink work runs on the audit writer
+        // thread. This is only a coarse regression guard that would catch
+        // accidentally adding blocking sink work directly to the caller-facing
+        // emit path, not a benchmark of aggregator processing speed.
         assert!(
             with_aggregator.total <= baseline.total * 20 + StdDuration::from_millis(50),
-            "aggregator should not meaningfully slow total AuditLog::emit time: baseline={:?}, with_aggregator={:?}",
+            "aggregator changed total AuditLog::emit time enough to trip the coarse non-blocking-path guard: baseline={:?}, with_aggregator={:?}",
             baseline.total,
             with_aggregator.total
         );
         assert!(
             with_aggregator.p99 <= baseline.p99 * 20 + StdDuration::from_millis(10),
-            "aggregator should not meaningfully slow p99 AuditLog::emit time: baseline={:?}, with_aggregator={:?}",
+            "aggregator changed p99 AuditLog::emit time enough to trip the coarse non-blocking-path guard: baseline={:?}, with_aggregator={:?}",
             baseline.p99,
             with_aggregator.p99
         );
