@@ -1231,6 +1231,7 @@ mod tests {
             listen_addr: "127.0.0.1:0"
                 .parse()
                 .expect("test listen address should parse"),
+            admin_listen_addr: None,
             admin_prefix: "/admin".to_owned(),
             audit_log_file: None,
             audit_sqlite_path: None,
