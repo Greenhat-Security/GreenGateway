@@ -205,7 +205,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -417,7 +418,9 @@ h3 {
 .primary-button:focus-visible,
 .secondary-button:focus-visible,
 .expand-button:focus-visible,
-input:focus-visible {
+.filter-toggle:focus-visible,
+input:focus-visible,
+select:focus-visible {
   outline: 2px solid var(--gh-sys-focus-ring);
   outline-offset: 2px;
 }
@@ -580,7 +583,8 @@ input:focus-visible {
 }
 
 .token-row input,
-.filter-form input {
+.filter-form input,
+.filter-form select {
   width: 100%;
   min-width: 0;
   height: 40px;
@@ -601,12 +605,14 @@ input:focus-visible {
 }
 
 .token-row input:hover:not(:disabled),
-.filter-form input:hover:not(:disabled) {
+.filter-form input:hover:not(:disabled),
+.filter-form select:hover:not(:disabled) {
   border-color: var(--gh-sys-border-hover);
 }
 
 .token-row input:focus,
-.filter-form input:focus {
+.filter-form input:focus,
+.filter-form select:focus {
   outline: none;
   border-color: var(--gh-sys-primary);
   box-shadow: 0 0 0 2px
@@ -771,6 +777,80 @@ input:focus-visible {
 
 .live-filter-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.traffic-filter-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.filter-toggle-row,
+.endpoint-title,
+.endpoint-badges,
+.review-cell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gh-ref-space-2);
+}
+
+.filter-toggle {
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-comp-button-radius);
+  padding: var(--gh-ref-space-2) var(--gh-ref-space-4);
+  color: var(--gh-sys-fg-muted);
+  background: var(--gh-sys-bg-surface);
+  font-size: var(--gh-type-body-sm);
+  font-weight: 650;
+  line-height: 1;
+  transition:
+    background var(--gh-ref-duration-base) var(--gh-ref-ease-standard),
+    border-color var(--gh-ref-duration-base) var(--gh-ref-ease-standard),
+    color var(--gh-ref-duration-base) var(--gh-ref-ease-standard),
+    transform var(--gh-ref-duration-base) var(--gh-ref-ease-standard);
+}
+
+.filter-toggle:hover {
+  color: var(--gh-sys-fg);
+}
+
+.filter-toggle:active {
+  transform: scale(0.98);
+}
+
+.filter-toggle.is-active {
+  border-color: color-mix(in srgb, var(--gh-sys-primary) 30%, transparent);
+  color: var(--gh-sys-primary-text);
+  background: var(--gh-sys-primary-subtle);
+}
+
+.traffic-endpoint-cell {
+  display: grid;
+  gap: var(--gh-ref-space-2);
+}
+
+.endpoint-template {
+  min-width: 0;
+  font-family: var(--gh-ref-font-mono);
+  overflow-wrap: anywhere;
+}
+
+.numeric-cell,
+.timestamp-cell {
+  font-variant-numeric: tabular-nums;
+}
+
+.timestamp-cell {
+  color: var(--gh-sys-fg-muted);
+}
+
+.review-cell {
+  align-items: flex-start;
+}
+
+.row-action-button {
+  height: var(--gh-ref-space-8);
+  padding-inline: var(--gh-ref-space-3);
+  font-size: var(--gh-type-caption);
 }
 
 .status-panel > .logs-heading {
@@ -1118,7 +1198,8 @@ input:focus-visible {
   }
 
   .token-row,
-  .filter-grid {
+  .filter-grid,
+  .traffic-filter-grid {
     grid-template-columns: 1fr;
   }
 
