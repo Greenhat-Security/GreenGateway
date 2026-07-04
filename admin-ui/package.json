@@ -9,6 +9,7 @@
     "build": "tsc --noEmit && vite build",
     "test": "vitest --run",
     "typecheck": "tsc --noEmit",
+    "screenshots": "playwright test",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -17,6 +18,7 @@
     "react-router-dom": "^7.18.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@testing-library/react": "^16.3.2",
     "@types/node": "^24.0.15",
     "@types/react": "^19.1.8",
