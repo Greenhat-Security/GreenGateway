@@ -3060,6 +3060,7 @@ mod tests {
             audit_log_file: None,
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,
+            discovery_sqlite_path: None,
             policy_file: None,
             cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
             max_body_size: 1_048_576,

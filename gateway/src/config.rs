@@ -56,6 +56,7 @@ const CSRF_COOKIE_NAME: &str = "CSRF_COOKIE_NAME";
 const CSRF_ENABLED: &str = "CSRF_ENABLED";
 const CSRF_EXEMPT_PATHS: &str = "CSRF_EXEMPT_PATHS";
 const CSRF_HEADER_NAME: &str = "CSRF_HEADER_NAME";
+const DISCOVERY_SQLITE_PATH: &str = "DISCOVERY_SQLITE_PATH";
 const EGRESS_ALLOWED_HOSTS: &str = "EGRESS_ALLOWED_HOSTS";
 const EGRESS_CONNECT_TIMEOUT_MS: &str = "EGRESS_CONNECT_TIMEOUT_MS";
 const EGRESS_DENY_PRIVATE_IPS: &str = "EGRESS_DENY_PRIVATE_IPS";
@@ -94,6 +95,7 @@ pub struct Config {
     pub audit_log_file: Option<String>,
     pub audit_sqlite_path: Option<String>,
     pub audit_sqlite_retention_days: Option<u32>,
+    pub discovery_sqlite_path: Option<String>,
     pub policy_file: Option<String>,
     pub cors_allow_origins: Vec<String>,
     pub max_body_size: usize,
@@ -222,6 +224,11 @@ impl Config {
             AUDIT_SQLITE_RETENTION_DAYS,
             get_var(AUDIT_SQLITE_RETENTION_DAYS),
             "day count",
+            &mut problems,
+        );
+        let discovery_sqlite_path = parse_optional_string(
+            DISCOVERY_SQLITE_PATH,
+            get_var(DISCOVERY_SQLITE_PATH),
             &mut problems,
         );
         let policy_file = parse_optional_string(POLICY_FILE, get_var(POLICY_FILE), &mut problems);
@@ -466,6 +473,7 @@ impl Config {
                 audit_log_file,
                 audit_sqlite_path,
                 audit_sqlite_retention_days,
+                discovery_sqlite_path,
                 policy_file,
                 cors_allow_origins,
                 max_body_size,
@@ -1321,6 +1329,7 @@ mod tests {
         assert_eq!(config.audit_log_file, None);
         assert_eq!(config.audit_sqlite_path, None);
         assert_eq!(config.audit_sqlite_retention_days, None);
+        assert_eq!(config.discovery_sqlite_path, None);
         assert_eq!(config.policy_file, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
@@ -1474,6 +1483,7 @@ mod tests {
         assert_eq!(config.audit_log_file, None);
         assert_eq!(config.audit_sqlite_path, None);
         assert_eq!(config.audit_sqlite_retention_days, None);
+        assert_eq!(config.discovery_sqlite_path, None);
         assert_eq!(config.policy_file, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
@@ -1729,6 +1739,31 @@ mod tests {
         assert!(message.contains("AUDIT_SQLITE_RETENTION_DAYS must be a valid day count"));
         assert!(message.contains("MAX_BODY_SIZE must be a valid byte size"));
         assert_eq!(error.problems.len(), 2);
+    }
+
+    #[test]
+    fn discovery_sqlite_path_parses_optional_path() {
+        let config = Config::from_env_vars(|name| match name {
+            "DISCOVERY_SQLITE_PATH" => Ok("  /var/lib/greengateway/discovery.sqlite  ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.discovery_sqlite_path,
+            Some("/var/lib/greengateway/discovery.sqlite".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_discovery_sqlite_path_is_none() {
+        let config = Config::from_env_vars(|name| match name {
+            "DISCOVERY_SQLITE_PATH" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.discovery_sqlite_path, None);
     }
 
     #[test]
