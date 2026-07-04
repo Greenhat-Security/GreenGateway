@@ -345,7 +345,6 @@ fn app_with_process_started_at(
 ) -> Result<Router, Box<dyn std::error::Error>> {
     let request_id_header = request_id_header();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
-    let rate_limit_state = middleware::rate_limit::RateLimitState::from_config(&config);
     let observation_state =
         middleware::observation::ObservationState::from_config(&config, audit_log.clone());
     let audit_query_store = config
@@ -355,6 +354,10 @@ fn app_with_process_started_at(
         .transpose()?
         .map(Arc::new);
     let loaded_policy = rbac::Policy::from_config(&config)?;
+    let rate_limit_state = middleware::rate_limit::RateLimitState::from_config_and_policy(
+        &config,
+        loaded_policy.as_ref(),
+    );
     let egress_config = match loaded_policy.as_ref() {
         Some(policy) => {
             egress::EgressConfig::from_config_and_policy(&config, Some(&policy.egress))?
@@ -387,11 +390,10 @@ fn app_with_process_started_at(
                 route_rules = policy.routes.len(),
                 "RBAC enabled: policy file loaded"
             );
-            Some(middleware::rbac::RbacState::from_policy(
-                policy,
-                &config,
-                audit_log.clone(),
-            ))
+            Some(
+                middleware::rbac::RbacState::from_policy(policy, &config, audit_log.clone())
+                    .with_rate_limit_state(rate_limit_state.clone()),
+            )
         }
         None => {
             tracing::warn!("RBAC disabled: no policy file configured");

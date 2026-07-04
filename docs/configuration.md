@@ -58,6 +58,8 @@ Format and validation: unset, empty, or whitespace-only values become `None`. No
 
 Route rules in a policy's `routes` array are evaluated in document order. The first rule whose `path_prefix` matches the request path and whose `methods` match the request method determines the required permission.
 
+Rate-limit overrides in a policy's `rate_limits` array are also evaluated in document order, and the first matching entry wins. Each entry may constrain `principal` with the same `roles`, `auth_methods`, and `principal_ids` matcher used by direct firewall rules; omit it or use `{}` to match authenticated and unauthenticated callers. Each entry may also constrain `methods` and an absolute `path` pattern using the same whole-path anchored glob syntax as `rules[].path`: literal segments, `*`, `**`, and `{name}` captures. Matching entries must set positive `requests_per_second` and positive `burst` values. If no rate-limit entry matches, the gateway falls back to the global `RATE_LIMIT_READ_*` or `RATE_LIMIT_WRITE_*` lanes below.
+
 ### RBAC_EXEMPT_PATHS
 
 Comma-separated paths that bypass RBAC authorization.
@@ -84,7 +86,7 @@ Format and validation: must parse as a non-negative byte count that fits in `usi
 
 ### RATE_LIMIT_READ_RPS
 
-Read-lane token refill rate for `GET` and `HEAD` requests, in requests per second.
+Fallback read-lane token refill rate for `GET` and `HEAD` requests, in requests per second, used when no policy `rate_limits` override matches.
 
 Default: `50.0`
 
@@ -92,7 +94,7 @@ Format and validation: must parse as a finite non-negative `f64`. The read lane 
 
 ### RATE_LIMIT_READ_BURST
 
-Read-lane token bucket burst size for `GET` and `HEAD` requests.
+Fallback read-lane token bucket burst size for `GET` and `HEAD` requests, used when no policy `rate_limits` override matches.
 
 Default: `100`
 
@@ -100,7 +102,7 @@ Format and validation: must parse as a `u32`. A fresh read-lane bucket starts fu
 
 ### RATE_LIMIT_WRITE_RPS
 
-Write-lane token refill rate for every method other than `GET` and `HEAD`, in requests per second.
+Fallback write-lane token refill rate for every method other than `GET` and `HEAD`, in requests per second, used when no policy `rate_limits` override matches.
 
 Default: `10.0`
 
@@ -108,7 +110,7 @@ Format and validation: must parse as a finite non-negative `f64`. The write lane
 
 ### RATE_LIMIT_WRITE_BURST
 
-Write-lane token bucket burst size for every method other than `GET` and `HEAD`.
+Fallback write-lane token bucket burst size for every method other than `GET` and `HEAD`, used when no policy `rate_limits` override matches.
 
 Default: `20`
 
@@ -124,13 +126,13 @@ Format and validation: must parse as a Rust boolean, `true` or `false`. With the
 
 ### SESSION_COOKIE_NAME
 
-Optional cookie name used for session-based rate-limit keying.
+Optional cookie name used for session-based rate-limit keying when no validated principal is present on the request.
 
 Default: empty string
 
-Format and validation: any valid Unicode string is accepted. When empty, rate limiting falls back to the canonical client IP. When set and the request includes a matching cookie, the bucket key uses a non-cryptographic hash of that cookie value instead of the client IP.
+Format and validation: any valid Unicode string is accepted. When a validated `Principal` is present in request extensions, rate limiting keys on that principal's stable `user_id` first. Otherwise, when this value is set and the request includes a matching cookie, the bucket key uses a non-cryptographic hash of that cookie value instead of the client IP. When empty or absent from the request, rate limiting falls back to the canonical client IP.
 
-Security note: leave this unset (the default) unless a trusted upstream/auth layer validates the session cookie before it reaches the gateway. Otherwise, because the cookie value is client-controlled and not yet validated, a client can rotate it to evade rate limiting. Key on the canonical client IP, which is the default behavior when unset, until sessions are validated.
+Security note: leave this unset (the default) unless a trusted upstream/auth layer validates the session cookie before rate limiting sees the request. The default gateway stack runs rate limiting early, before authentication, so ordinary unauthenticated requests still use cookie or IP fallback rather than a validated `Principal`. A client-controlled, unvalidated cookie can be rotated to evade rate limiting; canonical client IP keying remains the safe default when no principal is available.
 
 ### VALIDATION_ALLOWED_CONTENT_TYPES
 

@@ -125,7 +125,7 @@ fn constraint_matches(values: &[String], matches_value: impl Fn(&str) -> bool) -
     values.is_empty() || values.iter().any(|value| matches_value(value))
 }
 
-fn method_matches(methods: &[String], method: &str) -> bool {
+pub(crate) fn method_matches(methods: &[String], method: &str) -> bool {
     methods.is_empty()
         || methods.iter().any(|configured| {
             let configured = configured.trim();
@@ -133,7 +133,7 @@ fn method_matches(methods: &[String], method: &str) -> bool {
         })
 }
 
-fn path_pattern_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn path_pattern_matches(pattern: &str, path: &str) -> bool {
     let Some(pattern_segments) = absolute_path_segments(pattern) else {
         return false;
     };
