@@ -20,6 +20,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRuntimeToolConfig {
     pub enabled: bool,
+    pub allowed_roles: Vec<String>,
     pub timeout: Duration,
     pub max_concurrent: usize,
 }
@@ -118,13 +119,33 @@ impl Default for ToolInvocationContext {
 #[allow(dead_code)] // Issue #32's tool registry and issue #33's MCP endpoint will invoke this.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolRuntimeError {
-    UnknownTool { tool_name: String },
-    Disabled { tool_name: String },
-    Rejected { tool_name: String, reason: String },
-    QueueTimeout { tool_name: String },
-    Timeout { tool_name: String },
-    Cancelled { tool_name: String },
-    WorkFailed { tool_name: String, message: String },
+    UnknownTool {
+        tool_name: String,
+    },
+    Disabled {
+        tool_name: String,
+    },
+    RoleDenied {
+        tool_name: String,
+        allowed_roles: Vec<String>,
+    },
+    Rejected {
+        tool_name: String,
+        reason: String,
+    },
+    QueueTimeout {
+        tool_name: String,
+    },
+    Timeout {
+        tool_name: String,
+    },
+    Cancelled {
+        tool_name: String,
+    },
+    WorkFailed {
+        tool_name: String,
+        message: String,
+    },
 }
 
 impl fmt::Display for ToolRuntimeError {
@@ -134,6 +155,14 @@ impl fmt::Display for ToolRuntimeError {
                 write!(formatter, "tool '{tool_name}' is not configured")
             }
             Self::Disabled { tool_name } => write!(formatter, "tool '{tool_name}' is disabled"),
+            Self::RoleDenied {
+                tool_name,
+                allowed_roles,
+            } => write!(
+                formatter,
+                "tool '{tool_name}' requires one of the allowed roles: {}",
+                allowed_roles.join(", ")
+            ),
             Self::Rejected { tool_name, reason } => {
                 write!(formatter, "tool '{tool_name}' was rejected: {reason}")
             }
@@ -415,6 +444,14 @@ impl ToolRuntime {
             });
         }
 
+        if !allowed_roles_match(&state.config.allowed_roles, context) {
+            self.emit_rejected(context, tool_name, "role_not_allowed");
+            return Err(ToolRuntimeError::RoleDenied {
+                tool_name: tool_name.to_owned(),
+                allowed_roles: state.config.allowed_roles.clone(),
+            });
+        }
+
         let queue_permit = match Arc::clone(&self.inner.queue).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -512,6 +549,7 @@ impl ToolRuntime {
             DefaultToolPolicy::Allow => Ok(ToolExecutionState {
                 config: ToolRuntimeToolConfig {
                     enabled: true,
+                    allowed_roles: Vec::new(),
                     timeout: self.inner.config.default_timeout,
                     max_concurrent: self.inner.config.max_concurrent_global,
                 },
@@ -529,6 +567,7 @@ impl ToolRuntime {
         let reason = match error {
             ToolRuntimeError::UnknownTool { .. } => "unknown_tool",
             ToolRuntimeError::Disabled { .. } => "disabled",
+            ToolRuntimeError::RoleDenied { .. } => "role_not_allowed",
             ToolRuntimeError::Rejected { reason, .. } => reason,
             ToolRuntimeError::QueueTimeout { .. } => "queue_timeout",
             ToolRuntimeError::Timeout { .. } => "timeout",
@@ -569,9 +608,26 @@ impl ToolRuntime {
 fn tool_config_from_policy(entry: &policy::ToolPolicyEntry) -> ToolRuntimeToolConfig {
     ToolRuntimeToolConfig {
         enabled: entry.enabled,
+        allowed_roles: entry.allowed_roles.clone(),
         timeout: Duration::from_millis(entry.timeout_ms),
         max_concurrent: entry.max_concurrent as usize,
     }
+}
+
+fn allowed_roles_match(allowed_roles: &[String], context: &ToolInvocationContext) -> bool {
+    if allowed_roles.is_empty() {
+        return true;
+    }
+
+    context
+        .actor
+        .as_ref()
+        .and_then(|actor| actor.roles.as_ref())
+        .is_some_and(|actor_roles| {
+            allowed_roles
+                .iter()
+                .any(|allowed_role| actor_roles.iter().any(|role| role == allowed_role))
+        })
 }
 
 fn tool_audit_payload(tool_name: &str, outcome: &'static str, reason: Option<&str>) -> Value {
@@ -638,6 +694,132 @@ mod tests {
 
         assert!(matches!(error, ToolRuntimeError::Disabled { .. }));
         assert_rejected_events(&capture, "disabled", "disabled", 1).await;
+    }
+
+    #[tokio::test]
+    async fn role_restricted_tool_requires_any_allowed_role_and_audits_rejection() {
+        let (runtime, capture) = runtime_with_tools(
+            [("tool", role_restricted_tool(100, 1, &["operator"]))],
+            2,
+            1,
+            100,
+        );
+
+        let denied = runtime
+            .execute_with_context(
+                "tool",
+                context_with_roles(&["viewer"]),
+                CancellationToken::new(),
+                || async { "should not run" },
+            )
+            .await
+            .expect_err("viewer should not satisfy operator role policy");
+
+        assert!(matches!(
+            denied,
+            ToolRuntimeError::RoleDenied {
+                ref allowed_roles,
+                ..
+            } if allowed_roles.as_slice() == ["operator"]
+        ));
+        assert_rejected_events(&capture, "tool", "role_not_allowed", 1).await;
+
+        let allowed = runtime
+            .execute_with_context(
+                "tool",
+                context_with_roles(&["viewer", "operator"]),
+                CancellationToken::new(),
+                || async { "allowed" },
+            )
+            .await
+            .expect("any overlapping role should allow invocation");
+
+        assert_eq!(allowed, "allowed");
+    }
+
+    #[tokio::test]
+    async fn empty_allowed_roles_do_not_constrain_actor_roles() {
+        let (runtime, _capture) = runtime_with_tools([("tool", enabled_tool(100, 1))], 2, 1, 100);
+
+        let empty_roles_actor = runtime
+            .execute_with_context(
+                "tool",
+                context_with_roles(&[]),
+                CancellationToken::new(),
+                || async { "empty-roles" },
+            )
+            .await
+            .expect("empty allowed_roles should accept an actor with no roles");
+        let unauthenticated = runtime
+            .execute_with_context("tool", context(), CancellationToken::new(), || async {
+                "unauthenticated"
+            })
+            .await
+            .expect("empty allowed_roles should not require authentication");
+
+        assert_eq!(empty_roles_actor, "empty-roles");
+        assert_eq!(unauthenticated, "unauthenticated");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_call_to_role_restricted_tool_is_rejected() {
+        let (runtime, capture) = runtime_with_tools(
+            [("tool", role_restricted_tool(100, 1, &["operator"]))],
+            2,
+            1,
+            100,
+        );
+
+        let error = runtime
+            .execute_with_context("tool", context(), CancellationToken::new(), || async {
+                "should not run"
+            })
+            .await
+            .expect_err("actor-less invocation should not satisfy role policy");
+
+        assert!(matches!(error, ToolRuntimeError::RoleDenied { .. }));
+        assert_rejected_events(&capture, "tool", "role_not_allowed", 1).await;
+    }
+
+    #[tokio::test]
+    async fn default_policy_controls_unlisted_tools() {
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let deny_runtime = ToolRuntime::new(
+            ToolRuntimeConfig {
+                default_policy: DefaultToolPolicy::Deny,
+                tools: HashMap::new(),
+                ..runtime_base_config()
+            },
+            audit,
+        );
+
+        let denied = deny_runtime
+            .execute_with_context("unlisted", context(), CancellationToken::new(), || async {
+                "should not run"
+            })
+            .await
+            .expect_err("default deny should reject unlisted tools");
+
+        assert!(matches!(denied, ToolRuntimeError::UnknownTool { .. }));
+        assert_rejected_events(&capture, "unlisted", "unknown_tool", 1).await;
+
+        let allow_runtime = ToolRuntime::new(
+            ToolRuntimeConfig {
+                default_policy: DefaultToolPolicy::Allow,
+                tools: HashMap::new(),
+                ..runtime_base_config()
+            },
+            AuditLog::new(Arc::new(CaptureSink::new()) as Arc<dyn AuditSink>),
+        );
+        let allowed = allow_runtime
+            .execute_with_context("unlisted", context(), CancellationToken::new(), || async {
+                "allowed"
+            })
+            .await
+            .expect("default allow should admit unlisted tools");
+
+        assert_eq!(allowed, "allowed");
     }
 
     #[tokio::test]
@@ -1081,6 +1263,7 @@ mod tests {
                 "lookup": {},
                 "report": {
                     "enabled": false,
+                    "allowed_roles": ["operator"],
                     "timeout_ms": 1500,
                     "max_concurrent": 3
                 }
@@ -1096,6 +1279,7 @@ mod tests {
             runtime_config.tools["lookup"],
             ToolRuntimeToolConfig {
                 enabled: true,
+                allowed_roles: Vec::new(),
                 timeout: Duration::from_millis(30_000),
                 max_concurrent: 8,
             }
@@ -1104,6 +1288,7 @@ mod tests {
             runtime_config.tools["report"],
             ToolRuntimeToolConfig {
                 enabled: false,
+                allowed_roles: vec!["operator".to_owned()],
                 timeout: Duration::from_millis(1500),
                 max_concurrent: 3,
             }
@@ -1139,6 +1324,7 @@ mod tests {
     fn enabled_tool(timeout_ms: u64, max_concurrent: usize) -> ToolRuntimeToolConfig {
         ToolRuntimeToolConfig {
             enabled: true,
+            allowed_roles: Vec::new(),
             timeout: Duration::from_millis(timeout_ms),
             max_concurrent,
         }
@@ -1147,8 +1333,36 @@ mod tests {
     fn disabled_tool(timeout_ms: u64, max_concurrent: usize) -> ToolRuntimeToolConfig {
         ToolRuntimeToolConfig {
             enabled: false,
+            allowed_roles: Vec::new(),
             timeout: Duration::from_millis(timeout_ms),
             max_concurrent,
+        }
+    }
+
+    fn role_restricted_tool(
+        timeout_ms: u64,
+        max_concurrent: usize,
+        allowed_roles: &[&str],
+    ) -> ToolRuntimeToolConfig {
+        ToolRuntimeToolConfig {
+            enabled: true,
+            allowed_roles: allowed_roles
+                .iter()
+                .map(|role| (*role).to_owned())
+                .collect(),
+            timeout: Duration::from_millis(timeout_ms),
+            max_concurrent,
+        }
+    }
+
+    fn runtime_base_config() -> ToolRuntimeConfig {
+        ToolRuntimeConfig {
+            max_queue: 2,
+            queue_timeout: Duration::from_millis(100),
+            max_concurrent_global: 1,
+            default_policy: DefaultToolPolicy::Deny,
+            default_timeout: Duration::from_millis(100),
+            tools: HashMap::new(),
         }
     }
 
@@ -1157,6 +1371,18 @@ mod tests {
             request_id: "request-test".to_owned(),
             source_ip: "127.0.0.1".to_owned(),
             actor: None,
+        }
+    }
+
+    fn context_with_roles(roles: &[&str]) -> ToolInvocationContext {
+        ToolInvocationContext {
+            request_id: "request-test".to_owned(),
+            source_ip: "127.0.0.1".to_owned(),
+            actor: Some(Actor {
+                user_id: "user-123".to_owned(),
+                roles: Some(roles.iter().map(|role| (*role).to_owned()).collect()),
+                auth_mode: "bearer_token".to_owned(),
+            }),
         }
     }
 
