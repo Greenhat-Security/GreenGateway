@@ -65,6 +65,19 @@
       "methods": ["POST"],
       "path_prefix": "/__dev-echo",
       "permission": "dev:proxy:echo"
+    },
+    {
+      "methods": ["POST"],
+      "path_prefix": "/mcp",
+      "permission": "admin:mcp:use"
     }
-  ]
+  ],
+  "tools": {
+    "echo": {
+      "allowed_roles": ["admin"]
+    },
+    "get_widget": {
+      "allowed_roles": ["admin"]
+    }
+  }
 }
