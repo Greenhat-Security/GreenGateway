@@ -30,7 +30,23 @@ Format and validation: must be a non-root URI path prefix that starts with `/`, 
 
 With the default, the admin UI remains at `/admin` and the existing admin APIs remain under `/v1/admin`, including `/v1/admin/audit`, `/v1/admin/events/stream`, `/v1/admin/status`, `/v1/admin/policy`, `/v1/admin/policy/history`, `/v1/admin/policy/rollback/{version}`, `/v1/admin/policy/validate`, the policy rule-management routes under `/v1/admin/policy/rules`, the token-management routes under `/v1/admin/tokens`, the schema routes `/v1/admin/schema/coverage` and `/v1/admin/schema/inferred`, `/v1/admin/signals`, the signal transition routes under `/v1/admin/signals/{id}`, the traffic inventory routes `/v1/admin/traffic/endpoints`, `/v1/admin/traffic/endpoint`, and `/v1/admin/traffic/endpoints/review`, and the principal directory routes `/v1/admin/principals` and `/v1/admin/principal`. When `ADMIN_PREFIX` is changed, the admin UI moves to the new prefix and the admin APIs move to the corresponding `/v1{ADMIN_PREFIX}` prefix: for example, `ADMIN_PREFIX=/ops` serves the UI at `/ops` and admin APIs at `/v1/ops/audit`, `/v1/ops/events/stream`, `/v1/ops/status`, `/v1/ops/policy`, `/v1/ops/policy/history`, `/v1/ops/policy/rollback/{version}`, `/v1/ops/policy/validate`, `/v1/ops/policy/rules`, `/v1/ops/tokens`, `/v1/ops/schema/coverage`, `/v1/ops/schema/inferred`, `/v1/ops/signals`, `/v1/ops/signals/{id}/acknowledge`, `/v1/ops/signals/{id}/dismiss`, `/v1/ops/traffic/endpoints`, `/v1/ops/traffic/endpoint`, `/v1/ops/traffic/endpoints/review`, `/v1/ops/principals`, and `/v1/ops/principal`. The default `/admin` path and default `/v1/admin/*` API paths are no longer intercepted in that mode, so they can fall through to the reverse proxy when `UPSTREAM_URL` is configured.
 
-The default `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` include the effective `ADMIN_PREFIX` so the static admin UI shell can load before an operator pastes a token. Admin APIs remain protected by authentication and endpoint-specific authorization checks.
+When `ADMIN_LOGIN_PROVIDER` is set, the admin OIDC login routes are also registered under the effective API prefix: `/v1{ADMIN_PREFIX}/auth/login` starts the browser redirect to the identity provider, and `/v1{ADMIN_PREFIX}/auth/callback` receives the authorization-code callback.
+
+The default `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` include the effective `ADMIN_PREFIX` so the static admin UI shell can load before an operator pastes a token. When `ADMIN_LOGIN_PROVIDER` is set, they also include `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` so an unauthenticated browser can complete the login flow. Other admin APIs remain protected by authentication and endpoint-specific authorization checks.
+
+### ADMIN_LOGIN_PROVIDER
+
+Optional name of the `AUTH_PROVIDERS` entry used for admin UI OIDC login.
+
+Default: empty, which disables the SSO login button and leaves the existing manual bearer-token paste flow unchanged.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must exactly match an `AUTH_PROVIDERS[].name` entry whose `type` is `jwt`. The selected provider must set `issuer`, `client_id`, `client_secret`, and `redirect_uri`; startup fails closed with the normal aggregated configuration error if any of those are missing or if the named provider does not exist. `ADMIN_LOGIN_PROVIDER` does not use `cookie_session` providers.
+
+At startup, GreenGateway fetches the selected provider's OIDC discovery document from `{issuer}/.well-known/openid-configuration`. In addition to the `jwks_uri` used by bearer-token validation, the discovery document must include `authorization_endpoint` and `token_endpoint`. Missing discovery fields or discovery failures prevent startup rather than silently disabling SSO.
+
+The admin UI login flow uses OAuth2 authorization-code with PKCE. `GET /v1{ADMIN_PREFIX}/auth/login` creates a short-lived in-memory pending login state, generates a PKCE S256 challenge, and redirects the browser to the discovered `authorization_endpoint` with `scope=openid email profile`. `GET /v1{ADMIN_PREFIX}/auth/callback` consumes that state exactly once, exchanges the returned `code` at the discovered `token_endpoint` through the shared egress client, and returns the resulting `access_token` to the admin UI in a URL fragment: `{ADMIN_PREFIX}/#/auth/complete?token=...`. The admin UI stores that token through the same `sessionStorage` helper used by the manual paste flow and then clears the fragment from the address bar.
+
+The pending-login state is intentionally process-local and bounded in memory. It is suitable for a single GreenGateway instance; multi-instance deployments need sticky routing or a future shared state store for the login callback.
 
 ### AUDIT_LOG_FILE
 
@@ -464,7 +480,7 @@ Comma-separated paths that bypass RBAC authorization.
 
 Default: `/health,/version,/metrics,/admin`
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/version,/metrics` plus the effective `ADMIN_PREFIX`. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without RBAC permission checks and do not emit authz audit events.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without RBAC permission checks and do not emit authz audit events.
 
 ### CORS_ALLOW_ORIGINS
 
@@ -570,7 +586,7 @@ Comma-separated paths that bypass authentication.
 
 Default: `/health,/version,/metrics,/admin`
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/version,/metrics` plus the effective `ADMIN_PREFIX`. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without credential extraction and do not emit auth audit events.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without credential extraction and do not emit auth audit events.
 
 ### AUTH_PROVIDERS
 
@@ -580,13 +596,15 @@ Default: empty, which means the legacy single-provider `JWT_*` settings below ar
 
 Format and validation: unset, empty, or whitespace-only values use the legacy fallback. Non-empty values must be a JSON array. Each entry must include a non-empty unique `name` and `type` set to `jwt` or `cookie_session`.
 
-For `type:"jwt"`, each entry must set at least one of `jwks_url` or `issuer`. Optional fields are `audience`, `jwks_timeout_ms`, `require_jti`, `roles_claim`, `roles_claim_delimiter`, and `org_claim`. `jwks_url`, `issuer`, `audience`, and `org_claim` are trimmed, and blank values are treated as unset. `roles_claim_delimiter` preserves its exact configured value so a single space can split OAuth2-style scope strings; an empty delimiter is treated as unset. `jwks_timeout_ms` defaults to `2000`, `require_jti` defaults to `false`, and `roles_claim` defaults to `roles`.
+For `type:"jwt"`, each entry must set at least one of `jwks_url` or `issuer`. Optional fields are `audience`, `jwks_timeout_ms`, `require_jti`, `roles_claim`, `roles_claim_delimiter`, `org_claim`, `client_id`, `client_secret`, and `redirect_uri`. The OAuth client fields are ignored unless `ADMIN_LOGIN_PROVIDER` names that provider; when selected for admin login, `client_id`, `client_secret`, and `redirect_uri` are required and the provider must use OIDC discovery through `issuer`. `jwks_url`, `issuer`, `audience`, `org_claim`, `client_id`, `client_secret`, and `redirect_uri` are trimmed, and blank values are treated as unset. `roles_claim_delimiter` preserves its exact configured value so a single space can split OAuth2-style scope strings; an empty delimiter is treated as unset. `jwks_timeout_ms` defaults to `2000`, `require_jti` defaults to `false`, and `roles_claim` defaults to `roles`.
 
 For `type:"cookie_session"`, each entry must set `introspection_url` and `user_id_claim`. Optional fields are `introspection_timeout_ms`, `cache_ttl_ms`, `email_claim`, `org_claim`, `roles_claim`, and `roles_claim_delimiter`. `introspection_timeout_ms` defaults to `2000`; `cache_ttl_ms` defaults to `5000` and must be greater than `0`; `roles_claim` defaults to `roles`. Cookie-session-irrelevant JWT fields and JWT-irrelevant cookie-session fields are accepted by the flat JSON schema but ignored for the wrong provider type, so they do not affect validator construction or egress allowlisting.
 
 Example with OIDC discovery: `[{"name":"primary","type":"jwt","issuer":"https://idp.example.com","audience":"greengateway","roles_claim":"roles","require_jti":false}]`
 
 Example with an explicit JWKS endpoint: `[{"name":"primary","type":"jwt","jwks_url":"https://idp.example.com/.well-known/jwks.json","issuer":"https://idp.example.com","audience":"greengateway","roles_claim":"roles","require_jti":false}]`
+
+Admin UI OIDC login uses the same provider object. Add standard OAuth client settings to the jwt provider and set `ADMIN_LOGIN_PROVIDER` to its `name`: `[{"name":"primary","type":"jwt","issuer":"https://idp.example.com","audience":"greengateway","roles_claim":"roles","client_id":"greengateway-admin","client_secret":"placeholder-secret","redirect_uri":"https://gateway.example.com/v1/admin/auth/callback"}]`
 
 Claim mapping: `roles_claim`, `org_claim`, and cookie-session-only `user_id_claim`/`email_claim` first resolve the configured value as an exact top-level JSON key. Only when no exact key exists and the configured value contains `.` does GreenGateway walk it as a dotted path through nested JSON objects. This preserves Auth0-style namespaced URL claims such as `https://myapp.example.com/roles`, where dots are part of the literal claim key, while still supporting nested IdP shapes such as Keycloak `realm_access.roles`. Role arrays must contain only strings. String-valued role claims are split only when `roles_claim_delimiter` is set; each split piece is trimmed and empty pieces are dropped. `org_claim` is used only when it resolves to a string.
 
@@ -604,11 +622,11 @@ Provider-specific setup recipes for Keycloak, Auth0, Microsoft Entra ID, and Okt
 
 When `AUTH_PROVIDERS` is set, it defines the ordered auth provider chain and takes precedence over the legacy single-provider JWT settings for validator assembly. The legacy settings remain supported for backward compatibility.
 
-OIDC discovery: when a provider has `issuer` but no `jwks_url`, startup fetches `{issuer}/.well-known/openid-configuration` through the egress client, adds the returned `jwks_uri` host to the effective egress allowlist, and uses that `jwks_uri` for later JWKS refreshes. Discovery failure or a discovery document without `jwks_uri` prevents the provider from being constructed.
+OIDC discovery: when a provider has `issuer` but no `jwks_url`, startup fetches `{issuer}/.well-known/openid-configuration` through the egress client, adds the returned `jwks_uri` host to the effective egress allowlist, and uses that `jwks_uri` for later JWKS refreshes. Discovery failure or a discovery document without `jwks_uri` prevents the provider from being constructed. When the provider is selected by `ADMIN_LOGIN_PROVIDER`, the same discovery response must also contain `authorization_endpoint` and `token_endpoint`; the token endpoint host is added to the effective egress allowlist for the authorization-code exchange.
 
 JWT algorithms: JWKS keys with `kty` `RSA` validate RS256 tokens, `kty` `EC` with `crv` `P-256` validates ES256 tokens, and `kty` `OKP` with `crv` `Ed25519` validates EdDSA tokens. Unsupported or incomplete keys are skipped during JWKS refresh.
 
-Egress trust: each JWT provider `jwks_url`, each JWT provider `issuer` when it is a URL with a host, each discovered OIDC `jwks_uri` host, and each cookie-session provider `introspection_url` host are automatically trusted for gateway-originated egress. Private-IP, scheme, port, and DNS-pinning checks still apply to every discovery, JWKS, and introspection request.
+Egress trust: each JWT provider `jwks_url`, each JWT provider `issuer` when it is a URL with a host, each discovered OIDC `jwks_uri` host, the discovered admin-login `token_endpoint` host, and each cookie-session provider `introspection_url` host are automatically trusted for gateway-originated egress. Private-IP, scheme, port, and DNS-pinning checks still apply to every discovery, JWKS, token-exchange, and introspection request.
 
 ### JWT_JWKS_URL
 
@@ -865,7 +883,7 @@ Default: empty list, which denies all egress requests.
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, lowercase entries, and require each entry to be an ASCII hostname without a port. Configure only hostnames, not URLs. The egress client still blocks private resolved IP ranges by default even when a hostname is allowlisted.
 
-Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, every `UPSTREAM_ROUTES[].upstream_url`, configured `AUTH_PROVIDERS[].jwks_url` values, URL-shaped `AUTH_PROVIDERS[].issuer` values, OIDC-discovered `jwks_uri` hosts, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to configured upstreams, fetch OIDC discovery documents, or validate tokens without duplicating those hosts here.
+Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, every `UPSTREAM_ROUTES[].upstream_url`, configured `AUTH_PROVIDERS[].jwks_url` values, URL-shaped `AUTH_PROVIDERS[].issuer` values, OIDC-discovered `jwks_uri` hosts, the discovered admin-login `token_endpoint` host, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to configured upstreams, fetch OIDC discovery documents, validate tokens, or exchange admin-login authorization codes without duplicating those hosts here.
 
 ### EGRESS_TIMEOUT_MS
 

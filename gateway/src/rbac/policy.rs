@@ -2020,6 +2020,7 @@ mod tests {
                 .expect("test listen address should parse"),
             admin_listen_addr: None,
             admin_prefix: "/admin".to_owned(),
+            admin_login_provider: None,
             audit_log_file: None,
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,

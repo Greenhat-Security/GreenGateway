@@ -1,13 +1,22 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AdminShell } from './App';
+import { ADMIN_TOKEN_STORAGE_KEY } from './lib/auth';
 
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   window.localStorage.removeItem('greengateway_admin_theme');
+  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  window.history.replaceState(null, '', '/');
   delete document.documentElement.dataset.theme;
 });
 
@@ -47,6 +56,57 @@ describe('AdminShell', () => {
     expect(
       screen.getByRole('button', { name: 'Switch to light theme' }),
     ).toBeTruthy();
+  });
+
+  it('stores an OIDC completion fragment token and clears the fragment', async () => {
+    vi.stubGlobal('fetch', versionFetchMock(false));
+    window.history.replaceState(
+      null,
+      '',
+      '/admin/#/auth/complete?token=oidc-fragment-token',
+    );
+
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => {
+      expect(window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY)).toBe(
+        'oidc-fragment-token',
+      );
+    });
+    expect(window.location.hash).toBe('');
+    expect(
+      screen.getByText('Signed in with SSO for this browser session.'),
+    ).toBeTruthy();
+  });
+
+  it('hides the SSO login link when admin login is not configured', async () => {
+    vi.stubGlobal('fetch', versionFetchMock(false));
+
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/version'));
+    expect(screen.queryByRole('link', { name: 'Log in with SSO' })).toBeNull();
+  });
+
+  it('shows the SSO login link when admin login is configured', async () => {
+    vi.stubGlobal('fetch', versionFetchMock(true));
+
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    const link = await screen.findByRole('link', { name: 'Log in with SSO' });
+    expect(link.getAttribute('href')).toBe('/v1/admin/auth/login');
   });
 
   it('registers the traffic inventory route and navigation entry', async () => {
@@ -404,6 +464,30 @@ function policyShadowReviewFetchMock() {
             scanned_event_count: 0,
             scan_truncated: false,
             rules: [],
+          }),
+          {
+            status: 200,
+            headers: {
+              'Content-Type': 'application/json',
+            },
+          },
+        ),
+      );
+    }
+
+    return Promise.reject(new Error(`unexpected fetch: ${url.pathname}`));
+  });
+}
+
+function versionFetchMock(adminLoginConfigured: boolean) {
+  return vi.fn((input: RequestInfo | URL) => {
+    const url = new URL(String(input), 'http://localhost');
+    if (url.pathname === '/version') {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            version: '0.5.0',
+            admin_login_configured: adminLoginConfigured,
           }),
           {
             status: 200,

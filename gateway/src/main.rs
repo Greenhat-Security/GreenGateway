@@ -52,6 +52,8 @@ const ADMIN_UI_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src '
 const DEFAULT_ADMIN_API_PREFIX: &str = "/v1/admin";
 const AUDIT_ADMIN_ROUTE: &str = "/v1/admin/audit";
 const AUDIT_EVENTS_STREAM_ROUTE: &str = "/v1/admin/events/stream";
+const ADMIN_AUTH_LOGIN_ROUTE: &str = "/v1/admin/auth/login";
+const ADMIN_AUTH_CALLBACK_ROUTE: &str = "/v1/admin/auth/callback";
 const STATUS_ADMIN_ROUTE: &str = "/v1/admin/status";
 const POLICY_ADMIN_ROUTE: &str = "/v1/admin/policy";
 const POLICY_HISTORY_ADMIN_ROUTE: &str = "/v1/admin/policy/history";
@@ -117,6 +119,7 @@ struct AppState {
     metrics_handle: PrometheusHandle,
     proxy: Option<ProxyState>,
     routes: GatewayRoutes,
+    admin_login_configured: bool,
 }
 
 #[derive(Clone)]
@@ -177,6 +180,8 @@ struct AdminRoutes {
     api_prefix: String,
     audit_route: String,
     events_stream_route: String,
+    auth_login_route: String,
+    auth_callback_route: String,
     status_route: String,
     policy_route: String,
     policy_history_route: String,
@@ -249,6 +254,8 @@ impl AdminRoutes {
             ui_asset_route: format!("{admin_prefix}/{{*path}}"),
             audit_route: format!("{api_prefix}/audit"),
             events_stream_route: format!("{api_prefix}/events/stream"),
+            auth_login_route: format!("{api_prefix}/auth/login"),
+            auth_callback_route: format!("{api_prefix}/auth/callback"),
             status_route: format!("{api_prefix}/status"),
             policy_route: format!("{api_prefix}/policy"),
             policy_history_route: format!("{api_prefix}/policy/history"),
@@ -318,6 +325,12 @@ struct TokenAdminState {
 }
 
 #[derive(Clone)]
+struct AdminAuthState {
+    login: auth::OidcLoginState,
+    admin_prefix: String,
+}
+
+#[derive(Clone)]
 struct SchemaAdminState {
     coverage: discovery::openapi::SchemaCoverage,
     query_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
@@ -360,6 +373,7 @@ struct PrincipalAdminState {
 #[derive(Clone)]
 struct AdminApiStates {
     audit: AuditAdminState,
+    auth: Option<AdminAuthState>,
     status: StatusAdminState,
     policy: PolicyAdminState,
     tokens: TokenAdminState,
@@ -422,6 +436,7 @@ struct UpstreamHealthSnapshot {
 #[derive(Serialize)]
 struct VersionResponse {
     version: &'static str,
+    admin_login_configured: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -481,6 +496,13 @@ struct AuditQueryParams {
     status: Option<String>,
     limit: Option<String>,
     before_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AdminAuthCallbackParams {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -846,6 +868,19 @@ enum GatewayApp {
     Split { data: Router, admin: Router },
 }
 
+#[derive(Default)]
+struct DiscoveredOidcConfig {
+    jwks_urls: HashMap<String, String>,
+    admin_login: Option<DiscoveredAdminLoginEndpoints>,
+}
+
+#[derive(Clone)]
+struct DiscoveredAdminLoginEndpoints {
+    provider_name: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+}
+
 #[derive(Clone)]
 struct MiddlewareStack {
     config: config::Config,
@@ -1043,9 +1078,8 @@ fn gateway_app_with_process_started_at(
         None => egress::EgressConfig::from_config(&config),
     };
     let discovery_egress_client = Arc::new(egress::EgressClient::new(egress_config.clone())?);
-    let discovered_oidc_jwks_urls =
-        discover_oidc_jwks_urls_from_config(&config, discovery_egress_client)?;
-    auto_seed_discovered_oidc_jwks_hosts(&mut egress_config, &discovered_oidc_jwks_urls);
+    let discovered_oidc = discover_oidc_from_config(&config, discovery_egress_client)?;
+    auto_seed_discovered_oidc_hosts(&mut egress_config, &discovered_oidc);
     let egress_allowed_hosts_count = egress_config.allowed_host_rule_count();
     let proxy_egress_config = {
         let mut proxy_egress_config = egress_config.clone();
@@ -1073,10 +1107,12 @@ fn gateway_app_with_process_started_at(
     });
     let validator = auth_validator_from_config(
         &config,
-        egress_client,
+        Arc::clone(&egress_client),
         service_token_validator.clone(),
-        &discovered_oidc_jwks_urls,
+        &discovered_oidc.jwks_urls,
     )?;
+    let admin_auth_state =
+        admin_auth_state_from_config(&config, &discovered_oidc, Arc::clone(&egress_client))?;
     let principal_directory = auth::PrincipalDirectory::from_config(&config)?;
     let rbac_status = RbacStatus {
         policy_loaded: loaded_policy.is_some(),
@@ -1163,6 +1199,7 @@ fn gateway_app_with_process_started_at(
         metrics_handle,
         proxy: proxy_state,
         routes: routes.clone(),
+        admin_login_configured: admin_auth_state.is_some(),
     };
     let audit_admin_state = AuditAdminState {
         query_store: audit_query_store,
@@ -1194,6 +1231,7 @@ fn gateway_app_with_process_started_at(
     };
     let admin_api_states = AdminApiStates {
         audit: audit_admin_state,
+        auth: admin_auth_state,
         status: status_state,
         policy: policy_admin_state,
         tokens: token_admin_state,
@@ -1280,49 +1318,179 @@ fn auth_validator_from_config(
     ))
 }
 
-fn discover_oidc_jwks_urls_from_config(
+fn admin_auth_state_from_config(
+    config: &config::Config,
+    discovered_oidc: &DiscoveredOidcConfig,
+    egress_client: Arc<egress::EgressClient>,
+) -> Result<Option<AdminAuthState>, auth::AuthError> {
+    let Some(admin_login_provider) = config.admin_login_provider.as_deref() else {
+        return Ok(None);
+    };
+    let provider = config
+        .auth_providers
+        .iter()
+        .find(|provider| provider.name == admin_login_provider)
+        .ok_or_else(|| {
+            auth::AuthError::Upstream(format!(
+                "ADMIN_LOGIN_PROVIDER references unknown auth provider '{admin_login_provider}'"
+            ))
+        })?;
+    let endpoints = discovered_oidc
+        .admin_login
+        .as_ref()
+        .filter(|endpoints| endpoints.provider_name == provider.name)
+        .ok_or_else(|| {
+            auth::AuthError::Upstream(format!(
+                "ADMIN_LOGIN_PROVIDER '{}' is missing discovered OIDC login endpoints",
+                provider.name
+            ))
+        })?;
+
+    let login_config = auth::OidcLoginConfig {
+        client_id: required_admin_login_provider_field(provider, "client_id", &provider.client_id)?,
+        client_secret: required_admin_login_provider_field(
+            provider,
+            "client_secret",
+            &provider.client_secret,
+        )?,
+        redirect_uri: required_admin_login_provider_field(
+            provider,
+            "redirect_uri",
+            &provider.redirect_uri,
+        )?,
+        authorization_endpoint: endpoints.authorization_endpoint.clone(),
+        token_endpoint: endpoints.token_endpoint.clone(),
+        http_timeout: Duration::from_millis(provider.jwks_timeout_ms),
+    };
+
+    Ok(Some(AdminAuthState {
+        login: auth::OidcLoginState::new(login_config, egress_client),
+        admin_prefix: config.admin_prefix.clone(),
+    }))
+}
+
+fn required_admin_login_provider_field(
+    provider: &config::AuthProviderConfig,
+    field_name: &str,
+    value: &Option<String>,
+) -> Result<String, auth::AuthError> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            auth::AuthError::Upstream(format!(
+                "admin login provider '{}' is missing {field_name}",
+                provider.name
+            ))
+        })
+}
+
+fn discover_oidc_from_config(
     config: &config::Config,
     egress_client: Arc<egress::EgressClient>,
-) -> Result<HashMap<String, String>, auth::AuthError> {
-    let mut discovered = HashMap::new();
+) -> Result<DiscoveredOidcConfig, auth::AuthError> {
+    let mut discovered = DiscoveredOidcConfig::default();
 
     for provider in &config.auth_providers {
-        match provider.provider_type {
-            config::AuthProviderType::Jwt if provider.jwks_url.is_none() => {
-                let issuer = provider.issuer.as_deref().ok_or_else(|| {
-                    auth::AuthError::Upstream(format!(
-                        "JWT auth provider '{}' is missing jwks_url and issuer",
-                        provider.name
-                    ))
-                })?;
-                let jwks_url = auth::oidc::discover_jwks_uri_blocking(
-                    issuer,
-                    Duration::from_millis(provider.jwks_timeout_ms),
-                    Arc::clone(&egress_client),
-                )?;
-                discovered.insert(provider.name.clone(), jwks_url);
-            }
-            config::AuthProviderType::Jwt => {}
-            config::AuthProviderType::CookieSession => {}
+        if provider.provider_type != config::AuthProviderType::Jwt {
+            continue;
+        }
+        let is_admin_login_provider = config
+            .admin_login_provider
+            .as_deref()
+            .is_some_and(|name| name == provider.name);
+        if provider.jwks_url.is_some() && !is_admin_login_provider {
+            continue;
+        }
+
+        let issuer = provider.issuer.as_deref().ok_or_else(|| {
+            auth::AuthError::Upstream(format!(
+                "JWT auth provider '{}' is missing jwks_url and issuer",
+                provider.name
+            ))
+        })?;
+        if !is_admin_login_provider {
+            let jwks_url = auth::oidc::discover_jwks_uri_blocking(
+                issuer,
+                Duration::from_millis(provider.jwks_timeout_ms),
+                Arc::clone(&egress_client),
+            )?;
+            discovered.jwks_urls.insert(provider.name.clone(), jwks_url);
+            continue;
+        }
+
+        let document = auth::oidc::discover_document_blocking(
+            issuer,
+            Duration::from_millis(provider.jwks_timeout_ms),
+            Arc::clone(&egress_client),
+        )?;
+
+        if provider.jwks_url.is_none() {
+            let jwks_url = document.jwks_uri().ok_or_else(|| {
+                auth::AuthError::Upstream("OIDC discovery response missing jwks_uri".to_owned())
+            })?;
+            discovered.jwks_urls.insert(provider.name.clone(), jwks_url);
+        }
+
+        if is_admin_login_provider {
+            let authorization_endpoint = document.authorization_endpoint().ok_or_else(|| {
+                auth::AuthError::Upstream(
+                    "OIDC discovery response missing authorization_endpoint".to_owned(),
+                )
+            })?;
+            let token_endpoint = document.token_endpoint().ok_or_else(|| {
+                auth::AuthError::Upstream(
+                    "OIDC discovery response missing token_endpoint".to_owned(),
+                )
+            })?;
+            discovered.admin_login = Some(DiscoveredAdminLoginEndpoints {
+                provider_name: provider.name.clone(),
+                authorization_endpoint,
+                token_endpoint,
+            });
+        }
+    }
+
+    if let Some(admin_login_provider) = config.admin_login_provider.as_deref() {
+        if discovered.admin_login.is_none() {
+            return Err(auth::AuthError::Upstream(format!(
+                "ADMIN_LOGIN_PROVIDER '{admin_login_provider}' could not be resolved through OIDC discovery"
+            )));
         }
     }
 
     Ok(discovered)
 }
 
-fn auto_seed_discovered_oidc_jwks_hosts(
+#[cfg(test)]
+fn discover_oidc_jwks_urls_from_config(
+    config: &config::Config,
+    egress_client: Arc<egress::EgressClient>,
+) -> Result<HashMap<String, String>, auth::AuthError> {
+    discover_oidc_from_config(config, egress_client).map(|discovered| discovered.jwks_urls)
+}
+
+fn auto_seed_discovered_oidc_hosts(
     egress_config: &mut egress::EgressConfig,
-    discovered_oidc_jwks_urls: &HashMap<String, String>,
+    discovered_oidc: &DiscoveredOidcConfig,
 ) {
-    let auto_seeded_hosts = discovered_oidc_jwks_urls
+    let mut auto_seeded_hosts = discovered_oidc
+        .jwks_urls
         .values()
         .filter_map(|jwks_url| egress_config.auto_seed_endpoint_host(jwks_url))
         .collect::<Vec<_>>();
+    if let Some(admin_login) = &discovered_oidc.admin_login {
+        if let Some(host) = egress_config.auto_seed_endpoint_host(&admin_login.token_endpoint) {
+            auto_seeded_hosts.push(host);
+        }
+    }
 
     if !auto_seeded_hosts.is_empty() {
         tracing::debug!(
             hosts = ?auto_seeded_hosts,
-            "auto-seeded egress allowlist from discovered OIDC JWKS endpoints"
+            "auto-seeded egress allowlist from discovered OIDC endpoints"
         );
     }
 }
@@ -1423,6 +1591,7 @@ fn add_admin_api_routes(
                 .route(routes.admin.status_route.as_str(), get(status_endpoint))
                 .with_state(admin_api_states.status),
         )
+        .merge(admin_auth_router(routes, admin_api_states.auth))
         .merge(
             Router::new()
                 .route(
@@ -1559,6 +1728,23 @@ fn add_admin_api_routes(
                 )
                 .with_state(admin_api_states.traffic),
         )
+}
+
+fn admin_auth_router(routes: &GatewayRoutes, state: Option<AdminAuthState>) -> Router {
+    let Some(state) = state else {
+        return Router::new();
+    };
+
+    Router::new()
+        .route(
+            routes.admin.auth_login_route.as_str(),
+            get(admin_auth_login_endpoint),
+        )
+        .route(
+            routes.admin.auth_callback_route.as_str(),
+            get(admin_auth_callback_endpoint),
+        )
+        .with_state(state)
 }
 
 fn apply_middleware(router: Router, stack: &MiddlewareStack) -> Router {
@@ -1781,10 +1967,11 @@ fn rfc3339_timestamp(timestamp: OffsetDateTime) -> String {
     }
 }
 
-async fn version() -> Json<VersionResponse> {
+async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
     record_request("/version");
     Json(VersionResponse {
         version: env!("CARGO_PKG_VERSION"),
+        admin_login_configured: state.admin_login_configured,
     })
 }
 
@@ -2352,6 +2539,97 @@ fn payload_too_large(max_body_size: usize) -> Response {
         })),
     )
         .into_response()
+}
+
+async fn admin_auth_login_endpoint(State(state): State<AdminAuthState>) -> Response {
+    record_request(ADMIN_AUTH_LOGIN_ROUTE);
+
+    match state.login.begin_login() {
+        Ok(start) => found_redirect(start.authorization_url),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to start admin OIDC login");
+            found_redirect(admin_auth_error_url(
+                &state.admin_prefix,
+                "login_start_failed",
+            ))
+        }
+    }
+}
+
+async fn admin_auth_callback_endpoint(
+    State(state): State<AdminAuthState>,
+    Query(params): Query<AdminAuthCallbackParams>,
+) -> Response {
+    record_request(ADMIN_AUTH_CALLBACK_ROUTE);
+
+    if params.error.is_some() {
+        return found_redirect(admin_auth_error_url(&state.admin_prefix, "provider_error"));
+    }
+
+    let Some(code) = params
+        .code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+    else {
+        return found_redirect(admin_auth_error_url(&state.admin_prefix, "missing_code"));
+    };
+    let Some(oauth_state) = params
+        .state
+        .as_deref()
+        .map(str::trim)
+        .filter(|state| !state.is_empty())
+    else {
+        return found_redirect(admin_auth_error_url(&state.admin_prefix, "invalid_state"));
+    };
+
+    match state.login.exchange_code(code, oauth_state).await {
+        Ok(exchange) => found_redirect(admin_auth_complete_url(
+            &state.admin_prefix,
+            &exchange.access_token,
+        )),
+        Err(err) if err.is_invalid_state() => {
+            tracing::warn!("admin OIDC callback rejected unknown or expired state");
+            found_redirect(admin_auth_error_url(&state.admin_prefix, "invalid_state"))
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "admin OIDC token exchange failed");
+            found_redirect(admin_auth_error_url(
+                &state.admin_prefix,
+                "token_exchange_failed",
+            ))
+        }
+    }
+}
+
+fn found_redirect(location: String) -> Response {
+    match HeaderValue::from_str(&location) {
+        Ok(location) => (StatusCode::FOUND, [(header::LOCATION, location)]).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to build redirect Location header");
+            internal_server_error("redirect location was invalid")
+        }
+    }
+}
+
+fn admin_auth_complete_url(admin_prefix: &str, token: &str) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("token", token);
+    format!(
+        "{}/#/auth/complete?{}",
+        admin_prefix.trim_end_matches('/'),
+        serializer.finish()
+    )
+}
+
+fn admin_auth_error_url(admin_prefix: &str, error: &str) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("error", error);
+    format!(
+        "{}/#/auth/error?{}",
+        admin_prefix.trim_end_matches('/'),
+        serializer.finish()
+    )
 }
 
 async fn status_endpoint(
@@ -6328,7 +6606,7 @@ mod tests {
         io::{Read, Write},
         net::{IpAddr, Ipv4Addr},
         path::PathBuf,
-        sync::Arc,
+        sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -6348,6 +6626,7 @@ mod tests {
                 .expect("test listen address should parse"),
             admin_listen_addr: None,
             admin_prefix: config::DEFAULT_ADMIN_PREFIX.to_owned(),
+            admin_login_provider: None,
             audit_log_file: None,
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,
@@ -6660,6 +6939,270 @@ mod tests {
         });
 
         addr
+    }
+
+    struct MockOidcDiscoveryEndpoint {
+        issuer: String,
+        authorization_endpoint: String,
+        handle: std::thread::JoinHandle<usize>,
+    }
+
+    impl MockOidcDiscoveryEndpoint {
+        fn finish(self) {
+            assert_eq!(
+                self.handle
+                    .join()
+                    .expect("mock OIDC discovery endpoint should finish"),
+                1
+            );
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockOidcTokenState {
+        access_token: Arc<Mutex<Option<String>>>,
+        requests: Arc<Mutex<Vec<CapturedTokenRequest>>>,
+    }
+
+    #[derive(Clone)]
+    struct MockOidcTokenEndpoint {
+        url: String,
+        access_token: Arc<Mutex<Option<String>>>,
+        requests: Arc<Mutex<Vec<CapturedTokenRequest>>>,
+        handle: Arc<tokio::task::JoinHandle<()>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedTokenRequest {
+        method: Method,
+        headers: HeaderMap,
+        body: String,
+    }
+
+    impl MockOidcTokenEndpoint {
+        fn set_access_token(&self, token: String) {
+            *self
+                .access_token
+                .lock()
+                .expect("mock token state should lock") = Some(token);
+        }
+
+        fn requests(&self) -> Vec<CapturedTokenRequest> {
+            self.requests
+                .lock()
+                .expect("mock token requests should lock")
+                .clone()
+        }
+
+        fn abort(self) {
+            self.handle.abort();
+        }
+    }
+
+    fn spawn_mock_oidc_discovery_endpoint(
+        token_endpoint: Option<String>,
+    ) -> MockOidcDiscoveryEndpoint {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("mock OIDC discovery endpoint should bind");
+        let addr = listener
+            .local_addr()
+            .expect("mock OIDC discovery endpoint address should be available");
+        let issuer = format!("http://127.0.0.1:{}", addr.port());
+        let authorization_endpoint = format!("{issuer}/authorize");
+        let token_endpoint = token_endpoint.unwrap_or_else(|| format!("{issuer}/token"));
+        let discovery = json!({
+            "issuer": issuer.clone(),
+            "jwks_uri": format!("{issuer}/jwks.json"),
+            "authorization_endpoint": authorization_endpoint.clone(),
+            "token_endpoint": token_endpoint
+        });
+        let handle = spawn_blocking_json_server(
+            listener,
+            vec![(
+                "/.well-known/openid-configuration".to_owned(),
+                discovery.to_string(),
+            )],
+            1,
+        );
+
+        MockOidcDiscoveryEndpoint {
+            issuer,
+            authorization_endpoint,
+            handle,
+        }
+    }
+
+    async fn spawn_mock_oidc_token_endpoint(
+        host: Ipv4Addr,
+        access_token: Option<String>,
+    ) -> MockOidcTokenEndpoint {
+        let listener = tokio::net::TcpListener::bind((host, 0))
+            .await
+            .expect("mock OIDC token endpoint should bind");
+        let addr = listener
+            .local_addr()
+            .expect("mock OIDC token endpoint address should be available");
+        let url = format!("http://{}:{}/token", host, addr.port());
+        let access_token = Arc::new(Mutex::new(access_token));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = MockOidcTokenState {
+            access_token: Arc::clone(&access_token),
+            requests: Arc::clone(&requests),
+        };
+        let router = Router::new()
+            .route("/token", post(mock_oidc_token))
+            .with_state(state);
+        let handle = Arc::new(tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mock OIDC token endpoint should serve");
+        }));
+
+        MockOidcTokenEndpoint {
+            url,
+            access_token,
+            requests,
+            handle,
+        }
+    }
+
+    async fn mock_oidc_token(
+        State(state): State<MockOidcTokenState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        let body = String::from_utf8(body.to_vec()).expect("token request body should be UTF-8");
+        state
+            .requests
+            .lock()
+            .expect("mock token requests should lock")
+            .push(CapturedTokenRequest {
+                method: Method::POST,
+                headers,
+                body,
+            });
+        let access_token = state
+            .access_token
+            .lock()
+            .expect("mock token state should lock")
+            .clone()
+            .expect("mock access token should be set before token exchange");
+
+        Json(json!({
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": 3600
+        }))
+        .into_response()
+    }
+
+    fn admin_oidc_login_router(issuer: &str) -> Router {
+        let mut config = admin_oidc_login_config(issuer);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("admin OIDC login app should build")
+    }
+
+    fn admin_oidc_login_config(issuer: &str) -> config::Config {
+        let mut config = test_config(Vec::new());
+        config.admin_login_provider = Some("oidc".to_owned());
+        for path in [ADMIN_AUTH_LOGIN_ROUTE, ADMIN_AUTH_CALLBACK_ROUTE] {
+            config.auth_exempt_paths.push(path.to_owned());
+            config.rbac_exempt_paths.push(path.to_owned());
+        }
+        config.auth_providers = vec![config::AuthProviderConfig {
+            name: "oidc".to_owned(),
+            provider_type: config::AuthProviderType::Jwt,
+            jwks_url: None,
+            issuer: Some(issuer.to_owned()),
+            audience: None,
+            jwks_timeout_ms: 2000,
+            require_jti: false,
+            roles_claim: "roles".to_owned(),
+            roles_claim_delimiter: None,
+            org_claim: None,
+            introspection_url: None,
+            introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+            user_id_claim: None,
+            email_claim: None,
+            client_id: Some("admin-ui".to_owned()),
+            client_secret: Some("secret-value".to_owned()),
+            redirect_uri: Some("http://gateway.example.test/v1/admin/auth/callback".to_owned()),
+        }];
+
+        config
+    }
+
+    fn response_location(response: &Response) -> String {
+        response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("response should include Location")
+            .to_owned()
+    }
+
+    fn url_query_pairs(url: &Url) -> HashMap<String, String> {
+        url.query_pairs().into_owned().collect()
+    }
+
+    fn form_pairs(body: &str) -> HashMap<String, String> {
+        url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect()
+    }
+
+    fn fragment_query_pairs(
+        location: &str,
+        expected_path: &str,
+    ) -> Option<HashMap<String, String>> {
+        let url = Url::parse(&format!("http://gateway.test{location}"))
+            .expect("relative redirect location should parse against test origin");
+        let fragment = url.fragment()?;
+        let (path, query) = fragment.split_once('?')?;
+        if path != expected_path {
+            return None;
+        }
+
+        Some(form_pairs(query))
+    }
+
+    fn pkce_challenge_for_verifier(verifier: &str) -> String {
+        base64url_no_padding(&Sha256::digest(verifier.as_bytes()))
+    }
+
+    fn base64url_no_padding(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut output = String::with_capacity((bytes.len() * 4).div_ceil(3));
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0];
+            let b1 = chunk.get(1).copied().unwrap_or(0);
+            let b2 = chunk.get(2).copied().unwrap_or(0);
+            output.push(ALPHABET[(b0 >> 2) as usize] as char);
+            output.push(ALPHABET[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+            if chunk.len() > 1 {
+                output.push(ALPHABET[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+            }
+            if chunk.len() > 2 {
+                output.push(ALPHABET[(b2 & 0b0011_1111) as usize] as char);
+            }
+        }
+
+        output
+    }
+
+    fn is_pkce_unreserved(value: &str) -> bool {
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
     }
 
     fn gateway_app_for_test(config: config::Config) -> GatewayApp {
@@ -15468,6 +16011,9 @@ paths:
             cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
             user_id_claim: None,
             email_claim: None,
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
         }];
         config.egress_deny_private_ips = false;
         let egress_client = Arc::new(
@@ -15519,6 +16065,9 @@ paths:
             cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
             user_id_claim: None,
             email_claim: None,
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
         }];
         config.egress_deny_private_ips = false;
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -15562,6 +16111,243 @@ paths:
     }
 
     #[tokio::test]
+    async fn admin_oidc_login_redirects_exchanges_code_and_consumes_state_once() {
+        let token_endpoint =
+            spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
+        let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
+        let access_token = signed_token_with_issuer("admin-operator", &["admin"], &oidc.issuer);
+        token_endpoint.set_access_token(access_token.clone());
+        let router = admin_oidc_login_router(&oidc.issuer);
+
+        let login_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/auth/login")
+                    .body(Body::empty())
+                    .expect("login request should build"),
+            )
+            .await
+            .expect("login request should complete");
+
+        assert_eq!(login_response.status(), StatusCode::FOUND);
+        let login_location = response_location(&login_response);
+        let authorization_url =
+            Url::parse(&login_location).expect("authorization redirect should be absolute");
+        assert_eq!(
+            authorization_url.as_str().split('?').next(),
+            Some(oidc.authorization_endpoint.as_str())
+        );
+        let authorization_query = url_query_pairs(&authorization_url);
+        assert_eq!(
+            authorization_query.get("response_type").map(String::as_str),
+            Some("code")
+        );
+        assert_eq!(
+            authorization_query.get("client_id").map(String::as_str),
+            Some("admin-ui")
+        );
+        assert_eq!(
+            authorization_query.get("redirect_uri").map(String::as_str),
+            Some("http://gateway.example.test/v1/admin/auth/callback")
+        );
+        assert_eq!(
+            authorization_query.get("scope").map(String::as_str),
+            Some("openid email profile")
+        );
+        assert_eq!(
+            authorization_query
+                .get("code_challenge_method")
+                .map(String::as_str),
+            Some("S256")
+        );
+        let state = authorization_query
+            .get("state")
+            .expect("authorization redirect should include state");
+        let nonce = authorization_query
+            .get("nonce")
+            .expect("authorization redirect should include nonce");
+        assert!(!state.is_empty());
+        assert!(!nonce.is_empty());
+        let challenge = authorization_query
+            .get("code_challenge")
+            .expect("authorization redirect should include PKCE challenge");
+        assert_eq!(challenge.len(), 43);
+        assert!(is_pkce_unreserved(challenge));
+
+        let callback_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/admin/auth/callback?code=admin-code&state={}",
+                        query_encode(state)
+                    ))
+                    .body(Body::empty())
+                    .expect("callback request should build"),
+            )
+            .await
+            .expect("callback request should complete");
+
+        assert_eq!(callback_response.status(), StatusCode::FOUND);
+        let callback_location = response_location(&callback_response);
+        let completion = fragment_query_pairs(&callback_location, "/auth/complete")
+            .expect("callback should redirect to auth completion fragment");
+        assert_eq!(completion.get("token"), Some(&access_token));
+
+        let token_requests = token_endpoint.requests();
+        assert_eq!(token_requests.len(), 1);
+        assert_eq!(token_requests[0].method, Method::POST);
+        assert_eq!(
+            token_requests[0].headers.get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static(
+                "application/x-www-form-urlencoded"
+            ))
+        );
+        let token_form = form_pairs(&token_requests[0].body);
+        assert_eq!(
+            token_form.get("grant_type").map(String::as_str),
+            Some("authorization_code")
+        );
+        assert_eq!(
+            token_form.get("code").map(String::as_str),
+            Some("admin-code")
+        );
+        assert_eq!(
+            token_form.get("redirect_uri").map(String::as_str),
+            Some("http://gateway.example.test/v1/admin/auth/callback")
+        );
+        assert_eq!(
+            token_form.get("client_id").map(String::as_str),
+            Some("admin-ui")
+        );
+        assert_eq!(
+            token_form.get("client_secret").map(String::as_str),
+            Some("secret-value")
+        );
+        let verifier = token_form
+            .get("code_verifier")
+            .expect("token exchange should include the PKCE verifier");
+        assert!((43..=128).contains(&verifier.len()));
+        assert!(is_pkce_unreserved(verifier));
+        assert_eq!(pkce_challenge_for_verifier(verifier), *challenge);
+
+        let replay_response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/admin/auth/callback?code=admin-code&state={}",
+                        query_encode(state)
+                    ))
+                    .body(Body::empty())
+                    .expect("replay callback request should build"),
+            )
+            .await
+            .expect("replay callback should complete");
+
+        assert_eq!(replay_response.status(), StatusCode::FOUND);
+        assert!(
+            fragment_query_pairs(&response_location(&replay_response), "/auth/error")
+                .expect("replay should redirect to auth error fragment")
+                .get("error")
+                .is_some_and(|error| error == "invalid_state")
+        );
+        assert_eq!(token_endpoint.requests().len(), 1);
+
+        oidc.finish();
+        token_endpoint.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_oidc_callback_with_unknown_state_does_not_exchange_token() {
+        let token_endpoint = spawn_mock_oidc_token_endpoint(Ipv4Addr::LOCALHOST, None).await;
+        let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
+        token_endpoint.set_access_token(signed_token_with_issuer(
+            "admin-operator",
+            &["admin"],
+            &oidc.issuer,
+        ));
+        let router = admin_oidc_login_router(&oidc.issuer);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/auth/callback?code=admin-code&state=unknown-state")
+                    .body(Body::empty())
+                    .expect("callback request should build"),
+            )
+            .await
+            .expect("callback request should complete");
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert!(
+            fragment_query_pairs(&response_location(&response), "/auth/error")
+                .expect("unknown state should redirect to auth error fragment")
+                .get("error")
+                .is_some_and(|error| error == "invalid_state")
+        );
+        assert!(token_endpoint.requests().is_empty());
+
+        oidc.finish();
+        token_endpoint.abort();
+    }
+
+    #[test]
+    fn admin_oidc_login_provider_requires_discovered_authorize_and_token_endpoints() {
+        let (issuer, server) = spawn_oidc_discovery_server(
+            json!({
+                "jwks_uri": "http://127.0.0.1:1/jwks.json",
+                "authorization_endpoint": "http://127.0.0.1:1/authorize"
+            }),
+            1,
+        );
+        let mut config = admin_oidc_login_config(&issuer);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+
+        let error = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect_err("admin login discovery without token endpoint should fail startup");
+
+        assert!(error
+            .to_string()
+            .contains("OIDC discovery response missing token_endpoint"));
+        server
+            .join()
+            .expect("OIDC discovery test server should finish");
+    }
+
+    #[tokio::test]
+    async fn admin_oidc_login_routes_are_absent_when_provider_unset() {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build without admin login provider");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/auth/login")
+                    .body(Body::empty())
+                    .expect("login request should build"),
+            )
+            .await
+            .expect("login request should complete");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn oidc_discovery_jwks_uri_auto_seed_still_blocks_private_ip() {
         let (jwks_url, jwks_server) = spawn_blocking_jwks_server(Ipv4Addr::new(127, 0, 0, 2), 1);
         let (issuer, discovery_server) = spawn_blocking_oidc_discovery_server(jwks_url);
@@ -15595,6 +16381,9 @@ paths:
             cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
             user_id_claim: None,
             email_claim: None,
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
         }];
         let recorder = PrometheusBuilder::new().build_recorder();
         let router = app(
@@ -15656,6 +16445,9 @@ paths:
             cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
             user_id_claim: None,
             email_claim: None,
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
         }];
         config.egress_deny_private_ips = false;
         let egress_client = Arc::new(
@@ -18006,6 +18798,9 @@ O2gecI9QwDJNpm29J9wJB2F8
             cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
             user_id_claim: None,
             email_claim: None,
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
         }];
     }
 
@@ -18029,6 +18824,9 @@ O2gecI9QwDJNpm29J9wJB2F8
             cache_ttl_ms: 20,
             user_id_claim: Some("account.id".to_owned()),
             email_claim: Some("account.email".to_owned()),
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
         }];
     }
 
