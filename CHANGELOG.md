@@ -7,10 +7,45 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
-Each phase is versioned as it completes (`0.1` for Phase 1, `0.2` for Phase 2,
-`0.3` for Phase 3, `0.4` for Phase 4, … `1.0` once all 7 phases land) — see the
+Phase 6 (native MCP support) is in progress: the tool runtime and dynamic
+tool registry (with per-tool role policy) have landed, but there is no live
+MCP endpoint yet. See the
 [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44)
 for full phase-by-phase status.
+
+## [0.6.0] - 2026-07-05
+
+Phase 7 (identity & auth integrations) is complete. Phase 6 (native MCP
+support) remains in progress and is not part of this release — this version
+lands out of the usual phase-number order because Phase 7 finished first;
+see the [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44)
+for the full phase-by-phase plan.
+
+### Added — Phase 7 (identity & auth integrations)
+
+- Pluggable auth providers and OIDC discovery: an ordered `AUTH_PROVIDERS`
+  list of JWKS-backed JWT validators (RS256/ES256/EdDSA, direct JWKS URL or
+  OIDC discovery by issuer), per-provider audience enforcement, and
+  configurable roles/org claim mapping.
+- API key and service-token management: hash-at-rest service tokens with
+  their own admin-managed lifecycle and UI.
+- A generic cookie-session validator (introspection-backed, with the same
+  cache-hygiene hardening as the existing session-credential validators).
+- Identity directory: every authenticated principal (human or bot) that
+  traverses the gateway is persisted asynchronously off the request hot
+  path and queryable via a paginated admin API.
+- Identity UI: a directory table (identity/IdP badge/auth method/filters/
+  search) and a per-principal drill-down (endpoints touched, rules hit,
+  anomaly history), plus an identity-based "block this principal" shortcut
+  flowing directly into the rule builder.
+- Admin UI SSO: operators sign into the admin dashboard via their
+  configured IdP using a real authorization-code + PKCE flow (RFC 7636
+  S256, no `plain` fallback), with the resulting token validated by the
+  existing bearer-token pipeline; the pre-existing manual paste-a-token
+  flow still works as a fallback. Admin actions are gated by the same
+  granular RBAC permission model as every other admin endpoint and
+  attributed to the operator's real identity (subject, email) in the audit
+  trail.
 
 ### Changed — breaking
 
