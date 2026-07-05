@@ -65,6 +65,25 @@ describe('RuleEditor', () => {
     ).toBe(true);
   });
 
+  it('applies a principal deny shortcut to a new rule form', async () => {
+    vi.stubGlobal('fetch', policyBackedFetch(policyFixture(), 'W/"policy-1"'));
+
+    renderRuleEditor(
+      '/policy/rules/editor?prefill_principal_id=alice%2Fprod%40example.test&prefill_action=deny&prefill_path=%2F**',
+    );
+
+    expect(await screen.findByDisplayValue('/**')).toBeTruthy();
+    expect((screen.getByLabelText('Any method') as HTMLInputElement).checked).toBe(
+      true,
+    );
+    expect(
+      screen.getByLabelText('Principal IDs selected values').textContent,
+    ).toContain('alice/prod@example.test');
+    expect(
+      (screen.getByRole('radio', { name: /Deny/ }) as HTMLInputElement).checked,
+    ).toBe(true);
+  });
+
   it('ignores invalid prefill auth method and action values', async () => {
     vi.stubGlobal('fetch', policyBackedFetch(policyFixture(), 'W/"policy-1"'));
 
