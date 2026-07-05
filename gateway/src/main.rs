@@ -1011,6 +1011,7 @@ fn gateway_app_with_process_started_at(
         service_token_validator.clone(),
         &discovered_oidc_jwks_urls,
     )?;
+    let principal_directory = auth::PrincipalDirectory::from_config(&config)?;
     let rbac_status = RbacStatus {
         policy_loaded: loaded_policy.is_some(),
         policy_id: loaded_policy.as_ref().and_then(|policy| policy.id.clone()),
@@ -1078,6 +1079,7 @@ fn gateway_app_with_process_started_at(
             &config,
             validator,
             audit_log.clone(),
+            principal_directory.clone(),
         ))
     } else {
         None
@@ -1541,6 +1543,14 @@ fn install_metrics_recorder() -> Result<PrometheusHandle, metrics_exporter_prome
     ::metrics::describe_counter!(
         audit::AUDIT_SQLITE_FLUSH_ERRORS_TOTAL,
         "SQLite audit sink flush or retention prune errors"
+    );
+    ::metrics::describe_counter!(
+        auth::principal_directory::PRINCIPAL_DIRECTORY_EVENTS_DROPPED_TOTAL,
+        "Principal directory observations dropped by the bounded asynchronous channel"
+    );
+    ::metrics::describe_counter!(
+        auth::principal_directory::PRINCIPAL_DIRECTORY_SQLITE_FLUSH_ERRORS_TOTAL,
+        "SQLite principal directory flush errors"
     );
     ::metrics::describe_counter!(
         metrics::LOCK_POISON_RECOVERIES_TOTAL,
@@ -4672,6 +4682,7 @@ fn principal_from_audit_actor(actor: &audit::Actor) -> Option<auth::Principal> {
 
     Some(auth::Principal {
         user_id: actor.user_id.clone(),
+        issuer: None,
         email: None,
         org_id: None,
         roles: actor.roles.clone().unwrap_or_default(),
@@ -4860,6 +4871,7 @@ fn representative_principal_for_rule(rule: &rbac::Rule) -> Option<auth::Principa
             .first()
             .cloned()
             .unwrap_or_else(|| "traffic-coverage-principal".to_owned()),
+        issuer: None,
         email: None,
         org_id: None,
         roles: rule.principal.roles.clone(),
@@ -5916,6 +5928,7 @@ mod tests {
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,
             discovery_sqlite_path: None,
+            principal_sqlite_path: None,
             payload_capture_enabled: false,
             payload_capture_sample_rate: config::DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
             schema_mismatch_signal_threshold:
@@ -8554,6 +8567,61 @@ mod tests {
         );
         assert_eq!(body["auth_method"], json!("service_token"));
         assert_eq!(body["roles"], json!(["probe-reader"]));
+    }
+
+    #[tokio::test]
+    async fn authenticated_request_persists_principal_directory_row() {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let principal_db = TempDb::new("principal-directory-full-stack");
+        let mut config = test_config(Vec::new());
+        config.principal_sqlite_path = Some(principal_db.path.to_string_lossy().into_owned());
+        configure_test_jwt_provider(&mut config, jwks_addr);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+        let token = signed_token("directory-user", &["member"]);
+
+        let response = authenticated_principal_probe(&router, &token).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eventually(Duration::from_secs(1), || {
+            principal_directory_row_count(&principal_db.path) == 1
+        });
+        let row = principal_directory_row(&principal_db.path, "directory-user", "", "bearer");
+        assert_eq!(row.email.as_deref(), Some("directory-user@example.test"));
+        assert_eq!(row.request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn unset_principal_sqlite_path_leaves_directory_disabled() {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let unused_db = TempDb::new("principal-directory-disabled");
+        let mut config = test_config(Vec::new());
+        configure_test_jwt_provider(&mut config, jwks_addr);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+        let token = signed_token("directory-disabled-user", &["member"]);
+
+        let response = authenticated_principal_probe(&router, &token).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !unused_db.path.exists(),
+            "unset PRINCIPAL_SQLITE_PATH should not create an unrelated SQLite file"
+        );
     }
 
     #[tokio::test]
@@ -16561,6 +16629,7 @@ paths:
     fn test_principal(roles: &[&str]) -> auth::Principal {
         auth::Principal {
             user_id: "user-123".to_owned(),
+            issuer: None,
             email: Some("user@example.com".to_owned()),
             org_id: Some("org-456".to_owned()),
             roles: roles.iter().map(|role| (*role).to_owned()).collect(),
@@ -17310,6 +17379,46 @@ O2gecI9QwDJNpm29J9wJB2F8
                 params![method, endpoint_template, count],
             )
             .expect("schema mismatch count should update");
+    }
+
+    #[derive(Debug)]
+    struct PrincipalDirectoryRow {
+        email: Option<String>,
+        request_count: i64,
+    }
+
+    fn principal_directory_row_count(path: &PathBuf) -> i64 {
+        let connection = Connection::open(path).expect("test principal database should open");
+        connection
+            .query_row("SELECT COUNT(*) FROM principal_directory", [], |row| {
+                row.get(0)
+            })
+            .expect("principal directory count should query")
+    }
+
+    fn principal_directory_row(
+        path: &PathBuf,
+        subject: &str,
+        issuer: &str,
+        auth_method: &str,
+    ) -> PrincipalDirectoryRow {
+        let connection = Connection::open(path).expect("test principal database should open");
+        connection
+            .query_row(
+                r#"
+                SELECT email, request_count
+                FROM principal_directory
+                WHERE subject = ?1 AND issuer = ?2 AND auth_method = ?3
+                "#,
+                params![subject, issuer, auth_method],
+                |row| {
+                    Ok(PrincipalDirectoryRow {
+                        email: row.get(0)?,
+                        request_count: row.get(1)?,
+                    })
+                },
+            )
+            .expect("principal directory row should query")
     }
 
     fn insert_discovery_principal(

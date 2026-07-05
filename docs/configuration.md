@@ -74,6 +74,20 @@ Additional signal detectors also run only inside the discovery aggregator on the
 
 Rule suggestions are also stored in this SQLite file, in `discovery_rule_suggestions`. Suggestion generation is an explicit off-hot-path computation; the request handler and discovery aggregator do not compute suggestions while serving traffic. A generated suggestion reflects traffic and signals as of the last explicit generation run. Re-running generation is idempotent for the same logical target because the table has a uniqueness constraint on `(suggestion_type, method, path_pattern, principal_key)` and inserts use `INSERT OR IGNORE`.
 
+### PRINCIPAL_SQLITE_PATH
+
+Optional SQLite principal directory store path for a local authenticated-identity ledger.
+
+Default: empty, which disables principal directory persistence.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. When set, the gateway opens or creates the database at startup, creates the `principal_directory` table if needed, and records every successfully authenticated request through a bounded asynchronous flusher rather than writing SQLite rows inline on the request path.
+
+Rows are keyed by `(subject, issuer, auth_method)`, where `subject` is `Principal.user_id`, `auth_method` is `bearer`, `service_token`, or `cookie`, and `issuer` uses the empty string as the documented sentinel for principals with no issuer. SQLite composite primary keys handle `NULL` surprisingly, so GreenGateway stores this sentinel instead of `NULL` for the identity key.
+
+Each upsert preserves the earliest `first_seen`, refreshes `last_seen`, increments `request_count`, and overwrites `email` and `org_id` with the latest observed values. Roles are intentionally not persisted here; RBAC evaluates fresh roles on every request.
+
+Issuer note: configure `issuer` for JWT providers when you need fully collision-safe identity tracking across providers. A provider configured only with `jwks_url` and no `issuer` is still tracked, but it is keyed by subject plus an empty issuer sentinel.
+
 ### SCHEMA_MISMATCH_SIGNAL_THRESHOLD
 
 Cumulative schema mismatch count that opens a `schema_mismatch` discovery signal for an endpoint.

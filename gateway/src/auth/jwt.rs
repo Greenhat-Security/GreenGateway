@@ -305,6 +305,7 @@ impl JwtValidator {
 
         Ok(Principal {
             user_id: user_id.to_owned(),
+            issuer: self.cfg.issuer.clone(),
             email,
             org_id,
             roles,
@@ -622,6 +623,20 @@ RowSUZV5FSmOGJ7JyROZ80k=
         assert_eq!(principal.roles, vec!["admin", "member"]);
         assert_eq!(principal.session_id, "session-123");
         assert_eq!(principal.auth_method, AuthMethod::Bearer);
+        assert_eq!(principal.issuer, None);
+    }
+
+    #[tokio::test]
+    async fn principal_carries_configured_issuer() {
+        let issuer = "https://issuer.example.test/";
+        let mut claims = base_claims();
+        claims["iss"] = json!(issuer);
+        let mut cfg = default_cfg();
+        cfg.issuer = Some(issuer.to_owned());
+
+        let principal = principal_for_claims(claims, cfg).await;
+
+        assert_eq!(principal.issuer.as_deref(), Some(issuer));
     }
 
     #[tokio::test]
@@ -1480,6 +1495,7 @@ RowSUZV5FSmOGJ7JyROZ80k=
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,
             discovery_sqlite_path: None,
+            principal_sqlite_path: None,
             payload_capture_enabled: false,
             payload_capture_sample_rate: crate::config::DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
             schema_mismatch_signal_threshold:

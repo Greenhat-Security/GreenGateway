@@ -2002,6 +2002,7 @@ paths:
                     cookie_name: "session".to_owned(),
                     exempt_paths: Vec::new(),
                     audit: audit.clone(),
+                    principal_directory: crate::auth::PrincipalDirectory::disabled(),
                     trust_proxy_headers: false,
                 },
                 auth::auth_middleware,
@@ -2303,6 +2304,7 @@ paths:
     fn test_principal(roles: &[&str]) -> Principal {
         Principal {
             user_id: "user-123".to_owned(),
+            issuer: None,
             email: Some("user@example.test".to_owned()),
             org_id: None,
             roles: roles.iter().map(|role| (*role).to_owned()).collect(),

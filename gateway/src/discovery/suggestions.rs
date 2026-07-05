@@ -1085,6 +1085,7 @@ fn representative_principal_for_matcher(matcher: &PrincipalMatcher) -> Option<Pr
             .first()
             .cloned()
             .unwrap_or_else(|| "rule-suggestion-principal".to_owned()),
+        issuer: None,
         email: None,
         org_id: None,
         roles: matcher.roles.clone(),
