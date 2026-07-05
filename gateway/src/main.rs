@@ -970,12 +970,16 @@ fn gateway_app_with_process_started_at(
         &config,
         loaded_policy.as_ref(),
     );
-    let egress_config = match loaded_policy.as_ref() {
+    let mut egress_config = match loaded_policy.as_ref() {
         Some(policy) => {
             egress::EgressConfig::from_config_and_policy(&config, Some(&policy.egress))?
         }
         None => egress::EgressConfig::from_config(&config),
     };
+    let discovery_egress_client = Arc::new(egress::EgressClient::new(egress_config.clone())?);
+    let discovered_oidc_jwks_urls =
+        discover_oidc_jwks_urls_from_config(&config, discovery_egress_client)?;
+    auto_seed_discovered_oidc_jwks_hosts(&mut egress_config, &discovered_oidc_jwks_urls);
     let egress_allowed_hosts_count = egress_config.allowed_host_rule_count();
     let proxy_egress_config = {
         let mut proxy_egress_config = egress_config.clone();
@@ -1001,8 +1005,12 @@ fn gateway_app_with_process_started_at(
             Duration::from_millis(config.service_token_cache_ttl_ms),
         ))
     });
-    let validator =
-        auth_validator_from_config(&config, egress_client, service_token_validator.clone())?;
+    let validator = auth_validator_from_config(
+        &config,
+        egress_client,
+        service_token_validator.clone(),
+        &discovered_oidc_jwks_urls,
+    )?;
     let rbac_status = RbacStatus {
         policy_loaded: loaded_policy.is_some(),
         policy_id: loaded_policy.as_ref().and_then(|policy| policy.id.clone()),
@@ -1141,6 +1149,7 @@ fn auth_validator_from_config(
     config: &config::Config,
     egress_client: Arc<egress::EgressClient>,
     service_token_validator: Option<Arc<auth::ServiceTokenValidator>>,
+    discovered_oidc_jwks_urls: &HashMap<String, String>,
 ) -> Result<Option<Arc<dyn auth::SessionValidator>>, auth::AuthError> {
     if config.auth_providers.is_empty() && service_token_validator.is_none() {
         return Ok(None);
@@ -1155,7 +1164,27 @@ fn auth_validator_from_config(
     for provider in &config.auth_providers {
         match provider.provider_type {
             config::AuthProviderType::Jwt => {
-                let jwt_config = auth::JwtAuthConfig::from_provider_config(provider);
+                let jwks_url = match provider.jwks_url.clone() {
+                    Some(jwks_url) => jwks_url,
+                    None => {
+                        let issuer = provider.issuer.as_deref().ok_or_else(|| {
+                            auth::AuthError::Upstream(format!(
+                                "JWT auth provider '{}' is missing jwks_url and issuer",
+                                provider.name
+                            ))
+                        })?;
+                        discovered_oidc_jwks_urls
+                            .get(&provider.name)
+                            .cloned()
+                            .ok_or_else(|| {
+                                auth::AuthError::Upstream(format!(
+                                    "JWT auth provider '{}' is missing discovered jwks_uri for issuer '{issuer}'",
+                                    provider.name
+                                ))
+                            })?
+                    }
+                };
+                let jwt_config = auth::JwtAuthConfig::from_provider_config(provider, jwks_url);
                 validators.push(Arc::new(auth::JwtValidator::new(
                     jwt_config,
                     Arc::clone(&egress_client),
@@ -1167,6 +1196,52 @@ fn auth_validator_from_config(
     Ok(Some(
         Arc::new(auth::ChainValidator::new(validators)) as Arc<dyn auth::SessionValidator>
     ))
+}
+
+fn discover_oidc_jwks_urls_from_config(
+    config: &config::Config,
+    egress_client: Arc<egress::EgressClient>,
+) -> Result<HashMap<String, String>, auth::AuthError> {
+    let mut discovered = HashMap::new();
+
+    for provider in &config.auth_providers {
+        match provider.provider_type {
+            config::AuthProviderType::Jwt if provider.jwks_url.is_none() => {
+                let issuer = provider.issuer.as_deref().ok_or_else(|| {
+                    auth::AuthError::Upstream(format!(
+                        "JWT auth provider '{}' is missing jwks_url and issuer",
+                        provider.name
+                    ))
+                })?;
+                let jwks_url = auth::oidc::discover_jwks_uri_blocking(
+                    issuer,
+                    Duration::from_millis(provider.jwks_timeout_ms),
+                    Arc::clone(&egress_client),
+                )?;
+                discovered.insert(provider.name.clone(), jwks_url);
+            }
+            config::AuthProviderType::Jwt => {}
+        }
+    }
+
+    Ok(discovered)
+}
+
+fn auto_seed_discovered_oidc_jwks_hosts(
+    egress_config: &mut egress::EgressConfig,
+    discovered_oidc_jwks_urls: &HashMap<String, String>,
+) {
+    let auto_seeded_hosts = discovered_oidc_jwks_urls
+        .values()
+        .filter_map(|jwks_url| egress_config.auto_seed_endpoint_host(jwks_url))
+        .collect::<Vec<_>>();
+
+    if !auto_seeded_hosts.is_empty() {
+        tracing::debug!(
+            hosts = ?auto_seeded_hosts,
+            "auto-seeded egress allowlist from discovered OIDC JWKS endpoints"
+        );
+    }
 }
 
 fn policy_history_sqlite_path(config: &config::Config) -> Option<PathBuf> {
@@ -5814,6 +5889,7 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         fs,
+        io::{Read, Write},
         net::{IpAddr, Ipv4Addr},
         path::PathBuf,
         sync::Arc,
@@ -14468,6 +14544,209 @@ paths:
     }
 
     #[tokio::test]
+    async fn auth_validator_resolves_oidc_discovery_for_issuer_only_provider() {
+        let (issuer, server) = spawn_oidc_jwks_server();
+        let issuer_claim = issuer.clone();
+        let mut config = test_config(Vec::new());
+        config.auth_providers = vec![config::AuthProviderConfig {
+            name: "oidc".to_owned(),
+            provider_type: config::AuthProviderType::Jwt,
+            jwks_url: None,
+            issuer: Some(issuer),
+            audience: None,
+            jwks_timeout_ms: 2000,
+            require_jti: false,
+            roles_claim: "roles".to_owned(),
+        }];
+        config.egress_deny_private_ips = false;
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::from_config(&config))
+                .expect("egress client should build"),
+        );
+        let discovered_oidc_jwks_urls =
+            discover_oidc_jwks_urls_from_config(&config, Arc::clone(&egress_client))
+                .expect("issuer-only provider should discover JWKS URI");
+
+        let validator =
+            auth_validator_from_config(&config, egress_client, None, &discovered_oidc_jwks_urls)
+                .expect("issuer-only provider should build")
+                .expect("auth validator should be configured");
+        let principal = validator
+            .validate_session(&auth::SessionCredential::Bearer(signed_token_with_issuer(
+                "oidc-user",
+                &["member"],
+                &issuer_claim,
+            )))
+            .await
+            .expect("token should validate through discovered JWKS URI");
+
+        assert_eq!(principal.user_id, "oidc-user");
+        server
+            .join()
+            .expect("OIDC discovery test server should finish");
+    }
+
+    #[tokio::test]
+    async fn oidc_discovery_allowlists_jwks_uri_host_when_it_differs_from_issuer() {
+        let (jwks_url, jwks_server) = spawn_blocking_jwks_server(Ipv4Addr::new(127, 0, 0, 2), 1);
+        let (issuer, discovery_server) = spawn_blocking_oidc_discovery_server(jwks_url);
+        let issuer_claim = issuer.clone();
+        let mut config = test_config(Vec::new());
+        config.auth_providers = vec![config::AuthProviderConfig {
+            name: "oidc".to_owned(),
+            provider_type: config::AuthProviderType::Jwt,
+            jwks_url: None,
+            issuer: Some(issuer),
+            audience: None,
+            jwks_timeout_ms: 2000,
+            require_jti: false,
+            roles_claim: "roles".to_owned(),
+        }];
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build with issuer-only OIDC provider");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!(
+                            "Bearer {}",
+                            signed_token_with_issuer("split-oidc-user", &["member"], &issuer_claim)
+                        ),
+                    )
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await["user_id"],
+            json!("split-oidc-user")
+        );
+        assert_eq!(
+            discovery_server
+                .join()
+                .expect("OIDC discovery server should finish"),
+            1
+        );
+        assert_eq!(jwks_server.join().expect("JWKS server should finish"), 1);
+    }
+
+    #[tokio::test]
+    async fn oidc_discovery_jwks_uri_auto_seed_still_blocks_private_ip() {
+        let (jwks_url, jwks_server) = spawn_blocking_jwks_server(Ipv4Addr::new(127, 0, 0, 2), 1);
+        let (issuer, discovery_server) = spawn_blocking_oidc_discovery_server(jwks_url);
+        let issuer_claim = issuer.clone();
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "roles": {},
+                "routes": [],
+                "egress": {
+                    "cidrs": ["127.0.0.1/32"]
+                }
+            }"#,
+        );
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.auth_providers = vec![config::AuthProviderConfig {
+            name: "oidc".to_owned(),
+            provider_type: config::AuthProviderType::Jwt,
+            jwks_url: None,
+            issuer: Some(issuer),
+            audience: None,
+            jwks_timeout_ms: 2000,
+            require_jti: false,
+            roles_claim: "roles".to_owned(),
+        }];
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build after OIDC discovery");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!(
+                            "Bearer {}",
+                            signed_token_with_issuer(
+                                "blocked-jwks-user",
+                                &["member"],
+                                &issuer_claim
+                            )
+                        ),
+                    )
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            discovery_server
+                .join()
+                .expect("OIDC discovery server should finish"),
+            1
+        );
+        assert_eq!(jwks_server.join().expect("JWKS server should finish"), 0);
+    }
+
+    #[test]
+    fn auth_validator_reports_construction_error_when_oidc_discovery_lacks_jwks_uri() {
+        let (issuer, server) = spawn_oidc_discovery_server(json!({"issuer": "test"}), 1);
+        let mut config = test_config(Vec::new());
+        config.auth_providers = vec![config::AuthProviderConfig {
+            name: "oidc".to_owned(),
+            provider_type: config::AuthProviderType::Jwt,
+            jwks_url: None,
+            issuer: Some(issuer),
+            audience: None,
+            jwks_timeout_ms: 2000,
+            require_jti: false,
+            roles_claim: "roles".to_owned(),
+        }];
+        config.egress_deny_private_ips = false;
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::from_config(&config))
+                .expect("egress client should build"),
+        );
+
+        let error = match discover_oidc_jwks_urls_from_config(&config, egress_client) {
+            Ok(_) => panic!("missing jwks_uri should fail provider construction"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            auth::AuthError::Upstream(message)
+                if message.contains("OIDC discovery response missing jwks_uri")
+        ));
+        server
+            .join()
+            .expect("OIDC discovery test server should finish");
+    }
+
+    #[tokio::test]
     async fn policy_rate_limit_uses_real_authenticated_principal_buckets_in_app_stack() {
         let jwks_addr = spawn_test_jwks_server().await;
         let policy = TempPolicyFile::new(
@@ -16336,13 +16615,211 @@ O2gecI9QwDJNpm29J9wJB2F8
         .await
     }
 
+    fn spawn_oidc_jwks_server() -> (String, std::thread::JoinHandle<()>) {
+        let jwks = json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": TEST_JWT_KID,
+                "use": "sig",
+                "alg": "RS256",
+                "n": TEST_JWT_PUBLIC_KEY_N,
+                "e": TEST_JWT_PUBLIC_KEY_E
+            }]
+        });
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("OIDC discovery test server should bind");
+        let issuer = format!(
+            "http://127.0.0.1:{}",
+            listener
+                .local_addr()
+                .expect("OIDC discovery test server address should be available")
+                .port()
+        );
+        let discovery = json!({
+            "issuer": issuer,
+            "jwks_uri": format!("{issuer}/jwks.json")
+        });
+        spawn_oidc_server(listener, discovery, Some(jwks), 2)
+    }
+
+    fn spawn_oidc_discovery_server(
+        discovery: Value,
+        request_count: usize,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("OIDC discovery test server should bind");
+        spawn_oidc_server(listener, discovery, None, request_count)
+    }
+
+    fn spawn_blocking_jwks_server(
+        host: Ipv4Addr,
+        request_count: usize,
+    ) -> (String, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind((host, 0))
+            .expect("JWKS split-host test server should bind");
+        let jwks_url = format!(
+            "http://{}:{}/jwks.json",
+            host,
+            listener
+                .local_addr()
+                .expect("JWKS split-host test server address should be available")
+                .port()
+        );
+        let jwks = json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": TEST_JWT_KID,
+                "use": "sig",
+                "alg": "RS256",
+                "n": TEST_JWT_PUBLIC_KEY_N,
+                "e": TEST_JWT_PUBLIC_KEY_E
+            }]
+        });
+        let server = spawn_blocking_json_server(
+            listener,
+            vec![("/jwks.json".to_owned(), jwks.to_string())],
+            request_count,
+        );
+
+        (jwks_url, server)
+    }
+
+    fn spawn_blocking_oidc_discovery_server(
+        jwks_url: String,
+    ) -> (String, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("OIDC split-host discovery test server should bind");
+        let issuer = format!(
+            "http://127.0.0.1:{}",
+            listener
+                .local_addr()
+                .expect("OIDC split-host discovery test server address should be available")
+                .port()
+        );
+        let discovery = json!({
+            "issuer": issuer,
+            "jwks_uri": jwks_url
+        });
+        let server = spawn_blocking_json_server(
+            listener,
+            vec![(
+                "/.well-known/openid-configuration".to_owned(),
+                discovery.to_string(),
+            )],
+            1,
+        );
+
+        (issuer, server)
+    }
+
+    fn spawn_blocking_json_server(
+        listener: std::net::TcpListener,
+        routes: Vec<(String, String)>,
+        request_count: usize,
+    ) -> std::thread::JoinHandle<usize> {
+        std::thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("blocking JSON test server should set nonblocking mode");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut handled = 0;
+            while handled < request_count && Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("blocking JSON test stream should use blocking reads");
+                let path = read_blocking_http_path(&mut stream);
+                let matched = routes
+                    .iter()
+                    .find(|(route_path, _)| route_path == &path)
+                    .map(|(_, body)| body.as_str());
+                let (status, body) = match matched {
+                    Some(body) => ("200 OK", body),
+                    None => ("404 Not Found", "{}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("blocking JSON test response should write");
+                handled += 1;
+            }
+            handled
+        })
+    }
+
+    fn spawn_oidc_server(
+        listener: std::net::TcpListener,
+        discovery: Value,
+        jwks: Option<Value>,
+        request_count: usize,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let issuer = format!(
+            "http://127.0.0.1:{}",
+            listener
+                .local_addr()
+                .expect("OIDC discovery test server address should be available")
+                .port()
+        );
+        let discovery = discovery.to_string();
+        let jwks = jwks.map(|jwks| jwks.to_string());
+        let server = std::thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("OIDC discovery test server should set nonblocking mode");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut handled = 0;
+            while handled < request_count && Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                let path = read_blocking_http_path(&mut stream);
+                let (status, body) = match path.as_str() {
+                    "/.well-known/openid-configuration" => ("200 OK", discovery.as_str()),
+                    "/jwks.json" => ("200 OK", jwks.as_deref().unwrap_or("{}")),
+                    _ => ("404 Not Found", "{}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("OIDC discovery test response should write");
+                handled += 1;
+            }
+        });
+
+        (issuer, server)
+    }
+
+    fn read_blocking_http_path(stream: &mut std::net::TcpStream) -> String {
+        let mut buffer = [0; 2048];
+        let read = stream
+            .read(&mut buffer)
+            .expect("OIDC discovery test request should read");
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_owned()
+    }
+
     fn configure_test_jwt_provider(config: &mut config::Config, jwks_addr: std::net::SocketAddr) {
         let jwks_url = format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port());
         config.jwt_jwks_url = Some(jwks_url.clone());
         config.auth_providers = vec![config::AuthProviderConfig {
             name: "legacy".to_owned(),
             provider_type: config::AuthProviderType::Jwt,
-            jwks_url,
+            jwks_url: Some(jwks_url),
             issuer: None,
             audience: None,
             jwks_timeout_ms: config.jwt_jwks_timeout_ms,
@@ -16356,15 +16833,29 @@ O2gecI9QwDJNpm29J9wJB2F8
     }
 
     fn signed_token(user_id: &str, roles: &[&str]) -> String {
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(TEST_JWT_KID.to_owned());
-        let claims = json!({
+        signed_token_with_claims(json!({
             "sub": user_id,
             "email": format!("{user_id}@example.test"),
             "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
             "jti": format!("{user_id}-session"),
             "roles": roles
-        });
+        }))
+    }
+
+    fn signed_token_with_issuer(user_id: &str, roles: &[&str], issuer: &str) -> String {
+        signed_token_with_claims(json!({
+            "sub": user_id,
+            "email": format!("{user_id}@example.test"),
+            "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+            "jti": format!("{user_id}-session"),
+            "roles": roles,
+            "iss": issuer
+        }))
+    }
+
+    fn signed_token_with_claims(claims: Value) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(TEST_JWT_KID.to_owned());
 
         encode(
             &header,

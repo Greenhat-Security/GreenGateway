@@ -27,7 +27,7 @@ const MIN_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// JWT bearer-token validator configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JwtAuthConfig {
-    /// JWKS endpoint containing RS256 public keys.
+    /// Effective JWKS endpoint containing supported JWT public keys.
     pub jwks_url: String,
     /// Optional expected `iss` claim.
     pub issuer: Option<String>,
@@ -54,9 +54,9 @@ impl JwtAuthConfig {
         })
     }
 
-    pub fn from_provider_config(config: &AuthProviderConfig) -> Self {
+    pub fn from_provider_config(config: &AuthProviderConfig, jwks_url: String) -> Self {
         Self {
-            jwks_url: config.jwks_url.clone(),
+            jwks_url,
             issuer: config.issuer.clone(),
             audience: config.audience.clone(),
             http_timeout: Duration::from_millis(config.jwks_timeout_ms),
@@ -87,11 +87,11 @@ impl RevocationStore for NoopRevocationStore {
     }
 }
 
-/// RS256 JWT bearer-token validator backed by a kid-indexed JWKS key cache.
+/// JWT bearer-token validator backed by a kid-indexed JWKS key cache.
 pub struct JwtValidator {
     cfg: JwtAuthConfig,
     egress_client: Arc<EgressClient>,
-    keys: Arc<RwLock<HashMap<String, DecodingKey>>>,
+    keys: Arc<RwLock<HashMap<String, CachedDecodingKey>>>,
     last_jwks_refresh: Arc<Mutex<Option<Instant>>>,
     revocation: Arc<dyn RevocationStore>,
 }
@@ -143,7 +143,7 @@ impl JwtValidator {
         cfg: JwtAuthConfig,
         egress_client: Arc<EgressClient>,
         revocation: Arc<dyn RevocationStore>,
-        initial_keys: HashMap<String, DecodingKey>,
+        initial_keys: HashMap<String, CachedDecodingKey>,
     ) -> Result<Self, AuthError> {
         Self::with_keys(cfg, egress_client, revocation, initial_keys)
     }
@@ -152,7 +152,7 @@ impl JwtValidator {
         cfg: JwtAuthConfig,
         egress_client: Arc<EgressClient>,
         revocation: Arc<dyn RevocationStore>,
-        initial_keys: HashMap<String, DecodingKey>,
+        initial_keys: HashMap<String, CachedDecodingKey>,
     ) -> Result<Self, AuthError> {
         Ok(Self {
             cfg,
@@ -200,16 +200,8 @@ impl JwtValidator {
         let mut refreshed = HashMap::new();
 
         for key in jwks.keys {
-            if key.kty.as_deref() != Some("RSA") {
-                continue;
-            }
-
-            let (Some(kid), Some(n), Some(e)) = (key.kid, key.n, key.e) else {
-                continue;
-            };
-
-            if let Ok(decoding_key) = DecodingKey::from_rsa_components(&n, &e) {
-                refreshed.insert(kid, decoding_key);
+            if let Some(cached_key) = cached_decoding_key(key) {
+                refreshed.insert(cached_key.kid.clone(), cached_key);
             }
         }
 
@@ -238,8 +230,12 @@ impl JwtValidator {
         Err(AuthError::InvalidSession("unknown kid".to_owned()))
     }
 
-    fn decode_with_key(&self, token: &str, key: &DecodingKey) -> Result<JwtClaims, AuthError> {
-        let mut validation = Validation::new(Algorithm::RS256);
+    fn decode_with_key(
+        &self,
+        token: &str,
+        key: &CachedDecodingKey,
+    ) -> Result<JwtClaims, AuthError> {
+        let mut validation = Validation::new(key.algorithm);
         validation.validate_exp = true;
         validation.validate_aud = self.cfg.audience.is_some();
         let mut required = vec!["exp"];
@@ -256,7 +252,7 @@ impl JwtValidator {
 
         validation.set_required_spec_claims(&required);
 
-        decode::<JwtClaims>(token, key, &validation)
+        decode::<JwtClaims>(token, &key.decoding_key, &validation)
             .map(|token_data| token_data.claims)
             .map_err(|_| invalid_token())
     }
@@ -340,6 +336,16 @@ struct JwksKey {
     kty: Option<String>,
     n: Option<String>,
     e: Option<String>,
+    crv: Option<String>,
+    x: Option<String>,
+    y: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedDecodingKey {
+    kid: String,
+    decoding_key: DecodingKey,
+    algorithm: Algorithm,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,6 +373,58 @@ fn extract_roles(extra: &Map<String, Value>, claim_name: &str) -> Vec<String> {
 
 fn invalid_token() -> AuthError {
     AuthError::InvalidSession(INVALID_TOKEN.to_owned())
+}
+
+fn cached_decoding_key(key: JwksKey) -> Option<CachedDecodingKey> {
+    let JwksKey {
+        kid,
+        kty,
+        n,
+        e,
+        crv,
+        x,
+        y,
+    } = key;
+
+    match kty.as_deref() {
+        Some("RSA") => {
+            let (Some(kid), Some(n), Some(e)) = (kid, n, e) else {
+                return None;
+            };
+            DecodingKey::from_rsa_components(&n, &e)
+                .ok()
+                .map(|decoding_key| CachedDecodingKey {
+                    kid,
+                    decoding_key,
+                    algorithm: Algorithm::RS256,
+                })
+        }
+        Some("EC") if crv.as_deref() == Some("P-256") => {
+            let (Some(kid), Some(x), Some(y)) = (kid, x, y) else {
+                return None;
+            };
+            DecodingKey::from_ec_components(&x, &y)
+                .ok()
+                .map(|decoding_key| CachedDecodingKey {
+                    kid,
+                    decoding_key,
+                    algorithm: Algorithm::ES256,
+                })
+        }
+        Some("OKP") if crv.as_deref() == Some("Ed25519") => {
+            let (Some(kid), Some(x)) = (kid, x) else {
+                return None;
+            };
+            DecodingKey::from_ed_components(&x)
+                .ok()
+                .map(|decoding_key| CachedDecodingKey {
+                    kid,
+                    decoding_key,
+                    algorithm: Algorithm::EdDSA,
+                })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -426,6 +484,17 @@ NQIDAQAB
 -----END PUBLIC KEY-----"#;
     const TEST_PUBLIC_KEY_N: &str = "p4V3Y_cZsEtcYNBUpM_ws3oM27O8edvy4zXlaGirChYomYdl-k33jb_RQR5amj-HKzdzjTrrWo4NqI1cti6jpZl9KFjrLu7PcdUmaMtfDeY7TsP5J0rGA3OMuoq_9B_1jUX_qjGV6P2RlHg1NAtnzjVNF12hlg98qWkHqgpZ0iJzCCI6SdIAE8hjyVTblYJnXmHZDQXZpTiq13bEYO1IwJrfVl4ApusNTEQCHmSenEzYUOXMdCQVWUcXjUXFQ6V8fiFukAvh1k3G6xsRqTcwtQGmPauu1clf5y8qWixdpuEsiq2G5H-Ws6Mh-85Kb6W-poCT43WJYTuTPHVR72wfNQ";
     const TEST_PUBLIC_KEY_E: &str = "AQAB";
+    const TEST_EC_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgWTFfCGljY6aw3Hrt
+kHmPRiazukxPLb6ilpRAewjW8nihRANCAATDskChT+Altkm9X7MI69T3IUmrQU0L
+950IxEzvw/x5BMEINRMrXLBJhqzO9Bm+d6JbqA21YQmd1Kt4RzLJR1W+
+-----END PRIVATE KEY-----"#;
+    const TEST_EC_PUBLIC_KEY_X: &str = "w7JAoU_gJbZJvV-zCOvU9yFJq0FNC_edCMRM78P8eQQ";
+    const TEST_EC_PUBLIC_KEY_Y: &str = "wQg1EytcsEmGrM70Gb53oluoDbVhCZ3Uq3hHMslHVb4";
+    const TEST_ED25519_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIGrD/e7uKYqSY4twDEsRfMMuLSrODf14dpTiTK6K1YI0
+-----END PRIVATE KEY-----"#;
+    const TEST_ED25519_PUBLIC_KEY_X: &str = "2-Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8";
     const OTHER_PUBLIC_KEY: &str = r#"-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAw/aUzeUUmwEI8FZH92NP
 GVGZMV+rP6qUJSiRXlRvaNzj6Pr0vn6NrZtyiAwixyGRkzzVeoCNVek1U1eBOliJ
@@ -764,6 +833,79 @@ RowSUZV5FSmOGJ7JyROZ80k=
         assert_eq!(principal.auth_method, AuthMethod::Bearer);
     }
 
+    #[test]
+    fn jwks_key_parses_rsa_key_with_rs256_algorithm() {
+        let cached = cached_decoding_key(jwks_key(json!({
+            "kty": "RSA",
+            "kid": KID,
+            "n": TEST_PUBLIC_KEY_N,
+            "e": TEST_PUBLIC_KEY_E
+        })))
+        .expect("RSA key should parse");
+
+        assert_eq!(cached.algorithm, Algorithm::RS256);
+    }
+
+    #[test]
+    fn jwks_key_parses_p256_ec_key_with_es256_algorithm() {
+        let cached = cached_decoding_key(jwks_key(json!({
+            "kty": "EC",
+            "kid": KID,
+            "crv": "P-256",
+            "x": TEST_EC_PUBLIC_KEY_X,
+            "y": TEST_EC_PUBLIC_KEY_Y
+        })))
+        .expect("P-256 EC key should parse");
+
+        assert_eq!(cached.algorithm, Algorithm::ES256);
+    }
+
+    #[test]
+    fn jwks_key_parses_ed25519_okp_key_with_eddsa_algorithm() {
+        let cached = cached_decoding_key(jwks_key(json!({
+            "kty": "OKP",
+            "kid": KID,
+            "crv": "Ed25519",
+            "x": TEST_ED25519_PUBLIC_KEY_X
+        })))
+        .expect("Ed25519 OKP key should parse");
+
+        assert_eq!(cached.algorithm, Algorithm::EdDSA);
+    }
+
+    #[test]
+    fn jwks_key_skips_unsupported_or_incomplete_keys() {
+        let unsupported_ec = jwks_key(json!({
+            "kty": "EC",
+            "kid": KID,
+            "crv": "P-384",
+            "x": TEST_EC_PUBLIC_KEY_X,
+            "y": TEST_EC_PUBLIC_KEY_Y
+        }));
+        assert!(cached_decoding_key(unsupported_ec).is_none());
+
+        for incomplete in [
+            json!({
+                "kty": "RSA",
+                "kid": KID,
+                "n": TEST_PUBLIC_KEY_N
+            }),
+            json!({
+                "kty": "EC",
+                "kid": KID,
+                "crv": "P-256",
+                "x": TEST_EC_PUBLIC_KEY_X
+            }),
+            json!({
+                "kty": "OKP",
+                "kid": KID,
+                "crv": "Ed25519"
+            }),
+        ] {
+            assert!(cached_decoding_key(jwks_key(incomplete)).is_none());
+        }
+    }
+
     #[tokio::test]
     async fn unknown_kid_fetches_jwks_through_egress_and_validates_token() {
         let jwks = json!({
@@ -817,6 +959,73 @@ RowSUZV5FSmOGJ7JyROZ80k=
 
         assert_eq!(principal.user_id, "user-123");
         assert_eq!(principal.email, Some("user@example.com".to_owned()));
+        server.await.expect("JWKS test server task should finish");
+    }
+
+    #[tokio::test]
+    async fn es256_token_validates_with_ec_jwk() {
+        let jwks = json!({
+            "keys": [{
+                "kty": "EC",
+                "kid": KID,
+                "use": "sig",
+                "alg": "ES256",
+                "crv": "P-256",
+                "x": TEST_EC_PUBLIC_KEY_X,
+                "y": TEST_EC_PUBLIC_KEY_Y
+            }]
+        })
+        .to_string();
+        let (jwks_url, server) = jwks_server(jwks, 1).await;
+        let egress_client = egress_client(HashSet::from(["127.0.0.1".to_owned()]), false);
+        let validator =
+            JwtValidator::new(jwt_cfg(&jwks_url), egress_client).expect("validator should build");
+        let token = signed_token_with_key(
+            base_claims(),
+            Algorithm::ES256,
+            EncodingKey::from_ec_pem(TEST_EC_PRIVATE_KEY.as_bytes())
+                .expect("test EC private key should parse"),
+        );
+
+        let principal = validator
+            .validate_session(&SessionCredential::Bearer(token))
+            .await
+            .expect("ES256 token should validate with EC JWK");
+
+        assert_eq!(principal.user_id, "user-123");
+        server.await.expect("JWKS test server task should finish");
+    }
+
+    #[tokio::test]
+    async fn eddsa_token_validates_with_okp_jwk() {
+        let jwks = json!({
+            "keys": [{
+                "kty": "OKP",
+                "kid": KID,
+                "use": "sig",
+                "alg": "EdDSA",
+                "crv": "Ed25519",
+                "x": TEST_ED25519_PUBLIC_KEY_X
+            }]
+        })
+        .to_string();
+        let (jwks_url, server) = jwks_server(jwks, 1).await;
+        let egress_client = egress_client(HashSet::from(["127.0.0.1".to_owned()]), false);
+        let validator =
+            JwtValidator::new(jwt_cfg(&jwks_url), egress_client).expect("validator should build");
+        let token = signed_token_with_key(
+            base_claims(),
+            Algorithm::EdDSA,
+            EncodingKey::from_ed_pem(TEST_ED25519_PRIVATE_KEY.as_bytes())
+                .expect("test Ed25519 private key should parse"),
+        );
+
+        let principal = validator
+            .validate_session(&SessionCredential::Bearer(token))
+            .await
+            .expect("EdDSA token should validate with OKP JWK");
+
+        assert_eq!(principal.user_id, "user-123");
         server.await.expect("JWKS test server task should finish");
     }
 
@@ -917,16 +1126,29 @@ RowSUZV5FSmOGJ7JyROZ80k=
         )
     }
 
-    fn decoding_keys(public_key: &str) -> HashMap<String, DecodingKey> {
+    fn decoding_keys(public_key: &str) -> HashMap<String, CachedDecodingKey> {
         HashMap::from([(
             KID.to_owned(),
-            DecodingKey::from_rsa_pem(public_key.as_bytes())
-                .expect("test RSA public key should parse"),
+            CachedDecodingKey {
+                kid: KID.to_owned(),
+                decoding_key: DecodingKey::from_rsa_pem(public_key.as_bytes())
+                    .expect("test RSA public key should parse"),
+                algorithm: Algorithm::RS256,
+            },
         )])
     }
 
-    fn signed_token(mut claims: Value, private_key: &str) -> String {
-        let mut header = Header::new(Algorithm::RS256);
+    fn signed_token(claims: Value, private_key: &str) -> String {
+        signed_token_with_key(
+            claims,
+            Algorithm::RS256,
+            EncodingKey::from_rsa_pem(private_key.as_bytes())
+                .expect("test RSA private key should parse"),
+        )
+    }
+
+    fn signed_token_with_key(mut claims: Value, algorithm: Algorithm, key: EncodingKey) -> String {
+        let mut header = Header::new(algorithm);
         header.kid = Some(KID.to_owned());
         claims
             .as_object_mut()
@@ -934,13 +1156,11 @@ RowSUZV5FSmOGJ7JyROZ80k=
             .entry("exp")
             .or_insert_with(|| json!(future_timestamp()));
 
-        encode(
-            &header,
-            &claims,
-            &EncodingKey::from_rsa_pem(private_key.as_bytes())
-                .expect("test RSA private key should parse"),
-        )
-        .expect("test token should sign")
+        encode(&header, &claims, &key).expect("test token should sign")
+    }
+
+    fn jwks_key(value: Value) -> JwksKey {
+        serde_json::from_value(value).expect("test JWK should deserialize")
     }
 
     fn base_claims() -> Value {

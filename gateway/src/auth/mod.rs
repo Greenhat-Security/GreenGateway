@@ -1,5 +1,6 @@
 pub mod chain;
 pub mod jwt;
+pub mod oidc;
 pub mod principal;
 pub mod service_token_validator;
 pub mod tokens;

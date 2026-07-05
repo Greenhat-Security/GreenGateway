@@ -211,7 +211,7 @@ impl EgressConfig {
         );
         for provider in &config.auth_providers {
             auto_seed_endpoint_host(
-                Some(provider.jwks_url.as_str()),
+                provider.jwks_url.as_deref(),
                 &mut allowed_hosts,
                 &mut auto_seeded_hosts,
             );
@@ -271,6 +271,16 @@ impl EgressConfig {
 
     pub fn allowed_host_rule_count(&self) -> usize {
         self.allowed_hosts.len() + self.allowed_host_globs.len()
+    }
+
+    pub fn auto_seed_endpoint_host(&mut self, endpoint: &str) -> Option<String> {
+        let mut auto_seeded_hosts = Vec::new();
+        auto_seed_endpoint_host(
+            Some(endpoint),
+            &mut self.allowed_hosts,
+            &mut auto_seeded_hosts,
+        );
+        auto_seeded_hosts.into_iter().next()
     }
 
     fn apply_policy(&mut self, policy: &EgressPolicy) -> Result<(), EgressError> {
@@ -1176,7 +1186,7 @@ mod tests {
         config.auth_providers = vec![crate::config::AuthProviderConfig {
             name: "primary".to_owned(),
             provider_type: crate::config::AuthProviderType::Jwt,
-            jwks_url: "https://idp.example.test/.well-known/jwks.json".to_owned(),
+            jwks_url: Some("https://idp.example.test/.well-known/jwks.json".to_owned()),
             issuer: Some("https://issuer.example.test/".to_owned()),
             audience: None,
             jwks_timeout_ms: 2000,

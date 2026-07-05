@@ -203,7 +203,7 @@ pub struct UpstreamRouteConfig {
 pub struct AuthProviderConfig {
     pub name: String,
     pub provider_type: AuthProviderType,
-    pub jwks_url: String,
+    pub jwks_url: Option<String>,
     pub issuer: Option<String>,
     pub audience: Option<String>,
     pub jwks_timeout_ms: u64,
@@ -222,7 +222,8 @@ struct RawAuthProviderConfig {
     name: String,
     #[serde(rename = "type")]
     provider_type: String,
-    jwks_url: String,
+    #[serde(default)]
+    jwks_url: Option<String>,
     #[serde(default)]
     issuer: Option<String>,
     #[serde(default)]
@@ -921,7 +922,7 @@ fn parse_auth_providers(
         Ok(providers) => providers,
         Err(err) => {
             problems.push(format!(
-                "{name} must be a JSON array of auth provider objects with name, type, jwks_url, and optional issuer, audience, jwks_timeout_ms, require_jti, and roles_claim: {err}"
+                "{name} must be a JSON array of auth provider objects with name, type, and jwks_url or issuer, plus optional audience, jwks_timeout_ms, require_jti, and roles_claim: {err}"
             ));
             return Some(Vec::new());
         }
@@ -956,10 +957,11 @@ fn validate_auth_providers(
                 AuthProviderType::Jwt
             }
         };
-        let jwks_url = provider.jwks_url.trim().to_owned();
-        if jwks_url.is_empty() {
+        let jwks_url = normalize_optional_config_string(provider.jwks_url);
+        let issuer = normalize_optional_config_string(provider.issuer);
+        if jwks_url.is_none() && issuer.is_none() {
             problems.push(format!(
-                "{provider_name}.jwks_url must be a non-empty string"
+                "{provider_name} must set jwks_url or issuer for jwt providers"
             ));
         }
         let roles_claim = normalize_auth_provider_roles_claim(
@@ -972,7 +974,7 @@ fn validate_auth_providers(
             name: normalized_name,
             provider_type,
             jwks_url,
-            issuer: normalize_optional_config_string(provider.issuer),
+            issuer,
             audience: normalize_optional_config_string(provider.audience),
             jwks_timeout_ms: provider
                 .jwks_timeout_ms
@@ -1021,7 +1023,7 @@ fn legacy_auth_providers(
     vec![AuthProviderConfig {
         name: "legacy".to_owned(),
         provider_type: AuthProviderType::Jwt,
-        jwks_url: jwks_url.to_owned(),
+        jwks_url: Some(jwks_url.to_owned()),
         issuer: jwt_issuer.map(str::to_owned),
         audience: jwt_audience.map(str::to_owned),
         jwks_timeout_ms: jwt_jwks_timeout_ms,
@@ -2712,7 +2714,7 @@ mod tests {
                 AuthProviderConfig {
                     name: "primary".to_owned(),
                     provider_type: AuthProviderType::Jwt,
-                    jwks_url: "https://primary.example.test/.well-known/jwks.json".to_owned(),
+                    jwks_url: Some("https://primary.example.test/.well-known/jwks.json".to_owned(),),
                     issuer: Some("https://primary.example.test/".to_owned()),
                     audience: Some("greengateway".to_owned()),
                     jwks_timeout_ms: 7000,
@@ -2722,7 +2724,9 @@ mod tests {
                 AuthProviderConfig {
                     name: "secondary".to_owned(),
                     provider_type: AuthProviderType::Jwt,
-                    jwks_url: "https://secondary.example.test/.well-known/jwks.json".to_owned(),
+                    jwks_url: Some(
+                        "https://secondary.example.test/.well-known/jwks.json".to_owned(),
+                    ),
                     issuer: None,
                     audience: None,
                     jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
@@ -2731,6 +2735,52 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn auth_providers_accept_issuer_only_jwt_provider_for_oidc_discovery() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(r#"[{
+                    "name": "oidc",
+                    "type": "jwt",
+                    "issuer": " https://issuer.example.test/ ",
+                    "audience": " greengateway "
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("issuer-only JWT provider should parse");
+
+        assert_eq!(
+            config.auth_providers,
+            vec![AuthProviderConfig {
+                name: "oidc".to_owned(),
+                provider_type: AuthProviderType::Jwt,
+                jwks_url: None,
+                issuer: Some("https://issuer.example.test/".to_owned()),
+                audience: Some("greengateway".to_owned()),
+                jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
+                require_jti: false,
+                roles_claim: DEFAULT_ROLES_CLAIM.to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn auth_providers_reject_jwt_provider_without_jwks_url_or_issuer() {
+        let error = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(r#"[{
+                    "name": "missing-keys",
+                    "type": "jwt"
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("JWT provider should require jwks_url or issuer");
+
+        let message = error.to_string();
+        assert!(message.contains("AUTH_PROVIDERS[0] must set jwks_url or issuer"));
+        assert_eq!(error.problems.len(), 1);
     }
 
     #[test]
@@ -2809,7 +2859,7 @@ mod tests {
             vec![AuthProviderConfig {
                 name: "legacy".to_owned(),
                 provider_type: AuthProviderType::Jwt,
-                jwks_url: "https://legacy.example.test/.well-known/jwks.json".to_owned(),
+                jwks_url: Some("https://legacy.example.test/.well-known/jwks.json".to_owned()),
                 issuer: Some("https://legacy.example.test/".to_owned()),
                 audience: Some("greengateway".to_owned()),
                 jwks_timeout_ms: 6000,
@@ -2850,7 +2900,7 @@ mod tests {
             vec![AuthProviderConfig {
                 name: "declared".to_owned(),
                 provider_type: AuthProviderType::Jwt,
-                jwks_url: "https://declared.example.test/.well-known/jwks.json".to_owned(),
+                jwks_url: Some("https://declared.example.test/.well-known/jwks.json".to_owned()),
                 issuer: Some("https://declared.example.test/".to_owned()),
                 audience: Some("declared-audience".to_owned()),
                 jwks_timeout_ms: 8000,
