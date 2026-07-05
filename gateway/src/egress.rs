@@ -1192,6 +1192,8 @@ mod tests {
             jwks_timeout_ms: 2000,
             require_jti: false,
             roles_claim: "roles".to_owned(),
+            roles_claim_delimiter: None,
+            org_claim: None,
         }];
 
         let egress = EgressConfig::from_config(&config);

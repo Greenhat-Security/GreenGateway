@@ -37,8 +37,12 @@ pub struct JwtAuthConfig {
     pub http_timeout: Duration,
     /// Reject tokens without a non-empty `jti` claim.
     pub require_jti: bool,
-    /// Flat string-array claim name used to extract roles.
+    /// Literal claim key or dotted nested claim path used to extract roles.
     pub roles_claim: String,
+    /// Optional delimiter for splitting string-valued role claims.
+    pub roles_claim_delimiter: Option<String>,
+    /// Optional literal claim key or dotted nested claim path used to extract an organization ID.
+    pub org_claim: Option<String>,
 }
 
 impl JwtAuthConfig {
@@ -51,6 +55,8 @@ impl JwtAuthConfig {
             http_timeout: Duration::from_millis(config.jwt_jwks_timeout_ms),
             require_jti: config.jwt_require_jti,
             roles_claim: config.roles_claim.clone(),
+            roles_claim_delimiter: None,
+            org_claim: None,
         })
     }
 
@@ -62,6 +68,8 @@ impl JwtAuthConfig {
             http_timeout: Duration::from_millis(config.jwks_timeout_ms),
             require_jti: config.require_jti,
             roles_claim: config.roles_claim.clone(),
+            roles_claim_delimiter: config.roles_claim_delimiter.clone(),
+            org_claim: config.org_claim.clone(),
         }
     }
 }
@@ -105,6 +113,8 @@ impl fmt::Debug for JwtValidator {
             .field("audience", &self.cfg.audience)
             .field("require_jti", &self.cfg.require_jti)
             .field("roles_claim", &self.cfg.roles_claim)
+            .field("roles_claim_delimiter", &self.cfg.roles_claim_delimiter)
+            .field("org_claim", &self.cfg.org_claim)
             .finish_non_exhaustive()
     }
 }
@@ -285,13 +295,18 @@ impl JwtValidator {
             .map(str::trim)
             .filter(|email| !email.is_empty())
             .map(str::to_ascii_lowercase);
-        let roles = extract_roles(&claims.extra, &self.cfg.roles_claim);
+        let roles = extract_roles(
+            &claims.extra,
+            &self.cfg.roles_claim,
+            self.cfg.roles_claim_delimiter.as_deref(),
+        );
+        let org_id = extract_string_claim(&claims.extra, self.cfg.org_claim.as_deref());
         let session_id = jti.unwrap_or("-").to_owned();
 
         Ok(Principal {
             user_id: user_id.to_owned(),
             email,
-            org_id: None,
+            org_id,
             roles,
             session_id,
             auth_method: AuthMethod::Bearer,
@@ -359,16 +374,57 @@ struct JwtClaims {
     extra: Map<String, Value>,
 }
 
-fn extract_roles(extra: &Map<String, Value>, claim_name: &str) -> Vec<String> {
-    // Nested/provider-specific role claim shapes are out of scope for this phase.
-    match extra.get(claim_name).and_then(Value::as_array) {
-        Some(values) if values.iter().all(Value::is_string) => values
+fn resolve_claim<'a>(extra: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+    if let Some(value) = extra.get(path) {
+        return Some(value);
+    }
+
+    if !path.contains('.') {
+        return None;
+    }
+
+    let mut segments = path.split('.');
+    let first = segments.next()?;
+    let mut value = extra.get(first)?;
+
+    for segment in segments {
+        let object = value.as_object()?;
+        value = object.get(segment)?;
+    }
+
+    Some(value)
+}
+
+fn extract_roles(
+    extra: &Map<String, Value>,
+    claim_name: &str,
+    delimiter: Option<&str>,
+) -> Vec<String> {
+    match resolve_claim(extra, claim_name) {
+        Some(Value::Array(values)) if values.iter().all(Value::is_string) => values
             .iter()
             .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect(),
+        Some(Value::String(value)) => delimiter
+            .filter(|delimiter| !delimiter.is_empty())
+            .map(|delimiter| {
+                value
+                    .split(delimiter)
+                    .map(str::trim)
+                    .filter(|role| !role.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+fn extract_string_claim(extra: &Map<String, Value>, claim_name: Option<&str>) -> Option<String> {
+    resolve_claim(extra, claim_name?)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn invalid_token() -> AuthError {
@@ -597,6 +653,170 @@ RowSUZV5FSmOGJ7JyROZ80k=
 
         assert_eq!(groups_principal.roles, vec!["team-a", "team-b"]);
         assert!(roles_principal.roles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nested_roles_claim_path_extracts_realm_access_roles() {
+        let mut claims = base_claims();
+        let object = claims.as_object_mut().expect("claims should be an object");
+        object.remove("roles");
+        object.insert(
+            "realm_access".to_owned(),
+            json!({"roles": ["admin", "member"]}),
+        );
+
+        let mut cfg = default_cfg();
+        cfg.roles_claim = "realm_access.roles".to_owned();
+
+        let principal = principal_for_claims(claims, cfg).await;
+
+        assert_eq!(principal.roles, vec!["admin", "member"]);
+    }
+
+    #[tokio::test]
+    async fn dotted_literal_roles_claim_prefers_exact_auth0_style_key() {
+        let mut claims = base_claims();
+        let object = claims.as_object_mut().expect("claims should be an object");
+        object.remove("roles");
+        object.insert(
+            "https://myapp.example.com/roles".to_owned(),
+            json!(["literal-admin", "literal-member"]),
+        );
+        object.insert(
+            "https://myapp".to_owned(),
+            json!({"example": {"com/roles": ["wrong-split-role"]}}),
+        );
+
+        let mut cfg = default_cfg();
+        cfg.roles_claim = "https://myapp.example.com/roles".to_owned();
+
+        let principal = principal_for_claims(claims, cfg).await;
+
+        assert_eq!(principal.roles, vec!["literal-admin", "literal-member"]);
+    }
+
+    #[test]
+    fn resolve_claim_prefers_literal_key_before_dotted_path_segments() {
+        let claims = json!({
+            "https://myapp.example.com/roles": ["literal-admin"],
+            "https://myapp": {
+                "example": {
+                    "com/roles": ["wrong-split-role"]
+                }
+            }
+        });
+        let extra = claims.as_object().expect("claims should be an object");
+
+        let value = resolve_claim(extra, "https://myapp.example.com/roles")
+            .expect("literal dotted claim should resolve");
+
+        assert_eq!(value, &json!(["literal-admin"]));
+    }
+
+    #[tokio::test]
+    async fn delimiter_roles_claim_splits_scope_string() {
+        let mut claims = base_claims();
+        let object = claims.as_object_mut().expect("claims should be an object");
+        object.remove("roles");
+        object.insert("scope".to_owned(), json!("read write admin"));
+
+        let mut cfg = default_cfg();
+        cfg.roles_claim = "scope".to_owned();
+        cfg.roles_claim_delimiter = Some(" ".to_owned());
+
+        let principal = principal_for_claims(claims, cfg).await;
+
+        assert_eq!(principal.roles, vec!["read", "write", "admin"]);
+    }
+
+    #[tokio::test]
+    async fn string_roles_claim_without_delimiter_returns_empty_roles() {
+        let mut claims = base_claims();
+        claims["roles"] = json!("admin member");
+
+        let principal = principal_for_claims(claims, default_cfg()).await;
+
+        assert!(principal.roles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_nested_roles_claim_path_returns_empty_roles() {
+        let mut claims = base_claims();
+        let object = claims.as_object_mut().expect("claims should be an object");
+        object.remove("roles");
+        object.insert("a".to_owned(), json!("not-object"));
+
+        let mut cfg = default_cfg();
+        cfg.roles_claim = "a.b.c".to_owned();
+
+        let principal = principal_for_claims(claims, cfg).await;
+
+        assert!(principal.roles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_nested_roles_claim_path_returns_empty_roles() {
+        let mut claims = base_claims();
+        let object = claims.as_object_mut().expect("claims should be an object");
+        object.remove("roles");
+        object.insert("a".to_owned(), json!({"other": ["admin"]}));
+
+        let mut cfg = default_cfg();
+        cfg.roles_claim = "a.b.c".to_owned();
+
+        let principal = principal_for_claims(claims, cfg).await;
+
+        assert!(principal.roles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn org_claim_unset_leaves_org_id_none() {
+        let mut claims = base_claims();
+        claims["org_id"] = json!("acme-corp");
+
+        let principal = principal_for_claims(claims, default_cfg()).await;
+
+        assert_eq!(principal.org_id, None);
+    }
+
+    #[tokio::test]
+    async fn flat_org_claim_extracts_org_id() {
+        let mut claims = base_claims();
+        claims["org_id"] = json!("acme-corp");
+
+        let mut cfg = default_cfg();
+        cfg.org_claim = Some("org_id".to_owned());
+
+        let principal = principal_for_claims(claims, cfg).await;
+
+        assert_eq!(principal.org_id, Some("acme-corp".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn nested_org_claim_extracts_org_id() {
+        let mut claims = base_claims();
+        let object = claims.as_object_mut().expect("claims should be an object");
+        object.insert("tenant".to_owned(), json!({"id": "acme-corp"}));
+
+        let mut cfg = default_cfg();
+        cfg.org_claim = Some("tenant.id".to_owned());
+
+        let principal = principal_for_claims(claims, cfg).await;
+
+        assert_eq!(principal.org_id, Some("acme-corp".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn non_string_org_claim_leaves_org_id_none() {
+        let mut claims = base_claims();
+        claims["org_id"] = json!({"id": "acme-corp"});
+
+        let mut cfg = default_cfg();
+        cfg.org_claim = Some("org_id".to_owned());
+
+        let principal = principal_for_claims(claims, cfg).await;
+
+        assert_eq!(principal.org_id, None);
     }
 
     #[tokio::test]
@@ -1181,6 +1401,8 @@ RowSUZV5FSmOGJ7JyROZ80k=
             http_timeout: Duration::from_secs(1),
             require_jti: false,
             roles_claim: "roles".to_owned(),
+            roles_claim_delimiter: None,
+            org_claim: None,
         }
     }
 
@@ -1189,6 +1411,16 @@ RowSUZV5FSmOGJ7JyROZ80k=
             jwks_url: jwks_url.to_owned(),
             ..default_cfg()
         }
+    }
+
+    async fn principal_for_claims(claims: Value, cfg: JwtAuthConfig) -> Principal {
+        let validator = validator(cfg, Arc::new(NoopRevocationStore), TEST_PUBLIC_KEY);
+        let token = signed_token(claims, TEST_PRIVATE_KEY);
+
+        validator
+            .validate_session(&SessionCredential::Bearer(token))
+            .await
+            .expect("valid token should produce a principal")
     }
 
     fn jwks_response(n: &str, e: &str) -> String {

@@ -209,6 +209,8 @@ pub struct AuthProviderConfig {
     pub jwks_timeout_ms: u64,
     pub require_jti: bool,
     pub roles_claim: String,
+    pub roles_claim_delimiter: Option<String>,
+    pub org_claim: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +236,10 @@ struct RawAuthProviderConfig {
     require_jti: bool,
     #[serde(default)]
     roles_claim: Option<String>,
+    #[serde(default)]
+    roles_claim_delimiter: Option<String>,
+    #[serde(default)]
+    org_claim: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -922,7 +928,7 @@ fn parse_auth_providers(
         Ok(providers) => providers,
         Err(err) => {
             problems.push(format!(
-                "{name} must be a JSON array of auth provider objects with name, type, and jwks_url or issuer, plus optional audience, jwks_timeout_ms, require_jti, and roles_claim: {err}"
+                "{name} must be a JSON array of auth provider objects with name, type, and jwks_url or issuer, plus optional audience, jwks_timeout_ms, require_jti, roles_claim, roles_claim_delimiter, and org_claim: {err}"
             ));
             return Some(Vec::new());
         }
@@ -969,6 +975,9 @@ fn validate_auth_providers(
             provider.roles_claim,
             problems,
         );
+        let roles_claim_delimiter =
+            normalize_auth_provider_roles_claim_delimiter(provider.roles_claim_delimiter);
+        let org_claim = normalize_optional_config_string(provider.org_claim);
 
         validated.push(AuthProviderConfig {
             name: normalized_name,
@@ -981,6 +990,8 @@ fn validate_auth_providers(
                 .unwrap_or(DEFAULT_JWT_JWKS_TIMEOUT_MS),
             require_jti: provider.require_jti,
             roles_claim,
+            roles_claim_delimiter,
+            org_claim,
         });
     }
 
@@ -1008,6 +1019,10 @@ fn normalize_auth_provider_roles_claim(
     }
 }
 
+fn normalize_auth_provider_roles_claim_delimiter(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
 fn legacy_auth_providers(
     jwt_jwks_url: Option<&str>,
     jwt_issuer: Option<&str>,
@@ -1029,6 +1044,8 @@ fn legacy_auth_providers(
         jwks_timeout_ms: jwt_jwks_timeout_ms,
         require_jti: jwt_require_jti,
         roles_claim: roles_claim.to_owned(),
+        roles_claim_delimiter: None,
+        org_claim: None,
     }]
 }
 
@@ -2695,7 +2712,9 @@ mod tests {
                         "audience": " greengateway ",
                         "jwks_timeout_ms": 7000,
                         "require_jti": true,
-                        "roles_claim": " groups "
+                        "roles_claim": " groups ",
+                        "roles_claim_delimiter": " ",
+                        "org_claim": " tenant.id "
                     },
                     {
                         "name": "secondary",
@@ -2720,6 +2739,8 @@ mod tests {
                     jwks_timeout_ms: 7000,
                     require_jti: true,
                     roles_claim: "groups".to_owned(),
+                    roles_claim_delimiter: Some(" ".to_owned()),
+                    org_claim: Some("tenant.id".to_owned()),
                 },
                 AuthProviderConfig {
                     name: "secondary".to_owned(),
@@ -2732,8 +2753,42 @@ mod tests {
                     jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
                     require_jti: false,
                     roles_claim: DEFAULT_ROLES_CLAIM.to_owned(),
+                    roles_claim_delimiter: None,
+                    org_claim: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn auth_providers_treat_empty_optional_claim_mapping_fields_as_unset() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(r#"[{
+                    "name": "primary",
+                    "type": "jwt",
+                    "jwks_url": "https://primary.example.test/.well-known/jwks.json",
+                    "roles_claim_delimiter": "",
+                    "org_claim": "   "
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.auth_providers,
+            vec![AuthProviderConfig {
+                name: "primary".to_owned(),
+                provider_type: AuthProviderType::Jwt,
+                jwks_url: Some("https://primary.example.test/.well-known/jwks.json".to_owned()),
+                issuer: None,
+                audience: None,
+                jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
+                require_jti: false,
+                roles_claim: DEFAULT_ROLES_CLAIM.to_owned(),
+                roles_claim_delimiter: None,
+                org_claim: None,
+            }]
         );
     }
 
@@ -2762,6 +2817,8 @@ mod tests {
                 jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
                 require_jti: false,
                 roles_claim: DEFAULT_ROLES_CLAIM.to_owned(),
+                roles_claim_delimiter: None,
+                org_claim: None,
             }]
         );
     }
@@ -2865,6 +2922,8 @@ mod tests {
                 jwks_timeout_ms: 6000,
                 require_jti: true,
                 roles_claim: "groups".to_owned(),
+                roles_claim_delimiter: None,
+                org_claim: None,
             }]
         );
     }
@@ -2906,6 +2965,8 @@ mod tests {
                 jwks_timeout_ms: 8000,
                 require_jti: false,
                 roles_claim: "declared_roles".to_owned(),
+                roles_claim_delimiter: None,
+                org_claim: None,
             }]
         );
     }
