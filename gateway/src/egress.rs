@@ -273,6 +273,16 @@ impl EgressConfig {
         self.allowed_hosts.len() + self.allowed_host_globs.len()
     }
 
+    pub fn auto_seed_endpoint_host(&mut self, endpoint: &str) -> Option<String> {
+        let mut auto_seeded_hosts = Vec::new();
+        auto_seed_endpoint_host(
+            Some(endpoint),
+            &mut self.allowed_hosts,
+            &mut auto_seeded_hosts,
+        );
+        auto_seeded_hosts.into_iter().next()
+    }
+
     fn apply_policy(&mut self, policy: &EgressPolicy) -> Result<(), EgressError> {
         self.allowed_host_globs
             .extend(policy.hosts.iter().map(|host| host.to_ascii_lowercase()));

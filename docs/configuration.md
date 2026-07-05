@@ -566,11 +566,11 @@ Example with an explicit JWKS endpoint: `[{"name":"primary","type":"jwt","jwks_u
 
 When `AUTH_PROVIDERS` is set, it defines the ordered auth provider chain and takes precedence over the legacy single-provider JWT settings for validator assembly. The legacy settings remain supported for backward compatibility.
 
-OIDC discovery: when a provider has `issuer` but no `jwks_url`, startup fetches `{issuer}/.well-known/openid-configuration` through the egress client and uses the returned `jwks_uri` for later JWKS refreshes. Discovery failure or a discovery document without `jwks_uri` prevents the provider from being constructed.
+OIDC discovery: when a provider has `issuer` but no `jwks_url`, startup fetches `{issuer}/.well-known/openid-configuration` through the egress client, adds the returned `jwks_uri` host to the effective egress allowlist, and uses that `jwks_uri` for later JWKS refreshes. Discovery failure or a discovery document without `jwks_uri` prevents the provider from being constructed.
 
 JWT algorithms: JWKS keys with `kty` `RSA` validate RS256 tokens, `kty` `EC` with `crv` `P-256` validates ES256 tokens, and `kty` `OKP` with `crv` `Ed25519` validates EdDSA tokens. Unsupported or incomplete keys are skipped during JWKS refresh.
 
-Egress trust: each provider `jwks_url`, and each provider `issuer` when it is a URL with a host, is automatically trusted for gateway-originated egress.
+Egress trust: each provider `jwks_url`, each provider `issuer` when it is a URL with a host, and each discovered OIDC `jwks_uri` host are automatically trusted for gateway-originated egress. Private-IP, scheme, port, and DNS-pinning checks still apply to every discovery and JWKS request.
 
 ### JWT_JWKS_URL
 
@@ -795,7 +795,7 @@ Default: empty list, which denies all egress requests.
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, lowercase entries, and require each entry to be an ASCII hostname without a port. Configure only hostnames, not URLs. The egress client still blocks private resolved IP ranges by default even when a hostname is allowlisted.
 
-Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, every `UPSTREAM_ROUTES[].upstream_url`, configured `AUTH_PROVIDERS[].jwks_url` values, URL-shaped `AUTH_PROVIDERS[].issuer` values, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to configured upstreams, fetch OIDC discovery documents, or validate tokens without duplicating those hosts here.
+Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, every `UPSTREAM_ROUTES[].upstream_url`, configured `AUTH_PROVIDERS[].jwks_url` values, URL-shaped `AUTH_PROVIDERS[].issuer` values, OIDC-discovered `jwks_uri` hosts, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to configured upstreams, fetch OIDC discovery documents, or validate tokens without duplicating those hosts here.
 
 ### EGRESS_TIMEOUT_MS
 
