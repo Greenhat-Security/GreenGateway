@@ -210,16 +210,27 @@ impl EgressConfig {
             &mut auto_seeded_hosts,
         );
         for provider in &config.auth_providers {
-            auto_seed_endpoint_host(
-                provider.jwks_url.as_deref(),
-                &mut allowed_hosts,
-                &mut auto_seeded_hosts,
-            );
-            auto_seed_endpoint_host(
-                provider.issuer.as_deref(),
-                &mut allowed_hosts,
-                &mut auto_seeded_hosts,
-            );
+            match provider.provider_type {
+                crate::config::AuthProviderType::Jwt => {
+                    auto_seed_endpoint_host(
+                        provider.jwks_url.as_deref(),
+                        &mut allowed_hosts,
+                        &mut auto_seeded_hosts,
+                    );
+                    auto_seed_endpoint_host(
+                        provider.issuer.as_deref(),
+                        &mut allowed_hosts,
+                        &mut auto_seeded_hosts,
+                    );
+                }
+                crate::config::AuthProviderType::CookieSession => {
+                    auto_seed_endpoint_host(
+                        provider.introspection_url.as_deref(),
+                        &mut allowed_hosts,
+                        &mut auto_seeded_hosts,
+                    );
+                }
+            }
         }
         auto_seed_endpoint_host(
             config.upstream_url.as_deref(),
@@ -1194,12 +1205,45 @@ mod tests {
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
             org_claim: None,
+            introspection_url: None,
+            introspection_timeout_ms:
+                crate::config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: crate::config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+            user_id_claim: None,
+            email_claim: None,
         }];
 
         let egress = EgressConfig::from_config(&config);
 
         assert!(egress.allowed_hosts.contains("idp.example.test"));
         assert!(egress.allowed_hosts.contains("issuer.example.test"));
+    }
+
+    #[test]
+    fn from_config_auto_seeds_cookie_session_introspection_host_into_allowlist() {
+        let mut config = test_config();
+        config.auth_providers = vec![crate::config::AuthProviderConfig {
+            name: "app-session".to_owned(),
+            provider_type: crate::config::AuthProviderType::CookieSession,
+            jwks_url: None,
+            issuer: None,
+            audience: None,
+            jwks_timeout_ms: 2000,
+            require_jti: false,
+            roles_claim: "roles".to_owned(),
+            roles_claim_delimiter: None,
+            org_claim: None,
+            introspection_url: Some("https://sessions.example.test/introspect".to_owned()),
+            introspection_timeout_ms:
+                crate::config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: crate::config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+            user_id_claim: Some("user_id".to_owned()),
+            email_claim: None,
+        }];
+
+        let egress = EgressConfig::from_config(&config);
+
+        assert!(egress.allowed_hosts.contains("sessions.example.test"));
     }
 
     #[test]

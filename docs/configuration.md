@@ -572,19 +572,27 @@ Ordered JSON array of authentication provider objects.
 
 Default: empty, which means the legacy single-provider `JWT_*` settings below are used as an implicit one-entry provider named `legacy` when `JWT_JWKS_URL` is set.
 
-Format and validation: unset, empty, or whitespace-only values use the legacy fallback. Non-empty values must be a JSON array. Each entry must include a non-empty unique `name`, `type` set to `jwt`, and at least one of `jwks_url` or `issuer`. Optional fields are `audience`, `jwks_timeout_ms`, `require_jti`, `roles_claim`, `roles_claim_delimiter`, and `org_claim`. `jwks_url`, `issuer`, `audience`, and `org_claim` are trimmed, and blank values are treated as unset. `roles_claim_delimiter` preserves its exact configured value so a single space can split OAuth2-style scope strings; an empty delimiter is treated as unset. `jwks_timeout_ms` defaults to `2000`, `require_jti` defaults to `false`, and `roles_claim` defaults to `roles`.
+Format and validation: unset, empty, or whitespace-only values use the legacy fallback. Non-empty values must be a JSON array. Each entry must include a non-empty unique `name` and `type` set to `jwt` or `cookie_session`.
+
+For `type:"jwt"`, each entry must set at least one of `jwks_url` or `issuer`. Optional fields are `audience`, `jwks_timeout_ms`, `require_jti`, `roles_claim`, `roles_claim_delimiter`, and `org_claim`. `jwks_url`, `issuer`, `audience`, and `org_claim` are trimmed, and blank values are treated as unset. `roles_claim_delimiter` preserves its exact configured value so a single space can split OAuth2-style scope strings; an empty delimiter is treated as unset. `jwks_timeout_ms` defaults to `2000`, `require_jti` defaults to `false`, and `roles_claim` defaults to `roles`.
+
+For `type:"cookie_session"`, each entry must set `introspection_url` and `user_id_claim`. Optional fields are `introspection_timeout_ms`, `cache_ttl_ms`, `email_claim`, `org_claim`, `roles_claim`, and `roles_claim_delimiter`. `introspection_timeout_ms` defaults to `2000`; `cache_ttl_ms` defaults to `5000` and must be greater than `0`; `roles_claim` defaults to `roles`. Cookie-session-irrelevant JWT fields and JWT-irrelevant cookie-session fields are accepted by the flat JSON schema but ignored for the wrong provider type, so they do not affect validator construction or egress allowlisting.
 
 Example with OIDC discovery: `[{"name":"primary","type":"jwt","issuer":"https://idp.example.com","audience":"greengateway","roles_claim":"roles","require_jti":false}]`
 
 Example with an explicit JWKS endpoint: `[{"name":"primary","type":"jwt","jwks_url":"https://idp.example.com/.well-known/jwks.json","issuer":"https://idp.example.com","audience":"greengateway","roles_claim":"roles","require_jti":false}]`
 
-Claim mapping: `roles_claim` and `org_claim` first resolve the configured value as an exact top-level JWT claim key. Only when no exact key exists and the configured value contains `.` does GreenGateway walk it as a dotted path through nested JSON objects. This preserves Auth0-style namespaced URL claims such as `https://myapp.example.com/roles`, where dots are part of the literal claim key, while still supporting nested IdP shapes such as Keycloak `realm_access.roles`. Role arrays must contain only strings. String-valued role claims are split only when `roles_claim_delimiter` is set; each split piece is trimmed and empty pieces are dropped. `org_claim` is used only when it resolves to a string.
+Claim mapping: `roles_claim`, `org_claim`, and cookie-session-only `user_id_claim`/`email_claim` first resolve the configured value as an exact top-level JSON key. Only when no exact key exists and the configured value contains `.` does GreenGateway walk it as a dotted path through nested JSON objects. This preserves Auth0-style namespaced URL claims such as `https://myapp.example.com/roles`, where dots are part of the literal claim key, while still supporting nested IdP shapes such as Keycloak `realm_access.roles`. Role arrays must contain only strings. String-valued role claims are split only when `roles_claim_delimiter` is set; each split piece is trimmed and empty pieces are dropped. `org_claim` is used only when it resolves to a string.
 
 Keycloak-style nested roles: `[{"name":"keycloak","type":"jwt","issuer":"https://keycloak.example.com/realms/acme","audience":"greengateway","roles_claim":"realm_access.roles","org_claim":"tenant.id"}]`
 
 OAuth2 scope string as roles: `[{"name":"oauth","type":"jwt","issuer":"https://idp.example.com","audience":"greengateway","roles_claim":"scope","roles_claim_delimiter":" "}]`
 
 Auth0-style namespaced claims: `[{"name":"auth0","type":"jwt","issuer":"https://tenant.auth0.com/","audience":"https://api.example.com","roles_claim":"https://myapp.example.com/roles","org_claim":"https://myapp.example.com/org_id"}]`
+
+Cookie-session introspection: a cookie-session provider validates the value from `AUTH_COOKIE_NAME` by sending a `POST` request to `introspection_url` through the egress client with `Content-Type: application/json`, `Accept: application/json`, and body `{"session":"<cookie value>"}`. A `2xx` response must be a JSON object. `user_id_claim`, `email_claim`, `org_claim`, and `roles_claim` resolve against that response with the same exact-key-first and dotted-path fallback semantics described above. `401 Unauthorized`, `403 Forbidden`, and `404 Not Found` mean the session is invalid. Timeouts, egress denials, `5xx`, other unexpected non-2xx responses, malformed JSON success bodies, and success bodies missing `user_id_claim` are treated as upstream identity-service failures rather than invalid sessions.
+
+Cookie-session example: `[{"name":"app","type":"cookie_session","introspection_url":"https://app.example.com/session/introspect","user_id_claim":"account.id","email_claim":"account.email","roles_claim":"account.scope","roles_claim_delimiter":" ","org_claim":"account.tenant_id","cache_ttl_ms":5000}]`
 
 Provider-specific setup recipes for Keycloak, Auth0, Microsoft Entra ID, and Okta are in [docs/auth/README.md](auth/README.md).
 
@@ -594,7 +602,7 @@ OIDC discovery: when a provider has `issuer` but no `jwks_url`, startup fetches 
 
 JWT algorithms: JWKS keys with `kty` `RSA` validate RS256 tokens, `kty` `EC` with `crv` `P-256` validates ES256 tokens, and `kty` `OKP` with `crv` `Ed25519` validates EdDSA tokens. Unsupported or incomplete keys are skipped during JWKS refresh.
 
-Egress trust: each provider `jwks_url`, each provider `issuer` when it is a URL with a host, and each discovered OIDC `jwks_uri` host are automatically trusted for gateway-originated egress. Private-IP, scheme, port, and DNS-pinning checks still apply to every discovery and JWKS request.
+Egress trust: each JWT provider `jwks_url`, each JWT provider `issuer` when it is a URL with a host, each discovered OIDC `jwks_uri` host, and each cookie-session provider `introspection_url` host are automatically trusted for gateway-originated egress. Private-IP, scheme, port, and DNS-pinning checks still apply to every discovery, JWKS, and introspection request.
 
 ### JWT_JWKS_URL
 

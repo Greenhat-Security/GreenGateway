@@ -1192,6 +1192,13 @@ fn auth_validator_from_config(
                     Arc::clone(&egress_client),
                 )?) as Arc<dyn auth::SessionValidator>);
             }
+            config::AuthProviderType::CookieSession => {
+                let cookie_config = auth::CookieSessionAuthConfig::from_provider_config(provider)?;
+                validators.push(Arc::new(auth::CookieSessionValidator::new(
+                    cookie_config,
+                    Arc::clone(&egress_client),
+                )?) as Arc<dyn auth::SessionValidator>);
+            }
         }
     }
 
@@ -1223,6 +1230,7 @@ fn discover_oidc_jwks_urls_from_config(
                 discovered.insert(provider.name.clone(), jwks_url);
             }
             config::AuthProviderType::Jwt => {}
+            config::AuthProviderType::CookieSession => {}
         }
     }
 
@@ -8625,6 +8633,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_cookie_session_authenticates_through_full_stack() {
+        let (introspection_url, introspection_server) =
+            spawn_blocking_cookie_session_server(Ipv4Addr::LOCALHOST, 1);
+        let mut config = test_config(Vec::new());
+        configure_test_cookie_session_provider(&mut config, introspection_url);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .header(header::COOKIE, "session=session-secret-123")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["user_id"], json!("cookie-user"));
+        assert_eq!(body["auth_method"], json!("session_cookie"));
+        assert_eq!(body["roles"], json!(["admin", "member"]));
+        assert_eq!(
+            introspection_server
+                .join()
+                .expect("cookie-session introspection server should finish"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cookie_session_introspection_host_is_auto_seeded_for_cross_host_egress() {
+        let (introspection_url, introspection_server) =
+            spawn_blocking_cookie_session_server(Ipv4Addr::new(127, 0, 0, 2), 1);
+        let mut config = test_config(Vec::new());
+        configure_test_cookie_session_provider(&mut config, introspection_url);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .header(header::COOKIE, "session=session-secret-123")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["user_id"], json!("cookie-user"));
+        assert_eq!(
+            introspection_server
+                .join()
+                .expect("cookie-session introspection server should finish"),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn custom_admin_prefix_is_reserved_from_proxy_collisions() {
         let (upstream_addr, mut captured) = spawn_capture_upstream().await;
         let mut config = proxy_config(upstream_addr);
@@ -14627,6 +14712,11 @@ paths:
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
             org_claim: None,
+            introspection_url: None,
+            introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+            user_id_claim: None,
+            email_claim: None,
         }];
         config.egress_deny_private_ips = false;
         let egress_client = Arc::new(
@@ -14673,6 +14763,11 @@ paths:
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
             org_claim: None,
+            introspection_url: None,
+            introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+            user_id_claim: None,
+            email_claim: None,
         }];
         config.egress_deny_private_ips = false;
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -14744,6 +14839,11 @@ paths:
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
             org_claim: None,
+            introspection_url: None,
+            introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+            user_id_claim: None,
+            email_claim: None,
         }];
         let recorder = PrometheusBuilder::new().build_recorder();
         let router = app(
@@ -14800,6 +14900,11 @@ paths:
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
             org_claim: None,
+            introspection_url: None,
+            introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+            user_id_claim: None,
+            email_claim: None,
         }];
         config.egress_deny_private_ips = false;
         let egress_client = Arc::new(
@@ -16761,6 +16866,37 @@ O2gecI9QwDJNpm29J9wJB2F8
         (jwks_url, server)
     }
 
+    fn spawn_blocking_cookie_session_server(
+        host: Ipv4Addr,
+        request_count: usize,
+    ) -> (String, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind((host, 0))
+            .expect("cookie-session introspection test server should bind");
+        let introspection_url = format!(
+            "http://{}:{}/introspect",
+            host,
+            listener
+                .local_addr()
+                .expect("cookie-session introspection test server address should be available")
+                .port()
+        );
+        let body = json!({
+            "account": {
+                "id": "cookie-user",
+                "email": "Cookie.User@Example.TEST",
+                "tenant": { "id": "cookie-org" },
+                "scope": "admin member"
+            }
+        });
+        let server = spawn_blocking_json_server(
+            listener,
+            vec![("/introspect".to_owned(), body.to_string())],
+            request_count,
+        );
+
+        (introspection_url, server)
+    }
+
     fn spawn_blocking_oidc_discovery_server(
         jwks_url: String,
     ) -> (String, std::thread::JoinHandle<usize>) {
@@ -16904,6 +17040,34 @@ O2gecI9QwDJNpm29J9wJB2F8
             roles_claim: config.roles_claim.clone(),
             roles_claim_delimiter: None,
             org_claim: None,
+            introspection_url: None,
+            introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+            user_id_claim: None,
+            email_claim: None,
+        }];
+    }
+
+    fn configure_test_cookie_session_provider(
+        config: &mut config::Config,
+        introspection_url: String,
+    ) {
+        config.auth_providers = vec![config::AuthProviderConfig {
+            name: "app-session".to_owned(),
+            provider_type: config::AuthProviderType::CookieSession,
+            jwks_url: None,
+            issuer: None,
+            audience: None,
+            jwks_timeout_ms: config.jwt_jwks_timeout_ms,
+            require_jti: false,
+            roles_claim: "account.scope".to_owned(),
+            roles_claim_delimiter: Some(" ".to_owned()),
+            org_claim: Some("account.tenant.id".to_owned()),
+            introspection_url: Some(introspection_url),
+            introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: 20,
+            user_id_claim: Some("account.id".to_owned()),
+            email_claim: Some("account.email".to_owned()),
         }];
     }
 
