@@ -474,7 +474,7 @@ A copyable starter registry is available at `docs/examples/tools.starter.json`. 
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. The registry loader reads the file as JSON, validates it against `docs/schemas/tools.v0.schema.json`, rejects duplicate tool names, rejects unknown HTTP methods, and compiles each tool's `input_json_schema` as a JSON Schema document at load time.
 
-This is deliberately separate from `POLICY_FILE`. `TOOLS_FILE` defines what a tool is and how its future executor will map arguments onto an upstream HTTP request. The RBAC policy's `tools` section controls whether a configured tool may run and with what runtime limits. This PR does not execute tool calls or enforce per-tool RBAC.
+This is deliberately separate from `POLICY_FILE`. `TOOLS_FILE` defines what a tool is and how the generic executor maps arguments onto an upstream HTTP request. The RBAC policy's `tools` section controls whether a configured tool may run, which roles may invoke it through `allowed_roles`, and its runtime timeout and concurrency limits. Empty or omitted `allowed_roles` means no role constraint beyond `enabled`.
 
 ### POLICY_HISTORY_SQLITE_PATH
 

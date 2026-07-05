@@ -184,6 +184,9 @@ pub struct ToolPolicyEntry {
     /// Whether this tool is available for invocation.
     #[serde(default = "default_tool_policy_enabled")]
     pub enabled: bool,
+    /// Role names allowed to invoke this tool. Empty means no role constraint.
+    #[serde(default)]
+    pub allowed_roles: Vec<String>,
     /// Execution timeout for a single invocation, in milliseconds.
     #[serde(default = "default_tool_policy_timeout_ms")]
     pub timeout_ms: u64,
@@ -1074,6 +1077,7 @@ mod tests {
                     "lookup": {},
                     "report": {
                         "enabled": false,
+                        "allowed_roles": ["operator", "support"],
                         "timeout_ms": 1500,
                         "max_concurrent": 3
                     }
@@ -1088,6 +1092,7 @@ mod tests {
             policy.tools["lookup"],
             ToolPolicyEntry {
                 enabled: true,
+                allowed_roles: Vec::new(),
                 timeout_ms: DEFAULT_TOOL_POLICY_TIMEOUT_MS,
                 max_concurrent: DEFAULT_TOOL_POLICY_MAX_CONCURRENT,
             }
@@ -1096,6 +1101,7 @@ mod tests {
             policy.tools["report"],
             ToolPolicyEntry {
                 enabled: false,
+                allowed_roles: vec!["operator".to_owned(), "support".to_owned()],
                 timeout_ms: 1500,
                 max_concurrent: 3,
             }
@@ -1789,6 +1795,7 @@ mod tests {
             "tools": {
                 "lookup": {
                     "enabled": true,
+                    "allowed_roles": ["operator"],
                     "timeout_ms": 1500,
                     "max_concurrent": 3
                 },
@@ -2006,6 +2013,7 @@ mod tests {
                 "lookup".to_owned(),
                 ToolPolicyEntry {
                     enabled: true,
+                    allowed_roles: Vec::new(),
                     timeout_ms: DEFAULT_TOOL_POLICY_TIMEOUT_MS,
                     max_concurrent: DEFAULT_TOOL_POLICY_MAX_CONCURRENT,
                 },

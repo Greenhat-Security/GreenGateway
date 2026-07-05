@@ -58,7 +58,7 @@
     },
     "tools": {
       "type": "object",
-      "description": "Optional per-tool runtime policy for generic MCP tool invocation admission. Each key is a tool name. Tool implementations and registry wiring are configured by later MCP gateway features; this section only controls generic enablement, timeout, and per-tool concurrency.",
+      "description": "Optional per-tool runtime policy for generic MCP tool invocation admission. Each key is a tool name. Tool implementations and registry wiring are configured separately; this section controls generic enablement, role admission, timeout, and per-tool concurrency.",
       "additionalProperties": {
         "$ref": "#/$defs/tool_policy_entry"
       }
@@ -265,6 +265,14 @@
           "type": "boolean",
           "default": true,
           "description": "Whether this tool is available for invocation. Omitted values default to true."
+        },
+        "allowed_roles": {
+          "type": "array",
+          "default": [],
+          "description": "Role names allowed to invoke this tool. Empty or omitted means no role constraint beyond enabled.",
+          "items": {
+            "type": "string"
+          }
         },
         "timeout_ms": {
           "type": "integer",

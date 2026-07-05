@@ -1082,6 +1082,61 @@ mod tests {
         server.handle.abort();
     }
 
+    #[tokio::test]
+    async fn default_policy_deny_blocks_registry_tool_absent_from_policy_map() {
+        let server = gated_server().await;
+        let (executor, _capture) = executor_for_tools(
+            server.addr,
+            [echo_tool()],
+            runtime_config_without_tools(DefaultToolPolicy::Deny),
+        );
+
+        let error = executor
+            .execute(
+                "echo",
+                json!({ "message": "hello" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("default deny should reject registry tools absent from policy map");
+
+        assert!(matches!(error, ToolRuntimeError::UnknownTool { .. }));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            server.request_count(),
+            0,
+            "default-policy rejection must not reach upstream"
+        );
+
+        server.stop.cancel();
+        server.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn default_policy_allow_permits_registry_tool_absent_from_policy_map() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"ok").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [echo_tool()],
+            runtime_config_without_tools(DefaultToolPolicy::Allow),
+        );
+
+        let response = executor
+            .execute(
+                "echo",
+                json!({ "message": "hello" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("default allow should admit a registered tool absent from policy map");
+
+        assert_eq!(response.status, StatusCode::OK);
+        let request = server.await.expect("server task should join");
+        assert_eq!(request.target, "/v1/echo");
+    }
+
     fn executor_for_tools<const N: usize>(
         addr: SocketAddr,
         tools: [Value; N],
@@ -1134,9 +1189,21 @@ mod tests {
         }
     }
 
+    fn runtime_config_without_tools(default_policy: DefaultToolPolicy) -> ToolRuntimeConfig {
+        ToolRuntimeConfig {
+            max_queue: 2,
+            queue_timeout: Duration::from_millis(100),
+            max_concurrent_global: 1,
+            default_policy,
+            default_timeout: Duration::from_millis(500),
+            tools: HashMap::new(),
+        }
+    }
+
     fn enabled_tool(timeout_ms: u64, max_concurrent: usize) -> ToolRuntimeToolConfig {
         ToolRuntimeToolConfig {
             enabled: true,
+            allowed_roles: Vec::new(),
             timeout: Duration::from_millis(timeout_ms),
             max_concurrent,
         }
