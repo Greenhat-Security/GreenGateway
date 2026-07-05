@@ -93,6 +93,7 @@ const PAYLOAD_CAPTURE_ENABLED: &str = "PAYLOAD_CAPTURE_ENABLED";
 const PAYLOAD_CAPTURE_SAMPLE_RATE: &str = "PAYLOAD_CAPTURE_SAMPLE_RATE";
 const POLICY_FILE: &str = "POLICY_FILE";
 const POLICY_HISTORY_SQLITE_PATH: &str = "POLICY_HISTORY_SQLITE_PATH";
+const PRINCIPAL_SQLITE_PATH: &str = "PRINCIPAL_SQLITE_PATH";
 const PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD: &str =
     "PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD";
 const RBAC_EXEMPT_PATHS: &str = "RBAC_EXEMPT_PATHS";
@@ -125,6 +126,7 @@ pub struct Config {
     pub audit_sqlite_path: Option<String>,
     pub audit_sqlite_retention_days: Option<u32>,
     pub discovery_sqlite_path: Option<String>,
+    pub principal_sqlite_path: Option<String>,
     pub payload_capture_enabled: bool,
     pub payload_capture_sample_rate: f64,
     pub schema_mismatch_signal_threshold: u64,
@@ -331,6 +333,11 @@ impl Config {
         let discovery_sqlite_path = parse_optional_string(
             DISCOVERY_SQLITE_PATH,
             get_var(DISCOVERY_SQLITE_PATH),
+            &mut problems,
+        );
+        let principal_sqlite_path = parse_optional_string(
+            PRINCIPAL_SQLITE_PATH,
+            get_var(PRINCIPAL_SQLITE_PATH),
             &mut problems,
         );
         let payload_capture_enabled = parse_var(
@@ -696,6 +703,7 @@ impl Config {
                 audit_sqlite_path,
                 audit_sqlite_retention_days,
                 discovery_sqlite_path,
+                principal_sqlite_path,
                 payload_capture_enabled,
                 payload_capture_sample_rate,
                 schema_mismatch_signal_threshold,
@@ -1915,6 +1923,7 @@ mod tests {
         assert_eq!(config.audit_sqlite_path, None);
         assert_eq!(config.audit_sqlite_retention_days, None);
         assert_eq!(config.discovery_sqlite_path, None);
+        assert_eq!(config.principal_sqlite_path, None);
         assert_eq!(config.policy_file, None);
         assert_eq!(config.policy_history_sqlite_path, None);
         assert!(config.cors_allow_origins.is_empty());
@@ -2075,6 +2084,7 @@ mod tests {
         assert_eq!(config.audit_sqlite_path, None);
         assert_eq!(config.audit_sqlite_retention_days, None);
         assert_eq!(config.discovery_sqlite_path, None);
+        assert_eq!(config.principal_sqlite_path, None);
         assert!(!config.payload_capture_enabled);
         assert_eq!(
             config.payload_capture_sample_rate,
@@ -2369,6 +2379,31 @@ mod tests {
         .expect("config should parse");
 
         assert_eq!(config.discovery_sqlite_path, None);
+    }
+
+    #[test]
+    fn principal_sqlite_path_parses_optional_path() {
+        let config = Config::from_env_vars(|name| match name {
+            "PRINCIPAL_SQLITE_PATH" => Ok("  /var/lib/greengateway/principals.sqlite  ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.principal_sqlite_path,
+            Some("/var/lib/greengateway/principals.sqlite".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_principal_sqlite_path_is_none() {
+        let config = Config::from_env_vars(|name| match name {
+            "PRINCIPAL_SQLITE_PATH" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.principal_sqlite_path, None);
     }
 
     #[test]

@@ -22,6 +22,8 @@ impl AuthMethod {
 pub struct Principal {
     /// Canonical user identifier for authorization and ownership checks.
     pub user_id: String,
+    /// Optional identity-provider issuer used to disambiguate equal subjects across providers.
+    pub issuer: Option<String>,
     /// User email address, normalized to lowercase when present.
     #[allow(dead_code)] // RBAC and upstream policy rules will consume this identity field.
     pub email: Option<String>,
@@ -96,6 +98,7 @@ mod tests {
     fn test_principal(auth_method: AuthMethod, roles: Vec<&str>) -> Principal {
         Principal {
             user_id: "user-123".to_owned(),
+            issuer: None,
             email: Some("user@example.com".to_owned()),
             org_id: Some("org-456".to_owned()),
             roles: roles.into_iter().map(str::to_owned).collect(),

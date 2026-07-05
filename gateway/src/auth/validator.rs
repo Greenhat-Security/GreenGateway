@@ -158,6 +158,7 @@ mod tests {
     fn test_principal() -> Principal {
         Principal {
             user_id: "user-123".to_owned(),
+            issuer: None,
             email: Some("user@example.com".to_owned()),
             org_id: Some("org-456".to_owned()),
             roles: vec!["member".to_owned()],

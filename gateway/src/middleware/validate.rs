@@ -117,6 +117,7 @@ mod tests {
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,
             discovery_sqlite_path: None,
+            principal_sqlite_path: None,
             payload_capture_enabled: false,
             payload_capture_sample_rate: crate::config::DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
             schema_mismatch_signal_threshold:

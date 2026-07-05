@@ -298,6 +298,7 @@ impl CachedSessionValidation {
         match self {
             Self::Valid(valid) => Ok(Principal {
                 user_id: valid.user_id,
+                issuer: None,
                 email: valid.email,
                 org_id: valid.org_id,
                 roles: valid.roles,

@@ -766,6 +766,7 @@ mod tests {
         )
             .prop_map(|(user_id, roles, auth_method)| Principal {
                 user_id,
+                issuer: None,
                 email: Some("user@example.test".to_owned()),
                 org_id: None,
                 roles,
@@ -829,6 +830,7 @@ mod tests {
     fn test_principal(user_id: &str, roles: &[&str], auth_method: AuthMethod) -> Principal {
         Principal {
             user_id: user_id.to_owned(),
+            issuer: None,
             email: Some("user@example.test".to_owned()),
             org_id: None,
             roles: roles.iter().map(|role| (*role).to_owned()).collect(),

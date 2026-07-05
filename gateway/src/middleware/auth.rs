@@ -20,7 +20,10 @@ use serde_json::json;
 
 use crate::{
     audit::{AuditEvent, AuditLog},
-    auth::{actor_from_principal, AuthError, Principal, SessionCredential, SessionValidator},
+    auth::{
+        actor_from_principal, AuthError, Principal, PrincipalDirectory, SessionCredential,
+        SessionValidator,
+    },
     client_ip::{canonical_client_ip, request_id},
     config::{AuthMode, Config},
     path_match::path_prefix_matches,
@@ -38,6 +41,7 @@ pub struct AuthState {
     pub cookie_name: String,
     pub exempt_paths: Vec<String>,
     pub audit: AuditLog,
+    pub principal_directory: PrincipalDirectory,
     pub trust_proxy_headers: bool,
 }
 
@@ -58,6 +62,7 @@ impl AuthState {
         config: &Config,
         validator: Option<Arc<dyn SessionValidator>>,
         audit: AuditLog,
+        principal_directory: PrincipalDirectory,
     ) -> Self {
         Self {
             validator,
@@ -65,6 +70,7 @@ impl AuthState {
             cookie_name: config.auth_cookie_name.clone(),
             exempt_paths: config.auth_exempt_paths.clone(),
             audit,
+            principal_directory,
             trust_proxy_headers: config.trust_proxy_headers,
         }
     }
@@ -109,6 +115,7 @@ pub async fn auth_middleware(
         Ok(principal) => {
             emit_success(&state, &audit, &credential, &principal);
             req.extensions_mut().insert(principal.clone());
+            state.principal_directory.observe(&principal);
             let mut response = next.run(req).await;
             response.extensions_mut().insert(AuthOutcome {
                 principal: Some(principal),
@@ -381,6 +388,7 @@ mod tests {
                     "/admin".to_owned(),
                 ],
                 audit,
+                principal_directory: PrincipalDirectory::disabled(),
                 trust_proxy_headers: false,
             },
             capture,
@@ -406,6 +414,7 @@ mod tests {
     fn test_principal() -> Principal {
         Principal {
             user_id: "user-123".to_owned(),
+            issuer: None,
             email: Some("user@example.com".to_owned()),
             org_id: Some("org-456".to_owned()),
             roles: vec!["member".to_owned()],

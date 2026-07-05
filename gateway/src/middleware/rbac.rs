@@ -2037,6 +2037,7 @@ mod tests {
     fn test_principal(roles: &[&str]) -> Principal {
         Principal {
             user_id: "user-123".to_owned(),
+            issuer: None,
             email: Some("user@example.test".to_owned()),
             org_id: None,
             roles: roles.iter().map(|role| (*role).to_owned()).collect(),

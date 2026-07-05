@@ -177,6 +177,7 @@ impl CachedVerification {
 
                 Ok(Principal {
                     user_id: format!("service-token:{}", valid.id),
+                    issuer: None,
                     email: None,
                     org_id: None,
                     roles: valid.scopes,
@@ -271,6 +272,7 @@ mod tests {
             format!("service-token:{}", created.record.id)
         );
         assert_eq!(principal.email, None);
+        assert_eq!(principal.issuer, None);
         assert_eq!(principal.org_id, None);
         assert_eq!(
             principal.roles,
