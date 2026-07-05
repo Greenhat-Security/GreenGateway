@@ -14,7 +14,10 @@ use tokio::{
     time::timeout,
 };
 
-use crate::{config::Config, egress::EgressClient};
+use crate::{
+    config::{AuthProviderConfig, Config},
+    egress::EgressClient,
+};
 
 use super::{AuthError, AuthMethod, Principal, SessionCredential, SessionValidator};
 
@@ -39,6 +42,7 @@ pub struct JwtAuthConfig {
 }
 
 impl JwtAuthConfig {
+    #[allow(dead_code)] // Legacy single-provider constructor retained for compatibility tests and callers.
     pub fn from_config(config: &Config) -> Option<Self> {
         Some(Self {
             jwks_url: config.jwt_jwks_url.clone()?,
@@ -48,6 +52,17 @@ impl JwtAuthConfig {
             require_jti: config.jwt_require_jti,
             roles_claim: config.roles_claim.clone(),
         })
+    }
+
+    pub fn from_provider_config(config: &AuthProviderConfig) -> Self {
+        Self {
+            jwks_url: config.jwks_url.clone(),
+            issuer: config.issuer.clone(),
+            audience: config.audience.clone(),
+            http_timeout: Duration::from_millis(config.jwks_timeout_ms),
+            require_jti: config.require_jti,
+            roles_claim: config.roles_claim.clone(),
+        }
     }
 }
 
@@ -113,6 +128,7 @@ impl JwtValidator {
         Self::with_keys(cfg, egress_client, revocation, HashMap::new())
     }
 
+    #[allow(dead_code)] // Startup now builds JwtValidator instances from Config.auth_providers.
     pub fn from_config(
         config: &Config,
         egress_client: Arc<EgressClient>,
@@ -419,6 +435,36 @@ D06N4uTKth9Tvy8REyk8gqnvUm80RsHMIMjTzFyH2pMxKGVZ8YkFqubhfhBYaMK1
 Mqr96rIzKrhNTlduosMC0/W5cHRPnTk3eGcnFRa5QIJ/uLJcX8WT5pKzPiIAX4Tx
 mQIDAQAB
 -----END PUBLIC KEY-----"#;
+    const SECOND_TEST_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCqm28zt83mBdz5
+RB35PpFl1fr/jZGrxd/Z6T0sbZt5HYtQlPzW8s1byvvqG7ZbobPPCRDEP/k/3P4P
+0JzIAxr5WZJBw0NGdOYw50OkxsBvHd4CCPFkT94dufYLznnISvq4tQ+7ONinw8VD
+W7FyrrDwR5gRtubLOZQNI+sc46djMkLp7Tuv0ByHzwIWe2SpTlYGFtVhVqwn6C2O
+A4oXXlFGRGIiKemVCyLvTfnTurpv8znN4xiyOgt0a8exLK6gM0qLLL3EJFXNZmL8
+Uo0qe9frNkHU/Yd0ifEURQJlQ+td6iAvd4ViYdCxWp6NUReOWelp1zn7OtSYFoA9
+zz4jKA7TAgMBAAECggEAPrt8vkWdvjD1uepkIxvwlsOB0aoaoFDYKOZsigOboYNN
+kMnX1qnc/R28V67s9PCWj1BEDAWB/wuhl+sbWyhZKMrYzrmf6S5e3iiLZPF4HOOc
+mJ71M+9yOvgAEwNPIGkBnB1ntW4HrFh+FnCG5SZ7BT8uGYVpg9yeJd7JOwwypnRf
+izVPVewengB4Gdw5MK89yMJobXfLeJbMqFS1lGSjXFFx+RxQmXhT5ewli7J6dEbU
+YUqUVMnEMPthNH6gQdRDKs7E4kjDYWcluhcPDU/rcH1seqpCjpBm/rEwG0HbOUlj
+/miYceXcpVBRKUHFoGvrXLjaSL4La0GLNoadDljJAQKBgQDw6NvwYMwlh9FXEVuZ
+Qtxv0kjtpQ5iO8vBEySw/RfYdtSoBIb3fZj72oypRXm35QzgiK2CkGFA8Dk6UQf5
+q893Ajz+giTbeUUQ7XirQ1VXulPqs/+/xN3t+Z1tYuU9sUZtTRUbRhYUEeU9Y6gn
+mY8RPi4U+/c8kDJ4N5ILnV7GEwKBgQC1Szrz821idr9qG7SzXFOz7tX80DsFWwPp
+x79Rr74dL1W9Ro3qJcx6g4NYFCDcvKVI41DvT5GFCDpuyCWtHB2TFSoizt3TqzFp
+103gaWcf9fq+C91H8Wt9r2vUBZmGvQ54b+bQaFWGlJHuDaWifTixBwzzQ2CHrark
+8g6Ad1GsQQKBgDOg48mvJPECG2X6bVP6FT3Nph1v2xZIVFFLZficNOkKBmb/mWEe
+xJNs8eow3nX/m3PfNrgdcwo0sT8DMJ9cJ7kMfL/aakWyxo9rJQonAvorD2LkMnIJ
+obonXYqcwB4piLtR4q0WpxKkBynR2q6p5RQ/7CZJHWIYUQiceCsPDcmLAoGAVHc2
+gk5aGlQFHqTF7gMIJH8UR/Oka/xZuGQOKTreMq7JHaRvnjX6LOJ1IWZPYUirIWh3
+XugNfpO01cR+eUbuKIbl2M3U4DeUkCF18SZqm6N5LW5NrKU4VZiTfncVbodK5KYO
+Pe8+WbOCwgytrST2ctQ8HmK36L7rLjvwsb3l2YECgYEAyzwjQCVHQ3b+GnvQnpn7
+C28AjWRJLUugro3S8LefVTyiyxMzu3F59gizsagiX2z7Jn96/cdiP7286w+jtLF5
+3h13yp87g9/lSJG7nDwHendJVw4ZdqF5nJVfIfg9pvWYjUmEQJgVNBWwCTQRzjge
+RowSUZV5FSmOGJ7JyROZ80k=
+-----END PRIVATE KEY-----"#;
+    const SECOND_TEST_PUBLIC_KEY_N: &str = "qptvM7fN5gXc-UQd-T6RZdX6_42Rq8Xf2ek9LG2beR2LUJT81vLNW8r76hu2W6GzzwkQxD_5P9z-D9CcyAMa-VmSQcNDRnTmMOdDpMbAbx3eAgjxZE_eHbn2C855yEr6uLUPuzjYp8PFQ1uxcq6w8EeYEbbmyzmUDSPrHOOnYzJC6e07r9Ach88CFntkqU5WBhbVYVasJ-gtjgOKF15RRkRiIinplQsi703507q6b_M5zeMYsjoLdGvHsSyuoDNKiyy9xCRVzWZi_FKNKnvX6zZB1P2HdInxFEUCZUPrXeogL3eFYmHQsVqejVEXjlnpadc5-zrUmBaAPc8-IygO0w";
+    const SECOND_TEST_PUBLIC_KEY_E: &str = "AQAB";
 
     #[derive(Debug)]
     struct StaticRevocationStore {
@@ -774,6 +820,54 @@ mQIDAQAB
         server.await.expect("JWKS test server task should finish");
     }
 
+    #[tokio::test]
+    async fn chain_validates_tokens_from_two_real_jwt_providers() {
+        let provider_a_jwks = jwks_response(TEST_PUBLIC_KEY_N, TEST_PUBLIC_KEY_E);
+        let provider_b_jwks = jwks_response(SECOND_TEST_PUBLIC_KEY_N, SECOND_TEST_PUBLIC_KEY_E);
+        let (provider_a_url, provider_a_server) = jwks_server(provider_a_jwks, 2).await;
+        let (provider_b_url, provider_b_server) = jwks_server(provider_b_jwks, 2).await;
+        let egress_client = egress_client(HashSet::from(["127.0.0.1".to_owned()]), false);
+        let provider_a = jwt_cfg(&provider_a_url);
+        let provider_b = jwt_cfg(&provider_b_url);
+        let chain_b_then_a = crate::auth::ChainValidator::new(vec![
+            Arc::new(JwtValidator::new(provider_b.clone(), Arc::clone(&egress_client)).unwrap())
+                as Arc<dyn SessionValidator>,
+            Arc::new(JwtValidator::new(provider_a.clone(), Arc::clone(&egress_client)).unwrap())
+                as Arc<dyn SessionValidator>,
+        ]);
+        let chain_a_then_b = crate::auth::ChainValidator::new(vec![
+            Arc::new(JwtValidator::new(provider_a, Arc::clone(&egress_client)).unwrap())
+                as Arc<dyn SessionValidator>,
+            Arc::new(JwtValidator::new(provider_b, egress_client).unwrap())
+                as Arc<dyn SessionValidator>,
+        ]);
+
+        let mut provider_a_claims = base_claims();
+        provider_a_claims["sub"] = json!("provider-a-user");
+        let provider_a_token = signed_token(provider_a_claims, TEST_PRIVATE_KEY);
+        let mut provider_b_claims = base_claims();
+        provider_b_claims["sub"] = json!("provider-b-user");
+        let provider_b_token = signed_token(provider_b_claims, SECOND_TEST_PRIVATE_KEY);
+
+        let provider_a_principal = chain_b_then_a
+            .validate_session(&SessionCredential::Bearer(provider_a_token))
+            .await
+            .expect("provider A token should validate through the chain");
+        let provider_b_principal = chain_a_then_b
+            .validate_session(&SessionCredential::Bearer(provider_b_token))
+            .await
+            .expect("provider B token should validate through the chain");
+
+        assert_eq!(provider_a_principal.user_id, "provider-a-user");
+        assert_eq!(provider_b_principal.user_id, "provider-b-user");
+        provider_a_server
+            .await
+            .expect("provider A JWKS server task should finish");
+        provider_b_server
+            .await
+            .expect("provider B JWKS server task should finish");
+    }
+
     #[test]
     fn from_config_returns_none_without_jwks_url() {
         let config = test_config(None);
@@ -870,6 +964,59 @@ mQIDAQAB
         }
     }
 
+    fn jwt_cfg(jwks_url: &str) -> JwtAuthConfig {
+        JwtAuthConfig {
+            jwks_url: jwks_url.to_owned(),
+            ..default_cfg()
+        }
+    }
+
+    fn jwks_response(n: &str, e: &str) -> String {
+        json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": KID,
+                "use": "sig",
+                "alg": "RS256",
+                "n": n,
+                "e": e
+            }]
+        })
+        .to_string()
+    }
+
+    async fn jwks_server(
+        jwks: String,
+        request_count: usize,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("JWKS test server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("JWKS test server address should be available");
+        let server = tokio::spawn(async move {
+            for _ in 0..request_count {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("JWKS test server should accept a request");
+                read_one_request(&stream).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    jwks.len(),
+                    jwks
+                );
+                write_all(&stream, response.as_bytes()).await;
+            }
+        });
+
+        (
+            format!("http://127.0.0.1:{}/.well-known/jwks.json", addr.port()),
+            server,
+        )
+    }
+
     fn test_config(jwks_url: Option<&str>) -> Config {
         Config {
             listen_addr: "127.0.0.1:0"
@@ -918,6 +1065,7 @@ mQIDAQAB
                 "/version".to_owned(),
                 "/metrics".to_owned(),
             ],
+            auth_providers: Vec::new(),
             jwt_jwks_url: jwks_url.map(str::to_owned),
             jwt_issuer: None,
             jwt_audience: None,

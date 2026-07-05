@@ -552,6 +552,20 @@ Default: `/health,/version,/metrics,/admin`
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/version,/metrics` plus the effective `ADMIN_PREFIX`. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without credential extraction and do not emit auth audit events.
 
+### AUTH_PROVIDERS
+
+Ordered JSON array of authentication provider objects.
+
+Default: empty, which means the legacy single-provider `JWT_*` settings below are used as an implicit one-entry provider named `legacy` when `JWT_JWKS_URL` is set.
+
+Format and validation: unset, empty, or whitespace-only values use the legacy fallback. Non-empty values must be a JSON array. Each entry must include a non-empty unique `name`, `type` set to `jwt`, and a non-empty `jwks_url`. Optional fields are `issuer`, `audience`, `jwks_timeout_ms`, `require_jti`, and `roles_claim`. `issuer` and `audience` are trimmed, and blank values are treated as unset. `jwks_timeout_ms` defaults to `2000`, `require_jti` defaults to `false`, and `roles_claim` defaults to `roles`.
+
+Example: `[{"name":"primary","type":"jwt","jwks_url":"https://idp.example.com/.well-known/jwks.json","issuer":"https://idp.example.com","audience":"greengateway","roles_claim":"roles","require_jti":false}]`
+
+When `AUTH_PROVIDERS` is set, it defines the ordered auth provider chain and takes precedence over the legacy single-provider JWT settings for validator assembly. The legacy settings remain supported for backward compatibility.
+
+Egress trust: each provider `jwks_url`, and each provider `issuer` when it is a URL with a host, is automatically trusted for gateway-originated egress.
+
 ### JWT_JWKS_URL
 
 Optional JWKS endpoint used to validate RS256 bearer JWTs.
@@ -757,7 +771,7 @@ Default: empty list, which denies all egress requests.
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, lowercase entries, and require each entry to be an ASCII hostname without a port. Configure only hostnames, not URLs. The egress client still blocks private resolved IP ranges by default even when a hostname is allowlisted.
 
-Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, every `UPSTREAM_ROUTES[].upstream_url`, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to configured upstreams or validate tokens without duplicating those hosts here.
+Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, every `UPSTREAM_ROUTES[].upstream_url`, `AUTH_PROVIDERS[].jwks_url`, URL-shaped `AUTH_PROVIDERS[].issuer` values, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to configured upstreams or validate tokens without duplicating those hosts here.
 
 ### EGRESS_TIMEOUT_MS
 

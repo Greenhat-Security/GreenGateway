@@ -209,6 +209,18 @@ impl EgressConfig {
             &mut allowed_hosts,
             &mut auto_seeded_hosts,
         );
+        for provider in &config.auth_providers {
+            auto_seed_endpoint_host(
+                Some(provider.jwks_url.as_str()),
+                &mut allowed_hosts,
+                &mut auto_seeded_hosts,
+            );
+            auto_seed_endpoint_host(
+                provider.issuer.as_deref(),
+                &mut allowed_hosts,
+                &mut auto_seeded_hosts,
+            );
+        }
         auto_seed_endpoint_host(
             config.upstream_url.as_deref(),
             &mut allowed_hosts,
@@ -1159,6 +1171,26 @@ mod tests {
     }
 
     #[test]
+    fn from_config_auto_seeds_auth_provider_hosts_into_allowlist() {
+        let mut config = test_config();
+        config.auth_providers = vec![crate::config::AuthProviderConfig {
+            name: "primary".to_owned(),
+            provider_type: crate::config::AuthProviderType::Jwt,
+            jwks_url: "https://idp.example.test/.well-known/jwks.json".to_owned(),
+            issuer: Some("https://issuer.example.test/".to_owned()),
+            audience: None,
+            jwks_timeout_ms: 2000,
+            require_jti: false,
+            roles_claim: "roles".to_owned(),
+        }];
+
+        let egress = EgressConfig::from_config(&config);
+
+        assert!(egress.allowed_hosts.contains("idp.example.test"));
+        assert!(egress.allowed_hosts.contains("issuer.example.test"));
+    }
+
+    #[test]
     fn from_config_auto_seeds_upstream_host_into_allowlist() {
         let mut config = test_config();
         config.upstream_url = Some("https://upstream.example.test:8443/base".to_owned());
@@ -1810,6 +1842,7 @@ mod tests {
                 "/version".to_owned(),
                 "/metrics".to_owned(),
             ],
+            auth_providers: Vec::new(),
             jwt_jwks_url: None,
             jwt_issuer: None,
             jwt_audience: None,

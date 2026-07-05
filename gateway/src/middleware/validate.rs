@@ -157,6 +157,7 @@ mod tests {
                 "/version".to_owned(),
                 "/metrics".to_owned(),
             ],
+            auth_providers: Vec::new(),
             jwt_jwks_url: None,
             jwt_issuer: None,
             jwt_audience: None,
