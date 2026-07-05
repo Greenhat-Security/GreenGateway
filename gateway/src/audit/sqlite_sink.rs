@@ -808,6 +808,7 @@ mod tests {
             "203.0.113.10",
             Some(Actor {
                 user_id: "user-123".to_owned(),
+                email: None,
                 roles: Some(vec!["reader".to_owned()]),
                 auth_mode: "bearer_token".to_owned(),
             }),

@@ -12,6 +12,20 @@ Each phase is versioned as it completes (`0.1` for Phase 1, `0.2` for Phase 2,
 [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44)
 for full phase-by-phase status.
 
+### Changed — breaking
+
+- `GET /v1{ADMIN_PREFIX}/audit`, `GET /v1{ADMIN_PREFIX}/events/stream`, and
+  `GET /v1{ADMIN_PREFIX}/status` now require a configured `POLICY_FILE` and
+  the granular permissions `admin:audit:read`, `admin:audit:stream`, and
+  `admin:status:read` respectively, matching every other admin endpoint's
+  authorization pattern. Previously these three routes used a separate,
+  hardcoded check for a role literally named `admin` on the principal, with
+  no dependency on `POLICY_FILE` at all. **If you run these three endpoints
+  today with a JWT/OIDC role mapped to `admin` but no `POLICY_FILE`
+  configured, they will start returning `404 Not Found` after upgrading** —
+  add a policy file granting the appropriate role the new permission
+  strings (or `*`) to restore access.
+
 ## [0.5.0] - 2026-07-04
 
 ### Added — Phase 5 (visual rule builder)

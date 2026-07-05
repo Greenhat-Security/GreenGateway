@@ -86,7 +86,9 @@ const TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoint";
 const TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints/review";
 const PRINCIPALS_ADMIN_ROUTE: &str = "/v1/admin/principals";
 const PRINCIPAL_ADMIN_ROUTE: &str = "/v1/admin/principal";
-const AUDIT_ADMIN_ROLE: &str = "admin";
+const ADMIN_AUDIT_READ_PERMISSION: &str = "admin:audit:read";
+const ADMIN_AUDIT_STREAM_PERMISSION: &str = "admin:audit:stream";
+const ADMIN_STATUS_READ_PERMISSION: &str = "admin:status:read";
 const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
 const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
 const ADMIN_TOKENS_READ_PERMISSION: &str = "admin:tokens:read";
@@ -294,12 +296,14 @@ impl AdminRoutes {
 struct AuditAdminState {
     query_store: Option<Arc<audit::query::AuditQueryStore>>,
     event_sender: audit::AuditEventSender,
+    rbac_state: Option<middleware::rbac::RbacState>,
 }
 
 #[derive(Clone)]
 struct StatusAdminState {
     config: config::Config,
     rbac: RbacStatus,
+    rbac_state: Option<middleware::rbac::RbacState>,
     egress_allowed_hosts_count: usize,
     process_started_at: Instant,
 }
@@ -830,6 +834,11 @@ enum SuggestionsAdminAuthzError {
     Forbidden,
 }
 
+enum AdminReadAuthzError {
+    NotConfigured,
+    Forbidden,
+}
+
 enum IfMatchError {
     Missing,
     InvalidHeader,
@@ -1152,6 +1161,7 @@ fn gateway_app_with_process_started_at(
     let status_state = StatusAdminState {
         config: config.clone(),
         rbac: rbac_status,
+        rbac_state: rbac_state.clone(),
         egress_allowed_hosts_count,
         process_started_at,
     };
@@ -1214,6 +1224,7 @@ fn gateway_app_with_process_started_at(
     let audit_admin_state = AuditAdminState {
         query_store: audit_query_store,
         event_sender: audit_event_sender,
+        rbac_state: rbac_state.clone(),
     };
     let signals_admin_state = SignalsAdminState {
         discovery_store: discovery_query_store.clone(),
@@ -2652,8 +2663,8 @@ async fn status_endpoint(
         return unauthorized();
     };
 
-    if !principal.roles.iter().any(|role| role == AUDIT_ADMIN_ROLE) {
-        return forbidden();
+    if let Err(error) = authorized_status_state(&state, &principal, ADMIN_STATUS_READ_PERMISSION) {
+        return status_admin_authz_error_response(error);
     }
 
     Json(StatusResponse::from_state(&state)).into_response()
@@ -3714,8 +3725,8 @@ async fn audit_query_endpoint(
         return unauthorized();
     };
 
-    if !principal.roles.iter().any(|role| role == AUDIT_ADMIN_ROLE) {
-        return forbidden();
+    if let Err(error) = authorized_audit_state(&state, &principal, ADMIN_AUDIT_READ_PERMISSION) {
+        return audit_admin_authz_error_response(error);
     }
 
     let Some(query_store) = state.query_store.as_ref() else {
@@ -4450,8 +4461,8 @@ async fn audit_events_stream_endpoint(
         return unauthorized();
     };
 
-    if !principal.roles.iter().any(|role| role == AUDIT_ADMIN_ROLE) {
-        return forbidden();
+    if let Err(error) = authorized_audit_state(&state, &principal, ADMIN_AUDIT_STREAM_PERMISSION) {
+        return audit_admin_authz_error_response(error);
     }
 
     Sse::new(audit_event_sse_stream(
@@ -4931,6 +4942,38 @@ fn authorized_policy_state<'a>(
     Ok(rbac_state)
 }
 
+fn authorized_audit_state<'a>(
+    state: &'a AuditAdminState,
+    principal: &auth::Principal,
+    permission: &str,
+) -> Result<&'a middleware::rbac::RbacState, AdminReadAuthzError> {
+    authorized_admin_rbac_state(state.rbac_state.as_ref(), principal, permission)
+}
+
+fn authorized_status_state<'a>(
+    state: &'a StatusAdminState,
+    principal: &auth::Principal,
+    permission: &str,
+) -> Result<&'a middleware::rbac::RbacState, AdminReadAuthzError> {
+    authorized_admin_rbac_state(state.rbac_state.as_ref(), principal, permission)
+}
+
+fn authorized_admin_rbac_state<'a>(
+    rbac_state: Option<&'a middleware::rbac::RbacState>,
+    principal: &auth::Principal,
+    permission: &str,
+) -> Result<&'a middleware::rbac::RbacState, AdminReadAuthzError> {
+    let Some(rbac_state) = rbac_state else {
+        return Err(AdminReadAuthzError::NotConfigured);
+    };
+
+    if !rbac_state.principal_has_permission(principal, permission) {
+        return Err(AdminReadAuthzError::Forbidden);
+    }
+
+    Ok(rbac_state)
+}
+
 fn authorized_token_store<'a>(
     state: &'a TokenAdminState,
     principal: &auth::Principal,
@@ -5024,6 +5067,20 @@ fn policy_admin_authz_error_response(error: PolicyAdminAuthzError) -> Response {
     match error {
         PolicyAdminAuthzError::NotConfigured => policy_not_configured(),
         PolicyAdminAuthzError::Forbidden => forbidden(),
+    }
+}
+
+fn audit_admin_authz_error_response(error: AdminReadAuthzError) -> Response {
+    match error {
+        AdminReadAuthzError::NotConfigured => audit_rbac_not_configured(),
+        AdminReadAuthzError::Forbidden => forbidden(),
+    }
+}
+
+fn status_admin_authz_error_response(error: AdminReadAuthzError) -> Response {
+    match error {
+        AdminReadAuthzError::NotConfigured => status_rbac_not_configured(),
+        AdminReadAuthzError::Forbidden => forbidden(),
     }
 }
 
@@ -5286,7 +5343,7 @@ fn principal_from_audit_actor(actor: &audit::Actor) -> Option<auth::Principal> {
     Some(auth::Principal {
         user_id: actor.user_id.clone(),
         issuer: None,
-        email: None,
+        email: actor.email.clone(),
         org_id: None,
         roles: actor.roles.clone().unwrap_or_default(),
         session_id: "audit-history".to_owned(),
@@ -6336,6 +6393,26 @@ fn token_rbac_not_configured() -> Response {
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
             error: "token API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn audit_rbac_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "audit API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn status_rbac_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "status API requires POLICY_FILE to be configured".to_owned(),
         }),
     )
         .into_response()
@@ -8059,8 +8136,10 @@ mod tests {
 
     #[tokio::test]
     async fn default_admin_listener_unset_builds_single_router_with_data_and_admin_routes() {
+        let policy = TempPolicyFile::new(&audit_admin_policy_document_string());
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
+        let config = status_config_with_policy(config, &policy);
 
         let router = match gateway_app_for_test(config) {
             GatewayApp::Unified(router) => router,
@@ -8115,6 +8194,8 @@ mod tests {
         ));
         config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
         config.egress_deny_private_ips = false;
+        let policy = TempPolicyFile::new(&audit_admin_policy_document_string());
+        config = status_config_with_policy(config, &policy);
         configure_test_jwt_provider(&mut config, jwks_addr);
         let token = signed_admin_token();
         let (data_addr, admin_addr, data_server, admin_server) = spawn_split_gateway(config).await;
@@ -9376,6 +9457,7 @@ mod tests {
     async fn custom_admin_prefix_moves_admin_surface_and_frees_default_admin_path() {
         let (upstream_addr, mut captured) = spawn_capture_upstream().await;
         let mut config = proxy_config(upstream_addr);
+        let policy = TempPolicyFile::new(&audit_admin_policy_document_string());
         config.admin_prefix = "/ops".to_owned();
         config.auth_exempt_paths = vec![
             "/health".to_owned(),
@@ -9384,6 +9466,7 @@ mod tests {
             "/ops".to_owned(),
         ];
         config.rbac_exempt_paths = config.auth_exempt_paths.clone();
+        config = status_config_with_policy(config, &policy);
         let routes = GatewayRoutes::from_config(&config);
         let router = proxy_router(config, test_audit_log());
 
@@ -9449,6 +9532,7 @@ mod tests {
         let jwks_addr = spawn_test_jwks_server().await;
         let db = TempDb::new("custom-admin-real-auth");
         create_audit_schema(&db.path);
+        let policy = TempPolicyFile::new(&audit_admin_policy_document_string());
         let mut config = test_config(Vec::new());
         config.admin_prefix = "/ops".to_owned();
         config.auth_exempt_paths = vec![
@@ -9459,9 +9543,13 @@ mod tests {
         ];
         config.rbac_exempt_paths = config.auth_exempt_paths.clone();
         config.audit_sqlite_path = Some(db.path.to_string_lossy().into_owned());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
         configure_test_jwt_provider(&mut config, jwks_addr);
         config.egress_deny_private_ips = false;
         let routes = GatewayRoutes::from_config(&config);
+        config
+            .rbac_exempt_paths
+            .push(routes.admin.audit_route.clone());
         assert_eq!(routes.admin.api_prefix, "/v1/ops");
         assert_eq!(routes.admin.audit_route, "/v1/ops/audit");
 
@@ -10167,9 +10255,10 @@ mod tests {
 
     #[tokio::test]
     async fn audit_query_non_admin_principal_returns_forbidden_without_store_leak() {
+        let policy = TempPolicyFile::new(&audit_admin_policy_document_string());
         let recorder = PrometheusBuilder::new().build_recorder();
         let response = app(
-            audit_query_config(None),
+            audit_query_config_with_policy(None, &policy),
             recorder.handle(),
             test_audit_log(),
             test_audit_event_sender(),
@@ -10189,7 +10278,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_events_stream_without_principal_returns_unauthorized() {
-        let (router, _) = audit_events_router();
+        let (router, _, _policy) = audit_events_router();
 
         let response = router
             .oneshot(audit_query_request(AUDIT_EVENTS_STREAM_ROUTE, None))
@@ -10202,7 +10291,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_events_stream_non_admin_principal_returns_forbidden() {
-        let (router, _) = audit_events_router();
+        let (router, _, _policy) = audit_events_router();
 
         let response = router
             .oneshot(audit_query_request(
@@ -10233,8 +10322,10 @@ mod tests {
 
     #[tokio::test]
     async fn status_non_admin_principal_returns_forbidden() {
+        let policy = TempPolicyFile::new(&audit_admin_policy_document_string());
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
+        let config = status_config_with_policy(config, &policy);
         let router = status_router(config, Instant::now());
 
         let response = router
@@ -10247,6 +10338,27 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(body_string(response).await, r#"{"error":"forbidden"}"#);
+    }
+
+    #[tokio::test]
+    async fn status_principal_without_policy_returns_not_configured() {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        let router = status_router(config, Instant::now());
+
+        let response = router
+            .oneshot(audit_query_request(
+                STATUS_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+            ))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"status API requires POLICY_FILE to be configured"}"#
+        );
     }
 
     #[tokio::test]
@@ -10320,6 +10432,16 @@ mod tests {
         assert_eq!(rich["egress"]["allowed_hosts_count"], 2);
         assert_eq!(rich["egress"]["deny_private_ips"], false);
 
+        let minimal_policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "id": "status-minimal-policy",
+                "default_action": "deny",
+                "roles": {
+                    "status-reader": { "permissions": ["admin:status:read"] }
+                }
+            }"#,
+        );
         let mut minimal_config = test_config(Vec::new());
         minimal_config.listen_addr = "127.0.0.1:18182"
             .parse()
@@ -10329,17 +10451,18 @@ mod tests {
         minimal_config.rate_limit_read_burst = 77;
         minimal_config.rate_limit_write_rps = 8.5;
         minimal_config.rate_limit_write_burst = 12;
+        let minimal_config = status_config_with_policy(minimal_config, &minimal_policy);
 
         let minimal = status_json(
             status_router(minimal_config, Instant::now() - Duration::from_secs(5)),
-            Some(test_principal(&["admin"])),
+            Some(test_principal(&["status-reader"])),
         )
         .await;
 
         assert_eq!(minimal["listen_addr"], "127.0.0.1:18182");
         assert_eq!(minimal["auth_enabled"], false);
-        assert_eq!(minimal["rbac"]["policy_loaded"], false);
-        assert!(minimal["rbac"]["policy_id"].is_null());
+        assert_eq!(minimal["rbac"]["policy_loaded"], true);
+        assert_eq!(minimal["rbac"]["policy_id"], "status-minimal-policy");
         assert_eq!(minimal["audit_sinks"]["file"], false);
         assert_eq!(minimal["audit_sinks"]["sqlite"], false);
         assert_eq!(
@@ -10359,14 +10482,16 @@ mod tests {
 
     #[tokio::test]
     async fn status_reports_effective_egress_allowlist_count() {
+        let policy = TempPolicyFile::new(&audit_admin_policy_document_string());
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
         config.auth_exempt_paths.push(STATUS_ADMIN_ROUTE.to_owned());
         config.egress_allowed_hosts = vec!["api.example.test".to_owned()];
         config.upstream_url = Some("https://upstream.example.test/base".to_owned());
+        let config = status_config_with_policy(config, &policy);
         let router = status_router(config, Instant::now());
 
-        let status = status_json(router, Some(test_principal(&["admin"]))).await;
+        let status = status_json(router, Some(test_principal(&["status-reader"]))).await;
 
         assert_eq!(status["egress"]["allowed_hosts_count"], 2);
     }
@@ -12104,6 +12229,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_admin_mutation_with_real_jwt_persists_audit_actor_identity() {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let token_db = TempDb::new("token-admin-real-jwt-audit-token");
+        let audit_db = TempDb::new("token-admin-real-jwt-audit-log");
+        let policy = TempPolicyFile::new(&token_audit_full_stack_policy_document_string());
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        config.audit_sqlite_path = Some(audit_db.path.to_string_lossy().into_owned());
+        config.egress_deny_private_ips = false;
+        configure_test_jwt_provider(&mut config, jwks_addr);
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let (audit_log, audit_event_sender) =
+            audit::AuditLog::from_config(&config).expect("audit log should build");
+        let router = app(config, recorder.handle(), audit_log, audit_event_sender)
+            .expect("app should build");
+        let token = signed_token("sso-admin", &["admin"]);
+
+        let create_response = router
+            .clone()
+            .oneshot(bearer_json_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                &token,
+                json!({ "scopes": ["probe-reader"] }).to_string(),
+            ))
+            .await
+            .expect("token create request should complete");
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+
+        let event = wait_for_bearer_audit_event(
+            &router,
+            &format!(
+                "{AUDIT_ADMIN_ROUTE}?event_type={}",
+                audit::event::SERVICE_TOKEN_CHANGED
+            ),
+            &token,
+            |event| event["payload"]["action"] == json!("token_created"),
+        )
+        .await;
+        let actor = event["actor"]
+            .as_object()
+            .expect("service token audit event should include actor");
+
+        assert_eq!(actor["user_id"], json!("sso-admin"));
+        assert_eq!(actor["email"], json!("sso-admin@example.test"));
+        assert_eq!(actor["roles"], json!(["admin"]));
+        assert_eq!(actor["auth_mode"], json!("bearer_token"));
+    }
+
+    #[tokio::test]
     async fn token_admin_revoke_is_idempotent_requires_write_and_audits() {
         let token_db = TempDb::new("token-admin-revoke");
         let policy = TempPolicyFile::new(&token_policy_document_string());
@@ -13404,13 +13580,15 @@ paths:
 
     #[tokio::test]
     async fn status_uptime_increases_between_requests() {
+        let policy = TempPolicyFile::new(&audit_admin_policy_document_string());
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
+        let config = status_config_with_policy(config, &policy);
         let router = status_router(config, Instant::now() - Duration::from_secs(30));
 
-        let first = status_json(router.clone(), Some(test_principal(&["admin"]))).await;
+        let first = status_json(router.clone(), Some(test_principal(&["status-reader"]))).await;
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        let second = status_json(router, Some(test_principal(&["admin"]))).await;
+        let second = status_json(router, Some(test_principal(&["status-reader"]))).await;
 
         let first_uptime = first["uptime_seconds"]
             .as_u64()
@@ -13428,11 +13606,11 @@ paths:
 
     #[tokio::test]
     async fn audit_events_stream_admin_principal_receives_emitted_event() {
-        let (router, audit_log) = audit_events_router();
+        let (router, audit_log, _policy) = audit_events_router();
         let response = router
             .oneshot(audit_query_request(
                 AUDIT_EVENTS_STREAM_ROUTE,
-                Some(test_principal(&["admin"])),
+                Some(test_principal(&["audit-streamer"])),
             ))
             .await
             .expect("request should complete");
@@ -13452,11 +13630,11 @@ paths:
 
     #[tokio::test]
     async fn audit_events_stream_filters_by_event_type_and_path() {
-        let (router, audit_log) = audit_events_router();
+        let (router, audit_log, _policy) = audit_events_router();
         let response = router
             .oneshot(audit_query_request(
                 &format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type=audit.sse.match&path=/match"),
-                Some(test_principal(&["admin"])),
+                Some(test_principal(&["audit-streamer"])),
             ))
             .await
             .expect("request should complete");
@@ -13481,14 +13659,14 @@ paths:
 
     #[tokio::test]
     async fn audit_events_stream_delivers_request_event_within_latency_budget() {
-        let (router, _) = audit_events_router();
+        let (router, _, _policy) = audit_events_router();
         let response = router
             .clone()
             .oneshot(audit_query_request(
                 &format!(
                     "{AUDIT_EVENTS_STREAM_ROUTE}?event_type=http.request_observed&path=/health"
                 ),
-                Some(test_principal(&["admin"])),
+                Some(test_principal(&["audit-streamer"])),
             ))
             .await
             .expect("request should complete");
@@ -13530,6 +13708,14 @@ paths:
         let mut config = proxy_config(upstream_addr);
         config.auth_enabled = false;
         config.discovery_sqlite_path = Some(discovery_db.path.to_string_lossy().into_owned());
+        let policy = TempPolicyFile::new(&audit_admin_policy_document_string());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config
+            .rbac_exempt_paths
+            .push(AUDIT_EVENTS_STREAM_ROUTE.to_owned());
+        config
+            .rbac_exempt_paths
+            .push("/signal-stream-opened".to_owned());
         let recorder = PrometheusBuilder::new().build_recorder();
         let (audit_log, audit_event_sender) =
             audit::AuditLog::from_config(&config).expect("audit log should build");
@@ -13540,7 +13726,7 @@ paths:
             .clone()
             .oneshot(audit_query_request(
                 &format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type=signal.opened"),
-                Some(test_principal(&["admin"])),
+                Some(test_principal(&["audit-streamer"])),
             ))
             .await
             .expect("stream request should complete");
@@ -13644,7 +13830,14 @@ paths:
                 "schema_version": "0.1.0",
                 "default_action": "allow",
                 "enforcement_mode": "shadow",
-                "roles": {},
+                "roles": {
+                    "admin": {
+                        "permissions": [
+                            "admin:audit:read",
+                            "admin:audit:stream"
+                        ]
+                    }
+                },
                 "routes": [
                     {
                         "path_prefix": "/__test",
@@ -13746,7 +13939,7 @@ paths:
         let db = TempDb::new("audit-query-filters");
         create_audit_schema(&db.path);
         seed_filter_events(&db.path);
-        let router = audit_query_router(Some(&db.path));
+        let (router, _policy) = audit_query_router(Some(&db.path));
 
         assert_eq!(
             audit_event_ids(router.clone(), "/v1/admin/audit?event_type=audit.policy").await,
@@ -13794,7 +13987,7 @@ paths:
                 },
             );
         }
-        let router = audit_query_router(Some(&db.path));
+        let (router, _policy) = audit_query_router(Some(&db.path));
         let mut next_cursor = None;
         let mut returned = Vec::new();
         let mut seen = HashSet::new();
@@ -13833,9 +14026,10 @@ paths:
 
     #[tokio::test]
     async fn audit_query_admin_principal_without_store_returns_service_unavailable() {
+        let policy = TempPolicyFile::new(&audit_admin_policy_document_string());
         let recorder = PrometheusBuilder::new().build_recorder();
         let response = app(
-            audit_query_config(None),
+            audit_query_config_with_policy(None, &policy),
             recorder.handle(),
             test_audit_log(),
             test_audit_event_sender(),
@@ -13859,7 +14053,7 @@ paths:
     async fn audit_query_malformed_params_return_bad_request() {
         let db = TempDb::new("audit-query-malformed");
         create_audit_schema(&db.path);
-        let router = audit_query_router(Some(&db.path));
+        let (router, _policy) = audit_query_router(Some(&db.path));
 
         for (uri, parameter) in [
             ("/v1/admin/audit?status=not-a-number", "status"),
@@ -16833,15 +17027,32 @@ paths:
         config
     }
 
-    fn audit_query_router(sqlite_path: Option<&PathBuf>) -> Router {
+    fn audit_query_config_with_policy(
+        sqlite_path: Option<&PathBuf>,
+        policy: &TempPolicyFile,
+    ) -> config::Config {
+        let mut config = audit_query_config(sqlite_path);
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.rbac_exempt_paths.push(AUDIT_ADMIN_ROUTE.to_owned());
+        config
+            .rbac_exempt_paths
+            .push(AUDIT_EVENTS_STREAM_ROUTE.to_owned());
+
+        config
+    }
+
+    fn audit_query_router(sqlite_path: Option<&PathBuf>) -> (Router, TempPolicyFile) {
+        let policy = TempPolicyFile::new(&audit_admin_policy_document_string());
         let recorder = PrometheusBuilder::new().build_recorder();
-        app(
-            audit_query_config(sqlite_path),
+        let router = app(
+            audit_query_config_with_policy(sqlite_path, &policy),
             recorder.handle(),
             test_audit_log(),
             test_audit_event_sender(),
         )
-        .expect("app should build")
+        .expect("app should build");
+
+        (router, policy)
     }
 
     fn principal_admin_config(
@@ -16990,6 +17201,38 @@ paths:
             ]
         }))
         .expect("principal full-stack policy should serialize")
+    }
+
+    fn audit_admin_policy_document_string() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "id": "audit-admin-policy",
+            "default_action": "allow",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "admin": {
+                    "permissions": [
+                        ADMIN_AUDIT_READ_PERMISSION,
+                        ADMIN_AUDIT_STREAM_PERMISSION,
+                        ADMIN_STATUS_READ_PERMISSION
+                    ]
+                },
+                "audit-reader": {
+                    "permissions": [ADMIN_AUDIT_READ_PERMISSION]
+                },
+                "audit-streamer": {
+                    "permissions": [ADMIN_AUDIT_STREAM_PERMISSION]
+                },
+                "status-reader": {
+                    "permissions": [ADMIN_STATUS_READ_PERMISSION]
+                },
+                "reader": {
+                    "permissions": []
+                }
+            },
+            "routes": []
+        })
+        .to_string()
     }
 
     fn traffic_admin_config(
@@ -17246,6 +17489,9 @@ paths:
             "default_action": "deny",
             "enforcement_mode": "enforce",
             "roles": {
+                "admin": {
+                    "permissions": [ADMIN_AUDIT_STREAM_PERMISSION]
+                },
                 "signals-reader": {
                     "permissions": ["admin:signals:read"]
                 },
@@ -17433,9 +17679,14 @@ paths:
         .expect("suggestions policy should serialize")
     }
 
-    fn audit_events_router() -> (Router, audit::AuditLog) {
+    fn audit_events_router() -> (Router, audit::AuditLog, TempPolicyFile) {
+        let policy = TempPolicyFile::new(&audit_admin_policy_document_string());
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config
+            .rbac_exempt_paths
+            .push(AUDIT_EVENTS_STREAM_ROUTE.to_owned());
         let recorder = PrometheusBuilder::new().build_recorder();
         let (audit_log, audit_event_sender) = test_audit_log_with_broadcast();
         let router = app(
@@ -17446,7 +17697,7 @@ paths:
         )
         .expect("app should build");
 
-        (router, audit_log)
+        (router, audit_log, policy)
     }
 
     fn status_router(config: config::Config, process_started_at: Instant) -> Router {
@@ -17459,6 +17710,16 @@ paths:
             process_started_at,
         )
         .expect("app should build")
+    }
+
+    fn status_config_with_policy(
+        mut config: config::Config,
+        policy: &TempPolicyFile,
+    ) -> config::Config {
+        let status_route = GatewayRoutes::from_config(&config).admin.status_route;
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.rbac_exempt_paths.push(status_route);
+        config
     }
 
     fn schema_coverage_router(
@@ -17631,6 +17892,25 @@ paths:
         }
 
         request
+    }
+
+    fn bearer_json_request(method: Method, uri: &str, token: &str, body: String) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("bearer JSON request should build")
+    }
+
+    fn bearer_get_request(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .expect("bearer GET request should build")
     }
 
     async fn create_token_via_endpoint(router: &Router, scopes: &[&str]) -> Value {
@@ -17924,6 +18204,36 @@ paths:
         .to_string()
     }
 
+    fn token_audit_full_stack_policy_document_string() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "id": "token-audit-full-stack-policy",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "admin": {
+                    "permissions": [
+                        ADMIN_TOKENS_WRITE_PERMISSION,
+                        ADMIN_AUDIT_READ_PERMISSION
+                    ]
+                }
+            },
+            "routes": [
+                {
+                    "methods": ["POST"],
+                    "path_prefix": TOKENS_ADMIN_ROUTE,
+                    "permission": ADMIN_TOKENS_WRITE_PERMISSION
+                },
+                {
+                    "methods": ["GET"],
+                    "path_prefix": AUDIT_ADMIN_ROUTE,
+                    "permission": ADMIN_AUDIT_READ_PERMISSION
+                }
+            ]
+        })
+        .to_string()
+    }
+
     fn service_token_policy_document() -> String {
         json!({
             "schema_version": "0.1.0",
@@ -18199,7 +18509,10 @@ paths:
 
     async fn audit_event_ids(router: Router, uri: &str) -> Vec<String> {
         let response = router
-            .oneshot(audit_query_request(uri, Some(test_principal(&["admin"]))))
+            .oneshot(audit_query_request(
+                uri,
+                Some(test_principal(&["audit-reader"])),
+            ))
             .await
             .expect("request should complete");
 
@@ -18230,6 +18543,45 @@ paths:
             assert!(
                 started.elapsed() < Duration::from_secs(2),
                 "audit query did not return event with request_id {request_id}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn wait_for_bearer_audit_event(
+        router: &Router,
+        uri: &str,
+        token: &str,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let started = Instant::now();
+
+        loop {
+            let response = router
+                .clone()
+                .oneshot(bearer_get_request(uri, token))
+                .await
+                .expect("bearer audit query request should complete");
+            let status = response.status();
+            if status != StatusCode::OK {
+                panic!(
+                    "bearer audit query returned {status}: {}",
+                    body_string(response).await
+                );
+            }
+            let body = json_body(response).await;
+            if let Some(event) = body["events"]
+                .as_array()
+                .expect("events should be an array")
+                .iter()
+                .find(|event| predicate(event))
+            {
+                return event.clone();
+            }
+
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "bearer audit query did not return matching event: {body}"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -19640,6 +19992,7 @@ O2gecI9QwDJNpm29J9wJB2F8
     ) -> audit::AuditEvent {
         let actor = user_id.map(|user_id| audit::Actor {
             user_id: user_id.to_owned(),
+            email: None,
             roles: Some(vec!["reader".to_owned()]),
             auth_mode: "bearer_token".to_owned(),
         });

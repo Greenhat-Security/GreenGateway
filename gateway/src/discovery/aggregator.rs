@@ -2935,6 +2935,7 @@ mod tests {
     ) -> AuditEvent {
         let actor = user_id.map(|user_id| Actor {
             user_id: user_id.to_owned(),
+            email: None,
             roles: Some(vec!["reader".to_owned()]),
             auth_mode: "bearer_token".to_owned(),
         });

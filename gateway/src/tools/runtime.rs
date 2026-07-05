@@ -1037,6 +1037,7 @@ mod tests {
                     source_ip: "203.0.113.24".to_owned(),
                     actor: Some(Actor {
                         user_id: "user-123".to_owned(),
+                        email: None,
                         roles: Some(vec!["operator".to_owned()]),
                         auth_mode: "bearer_token".to_owned(),
                     }),
