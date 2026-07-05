@@ -115,6 +115,7 @@ const TOOL_RUNTIME_DEFAULT_TIMEOUT_MS: &str = "TOOL_RUNTIME_DEFAULT_TIMEOUT_MS";
 const TOOL_RUNTIME_GLOBAL_CONCURRENCY: &str = "TOOL_RUNTIME_GLOBAL_CONCURRENCY";
 const TOOL_RUNTIME_QUEUE_DEPTH: &str = "TOOL_RUNTIME_QUEUE_DEPTH";
 const TOOL_RUNTIME_QUEUE_TIMEOUT_MS: &str = "TOOL_RUNTIME_QUEUE_TIMEOUT_MS";
+const TOOLS_FILE: &str = "TOOLS_FILE";
 const TRUST_PROXY_HEADERS: &str = "TRUST_PROXY_HEADERS";
 const SESSION_COOKIE_NAME: &str = "SESSION_COOKIE_NAME";
 const UPSTREAM_CONNECT_TIMEOUT_MS: &str = "UPSTREAM_CONNECT_TIMEOUT_MS";
@@ -146,6 +147,7 @@ pub struct Config {
     pub rule_suggestion_baseline_window_hours: u64,
     pub openapi_spec_path: Option<PathBuf>,
     pub policy_file: Option<String>,
+    pub tools_file: Option<String>,
     pub policy_history_sqlite_path: Option<String>,
     pub cors_allow_origins: Vec<String>,
     pub max_body_size: usize,
@@ -455,6 +457,7 @@ impl Config {
         let openapi_spec_path =
             parse_optional_path(OPENAPI_SPEC_PATH, get_var(OPENAPI_SPEC_PATH), &mut problems);
         let policy_file = parse_optional_string(POLICY_FILE, get_var(POLICY_FILE), &mut problems);
+        let tools_file = parse_optional_string(TOOLS_FILE, get_var(TOOLS_FILE), &mut problems);
         let policy_history_sqlite_path = parse_optional_string(
             POLICY_HISTORY_SQLITE_PATH,
             get_var(POLICY_HISTORY_SQLITE_PATH),
@@ -805,6 +808,7 @@ impl Config {
                 rule_suggestion_baseline_window_hours,
                 openapi_spec_path,
                 policy_file,
+                tools_file,
                 policy_history_sqlite_path,
                 cors_allow_origins,
                 max_body_size,
@@ -2108,6 +2112,7 @@ mod tests {
         assert_eq!(config.discovery_sqlite_path, None);
         assert_eq!(config.principal_sqlite_path, None);
         assert_eq!(config.policy_file, None);
+        assert_eq!(config.tools_file, None);
         assert_eq!(config.policy_history_sqlite_path, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
@@ -2298,6 +2303,7 @@ mod tests {
             RuleSuggestionConfig::default()
         );
         assert_eq!(config.policy_file, None);
+        assert_eq!(config.tools_file, None);
         assert_eq!(config.policy_history_sqlite_path, None);
         assert!(config.cors_allow_origins.is_empty());
         assert_eq!(config.max_body_size, DEFAULT_MAX_BODY_SIZE);
@@ -2805,6 +2811,31 @@ mod tests {
         .expect("config should parse");
 
         assert_eq!(config.policy_file, None);
+    }
+
+    #[test]
+    fn tools_file_parses_optional_path() {
+        let config = Config::from_env_vars(|name| match name {
+            "TOOLS_FILE" => Ok("  /etc/greengateway/tools.json  ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.tools_file,
+            Some("/etc/greengateway/tools.json".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_tools_file_is_none() {
+        let config = Config::from_env_vars(|name| match name {
+            "TOOLS_FILE" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.tools_file, None);
     }
 
     #[test]

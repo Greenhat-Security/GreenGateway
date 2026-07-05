@@ -120,6 +120,7 @@ struct AppState {
     proxy: Option<ProxyState>,
     routes: GatewayRoutes,
     admin_login_configured: bool,
+    _tool_registry: tools::definitions::ToolRegistry,
 }
 
 #[derive(Clone)]
@@ -1140,6 +1141,14 @@ fn gateway_app_with_process_started_at(
     {
         middleware::rbac::spawn_policy_reload_tasks(policy_file.clone(), rbac_state.clone())?;
     }
+    let tool_registry =
+        tools::definitions::ToolRegistry::from_config_with_audit(&config, audit_log.clone())?;
+    if let Some(tools_file) = config.tools_file.as_ref() {
+        tools::definitions::spawn_tool_registry_reload_tasks(
+            tools_file.clone(),
+            tool_registry.clone(),
+        )?;
+    }
     let status_state = StatusAdminState {
         config: config.clone(),
         rbac: rbac_status,
@@ -1200,6 +1209,7 @@ fn gateway_app_with_process_started_at(
         proxy: proxy_state,
         routes: routes.clone(),
         admin_login_configured: admin_auth_state.is_some(),
+        _tool_registry: tool_registry,
     };
     let audit_admin_state = AuditAdminState {
         query_store: audit_query_store,
@@ -6646,6 +6656,7 @@ mod tests {
                 discovery::suggestions::DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
             openapi_spec_path: None,
             policy_file: None,
+            tools_file: None,
             policy_history_sqlite_path: None,
             cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
             max_body_size: 1_048_576,

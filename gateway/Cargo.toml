@@ -14,6 +14,7 @@ getrandom.workspace = true
 hex.workspace = true
 http.workspace = true
 ipnet.workspace = true
+jsonschema.workspace = true
 jsonwebtoken.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
@@ -36,7 +37,6 @@ uuid.workspace = true
 yaml_serde.workspace = true
 
 [dev-dependencies]
-jsonschema.workspace = true
 proptest.workspace = true
 rcgen.workspace = true
 tokio-rustls.workspace = true
