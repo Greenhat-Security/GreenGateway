@@ -1600,6 +1600,7 @@ mod tests {
             rules: Vec::new(),
             egress: Default::default(),
             rate_limits: Vec::new(),
+            tools: Default::default(),
         }
     }
 

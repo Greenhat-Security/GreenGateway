@@ -55,6 +55,13 @@
       "items": {
         "$ref": "#/$defs/rate_limit_rule"
       }
+    },
+    "tools": {
+      "type": "object",
+      "description": "Optional per-tool runtime policy for generic MCP tool invocation admission. Each key is a tool name. Tool implementations and registry wiring are configured by later MCP gateway features; this section only controls generic enablement, timeout, and per-tool concurrency.",
+      "additionalProperties": {
+        "$ref": "#/$defs/tool_policy_entry"
+      }
     }
   },
   "$defs": {
@@ -247,6 +254,30 @@
           "minimum": 1,
           "maximum": 4294967295,
           "description": "Positive token bucket burst size for matching requests."
+        }
+      }
+    },
+    "tool_policy_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether this tool is available for invocation. Omitted values default to true."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30000,
+          "description": "Maximum execution time for one tool invocation, in milliseconds."
+        },
+        "max_concurrent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 8,
+          "description": "Maximum concurrent executions for this tool. A configured value of 0 is treated by the runtime as 1 to avoid a zero-permit semaphore."
         }
       }
     }

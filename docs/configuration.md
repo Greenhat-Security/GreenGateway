@@ -680,6 +680,38 @@ Format and validation: must parse as a positive `u64` millisecond duration. The 
 
 Service token admin API: when `SERVICE_TOKEN_SQLITE_PATH` and `POLICY_FILE` are configured, `POST /v1{ADMIN_PREFIX}/tokens` creates a service token and requires `admin:tokens:write`; `GET /v1{ADMIN_PREFIX}/tokens` and `GET /v1{ADMIN_PREFIX}/tokens/{id}` require `admin:tokens:read`; `DELETE /v1{ADMIN_PREFIX}/tokens/{id}` revokes a token and requires `admin:tokens:write`; `POST /v1{ADMIN_PREFIX}/tokens/{id}/rotate` rotates a token and requires `admin:tokens:write`. Create and rotate responses include the plaintext `ggw_` token exactly once with a notice that it will not be shown again. List and get responses return only token metadata. Create, revoke, and rotate emit `service_token.changed` audit events with actor attribution, token id, display prefix, scopes, and lifecycle timestamps, never plaintext tokens or token hashes.
 
+### TOOL_RUNTIME_QUEUE_DEPTH
+
+Maximum queued plus running tool invocations admitted by the generic tool runtime.
+
+Default: `1024`
+
+Format and validation: must parse as an integer greater than `0`. This is an admission backpressure cap: once all queue slots are held by queued or running invocations, new invocations are rejected immediately instead of waiting. The runtime is available even when no tool registry or MCP endpoint is wired yet.
+
+### TOOL_RUNTIME_GLOBAL_CONCURRENCY
+
+Maximum concurrently executing tool invocations across all tools.
+
+Default: `64`
+
+Format and validation: must parse as an integer greater than `0`. This is separate from `TOOL_RUNTIME_QUEUE_DEPTH`: queue depth bounds admitted work, while global concurrency bounds work actively executing after runtime admission.
+
+### TOOL_RUNTIME_QUEUE_TIMEOUT_MS
+
+Maximum time an admitted tool invocation waits for global and per-tool execution permits, in milliseconds.
+
+Default: `1000`
+
+Format and validation: must parse as a `u64` millisecond duration greater than `0`. A queue timeout is reported distinctly from a tool execution timeout so operators can tell runtime congestion apart from slow tool work.
+
+### TOOL_RUNTIME_DEFAULT_TIMEOUT_MS
+
+Default execution timeout for generic tool runtime invocations, in milliseconds.
+
+Default: `30000`
+
+Format and validation: must parse as a `u64` millisecond duration greater than `0`. Per-tool policy entries can override this by setting `tools.<tool_name>.timeout_ms` in the RBAC policy document once a tool registry is configured.
+
 ### CSRF_ENABLED
 
 Enables double-submit-cookie CSRF checks for the gateway's own state-changing control-plane requests.

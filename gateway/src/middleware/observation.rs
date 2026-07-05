@@ -2104,6 +2104,7 @@ paths:
             rules: Vec::new(),
             egress: EgressPolicy::default(),
             rate_limits: Vec::new(),
+            tools: HashMap::new(),
         }
     }
 

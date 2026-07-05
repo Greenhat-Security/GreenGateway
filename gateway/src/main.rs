@@ -42,6 +42,7 @@ mod metrics;
 mod middleware;
 mod path_match;
 mod rbac;
+mod tools;
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -5941,6 +5942,7 @@ fn policy_audit_summary(policy: &rbac::Policy) -> Value {
         "egress_hosts": policy.egress.hosts.len(),
         "egress_cidrs": policy.egress.cidrs.len(),
         "egress_ports": policy.egress.ports.len(),
+        "tools": policy.tools.len(),
     })
 }
 
@@ -5970,6 +5972,9 @@ fn changed_policy_sections(before: &rbac::Policy, after: &rbac::Policy) -> Vec<&
     }
     if before.egress != after.egress {
         sections.push("egress");
+    }
+    if before.tools != after.tools {
+        sections.push("tools");
     }
 
     sections
@@ -6396,6 +6401,10 @@ mod tests {
             roles_claim: "roles".to_owned(),
             service_token_sqlite_path: None,
             service_token_cache_ttl_ms: config::DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS,
+            tool_runtime_queue_depth: config::DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH,
+            tool_runtime_global_concurrency: config::DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
+            tool_runtime_queue_timeout_ms: config::DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
+            tool_runtime_default_timeout_ms: config::DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
             csrf_enabled: true,
             csrf_cookie_name: "csrf_token".to_owned(),
             csrf_header_name: "x-csrf-token".to_owned(),
