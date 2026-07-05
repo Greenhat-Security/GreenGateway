@@ -44,6 +44,8 @@ pub const DEFAULT_ADMIN_PREFIX: &str = "/admin";
 const DEFAULT_EXEMPT_PROBE_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_JWT_JWKS_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_ROLES_CLAIM: &str = "roles";
+pub const DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS: u64 = 2000;
+pub const DEFAULT_COOKIE_SESSION_CACHE_TTL_MS: u64 = DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS;
 pub const DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS: u64 = 5_000;
 const DEFAULT_CSRF_ENABLED: bool = true;
 const DEFAULT_CSRF_COOKIE_NAME: &str = "csrf_token";
@@ -211,11 +213,17 @@ pub struct AuthProviderConfig {
     pub roles_claim: String,
     pub roles_claim_delimiter: Option<String>,
     pub org_claim: Option<String>,
+    pub introspection_url: Option<String>,
+    pub introspection_timeout_ms: u64,
+    pub cache_ttl_ms: u64,
+    pub user_id_claim: Option<String>,
+    pub email_claim: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthProviderType {
     Jwt,
+    CookieSession,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,6 +248,16 @@ struct RawAuthProviderConfig {
     roles_claim_delimiter: Option<String>,
     #[serde(default)]
     org_claim: Option<String>,
+    #[serde(default)]
+    introspection_url: Option<String>,
+    #[serde(default)]
+    introspection_timeout_ms: Option<u64>,
+    #[serde(default)]
+    cache_ttl_ms: Option<u64>,
+    #[serde(default)]
+    user_id_claim: Option<String>,
+    #[serde(default)]
+    email_claim: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -928,7 +946,7 @@ fn parse_auth_providers(
         Ok(providers) => providers,
         Err(err) => {
             problems.push(format!(
-                "{name} must be a JSON array of auth provider objects with name, type, and jwks_url or issuer, plus optional audience, jwks_timeout_ms, require_jti, roles_claim, roles_claim_delimiter, and org_claim: {err}"
+                "{name} must be a JSON array of auth provider objects with name, type, and provider-specific fields: jwt uses jwks_url or issuer; cookie_session uses introspection_url and user_id_claim: {err}"
             ));
             return Some(Vec::new());
         }
@@ -958,18 +976,14 @@ fn validate_auth_providers(
 
         let provider_type = match provider.provider_type.trim() {
             "jwt" => AuthProviderType::Jwt,
+            "cookie_session" => AuthProviderType::CookieSession,
             value => {
-                problems.push(format!("{provider_name}.type must be 'jwt', got '{value}'"));
+                problems.push(format!(
+                    "{provider_name}.type must be 'jwt' or 'cookie_session', got '{value}'"
+                ));
                 AuthProviderType::Jwt
             }
         };
-        let jwks_url = normalize_optional_config_string(provider.jwks_url);
-        let issuer = normalize_optional_config_string(provider.issuer);
-        if jwks_url.is_none() && issuer.is_none() {
-            problems.push(format!(
-                "{provider_name} must set jwks_url or issuer for jwt providers"
-            ));
-        }
         let roles_claim = normalize_auth_provider_roles_claim(
             &format!("{provider_name}.roles_claim"),
             provider.roles_claim,
@@ -979,19 +993,74 @@ fn validate_auth_providers(
             normalize_auth_provider_roles_claim_delimiter(provider.roles_claim_delimiter);
         let org_claim = normalize_optional_config_string(provider.org_claim);
 
+        let mut jwks_url = None;
+        let mut issuer = None;
+        let mut audience = None;
+        let mut jwks_timeout_ms = DEFAULT_JWT_JWKS_TIMEOUT_MS;
+        let mut require_jti = false;
+        let mut introspection_url = None;
+        let mut introspection_timeout_ms = DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS;
+        let mut cache_ttl_ms = DEFAULT_COOKIE_SESSION_CACHE_TTL_MS;
+        let mut user_id_claim = None;
+        let mut email_claim = None;
+
+        match provider_type {
+            AuthProviderType::Jwt => {
+                jwks_url = normalize_optional_config_string(provider.jwks_url);
+                issuer = normalize_optional_config_string(provider.issuer);
+                audience = normalize_optional_config_string(provider.audience);
+                jwks_timeout_ms = provider
+                    .jwks_timeout_ms
+                    .unwrap_or(DEFAULT_JWT_JWKS_TIMEOUT_MS);
+                require_jti = provider.require_jti;
+                if jwks_url.is_none() && issuer.is_none() {
+                    problems.push(format!(
+                        "{provider_name} must set jwks_url or issuer for jwt providers"
+                    ));
+                }
+            }
+            AuthProviderType::CookieSession => {
+                introspection_url = normalize_optional_config_string(provider.introspection_url);
+                if introspection_url.is_none() {
+                    problems.push(format!("{provider_name} must set introspection_url"));
+                }
+                introspection_timeout_ms = validate_auth_provider_positive_u64(
+                    &format!("{provider_name}.introspection_timeout_ms"),
+                    provider.introspection_timeout_ms,
+                    DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+                    problems,
+                );
+                cache_ttl_ms = validate_auth_provider_positive_u64(
+                    &format!("{provider_name}.cache_ttl_ms"),
+                    provider.cache_ttl_ms,
+                    DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+                    problems,
+                );
+                user_id_claim = normalize_required_auth_provider_string(
+                    &format!("{provider_name}.user_id_claim"),
+                    provider.user_id_claim,
+                    problems,
+                );
+                email_claim = normalize_optional_config_string(provider.email_claim);
+            }
+        }
+
         validated.push(AuthProviderConfig {
             name: normalized_name,
             provider_type,
             jwks_url,
             issuer,
-            audience: normalize_optional_config_string(provider.audience),
-            jwks_timeout_ms: provider
-                .jwks_timeout_ms
-                .unwrap_or(DEFAULT_JWT_JWKS_TIMEOUT_MS),
-            require_jti: provider.require_jti,
+            audience,
+            jwks_timeout_ms,
+            require_jti,
             roles_claim,
             roles_claim_delimiter,
             org_claim,
+            introspection_url,
+            introspection_timeout_ms,
+            cache_ttl_ms,
+            user_id_claim,
+            email_claim,
         });
     }
 
@@ -1023,6 +1092,40 @@ fn normalize_auth_provider_roles_claim_delimiter(value: Option<String>) -> Optio
     value.filter(|value| !value.is_empty())
 }
 
+fn normalize_required_auth_provider_string(
+    name: &str,
+    value: Option<String>,
+    problems: &mut Vec<String>,
+) -> Option<String> {
+    match value.map(|value| value.trim().to_owned()) {
+        Some(value) if value.is_empty() => {
+            problems.push(format!("{name} must be a non-empty string"));
+            None
+        }
+        Some(value) => Some(value),
+        None => {
+            problems.push(format!("{name} must be a non-empty string"));
+            None
+        }
+    }
+}
+
+fn validate_auth_provider_positive_u64(
+    name: &str,
+    value: Option<u64>,
+    default: u64,
+    problems: &mut Vec<String>,
+) -> u64 {
+    match value {
+        Some(0) => {
+            problems.push(format!("{name} must be greater than 0"));
+            default
+        }
+        Some(value) => value,
+        None => default,
+    }
+}
+
 fn legacy_auth_providers(
     jwt_jwks_url: Option<&str>,
     jwt_issuer: Option<&str>,
@@ -1046,6 +1149,11 @@ fn legacy_auth_providers(
         roles_claim: roles_claim.to_owned(),
         roles_claim_delimiter: None,
         org_claim: None,
+        introspection_url: None,
+        introspection_timeout_ms: DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+        cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+        user_id_claim: None,
+        email_claim: None,
     }]
 }
 
@@ -2741,6 +2849,11 @@ mod tests {
                     roles_claim: "groups".to_owned(),
                     roles_claim_delimiter: Some(" ".to_owned()),
                     org_claim: Some("tenant.id".to_owned()),
+                    introspection_url: None,
+                    introspection_timeout_ms: DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+                    cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+                    user_id_claim: None,
+                    email_claim: None,
                 },
                 AuthProviderConfig {
                     name: "secondary".to_owned(),
@@ -2755,6 +2868,11 @@ mod tests {
                     roles_claim: DEFAULT_ROLES_CLAIM.to_owned(),
                     roles_claim_delimiter: None,
                     org_claim: None,
+                    introspection_url: None,
+                    introspection_timeout_ms: DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+                    cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+                    user_id_claim: None,
+                    email_claim: None,
                 },
             ]
         );
@@ -2788,8 +2906,76 @@ mod tests {
                 roles_claim: DEFAULT_ROLES_CLAIM.to_owned(),
                 roles_claim_delimiter: None,
                 org_claim: None,
+                introspection_url: None,
+                introspection_timeout_ms: DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+                cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+                user_id_claim: None,
+                email_claim: None,
             }]
         );
+    }
+
+    #[test]
+    fn auth_providers_parse_cookie_session_provider() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(r#"[{
+                    "name": "app-session",
+                    "type": "cookie_session",
+                    "introspection_url": " https://app.example.test/session/introspect ",
+                    "introspection_timeout_ms": 1500,
+                    "cache_ttl_ms": 750,
+                    "user_id_claim": " account.id ",
+                    "email_claim": " account.email ",
+                    "org_claim": " account.tenant.id ",
+                    "roles_claim": " account.scope ",
+                    "roles_claim_delimiter": " "
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("cookie-session provider should parse");
+
+        assert_eq!(
+            config.auth_providers,
+            vec![AuthProviderConfig {
+                name: "app-session".to_owned(),
+                provider_type: AuthProviderType::CookieSession,
+                jwks_url: None,
+                issuer: None,
+                audience: None,
+                jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
+                require_jti: false,
+                roles_claim: "account.scope".to_owned(),
+                roles_claim_delimiter: Some(" ".to_owned()),
+                org_claim: Some("account.tenant.id".to_owned()),
+                introspection_url: Some("https://app.example.test/session/introspect".to_owned()),
+                introspection_timeout_ms: 1500,
+                cache_ttl_ms: 750,
+                user_id_claim: Some("account.id".to_owned()),
+                email_claim: Some("account.email".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn auth_providers_reject_cookie_session_provider_without_required_fields() {
+        let error = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(r#"[{
+                    "name": "app-session",
+                    "type": "cookie_session",
+                    "cache_ttl_ms": 0,
+                    "user_id_claim": "   "
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("cookie-session provider should require introspection URL and user id claim");
+
+        let message = error.to_string();
+        assert!(message.contains("AUTH_PROVIDERS[0] must set introspection_url"));
+        assert!(message.contains("AUTH_PROVIDERS[0].user_id_claim must be a non-empty string"));
+        assert!(message.contains("AUTH_PROVIDERS[0].cache_ttl_ms must be greater than 0"));
+        assert_eq!(error.problems.len(), 3);
     }
 
     #[test]
@@ -2978,6 +3164,11 @@ mod tests {
             roles_claim: roles_claim.to_owned(),
             roles_claim_delimiter: roles_claim_delimiter.map(str::to_owned),
             org_claim: org_claim.map(str::to_owned),
+            introspection_url: None,
+            introspection_timeout_ms: DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+            user_id_claim: None,
+            email_claim: None,
         }
     }
 
@@ -3008,6 +3199,11 @@ mod tests {
                 roles_claim: DEFAULT_ROLES_CLAIM.to_owned(),
                 roles_claim_delimiter: None,
                 org_claim: None,
+                introspection_url: None,
+                introspection_timeout_ms: DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+                cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+                user_id_claim: None,
+                email_claim: None,
             }]
         );
     }
@@ -3083,7 +3279,7 @@ mod tests {
         .expect_err("config should reject unrecognized auth provider types");
 
         let message = error.to_string();
-        assert!(message.contains("AUTH_PROVIDERS[0].type must be 'jwt'"));
+        assert!(message.contains("AUTH_PROVIDERS[0].type must be 'jwt' or 'cookie_session'"));
         assert_eq!(error.problems.len(), 1);
     }
 
@@ -3113,6 +3309,11 @@ mod tests {
                 roles_claim: "groups".to_owned(),
                 roles_claim_delimiter: None,
                 org_claim: None,
+                introspection_url: None,
+                introspection_timeout_ms: DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+                cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+                user_id_claim: None,
+                email_claim: None,
             }]
         );
     }
@@ -3156,6 +3357,11 @@ mod tests {
                 roles_claim: "declared_roles".to_owned(),
                 roles_claim_delimiter: None,
                 org_claim: None,
+                introspection_url: None,
+                introspection_timeout_ms: DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+                cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+                user_id_claim: None,
+                email_claim: None,
             }]
         );
     }
