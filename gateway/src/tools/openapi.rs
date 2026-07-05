@@ -23,6 +23,7 @@ const MAX_TOOL_NAME_LENGTH: usize = 128;
 pub struct OpenApiToolGeneration {
     pub definitions: Vec<ToolDefinition>,
     pub operation_id_fallbacks: Vec<OpenApiToolNameFallback>,
+    pub skipped_operations: Vec<OpenApiSkippedOperation>,
     pub api_key_header_auth_requirements: Vec<OpenApiApiKeyHeaderAuthRequirement>,
 }
 
@@ -46,6 +47,19 @@ pub enum OpenApiToolNameFallbackReason {
     MissingOperationId,
     InvalidOperationId,
     DuplicateToolName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenApiSkippedOperation {
+    pub method: String,
+    pub path_template: String,
+    pub original_operation_id: Option<String>,
+    pub reason: OpenApiSkippedOperationReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenApiSkippedOperationReason {
+    BodyPropertyParameterNameCollision { property_name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,11 +167,27 @@ pub fn generate_tools_from_openapi_str(
 
     let mut definitions = Vec::new();
     let mut operation_id_fallbacks = Vec::new();
+    let mut skipped_operations = Vec::new();
     let mut api_key_header_auth_requirements = Vec::new();
     let mut used_names = BTreeSet::new();
 
     for operation in &parsed_spec.operations {
         let operation_value = operation_value(&document, operation);
+        let parameters = operation_parameters(&document, operation)?;
+        let body_schema = json_request_body_schema(&document, operation_value)?;
+        let input_schema = match input_schema_for(operation, &parameters, body_schema.as_ref()) {
+            Ok(input_schema) => input_schema,
+            Err(reason) => {
+                skipped_operations.push(OpenApiSkippedOperation {
+                    method: operation.method.clone(),
+                    path_template: operation.path_template.clone(),
+                    original_operation_id: operation.operation_id.clone(),
+                    reason,
+                });
+                continue;
+            }
+        };
+
         let (tool_name, fallback) = tool_name_for(operation, &mut used_names);
         if let Some(fallback) = fallback {
             operation_id_fallbacks.push(fallback);
@@ -170,9 +200,6 @@ pub fn generate_tools_from_openapi_str(
             &tool_name,
         )?);
 
-        let parameters = operation_parameters(&document, operation)?;
-        let body_schema = json_request_body_schema(&document, operation_value)?;
-        let input_schema = input_schema_for(operation, &parameters, body_schema.as_ref());
         let query_params = parameters
             .iter()
             .filter(|parameter| parameter.location == GeneratedParameterLocation::Query)
@@ -201,6 +228,7 @@ pub fn generate_tools_from_openapi_str(
     Ok(OpenApiToolGeneration {
         definitions,
         operation_id_fallbacks,
+        skipped_operations,
         api_key_header_auth_requirements,
     })
 }
@@ -487,7 +515,7 @@ fn input_schema_for(
     operation: &OpenApiOperation,
     parameters: &[GeneratedParameter],
     body_schema: Option<&Value>,
-) -> Value {
+) -> Result<Value, OpenApiSkippedOperationReason> {
     let mut properties = Map::new();
     let mut required = BTreeSet::<String>::new();
 
@@ -505,41 +533,56 @@ fn input_schema_for(
         required.insert(path_parameter_name);
     }
 
+    let parameter_property_names = properties.keys().cloned().collect::<BTreeSet<_>>();
     if let Some(body_schema) = body_schema {
-        merge_body_schema(body_schema, &mut properties, &mut required);
+        merge_body_schema(
+            body_schema,
+            &parameter_property_names,
+            &mut properties,
+            &mut required,
+        )?;
     }
 
-    json!({
+    Ok(json!({
         "type": "object",
         "required": required.into_iter().collect::<Vec<_>>(),
         "properties": properties,
         "additionalProperties": false,
-    })
+    }))
 }
 
 fn merge_body_schema(
     schema: &Value,
+    parameter_property_names: &BTreeSet<String>,
     properties: &mut Map<String, Value>,
     required: &mut BTreeSet<String>,
-) {
+) -> Result<(), OpenApiSkippedOperationReason> {
     if let Some(all_of) = schema
         .as_object()
         .and_then(|object| object.get("allOf"))
         .and_then(Value::as_array)
     {
         for schema in all_of {
-            merge_body_schema(schema, properties, required);
+            merge_body_schema(schema, parameter_property_names, properties, required)?;
         }
     }
 
     let Some(object) = schema.as_object() else {
-        return;
+        return Ok(());
     };
 
     if let Some(schema_properties) = object.get("properties").and_then(Value::as_object) {
         for (name, schema) in schema_properties {
             let name = name.trim();
             if !name.is_empty() {
+                if parameter_property_names.contains(name) {
+                    return Err(
+                        OpenApiSkippedOperationReason::BodyPropertyParameterNameCollision {
+                            property_name: name.to_owned(),
+                        },
+                    );
+                }
+
                 properties
                     .entry(name.to_owned())
                     .or_insert_with(|| schema.clone());
@@ -557,6 +600,8 @@ fn merge_body_schema(
             required.insert(name.to_owned());
         }
     }
+
+    Ok(())
 }
 
 fn json_request_body_schema(
@@ -776,10 +821,12 @@ fn json_pointer_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    use serde_json::{json, Value};
 
     use super::*;
-    use crate::tools::definitions::{BodyMappingMode, ToolRegistry};
+    use crate::tools::definitions::{BodyMappingMode, QueryParamMapping, ToolRegistry};
 
     #[test]
     fn generates_valid_tools_from_realistic_multi_operation_spec() {
@@ -787,6 +834,7 @@ mod tests {
             .expect("OpenAPI spec should generate tools");
 
         assert_eq!(generation.definitions.len(), 3);
+        assert!(generation.skipped_operations.is_empty());
         ToolRegistry::from_json_value(generation.tools_file_value())
             .expect("generated tools file should pass schema and semantic validation");
 
@@ -819,6 +867,103 @@ mod tests {
             create_widget.input_schema["properties"]["quantity"],
             json!({ "type": "integer", "minimum": 1 })
         );
+    }
+
+    #[test]
+    fn realistic_spec_generates_same_non_colliding_tools_without_skips() {
+        let generation = generate_tools_from_openapi_str("test.yaml", realistic_spec())
+            .expect("OpenAPI spec should generate tools");
+
+        assert!(generation.skipped_operations.is_empty());
+
+        let actual: BTreeMap<String, Value> = generation
+            .definitions
+            .iter()
+            .map(|definition| {
+                (
+                    definition.name.clone(),
+                    serde_json::to_value(definition)
+                        .expect("generated definition should serialize"),
+                )
+            })
+            .collect();
+        let expected = BTreeMap::from([
+            (
+                "createWidget".to_owned(),
+                json!({
+                    "name": "createWidget",
+                    "description": "Create a widget",
+                    "input_json_schema": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {
+                            "name": { "type": "string" },
+                            "quantity": { "type": "integer", "minimum": 1 }
+                        },
+                        "additionalProperties": false
+                    },
+                    "upstream": {
+                        "method": "POST",
+                        "path_template": "/widgets",
+                        "body": { "mode": "whole_args_json" }
+                    }
+                }),
+            ),
+            (
+                "deleteWidget".to_owned(),
+                json!({
+                    "name": "deleteWidget",
+                    "description": "Deletes a widget when it is no longer needed.",
+                    "input_json_schema": {
+                        "type": "object",
+                        "required": ["widgetId"],
+                        "properties": {
+                            "widgetId": { "type": "string" }
+                        },
+                        "additionalProperties": false
+                    },
+                    "upstream": {
+                        "method": "DELETE",
+                        "path_template": "/widgets/{widgetId}"
+                    }
+                }),
+            ),
+            (
+                "getWidget".to_owned(),
+                json!({
+                    "name": "getWidget",
+                    "description": "Fetch a widget",
+                    "input_json_schema": {
+                        "type": "object",
+                        "required": ["page", "widgetId"],
+                        "properties": {
+                            "includeDetails": { "type": "boolean" },
+                            "page": { "type": "integer", "minimum": 1 },
+                            "widgetId": { "type": "string" }
+                        },
+                        "additionalProperties": false
+                    },
+                    "upstream": {
+                        "method": "GET",
+                        "path_template": "/widgets/{widgetId}",
+                        "query_params": [
+                            {
+                                "arg_name": "includeDetails",
+                                "query_name": "includeDetails",
+                                "required": false
+                            },
+                            {
+                                "arg_name": "page",
+                                "query_name": "page",
+                                "required": true
+                            }
+                        ]
+                    }
+                }),
+            ),
+        ]);
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -902,6 +1047,185 @@ paths:
     }
 
     #[test]
+    fn skips_operation_when_body_property_collides_with_path_parameter() {
+        let generation = generate_tools_from_openapi_str(
+            "collision.yaml",
+            r#"
+openapi: 3.0.3
+info:
+  title: Collision API
+  version: 1.0.0
+paths:
+  /widgets/{id}:
+    put:
+      operationId: updateWidget
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: object
+                  properties:
+                    external:
+                      type: string
+                name:
+                  type: string
+"#,
+        )
+        .expect("OpenAPI spec should generate a report");
+
+        assert!(generation.definitions.is_empty());
+        assert_eq!(
+            generation.skipped_operations,
+            vec![OpenApiSkippedOperation {
+                method: "PUT".to_owned(),
+                path_template: "/widgets/{id}".to_owned(),
+                original_operation_id: Some("updateWidget".to_owned()),
+                reason: OpenApiSkippedOperationReason::BodyPropertyParameterNameCollision {
+                    property_name: "id".to_owned(),
+                },
+            }]
+        );
+        assert!(
+            generation
+                .definitions
+                .iter()
+                .all(|definition| definition.name != "updateWidget"),
+            "colliding operation must not be emitted as a broken tool"
+        );
+    }
+
+    #[test]
+    fn continues_generating_other_operations_when_collision_is_skipped() {
+        let generation =
+            generate_tools_from_openapi_str("mixed-batch.yaml", colliding_and_valid_spec())
+                .expect("OpenAPI spec should generate non-colliding tools");
+
+        assert_eq!(
+            generation
+                .definitions
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["getStatus"]
+        );
+        assert_eq!(
+            generation.skipped_operations,
+            vec![OpenApiSkippedOperation {
+                method: "PUT".to_owned(),
+                path_template: "/widgets/{id}".to_owned(),
+                original_operation_id: Some("updateWidget".to_owned()),
+                reason: OpenApiSkippedOperationReason::BodyPropertyParameterNameCollision {
+                    property_name: "id".to_owned(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn whole_args_json_mixed_operation_includes_path_query_and_body_properties() {
+        let generation = generate_tools_from_openapi_str(
+            "mixed-operation.yaml",
+            r#"
+openapi: 3.0.3
+info:
+  title: Mixed API
+  version: 1.0.0
+paths:
+  /widgets/{id}:
+    put:
+      operationId: updateWidgetName
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: dryRun
+          required: false
+          schema:
+            type: boolean
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                quantity:
+                  type: integer
+"#,
+        )
+        .expect("OpenAPI spec should generate tools");
+
+        assert!(generation.skipped_operations.is_empty());
+        let definition = generation
+            .definitions
+            .iter()
+            .find(|definition| definition.name == "updateWidgetName")
+            .expect("mixed operation should generate a tool");
+
+        assert_eq!(
+            definition.input_schema["properties"]["id"],
+            json!({ "type": "string" })
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["dryRun"],
+            json!({ "type": "boolean" })
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["name"],
+            json!({ "type": "string" })
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["quantity"],
+            json!({ "type": "integer" })
+        );
+        assert!(
+            definition.input_schema["required"]
+                .as_array()
+                .expect("required should be an array")
+                .iter()
+                .any(|value| value == "id"),
+            "path parameter should remain required"
+        );
+        assert!(
+            definition.input_schema["required"]
+                .as_array()
+                .expect("required should be an array")
+                .iter()
+                .any(|value| value == "name"),
+            "body-required property should remain required"
+        );
+        assert_eq!(
+            definition.upstream.query_params,
+            vec![QueryParamMapping {
+                arg_name: "dryRun".to_owned(),
+                query_name: "dryRun".to_owned(),
+                required: false,
+            }]
+        );
+        assert_eq!(
+            definition.upstream.body.as_ref().map(|body| body.mode),
+            Some(BodyMappingMode::WholeArgsJson)
+        );
+    }
+
+    #[test]
     fn reports_api_key_header_security_requirements() {
         let generation = generate_tools_from_openapi_str("test.yaml", realistic_spec())
             .expect("OpenAPI spec should generate tools");
@@ -981,6 +1305,40 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/WidgetCreate'
+"#
+    }
+
+    fn colliding_and_valid_spec() -> &'static str {
+        r#"
+openapi: 3.0.3
+info:
+  title: Batch API
+  version: 1.0.0
+paths:
+  /widgets/{id}:
+    put:
+      operationId: updateWidget
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id:
+                  type: integer
+                name:
+                  type: string
+  /status:
+    get:
+      operationId: getStatus
+      summary: Read status
 "#
     }
 }
