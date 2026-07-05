@@ -145,6 +145,7 @@ pub enum ToolRuntimeError {
     WorkFailed {
         tool_name: String,
         message: String,
+        reason: Option<String>,
     },
 }
 
@@ -178,7 +179,9 @@ impl fmt::Display for ToolRuntimeError {
             Self::Cancelled { tool_name } => {
                 write!(formatter, "tool '{tool_name}' invocation was cancelled")
             }
-            Self::WorkFailed { tool_name, message } => {
+            Self::WorkFailed {
+                tool_name, message, ..
+            } => {
                 write!(formatter, "tool '{tool_name}' failed: {message}")
             }
         }
@@ -353,6 +356,24 @@ impl ToolRuntime {
         Fut: Future<Output = Result<T, E>>,
         E: fmt::Display,
     {
+        self.execute_result_with_context_and_reason(tool_name, context, cancel, work, |_| None)
+            .await
+    }
+
+    pub(crate) async fn execute_result_with_context_and_reason<F, Fut, T, E, R>(
+        &self,
+        tool_name: &str,
+        context: ToolInvocationContext,
+        cancel: CancellationToken,
+        work: F,
+        failure_reason: R,
+    ) -> Result<T, ToolRuntimeError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        E: fmt::Display,
+        R: Fn(&E) -> Option<String>,
+    {
         let admitted = self
             .prepare_invocation(tool_name, &context, &cancel)
             .await?;
@@ -391,6 +412,7 @@ impl ToolRuntime {
                         Ok(value)
                     }
                     Ok(Err(err)) => {
+                        let reason = failure_reason(&err);
                         let message = err.to_string();
                         self.emit(
                             audit::event::TOOL_INVOKE_FAILURE,
@@ -402,6 +424,7 @@ impl ToolRuntime {
                         Err(ToolRuntimeError::WorkFailed {
                             tool_name: tool_name.to_owned(),
                             message,
+                            reason,
                         })
                     }
                     Err(_) => {
@@ -498,6 +521,18 @@ impl ToolRuntime {
             config: state.config,
             _permits: permits,
         })
+    }
+
+    pub(crate) fn tool_visible_to_context(
+        &self,
+        tool_name: &str,
+        context: &ToolInvocationContext,
+    ) -> bool {
+        let Ok(state) = self.lookup_tool(tool_name) else {
+            return false;
+        };
+
+        state.config.enabled && allowed_roles_match(&state.config.allowed_roles, context)
     }
 
     async fn acquire_execution_permits(

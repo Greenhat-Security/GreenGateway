@@ -272,12 +272,22 @@ impl ToolExecutor {
         let executor = self.clone();
 
         self.runtime
-            .execute_result_with_context(&runtime_tool_name, context, cancel, move || async move {
-                executor
-                    .execute_inner(&work_tool_name, args, &work_context)
-                    .await
-            })
+            .execute_result_with_context_and_reason(
+                &runtime_tool_name,
+                context,
+                cancel,
+                move || async move {
+                    executor
+                        .execute_inner(&work_tool_name, args, &work_context)
+                        .await
+                },
+                |error| Some(executor_work_failure_reason(error).to_owned()),
+            )
             .await
+    }
+
+    pub(crate) fn can_list_tool(&self, tool_name: &str, context: &ToolInvocationContext) -> bool {
+        self.runtime.tool_visible_to_context(tool_name, context)
     }
 
     async fn execute_inner(
@@ -723,6 +733,25 @@ fn egress_error_reason(error: &EgressError) -> &'static str {
         EgressError::InvalidTlsCaBundle { .. } => "invalid_tls_ca_bundle",
         EgressError::Http(err) if err.is_timeout() => "timeout",
         EgressError::Http(_) => "http_error",
+    }
+}
+
+fn executor_work_failure_reason(error: &ToolExecutorError) -> &'static str {
+    match error {
+        ToolExecutorError::UnknownTool { .. } => "unknown_tool",
+        ToolExecutorError::InputValidation { .. }
+        | ToolExecutorError::MissingArgument { .. }
+        | ToolExecutorError::UnsupportedArgumentValue { .. }
+        | ToolExecutorError::PathSegmentIsDotSegment { .. } => "invalid_params",
+        ToolExecutorError::Egress { source, .. } => egress_error_reason(source),
+        ToolExecutorError::MissingUpstreamUrl
+        | ToolExecutorError::InvalidUpstreamUrl { .. }
+        | ToolExecutorError::SchemaCacheKey { .. }
+        | ToolExecutorError::SchemaCompile { .. }
+        | ToolExecutorError::InvalidMapping { .. }
+        | ToolExecutorError::InvalidMethod { .. }
+        | ToolExecutorError::BodySerialize { .. }
+        | ToolExecutorError::UrlBuild { .. } => "internal_configuration_error",
     }
 }
 

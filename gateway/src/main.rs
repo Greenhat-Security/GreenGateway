@@ -38,6 +38,7 @@ mod client_ip;
 mod config;
 mod discovery;
 mod egress;
+mod mcp;
 mod metrics;
 mod middleware;
 mod path_match;
@@ -101,6 +102,9 @@ const ADMIN_SUGGESTIONS_WRITE_PERMISSION: &str = "admin:suggestions:write";
 const ADMIN_TRAFFIC_READ_PERMISSION: &str = "admin:traffic:read";
 const ADMIN_TRAFFIC_WRITE_PERMISSION: &str = "admin:traffic:write";
 const ADMIN_PRINCIPALS_READ_PERMISSION: &str = "admin:principals:read";
+#[cfg(test)]
+const ADMIN_MCP_USE_PERMISSION: &str = "admin:mcp:use";
+const MCP_ROUTE: &str = "/mcp";
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
 const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
@@ -122,7 +126,7 @@ struct AppState {
     proxy: Option<ProxyState>,
     routes: GatewayRoutes,
     admin_login_configured: bool,
-    _tool_registry: tools::definitions::ToolRegistry,
+    mcp: mcp::McpState,
 }
 
 #[derive(Clone)]
@@ -225,8 +229,9 @@ impl GatewayRoutes {
         let mut prefix_owned_paths = vec![admin.ui_prefix.clone(), admin.api_prefix.clone()];
         prefix_owned_paths.sort();
         prefix_owned_paths.dedup();
-        // Add the future /mcp control-plane prefix here when the Phase 6 route
-        // lands; do not reserve it with a fabricated route before then.
+        prefix_owned_paths.push(MCP_ROUTE.to_owned());
+        prefix_owned_paths.sort();
+        prefix_owned_paths.dedup();
 
         Self {
             admin,
@@ -1079,6 +1084,12 @@ fn gateway_app_with_process_started_at(
                 ),
             );
     let loaded_policy = rbac::Policy::from_config(&config)?;
+    let tool_runtime_config = match loaded_policy.as_ref() {
+        Some(policy) => {
+            tools::runtime::ToolRuntimeConfig::from_env_defaults(&config).with_policy_tools(policy)
+        }
+        None => tools::runtime::ToolRuntimeConfig::from_env_defaults(&config),
+    };
     let rate_limit_state = middleware::rate_limit::RateLimitState::from_config_and_policy(
         &config,
         loaded_policy.as_ref(),
@@ -1160,6 +1171,19 @@ fn gateway_app_with_process_started_at(
             tool_registry.clone(),
         )?;
     }
+    let tool_runtime = tools::runtime::ToolRuntime::new(tool_runtime_config, audit_log.clone());
+    let mcp_executor = mcp::mcp_executor_from_config(
+        &config,
+        tool_registry.clone(),
+        tool_runtime,
+        Arc::clone(&egress_client),
+        audit_log.clone(),
+    )?;
+    let mcp_state = mcp::McpState::new(
+        tool_registry.clone(),
+        mcp_executor,
+        config.trust_proxy_headers,
+    );
     let status_state = StatusAdminState {
         config: config.clone(),
         rbac: rbac_status,
@@ -1221,7 +1245,7 @@ fn gateway_app_with_process_started_at(
         proxy: proxy_state,
         routes: routes.clone(),
         admin_login_configured: admin_auth_state.is_some(),
-        _tool_registry: tool_registry,
+        mcp: mcp_state,
     };
     let audit_admin_state = AuditAdminState {
         query_store: audit_query_store,
@@ -1556,6 +1580,7 @@ fn unified_router(
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/metrics", get(metrics_endpoint))
+        .route(MCP_ROUTE, any(mcp::mcp_endpoint))
         .route(routes.admin.ui_prefix.as_str(), get(admin_ui_index))
         .route(routes.admin.ui_slash_route.as_str(), get(admin_ui_index))
         .route(routes.admin.ui_asset_route.as_str(), get(admin_ui_asset));
@@ -1576,7 +1601,8 @@ fn data_router(app_state: AppState) -> Router {
     let router = Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
-        .route("/metrics", get(metrics_endpoint));
+        .route("/metrics", get(metrics_endpoint))
+        .route(MCP_ROUTE, any(mcp::mcp_endpoint));
 
     with_proxy_fallback_if_configured(router, &app_state).with_state(app_state)
 }
@@ -9732,6 +9758,480 @@ mod tests {
         );
         assert_eq!(body["auth_method"], json!("service_token"));
         assert_eq!(body["roles"], json!(["probe-reader"]));
+    }
+
+    #[tokio::test]
+    async fn mcp_initialize_handshake_succeeds() {
+        let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            1,
+            "initialize",
+            Some(mcp_initialize_params()),
+            "mcp-init-request",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["jsonrpc"], json!("2.0"));
+        assert_eq!(body["id"], json!(1));
+        assert_eq!(body["result"]["serverInfo"]["name"], json!("greengateway"));
+        assert_eq!(body["result"]["capabilities"]["tools"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_list_returns_registry_tools_and_schemas() {
+        let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            2,
+            "tools/list",
+            None,
+            "mcp-list-request",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let tools = body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        let echo = tools
+            .iter()
+            .find(|tool| tool["name"] == json!("echo"))
+            .expect("echo tool should be listed");
+        let widget = tools
+            .iter()
+            .find(|tool| tool["name"] == json!("get_widget"))
+            .expect("get_widget tool should be listed");
+
+        assert_eq!(
+            echo["description"],
+            json!("Echoes a message through a generic upstream endpoint.")
+        );
+        assert_eq!(echo["inputSchema"]["required"], json!(["message"]));
+        assert_eq!(
+            echo["inputSchema"]["properties"]["message"]["type"],
+            json!("string")
+        );
+        assert_eq!(widget["inputSchema"]["required"], json!(["widget_id"]));
+        assert_eq!(
+            widget["inputSchema"]["properties"]["include_details"]["type"],
+            json!("boolean")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_list_filters_tools_by_allowed_roles() {
+        let harness = mcp_test_harness(&[], test_audit_log()).await;
+
+        let (reader_status, reader_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.reader_token),
+            11,
+            "tools/list",
+            None,
+            "mcp-list-reader",
+        )
+        .await;
+        assert_eq!(reader_status, StatusCode::OK);
+        let reader_tools = reader_body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        assert!(
+            reader_tools
+                .iter()
+                .any(|tool| tool["name"] == json!("echo")),
+            "unrestricted tool should be listed"
+        );
+        assert!(
+            !reader_tools
+                .iter()
+                .any(|tool| tool["name"] == json!("get_widget")),
+            "admin-only tool should not be listed to reader"
+        );
+
+        let (admin_status, admin_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            12,
+            "tools/list",
+            None,
+            "mcp-list-admin",
+        )
+        .await;
+        assert_eq!(admin_status, StatusCode::OK);
+        let admin_tools = admin_body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        assert!(
+            admin_tools
+                .iter()
+                .any(|tool| tool["name"] == json!("get_widget")),
+            "matching role should see role-restricted tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_route_rejects_missing_authentication_and_missing_permission() {
+        let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
+
+        let (missing_status, missing_body) = mcp_rpc(
+            &harness.router,
+            None,
+            3,
+            "tools/list",
+            None,
+            "mcp-missing-auth",
+        )
+        .await;
+        assert_eq!(missing_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(missing_body, json!({ "error": "unauthorized" }));
+
+        let (forbidden_status, forbidden_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.blocked_token),
+            4,
+            "tools/list",
+            None,
+            "mcp-forbidden",
+        )
+        .await;
+        assert_eq!(forbidden_status, StatusCode::FORBIDDEN);
+        assert_eq!(forbidden_body, json!({ "error": "forbidden" }));
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_echo_succeeds() {
+        let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            5,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "hello from mcp"
+                }
+            })),
+            "mcp-call-success",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["result"]["isError"], json!(false));
+        assert_eq!(body["result"]["structuredContent"]["status"], json!(200));
+        assert_eq!(
+            body["result"]["structuredContent"]["body"],
+            json!({ "message": "hello from mcp" })
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_get_widget_succeeds() {
+        let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            10,
+            "tools/call",
+            Some(json!({
+                "name": "get_widget",
+                "arguments": {
+                    "widget_id": "widget-123",
+                    "include_details": true
+                }
+            })),
+            "mcp-call-widget-success",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["result"]["isError"], json!(false));
+        assert_eq!(body["result"]["structuredContent"]["status"], json!(200));
+        assert_eq!(
+            body["result"]["structuredContent"]["body"],
+            json!({
+                "widget_id": "widget-123",
+                "include_details": true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_errors_are_mapped_to_json_rpc_errors() {
+        let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
+
+        let (unknown_status, unknown_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            6,
+            "tools/call",
+            Some(json!({
+                "name": "missing_tool",
+                "arguments": {}
+            })),
+            "mcp-call-unknown",
+        )
+        .await;
+        assert_eq!(unknown_status, StatusCode::OK);
+        assert_eq!(unknown_body["error"]["code"], json!(-32601));
+        assert_eq!(
+            unknown_body["error"]["message"],
+            json!("tool 'missing_tool' is not defined")
+        );
+        assert_eq!(
+            unknown_body["error"]["data"]["tool_name"],
+            json!("missing_tool")
+        );
+
+        let (schema_status, schema_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            7,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {}
+            })),
+            "mcp-call-schema",
+        )
+        .await;
+        assert_eq!(schema_status, StatusCode::OK);
+        assert_eq!(schema_body["error"]["code"], json!(-32602));
+        assert_eq!(schema_body["error"]["data"]["tool_name"], json!("echo"));
+        assert!(schema_body["error"]["message"]
+            .as_str()
+            .expect("invalid params error should include a message")
+            .contains("failed input schema validation"));
+
+        let (role_status, role_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.reader_token),
+            8,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "reader should be denied by tool policy"
+                }
+            })),
+            "mcp-call-role-denied",
+        )
+        .await;
+        assert_eq!(role_status, StatusCode::OK);
+        assert_eq!(role_body["error"]["code"], json!(-32001));
+        assert_eq!(
+            role_body["error"]["message"],
+            json!("tool invocation is denied by role policy")
+        );
+        assert_eq!(role_body["error"]["data"]["tool_name"], json!("echo"));
+        assert_eq!(role_body["error"]["data"]["reason"], json!("role_denied"));
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_transport_failure_uses_sanitized_error_reason() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let upstream_addr = listener
+            .local_addr()
+            .expect("listener address should be available");
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("test server should accept a connection");
+                drop(stream);
+            }
+        });
+        let harness = mcp_test_harness_with_upstream_url(
+            &["admin"],
+            test_audit_log(),
+            format!("http://{upstream_addr}"),
+            mcp_tools_document(),
+            vec!["127.0.0.1".to_owned()],
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            13,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "trigger reset"
+                }
+            })),
+            "mcp-call-reset-upstream",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32603));
+        assert_eq!(body["error"]["message"], json!("tool invocation failed"));
+        assert_eq!(body["error"]["data"]["tool_name"], json!("echo"));
+        assert_eq!(body["error"]["data"]["reason"], json!("http_error"));
+        let body_string = body.to_string();
+        assert!(!body_string.contains("127.0.0.1"));
+        assert!(!body_string.contains(&upstream_addr.port().to_string()));
+        assert!(!body_string.contains("connection"));
+        assert!(!body_string.contains("reqwest"));
+        assert!(!body_string.contains("error sending request"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_sanitizes_non_success_upstream_error_body() {
+        let upstream_addr = spawn_fixed_echo_upstream(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            json!({
+                "message": "validation failed against api.internal.example.test",
+                "errors": [
+                    {
+                        "detail": "bad value used secret=gg_test_fake_secret_400"
+                    }
+                ],
+                "debug": "stack trace from api.internal.example.test with gg_test_fake_secret_400"
+            })
+            .to_string(),
+        )
+        .await;
+        let harness = mcp_test_harness_with_upstream_url(
+            &["admin"],
+            test_audit_log(),
+            format!("http://{upstream_addr}"),
+            mcp_tools_document(),
+            vec!["127.0.0.1".to_owned()],
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            14,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "bad input"
+                }
+            })),
+            "mcp-call-upstream-400",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["result"]["isError"], json!(true));
+        assert_eq!(body["result"]["structuredContent"]["status"], json!(400));
+        assert_eq!(
+            body["result"]["structuredContent"]["body"]["message"],
+            json!("validation failed against [redacted]")
+        );
+        assert_eq!(
+            body["result"]["structuredContent"]["body"]["errors"][0]["detail"],
+            json!("bad value used [redacted]")
+        );
+        let body_string = body.to_string();
+        assert!(!body_string.contains("api.internal.example.test"));
+        assert!(!body_string.contains("gg_test_fake_secret_400"));
+        assert!(!body_string.contains("stack trace"));
+        assert!(!mcp_content_text(&body).contains("api.internal.example.test"));
+        assert!(!mcp_content_text(&body).contains("gg_test_fake_secret_400"));
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_success_body_is_forwarded_faithfully() {
+        let upstream_body = json!({
+            "message": "ok",
+            "diagnostic": "api.internal.example.test",
+            "marker": "gg_test_fake_secret_success"
+        });
+        let upstream_addr = spawn_fixed_echo_upstream(
+            StatusCode::OK,
+            "application/json",
+            upstream_body.to_string(),
+        )
+        .await;
+        let harness = mcp_test_harness_with_upstream_url(
+            &["admin"],
+            test_audit_log(),
+            format!("http://{upstream_addr}"),
+            mcp_tools_document(),
+            vec!["127.0.0.1".to_owned()],
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            15,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "successful output"
+                }
+            })),
+            "mcp-call-success-passthrough",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["result"]["isError"], json!(false));
+        assert_eq!(body["result"]["structuredContent"]["status"], json!(200));
+        assert_eq!(body["result"]["structuredContent"]["body"], upstream_body);
+        assert!(mcp_content_text(&body).contains("api.internal.example.test"));
+        assert!(mcp_content_text(&body).contains("gg_test_fake_secret_success"));
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_emits_http_observation_event() {
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let harness = mcp_test_harness(&["admin"], audit_log).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            9,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "observe me"
+                }
+            })),
+            "mcp-observed-request",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], json!(false));
+
+        assert_eventually(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == "http.request_observed"
+                    && event.request_id == "mcp-observed-request"
+                    && event.payload["path"] == json!(MCP_ROUTE)
+                    && event.payload["method"] == json!("POST")
+                    && event.payload["status"] == json!(200)
+            })
+        });
     }
 
     #[tokio::test]
@@ -18737,6 +19237,321 @@ paths:
         .to_string()
     }
 
+    struct McpTestHarness {
+        router: Router,
+        admin_token: String,
+        reader_token: String,
+        blocked_token: String,
+        _policy: TempPolicyFile,
+        _tools: TempToolsFile,
+        _token_db: TempDb,
+    }
+
+    async fn mcp_test_harness(
+        echo_allowed_roles: &[&str],
+        audit_log: audit::AuditLog,
+    ) -> McpTestHarness {
+        let upstream_addr = spawn_echo_json_upstream().await;
+        mcp_test_harness_with_upstream_url(
+            echo_allowed_roles,
+            audit_log,
+            format!("http://{upstream_addr}"),
+            mcp_tools_document(),
+            vec!["127.0.0.1".to_owned()],
+        )
+        .await
+    }
+
+    async fn mcp_test_harness_with_upstream_url(
+        echo_allowed_roles: &[&str],
+        audit_log: audit::AuditLog,
+        upstream_url: String,
+        tools_document: String,
+        egress_allowed_hosts: Vec<String>,
+    ) -> McpTestHarness {
+        let token_db = TempDb::new("mcp-service-tokens");
+        let token_store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        let admin_token = create_service_token(&token_store, &["admin"]);
+        let reader_token = create_service_token(&token_store, &["reader"]);
+        let blocked_token = create_service_token(&token_store, &["blocked"]);
+        let policy = TempPolicyFile::new(&mcp_policy_document(echo_allowed_roles));
+        let tools = TempToolsFile::new(&tools_document);
+
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.tools_file = Some(tools.path.to_string_lossy().into_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        config.service_token_cache_ttl_ms = 20;
+        config.upstream_url = Some(upstream_url);
+        config.egress_allowed_hosts = egress_allowed_hosts;
+        config.egress_deny_private_ips = false;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("MCP test app should build");
+
+        McpTestHarness {
+            router,
+            admin_token,
+            reader_token,
+            blocked_token,
+            _policy: policy,
+            _tools: tools,
+            _token_db: token_db,
+        }
+    }
+
+    fn create_service_token(store: &auth::SqliteTokenStore, roles: &[&str]) -> String {
+        store
+            .create(auth::tokens::CreateTokenRequest {
+                scopes: roles.iter().map(|role| (*role).to_owned()).collect(),
+                created_by: "mcp-test-bootstrap".to_owned(),
+                expires_at: None,
+            })
+            .expect("service token should create")
+            .plaintext_token
+    }
+
+    async fn spawn_echo_json_upstream() -> std::net::SocketAddr {
+        async fn echo(body: Bytes) -> Response {
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response()
+        }
+
+        async fn get_widget(
+            Path(widget_id): Path<String>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> Response {
+            Json(json!({
+                "widget_id": widget_id,
+                "include_details": params
+                    .get("include_details")
+                    .is_some_and(|value| value == "true"),
+            }))
+            .into_response()
+        }
+
+        spawn_router(
+            Router::new()
+                .route("/v1/echo", post(echo))
+                .route("/v1/widgets/{widget_id}", get(get_widget)),
+        )
+        .await
+    }
+
+    async fn spawn_fixed_echo_upstream(
+        status: StatusCode,
+        content_type: &'static str,
+        body: String,
+    ) -> std::net::SocketAddr {
+        let body = Arc::new(body);
+
+        spawn_router(Router::new().route(
+            "/v1/echo",
+            post(move || {
+                let body = Arc::clone(&body);
+                async move {
+                    Response::builder()
+                        .status(status)
+                        .header(header::CONTENT_TYPE, content_type)
+                        .body(Body::from(body.as_ref().clone()))
+                        .expect("fixed upstream response should build")
+                }
+            }),
+        ))
+        .await
+    }
+
+    async fn mcp_rpc(
+        router: &Router,
+        token: Option<&str>,
+        id: u64,
+        method: &str,
+        params: Option<Value>,
+        request_id: &str,
+    ) -> (StatusCode, Value) {
+        let response = router
+            .clone()
+            .oneshot(mcp_request(token, id, method, params, request_id))
+            .await
+            .expect("MCP request should complete");
+        let status = response.status();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("MCP body should read");
+        let body = serde_json::from_slice(&body_bytes).unwrap_or_else(|err| {
+            panic!(
+                "MCP body should be JSON, status={status}, body={:?}: {err}",
+                String::from_utf8_lossy(&body_bytes)
+            )
+        });
+
+        (status, body)
+    }
+
+    fn mcp_request(
+        token: Option<&str>,
+        id: u64,
+        method: &str,
+        params: Option<Value>,
+        request_id: &str,
+    ) -> Request<Body> {
+        let mut body = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+        });
+
+        if let Some(params) = params {
+            body["params"] = params;
+        }
+
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(MCP_ROUTE)
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::COOKIE, "csrf_token=mcp-test-csrf")
+            .header("x-csrf-token", "mcp-test-csrf")
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .header(REQUEST_ID_HEADER, request_id);
+
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+
+        builder
+            .body(Body::from(body.to_string()))
+            .expect("MCP request should build")
+    }
+
+    fn mcp_content_text(body: &Value) -> &str {
+        body["result"]["content"][0]["text"]
+            .as_str()
+            .expect("MCP result should include text content")
+    }
+
+    fn mcp_initialize_params() -> Value {
+        json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "greengateway-test-client",
+                "version": "0.0.0"
+            }
+        })
+    }
+
+    fn mcp_tools_document() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "tools": [
+                {
+                    "name": "echo",
+                    "description": "Echoes a message through a generic upstream endpoint.",
+                    "input_json_schema": {
+                        "type": "object",
+                        "required": ["message"],
+                        "properties": {
+                            "message": {
+                                "type": "string"
+                            }
+                        },
+                        "additionalProperties": false
+                    },
+                    "upstream": {
+                        "method": "POST",
+                        "path_template": "/v1/echo",
+                        "body": {
+                            "mode": "whole_args_json"
+                        }
+                    }
+                },
+                {
+                    "name": "get_widget",
+                    "description": "Looks up an illustrative widget by identifier.",
+                    "input_json_schema": {
+                        "type": "object",
+                        "required": ["widget_id"],
+                        "properties": {
+                            "widget_id": {
+                                "type": "string"
+                            },
+                            "include_details": {
+                                "type": "boolean",
+                                "default": false
+                            }
+                        },
+                        "additionalProperties": false
+                    },
+                    "upstream": {
+                        "method": "GET",
+                        "path_template": "/v1/widgets/{widget_id}",
+                        "query_params": [
+                            {
+                                "arg_name": "include_details",
+                                "query_name": "include_details",
+                                "required": false
+                            }
+                        ]
+                    }
+                }
+            ]
+        })
+        .to_string()
+    }
+
+    fn mcp_policy_document(echo_allowed_roles: &[&str]) -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "id": "mcp-test-policy",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "admin": {
+                    "permissions": [ADMIN_MCP_USE_PERMISSION]
+                },
+                "reader": {
+                    "permissions": [ADMIN_MCP_USE_PERMISSION]
+                },
+                "blocked": {
+                    "permissions": []
+                }
+            },
+            "routes": [
+                {
+                    "methods": ["POST"],
+                    "path_prefix": MCP_ROUTE,
+                    "permission": ADMIN_MCP_USE_PERMISSION
+                }
+            ],
+            "tools": {
+                "echo": {
+                    "allowed_roles": echo_allowed_roles,
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                },
+                "get_widget": {
+                    "allowed_roles": ["admin"],
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            }
+        })
+        .to_string()
+    }
+
     fn schema_policy_document() -> String {
         json!({
             "schema_version": "0.1.0",
@@ -21027,6 +21842,29 @@ O2gecI9QwDJNpm29J9wJB2F8
                 let path = PathBuf::from(format!("{}{}", history_path.display(), suffix));
                 let _ = fs::remove_file(path);
             }
+        }
+    }
+
+    struct TempToolsFile {
+        path: PathBuf,
+    }
+
+    impl TempToolsFile {
+        fn new(contents: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "greengateway-mcp-tools-test-{}.json",
+                uuid::Uuid::new_v4()
+            ));
+            fs::write(&path, contents)
+                .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
+
+            Self { path }
+        }
+    }
+
+    impl Drop for TempToolsFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
         }
     }
 
