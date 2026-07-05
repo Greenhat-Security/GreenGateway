@@ -23,9 +23,12 @@ use crate::{
     },
 };
 
-// Path arguments are substituted into exactly one path segment. Encoding `.`
-// as well as URL delimiters prevents caller-controlled values from becoming
-// dot segments or adding path/query/fragment structure.
+// Path arguments are substituted into exactly one path segment. Encoding `/`,
+// `?`, and `#` prevents caller-controlled values from adding path, query, or
+// fragment structure; encoding `\` avoids backslash-based path confusion. Dot
+// segment collapse is handled by an explicit `.`/`..` rejection before URL
+// parsing, because WHATWG URL parsing also treats encoded dot-only segments as
+// dot segments.
 const PATH_SEGMENT_ARGUMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -90,6 +93,10 @@ pub enum ToolExecutorError {
         arg_name: String,
         location: &'static str,
         value_type: &'static str,
+    },
+    PathSegmentIsDotSegment {
+        tool_name: String,
+        arg_name: String,
     },
     InvalidMethod {
         tool_name: String,
@@ -157,6 +164,13 @@ impl fmt::Display for ToolExecutorError {
             } => write!(
                 formatter,
                 "tool '{tool_name}' {location} argument '{arg_name}' must be a string, number, or boolean, got {value_type}"
+            ),
+            Self::PathSegmentIsDotSegment {
+                tool_name,
+                arg_name,
+            } => write!(
+                formatter,
+                "tool '{tool_name}' path argument '{arg_name}' must not be a dot segment ('.' or '..')"
             ),
             Self::InvalidMethod {
                 tool_name,
@@ -559,6 +573,12 @@ fn render_path_template(tool: &ToolDefinition, args: &Value) -> Result<String, T
         validate_placeholder_declared_in_schema(tool, arg_name)?;
         let value = required_argument(tool, args, arg_name, "path")?;
         let value = scalar_argument_to_string(tool, arg_name, "path", value)?;
+        if is_dot_segment(&value) {
+            return Err(ToolExecutorError::PathSegmentIsDotSegment {
+                tool_name: tool.name.clone(),
+                arg_name: arg_name.to_owned(),
+            });
+        }
         rendered.push_str(&encode_path_segment_argument(&value));
 
         rest = &after_open[close + 1..];
@@ -653,6 +673,10 @@ fn scalar_argument_to_string(
 
 fn encode_path_segment_argument(value: &str) -> String {
     utf8_percent_encode(value, PATH_SEGMENT_ARGUMENT_ENCODE_SET).to_string()
+}
+
+fn is_dot_segment(value: &str) -> bool {
+    matches!(value, "." | "..")
 }
 
 fn upstream_origin_from_url(upstream_url: &str) -> Result<String, ToolExecutorError> {
@@ -853,6 +877,89 @@ mod tests {
 
         let message = work_failed_message(error);
         assert!(message.contains("missing required query argument 'include_details'"));
+    }
+
+    #[tokio::test]
+    async fn dot_dot_path_placeholder_arg_is_rejected_before_network() {
+        assert_dot_segment_rejected_before_network(
+            widget_tool(false, true),
+            "get_widget",
+            json!({ "widget_id": ".." }),
+            "widget_id",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn single_dot_path_placeholder_arg_is_rejected_before_network() {
+        assert_dot_segment_rejected_before_network(
+            widget_tool(false, true),
+            "get_widget",
+            json!({ "widget_id": "." }),
+            "widget_id",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn non_dot_segment_path_placeholder_args_with_dots_are_accepted_and_encoded() {
+        for (value, expected_target) in [
+            ("v1.2.3", "/v1/widgets/v1%2E2%2E3?include_details=true"),
+            ("file.txt", "/v1/widgets/file%2Etxt?include_details=true"),
+            (".hidden", "/v1/widgets/%2Ehidden?include_details=true"),
+        ] {
+            let (addr, server) = one_request_server(StatusCode::OK, b"safe").await;
+            let (executor, _capture) = executor_for_tools(
+                addr,
+                [widget_tool(false, true)],
+                runtime_config([("get_widget", enabled_tool(500, 1))], 2, 1, 100),
+            );
+
+            let response = executor
+                .execute(
+                    "get_widget",
+                    json!({
+                        "widget_id": value,
+                        "include_details": true
+                    }),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("non-dot-segment value should make a valid request");
+
+            assert_eq!(response.status, StatusCode::OK);
+            let request = server.await.expect("server task should join");
+            assert_eq!(request.target, expected_target);
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_subtree_dot_segment_placeholder_arg_is_rejected_before_network() {
+        for (args, rejected_arg_name) in [
+            (
+                json!({
+                    "tenant_id": "..",
+                    "config_name": "default"
+                }),
+                "tenant_id",
+            ),
+            (
+                json!({
+                    "tenant_id": "tenant-a",
+                    "config_name": "."
+                }),
+                "config_name",
+            ),
+        ] {
+            assert_dot_segment_rejected_before_network(
+                tenant_config_tool(),
+                "get_tenant_config",
+                args,
+                rejected_arg_name,
+            )
+            .await;
+        }
     }
 
     #[tokio::test]
@@ -1090,6 +1197,26 @@ mod tests {
         })
     }
 
+    fn tenant_config_tool() -> Value {
+        json!({
+            "name": "get_tenant_config",
+            "description": "Reads tenant-scoped configuration.",
+            "input_json_schema": {
+                "type": "object",
+                "required": ["tenant_id", "config_name"],
+                "properties": {
+                    "tenant_id": { "type": "string" },
+                    "config_name": { "type": "string" }
+                },
+                "additionalProperties": false
+            },
+            "upstream": {
+                "method": "GET",
+                "path_template": "/v1/tenants/{tenant_id}/config/{config_name}"
+            }
+        })
+    }
+
     async fn one_request_server(
         status: StatusCode,
         body: &'static [u8],
@@ -1310,6 +1437,82 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    async fn assert_dot_segment_rejected_before_network(
+        tool: Value,
+        tool_name: &str,
+        args: Value,
+        rejected_arg_name: &str,
+    ) {
+        let definition = tool_definition(tool.clone(), tool_name);
+        let error = render_path_template(&definition, &args)
+            .expect_err("dot-segment path arg should reject during path rendering");
+        assert_path_segment_is_dot_segment(error, tool_name, rejected_arg_name);
+
+        let server = gated_server().await;
+        let (executor, _capture) = executor_for_tools(
+            server.addr,
+            [tool],
+            runtime_config([(tool_name, enabled_tool(500, 1))], 2, 1, 100),
+        );
+
+        let error = executor
+            .execute(
+                tool_name,
+                args,
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("dot-segment path arg should fail before upstream request");
+        let message = work_failed_message(error);
+        assert!(
+            message.contains(&format!(
+                "path argument '{rejected_arg_name}' must not be a dot segment"
+            )),
+            "unexpected error: {message}"
+        );
+
+        assert_no_upstream_requests(&server).await;
+        server.stop.cancel();
+        server.handle.abort();
+    }
+
+    fn tool_definition(tool: Value, tool_name: &str) -> Arc<ToolDefinition> {
+        ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect("test tool should load")
+        .get(tool_name)
+        .expect("test tool should exist")
+    }
+
+    fn assert_path_segment_is_dot_segment(
+        error: ToolExecutorError,
+        expected_tool_name: &str,
+        expected_arg_name: &str,
+    ) {
+        match error {
+            ToolExecutorError::PathSegmentIsDotSegment {
+                tool_name,
+                arg_name,
+            } => {
+                assert_eq!(tool_name, expected_tool_name);
+                assert_eq!(arg_name, expected_arg_name);
+            }
+            other => panic!("expected PathSegmentIsDotSegment, got {other:?}"),
+        }
+    }
+
+    async fn assert_no_upstream_requests(server: &GatedServer) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            server.request_count(),
+            0,
+            "dot-segment rejection must not reach upstream"
+        );
     }
 
     #[derive(Debug)]
