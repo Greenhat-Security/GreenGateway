@@ -47,6 +47,10 @@ const DEFAULT_ROLES_CLAIM: &str = "roles";
 pub const DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS: u64 = 2000;
 pub const DEFAULT_COOKIE_SESSION_CACHE_TTL_MS: u64 = DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS;
 pub const DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS: u64 = 5_000;
+pub const DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH: usize = 1_024;
+pub const DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY: usize = 64;
+pub const DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS: u64 = 1_000;
+pub const DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_CSRF_ENABLED: bool = true;
 const DEFAULT_CSRF_COOKIE_NAME: &str = "csrf_token";
 const DEFAULT_CSRF_HEADER_NAME: &str = "x-csrf-token";
@@ -106,6 +110,10 @@ const ROLES_CLAIM: &str = "ROLES_CLAIM";
 const SERVICE_TOKEN_CACHE_TTL_MS: &str = "SERVICE_TOKEN_CACHE_TTL_MS";
 const SERVICE_TOKEN_SQLITE_PATH: &str = "SERVICE_TOKEN_SQLITE_PATH";
 const SCHEMA_MISMATCH_SIGNAL_THRESHOLD: &str = "SCHEMA_MISMATCH_SIGNAL_THRESHOLD";
+const TOOL_RUNTIME_DEFAULT_TIMEOUT_MS: &str = "TOOL_RUNTIME_DEFAULT_TIMEOUT_MS";
+const TOOL_RUNTIME_GLOBAL_CONCURRENCY: &str = "TOOL_RUNTIME_GLOBAL_CONCURRENCY";
+const TOOL_RUNTIME_QUEUE_DEPTH: &str = "TOOL_RUNTIME_QUEUE_DEPTH";
+const TOOL_RUNTIME_QUEUE_TIMEOUT_MS: &str = "TOOL_RUNTIME_QUEUE_TIMEOUT_MS";
 const TRUST_PROXY_HEADERS: &str = "TRUST_PROXY_HEADERS";
 const SESSION_COOKIE_NAME: &str = "SESSION_COOKIE_NAME";
 const UPSTREAM_CONNECT_TIMEOUT_MS: &str = "UPSTREAM_CONNECT_TIMEOUT_MS";
@@ -160,6 +168,10 @@ pub struct Config {
     pub roles_claim: String,
     pub service_token_sqlite_path: Option<String>,
     pub service_token_cache_ttl_ms: u64,
+    pub tool_runtime_queue_depth: usize,
+    pub tool_runtime_global_concurrency: usize,
+    pub tool_runtime_queue_timeout_ms: u64,
+    pub tool_runtime_default_timeout_ms: u64,
     pub csrf_enabled: bool,
     pub csrf_cookie_name: String,
     pub csrf_header_name: String,
@@ -577,6 +589,54 @@ impl Config {
             DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS,
             &mut problems,
         );
+        let tool_runtime_queue_depth = validate_positive_usize(
+            TOOL_RUNTIME_QUEUE_DEPTH,
+            parse_var(
+                TOOL_RUNTIME_QUEUE_DEPTH,
+                get_var(TOOL_RUNTIME_QUEUE_DEPTH),
+                DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH,
+                "positive integer",
+                &mut problems,
+            ),
+            DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH,
+            &mut problems,
+        );
+        let tool_runtime_global_concurrency = validate_positive_usize(
+            TOOL_RUNTIME_GLOBAL_CONCURRENCY,
+            parse_var(
+                TOOL_RUNTIME_GLOBAL_CONCURRENCY,
+                get_var(TOOL_RUNTIME_GLOBAL_CONCURRENCY),
+                DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
+                "positive integer",
+                &mut problems,
+            ),
+            DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
+            &mut problems,
+        );
+        let tool_runtime_queue_timeout_ms = validate_positive_u64(
+            TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
+            parse_var(
+                TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
+                get_var(TOOL_RUNTIME_QUEUE_TIMEOUT_MS),
+                DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
+            &mut problems,
+        );
+        let tool_runtime_default_timeout_ms = validate_positive_u64(
+            TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
+            parse_var(
+                TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
+                get_var(TOOL_RUNTIME_DEFAULT_TIMEOUT_MS),
+                DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
+            &mut problems,
+        );
         let auth_providers =
             parse_auth_providers(AUTH_PROVIDERS, get_var(AUTH_PROVIDERS), &mut problems)
                 .unwrap_or_else(|| {
@@ -737,6 +797,10 @@ impl Config {
                 roles_claim,
                 service_token_sqlite_path,
                 service_token_cache_ttl_ms,
+                tool_runtime_queue_depth,
+                tool_runtime_global_concurrency,
+                tool_runtime_queue_timeout_ms,
+                tool_runtime_default_timeout_ms,
                 csrf_enabled,
                 csrf_cookie_name,
                 csrf_header_name,
@@ -822,6 +886,20 @@ fn validate_payload_capture_sample_rate(
 }
 
 fn validate_positive_u64(name: &str, value: u64, default: u64, problems: &mut Vec<String>) -> u64 {
+    if value > 0 {
+        value
+    } else {
+        problems.push(format!("{name} must be greater than 0, got '{value}'"));
+        default
+    }
+}
+
+fn validate_positive_usize(
+    name: &str,
+    value: usize,
+    default: usize,
+    problems: &mut Vec<String>,
+) -> usize {
     if value > 0 {
         value
     } else {
@@ -1973,6 +2051,22 @@ mod tests {
             config.service_token_cache_ttl_ms,
             DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS
         );
+        assert_eq!(
+            config.tool_runtime_queue_depth,
+            DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH
+        );
+        assert_eq!(
+            config.tool_runtime_global_concurrency,
+            DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY
+        );
+        assert_eq!(
+            config.tool_runtime_queue_timeout_ms,
+            DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.tool_runtime_default_timeout_ms,
+            DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS
+        );
         assert!(config.csrf_enabled);
         assert_eq!(config.csrf_cookie_name, "csrf_token");
         assert_eq!(config.csrf_header_name, "x-csrf-token");
@@ -2142,6 +2236,27 @@ mod tests {
         assert_eq!(config.jwt_jwks_timeout_ms, DEFAULT_JWT_JWKS_TIMEOUT_MS);
         assert!(!config.jwt_require_jti);
         assert_eq!(config.roles_claim, "roles");
+        assert_eq!(config.service_token_sqlite_path, None);
+        assert_eq!(
+            config.service_token_cache_ttl_ms,
+            DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS
+        );
+        assert_eq!(
+            config.tool_runtime_queue_depth,
+            DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH
+        );
+        assert_eq!(
+            config.tool_runtime_global_concurrency,
+            DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY
+        );
+        assert_eq!(
+            config.tool_runtime_queue_timeout_ms,
+            DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.tool_runtime_default_timeout_ms,
+            DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS
+        );
         assert!(config.csrf_enabled);
         assert_eq!(config.csrf_cookie_name, "csrf_token");
         assert_eq!(config.csrf_header_name, "x-csrf-token");
@@ -3488,6 +3603,38 @@ mod tests {
         assert!(error
             .to_string()
             .contains("SERVICE_TOKEN_CACHE_TTL_MS must be greater than 0"));
+    }
+
+    #[test]
+    fn tool_runtime_config_parses_and_validates() {
+        let config = Config::from_env_vars(|name| match name {
+            "TOOL_RUNTIME_QUEUE_DEPTH" => Ok("64".to_owned()),
+            "TOOL_RUNTIME_GLOBAL_CONCURRENCY" => Ok("16".to_owned()),
+            "TOOL_RUNTIME_QUEUE_TIMEOUT_MS" => Ok("250".to_owned()),
+            "TOOL_RUNTIME_DEFAULT_TIMEOUT_MS" => Ok("15000".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(config.tool_runtime_queue_depth, 64);
+        assert_eq!(config.tool_runtime_global_concurrency, 16);
+        assert_eq!(config.tool_runtime_queue_timeout_ms, 250);
+        assert_eq!(config.tool_runtime_default_timeout_ms, 15_000);
+
+        let error = Config::from_env_vars(|name| match name {
+            "TOOL_RUNTIME_QUEUE_DEPTH" => Ok("0".to_owned()),
+            "TOOL_RUNTIME_GLOBAL_CONCURRENCY" => Ok("0".to_owned()),
+            "TOOL_RUNTIME_QUEUE_TIMEOUT_MS" => Ok("0".to_owned()),
+            "TOOL_RUNTIME_DEFAULT_TIMEOUT_MS" => Ok("0".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject zero tool runtime settings");
+        let message = error.to_string();
+        assert!(message.contains("TOOL_RUNTIME_QUEUE_DEPTH must be greater than 0"));
+        assert!(message.contains("TOOL_RUNTIME_GLOBAL_CONCURRENCY must be greater than 0"));
+        assert!(message.contains("TOOL_RUNTIME_QUEUE_TIMEOUT_MS must be greater than 0"));
+        assert!(message.contains("TOOL_RUNTIME_DEFAULT_TIMEOUT_MS must be greater than 0"));
+        assert_eq!(error.problems.len(), 4);
     }
 
     #[test]

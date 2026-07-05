@@ -1009,6 +1009,7 @@ mod tests {
             rules: Vec::new(),
             egress: EgressPolicy::default(),
             rate_limits,
+            tools: HashMap::new(),
         }
     }
 

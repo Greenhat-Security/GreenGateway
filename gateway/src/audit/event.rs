@@ -9,6 +9,10 @@ pub const SIGNAL_LIFECYCLE_CHANGED: &str = "signal.lifecycle_changed";
 pub const SUGGESTION_LIFECYCLE_CHANGED: &str = "suggestion.lifecycle_changed";
 pub const SERVICE_TOKEN_CHANGED: &str = "service_token.changed";
 pub const TRAFFIC_ENDPOINT_REVIEW_CHANGED: &str = "traffic.endpoint_review_changed";
+pub const TOOL_INVOKE_START: &str = "tool.invoke_start";
+pub const TOOL_INVOKE_SUCCESS: &str = "tool.invoke_success";
+pub const TOOL_INVOKE_FAILURE: &str = "tool.invoke_failure";
+pub const TOOL_INVOKE_REJECTED: &str = "tool.invoke_rejected";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {

@@ -28,12 +28,16 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "rules",
     "egress",
     "rate_limits",
+    "tools",
 ];
 #[allow(dead_code)]
 const TEMP_FILE_CREATE_ATTEMPTS: u8 = 16;
 
 #[allow(dead_code)]
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub const DEFAULT_TOOL_POLICY_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_TOOL_POLICY_MAX_CONCURRENT: u32 = 8;
 
 /// Action to apply when no route rule matches.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -91,6 +95,10 @@ pub struct Policy {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rate_limits: Vec<RateLimitRule>,
+    /// Per-tool invocation policy used by the generic MCP tool runtime.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub tools: HashMap<String, ToolPolicyEntry>,
 }
 
 /// Permissions granted by one role.
@@ -167,6 +175,21 @@ pub struct RateLimitRule {
     pub path: Option<String>,
     pub requests_per_second: f64,
     pub burst: u32,
+}
+
+/// Per-tool runtime policy for generic tool invocation admission.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolPolicyEntry {
+    /// Whether this tool is available for invocation.
+    #[serde(default = "default_tool_policy_enabled")]
+    pub enabled: bool,
+    /// Execution timeout for a single invocation, in milliseconds.
+    #[serde(default = "default_tool_policy_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Maximum concurrent executions for this tool.
+    #[serde(default = "default_tool_policy_max_concurrent")]
+    pub max_concurrent: u32,
 }
 
 #[derive(Debug)]
@@ -264,6 +287,7 @@ impl Policy {
 
         validate_rules(&self.rules)?;
         validate_rate_limits(&self.rate_limits)?;
+        validate_tools(&self.tools)?;
 
         self.egress.validate()
     }
@@ -290,6 +314,30 @@ fn validate_rules(rules: &[Rule]) -> Result<(), PolicyError> {
     }
 
     Ok(())
+}
+
+fn validate_tools(tools: &HashMap<String, ToolPolicyEntry>) -> Result<(), PolicyError> {
+    for (tool_name, entry) in tools {
+        if entry.timeout_ms == 0 {
+            return Err(PolicyError::Invalid(format!(
+                "tools.{tool_name}.timeout_ms must be positive"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn default_tool_policy_enabled() -> bool {
+    true
+}
+
+fn default_tool_policy_timeout_ms() -> u64 {
+    DEFAULT_TOOL_POLICY_TIMEOUT_MS
+}
+
+fn default_tool_policy_max_concurrent() -> u32 {
+    DEFAULT_TOOL_POLICY_MAX_CONCURRENT
 }
 
 fn validate_rate_limits(rate_limits: &[RateLimitRule]) -> Result<(), PolicyError> {
@@ -660,6 +708,7 @@ mod tests {
         assert!(policy.routes.is_empty());
         assert!(policy.rules.is_empty());
         assert!(policy.rate_limits.is_empty());
+        assert!(policy.tools.is_empty());
     }
 
     #[test]
@@ -829,6 +878,18 @@ mod tests {
         assert_eq!(
             unknown_top_level_keys(&value),
             vec!["unexpected_section".to_owned()]
+        );
+
+        let value_with_tools = json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "lookup": {}
+            }
+        });
+
+        assert!(
+            unknown_top_level_keys(&value_with_tools).is_empty(),
+            "tools should be a known top-level policy section"
         );
     }
 
@@ -1002,6 +1063,96 @@ mod tests {
             serde_json::from_value(round_trip_value).expect("serialized policy should parse");
 
         assert_eq!(round_tripped, policy);
+    }
+
+    #[test]
+    fn tools_section_parses_and_round_trips_with_defaults() {
+        let file = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "tools": {
+                    "lookup": {},
+                    "report": {
+                        "enabled": false,
+                        "timeout_ms": 1500,
+                        "max_concurrent": 3
+                    }
+                }
+            }"#,
+        );
+
+        let policy = Policy::from_file(file.path()).expect("tools section should parse");
+
+        assert_eq!(policy.tools.len(), 2);
+        assert_eq!(
+            policy.tools["lookup"],
+            ToolPolicyEntry {
+                enabled: true,
+                timeout_ms: DEFAULT_TOOL_POLICY_TIMEOUT_MS,
+                max_concurrent: DEFAULT_TOOL_POLICY_MAX_CONCURRENT,
+            }
+        );
+        assert_eq!(
+            policy.tools["report"],
+            ToolPolicyEntry {
+                enabled: false,
+                timeout_ms: 1500,
+                max_concurrent: 3,
+            }
+        );
+
+        let round_trip_value =
+            serde_json::to_value(&policy).expect("policy with tools should serialize");
+        let round_tripped: Policy =
+            serde_json::from_value(round_trip_value).expect("serialized policy should parse");
+
+        assert_eq!(round_tripped, policy);
+    }
+
+    #[test]
+    fn malformed_tool_entries_are_rejected_by_parser_and_schema() {
+        let cases = [
+            (
+                "unknown field",
+                json!({
+                    "schema_version": "0.1.0",
+                    "tools": {
+                        "lookup": {
+                            "timeout": 1000
+                        }
+                    }
+                }),
+                "unknown field",
+            ),
+            (
+                "zero timeout",
+                json!({
+                    "schema_version": "0.1.0",
+                    "tools": {
+                        "lookup": {
+                            "timeout_ms": 0
+                        }
+                    }
+                }),
+                "timeout_ms must be positive",
+            ),
+        ];
+        let validator = policy_schema_validator();
+
+        for (name, value, expected_error) in cases {
+            assert!(
+                !validator.is_valid(&value),
+                "published schema should reject {name}"
+            );
+
+            let error =
+                Policy::from_json_value(value, None).expect_err("malformed tool should fail");
+
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error for {name}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1522,6 +1673,7 @@ mod tests {
         assert!(policy.routes.is_empty());
         assert!(policy.rules.is_empty());
         assert!(policy.rate_limits.is_empty());
+        assert!(policy.tools.is_empty());
         assert_schema_accepts(&policy_schema_validator(), &value);
     }
 
@@ -1627,6 +1779,27 @@ mod tests {
         assert_schema_accepts(&validator, &policy);
         Policy::from_json_value(policy, None)
             .expect("schema-valid rate_limits policy should parse");
+    }
+
+    #[test]
+    fn published_schema_accepts_policy_with_tools() {
+        let validator = policy_schema_validator();
+        let policy = json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "lookup": {
+                    "enabled": true,
+                    "timeout_ms": 1500,
+                    "max_concurrent": 3
+                },
+                "report": {
+                    "enabled": false
+                }
+            }
+        });
+
+        assert_schema_accepts(&validator, &policy);
+        Policy::from_json_value(policy, None).expect("schema-valid tools policy should parse");
     }
 
     #[test]
@@ -1829,6 +2002,14 @@ mod tests {
                 requests_per_second: 20.0,
                 burst: 40,
             }],
+            tools: HashMap::from([(
+                "lookup".to_owned(),
+                ToolPolicyEntry {
+                    enabled: true,
+                    timeout_ms: DEFAULT_TOOL_POLICY_TIMEOUT_MS,
+                    max_concurrent: DEFAULT_TOOL_POLICY_MAX_CONCURRENT,
+                },
+            )]),
         }
     }
 
@@ -1890,6 +2071,10 @@ mod tests {
             roles_claim: "roles".to_owned(),
             service_token_sqlite_path: None,
             service_token_cache_ttl_ms: crate::config::DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS,
+            tool_runtime_queue_depth: crate::config::DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH,
+            tool_runtime_global_concurrency: crate::config::DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
+            tool_runtime_queue_timeout_ms: crate::config::DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
+            tool_runtime_default_timeout_ms: crate::config::DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
             csrf_enabled: true,
             csrf_cookie_name: "csrf_token".to_owned(),
             csrf_header_name: "x-csrf-token".to_owned(),
