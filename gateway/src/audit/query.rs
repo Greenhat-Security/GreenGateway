@@ -552,6 +552,42 @@ impl AuditQueryStore {
         Ok(rows)
     }
 
+    pub fn anonymous_request_count(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<u64, AuditQueryError> {
+        let mut sql = String::from(
+            r#"
+            SELECT COUNT(*)
+            FROM audit_events
+            WHERE event_type = 'http.request_observed'
+              AND actor_user_id IS NULL
+            "#,
+        );
+        let mut params = Vec::new();
+        if let Some(from) = from {
+            sql.push_str(" AND julianday(timestamp) >= julianday(?)");
+            params.push(SqlValue::Text(from.to_owned()));
+        }
+        if let Some(to) = to {
+            sql.push_str(" AND julianday(timestamp) <= julianday(?)");
+            params.push(SqlValue::Text(to.to_owned()));
+        }
+
+        let connection = self.connection_guard();
+        let count = connection
+            .query_row(&sql, params_from_iter(params.iter()), |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|source| AuditQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
     pub fn shadow_rule_would_deny_summaries(
         &self,
         rule_ids: &[String],

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
     path::PathBuf,
@@ -81,6 +81,8 @@ const SCHEMA_INFERRED_ADMIN_ROUTE: &str = "/v1/admin/schema/inferred";
 const TRAFFIC_ENDPOINTS_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints";
 const TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoint";
 const TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints/review";
+const PRINCIPALS_ADMIN_ROUTE: &str = "/v1/admin/principals";
+const PRINCIPAL_ADMIN_ROUTE: &str = "/v1/admin/principal";
 const AUDIT_ADMIN_ROLE: &str = "admin";
 const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
 const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
@@ -93,11 +95,14 @@ const ADMIN_SUGGESTIONS_READ_PERMISSION: &str = "admin:suggestions:read";
 const ADMIN_SUGGESTIONS_WRITE_PERMISSION: &str = "admin:suggestions:write";
 const ADMIN_TRAFFIC_READ_PERMISSION: &str = "admin:traffic:read";
 const ADMIN_TRAFFIC_WRITE_PERMISSION: &str = "admin:traffic:write";
+const ADMIN_PRINCIPALS_READ_PERMISSION: &str = "admin:principals:read";
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
 const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
 const MAX_AUDIT_QUERY_LIMIT: usize = 500;
 const DEFAULT_TRAFFIC_RECENT_EVENTS_LIMIT: usize = 20;
+const DEFAULT_PRINCIPAL_DETAIL_AUDIT_EVENT_LIMIT: usize = 500;
+const DEFAULT_PRINCIPAL_ANOMALY_HISTORY_LIMIT: usize = 20;
 const DEFAULT_RULE_PREVIEW_SAMPLE_LIMIT: usize = 20;
 const MAX_RULE_PREVIEW_SAMPLE_LIMIT: usize = 100;
 const UPSTREAM_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
@@ -197,6 +202,8 @@ struct AdminRoutes {
     traffic_endpoints_route: String,
     traffic_endpoint_detail_route: String,
     traffic_endpoint_review_route: String,
+    principals_route: String,
+    principal_detail_route: String,
 }
 
 impl GatewayRoutes {
@@ -267,6 +274,8 @@ impl AdminRoutes {
             traffic_endpoints_route: format!("{api_prefix}/traffic/endpoints"),
             traffic_endpoint_detail_route: format!("{api_prefix}/traffic/endpoint"),
             traffic_endpoint_review_route: format!("{api_prefix}/traffic/endpoints/review"),
+            principals_route: format!("{api_prefix}/principals"),
+            principal_detail_route: format!("{api_prefix}/principal"),
             api_prefix,
         }
     }
@@ -340,6 +349,14 @@ struct TrafficAdminState {
 }
 
 #[derive(Clone)]
+struct PrincipalAdminState {
+    directory: auth::PrincipalDirectory,
+    audit_query_store: Option<Arc<audit::query::AuditQueryStore>>,
+    discovery_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
+    rbac_state: Option<middleware::rbac::RbacState>,
+}
+
+#[derive(Clone)]
 struct AdminApiStates {
     audit: AuditAdminState,
     status: StatusAdminState,
@@ -349,6 +366,7 @@ struct AdminApiStates {
     signals: SignalsAdminState,
     suggestions: SuggestionsAdminState,
     traffic: TrafficAdminState,
+    principals: PrincipalAdminState,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -484,6 +502,17 @@ struct TrafficEndpointListParams {
 }
 
 #[derive(Deserialize)]
+struct PrincipalListParams {
+    issuer: Option<String>,
+    auth_method: Option<String>,
+    principal_type: Option<String>,
+    last_seen_after: Option<String>,
+    last_seen_before: Option<String>,
+    limit: Option<String>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct SignalListParams {
     state: Option<String>,
     signal_type: Option<String>,
@@ -529,6 +558,13 @@ struct TrafficEndpointDetailParams {
 }
 
 #[derive(Deserialize)]
+struct PrincipalDetailParams {
+    subject: Option<String>,
+    issuer: Option<String>,
+    auth_method: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct InferredSchemaParams {
     method: Option<String>,
     endpoint_template: Option<String>,
@@ -559,6 +595,30 @@ struct TrafficEndpointDetailResponse {
     endpoint: discovery::query::EndpointAggregateDetail,
     principals: discovery::query::PrincipalPage,
     audit: TrafficEndpointAuditEnrichment,
+}
+
+#[derive(Serialize)]
+struct PrincipalListResponse {
+    principals: Vec<auth::principal_directory::PrincipalDirectoryRecord>,
+    next_cursor: Option<String>,
+    anonymous_request_count: u64,
+}
+
+#[derive(Serialize)]
+struct PrincipalDetailResponse {
+    principal: auth::principal_directory::PrincipalDirectoryRecord,
+    endpoints_touched: Vec<PrincipalEndpointTouch>,
+    rules_hit: Vec<String>,
+    anomaly_history: Vec<discovery::signals::Signal>,
+    tools_called: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct PrincipalEndpointTouch {
+    method: String,
+    path: String,
+    request_count: u64,
+    last_seen: String,
 }
 
 #[derive(Serialize)]
@@ -727,6 +787,11 @@ enum TokenAdminAuthzError {
 }
 
 enum TrafficAdminAuthzError {
+    NotConfigured,
+    Forbidden,
+}
+
+enum PrincipalAdminAuthzError {
     NotConfigured,
     Forbidden,
 }
@@ -1112,6 +1177,12 @@ fn gateway_app_with_process_started_at(
         suggestion_engine: rule_suggestion_engine,
         policy: policy_admin_state.clone(),
     };
+    let principal_admin_state = PrincipalAdminState {
+        directory: principal_directory,
+        audit_query_store: audit_admin_state.query_store.clone(),
+        discovery_store: discovery_query_store.clone(),
+        rbac_state: rbac_state.clone(),
+    };
     let traffic_admin_state = TrafficAdminState {
         discovery_store: discovery_query_store,
         audit_query_store: audit_admin_state.query_store.clone(),
@@ -1129,6 +1200,7 @@ fn gateway_app_with_process_started_at(
         signals: signals_admin_state,
         suggestions: suggestions_admin_state,
         traffic: traffic_admin_state,
+        principals: principal_admin_state,
     };
 
     if split_admin_listener {
@@ -1457,6 +1529,18 @@ fn add_admin_api_routes(
                     post(token_rotate_endpoint),
                 )
                 .with_state(admin_api_states.tokens),
+        )
+        .merge(
+            Router::new()
+                .route(
+                    routes.admin.principals_route.as_str(),
+                    get(principal_list_endpoint),
+                )
+                .route(
+                    routes.admin.principal_detail_route.as_str(),
+                    get(principal_detail_endpoint),
+                )
+                .with_state(admin_api_states.principals),
         )
         .merge(
             Router::new()
@@ -3697,6 +3781,148 @@ async fn rule_suggestion_transition_endpoint(
     (StatusCode::OK, Json(suggestion)).into_response()
 }
 
+async fn principal_list_endpoint(
+    State(state): State<PrincipalAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+    Query(params): Query<PrincipalListParams>,
+) -> Response {
+    record_request(PRINCIPALS_ADMIN_ROUTE);
+
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+    if let Err(error) =
+        authorized_principal_state(&state, &principal, ADMIN_PRINCIPALS_READ_PERMISSION)
+    {
+        return principal_admin_authz_error_response(error);
+    }
+
+    if !state.directory.is_enabled() {
+        return principal_directory_not_configured();
+    }
+    let query = match params.into_query() {
+        Ok(query) => query,
+        Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
+    };
+
+    let directory = state.directory.clone();
+    let filters = query.filters.clone();
+    let page = match tokio::task::spawn_blocking(move || directory.list(&filters)).await {
+        Ok(Ok(page)) => page,
+        Ok(Err(auth::principal_directory::PrincipalDirectoryQueryError::InvalidCursor {
+            parameter,
+        })) => return bad_request(&format!("invalid query parameter: {parameter}")),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "failed to query principal directory");
+            return internal_server_error("principal directory query failed");
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "principal directory query task failed");
+            return internal_server_error("principal directory query failed");
+        }
+    };
+    let anonymous_request_count = match state.audit_query_store.as_ref() {
+        Some(audit_query_store) => match audit_query_store.anonymous_request_count(
+            query.filters.last_seen_after.as_deref(),
+            query.filters.last_seen_before.as_deref(),
+        ) {
+            Ok(count) => count,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to query anonymous request count");
+                return internal_server_error("anonymous request count query failed");
+            }
+        },
+        None => 0,
+    };
+
+    (
+        StatusCode::OK,
+        Json(PrincipalListResponse {
+            principals: page.principals,
+            next_cursor: page.next_cursor,
+            anonymous_request_count,
+        }),
+    )
+        .into_response()
+}
+
+async fn principal_detail_endpoint(
+    State(state): State<PrincipalAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+    Query(params): Query<PrincipalDetailParams>,
+) -> Response {
+    record_request(PRINCIPAL_ADMIN_ROUTE);
+
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+    if let Err(error) =
+        authorized_principal_state(&state, &principal, ADMIN_PRINCIPALS_READ_PERMISSION)
+    {
+        return principal_admin_authz_error_response(error);
+    }
+
+    if !state.directory.is_enabled() {
+        return principal_directory_not_configured();
+    }
+    let query = match params.into_query() {
+        Ok(query) => query,
+        Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
+    };
+
+    let directory = state.directory.clone();
+    let key = query.key.clone();
+    let principal_record = match tokio::task::spawn_blocking(move || directory.get(&key)).await {
+        Ok(Ok(Some(principal))) => principal,
+        Ok(Ok(None)) => return not_found("principal was not found"),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "failed to query principal detail");
+            return internal_server_error("principal detail query failed");
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "principal detail query task failed");
+            return internal_server_error("principal detail query failed");
+        }
+    };
+    let (endpoints_touched, rules_hit) = match state.audit_query_store.as_ref() {
+        Some(audit_query_store) => {
+            match principal_audit_summary(audit_query_store, principal_record.subject.as_str()) {
+                Ok(summary) => summary,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to query principal audit summary");
+                    return internal_server_error("principal audit summary query failed");
+                }
+            }
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    let anomaly_history = match state.discovery_store.as_ref() {
+        Some(discovery_store) => match discovery_store.list_principal_endpoint_signals(
+            principal_record.subject.as_str(),
+            DEFAULT_PRINCIPAL_ANOMALY_HISTORY_LIMIT,
+        ) {
+            Ok(signals) => signals,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to query principal anomaly history");
+                return internal_server_error("principal anomaly history query failed");
+            }
+        },
+        None => Vec::new(),
+    };
+
+    (
+        StatusCode::OK,
+        Json(PrincipalDetailResponse {
+            principal: principal_record,
+            endpoints_touched,
+            rules_hit,
+            anomaly_history,
+            tools_called: Vec::new(),
+        }),
+    )
+        .into_response()
+}
+
 async fn traffic_endpoint_list_endpoint(
     State(state): State<TrafficAdminState>,
     principal: Option<Extension<auth::Principal>>,
@@ -4103,6 +4329,14 @@ struct TrafficEndpointListQuery {
     covered_by_rule: Option<bool>,
 }
 
+struct PrincipalListQuery {
+    filters: auth::principal_directory::PrincipalDirectoryListFilters,
+}
+
+struct PrincipalDetailQuery {
+    key: auth::principal_directory::PrincipalDirectoryKey,
+}
+
 impl TrafficEndpointListParams {
     fn into_query(self) -> Result<TrafficEndpointListQuery, &'static str> {
         let first_seen_after = validate_rfc3339("first_seen_after", self.first_seen_after)?;
@@ -4145,6 +4379,27 @@ impl TrafficEndpointListParams {
     }
 }
 
+impl PrincipalListParams {
+    fn into_query(self) -> Result<PrincipalListQuery, &'static str> {
+        let last_seen_after = validate_rfc3339("last_seen_after", self.last_seen_after)?;
+        let last_seen_before = validate_rfc3339("last_seen_before", self.last_seen_before)?;
+        let principal_type = parse_principal_type(self.principal_type)?;
+        let limit = parse_limit(self.limit)?;
+
+        Ok(PrincipalListQuery {
+            filters: auth::principal_directory::PrincipalDirectoryListFilters {
+                issuer: self.issuer,
+                auth_method: empty_string_as_none(self.auth_method),
+                principal_type,
+                last_seen_after,
+                last_seen_before,
+                limit,
+                cursor: self.cursor,
+            },
+        })
+    }
+}
+
 impl TrafficEndpointDetailParams {
     fn into_query(self) -> Result<TrafficEndpointDetailQuery, &'static str> {
         let method = required_non_empty("method", self.method)?;
@@ -4170,6 +4425,22 @@ impl TrafficEndpointDetailParams {
             bucket,
             events_limit,
             events_before_id,
+        })
+    }
+}
+
+impl PrincipalDetailParams {
+    fn into_query(self) -> Result<PrincipalDetailQuery, &'static str> {
+        let subject = required_non_empty("subject", self.subject)?;
+        let issuer = self.issuer.ok_or("issuer")?;
+        let auth_method = required_non_empty("auth_method", self.auth_method)?;
+
+        Ok(PrincipalDetailQuery {
+            key: auth::principal_directory::PrincipalDirectoryKey {
+                subject,
+                issuer,
+                auth_method,
+            },
         })
     }
 }
@@ -4265,6 +4536,18 @@ fn parse_optional_bool(
             "true" => Ok(true),
             "false" => Ok(false),
             _ => Err(parameter),
+        })
+        .transpose()
+}
+
+fn parse_principal_type(
+    value: Option<String>,
+) -> Result<Option<auth::principal_directory::PrincipalTypeFilter>, &'static str> {
+    value
+        .map(|value| match value.as_str() {
+            "human" => Ok(auth::principal_directory::PrincipalTypeFilter::Human),
+            "service" => Ok(auth::principal_directory::PrincipalTypeFilter::Service),
+            _ => Err("principal_type"),
         })
         .transpose()
 }
@@ -4400,6 +4683,22 @@ fn authorized_traffic_state<'a>(
     Ok(rbac_state)
 }
 
+fn authorized_principal_state<'a>(
+    state: &'a PrincipalAdminState,
+    principal: &auth::Principal,
+    permission: &str,
+) -> Result<&'a middleware::rbac::RbacState, PrincipalAdminAuthzError> {
+    let Some(rbac_state) = state.rbac_state.as_ref() else {
+        return Err(PrincipalAdminAuthzError::NotConfigured);
+    };
+
+    if !rbac_state.principal_has_permission(principal, permission) {
+        return Err(PrincipalAdminAuthzError::Forbidden);
+    }
+
+    Ok(rbac_state)
+}
+
 fn authorized_signals_state<'a>(
     state: &'a SignalsAdminState,
     principal: &auth::Principal,
@@ -4451,6 +4750,13 @@ fn traffic_admin_authz_error_response(error: TrafficAdminAuthzError) -> Response
     match error {
         TrafficAdminAuthzError::NotConfigured => traffic_rbac_not_configured(),
         TrafficAdminAuthzError::Forbidden => forbidden(),
+    }
+}
+
+fn principal_admin_authz_error_response(error: PrincipalAdminAuthzError) -> Response {
+    match error {
+        PrincipalAdminAuthzError::NotConfigured => principal_rbac_not_configured(),
+        PrincipalAdminAuthzError::Forbidden => forbidden(),
     }
 }
 
@@ -4788,6 +5094,91 @@ fn list_traffic_endpoint_page(
         endpoints,
         next_cursor,
     })
+}
+
+fn principal_audit_summary(
+    audit_query_store: &audit::query::AuditQueryStore,
+    subject: &str,
+) -> Result<(Vec<PrincipalEndpointTouch>, Vec<String>), audit::query::AuditQueryError> {
+    // Audit events currently store only actor_user_id, not issuer/auth_method,
+    // so this convenience view can include same-subject events from another
+    // principal-directory identity key.
+    let page = audit_query_store.query(&audit::query::AuditQueryFilters {
+        from: None,
+        to: None,
+        event_type: Some("http.request_observed".to_owned()),
+        actor: Some(subject.to_owned()),
+        method: None,
+        path: None,
+        status: None,
+        matched_rule_id: None,
+        limit: DEFAULT_PRINCIPAL_DETAIL_AUDIT_EVENT_LIMIT,
+        before_id: None,
+    })?;
+    let mut endpoints = BTreeMap::<(String, String), (u64, String)>::new();
+    let mut rules = BTreeSet::<String>::new();
+
+    for event in page.events {
+        let method = event
+            .payload
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let path = event
+            .payload
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let (Some(method), Some(path)) = (method, path) {
+            let entry = endpoints
+                .entry((method, path))
+                .or_insert_with(|| (0, event.timestamp.clone()));
+            entry.0 = entry.0.saturating_add(1);
+            if rfc3339_after(&event.timestamp, &entry.1) {
+                entry.1 = event.timestamp.clone();
+            }
+        }
+
+        if let Some(rule_id) = event
+            .payload
+            .get("matched_rule_id")
+            .and_then(Value::as_str)
+            .filter(|rule_id| !rule_id.is_empty())
+        {
+            rules.insert(rule_id.to_owned());
+        }
+    }
+
+    let mut endpoints = endpoints
+        .into_iter()
+        .map(
+            |((method, path), (request_count, last_seen))| PrincipalEndpointTouch {
+                method,
+                path,
+                request_count,
+                last_seen,
+            },
+        )
+        .collect::<Vec<_>>();
+    endpoints.sort_by(|left, right| {
+        right
+            .last_seen
+            .cmp(&left.last_seen)
+            .then_with(|| left.method.cmp(&right.method))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    Ok((endpoints, rules.into_iter().collect()))
+}
+
+fn rfc3339_after(left: &str, right: &str) -> bool {
+    match (
+        OffsetDateTime::parse(left, &Rfc3339),
+        OffsetDateTime::parse(right, &Rfc3339),
+    ) {
+        (Ok(left), Ok(right)) => left > right,
+        _ => left > right,
+    }
 }
 
 fn endpoint_covered_by_active_direct_rule(
@@ -5688,6 +6079,16 @@ fn traffic_rbac_not_configured() -> Response {
         .into_response()
 }
 
+fn principal_rbac_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "principal directory requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
 fn signals_rbac_not_configured() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -5760,6 +6161,16 @@ fn discovery_not_configured() -> Response {
         Json(ErrorResponse {
             error: "traffic endpoint inventory requires DISCOVERY_SQLITE_PATH to be configured"
                 .to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn principal_directory_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "principal directory requires PRINCIPAL_SQLITE_PATH to be configured".to_owned(),
         }),
     )
         .into_response()
@@ -7003,6 +7414,8 @@ mod tests {
             default_routes.traffic_endpoint_review_route,
             TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE
         );
+        assert_eq!(default_routes.principals_route, PRINCIPALS_ADMIN_ROUTE);
+        assert_eq!(default_routes.principal_detail_route, PRINCIPAL_ADMIN_ROUTE);
 
         let custom_routes = AdminRoutes::from_prefix("/ops");
         assert_eq!(custom_routes.ui_prefix, "/ops");
@@ -7077,6 +7490,8 @@ mod tests {
             custom_routes.traffic_endpoint_review_route,
             "/v1/ops/traffic/endpoints/review"
         );
+        assert_eq!(custom_routes.principals_route, "/v1/ops/principals");
+        assert_eq!(custom_routes.principal_detail_route, "/v1/ops/principal");
     }
 
     #[tokio::test]
@@ -8630,6 +9045,333 @@ mod tests {
             !unused_db.path.exists(),
             "unset PRINCIPAL_SQLITE_PATH should not create an unrelated SQLite file"
         );
+    }
+
+    #[tokio::test]
+    async fn principal_directory_list_filters_paginates_and_counts_anonymous_requests() {
+        let principal_db = TempDb::new("principal-directory-list");
+        let audit_db = TempDb::new("principal-directory-list-audit");
+        create_principal_schema(&principal_db.path);
+        create_audit_schema(&audit_db.path);
+        seed_principal_directory_rows(&principal_db.path);
+        insert_anonymous_observation_event(
+            &audit_db.path,
+            "anonymous-in-window",
+            "2026-01-03T12:00:00Z",
+            "/anonymous",
+        );
+        insert_anonymous_observation_event(
+            &audit_db.path,
+            "anonymous-outside-window",
+            "2025-12-31T23:59:59Z",
+            "/anonymous",
+        );
+        let (router, _policy) =
+            principal_admin_router(Some(&principal_db.path), Some(&audit_db.path), None);
+
+        let issuer = query_encode("https://issuer-a.example.test/");
+        let first_page = principal_json(
+            &router,
+            &format!("/v1/admin/principals?issuer={issuer}&limit=2"),
+            Some(test_principal(&["principal-reader"])),
+        )
+        .await;
+        assert_eq!(
+            principal_subjects(&first_page),
+            vec!["alpha".to_owned(), "bravo".to_owned()]
+        );
+        let cursor = first_page["next_cursor"]
+            .as_str()
+            .expect("first principal page should include a cursor");
+        let second_page = principal_json(
+            &router,
+            &format!("/v1/admin/principals?issuer={issuer}&limit=2&cursor={cursor}"),
+            Some(test_principal(&["principal-reader"])),
+        )
+        .await;
+        assert_eq!(principal_subjects(&second_page), vec!["delta".to_owned()]);
+        assert!(second_page["next_cursor"].is_null());
+
+        let service_tokens = principal_json(
+            &router,
+            "/v1/admin/principals?auth_method=service_token",
+            Some(test_principal(&["principal-reader"])),
+        )
+        .await;
+        assert_eq!(
+            principal_subjects(&service_tokens),
+            vec!["bravo".to_owned()]
+        );
+
+        let humans = principal_json(
+            &router,
+            "/v1/admin/principals?principal_type=human",
+            Some(test_principal(&["principal-reader"])),
+        )
+        .await;
+        assert_eq!(
+            principal_subjects(&humans),
+            vec!["alpha".to_owned(), "charlie".to_owned(), "delta".to_owned()]
+        );
+
+        let combined = principal_json(
+            &router,
+            &format!(
+                "/v1/admin/principals?issuer={issuer}&auth_method=bearer&principal_type=human&last_seen_after=2026-01-01T12:00:00Z&last_seen_before=2026-01-04T12:00:00Z"
+            ),
+            Some(test_principal(&["principal-reader"])),
+        )
+        .await;
+        assert_eq!(principal_subjects(&combined), vec!["alpha".to_owned()]);
+        assert_eq!(combined["anonymous_request_count"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn principal_directory_admin_requires_principals_read_permission() {
+        let principal_db = TempDb::new("principal-directory-authz");
+        create_principal_schema(&principal_db.path);
+        insert_principal_directory_row(
+            &principal_db.path,
+            PrincipalDirectorySeed {
+                subject: "alpha",
+                issuer: "",
+                auth_method: "bearer",
+                email: None,
+                org_id: None,
+                first_seen: "2026-01-01T00:00:00Z",
+                last_seen: "2026-01-01T00:00:00Z",
+                request_count: 1,
+            },
+        );
+        let (router, _policy) = principal_admin_router(Some(&principal_db.path), None, None);
+
+        for uri in [
+            "/v1/admin/principals",
+            "/v1/admin/principal?subject=alpha&issuer=&auth_method=bearer",
+        ] {
+            let unauthenticated = router
+                .clone()
+                .oneshot(principal_admin_request(uri, None))
+                .await
+                .expect("principal admin request should complete");
+            assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+            let forbidden_response = router
+                .clone()
+                .oneshot(principal_admin_request(
+                    uri,
+                    Some(test_principal(&["reader"])),
+                ))
+                .await
+                .expect("principal admin request should complete");
+            assert_eq!(forbidden_response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                body_string(forbidden_response).await,
+                r#"{"error":"forbidden"}"#
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn principal_directory_admin_reports_not_configured() {
+        let (router, _policy) = principal_admin_router(None, None, None);
+
+        for uri in [
+            "/v1/admin/principals",
+            "/v1/admin/principal?subject=missing&issuer=&auth_method=bearer",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(principal_admin_request(
+                    uri,
+                    Some(test_principal(&["principal-reader"])),
+                ))
+                .await
+                .expect("principal admin request should complete");
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                body_string(response).await,
+                r#"{"error":"principal directory requires PRINCIPAL_SQLITE_PATH to be configured"}"#
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn principal_directory_detail_returns_404_for_missing_composite_key() {
+        let principal_db = TempDb::new("principal-directory-detail-missing");
+        create_principal_schema(&principal_db.path);
+        let (router, _policy) = principal_admin_router(Some(&principal_db.path), None, None);
+
+        let response = router
+            .oneshot(principal_admin_request(
+                "/v1/admin/principal?subject=missing&issuer=&auth_method=bearer",
+                Some(test_principal(&["principal-reader"])),
+            ))
+            .await
+            .expect("principal detail request should complete");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"principal was not found"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn principal_directory_detail_enriches_authenticated_request_from_audit() {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let principal_db = TempDb::new("principal-directory-detail-full-stack");
+        let audit_db = TempDb::new("principal-directory-detail-audit");
+        let policy = TempPolicyFile::new(&principal_full_stack_policy_document_string());
+        let mut config = test_config(Vec::new());
+        config.principal_sqlite_path = Some(principal_db.path.to_string_lossy().into_owned());
+        config.audit_sqlite_path = Some(audit_db.path.to_string_lossy().into_owned());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config
+            .rbac_exempt_paths
+            .push("/v1/admin/principals".to_owned());
+        config
+            .rbac_exempt_paths
+            .push("/v1/admin/principal".to_owned());
+        configure_test_jwt_provider(&mut config, jwks_addr);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let (audit_log, audit_event_sender) = audit_log_with_sqlite_and_broadcast(&audit_db.path);
+        let router = app(config, recorder.handle(), audit_log, audit_event_sender)
+            .expect("app should build");
+        let user_token = signed_token("directory-detail-user", &["member"]);
+        let admin_token = signed_token("directory-admin", &["principal-reader"]);
+
+        let response = authenticated_principal_probe(&router, &user_token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eventually(Duration::from_secs(1), || {
+            principal_directory_row_count(&principal_db.path) == 1
+        });
+
+        let detail_uri =
+            "/v1/admin/principal?subject=directory-detail-user&issuer=&auth_method=bearer";
+        let body = wait_for_principal_detail_json(&router, detail_uri, &admin_token, |body| {
+            principal_detail_endpoint_paths(body)
+                .contains(&("GET".to_owned(), "/__test/principal".to_owned()))
+                && principal_detail_rule_ids(body).contains(&"allow-probe".to_owned())
+        })
+        .await;
+
+        assert_eq!(body["principal"]["subject"], json!("directory-detail-user"));
+        assert_eq!(body["principal"]["auth_method"], json!("bearer"));
+        assert_eq!(body["tools_called"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn principal_directory_detail_filters_principal_endpoint_signal_history_exactly() {
+        let principal_db = TempDb::new("principal-directory-signals");
+        let discovery_db = TempDb::new("principal-directory-signals-discovery");
+        create_principal_schema(&principal_db.path);
+        create_discovery_schema(&discovery_db.path);
+        for subject in ["bob", "alice bob", "charlie"] {
+            insert_principal_directory_row(
+                &principal_db.path,
+                PrincipalDirectorySeed {
+                    subject,
+                    issuer: "",
+                    auth_method: "bearer",
+                    email: None,
+                    org_id: None,
+                    first_seen: "2026-01-01T00:00:00Z",
+                    last_seen: "2026-01-01T00:00:00Z",
+                    request_count: 1,
+                },
+            );
+        }
+        insert_principal_endpoint_signal(
+            &discovery_db.path,
+            "sig-bob",
+            "POST",
+            "/principal-pairs/{id}",
+            "bob",
+            "2026-01-02T00:00:00Z",
+        );
+        insert_principal_endpoint_signal(
+            &discovery_db.path,
+            "sig-alice-bob",
+            "POST",
+            "/principal-pairs/{id}",
+            "alice bob",
+            "2026-01-03T00:00:00Z",
+        );
+        let (router, _policy) =
+            principal_admin_router(Some(&principal_db.path), None, Some(&discovery_db.path));
+
+        let bob = principal_json(
+            &router,
+            "/v1/admin/principal?subject=bob&issuer=&auth_method=bearer",
+            Some(test_principal(&["principal-reader"])),
+        )
+        .await;
+        assert_eq!(
+            principal_detail_signal_ids(&bob),
+            vec!["sig-bob".to_owned()]
+        );
+
+        let charlie = principal_json(
+            &router,
+            "/v1/admin/principal?subject=charlie&issuer=&auth_method=bearer",
+            Some(test_principal(&["principal-reader"])),
+        )
+        .await;
+        assert!(principal_detail_signal_ids(&charlie).is_empty());
+    }
+
+    #[tokio::test]
+    async fn principal_directory_list_counts_failed_auth_without_creating_principal_row() {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let principal_db = TempDb::new("principal-directory-anonymous");
+        let audit_db = TempDb::new("principal-directory-anonymous-audit");
+        let mut config = test_config(Vec::new());
+        config.principal_sqlite_path = Some(principal_db.path.to_string_lossy().into_owned());
+        config.audit_sqlite_path = Some(audit_db.path.to_string_lossy().into_owned());
+        configure_test_jwt_provider(&mut config, jwks_addr);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let (audit_log, audit_event_sender) = audit_log_with_sqlite_and_broadcast(&audit_db.path);
+        let router = app(config, recorder.handle(), audit_log, audit_event_sender)
+            .expect("app should build");
+        let window_start = (OffsetDateTime::now_utc() - time::Duration::seconds(10))
+            .format(&Rfc3339)
+            .expect("window start should format");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .body(Body::empty())
+                    .expect("anonymous request should build"),
+            )
+            .await
+            .expect("anonymous request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eventually(Duration::from_secs(1), || {
+            anonymous_observation_count(&audit_db.path) == 1
+        });
+        assert_eq!(principal_directory_row_count(&principal_db.path), 0);
+
+        let window_end = (OffsetDateTime::now_utc() + time::Duration::seconds(10))
+            .format(&Rfc3339)
+            .expect("window end should format");
+        let (query_router, _policy) =
+            principal_admin_router(Some(&principal_db.path), Some(&audit_db.path), None);
+        let body = principal_json(
+            &query_router,
+            &format!(
+                "/v1/admin/principals?last_seen_after={window_start}&last_seen_before={window_end}"
+            ),
+            Some(test_principal(&["principal-reader"])),
+        )
+        .await;
+
+        assert_eq!(body["principals"], json!([]));
+        assert_eq!(body["anonymous_request_count"], json!(1));
     }
 
     #[tokio::test]
@@ -15290,6 +16032,154 @@ paths:
         .expect("app should build")
     }
 
+    fn principal_admin_config(
+        principal_path: Option<&PathBuf>,
+        audit_path: Option<&PathBuf>,
+        discovery_path: Option<&PathBuf>,
+        policy: &TempPolicyFile,
+    ) -> config::Config {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.principal_sqlite_path =
+            principal_path.map(|path| path.to_string_lossy().into_owned());
+        config.audit_sqlite_path = audit_path.map(|path| path.to_string_lossy().into_owned());
+        config.discovery_sqlite_path =
+            discovery_path.map(|path| path.to_string_lossy().into_owned());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config
+            .rbac_exempt_paths
+            .push("/v1/admin/principals".to_owned());
+        config
+            .rbac_exempt_paths
+            .push("/v1/admin/principal".to_owned());
+        config
+    }
+
+    fn principal_admin_router(
+        principal_path: Option<&PathBuf>,
+        audit_path: Option<&PathBuf>,
+        discovery_path: Option<&PathBuf>,
+    ) -> (Router, TempPolicyFile) {
+        let policy = TempPolicyFile::new(&principal_policy_document_string());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            principal_admin_config(principal_path, audit_path, discovery_path, &policy),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        (router, policy)
+    }
+
+    fn principal_admin_request(uri: &str, principal: Option<auth::Principal>) -> Request<Body> {
+        let mut request = Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request should build");
+        if let Some(principal) = principal {
+            request.extensions_mut().insert(principal);
+        }
+
+        request
+    }
+
+    fn principal_admin_bearer_request(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .expect("principal admin bearer request should build")
+    }
+
+    async fn principal_json(
+        router: &Router,
+        uri: &str,
+        principal: Option<auth::Principal>,
+    ) -> Value {
+        let response = router
+            .clone()
+            .oneshot(principal_admin_request(uri, principal))
+            .await
+            .expect("principal admin request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await
+    }
+
+    async fn wait_for_principal_detail_json(
+        router: &Router,
+        uri: &str,
+        token: &str,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let started = Instant::now();
+
+        loop {
+            let response = router
+                .clone()
+                .oneshot(principal_admin_bearer_request(uri, token))
+                .await
+                .expect("principal detail request should complete");
+            let status = response.status();
+            if status != StatusCode::OK {
+                panic!(
+                    "principal detail request returned {status}: {}",
+                    body_string(response).await
+                );
+            }
+            let body = json_body(response).await;
+            if predicate(&body) {
+                return body;
+            }
+
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "principal detail did not match condition within async flush window: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn principal_policy_document_string() -> String {
+        serde_json::to_string_pretty(&json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "principal-reader": {
+                    "permissions": ["admin:principals:read"]
+                },
+                "reader": {
+                    "permissions": []
+                }
+            },
+            "rules": []
+        }))
+        .expect("principal policy should serialize")
+    }
+
+    fn principal_full_stack_policy_document_string() -> String {
+        serde_json::to_string_pretty(&json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "principal-reader": {
+                    "permissions": ["admin:principals:read"]
+                },
+                "member": {
+                    "permissions": []
+                }
+            },
+            "rules": [
+                direct_rule_json(Some("allow-probe"), &["GET"], "/__test/principal", "allow")
+            ]
+        }))
+        .expect("principal full-stack policy should serialize")
+    }
+
     fn traffic_admin_config(
         discovery_path: Option<&PathBuf>,
         audit_path: Option<&PathBuf>,
@@ -16671,6 +17561,68 @@ paths:
             .collect()
     }
 
+    fn principal_subjects(body: &Value) -> Vec<String> {
+        body["principals"]
+            .as_array()
+            .expect("principals should be an array")
+            .iter()
+            .map(|principal| {
+                principal["subject"]
+                    .as_str()
+                    .expect("subject should be a string")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn principal_detail_endpoint_paths(body: &Value) -> Vec<(String, String)> {
+        body["endpoints_touched"]
+            .as_array()
+            .expect("endpoints_touched should be an array")
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint["method"]
+                        .as_str()
+                        .expect("endpoint method should be a string")
+                        .to_owned(),
+                    endpoint["path"]
+                        .as_str()
+                        .expect("endpoint path should be a string")
+                        .to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn principal_detail_rule_ids(body: &Value) -> Vec<String> {
+        body["rules_hit"]
+            .as_array()
+            .expect("rules_hit should be an array")
+            .iter()
+            .map(|rule_id| {
+                rule_id
+                    .as_str()
+                    .expect("rule id should be a string")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn principal_detail_signal_ids(body: &Value) -> Vec<String> {
+        body["anomaly_history"]
+            .as_array()
+            .expect("anomaly_history should be an array")
+            .iter()
+            .map(|signal| {
+                signal["id"]
+                    .as_str()
+                    .expect("signal id should be a string")
+                    .to_owned()
+            })
+            .collect()
+    }
+
     fn query_encode(value: &str) -> String {
         value
             .bytes()
@@ -17543,6 +18495,231 @@ O2gecI9QwDJNpm29J9wJB2F8
                 params![method, endpoint_template, count],
             )
             .expect("schema mismatch count should update");
+    }
+
+    fn create_principal_schema(path: &PathBuf) {
+        let connection = Connection::open(path).expect("test principal database should open");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS principal_directory (
+                    subject TEXT NOT NULL,
+                    issuer TEXT NOT NULL,
+                    auth_method TEXT NOT NULL,
+                    email TEXT,
+                    org_id TEXT,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    request_count INTEGER NOT NULL,
+                    PRIMARY KEY (subject, issuer, auth_method)
+                );
+                "#,
+            )
+            .expect("principal directory schema should create");
+    }
+
+    fn seed_principal_directory_rows(path: &PathBuf) {
+        for principal in [
+            PrincipalDirectorySeed {
+                subject: "alpha",
+                issuer: "https://issuer-a.example.test/",
+                auth_method: "bearer",
+                email: Some("alpha@example.test"),
+                org_id: Some("org-a"),
+                first_seen: "2026-01-01T00:00:00Z",
+                last_seen: "2026-01-04T00:00:00Z",
+                request_count: 4,
+            },
+            PrincipalDirectorySeed {
+                subject: "bravo",
+                issuer: "https://issuer-a.example.test/",
+                auth_method: "service_token",
+                email: None,
+                org_id: Some("org-a"),
+                first_seen: "2026-01-01T00:00:00Z",
+                last_seen: "2026-01-03T00:00:00Z",
+                request_count: 3,
+            },
+            PrincipalDirectorySeed {
+                subject: "charlie",
+                issuer: "https://issuer-b.example.test/",
+                auth_method: "cookie",
+                email: Some("charlie@example.test"),
+                org_id: Some("org-b"),
+                first_seen: "2026-01-01T00:00:00Z",
+                last_seen: "2026-01-02T00:00:00Z",
+                request_count: 2,
+            },
+            PrincipalDirectorySeed {
+                subject: "delta",
+                issuer: "https://issuer-a.example.test/",
+                auth_method: "bearer",
+                email: None,
+                org_id: None,
+                first_seen: "2026-01-01T00:00:00Z",
+                last_seen: "2026-01-01T00:00:00Z",
+                request_count: 1,
+            },
+        ] {
+            insert_principal_directory_row(path, principal);
+        }
+    }
+
+    struct PrincipalDirectorySeed<'a> {
+        subject: &'a str,
+        issuer: &'a str,
+        auth_method: &'a str,
+        email: Option<&'a str>,
+        org_id: Option<&'a str>,
+        first_seen: &'a str,
+        last_seen: &'a str,
+        request_count: i64,
+    }
+
+    fn insert_principal_directory_row(path: &PathBuf, principal: PrincipalDirectorySeed<'_>) {
+        let connection = Connection::open(path).expect("test principal database should open");
+        connection
+            .execute(
+                r#"
+                INSERT INTO principal_directory (
+                    subject,
+                    issuer,
+                    auth_method,
+                    email,
+                    org_id,
+                    first_seen,
+                    last_seen,
+                    request_count
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    principal.subject,
+                    principal.issuer,
+                    principal.auth_method,
+                    principal.email,
+                    principal.org_id,
+                    principal.first_seen,
+                    principal.last_seen,
+                    principal.request_count,
+                ],
+            )
+            .expect("principal directory row should insert");
+    }
+
+    fn insert_anonymous_observation_event(
+        path: &PathBuf,
+        event_id: &str,
+        timestamp: &str,
+        request_path: &str,
+    ) {
+        let connection = Connection::open(path).expect("test audit database should open");
+        let payload_json = json!({
+            "method": "GET",
+            "path": request_path,
+            "status": 401,
+            "auth_outcome": "anonymous_or_failed"
+        })
+        .to_string();
+        connection
+            .execute(
+                r#"
+                INSERT INTO audit_events (
+                    event_id,
+                    event_type,
+                    timestamp,
+                    schema_version,
+                    request_id,
+                    source_ip,
+                    actor_user_id,
+                    actor_json,
+                    payload_method,
+                    payload_path,
+                    payload_status,
+                    payload_json
+                ) VALUES (?1, 'http.request_observed', ?2, '0.1.0', ?3, '203.0.113.10', NULL, NULL, 'GET', ?4, 401, ?5)
+                "#,
+                params![
+                    event_id,
+                    timestamp,
+                    format!("request-{event_id}"),
+                    request_path,
+                    payload_json,
+                ],
+            )
+            .expect("anonymous observation should insert");
+    }
+
+    fn anonymous_observation_count(path: &PathBuf) -> i64 {
+        let connection = Connection::open(path).expect("test audit database should open");
+        connection
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM audit_events
+                WHERE event_type = 'http.request_observed'
+                  AND actor_user_id IS NULL
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .expect("anonymous observation count should query")
+    }
+
+    fn insert_principal_endpoint_signal(
+        path: &PathBuf,
+        id: &str,
+        method: &str,
+        endpoint_template: &str,
+        principal: &str,
+        created_at: &str,
+    ) {
+        let connection = Connection::open(path).expect("test discovery database should open");
+        let target_identity_json = serde_json::to_string(&json!({
+            "method": method,
+            "endpoint_template": endpoint_template,
+            "principal": principal,
+        }))
+        .expect("target identity should serialize");
+        let evidence_json = serde_json::to_string(&json!({
+            "observed_at": created_at,
+            "principal": principal,
+            "prior_distinct_principal_count": 1,
+            "threshold": 1
+        }))
+        .expect("evidence should serialize");
+        let target_key =
+            discovery::signals::principal_endpoint_target_key(method, endpoint_template, principal);
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_signals (
+                    id,
+                    signal_type,
+                    target_kind,
+                    target_key,
+                    target_identity_json,
+                    explanation,
+                    evidence_json,
+                    state,
+                    created_at,
+                    updated_at,
+                    transitioned_at,
+                    transitioned_by
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?8, NULL, NULL)
+                "#,
+                params![
+                    id,
+                    discovery::signals::PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_TYPE,
+                    discovery::signals::PRINCIPAL_ENDPOINT_TARGET_KIND,
+                    target_key,
+                    target_identity_json,
+                    format!("Principal new to endpoint: {principal}"),
+                    evidence_json,
+                    created_at,
+                ],
+            )
+            .expect("principal endpoint signal should insert");
     }
 
     #[derive(Debug)]
