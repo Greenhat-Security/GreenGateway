@@ -51,6 +51,30 @@ describe('OpenApiToolsView', () => {
     expect(authCheckbox.checked).toBe(false);
   });
 
+  it('keeps auth-required tool checkboxes disabled and unselected', async () => {
+    vi.stubGlobal('fetch', openApiToolsFetchMock().fetch);
+
+    renderOpenApiToolsView();
+
+    fireEvent.change(screen.getByLabelText('OpenAPI spec'), {
+      target: { value: widgetSpec },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+
+    await screen.findByText('getWidget');
+    const authCheckbox = screen.getByRole('checkbox', {
+      name: 'Select getWidget',
+    }) as HTMLInputElement;
+
+    expect(authCheckbox.disabled).toBe(true);
+    expect(authCheckbox.checked).toBe(false);
+
+    fireEvent.click(authCheckbox);
+
+    expect(authCheckbox.checked).toBe(false);
+    expect(screen.getByText('1 selected')).toBeTruthy();
+  });
+
   it('registers selected tools with the preview ETag and shows success', async () => {
     const fetcher = openApiToolsFetchMock();
     vi.stubGlobal('fetch', fetcher.fetch);

@@ -76,6 +76,7 @@ const TOKEN_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}";
 const TOKEN_ROTATE_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}/rotate";
 const TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/preview";
 const TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/register";
+const OPENAPI_TOOLS_UNSUPPORTED_AUTH_REQUIREMENTS_ERROR: &str = "cannot register selected OpenAPI tools: upstream API-key header injection is not yet supported; see issue #36's known limitation";
 const SCHEMA_COVERAGE_ADMIN_ROUTE: &str = "/v1/admin/schema/coverage";
 const SIGNALS_ADMIN_ROUTE: &str = "/v1/admin/signals";
 const SIGNAL_ACKNOWLEDGE_ADMIN_ROUTE: &str = "/v1/admin/signals/{id}/acknowledge";
@@ -836,6 +837,12 @@ struct OpenApiToolsRegisterResponse {
 struct ToolNameConflictResponse {
     error: &'static str,
     conflicts: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct UnsupportedOpenApiToolAuthRequirementsResponse {
+    error: &'static str,
+    unsupported_tool_names: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -3619,7 +3626,7 @@ async fn tools_openapi_register_endpoint(
         Ok(generation) => generation,
         Err(err) => return bad_request(&format!("invalid OpenAPI spec: {err}")),
     };
-    let selected = match selected_generated_tools(&generation.definitions, &requested) {
+    let selected = match selected_generated_tools(&generation, &requested) {
         Ok(selected) => selected,
         Err(response) => return *response,
     };
@@ -6078,7 +6085,7 @@ fn openapi_skipped_operation_response(
 }
 
 fn selected_generated_tools(
-    definitions: &[tools::definitions::ToolDefinition],
+    generation: &tools::openapi::OpenApiToolGeneration,
     request: &OpenApiToolsRegisterRequest,
 ) -> ResponseResult<Vec<tools::definitions::ToolDefinition>> {
     let duplicates = duplicate_strings(&request.selected_tool_names);
@@ -6089,7 +6096,8 @@ fn selected_generated_tools(
         ))));
     }
 
-    let generated_names = definitions
+    let generated_names = generation
+        .definitions
         .iter()
         .map(|definition| definition.name.as_str())
         .collect::<BTreeSet<_>>();
@@ -6110,11 +6118,39 @@ fn selected_generated_tools(
         ))));
     }
 
-    Ok(definitions
+    let unsupported_tool_names = generation
+        .api_key_header_auth_requirements
+        .iter()
+        .filter(|requirement| selected_names.contains(requirement.tool_name.as_str()))
+        .map(|requirement| requirement.tool_name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if !unsupported_tool_names.is_empty() {
+        return Err(Box::new(
+            unsupported_openapi_tool_auth_requirements_response(unsupported_tool_names),
+        ));
+    }
+
+    Ok(generation
+        .definitions
         .iter()
         .filter(|definition| selected_names.contains(definition.name.as_str()))
         .cloned()
         .collect())
+}
+
+fn unsupported_openapi_tool_auth_requirements_response(
+    unsupported_tool_names: Vec<String>,
+) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(UnsupportedOpenApiToolAuthRequirementsResponse {
+            error: OPENAPI_TOOLS_UNSUPPORTED_AUTH_REQUIREMENTS_ERROR,
+            unsupported_tool_names,
+        }),
+    )
+        .into_response()
 }
 
 fn duplicate_strings(values: &[String]) -> Vec<String> {
@@ -13715,7 +13751,7 @@ mod tests {
                 &harness.admin_token,
                 json!({
                     "spec": widget_openapi_spec(),
-                    "selected_tool_names": ["createWidget", "getWidget"]
+                    "selected_tool_names": ["createWidget"]
                 }),
                 Some(&etag),
             ))
@@ -13730,6 +13766,54 @@ mod tests {
             fs::read_to_string(&harness.tools.path).expect("tools file should read"),
             before_contents,
             "colliding register must not partially persist selected tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn openapi_tools_register_rejects_auth_required_tools_without_partial_persist() {
+        let harness = tools_admin_harness(empty_tools_document(), test_audit_log()).await;
+        let before_contents =
+            fs::read_to_string(&harness.tools.path).expect("tools file should read");
+        let preview = harness
+            .router
+            .clone()
+            .oneshot(tools_openapi_preview_request(
+                &harness.admin_token,
+                widget_openapi_spec(),
+            ))
+            .await
+            .expect("OpenAPI tools preview request should complete");
+        let etag = preview
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("preview should include ETag")
+            .to_owned();
+
+        let response = harness
+            .router
+            .oneshot(tools_openapi_register_request(
+                &harness.admin_token,
+                json!({
+                    "spec": widget_openapi_spec(),
+                    "selected_tool_names": ["createWidget", "getWidget"]
+                }),
+                Some(&etag),
+            ))
+            .await
+            .expect("auth-required OpenAPI tools register request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["error"],
+            json!("cannot register selected OpenAPI tools: upstream API-key header injection is not yet supported; see issue #36's known limitation")
+        );
+        assert_eq!(body["unsupported_tool_names"], json!(["getWidget"]));
+        assert_eq!(
+            fs::read_to_string(&harness.tools.path).expect("tools file should read"),
+            before_contents,
+            "auth-required register must not partially persist selected tools"
         );
     }
 

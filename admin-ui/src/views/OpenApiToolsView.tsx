@@ -149,6 +149,10 @@ export function OpenApiToolsView() {
   }
 
   function toggleTool(toolName: string) {
+    if (authRequirementByTool.has(toolName)) {
+      return;
+    }
+
     setSelectedToolNames((current) => {
       const next = new Set(current);
       if (next.has(toolName)) {
@@ -238,16 +242,23 @@ export function OpenApiToolsView() {
                   </tr>
                 </thead>
                 <tbody>
-                  {preview.tools.map((tool, index) => (
-                    <OpenApiToolRow
-                      key={tool.name}
-                      authRequirement={authRequirementByTool.get(tool.name)}
-                      isSelected={selectedToolNames.has(tool.name)}
-                      rowIndex={index}
-                      tool={tool}
-                      onToggle={() => toggleTool(tool.name)}
-                    />
-                  ))}
+                  {preview.tools.map((tool, index) => {
+                    const authRequirement = authRequirementByTool.get(tool.name);
+
+                    return (
+                      <OpenApiToolRow
+                        key={tool.name}
+                        authRequirement={authRequirement}
+                        isSelected={
+                          authRequirement === undefined &&
+                          selectedToolNames.has(tool.name)
+                        }
+                        rowIndex={index}
+                        tool={tool}
+                        onToggle={() => toggleTool(tool.name)}
+                      />
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -273,6 +284,8 @@ function OpenApiToolRow({
   authRequirement?: OpenApiApiKeyHeaderAuthRequirement;
   onToggle: () => void;
 }) {
+  const hasAuthRequirement = authRequirement !== undefined;
+
   return (
     <tr className={`event-row ${rowIndex % 2 === 1 ? 'is-even' : ''}`}>
       <td>
@@ -281,6 +294,7 @@ function OpenApiToolRow({
           type="checkbox"
           aria-label={`Select ${tool.name}`}
           checked={isSelected}
+          disabled={hasAuthRequirement}
           onChange={onToggle}
         />
       </td>
