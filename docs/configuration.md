@@ -558,21 +558,27 @@ Ordered JSON array of authentication provider objects.
 
 Default: empty, which means the legacy single-provider `JWT_*` settings below are used as an implicit one-entry provider named `legacy` when `JWT_JWKS_URL` is set.
 
-Format and validation: unset, empty, or whitespace-only values use the legacy fallback. Non-empty values must be a JSON array. Each entry must include a non-empty unique `name`, `type` set to `jwt`, and a non-empty `jwks_url`. Optional fields are `issuer`, `audience`, `jwks_timeout_ms`, `require_jti`, and `roles_claim`. `issuer` and `audience` are trimmed, and blank values are treated as unset. `jwks_timeout_ms` defaults to `2000`, `require_jti` defaults to `false`, and `roles_claim` defaults to `roles`.
+Format and validation: unset, empty, or whitespace-only values use the legacy fallback. Non-empty values must be a JSON array. Each entry must include a non-empty unique `name`, `type` set to `jwt`, and at least one of `jwks_url` or `issuer`. Optional fields are `audience`, `jwks_timeout_ms`, `require_jti`, and `roles_claim`. `jwks_url`, `issuer`, and `audience` are trimmed, and blank values are treated as unset. `jwks_timeout_ms` defaults to `2000`, `require_jti` defaults to `false`, and `roles_claim` defaults to `roles`.
 
-Example: `[{"name":"primary","type":"jwt","jwks_url":"https://idp.example.com/.well-known/jwks.json","issuer":"https://idp.example.com","audience":"greengateway","roles_claim":"roles","require_jti":false}]`
+Example with OIDC discovery: `[{"name":"primary","type":"jwt","issuer":"https://idp.example.com","audience":"greengateway","roles_claim":"roles","require_jti":false}]`
+
+Example with an explicit JWKS endpoint: `[{"name":"primary","type":"jwt","jwks_url":"https://idp.example.com/.well-known/jwks.json","issuer":"https://idp.example.com","audience":"greengateway","roles_claim":"roles","require_jti":false}]`
 
 When `AUTH_PROVIDERS` is set, it defines the ordered auth provider chain and takes precedence over the legacy single-provider JWT settings for validator assembly. The legacy settings remain supported for backward compatibility.
+
+OIDC discovery: when a provider has `issuer` but no `jwks_url`, startup fetches `{issuer}/.well-known/openid-configuration` through the egress client and uses the returned `jwks_uri` for later JWKS refreshes. Discovery failure or a discovery document without `jwks_uri` prevents the provider from being constructed.
+
+JWT algorithms: JWKS keys with `kty` `RSA` validate RS256 tokens, `kty` `EC` with `crv` `P-256` validates ES256 tokens, and `kty` `OKP` with `crv` `Ed25519` validates EdDSA tokens. Unsupported or incomplete keys are skipped during JWKS refresh.
 
 Egress trust: each provider `jwks_url`, and each provider `issuer` when it is a URL with a host, is automatically trusted for gateway-originated egress.
 
 ### JWT_JWKS_URL
 
-Optional JWKS endpoint used to validate RS256 bearer JWTs.
+Optional JWKS endpoint used to validate bearer JWTs.
 
 Default: empty, which means no JWT validator is built.
 
-Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode. The validator fetches public keys from this endpoint and caches them by `kid`.
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode. The validator fetches public keys from this endpoint and caches them by `kid`. Supported JWKS signing keys are RSA for RS256, EC P-256 for ES256, and OKP Ed25519 for EdDSA.
 
 Egress trust: when this value is a URL with a host, that host is automatically trusted for gateway-originated egress. Operators do not need to duplicate the JWKS host in `EGRESS_ALLOWED_HOSTS`.
 
@@ -789,7 +795,7 @@ Default: empty list, which denies all egress requests.
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, lowercase entries, and require each entry to be an ASCII hostname without a port. Configure only hostnames, not URLs. The egress client still blocks private resolved IP ranges by default even when a hostname is allowlisted.
 
-Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, every `UPSTREAM_ROUTES[].upstream_url`, `AUTH_PROVIDERS[].jwks_url`, URL-shaped `AUTH_PROVIDERS[].issuer` values, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to configured upstreams or validate tokens without duplicating those hosts here.
+Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, every `UPSTREAM_ROUTES[].upstream_url`, configured `AUTH_PROVIDERS[].jwks_url` values, URL-shaped `AUTH_PROVIDERS[].issuer` values, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to configured upstreams, fetch OIDC discovery documents, or validate tokens without duplicating those hosts here.
 
 ### EGRESS_TIMEOUT_MS
 

@@ -1155,7 +1155,23 @@ fn auth_validator_from_config(
     for provider in &config.auth_providers {
         match provider.provider_type {
             config::AuthProviderType::Jwt => {
-                let jwt_config = auth::JwtAuthConfig::from_provider_config(provider);
+                let jwks_url = match provider.jwks_url.clone() {
+                    Some(jwks_url) => jwks_url,
+                    None => {
+                        let issuer = provider.issuer.as_deref().ok_or_else(|| {
+                            auth::AuthError::Upstream(format!(
+                                "JWT auth provider '{}' is missing jwks_url and issuer",
+                                provider.name
+                            ))
+                        })?;
+                        auth::oidc::discover_jwks_uri_blocking(
+                            issuer,
+                            Duration::from_millis(provider.jwks_timeout_ms),
+                            Arc::clone(&egress_client),
+                        )?
+                    }
+                };
+                let jwt_config = auth::JwtAuthConfig::from_provider_config(provider, jwks_url);
                 validators.push(Arc::new(auth::JwtValidator::new(
                     jwt_config,
                     Arc::clone(&egress_client),
@@ -5814,6 +5830,7 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         fs,
+        io::{Read, Write},
         net::{IpAddr, Ipv4Addr},
         path::PathBuf,
         sync::Arc,
@@ -14468,6 +14485,80 @@ paths:
     }
 
     #[tokio::test]
+    async fn auth_validator_resolves_oidc_discovery_for_issuer_only_provider() {
+        let (issuer, server) = spawn_oidc_jwks_server();
+        let issuer_claim = issuer.clone();
+        let mut config = test_config(Vec::new());
+        config.auth_providers = vec![config::AuthProviderConfig {
+            name: "oidc".to_owned(),
+            provider_type: config::AuthProviderType::Jwt,
+            jwks_url: None,
+            issuer: Some(issuer),
+            audience: None,
+            jwks_timeout_ms: 2000,
+            require_jti: false,
+            roles_claim: "roles".to_owned(),
+        }];
+        config.egress_deny_private_ips = false;
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::from_config(&config))
+                .expect("egress client should build"),
+        );
+
+        let validator = auth_validator_from_config(&config, egress_client, None)
+            .expect("issuer-only provider should discover JWKS URI")
+            .expect("auth validator should be configured");
+        let principal = validator
+            .validate_session(&auth::SessionCredential::Bearer(signed_token_with_issuer(
+                "oidc-user",
+                &["member"],
+                &issuer_claim,
+            )))
+            .await
+            .expect("token should validate through discovered JWKS URI");
+
+        assert_eq!(principal.user_id, "oidc-user");
+        server
+            .join()
+            .expect("OIDC discovery test server should finish");
+    }
+
+    #[test]
+    fn auth_validator_reports_construction_error_when_oidc_discovery_lacks_jwks_uri() {
+        let (issuer, server) = spawn_oidc_discovery_server(json!({"issuer": "test"}), 1);
+        let mut config = test_config(Vec::new());
+        config.auth_providers = vec![config::AuthProviderConfig {
+            name: "oidc".to_owned(),
+            provider_type: config::AuthProviderType::Jwt,
+            jwks_url: None,
+            issuer: Some(issuer),
+            audience: None,
+            jwks_timeout_ms: 2000,
+            require_jti: false,
+            roles_claim: "roles".to_owned(),
+        }];
+        config.egress_deny_private_ips = false;
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::from_config(&config))
+                .expect("egress client should build"),
+        );
+
+        let error = match auth_validator_from_config(&config, egress_client, None) {
+            Ok(_) => panic!("missing jwks_uri should fail provider construction"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            auth::AuthError::Upstream(message)
+                if message.contains("OIDC discovery response missing jwks_uri")
+        ));
+        server
+            .join()
+            .expect("OIDC discovery test server should finish");
+    }
+
+    #[tokio::test]
     async fn policy_rate_limit_uses_real_authenticated_principal_buckets_in_app_stack() {
         let jwks_addr = spawn_test_jwks_server().await;
         let policy = TempPolicyFile::new(
@@ -16336,13 +16427,109 @@ O2gecI9QwDJNpm29J9wJB2F8
         .await
     }
 
+    fn spawn_oidc_jwks_server() -> (String, std::thread::JoinHandle<()>) {
+        let jwks = json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": TEST_JWT_KID,
+                "use": "sig",
+                "alg": "RS256",
+                "n": TEST_JWT_PUBLIC_KEY_N,
+                "e": TEST_JWT_PUBLIC_KEY_E
+            }]
+        });
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("OIDC discovery test server should bind");
+        let issuer = format!(
+            "http://127.0.0.1:{}",
+            listener
+                .local_addr()
+                .expect("OIDC discovery test server address should be available")
+                .port()
+        );
+        let discovery = json!({
+            "issuer": issuer,
+            "jwks_uri": format!("{issuer}/jwks.json")
+        });
+        spawn_oidc_server(listener, discovery, Some(jwks), 2)
+    }
+
+    fn spawn_oidc_discovery_server(
+        discovery: Value,
+        request_count: usize,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("OIDC discovery test server should bind");
+        spawn_oidc_server(listener, discovery, None, request_count)
+    }
+
+    fn spawn_oidc_server(
+        listener: std::net::TcpListener,
+        discovery: Value,
+        jwks: Option<Value>,
+        request_count: usize,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let issuer = format!(
+            "http://127.0.0.1:{}",
+            listener
+                .local_addr()
+                .expect("OIDC discovery test server address should be available")
+                .port()
+        );
+        let discovery = discovery.to_string();
+        let jwks = jwks.map(|jwks| jwks.to_string());
+        let server = std::thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("OIDC discovery test server should set nonblocking mode");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut handled = 0;
+            while handled < request_count && Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                let path = read_blocking_http_path(&mut stream);
+                let (status, body) = match path.as_str() {
+                    "/.well-known/openid-configuration" => ("200 OK", discovery.as_str()),
+                    "/jwks.json" => ("200 OK", jwks.as_deref().unwrap_or("{}")),
+                    _ => ("404 Not Found", "{}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("OIDC discovery test response should write");
+                handled += 1;
+            }
+        });
+
+        (issuer, server)
+    }
+
+    fn read_blocking_http_path(stream: &mut std::net::TcpStream) -> String {
+        let mut buffer = [0; 2048];
+        let read = stream
+            .read(&mut buffer)
+            .expect("OIDC discovery test request should read");
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_owned()
+    }
+
     fn configure_test_jwt_provider(config: &mut config::Config, jwks_addr: std::net::SocketAddr) {
         let jwks_url = format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port());
         config.jwt_jwks_url = Some(jwks_url.clone());
         config.auth_providers = vec![config::AuthProviderConfig {
             name: "legacy".to_owned(),
             provider_type: config::AuthProviderType::Jwt,
-            jwks_url,
+            jwks_url: Some(jwks_url),
             issuer: None,
             audience: None,
             jwks_timeout_ms: config.jwt_jwks_timeout_ms,
@@ -16356,15 +16543,29 @@ O2gecI9QwDJNpm29J9wJB2F8
     }
 
     fn signed_token(user_id: &str, roles: &[&str]) -> String {
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(TEST_JWT_KID.to_owned());
-        let claims = json!({
+        signed_token_with_claims(json!({
             "sub": user_id,
             "email": format!("{user_id}@example.test"),
             "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
             "jti": format!("{user_id}-session"),
             "roles": roles
-        });
+        }))
+    }
+
+    fn signed_token_with_issuer(user_id: &str, roles: &[&str], issuer: &str) -> String {
+        signed_token_with_claims(json!({
+            "sub": user_id,
+            "email": format!("{user_id}@example.test"),
+            "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+            "jti": format!("{user_id}-session"),
+            "roles": roles,
+            "iss": issuer
+        }))
+    }
+
+    fn signed_token_with_claims(claims: Value) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(TEST_JWT_KID.to_owned());
 
         encode(
             &header,
