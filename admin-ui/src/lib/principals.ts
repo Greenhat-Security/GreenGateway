@@ -101,9 +101,9 @@ export function principalDetailPath(
   principal: Pick<PrincipalRecord, 'subject' | 'issuer' | 'auth_method'>,
 ): string {
   const params = new URLSearchParams();
-  params.set('subject', principal.subject);
+  params.set('subject', principal.subject.trim());
   params.set('issuer', principal.issuer);
-  params.set('auth_method', principal.auth_method);
+  params.set('auth_method', principal.auth_method.trim());
 
   return `/identities/detail?${params.toString()}`;
 }
