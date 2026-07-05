@@ -1380,6 +1380,7 @@ mod tests {
             source_ip: "127.0.0.1".to_owned(),
             actor: Some(Actor {
                 user_id: "user-123".to_owned(),
+                email: None,
                 roles: Some(roles.iter().map(|role| (*role).to_owned()).collect()),
                 auth_mode: "bearer_token".to_owned(),
             }),
