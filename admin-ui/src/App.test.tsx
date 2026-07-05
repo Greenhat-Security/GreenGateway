@@ -151,6 +151,55 @@ describe('AdminShell', () => {
     ).toBeTruthy();
   });
 
+  it('registers the principal detail route', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            principal: {
+              subject: 'alice',
+              issuer: '',
+              auth_method: 'bearer',
+              email: 'alice@example.test',
+              org_id: 'org-a',
+              first_seen: '2026-07-04T08:00:00Z',
+              last_seen: '2026-07-04T10:00:00Z',
+              request_count: 10,
+            },
+            endpoints_touched: [],
+            rules_hit: [],
+            anomaly_history: [],
+            tools_called: [],
+          }),
+          {
+            status: 200,
+            headers: {
+              'Content-Type': 'application/json',
+            },
+          },
+        ),
+      ),
+    );
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          '/identities/detail?subject=alice&issuer=&auth_method=bearer',
+        ]}
+      >
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByRole('heading', {
+        level: 2,
+        name: 'alice',
+      }),
+    ).toBeTruthy();
+  });
+
   it('registers the policy rules route and navigation entry', async () => {
     vi.stubGlobal(
       'fetch',
