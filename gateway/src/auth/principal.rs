@@ -4,6 +4,7 @@
 pub enum AuthMethod {
     Cookie,
     Bearer,
+    ServiceToken,
 }
 
 impl AuthMethod {
@@ -11,6 +12,7 @@ impl AuthMethod {
         match self {
             Self::Cookie => "session_cookie",
             Self::Bearer => "bearer_token",
+            Self::ServiceToken => "service_token",
         }
     }
 }
@@ -79,6 +81,16 @@ mod tests {
         assert_eq!(actor.user_id, "user-123");
         assert_eq!(actor.roles, None);
         assert_eq!(actor.auth_mode, "bearer_token");
+    }
+
+    #[test]
+    fn actor_from_principal_maps_service_token_auth_mode() {
+        let principal = test_principal(AuthMethod::ServiceToken, vec!["admin:tokens:read"]);
+
+        let actor = actor_from_principal(&principal);
+
+        assert_eq!(actor.auth_mode, "service_token");
+        assert_eq!(actor.roles, Some(vec!["admin:tokens:read".to_owned()]));
     }
 
     fn test_principal(auth_method: AuthMethod, roles: Vec<&str>) -> Principal {

@@ -758,7 +758,11 @@ mod tests {
         (
             principal_id_strategy(),
             prop::collection::vec(role_strategy(), 0..3),
-            prop_oneof![Just(AuthMethod::Bearer), Just(AuthMethod::Cookie)],
+            prop_oneof![
+                Just(AuthMethod::Bearer),
+                Just(AuthMethod::Cookie),
+                Just(AuthMethod::ServiceToken)
+            ],
         )
             .prop_map(|(user_id, roles, auth_method)| Principal {
                 user_id,
@@ -774,6 +778,7 @@ mod tests {
         prop_oneof![
             Just("bearer_token".to_owned()),
             Just("session_cookie".to_owned()),
+            Just("service_token".to_owned()),
         ]
     }
 

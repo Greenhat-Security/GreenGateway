@@ -4,6 +4,7 @@ use crate::auth::{AuthMethod, Principal};
 
 pub const AUTH_METHOD_BEARER_TOKEN: &str = "bearer_token";
 pub const AUTH_METHOD_SESSION_COOKIE: &str = "session_cookie";
+pub const AUTH_METHOD_SERVICE_TOKEN: &str = "service_token";
 
 /// Action applied by a first-match-wins firewall rule.
 ///
@@ -36,8 +37,9 @@ pub struct PrincipalMatcher {
     /// Role names this rule matches. Empty means any role set.
     #[serde(default)]
     pub roles: Vec<String>,
-    /// Authentication methods this rule matches: "bearer_token" or
-    /// "session_cookie". Empty means any authentication method.
+    /// Authentication methods this rule matches: "bearer_token",
+    /// "session_cookie", or "service_token". Empty means any authentication
+    /// method.
     #[serde(default)]
     pub auth_methods: Vec<String>,
     /// Exact principal user_id values this rule matches. Empty means any
@@ -135,13 +137,17 @@ fn is_default_rule_enabled(value: &bool) -> bool {
 }
 
 pub fn valid_auth_method_name(value: &str) -> bool {
-    matches!(value, AUTH_METHOD_BEARER_TOKEN | AUTH_METHOD_SESSION_COOKIE)
+    matches!(
+        value,
+        AUTH_METHOD_BEARER_TOKEN | AUTH_METHOD_SESSION_COOKIE | AUTH_METHOD_SERVICE_TOKEN
+    )
 }
 
 fn auth_method_policy_value(auth_method: &AuthMethod) -> &'static str {
     match auth_method {
         AuthMethod::Bearer => AUTH_METHOD_BEARER_TOKEN,
         AuthMethod::Cookie => AUTH_METHOD_SESSION_COOKIE,
+        AuthMethod::ServiceToken => AUTH_METHOD_SERVICE_TOKEN,
     }
 }
 
@@ -206,6 +212,26 @@ mod tests {
             AuthMethod::Bearer
         ))));
         assert!(!matcher.matches(None));
+    }
+
+    #[test]
+    fn principal_matcher_can_match_service_token_auth_method() {
+        let matcher = PrincipalMatcher {
+            roles: Vec::new(),
+            auth_methods: vec![AUTH_METHOD_SERVICE_TOKEN.to_owned()],
+            principal_ids: Vec::new(),
+        };
+
+        assert!(matcher.matches(Some(&test_principal(
+            "service-token:token_123",
+            &["admin:tokens:read"],
+            AuthMethod::ServiceToken
+        ))));
+        assert!(!matcher.matches(Some(&test_principal(
+            "user-123",
+            &["admin:tokens:read"],
+            AuthMethod::Bearer
+        ))));
     }
 
     #[test]
