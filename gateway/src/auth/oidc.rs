@@ -51,7 +51,7 @@ pub(crate) async fn discover_document(
     http_timeout: Duration,
     egress_client: &EgressClient,
 ) -> Result<DiscoveryDocument, AuthError> {
-    let issuer = normalize_discovery_issuer(issuer)?;
+    let issuer = normalize_required_issuer(issuer)?;
 
     let discovery_url = format!("{issuer}/.well-known/openid-configuration");
     let response = timeout(
@@ -143,15 +143,18 @@ fn normalize_discovery_endpoint(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn normalize_discovery_issuer(issuer: &str) -> Result<String, AuthError> {
+pub(crate) fn normalize_issuer(issuer: &str) -> Option<String> {
     let issuer = issuer.trim().trim_end_matches('/');
     if issuer.is_empty() {
-        return Err(AuthError::Upstream(
-            "OIDC discovery issuer must be non-empty".to_owned(),
-        ));
+        return None;
     }
 
-    Ok(issuer.to_owned())
+    Some(issuer.to_owned())
+}
+
+pub(crate) fn normalize_required_issuer(issuer: &str) -> Result<String, AuthError> {
+    normalize_issuer(issuer)
+        .ok_or_else(|| AuthError::Upstream("OIDC discovery issuer must be non-empty".to_owned()))
 }
 
 fn validate_discovery_issuer(
@@ -159,10 +162,20 @@ fn validate_discovery_issuer(
     expected_issuer: &str,
 ) -> Result<(), AuthError> {
     match document.issuer() {
-        Some(document_issuer) if document_issuer == expected_issuer => Ok(()),
-        Some(document_issuer) => Err(AuthError::Upstream(format!(
-            "OIDC discovery issuer mismatch: expected '{expected_issuer}', got '{document_issuer}'"
-        ))),
+        Some(document_issuer) => {
+            let expected_issuer = normalize_required_issuer(expected_issuer)?;
+            let document_issuer_normalized =
+                normalize_issuer(document_issuer).ok_or_else(|| {
+                    AuthError::Upstream("OIDC discovery response missing issuer".to_owned())
+                })?;
+            if document_issuer_normalized == expected_issuer {
+                Ok(())
+            } else {
+                Err(AuthError::Upstream(format!(
+                    "OIDC discovery issuer mismatch: expected '{expected_issuer}', got '{document_issuer}'"
+                )))
+            }
+        }
         None => Err(AuthError::Upstream(
             "OIDC discovery response missing issuer".to_owned(),
         )),

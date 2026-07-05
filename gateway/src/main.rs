@@ -1451,9 +1451,12 @@ fn discover_oidc_from_config(
             Duration::from_millis(provider.jwks_timeout_ms),
             Arc::clone(&egress_client),
         )?;
-        let issuer = document.issuer().ok_or_else(|| {
-            auth::AuthError::Upstream("OIDC discovery response missing issuer".to_owned())
-        })?;
+        let issuer = document
+            .issuer()
+            .and_then(auth::oidc::normalize_issuer)
+            .ok_or_else(|| {
+                auth::AuthError::Upstream("OIDC discovery response missing issuer".to_owned())
+            })?;
 
         let jwks_url = match provider.jwks_url.clone() {
             Some(jwks_url) => jwks_url,
@@ -1478,7 +1481,7 @@ fn discover_oidc_from_config(
         })?;
         discovered.admin_login = Some(DiscoveredAdminLoginEndpoints {
             provider_name: provider.name.clone(),
-            issuer: issuer.to_owned(),
+            issuer,
             jwks_url,
             authorization_endpoint,
             token_endpoint,
@@ -16346,6 +16349,70 @@ paths:
             .expect("OIDC discovery test server should finish");
     }
 
+    #[tokio::test]
+    async fn auth_validator_accepts_slashless_oidc_issuer_when_config_has_trailing_slash() {
+        let (issuer, document_issuer, server) =
+            spawn_oidc_jwks_server_with_document_issuer(str::to_owned);
+        let mut config = test_config(Vec::new());
+        config.auth_providers = vec![oidc_jwt_provider(format!("{issuer}/"))];
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build with slash-normalized OIDC issuer");
+
+        let response = authenticated_principal_probe(
+            &router,
+            &signed_token_with_issuer("slashless-oidc-user", &["member"], &document_issuer),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await["user_id"],
+            json!("slashless-oidc-user")
+        );
+        server
+            .join()
+            .expect("OIDC discovery and JWKS test server should finish");
+    }
+
+    #[tokio::test]
+    async fn auth_validator_accepts_slash_retained_oidc_issuer_and_token() {
+        let (_issuer, document_issuer, server) =
+            spawn_oidc_jwks_server_with_document_issuer(|issuer| format!("{issuer}/"));
+        let mut config = test_config(Vec::new());
+        config.auth_providers = vec![oidc_jwt_provider(document_issuer.clone())];
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build with slash-retained OIDC issuer");
+
+        let response = authenticated_principal_probe(
+            &router,
+            &signed_token_with_issuer("slash-retained-oidc-user", &["member"], &document_issuer),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await["user_id"],
+            json!("slash-retained-oidc-user")
+        );
+        server
+            .join()
+            .expect("OIDC discovery and JWKS test server should finish");
+    }
+
     #[test]
     fn auth_validator_rejects_oidc_discovery_with_mismatched_issuer() {
         let (issuer, server) = spawn_oidc_discovery_server(
@@ -16512,12 +16579,16 @@ paths:
 
     #[tokio::test]
     async fn admin_oidc_login_redirects_exchanges_code_and_consumes_state_once() {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let jwks_url = format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port());
         let token_endpoint =
             spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
         let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
         let access_token = signed_token_with_issuer("admin-operator", &["admin"], &oidc.issuer);
         token_endpoint.set_access_token(access_token.clone());
-        let router = admin_oidc_login_router(&oidc.issuer);
+        let mut config = admin_oidc_login_config(&oidc.issuer);
+        config.auth_providers[0].jwks_url = Some(jwks_url);
+        let router = admin_oidc_login_router_from_config(config);
 
         let login_response = router
             .clone()
@@ -16569,6 +16640,7 @@ paths:
             .expect("authorization redirect should include nonce");
         assert!(!state.is_empty());
         assert!(!nonce.is_empty());
+        token_endpoint.set_id_token(signed_admin_id_token(&oidc.issuer, "admin-ui", nonce));
         let challenge = authorization_query
             .get("code_challenge")
             .expect("authorization redirect should include PKCE challenge");
@@ -16651,6 +16723,62 @@ paths:
                 .expect("replay should redirect to auth error fragment")
                 .get("error")
                 .is_some_and(|error| error == "invalid_state")
+        );
+        assert_eq!(token_endpoint.requests().len(), 1);
+
+        oidc.finish();
+        token_endpoint.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_oidc_login_rejects_token_response_without_id_token() {
+        let token_endpoint =
+            spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
+        let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
+        token_endpoint.set_access_token(signed_token_with_issuer(
+            "admin-operator",
+            &["admin"],
+            &oidc.issuer,
+        ));
+        let router = admin_oidc_login_router(&oidc.issuer);
+
+        let login_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/auth/login")
+                    .body(Body::empty())
+                    .expect("login request should build"),
+            )
+            .await
+            .expect("login request should complete");
+        let login_location = response_location(&login_response);
+        let authorization_url =
+            Url::parse(&login_location).expect("authorization redirect should be absolute");
+        let authorization_query = url_query_pairs(&authorization_url);
+        let state = authorization_query
+            .get("state")
+            .expect("authorization redirect should include state");
+
+        let callback_response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/admin/auth/callback?code=admin-code&state={}",
+                        query_encode(state)
+                    ))
+                    .body(Body::empty())
+                    .expect("callback request should build"),
+            )
+            .await
+            .expect("callback request should complete");
+
+        assert_eq!(callback_response.status(), StatusCode::FOUND);
+        assert!(
+            fragment_query_pairs(&response_location(&callback_response), "/auth/error")
+                .expect("missing id_token should redirect to auth error fragment")
+                .get("error")
+                .is_some_and(|error| error == "token_exchange_failed")
         );
         assert_eq!(token_endpoint.requests().len(), 1);
 
@@ -19277,6 +19405,38 @@ O2gecI9QwDJNpm29J9wJB2F8
         spawn_oidc_server(listener, discovery, Some(jwks), 2)
     }
 
+    fn spawn_oidc_jwks_server_with_document_issuer(
+        document_issuer: impl FnOnce(&str) -> String,
+    ) -> (String, String, std::thread::JoinHandle<()>) {
+        let jwks = json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": TEST_JWT_KID,
+                "use": "sig",
+                "alg": "RS256",
+                "n": TEST_JWT_PUBLIC_KEY_N,
+                "e": TEST_JWT_PUBLIC_KEY_E
+            }]
+        });
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("OIDC discovery test server should bind");
+        let issuer = format!(
+            "http://127.0.0.1:{}",
+            listener
+                .local_addr()
+                .expect("OIDC discovery test server address should be available")
+                .port()
+        );
+        let document_issuer = document_issuer(&issuer);
+        let discovery = json!({
+            "issuer": document_issuer.clone(),
+            "jwks_uri": format!("{issuer}/jwks.json")
+        });
+        let (issuer, server) = spawn_oidc_server(listener, discovery, Some(jwks), 2);
+
+        (issuer, document_issuer, server)
+    }
+
     fn spawn_oidc_discovery_server(
         discovery: Value,
         request_count: usize,
@@ -19517,6 +19677,29 @@ O2gecI9QwDJNpm29J9wJB2F8
             client_secret: None,
             redirect_uri: None,
         }];
+    }
+
+    fn oidc_jwt_provider(issuer: String) -> config::AuthProviderConfig {
+        config::AuthProviderConfig {
+            name: "oidc".to_owned(),
+            provider_type: config::AuthProviderType::Jwt,
+            jwks_url: None,
+            issuer: Some(issuer),
+            audience: None,
+            jwks_timeout_ms: 2000,
+            require_jti: false,
+            roles_claim: "roles".to_owned(),
+            roles_claim_delimiter: None,
+            org_claim: None,
+            introspection_url: None,
+            introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+            user_id_claim: None,
+            email_claim: None,
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
+        }
     }
 
     fn configure_test_cookie_session_provider(

@@ -21,7 +21,7 @@ use crate::{
 
 use super::{
     claims::{extract_roles, extract_string_claim},
-    AuthError, AuthMethod, Principal, SessionCredential, SessionValidator,
+    oidc, AuthError, AuthMethod, Principal, SessionCredential, SessionValidator,
 };
 
 const INVALID_TOKEN: &str = "invalid or expired token";
@@ -53,7 +53,7 @@ impl JwtAuthConfig {
     pub fn from_config(config: &Config) -> Option<Self> {
         Some(Self {
             jwks_url: config.jwt_jwks_url.clone()?,
-            issuer: config.jwt_issuer.clone(),
+            issuer: normalize_auth_config_issuer(config.jwt_issuer.as_deref()),
             audience: config.jwt_audience.clone(),
             http_timeout: Duration::from_millis(config.jwt_jwks_timeout_ms),
             require_jti: config.jwt_require_jti,
@@ -66,7 +66,7 @@ impl JwtAuthConfig {
     pub fn from_provider_config(config: &AuthProviderConfig, jwks_url: String) -> Self {
         Self {
             jwks_url,
-            issuer: config.issuer.clone(),
+            issuer: normalize_auth_config_issuer(config.issuer.as_deref()),
             audience: config.audience.clone(),
             http_timeout: Duration::from_millis(config.jwks_timeout_ms),
             require_jti: config.require_jti,
@@ -162,11 +162,16 @@ impl JwtValidator {
     }
 
     fn with_keys(
-        cfg: JwtAuthConfig,
+        mut cfg: JwtAuthConfig,
         egress_client: Arc<EgressClient>,
         revocation: Arc<dyn RevocationStore>,
         initial_keys: HashMap<String, CachedDecodingKey>,
     ) -> Result<Self, AuthError> {
+        cfg.issuer = cfg
+            .issuer
+            .as_deref()
+            .map(normalize_configured_issuer)
+            .transpose()?;
         Ok(Self {
             cfg,
             egress_client,
@@ -253,8 +258,7 @@ impl JwtValidator {
         validation.validate_aud = self.cfg.audience.is_some();
         let mut required = vec!["exp"];
 
-        if let Some(issuer) = &self.cfg.issuer {
-            validation.set_issuer(&[issuer.as_str()]);
+        if self.cfg.issuer.is_some() {
             required.push("iss");
         }
 
@@ -265,9 +269,28 @@ impl JwtValidator {
 
         validation.set_required_spec_claims(&required);
 
-        decode::<JwtClaims>(token, &key.decoding_key, &validation)
+        let claims = decode::<JwtClaims>(token, &key.decoding_key, &validation)
             .map(|token_data| token_data.claims)
-            .map_err(|_| invalid_token())
+            .map_err(|_| invalid_token())?;
+        self.validate_issuer_claim(&claims)?;
+
+        Ok(claims)
+    }
+
+    fn validate_issuer_claim(&self, claims: &JwtClaims) -> Result<(), AuthError> {
+        let Some(expected_issuer) = &self.cfg.issuer else {
+            return Ok(());
+        };
+        let actual_issuer = claims
+            .iss
+            .as_deref()
+            .and_then(oidc::normalize_issuer)
+            .ok_or_else(invalid_token)?;
+        if actual_issuer != *expected_issuer {
+            return Err(invalid_token());
+        }
+
+        Ok(())
     }
 
     async fn validate_claims(&self, claims: JwtClaims) -> Result<Principal, AuthError> {
@@ -382,6 +405,7 @@ pub(crate) struct CachedDecodingKey {
 #[derive(Debug, Deserialize)]
 struct JwtClaims {
     sub: String,
+    iss: Option<String>,
     email: Option<String>,
     #[allow(dead_code)] // jsonwebtoken validates `exp`; GreenGateway does not read it directly.
     exp: Option<u64>,
@@ -392,6 +416,15 @@ struct JwtClaims {
 
 fn invalid_token() -> AuthError {
     AuthError::InvalidSession(INVALID_TOKEN.to_owned())
+}
+
+fn normalize_configured_issuer(issuer: &str) -> Result<String, AuthError> {
+    oidc::normalize_issuer(issuer)
+        .ok_or_else(|| AuthError::Upstream("JWT issuer must be non-empty".to_owned()))
+}
+
+fn normalize_auth_config_issuer(issuer: Option<&str>) -> Option<String> {
+    issuer.map(|issuer| oidc::normalize_issuer(issuer).unwrap_or_else(|| issuer.to_owned()))
 }
 
 fn cached_decoding_key(key: JwksKey) -> Option<CachedDecodingKey> {
@@ -589,7 +622,7 @@ RowSUZV5FSmOGJ7JyROZ80k=
     }
 
     #[tokio::test]
-    async fn principal_carries_configured_issuer() {
+    async fn principal_carries_normalized_configured_issuer() {
         let issuer = "https://issuer.example.test/";
         let mut claims = base_claims();
         claims["iss"] = json!(issuer);
@@ -598,7 +631,10 @@ RowSUZV5FSmOGJ7JyROZ80k=
 
         let principal = principal_for_claims(claims, cfg).await;
 
-        assert_eq!(principal.issuer.as_deref(), Some(issuer));
+        assert_eq!(
+            principal.issuer.as_deref(),
+            Some("https://issuer.example.test")
+        );
     }
 
     #[tokio::test]

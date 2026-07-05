@@ -50,6 +50,8 @@ impl fmt::Debug for OidcLoginConfig {
             .field("client_id", &self.client_id)
             .field("client_secret", &"<redacted>")
             .field("redirect_uri", &self.redirect_uri)
+            .field("issuer", &self.issuer)
+            .field("jwks_url", &self.jwks_url)
             .field("authorization_endpoint", &self.authorization_endpoint)
             .field("token_endpoint", &self.token_endpoint)
             .field("http_timeout", &self.http_timeout)
@@ -84,6 +86,7 @@ pub enum OidcLoginError {
     TokenExchangeFailed,
     InvalidTokenResponse,
     MissingAccessToken,
+    MissingIdToken,
     InvalidIdToken,
 }
 
@@ -101,6 +104,7 @@ impl fmt::Display for OidcLoginError {
             Self::MissingAccessToken => {
                 write!(formatter, "OIDC token response missing access_token")
             }
+            Self::MissingIdToken => write!(formatter, "OIDC token response missing id_token"),
             Self::InvalidIdToken => write!(formatter, "OIDC id_token validation failed"),
         }
     }
@@ -246,19 +250,20 @@ impl OidcLoginState {
             .filter(|token| !token.is_empty())
             .ok_or(OidcLoginError::MissingAccessToken)?;
 
-        if let Some(id_token) = token_response.id_token {
-            let id_token = id_token.trim();
-            if id_token.is_empty() {
-                return Err(OidcLoginError::InvalidIdToken);
-            }
-            self.id_token_validator
-                .validate_oidc_id_token_nonce(id_token, &nonce)
-                .await
-                .map_err(|err| {
-                    tracing::warn!(error = %err, "OIDC id_token validation failed");
-                    OidcLoginError::InvalidIdToken
-                })?;
+        let id_token = token_response
+            .id_token
+            .ok_or(OidcLoginError::MissingIdToken)?;
+        let id_token = id_token.trim();
+        if id_token.is_empty() {
+            return Err(OidcLoginError::InvalidIdToken);
         }
+        self.id_token_validator
+            .validate_oidc_id_token_nonce(id_token, &nonce)
+            .await
+            .map_err(|err| {
+                tracing::warn!(error = %err, "OIDC id_token validation failed");
+                OidcLoginError::InvalidIdToken
+            })?;
 
         Ok(TokenExchange { access_token })
     }
@@ -414,6 +419,8 @@ mod tests {
             client_id: "admin-ui".to_owned(),
             client_secret: secret.to_owned(),
             redirect_uri: "https://gateway.example.test/v1/admin/auth/callback".to_owned(),
+            issuer: "https://issuer.example.test".to_owned(),
+            jwks_url: "https://issuer.example.test/jwks.json".to_owned(),
             authorization_endpoint: "https://issuer.example.test/oauth2/authorize".to_owned(),
             token_endpoint: "https://issuer.example.test/oauth2/token".to_owned(),
             http_timeout: Duration::from_secs(2),
@@ -424,5 +431,13 @@ mod tests {
         assert!(!output.contains(secret));
         assert!(output.contains("<redacted>"));
         assert!(output.contains("client_secret"));
+    }
+
+    #[test]
+    fn missing_id_token_error_has_clear_display_message() {
+        assert_eq!(
+            OidcLoginError::MissingIdToken.to_string(),
+            "OIDC token response missing id_token"
+        );
     }
 }
