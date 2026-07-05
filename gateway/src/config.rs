@@ -44,6 +44,7 @@ pub const DEFAULT_ADMIN_PREFIX: &str = "/admin";
 const DEFAULT_EXEMPT_PROBE_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_JWT_JWKS_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_ROLES_CLAIM: &str = "roles";
+pub const DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS: u64 = 5_000;
 const DEFAULT_CSRF_ENABLED: bool = true;
 const DEFAULT_CSRF_COOKIE_NAME: &str = "csrf_token";
 const DEFAULT_CSRF_HEADER_NAME: &str = "x-csrf-token";
@@ -99,6 +100,8 @@ const RATE_LIMIT_READ_BURST: &str = "RATE_LIMIT_READ_BURST";
 const RATE_LIMIT_WRITE_RPS: &str = "RATE_LIMIT_WRITE_RPS";
 const RATE_LIMIT_WRITE_BURST: &str = "RATE_LIMIT_WRITE_BURST";
 const ROLES_CLAIM: &str = "ROLES_CLAIM";
+const SERVICE_TOKEN_CACHE_TTL_MS: &str = "SERVICE_TOKEN_CACHE_TTL_MS";
+const SERVICE_TOKEN_SQLITE_PATH: &str = "SERVICE_TOKEN_SQLITE_PATH";
 const SCHEMA_MISMATCH_SIGNAL_THRESHOLD: &str = "SCHEMA_MISMATCH_SIGNAL_THRESHOLD";
 const TRUST_PROXY_HEADERS: &str = "TRUST_PROXY_HEADERS";
 const SESSION_COOKIE_NAME: &str = "SESSION_COOKIE_NAME";
@@ -151,6 +154,8 @@ pub struct Config {
     pub jwt_jwks_timeout_ms: u64,
     pub jwt_require_jti: bool,
     pub roles_claim: String,
+    pub service_token_sqlite_path: Option<String>,
+    pub service_token_cache_ttl_ms: u64,
     pub csrf_enabled: bool,
     pub csrf_cookie_name: String,
     pub csrf_header_name: String,
@@ -523,6 +528,23 @@ impl Config {
             DEFAULT_ROLES_CLAIM,
             &mut problems,
         );
+        let service_token_sqlite_path = parse_optional_string(
+            SERVICE_TOKEN_SQLITE_PATH,
+            get_var(SERVICE_TOKEN_SQLITE_PATH),
+            &mut problems,
+        );
+        let service_token_cache_ttl_ms = validate_positive_u64(
+            SERVICE_TOKEN_CACHE_TTL_MS,
+            parse_var(
+                SERVICE_TOKEN_CACHE_TTL_MS,
+                get_var(SERVICE_TOKEN_CACHE_TTL_MS),
+                DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS,
+            &mut problems,
+        );
         let auth_providers =
             parse_auth_providers(AUTH_PROVIDERS, get_var(AUTH_PROVIDERS), &mut problems)
                 .unwrap_or_else(|| {
@@ -680,6 +702,8 @@ impl Config {
                 jwt_jwks_timeout_ms,
                 jwt_require_jti,
                 roles_claim,
+                service_token_sqlite_path,
+                service_token_cache_ttl_ms,
                 csrf_enabled,
                 csrf_cookie_name,
                 csrf_header_name,
@@ -1808,6 +1832,11 @@ mod tests {
         assert_eq!(config.jwt_jwks_timeout_ms, DEFAULT_JWT_JWKS_TIMEOUT_MS);
         assert!(!config.jwt_require_jti);
         assert_eq!(config.roles_claim, "roles");
+        assert_eq!(config.service_token_sqlite_path, None);
+        assert_eq!(
+            config.service_token_cache_ttl_ms,
+            DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS
+        );
         assert!(config.csrf_enabled);
         assert_eq!(config.csrf_cookie_name, "csrf_token");
         assert_eq!(config.csrf_header_name, "x-csrf-token");
@@ -2893,6 +2922,31 @@ mod tests {
         assert!(message.contains("CSRF_COOKIE_DOMAIN must be a valid cookie Domain attribute"));
         assert!(message.contains("CSRF_EXEMPT_PATHS entries must be URI paths"));
         assert_eq!(error.problems.len(), 5);
+    }
+
+    #[test]
+    fn service_token_config_parses_and_validates() {
+        let config = Config::from_env_vars(|name| match name {
+            "SERVICE_TOKEN_SQLITE_PATH" => Ok(" data/service-tokens.sqlite ".to_owned()),
+            "SERVICE_TOKEN_CACHE_TTL_MS" => Ok("7500".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.service_token_sqlite_path,
+            Some("data/service-tokens.sqlite".to_owned())
+        );
+        assert_eq!(config.service_token_cache_ttl_ms, 7500);
+
+        let error = Config::from_env_vars(|name| match name {
+            "SERVICE_TOKEN_CACHE_TTL_MS" => Ok("0".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject zero service-token TTL");
+        assert!(error
+            .to_string()
+            .contains("SERVICE_TOKEN_CACHE_TTL_MS must be greater than 0"));
     }
 
     #[test]

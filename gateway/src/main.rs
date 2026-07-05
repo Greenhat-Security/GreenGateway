@@ -66,6 +66,9 @@ const POLICY_VALIDATE_ADMIN_ROUTE: &str = "/v1/admin/policy/validate";
 const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
 const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
+const TOKENS_ADMIN_ROUTE: &str = "/v1/admin/tokens";
+const TOKEN_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}";
+const TOKEN_ROTATE_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}/rotate";
 const SCHEMA_COVERAGE_ADMIN_ROUTE: &str = "/v1/admin/schema/coverage";
 const SIGNALS_ADMIN_ROUTE: &str = "/v1/admin/signals";
 const SIGNAL_ACKNOWLEDGE_ADMIN_ROUTE: &str = "/v1/admin/signals/{id}/acknowledge";
@@ -81,6 +84,8 @@ const TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints/r
 const AUDIT_ADMIN_ROLE: &str = "admin";
 const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
 const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
+const ADMIN_TOKENS_READ_PERMISSION: &str = "admin:tokens:read";
+const ADMIN_TOKENS_WRITE_PERMISSION: &str = "admin:tokens:write";
 const ADMIN_SCHEMA_READ_PERMISSION: &str = "admin:schema:read";
 const ADMIN_SIGNALS_READ_PERMISSION: &str = "admin:signals:read";
 const ADMIN_SIGNALS_WRITE_PERMISSION: &str = "admin:signals:write";
@@ -177,6 +182,9 @@ struct AdminRoutes {
     policy_rules_route: String,
     policy_rule_route: String,
     policy_rules_order_route: String,
+    tokens_route: String,
+    token_route: String,
+    token_rotate_route: String,
     schema_coverage_route: String,
     signals_route: String,
     signal_acknowledge_route: String,
@@ -244,6 +252,9 @@ impl AdminRoutes {
             policy_rules_route: format!("{api_prefix}/policy/rules"),
             policy_rule_route: format!("{api_prefix}/policy/rules/{{id}}"),
             policy_rules_order_route: format!("{api_prefix}/policy/rules/order"),
+            tokens_route: format!("{api_prefix}/tokens"),
+            token_route: format!("{api_prefix}/tokens/{{id}}"),
+            token_rotate_route: format!("{api_prefix}/tokens/{{id}}/rotate"),
             schema_coverage_route: format!("{api_prefix}/schema/coverage"),
             signals_route: format!("{api_prefix}/signals"),
             signal_acknowledge_route: format!("{api_prefix}/signals/{{id}}/acknowledge"),
@@ -287,6 +298,16 @@ struct PolicyAdminState {
 }
 
 #[derive(Clone)]
+struct TokenAdminState {
+    store: Option<Arc<dyn auth::TokenStore>>,
+    validator: Option<Arc<auth::ServiceTokenValidator>>,
+    rbac_state: Option<middleware::rbac::RbacState>,
+    audit: audit::AuditLog,
+    trust_proxy_headers: bool,
+    max_body_size: usize,
+}
+
+#[derive(Clone)]
 struct SchemaAdminState {
     coverage: discovery::openapi::SchemaCoverage,
     query_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
@@ -323,6 +344,7 @@ struct AdminApiStates {
     audit: AuditAdminState,
     status: StatusAdminState,
     policy: PolicyAdminState,
+    tokens: TokenAdminState,
     schema: SchemaAdminState,
     signals: SignalsAdminState,
     suggestions: SuggestionsAdminState,
@@ -487,6 +509,12 @@ struct PolicyHistoryParams {
 }
 
 #[derive(Deserialize)]
+struct TokenListParams {
+    limit: Option<String>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct TrafficEndpointDetailParams {
     method: Option<String>,
     endpoint_template: Option<String>,
@@ -625,6 +653,20 @@ struct PolicyRuleShadowReviewSummary {
     samples: Vec<audit::query::ShadowRuleWouldDenySample>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateTokenAdminRequest {
+    scopes: Vec<String>,
+    expires_at: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CreatedTokenAdminResponse {
+    plaintext_token: String,
+    plaintext_token_notice: &'static str,
+    token: auth::tokens::TokenRecord,
+}
+
 #[derive(Serialize)]
 struct RuleDeletedResponse {
     deleted_rule_id: String,
@@ -675,6 +717,12 @@ struct PolicyMutationCommitContext<'a> {
 
 enum PolicyAdminAuthzError {
     NotConfigured,
+    Forbidden,
+}
+
+enum TokenAdminAuthzError {
+    StoreNotConfigured,
+    RbacNotConfigured,
     Forbidden,
 }
 
@@ -941,7 +989,20 @@ fn gateway_app_with_process_started_at(
         proxy.spawn_upstream_health_checks();
     }
     let routes = GatewayRoutes::from_config(&config);
-    let validator = auth_validator_from_config(&config, egress_client)?;
+    let service_token_store = config
+        .service_token_sqlite_path
+        .as_deref()
+        .map(auth::SqliteTokenStore::open)
+        .transpose()?
+        .map(|store| Arc::new(store) as Arc<dyn auth::TokenStore>);
+    let service_token_validator = service_token_store.as_ref().map(|store| {
+        Arc::new(auth::ServiceTokenValidator::new(
+            Arc::clone(store),
+            Duration::from_millis(config.service_token_cache_ttl_ms),
+        ))
+    });
+    let validator =
+        auth_validator_from_config(&config, egress_client, service_token_validator.clone())?;
     let rbac_status = RbacStatus {
         policy_loaded: loaded_policy.is_some(),
         policy_id: loaded_policy.as_ref().and_then(|policy| policy.id.clone()),
@@ -979,6 +1040,14 @@ fn gateway_app_with_process_started_at(
         rbac_state: rbac_state.clone(),
         history_store: policy_history_store,
         query_store: audit_query_store.clone(),
+        audit: audit_log.clone(),
+        trust_proxy_headers: config.trust_proxy_headers,
+        max_body_size: config.max_body_size,
+    };
+    let token_admin_state = TokenAdminState {
+        store: service_token_store,
+        validator: service_token_validator,
+        rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
         trust_proxy_headers: config.trust_proxy_headers,
         max_body_size: config.max_body_size,
@@ -1045,6 +1114,7 @@ fn gateway_app_with_process_started_at(
         audit: audit_admin_state,
         status: status_state,
         policy: policy_admin_state,
+        tokens: token_admin_state,
         schema: schema_admin_state,
         signals: signals_admin_state,
         suggestions: suggestions_admin_state,
@@ -1070,12 +1140,18 @@ fn gateway_app_with_process_started_at(
 fn auth_validator_from_config(
     config: &config::Config,
     egress_client: Arc<egress::EgressClient>,
+    service_token_validator: Option<Arc<auth::ServiceTokenValidator>>,
 ) -> Result<Option<Arc<dyn auth::SessionValidator>>, auth::AuthError> {
-    if config.auth_providers.is_empty() {
+    if config.auth_providers.is_empty() && service_token_validator.is_none() {
         return Ok(None);
     }
 
-    let mut validators = Vec::with_capacity(config.auth_providers.len());
+    let mut validators = Vec::with_capacity(
+        config.auth_providers.len() + usize::from(service_token_validator.is_some()),
+    );
+    if let Some(service_token_validator) = service_token_validator {
+        validators.push(service_token_validator as Arc<dyn auth::SessionValidator>);
+    }
     for provider in &config.auth_providers {
         match provider.provider_type {
             config::AuthProviderType::Jwt => {
@@ -1280,6 +1356,22 @@ fn add_admin_api_routes(
                     put(policy_rules_order_put_endpoint),
                 )
                 .with_state(admin_api_states.policy),
+        )
+        .merge(
+            Router::new()
+                .route(
+                    routes.admin.tokens_route.as_str(),
+                    get(token_list_endpoint).post(token_create_endpoint),
+                )
+                .route(
+                    routes.admin.token_route.as_str(),
+                    get(token_get_endpoint).delete(token_revoke_endpoint),
+                )
+                .route(
+                    routes.admin.token_rotate_route.as_str(),
+                    post(token_rotate_endpoint),
+                )
+                .with_state(admin_api_states.tokens),
         )
         .merge(
             Router::new()
@@ -2652,6 +2744,165 @@ async fn policy_rules_order_put_endpoint(
     with_policy_history_append_warning(response, commit.history_append_failed)
 }
 
+async fn token_create_endpoint(
+    State(state): State<TokenAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(TOKENS_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    let store = match authorized_token_store(&state, &principal, ADMIN_TOKENS_WRITE_PERMISSION) {
+        Ok(store) => store,
+        Err(error) => return token_admin_authz_error_response(error),
+    };
+    let body = match read_request_body(body, state.max_body_size).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let requested = match parse_create_token_body(&body) {
+        Ok(requested) => requested,
+        Err(response) => return *response,
+    };
+
+    let created = match store.create(auth::tokens::CreateTokenRequest {
+        scopes: requested.scopes,
+        created_by: principal.user_id.clone(),
+        expires_at: requested.expires_at,
+    }) {
+        Ok(created) => created,
+        Err(error) => return token_store_error_response(error),
+    };
+
+    emit_service_token_changed(&state, &parts, &principal, "token_created", &created.record);
+
+    (
+        StatusCode::CREATED,
+        Json(CreatedTokenAdminResponse::from_created(created)),
+    )
+        .into_response()
+}
+
+async fn token_list_endpoint(
+    State(state): State<TokenAdminState>,
+    Query(params): Query<TokenListParams>,
+    request: AxumRequest,
+) -> Response {
+    record_request(TOKENS_ADMIN_ROUTE);
+
+    let Some(principal) = request.extensions().get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    let store = match authorized_token_store(&state, principal, ADMIN_TOKENS_READ_PERMISSION) {
+        Ok(store) => store,
+        Err(error) => return token_admin_authz_error_response(error),
+    };
+    let filters = match params.into_filters() {
+        Ok(filters) => filters,
+        Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
+    };
+
+    match store.list(&filters) {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(error) => token_store_error_response(error),
+    }
+}
+
+async fn token_get_endpoint(
+    State(state): State<TokenAdminState>,
+    Path(token_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(TOKEN_ADMIN_ROUTE);
+
+    let Some(principal) = request.extensions().get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    let store = match authorized_token_store(&state, principal, ADMIN_TOKENS_READ_PERMISSION) {
+        Ok(store) => store,
+        Err(error) => return token_admin_authz_error_response(error),
+    };
+
+    match store.get_by_id(&token_id) {
+        Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
+        Ok(None) => not_found("service token was not found"),
+        Err(error) => token_store_error_response(error),
+    }
+}
+
+async fn token_revoke_endpoint(
+    State(state): State<TokenAdminState>,
+    Path(token_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(TOKEN_ADMIN_ROUTE);
+
+    let (parts, _body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    let store = match authorized_token_store(&state, &principal, ADMIN_TOKENS_WRITE_PERMISSION) {
+        Ok(store) => store,
+        Err(error) => return token_admin_authz_error_response(error),
+    };
+
+    match store.revoke(&token_id) {
+        Ok(Some(record)) => {
+            if let Some(validator) = state.validator.as_ref() {
+                validator.invalidate_token_id(&token_id);
+            }
+            emit_service_token_changed(&state, &parts, &principal, "token_revoked", &record);
+            (StatusCode::OK, Json(record)).into_response()
+        }
+        Ok(None) => not_found("service token was not found"),
+        Err(error) => token_store_error_response(error),
+    }
+}
+
+async fn token_rotate_endpoint(
+    State(state): State<TokenAdminState>,
+    Path(token_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(TOKEN_ROTATE_ADMIN_ROUTE);
+
+    let (parts, _body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    let store = match authorized_token_store(&state, &principal, ADMIN_TOKENS_WRITE_PERMISSION) {
+        Ok(store) => store,
+        Err(error) => return token_admin_authz_error_response(error),
+    };
+
+    match store.rotate(&token_id) {
+        Ok(Some(created)) => {
+            if let Some(validator) = state.validator.as_ref() {
+                validator.invalidate_token_id(&token_id);
+            }
+            emit_service_token_changed(
+                &state,
+                &parts,
+                &principal,
+                "token_rotated",
+                &created.record,
+            );
+            (
+                StatusCode::OK,
+                Json(CreatedTokenAdminResponse::from_created(created)),
+            )
+                .into_response()
+        }
+        Ok(None) => not_found("service token was not found"),
+        Err(auth::tokens::TokenStoreError::RevokedToken { .. }) => {
+            conflict("cannot rotate revoked service token")
+        }
+        Err(error) => token_store_error_response(error),
+    }
+}
+
 async fn policy_rule_preview_endpoint(
     State(state): State<PolicyAdminState>,
     request: AxumRequest,
@@ -3722,6 +3973,25 @@ impl PolicyHistoryParams {
     }
 }
 
+impl TokenListParams {
+    fn into_filters(self) -> Result<auth::tokens::TokenListFilters, &'static str> {
+        Ok(auth::tokens::TokenListFilters {
+            limit: parse_limit(self.limit)?,
+            cursor: self.cursor,
+        })
+    }
+}
+
+impl CreatedTokenAdminResponse {
+    fn from_created(created: auth::tokens::CreatedToken) -> Self {
+        Self {
+            plaintext_token: created.plaintext_token,
+            plaintext_token_notice: "Save this token now; the plaintext will not be shown again.",
+            token: created.record,
+        }
+    }
+}
+
 struct TrafficEndpointDetailQuery {
     method: String,
     endpoint_template: String,
@@ -3996,6 +4266,25 @@ fn authorized_policy_state<'a>(
     Ok(rbac_state)
 }
 
+fn authorized_token_store<'a>(
+    state: &'a TokenAdminState,
+    principal: &auth::Principal,
+    permission: &str,
+) -> Result<&'a Arc<dyn auth::TokenStore>, TokenAdminAuthzError> {
+    let Some(rbac_state) = state.rbac_state.as_ref() else {
+        return Err(TokenAdminAuthzError::RbacNotConfigured);
+    };
+
+    if !rbac_state.principal_has_permission(principal, permission) {
+        return Err(TokenAdminAuthzError::Forbidden);
+    }
+
+    state
+        .store
+        .as_ref()
+        .ok_or(TokenAdminAuthzError::StoreNotConfigured)
+}
+
 fn authorized_schema_reader(state: &SchemaAdminState, principal: &auth::Principal) -> bool {
     state.rbac_state.as_ref().is_some_and(|rbac_state| {
         rbac_state.principal_has_permission(principal, ADMIN_SCHEMA_READ_PERMISSION)
@@ -4057,6 +4346,14 @@ fn policy_admin_authz_error_response(error: PolicyAdminAuthzError) -> Response {
     }
 }
 
+fn token_admin_authz_error_response(error: TokenAdminAuthzError) -> Response {
+    match error {
+        TokenAdminAuthzError::StoreNotConfigured => token_store_not_configured(),
+        TokenAdminAuthzError::RbacNotConfigured => token_rbac_not_configured(),
+        TokenAdminAuthzError::Forbidden => forbidden(),
+    }
+}
+
 fn traffic_admin_authz_error_response(error: TrafficAdminAuthzError) -> Response {
     match error {
         TrafficAdminAuthzError::NotConfigured => traffic_rbac_not_configured(),
@@ -4111,6 +4408,11 @@ fn split_authorized_policy_mutation_request(
     };
 
     Ok((parts, body, principal, rbac_state, policy_file))
+}
+
+fn parse_create_token_body(body: &Bytes) -> ResponseResult<CreateTokenAdminRequest> {
+    serde_json::from_slice::<CreateTokenAdminRequest>(body)
+        .map_err(|err| Box::new(bad_request(&format!("invalid token create JSON: {err}"))))
 }
 
 fn parse_policy_body(body: &Bytes) -> Result<rbac::Policy, Vec<String>> {
@@ -5002,6 +5304,43 @@ fn emit_policy_changed_payload(
     ));
 }
 
+fn emit_service_token_changed(
+    state: &TokenAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    action: &'static str,
+    record: &auth::tokens::TokenRecord,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip = client_ip::canonical_client_ip(
+        &parts.headers,
+        &parts.extensions,
+        state.trust_proxy_headers,
+    );
+    let actor = Some(auth::actor_from_principal(principal));
+    let mut payload = json!({
+        "action": action,
+        "token_id": &record.id,
+        "token_prefix": &record.token_prefix,
+        "scopes": &record.scopes,
+        "created_by": &record.created_by,
+    });
+    if let Some(expires_at) = record.expires_at.as_deref() {
+        payload["expires_at"] = json!(expires_at);
+    }
+    if let Some(revoked_at) = record.revoked_at.as_deref() {
+        payload["revoked_at"] = json!(revoked_at);
+    }
+
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::SERVICE_TOKEN_CHANGED,
+        request_id,
+        source_ip,
+        actor,
+        payload,
+    ));
+}
+
 fn emit_traffic_endpoint_review_changed(
     state: &TrafficAdminState,
     parts: &http::request::Parts,
@@ -5213,6 +5552,26 @@ fn policy_history_not_configured() -> Response {
         .into_response()
 }
 
+fn token_rbac_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "token API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn token_store_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "token API requires SERVICE_TOKEN_SQLITE_PATH to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
 fn schema_not_configured() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -5381,6 +5740,24 @@ fn internal_server_error(error: &str) -> Response {
         .into_response()
 }
 
+fn token_store_error_response(error: auth::tokens::TokenStoreError) -> Response {
+    match error {
+        auth::tokens::TokenStoreError::InvalidCursor { parameter } => {
+            bad_request(&format!("invalid query parameter: {parameter}"))
+        }
+        auth::tokens::TokenStoreError::TimeParse { context, .. } => {
+            bad_request(&format!("invalid service-token {context} timestamp"))
+        }
+        auth::tokens::TokenStoreError::RevokedToken { .. } => {
+            conflict("cannot rotate revoked service token")
+        }
+        error => {
+            tracing::error!(error = %error, "service-token store operation failed");
+            internal_server_error("service-token store operation failed")
+        }
+    }
+}
+
 fn record_request(route: &'static str) {
     ::metrics::counter!(REQUEST_COUNTER, "route" => route).increment(1);
 }
@@ -5406,14 +5783,29 @@ async fn principal_probe(
     principal: Option<Extension<auth::Principal>>,
 ) -> axum::response::Response {
     match principal {
-        Some(Extension(principal)) => Json(json!({ "user_id": principal.user_id })).into_response(),
+        Some(Extension(principal)) => Json(json!({
+            "user_id": principal.user_id,
+            "roles": principal.roles,
+            "auth_method": test_auth_method_label(&principal.auth_method),
+        }))
+        .into_response(),
         None => http::StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+#[cfg(test)]
+fn test_auth_method_label(auth_method: &auth::AuthMethod) -> &'static str {
+    match auth_method {
+        auth::AuthMethod::Cookie => "session_cookie",
+        auth::AuthMethod::Bearer => "bearer_token",
+        auth::AuthMethod::ServiceToken => "service_token",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::TokenStore;
     use axum::{body::Body, http::StatusCode};
     use futures_util::StreamExt;
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -5494,6 +5886,8 @@ mod tests {
             jwt_jwks_timeout_ms: 2000,
             jwt_require_jti: false,
             roles_claim: "roles".to_owned(),
+            service_token_sqlite_path: None,
+            service_token_cache_ttl_ms: config::DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS,
             csrf_enabled: true,
             csrf_cookie_name: "csrf_token".to_owned(),
             csrf_header_name: "x-csrf-token".to_owned(),
@@ -6476,6 +6870,9 @@ mod tests {
             default_routes.policy_rules_order_route,
             POLICY_RULES_ORDER_ADMIN_ROUTE
         );
+        assert_eq!(default_routes.tokens_route, TOKENS_ADMIN_ROUTE);
+        assert_eq!(default_routes.token_route, TOKEN_ADMIN_ROUTE);
+        assert_eq!(default_routes.token_rotate_route, TOKEN_ROTATE_ADMIN_ROUTE);
         assert_eq!(
             default_routes.schema_coverage_route,
             SCHEMA_COVERAGE_ADMIN_ROUTE
@@ -6543,6 +6940,12 @@ mod tests {
         assert_eq!(
             custom_routes.policy_rules_order_route,
             "/v1/ops/policy/rules/order"
+        );
+        assert_eq!(custom_routes.tokens_route, "/v1/ops/tokens");
+        assert_eq!(custom_routes.token_route, "/v1/ops/tokens/{id}");
+        assert_eq!(
+            custom_routes.token_rotate_route,
+            "/v1/ops/tokens/{id}/rotate"
         );
         assert_eq!(
             custom_routes.schema_coverage_route,
@@ -8037,6 +8440,44 @@ mod tests {
             .expect("authenticated custom audit request should complete");
         assert_eq!(authenticated_response.status(), StatusCode::OK);
         assert_eq!(json_body(authenticated_response).await["events"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn real_service_token_authenticates_through_full_stack() {
+        let token_db = TempDb::new("service-token-full-stack");
+        let token_store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        let created = token_store
+            .create(auth::tokens::CreateTokenRequest {
+                scopes: vec!["probe-reader".to_owned()],
+                created_by: "bootstrap-admin".to_owned(),
+                expires_at: None,
+            })
+            .expect("service token should create");
+        let policy = TempPolicyFile::new(&service_token_policy_document());
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        config.service_token_cache_ttl_ms = 20;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let response = authenticated_principal_probe(&router, &created.plaintext_token).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["user_id"],
+            json!(format!("service-token:{}", created.record.id))
+        );
+        assert_eq!(body["auth_method"], json!("service_token"));
+        assert_eq!(body["roles"], json!(["probe-reader"]));
     }
 
     #[tokio::test]
@@ -9994,6 +10435,284 @@ mod tests {
         );
         let (after_etag, _) = current_policy(&router).await;
         assert_eq!(after_etag, current_etag);
+    }
+
+    #[tokio::test]
+    async fn token_admin_create_list_get_require_permissions_and_never_list_secret_material() {
+        let token_db = TempDb::new("token-admin-create-list");
+        let policy = TempPolicyFile::new(&token_policy_document_string());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = token_admin_router(&token_db, &policy, audit_log);
+
+        let forbidden_create = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-reader"])),
+                Some(json!({ "scopes": ["probe-reader"] }).to_string()),
+            ))
+            .await
+            .expect("read-only token create request should complete");
+        assert_eq!(forbidden_create.status(), StatusCode::FORBIDDEN);
+
+        let create_response = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-writer"])),
+                Some(
+                    json!({
+                        "scopes": ["probe-reader", "admin:tokens:read"],
+                        "expires_at": "2099-01-01T00:00:00Z"
+                    })
+                    .to_string(),
+                ),
+            ))
+            .await
+            .expect("token create request should complete");
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = json_body(create_response).await;
+        let plaintext = create_body["plaintext_token"]
+            .as_str()
+            .expect("created response should include one-time plaintext token")
+            .to_owned();
+        assert!(plaintext.starts_with("ggw_"));
+        assert!(create_body["plaintext_token_notice"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("will not be shown again"));
+        let token_id = create_body["token"]["id"]
+            .as_str()
+            .expect("created response should include token id")
+            .to_owned();
+        assert_eq!(
+            create_body["token"]["scopes"],
+            json!(["probe-reader", "admin:tokens:read"])
+        );
+        let create_serialized = serde_json::to_string(&create_body).unwrap();
+        assert!(!create_serialized.contains("token_hash"));
+
+        let forbidden_list = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::GET,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-writer"])),
+                None,
+            ))
+            .await
+            .expect("write-only token list request should complete");
+        assert_eq!(forbidden_list.status(), StatusCode::FORBIDDEN);
+
+        let list_response = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::GET,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-reader"])),
+                None,
+            ))
+            .await
+            .expect("token list request should complete");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = json_body(list_response).await;
+        assert_eq!(list_body["tokens"][0]["id"], json!(token_id));
+        let list_serialized = serde_json::to_string(&list_body).unwrap();
+        assert!(!list_serialized.contains(&plaintext));
+        assert!(!list_serialized.contains("plaintext_token"));
+        assert!(!list_serialized.contains("token_hash"));
+
+        let get_missing = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::GET,
+                &format!("{TOKENS_ADMIN_ROUTE}/missing"),
+                Some(test_principal(&["tokens-reader"])),
+                None,
+            ))
+            .await
+            .expect("missing token get request should complete");
+        assert_eq!(get_missing.status(), StatusCode::NOT_FOUND);
+
+        let get_response = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::GET,
+                &format!("{TOKENS_ADMIN_ROUTE}/{token_id}"),
+                Some(test_principal(&["tokens-reader"])),
+                None,
+            ))
+            .await
+            .expect("token get request should complete");
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_body = json_body(get_response).await;
+        assert_eq!(get_body["id"], json!(token_id));
+        let get_serialized = serde_json::to_string(&get_body).unwrap();
+        assert!(!get_serialized.contains(&plaintext));
+        assert!(!get_serialized.contains("plaintext_token"));
+        assert!(!get_serialized.contains("token_hash"));
+
+        let event = captured_token_change(&capture, "token_created");
+        assert_token_change_actor(&event);
+        assert_eq!(event.payload["action"], json!("token_created"));
+        assert_eq!(event.payload["token_id"], json!(token_id));
+        assert_eq!(
+            event.payload["scopes"],
+            json!(["probe-reader", "admin:tokens:read"])
+        );
+        let audit_serialized = serde_json::to_string(&event).unwrap();
+        assert!(!audit_serialized.contains(&plaintext));
+        assert!(!audit_serialized.contains("token_hash"));
+    }
+
+    #[tokio::test]
+    async fn token_admin_revoke_is_idempotent_requires_write_and_audits() {
+        let token_db = TempDb::new("token-admin-revoke");
+        let policy = TempPolicyFile::new(&token_policy_document_string());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = token_admin_router(&token_db, &policy, audit_log);
+        let created = create_token_via_endpoint(&router, &["probe-reader"]).await;
+        let token_id = created["token"]["id"]
+            .as_str()
+            .expect("created response should include token id")
+            .to_owned();
+
+        let forbidden_revoke = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::DELETE,
+                &format!("{TOKENS_ADMIN_ROUTE}/{token_id}"),
+                Some(test_principal(&["tokens-reader"])),
+                None,
+            ))
+            .await
+            .expect("read-only token revoke request should complete");
+        assert_eq!(forbidden_revoke.status(), StatusCode::FORBIDDEN);
+
+        let first = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::DELETE,
+                &format!("{TOKENS_ADMIN_ROUTE}/{token_id}"),
+                Some(test_principal(&["tokens-writer"])),
+                None,
+            ))
+            .await
+            .expect("token revoke request should complete");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = json_body(first).await;
+        let first_revoked_at = first_body["revoked_at"]
+            .as_str()
+            .expect("revoked token should include revoked_at")
+            .to_owned();
+
+        let second = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::DELETE,
+                &format!("{TOKENS_ADMIN_ROUTE}/{token_id}"),
+                Some(test_principal(&["tokens-writer"])),
+                None,
+            ))
+            .await
+            .expect("second token revoke request should complete");
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(second).await["revoked_at"],
+            json!(first_revoked_at)
+        );
+
+        let event = captured_token_change(&capture, "token_revoked");
+        assert_token_change_actor(&event);
+        assert_eq!(event.payload["action"], json!("token_revoked"));
+        assert_eq!(event.payload["token_id"], json!(token_id));
+    }
+
+    #[tokio::test]
+    async fn token_admin_rotate_returns_new_plaintext_and_invalidates_old_bearer() {
+        let token_db = TempDb::new("token-admin-rotate");
+        let token_store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        let created = token_store
+            .create(auth::tokens::CreateTokenRequest {
+                scopes: vec!["token-admin".to_owned(), "probe-reader".to_owned()],
+                created_by: "bootstrap-admin".to_owned(),
+                expires_at: None,
+            })
+            .expect("service token should create");
+        let policy = TempPolicyFile::new(&service_token_policy_document());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        config.service_token_cache_ttl_ms = 5_000;
+        config.rbac_exempt_paths.push(TOKENS_ADMIN_ROUTE.to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let before_rotate = authenticated_principal_probe(&router, &created.plaintext_token).await;
+        assert_eq!(before_rotate.status(), StatusCode::OK);
+
+        let rotate_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{TOKENS_ADMIN_ROUTE}/{}/rotate", created.record.id))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", created.plaintext_token),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::empty())
+                    .expect("rotate request should build"),
+            )
+            .await
+            .expect("token rotate request should complete");
+        assert_eq!(rotate_response.status(), StatusCode::OK);
+        let rotate_body = json_body(rotate_response).await;
+        let new_plaintext = rotate_body["plaintext_token"]
+            .as_str()
+            .expect("rotate response should include new one-time plaintext")
+            .to_owned();
+        assert_ne!(new_plaintext, created.plaintext_token);
+        assert!(rotate_body["plaintext_token_notice"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("will not be shown again"));
+
+        let old_probe = authenticated_principal_probe(&router, &created.plaintext_token).await;
+        assert_eq!(old_probe.status(), StatusCode::UNAUTHORIZED);
+        let new_probe = authenticated_principal_probe(&router, &new_plaintext).await;
+        assert_eq!(new_probe.status(), StatusCode::OK);
+
+        let event = captured_token_change(&capture, "token_rotated");
+        let actor = event.actor.as_ref().expect("rotate actor should be set");
+        assert_eq!(
+            actor.user_id,
+            format!("service-token:{}", created.record.id)
+        );
+        assert_eq!(actor.auth_mode, "service_token");
+        assert_eq!(event.payload["action"], json!("token_rotated"));
+        assert_eq!(event.payload["token_id"], json!(created.record.id));
+        let audit_serialized = serde_json::to_string(&event).unwrap();
+        assert!(!audit_serialized.contains(&created.plaintext_token));
+        assert!(!audit_serialized.contains(&new_plaintext));
+        assert!(!audit_serialized.contains("token_hash"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14707,6 +15426,66 @@ paths:
         .expect("app should build")
     }
 
+    fn token_admin_router(
+        token_db: &TempDb,
+        policy: &TempPolicyFile,
+        audit_log: audit::AuditLog,
+    ) -> Router {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        config.rbac_exempt_paths.push(TOKENS_ADMIN_ROUTE.to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+
+        app(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("app should build")
+    }
+
+    fn token_admin_request(
+        method: Method,
+        uri: &str,
+        principal: Option<auth::Principal>,
+        body: Option<String>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method(method.clone()).uri(uri);
+        if matches!(method, Method::POST) {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        if matches!(method, Method::POST | Method::DELETE) {
+            builder = builder.header(header::AUTHORIZATION, "Bearer test-token");
+        }
+
+        let mut request = builder
+            .body(Body::from(body.unwrap_or_default()))
+            .expect("token admin request should build");
+        if let Some(principal) = principal {
+            request.extensions_mut().insert(principal);
+        }
+
+        request
+    }
+
+    async fn create_token_via_endpoint(router: &Router, scopes: &[&str]) -> Value {
+        let response = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-writer"])),
+                Some(json!({ "scopes": scopes }).to_string()),
+            ))
+            .await
+            .expect("token create request should complete");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        json_body(response).await
+    }
+
     fn policy_admin_request(
         method: Method,
         uri: &str,
@@ -14955,6 +15734,72 @@ paths:
         })
     }
 
+    fn token_policy_document_string() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "id": "token-admin-policy",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "tokens-reader": {
+                    "permissions": [ADMIN_TOKENS_READ_PERMISSION]
+                },
+                "tokens-writer": {
+                    "permissions": [ADMIN_TOKENS_WRITE_PERMISSION]
+                },
+                "token-admin": {
+                    "permissions": [
+                        ADMIN_TOKENS_READ_PERMISSION,
+                        ADMIN_TOKENS_WRITE_PERMISSION
+                    ]
+                },
+                "probe-reader": {
+                    "permissions": ["test:read"]
+                }
+            },
+            "routes": []
+        })
+        .to_string()
+    }
+
+    fn service_token_policy_document() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "id": "service-token-policy",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "probe-reader": {
+                    "permissions": ["test:read"]
+                },
+                "token-admin": {
+                    "permissions": [
+                        ADMIN_TOKENS_READ_PERMISSION,
+                        ADMIN_TOKENS_WRITE_PERMISSION
+                    ]
+                }
+            },
+            "routes": [
+                {
+                    "methods": ["GET"],
+                    "path_prefix": "/__test",
+                    "permission": "test:read"
+                },
+                {
+                    "methods": ["GET"],
+                    "path_prefix": TOKENS_ADMIN_ROUTE,
+                    "permission": ADMIN_TOKENS_READ_PERMISSION
+                },
+                {
+                    "methods": ["POST", "DELETE"],
+                    "path_prefix": TOKENS_ADMIN_ROUTE,
+                    "permission": ADMIN_TOKENS_WRITE_PERMISSION
+                }
+            ]
+        })
+        .to_string()
+    }
+
     fn schema_policy_document() -> String {
         json!({
             "schema_version": "0.1.0",
@@ -15096,6 +15941,33 @@ paths:
         let actor = event.actor.as_ref().expect("actor should be set");
         assert_eq!(actor.user_id, "user-123");
         assert_eq!(actor.roles, Some(vec!["admin".to_owned()]));
+    }
+
+    fn captured_token_change(
+        capture: &audit::sink::tests::CaptureSink,
+        action: &str,
+    ) -> audit::AuditEvent {
+        assert_eventually(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == audit::event::SERVICE_TOKEN_CHANGED
+                    && event.payload["action"] == json!(action)
+            })
+        });
+
+        capture
+            .events()
+            .into_iter()
+            .find(|event| {
+                event.event_type == audit::event::SERVICE_TOKEN_CHANGED
+                    && event.payload["action"] == json!(action)
+            })
+            .expect("service_token.changed event should be captured")
+    }
+
+    fn assert_token_change_actor(event: &audit::AuditEvent) {
+        let actor = event.actor.as_ref().expect("actor should be set");
+        assert_eq!(actor.user_id, "user-123");
+        assert_eq!(actor.auth_mode, "bearer_token");
     }
 
     async fn status_json(router: Router, principal: Option<auth::Principal>) -> Value {

@@ -123,7 +123,8 @@
           "items": {
             "enum": [
               "bearer_token",
-              "session_cookie"
+              "session_cookie",
+              "service_token"
             ]
           }
         },

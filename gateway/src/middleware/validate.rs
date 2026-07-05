@@ -164,6 +164,8 @@ mod tests {
             jwt_jwks_timeout_ms: 2000,
             jwt_require_jti: false,
             roles_claim: "roles".to_owned(),
+            service_token_sqlite_path: None,
+            service_token_cache_ttl_ms: crate::config::DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS,
             csrf_enabled: true,
             csrf_cookie_name: "csrf_token".to_owned(),
             csrf_header_name: "x-csrf-token".to_owned(),
