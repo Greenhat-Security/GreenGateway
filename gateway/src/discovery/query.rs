@@ -804,6 +804,87 @@ impl DiscoveryQueryStore {
         })
     }
 
+    pub fn list_principal_endpoint_signals(
+        &self,
+        principal: &str,
+        limit: usize,
+    ) -> Result<Vec<Signal>, DiscoveryQueryError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let target_key_suffix = format!(" {principal}");
+        let target_key_pattern = format!("%{}", like_escape(&target_key_suffix));
+        let rows = {
+            let connection = self.connection_guard();
+            let mut statement = connection
+                .prepare(
+                    r#"
+                    SELECT
+                        id,
+                        signal_type,
+                        target_kind,
+                        target_key,
+                        target_identity_json,
+                        explanation,
+                        evidence_json,
+                        state,
+                        created_at,
+                        updated_at,
+                        transitioned_at,
+                        transitioned_by
+                    FROM discovery_signals
+                    WHERE signal_type = ?1
+                      AND target_kind = ?2
+                      AND target_key LIKE ?3 ESCAPE '\'
+                    ORDER BY julianday(created_at) DESC, id ASC
+                    "#,
+                )
+                .map_err(|source| DiscoveryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let rows = statement
+                .query_map(
+                    params![
+                        signals::PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_TYPE,
+                        signals::PRINCIPAL_ENDPOINT_TARGET_KIND,
+                        target_key_pattern
+                    ],
+                    RawSignal::from_row,
+                )
+                .map_err(|source| DiscoveryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| DiscoveryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            rows
+        };
+
+        let mut signals = Vec::new();
+        for row in rows {
+            let signal = row.into_signal()?;
+            if signal
+                .target
+                .identity
+                .get("principal")
+                .and_then(Value::as_str)
+                == Some(principal)
+            {
+                signals.push(signal);
+                if signals.len() == limit {
+                    break;
+                }
+            }
+        }
+
+        Ok(signals)
+    }
+
     pub fn transition_signal(
         &self,
         signal_id: &str,

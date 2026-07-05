@@ -1,16 +1,17 @@
 use std::{
     error::Error,
     fmt, io,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
     },
     thread::{self, JoinHandle},
     time::Duration as StdDuration,
 };
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{config::Config, metrics::LOCK_POISON_RECOVERIES_TOTAL};
@@ -73,10 +74,15 @@ pub struct PrincipalDirectory {
 }
 
 struct PrincipalDirectoryInner {
-    path: PathBuf,
+    shared: Arc<PrincipalDirectoryShared>,
     tx: SyncSender<PrincipalObservation>,
     shutdown_tx: Mutex<Option<Sender<()>>>,
     flusher: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct PrincipalDirectoryShared {
+    path: PathBuf,
+    connection: Mutex<Connection>,
 }
 
 #[derive(Debug)]
@@ -124,6 +130,104 @@ impl Error for PrincipalDirectoryError {
     }
 }
 
+#[derive(Debug)]
+pub enum PrincipalDirectoryQueryError {
+    NotConfigured,
+    InvalidCursor {
+        parameter: &'static str,
+    },
+    Sqlite {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
+    Json {
+        context: &'static str,
+        source: serde_json::Error,
+    },
+}
+
+impl fmt::Display for PrincipalDirectoryQueryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotConfigured => write!(formatter, "principal directory is not configured"),
+            Self::InvalidCursor { parameter } => {
+                write!(
+                    formatter,
+                    "invalid principal directory cursor parameter {parameter}"
+                )
+            }
+            Self::Sqlite { path, source } => write!(
+                formatter,
+                "failed to query SQLite principal directory at {}: {source}",
+                path.display()
+            ),
+            Self::Json { context, source } => {
+                write!(formatter, "failed to serialize {context}: {source}")
+            }
+        }
+    }
+}
+
+impl Error for PrincipalDirectoryQueryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Sqlite { source, .. } => Some(source),
+            Self::Json { source, .. } => Some(source),
+            Self::NotConfigured | Self::InvalidCursor { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrincipalTypeFilter {
+    Human,
+    Service,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrincipalDirectoryListFilters {
+    pub issuer: Option<String>,
+    pub auth_method: Option<String>,
+    pub principal_type: Option<PrincipalTypeFilter>,
+    pub last_seen_after: Option<String>,
+    pub last_seen_before: Option<String>,
+    pub limit: usize,
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrincipalDirectoryKey {
+    pub subject: String,
+    pub issuer: String,
+    pub auth_method: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PrincipalDirectoryRecord {
+    pub subject: String,
+    pub issuer: String,
+    pub auth_method: String,
+    pub email: Option<String>,
+    pub org_id: Option<String>,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub request_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PrincipalDirectoryListPage {
+    pub principals: Vec<PrincipalDirectoryRecord>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PrincipalDirectoryCursor {
+    last_seen: String,
+    subject: String,
+    issuer: String,
+    auth_method: String,
+}
+
 impl PrincipalDirectory {
     pub fn disabled() -> Self {
         Self { inner: None }
@@ -153,19 +257,23 @@ impl PrincipalDirectory {
             path: path.clone(),
             source,
         })?;
+        let shared = Arc::new(PrincipalDirectoryShared {
+            path: path.clone(),
+            connection: Mutex::new(connection),
+        });
 
         let (tx, rx) =
             mpsc::sync_channel::<PrincipalObservation>(PRINCIPAL_DIRECTORY_CHANNEL_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
-        let flusher_path = path.clone();
+        let flusher_shared = Arc::clone(&shared);
         let flusher = thread::Builder::new()
             .name("principal-directory-sqlite-flusher".to_owned())
-            .spawn(move || flusher_loop(flusher_path, connection, rx, shutdown_rx, flush_interval))
+            .spawn(move || flusher_loop(flusher_shared, rx, shutdown_rx, flush_interval))
             .map_err(|source| PrincipalDirectoryError::ThreadSpawn { source })?;
 
         Ok(Self {
             inner: Some(Arc::new(PrincipalDirectoryInner {
-                path,
+                shared,
                 tx,
                 shutdown_tx: Mutex::new(Some(shutdown_tx)),
                 flusher: Mutex::new(Some(flusher)),
@@ -179,6 +287,32 @@ impl PrincipalDirectory {
         };
 
         inner.observe(PrincipalObservation::from_principal(principal));
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    pub fn list(
+        &self,
+        filters: &PrincipalDirectoryListFilters,
+    ) -> Result<PrincipalDirectoryListPage, PrincipalDirectoryQueryError> {
+        let Some(inner) = &self.inner else {
+            return Err(PrincipalDirectoryQueryError::NotConfigured);
+        };
+
+        inner.shared.list(filters)
+    }
+
+    pub fn get(
+        &self,
+        key: &PrincipalDirectoryKey,
+    ) -> Result<Option<PrincipalDirectoryRecord>, PrincipalDirectoryQueryError> {
+        let Some(inner) = &self.inner else {
+            return Err(PrincipalDirectoryQueryError::NotConfigured);
+        };
+
+        inner.shared.get(key)
     }
 }
 
@@ -204,6 +338,112 @@ impl PrincipalDirectoryInner {
     }
 }
 
+impl PrincipalDirectoryShared {
+    fn list(
+        &self,
+        filters: &PrincipalDirectoryListFilters,
+    ) -> Result<PrincipalDirectoryListPage, PrincipalDirectoryQueryError> {
+        let cursor = filters
+            .cursor
+            .as_deref()
+            .map(|value| decode_cursor::<PrincipalDirectoryCursor>("cursor", value))
+            .transpose()?;
+        let (sql, params) = build_principal_list_query(filters, cursor.as_ref());
+        let rows = {
+            let connection = self.connection_guard();
+            let mut statement = connection.prepare(&sql).map_err(|source| {
+                PrincipalDirectoryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                }
+            })?;
+            let rows = statement
+                .query_map(params_from_iter(params.iter()), principal_record_from_row)
+                .map_err(|source| PrincipalDirectoryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| PrincipalDirectoryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            rows
+        };
+
+        let mut principals = rows;
+        let has_more = principals.len() > filters.limit;
+        if has_more {
+            principals.truncate(filters.limit);
+        }
+        let next_cursor = if has_more {
+            principals
+                .last()
+                .map(|record| {
+                    encode_cursor(&PrincipalDirectoryCursor {
+                        last_seen: record.last_seen.clone(),
+                        subject: record.subject.clone(),
+                        issuer: record.issuer.clone(),
+                        auth_method: record.auth_method.clone(),
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
+        Ok(PrincipalDirectoryListPage {
+            principals,
+            next_cursor,
+        })
+    }
+
+    fn get(
+        &self,
+        key: &PrincipalDirectoryKey,
+    ) -> Result<Option<PrincipalDirectoryRecord>, PrincipalDirectoryQueryError> {
+        let connection = self.connection_guard();
+        connection
+            .query_row(
+                r#"
+                SELECT subject, issuer, auth_method, email, org_id, first_seen, last_seen, request_count
+                FROM principal_directory
+                WHERE subject = ?1 AND issuer = ?2 AND auth_method = ?3
+                "#,
+                params![
+                    key.subject.as_str(),
+                    key.issuer.as_str(),
+                    key.auth_method.as_str()
+                ],
+                principal_record_from_row,
+            )
+            .optional()
+            .map_err(|source| PrincipalDirectoryQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    fn connection_guard(&self) -> MutexGuard<'_, Connection> {
+        match self.connection.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                ::metrics::counter!(
+                    LOCK_POISON_RECOVERIES_TOTAL,
+                    "component" => "principal_directory",
+                    "lock" => "connection"
+                )
+                .increment(1);
+                tracing::error!(
+                    path = %self.path.display(),
+                    "SQLite principal directory connection lock poisoned; recovering"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+}
+
 impl Drop for PrincipalDirectoryInner {
     fn drop(&mut self) {
         if let Some(shutdown_tx) = take_mutex_value(&self.shutdown_tx, "shutdown_tx", self) {
@@ -213,7 +453,7 @@ impl Drop for PrincipalDirectoryInner {
         if let Some(flusher) = take_mutex_value(&self.flusher, "flusher", self) {
             if flusher.join().is_err() {
                 tracing::error!(
-                    path = %self.path.display(),
+                    path = %self.shared.path.display(),
                     "SQLite principal directory flusher thread panicked during shutdown"
                 );
             }
@@ -245,8 +485,7 @@ impl PrincipalObservation {
 }
 
 fn flusher_loop(
-    path: PathBuf,
-    mut connection: Connection,
+    shared: Arc<PrincipalDirectoryShared>,
     rx: Receiver<PrincipalObservation>,
     shutdown_rx: Receiver<()>,
     flush_interval: StdDuration,
@@ -256,22 +495,22 @@ fn flusher_loop(
     loop {
         match rx.recv_timeout(flush_interval) {
             Ok(observation) => {
-                push_observation(&path, &mut connection, &mut buffer, observation);
-                drain_available_observations(&path, &mut connection, &rx, &mut buffer);
+                push_observation(&shared, &mut buffer, observation);
+                drain_available_observations(&shared, &rx, &mut buffer);
             }
             Err(RecvTimeoutError::Timeout) => {
-                flush_buffer(&path, &mut connection, &mut buffer);
+                flush_buffer(&shared, &mut buffer);
             }
             Err(RecvTimeoutError::Disconnected) => {
-                flush_buffer(&path, &mut connection, &mut buffer);
+                flush_buffer(&shared, &mut buffer);
                 return;
             }
         }
 
         match shutdown_rx.try_recv() {
             Ok(()) | Err(TryRecvError::Disconnected) => {
-                drain_available_observations(&path, &mut connection, &rx, &mut buffer);
-                flush_buffer(&path, &mut connection, &mut buffer);
+                drain_available_observations(&shared, &rx, &mut buffer);
+                flush_buffer(&shared, &mut buffer);
                 return;
             }
             Err(TryRecvError::Empty) => {}
@@ -280,45 +519,48 @@ fn flusher_loop(
 }
 
 fn drain_available_observations(
-    path: &Path,
-    connection: &mut Connection,
+    shared: &PrincipalDirectoryShared,
     rx: &Receiver<PrincipalObservation>,
     buffer: &mut Vec<PrincipalObservation>,
 ) {
     loop {
         match rx.try_recv() {
-            Ok(observation) => push_observation(path, connection, buffer, observation),
+            Ok(observation) => push_observation(shared, buffer, observation),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
         }
     }
 }
 
 fn push_observation(
-    path: &Path,
-    connection: &mut Connection,
+    shared: &PrincipalDirectoryShared,
     buffer: &mut Vec<PrincipalObservation>,
     observation: PrincipalObservation,
 ) {
     buffer.push(observation);
 
     if buffer.len() >= PRINCIPAL_DIRECTORY_BATCH_SIZE {
-        flush_buffer(path, connection, buffer);
+        flush_buffer(shared, buffer);
     }
 }
 
-fn flush_buffer(path: &Path, connection: &mut Connection, buffer: &mut Vec<PrincipalObservation>) {
+fn flush_buffer(shared: &PrincipalDirectoryShared, buffer: &mut Vec<PrincipalObservation>) {
     if buffer.is_empty() {
         return;
     }
 
-    if let Err(err) = write_observations(connection, buffer) {
+    let result = {
+        let mut connection = shared.connection_guard();
+        write_observations(&mut connection, buffer)
+    };
+
+    if let Err(err) = result {
         ::metrics::counter!(
             PRINCIPAL_DIRECTORY_SQLITE_FLUSH_ERRORS_TOTAL,
             "operation" => "flush"
         )
         .increment(1);
         tracing::error!(
-            path = %path.display(),
+            path = %shared.path.display(),
             observation_count = buffer.len(),
             error = %err,
             "failed to flush SQLite principal directory observations; dropping batch"
@@ -376,6 +618,123 @@ fn auth_method_label(auth_method: &AuthMethod) -> &'static str {
     }
 }
 
+fn build_principal_list_query(
+    filters: &PrincipalDirectoryListFilters,
+    cursor: Option<&PrincipalDirectoryCursor>,
+) -> (String, Vec<SqlValue>) {
+    let mut sql = String::from(
+        r#"
+        SELECT subject, issuer, auth_method, email, org_id, first_seen, last_seen, request_count
+        FROM principal_directory
+        "#,
+    );
+    let mut clauses = Vec::new();
+    let mut params = Vec::new();
+
+    if let Some(issuer) = &filters.issuer {
+        clauses.push("issuer = ?");
+        params.push(SqlValue::Text(issuer.clone()));
+    }
+    if let Some(auth_method) = &filters.auth_method {
+        clauses.push("auth_method = ?");
+        params.push(SqlValue::Text(auth_method.clone()));
+    }
+    if let Some(principal_type) = filters.principal_type {
+        match principal_type {
+            PrincipalTypeFilter::Human => {
+                clauses.push("auth_method IN ('bearer', 'cookie')");
+            }
+            PrincipalTypeFilter::Service => {
+                clauses.push("auth_method = 'service_token'");
+            }
+        }
+    }
+    if let Some(last_seen_after) = &filters.last_seen_after {
+        clauses.push("julianday(last_seen) >= julianday(?)");
+        params.push(SqlValue::Text(last_seen_after.clone()));
+    }
+    if let Some(last_seen_before) = &filters.last_seen_before {
+        clauses.push("julianday(last_seen) <= julianday(?)");
+        params.push(SqlValue::Text(last_seen_before.clone()));
+    }
+    if let Some(cursor) = cursor {
+        clauses.push(
+            r#"
+            (
+                julianday(last_seen) < julianday(?)
+                OR (
+                    julianday(last_seen) = julianday(?)
+                    AND (
+                        subject > ?
+                        OR (subject = ? AND issuer > ?)
+                        OR (subject = ? AND issuer = ? AND auth_method > ?)
+                    )
+                )
+            )
+            "#,
+        );
+        params.push(SqlValue::Text(cursor.last_seen.clone()));
+        params.push(SqlValue::Text(cursor.last_seen.clone()));
+        params.push(SqlValue::Text(cursor.subject.clone()));
+        params.push(SqlValue::Text(cursor.subject.clone()));
+        params.push(SqlValue::Text(cursor.issuer.clone()));
+        params.push(SqlValue::Text(cursor.subject.clone()));
+        params.push(SqlValue::Text(cursor.issuer.clone()));
+        params.push(SqlValue::Text(cursor.auth_method.clone()));
+    }
+
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+
+    sql.push_str(
+        " ORDER BY julianday(last_seen) DESC, subject ASC, issuer ASC, auth_method ASC LIMIT ?",
+    );
+    params.push(SqlValue::Integer(query_limit(filters.limit)));
+
+    (sql, params)
+}
+
+fn principal_record_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PrincipalDirectoryRecord> {
+    let request_count: i64 = row.get(7)?;
+    Ok(PrincipalDirectoryRecord {
+        subject: row.get(0)?,
+        issuer: row.get(1)?,
+        auth_method: row.get(2)?,
+        email: row.get(3)?,
+        org_id: row.get(4)?,
+        first_seen: row.get(5)?,
+        last_seen: row.get(6)?,
+        request_count: u64::try_from(request_count).unwrap_or(0),
+    })
+}
+
+fn encode_cursor<T: Serialize>(cursor: &T) -> Result<String, PrincipalDirectoryQueryError> {
+    let json = serde_json::to_vec(cursor).map_err(|source| PrincipalDirectoryQueryError::Json {
+        context: "cursor",
+        source,
+    })?;
+
+    Ok(hex::encode(json))
+}
+
+fn decode_cursor<T: DeserializeOwned>(
+    parameter: &'static str,
+    value: &str,
+) -> Result<T, PrincipalDirectoryQueryError> {
+    let bytes = hex::decode(value)
+        .map_err(|_| PrincipalDirectoryQueryError::InvalidCursor { parameter })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| PrincipalDirectoryQueryError::InvalidCursor { parameter })
+}
+
+fn query_limit(limit: usize) -> i64 {
+    i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
+}
+
 fn take_mutex_value<T>(
     mutex: &Mutex<Option<T>>,
     lock_name: &'static str,
@@ -391,7 +750,7 @@ fn take_mutex_value<T>(
             )
             .increment(1);
             tracing::error!(
-                path = %inner.path.display(),
+                path = %inner.shared.path.display(),
                 lock = lock_name,
                 "SQLite principal directory shutdown lock poisoned; recovering"
             );
@@ -541,6 +900,198 @@ mod tests {
     }
 
     #[test]
+    fn list_filters_principals_by_issuer_auth_method_type_and_activity_window() {
+        let directory = seeded_directory(
+            "list-filters",
+            &[
+                observation(
+                    "alpha",
+                    Some("https://issuer-a.example.test/"),
+                    "bearer",
+                    Some("alpha@example.test"),
+                    Some("org-a"),
+                    "2026-01-04T00:00:00Z",
+                ),
+                observation(
+                    "bravo",
+                    Some("https://issuer-a.example.test/"),
+                    "service_token",
+                    None,
+                    Some("org-a"),
+                    "2026-01-03T00:00:00Z",
+                ),
+                observation(
+                    "charlie",
+                    Some("https://issuer-b.example.test/"),
+                    "cookie",
+                    Some("charlie@example.test"),
+                    Some("org-b"),
+                    "2026-01-02T00:00:00Z",
+                ),
+                observation(
+                    "delta",
+                    Some("https://issuer-a.example.test/"),
+                    "bearer",
+                    None,
+                    None,
+                    "2026-01-01T00:00:00Z",
+                ),
+            ],
+        );
+
+        let issuer_page = directory
+            .list(&PrincipalDirectoryListFilters {
+                issuer: Some("https://issuer-a.example.test/".to_owned()),
+                auth_method: None,
+                principal_type: None,
+                last_seen_after: None,
+                last_seen_before: None,
+                limit: 50,
+                cursor: None,
+            })
+            .expect("issuer-filtered principals should query");
+        assert_eq!(
+            record_subjects(&issuer_page.principals),
+            vec!["alpha", "bravo", "delta"]
+        );
+
+        let service_page = directory
+            .list(&PrincipalDirectoryListFilters {
+                issuer: None,
+                auth_method: Some("service_token".to_owned()),
+                principal_type: None,
+                last_seen_after: None,
+                last_seen_before: None,
+                limit: 50,
+                cursor: None,
+            })
+            .expect("auth-method-filtered principals should query");
+        assert_eq!(record_subjects(&service_page.principals), vec!["bravo"]);
+
+        let human_page = directory
+            .list(&PrincipalDirectoryListFilters {
+                issuer: None,
+                auth_method: None,
+                principal_type: Some(PrincipalTypeFilter::Human),
+                last_seen_after: None,
+                last_seen_before: None,
+                limit: 50,
+                cursor: None,
+            })
+            .expect("human principals should query");
+        assert_eq!(
+            record_subjects(&human_page.principals),
+            vec!["alpha", "charlie", "delta"]
+        );
+
+        let combined_page = directory
+            .list(&PrincipalDirectoryListFilters {
+                issuer: Some("https://issuer-a.example.test/".to_owned()),
+                auth_method: Some("bearer".to_owned()),
+                principal_type: Some(PrincipalTypeFilter::Human),
+                last_seen_after: Some("2026-01-01T12:00:00Z".to_owned()),
+                last_seen_before: Some("2026-01-04T12:00:00Z".to_owned()),
+                limit: 50,
+                cursor: None,
+            })
+            .expect("combined principal filters should query");
+        assert_eq!(record_subjects(&combined_page.principals), vec!["alpha"]);
+    }
+
+    #[test]
+    fn list_paginates_with_stable_opaque_cursor() {
+        let directory = seeded_directory(
+            "list-pagination",
+            &[
+                observation("alpha", None, "bearer", None, None, "2026-01-03T00:00:00Z"),
+                observation("bravo", None, "bearer", None, None, "2026-01-02T00:00:00Z"),
+                observation(
+                    "charlie",
+                    None,
+                    "bearer",
+                    None,
+                    None,
+                    "2026-01-02T00:00:00Z",
+                ),
+                observation("delta", None, "bearer", None, None, "2026-01-01T00:00:00Z"),
+            ],
+        );
+
+        let first_page = directory
+            .list(&PrincipalDirectoryListFilters {
+                issuer: None,
+                auth_method: None,
+                principal_type: None,
+                last_seen_after: None,
+                last_seen_before: None,
+                limit: 2,
+                cursor: None,
+            })
+            .expect("first principal page should query");
+        assert_eq!(
+            record_subjects(&first_page.principals),
+            vec!["alpha", "bravo"]
+        );
+        let cursor = first_page
+            .next_cursor
+            .expect("first page should include cursor");
+
+        let second_page = directory
+            .list(&PrincipalDirectoryListFilters {
+                issuer: None,
+                auth_method: None,
+                principal_type: None,
+                last_seen_after: None,
+                last_seen_before: None,
+                limit: 2,
+                cursor: Some(cursor),
+            })
+            .expect("second principal page should query");
+        assert_eq!(
+            record_subjects(&second_page.principals),
+            vec!["charlie", "delta"]
+        );
+        assert!(second_page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn get_returns_one_principal_by_exact_composite_key() {
+        let directory = seeded_directory(
+            "get-one",
+            &[
+                observation(
+                    "shared",
+                    Some("https://issuer-a.example.test/"),
+                    "bearer",
+                    Some("a@example.test"),
+                    None,
+                    "2026-01-01T00:00:00Z",
+                ),
+                observation(
+                    "shared",
+                    Some("https://issuer-b.example.test/"),
+                    "bearer",
+                    Some("b@example.test"),
+                    None,
+                    "2026-01-01T00:01:00Z",
+                ),
+            ],
+        );
+
+        let record = directory
+            .get(&PrincipalDirectoryKey {
+                subject: "shared".to_owned(),
+                issuer: "https://issuer-b.example.test/".to_owned(),
+                auth_method: "bearer".to_owned(),
+            })
+            .expect("principal detail should query")
+            .expect("principal should exist");
+
+        assert_eq!(record.email.as_deref(), Some("b@example.test"));
+        assert_eq!(record.issuer, "https://issuer-b.example.test/");
+    }
+
+    #[test]
     fn sink_flushes_observations_asynchronously() {
         let db = TempDb::new("async-flush");
         let directory = PrincipalDirectory::open_with_flush_interval(
@@ -560,6 +1111,46 @@ mod tests {
         });
 
         assert_eventually(Duration::from_secs(1), || row_count(&db.path) == 1);
+    }
+
+    fn seeded_directory(test_name: &str, observations: &[PrincipalObservation]) -> SeededDirectory {
+        let db = TempDb::new(test_name);
+        let directory = PrincipalDirectory::open_with_flush_interval(
+            db.path.clone(),
+            Duration::from_millis(20),
+        )
+        .expect("principal directory should open");
+        {
+            let shared = &directory
+                .inner
+                .as_ref()
+                .expect("directory should be enabled")
+                .shared;
+            let mut connection = shared.connection_guard();
+            write_observations(&mut connection, observations)
+                .expect("principal observations should seed");
+        }
+        SeededDirectory { directory, _db: db }
+    }
+
+    fn record_subjects(records: &[PrincipalDirectoryRecord]) -> Vec<&str> {
+        records
+            .iter()
+            .map(|record| record.subject.as_str())
+            .collect()
+    }
+
+    struct SeededDirectory {
+        directory: PrincipalDirectory,
+        _db: TempDb,
+    }
+
+    impl std::ops::Deref for SeededDirectory {
+        type Target = PrincipalDirectory;
+
+        fn deref(&self) -> &Self::Target {
+            &self.directory
+        }
     }
 
     fn observation(
