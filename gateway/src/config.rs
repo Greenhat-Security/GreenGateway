@@ -219,7 +219,7 @@ pub struct UpstreamRouteConfig {
     pub openapi_spec_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthProviderConfig {
     pub name: String,
     pub provider_type: AuthProviderType,
@@ -239,6 +239,34 @@ pub struct AuthProviderConfig {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub redirect_uri: Option<String>,
+}
+
+impl fmt::Debug for AuthProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let client_secret = self.client_secret.as_ref().map(|_| "<redacted>");
+
+        formatter
+            .debug_struct("AuthProviderConfig")
+            .field("name", &self.name)
+            .field("provider_type", &self.provider_type)
+            .field("jwks_url", &self.jwks_url)
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("jwks_timeout_ms", &self.jwks_timeout_ms)
+            .field("require_jti", &self.require_jti)
+            .field("roles_claim", &self.roles_claim)
+            .field("roles_claim_delimiter", &self.roles_claim_delimiter)
+            .field("org_claim", &self.org_claim)
+            .field("introspection_url", &self.introspection_url)
+            .field("introspection_timeout_ms", &self.introspection_timeout_ms)
+            .field("cache_ttl_ms", &self.cache_ttl_ms)
+            .field("user_id_claim", &self.user_id_claim)
+            .field("email_claim", &self.email_claim)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &client_secret)
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3203,6 +3231,35 @@ mod tests {
             config.auth_providers[0].redirect_uri.as_deref(),
             Some("https://gateway.example.test/v1/admin/auth/callback")
         );
+    }
+
+    #[test]
+    fn auth_provider_config_debug_redacts_client_secret() {
+        let secret = "auth-provider-secret-value";
+        let config = Config::from_env_vars(|name| match name {
+            "ADMIN_LOGIN_PROVIDER" => Ok("primary".to_owned()),
+            "AUTH_PROVIDERS" => Ok(format!(
+                r#"[
+                    {{
+                        "name": "primary",
+                        "type": "jwt",
+                        "issuer": "https://issuer.example.test/",
+                        "jwks_url": "https://issuer.example.test/.well-known/jwks.json",
+                        "client_id": "admin-ui",
+                        "client_secret": "{secret}",
+                        "redirect_uri": "https://gateway.example.test/v1/admin/auth/callback"
+                    }}
+                ]"#
+            )),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("admin login provider should parse");
+
+        let output = format!("{:?}", config.auth_providers[0]);
+
+        assert!(!output.contains(secret));
+        assert!(output.contains("<redacted>"));
+        assert!(output.contains("client_secret"));
     }
 
     #[test]

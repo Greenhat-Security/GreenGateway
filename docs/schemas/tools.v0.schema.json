@@ -55,15 +55,17 @@
       }
     },
     "json_schema_document": {
-      "description": "JSON Schema documents may be objects or boolean schemas. Semantic schema validity is enforced by jsonschema::validator_for at registry load time.",
-      "anyOf": [
-        {
-          "type": "object"
-        },
-        {
-          "type": "boolean"
+      "description": "A JSON Schema document for a tool argument object. Tool schemas must declare an object-valued properties keyword so path-template placeholders can be checked against explicit arguments. Semantic schema validity is enforced by jsonschema::validator_for at registry load time.",
+      "type": "object",
+      "required": [
+        "properties"
+      ],
+      "properties": {
+        "properties": {
+          "type": "object",
+          "description": "Named tool-call arguments accepted by this tool."
         }
-      ]
+      }
     },
     "upstream_mapping": {
       "type": "object",

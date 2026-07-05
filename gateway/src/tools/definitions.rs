@@ -613,7 +613,8 @@ mod tests {
     fn malformed_input_schema_is_rejected_and_names_tool() {
         let mut tool = echo_tool("bad_schema", "POST", "/v1/echo");
         tool["input_json_schema"] = json!({
-            "type": "not-a-json-schema-type"
+            "type": "not-a-json-schema-type",
+            "properties": {}
         });
         let file = TempToolsFile::new(&tools_document(&[tool]));
 
@@ -628,6 +629,31 @@ mod tests {
         assert!(
             message.contains("not-a-json-schema-type"),
             "schema compiler error should be included: {message}"
+        );
+    }
+
+    #[test]
+    fn input_schema_without_properties_is_rejected_at_load_time() {
+        let mut tool = echo_tool("properties_less", "GET", "/v1/widgets/{widget_id}");
+        tool["input_json_schema"] = json!({
+            "type": "object"
+        });
+        let file = TempToolsFile::new(&tools_document(&[tool]));
+
+        let error = ToolRegistry::from_file(file.path())
+            .expect_err("properties-less input_json_schema should reject");
+        let ToolRegistryError::Invalid { problems } = error else {
+            panic!("properties-less input_json_schema should fail schema validation");
+        };
+        let message = problems.join("; ");
+
+        assert!(
+            message.contains("/tools/0/input_json_schema"),
+            "schema error should identify the tool input schema path: {message}"
+        );
+        assert!(
+            message.contains("properties"),
+            "schema error should mention the missing properties key: {message}"
         );
     }
 

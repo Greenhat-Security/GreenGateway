@@ -10341,24 +10341,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_principal_without_policy_returns_not_configured() {
+    async fn audit_and_status_principals_without_policy_return_not_configured() {
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
         let router = status_router(config, Instant::now());
 
-        let response = router
-            .oneshot(audit_query_request(
+        for (uri, expected_body) in [
+            (
+                AUDIT_ADMIN_ROUTE,
+                r#"{"error":"audit API requires POLICY_FILE to be configured"}"#,
+            ),
+            (
+                AUDIT_EVENTS_STREAM_ROUTE,
+                r#"{"error":"audit API requires POLICY_FILE to be configured"}"#,
+            ),
+            (
                 STATUS_ADMIN_ROUTE,
-                Some(test_principal(&["admin"])),
-            ))
-            .await
-            .expect("request should complete");
+                r#"{"error":"status API requires POLICY_FILE to be configured"}"#,
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(audit_query_request(uri, Some(test_principal(&["admin"]))))
+                .await
+                .expect("request should complete");
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            body_string(response).await,
-            r#"{"error":"status API requires POLICY_FILE to be configured"}"#
-        );
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(body_string(response).await, expected_body);
+        }
     }
 
     #[tokio::test]

@@ -29,7 +29,7 @@ const ADMIN_LOGIN_PENDING_MAX_ENTRIES: usize = 1024;
 const PKCE_VERIFIER_RANDOM_BYTES: usize = 32;
 const OIDC_SCOPE: &str = "openid email profile";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct OidcLoginConfig {
     pub client_id: String,
     pub client_secret: String,
@@ -37,6 +37,20 @@ pub struct OidcLoginConfig {
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub http_timeout: Duration,
+}
+
+impl fmt::Debug for OidcLoginConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OidcLoginConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_uri", &self.redirect_uri)
+            .field("authorization_endpoint", &self.authorization_endpoint)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("http_timeout", &self.http_timeout)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -351,4 +365,28 @@ fn base64url_no_padding(bytes: &[u8]) -> String {
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oidc_login_config_debug_redacts_client_secret() {
+        let secret = "oidc-client-secret-value";
+        let config = OidcLoginConfig {
+            client_id: "admin-ui".to_owned(),
+            client_secret: secret.to_owned(),
+            redirect_uri: "https://gateway.example.test/v1/admin/auth/callback".to_owned(),
+            authorization_endpoint: "https://issuer.example.test/oauth2/authorize".to_owned(),
+            token_endpoint: "https://issuer.example.test/oauth2/token".to_owned(),
+            http_timeout: Duration::from_secs(2),
+        };
+
+        let output = format!("{config:?}");
+
+        assert!(!output.contains(secret));
+        assert!(output.contains("<redacted>"));
+        assert!(output.contains("client_secret"));
+    }
 }
