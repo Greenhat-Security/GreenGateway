@@ -275,7 +275,7 @@ pub enum AuthProviderType {
     CookieSession,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAuthProviderConfig {
     name: String,
@@ -313,6 +313,34 @@ struct RawAuthProviderConfig {
     client_secret: Option<String>,
     #[serde(default)]
     redirect_uri: Option<String>,
+}
+
+impl fmt::Debug for RawAuthProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let client_secret = self.client_secret.as_ref().map(|_| "<redacted>");
+
+        formatter
+            .debug_struct("RawAuthProviderConfig")
+            .field("name", &self.name)
+            .field("provider_type", &self.provider_type)
+            .field("jwks_url", &self.jwks_url)
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("jwks_timeout_ms", &self.jwks_timeout_ms)
+            .field("require_jti", &self.require_jti)
+            .field("roles_claim", &self.roles_claim)
+            .field("roles_claim_delimiter", &self.roles_claim_delimiter)
+            .field("org_claim", &self.org_claim)
+            .field("introspection_url", &self.introspection_url)
+            .field("introspection_timeout_ms", &self.introspection_timeout_ms)
+            .field("cache_ttl_ms", &self.cache_ttl_ms)
+            .field("user_id_claim", &self.user_id_claim)
+            .field("email_claim", &self.email_claim)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &client_secret)
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3260,6 +3288,45 @@ mod tests {
         assert!(!output.contains(secret));
         assert!(output.contains("<redacted>"));
         assert!(output.contains("client_secret"));
+    }
+
+    #[test]
+    fn raw_auth_provider_config_debug_redacts_client_secret() {
+        let secret = "raw-auth-provider-secret-value";
+        let raw_with_secret: RawAuthProviderConfig = serde_json::from_str(&format!(
+            r#"{{
+                "name": "primary",
+                "type": "jwt",
+                "issuer": "https://issuer.example.test/",
+                "jwks_url": "https://issuer.example.test/.well-known/jwks.json",
+                "client_id": "admin-ui",
+                "client_secret": "{secret}",
+                "redirect_uri": "https://gateway.example.test/v1/admin/auth/callback"
+            }}"#
+        ))
+        .expect("raw auth provider should parse");
+
+        let output = format!("{:?}", raw_with_secret);
+
+        assert!(!output.contains(secret));
+        assert!(output.contains("<redacted>"));
+        assert!(output.contains("client_secret"));
+
+        let raw_without_secret: RawAuthProviderConfig = serde_json::from_str(
+            r#"{
+                "name": "primary",
+                "type": "jwt",
+                "issuer": "https://issuer.example.test/",
+                "jwks_url": "https://issuer.example.test/.well-known/jwks.json",
+                "client_id": "admin-ui",
+                "redirect_uri": "https://gateway.example.test/v1/admin/auth/callback"
+            }"#,
+        )
+        .expect("raw auth provider without secret should parse");
+
+        let output_without_secret = format!("{:?}", raw_without_secret);
+
+        assert!(output_without_secret.contains("client_secret: None"));
     }
 
     #[test]
