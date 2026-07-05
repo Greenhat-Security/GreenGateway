@@ -14557,6 +14557,8 @@ paths:
             jwks_timeout_ms: 2000,
             require_jti: false,
             roles_claim: "roles".to_owned(),
+            roles_claim_delimiter: None,
+            org_claim: None,
         }];
         config.egress_deny_private_ips = false;
         let egress_client = Arc::new(
@@ -14601,6 +14603,8 @@ paths:
             jwks_timeout_ms: 2000,
             require_jti: false,
             roles_claim: "roles".to_owned(),
+            roles_claim_delimiter: None,
+            org_claim: None,
         }];
         config.egress_deny_private_ips = false;
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -14670,6 +14674,8 @@ paths:
             jwks_timeout_ms: 2000,
             require_jti: false,
             roles_claim: "roles".to_owned(),
+            roles_claim_delimiter: None,
+            org_claim: None,
         }];
         let recorder = PrometheusBuilder::new().build_recorder();
         let router = app(
@@ -14724,6 +14730,8 @@ paths:
             jwks_timeout_ms: 2000,
             require_jti: false,
             roles_claim: "roles".to_owned(),
+            roles_claim_delimiter: None,
+            org_claim: None,
         }];
         config.egress_deny_private_ips = false;
         let egress_client = Arc::new(
@@ -16825,6 +16833,8 @@ O2gecI9QwDJNpm29J9wJB2F8
             jwks_timeout_ms: config.jwt_jwks_timeout_ms,
             require_jti: config.jwt_require_jti,
             roles_claim: config.roles_claim.clone(),
+            roles_claim_delimiter: None,
+            org_claim: None,
         }];
     }
 

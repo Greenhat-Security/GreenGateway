@@ -558,11 +558,19 @@ Ordered JSON array of authentication provider objects.
 
 Default: empty, which means the legacy single-provider `JWT_*` settings below are used as an implicit one-entry provider named `legacy` when `JWT_JWKS_URL` is set.
 
-Format and validation: unset, empty, or whitespace-only values use the legacy fallback. Non-empty values must be a JSON array. Each entry must include a non-empty unique `name`, `type` set to `jwt`, and at least one of `jwks_url` or `issuer`. Optional fields are `audience`, `jwks_timeout_ms`, `require_jti`, and `roles_claim`. `jwks_url`, `issuer`, and `audience` are trimmed, and blank values are treated as unset. `jwks_timeout_ms` defaults to `2000`, `require_jti` defaults to `false`, and `roles_claim` defaults to `roles`.
+Format and validation: unset, empty, or whitespace-only values use the legacy fallback. Non-empty values must be a JSON array. Each entry must include a non-empty unique `name`, `type` set to `jwt`, and at least one of `jwks_url` or `issuer`. Optional fields are `audience`, `jwks_timeout_ms`, `require_jti`, `roles_claim`, `roles_claim_delimiter`, and `org_claim`. `jwks_url`, `issuer`, `audience`, and `org_claim` are trimmed, and blank values are treated as unset. `roles_claim_delimiter` preserves its exact configured value so a single space can split OAuth2-style scope strings; an empty delimiter is treated as unset. `jwks_timeout_ms` defaults to `2000`, `require_jti` defaults to `false`, and `roles_claim` defaults to `roles`.
 
 Example with OIDC discovery: `[{"name":"primary","type":"jwt","issuer":"https://idp.example.com","audience":"greengateway","roles_claim":"roles","require_jti":false}]`
 
 Example with an explicit JWKS endpoint: `[{"name":"primary","type":"jwt","jwks_url":"https://idp.example.com/.well-known/jwks.json","issuer":"https://idp.example.com","audience":"greengateway","roles_claim":"roles","require_jti":false}]`
+
+Claim mapping: `roles_claim` and `org_claim` first resolve the configured value as an exact top-level JWT claim key. Only when no exact key exists and the configured value contains `.` does GreenGateway walk it as a dotted path through nested JSON objects. This preserves Auth0-style namespaced URL claims such as `https://myapp.example.com/roles`, where dots are part of the literal claim key, while still supporting nested IdP shapes such as Keycloak `realm_access.roles`. Role arrays must contain only strings. String-valued role claims are split only when `roles_claim_delimiter` is set; each split piece is trimmed and empty pieces are dropped. `org_claim` is used only when it resolves to a string.
+
+Keycloak-style nested roles: `[{"name":"keycloak","type":"jwt","issuer":"https://keycloak.example.com/realms/acme","audience":"greengateway","roles_claim":"realm_access.roles","org_claim":"tenant.id"}]`
+
+OAuth2 scope string as roles: `[{"name":"oauth","type":"jwt","issuer":"https://idp.example.com","audience":"greengateway","roles_claim":"scope","roles_claim_delimiter":" "}]`
+
+Auth0-style namespaced claims: `[{"name":"auth0","type":"jwt","issuer":"https://tenant.auth0.com/","audience":"https://api.example.com","roles_claim":"https://myapp.example.com/roles","org_claim":"https://myapp.example.com/org_id"}]`
 
 When `AUTH_PROVIDERS` is set, it defines the ordered auth provider chain and takes precedence over the legacy single-provider JWT settings for validator assembly. The legacy settings remain supported for backward compatibility.
 
@@ -618,11 +626,11 @@ Format and validation: must parse as a Rust boolean, `true` or `false`. When ena
 
 ### ROLES_CLAIM
 
-Flat JWT claim name used to read roles.
+JWT claim key or dotted claim path used to read roles for the legacy single-provider JWT settings.
 
 Default: `roles`
 
-Format and validation: must be a non-empty Unicode string. The validator reads this claim as a flat JSON array of strings; missing claims and non-array values produce an empty role list.
+Format and validation: must be a non-empty Unicode string. Resolution first tries the value as an exact top-level claim key, then falls back to dotted nested-object path walking only when no exact key exists and the value contains `.`. This means namespaced URL claim keys with dots remain literal keys, while paths such as `realm_access.roles` can read nested arrays. The legacy `ROLES_CLAIM` setting reads arrays of strings only; string-valued role claims require `AUTH_PROVIDERS[].roles_claim_delimiter`. Missing claims, malformed paths, non-array values, and arrays containing non-strings produce an empty role list.
 
 ### SERVICE_TOKEN_SQLITE_PATH
 
