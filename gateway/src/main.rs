@@ -887,6 +887,8 @@ struct DiscoveredOidcConfig {
 #[derive(Clone)]
 struct DiscoveredAdminLoginEndpoints {
     provider_name: String,
+    issuer: String,
+    jwks_url: String,
     authorization_endpoint: String,
     token_endpoint: String,
 }
@@ -1379,13 +1381,15 @@ fn admin_auth_state_from_config(
             "redirect_uri",
             &provider.redirect_uri,
         )?,
+        issuer: endpoints.issuer.clone(),
+        jwks_url: endpoints.jwks_url.clone(),
         authorization_endpoint: endpoints.authorization_endpoint.clone(),
         token_endpoint: endpoints.token_endpoint.clone(),
         http_timeout: Duration::from_millis(provider.jwks_timeout_ms),
     };
 
     Ok(Some(AdminAuthState {
-        login: auth::OidcLoginState::new(login_config, egress_client),
+        login: auth::OidcLoginState::new(login_config, egress_client)?,
         admin_prefix: config.admin_prefix.clone(),
     }))
 }
@@ -1447,31 +1451,38 @@ fn discover_oidc_from_config(
             Duration::from_millis(provider.jwks_timeout_ms),
             Arc::clone(&egress_client),
         )?;
+        let issuer = document.issuer().ok_or_else(|| {
+            auth::AuthError::Upstream("OIDC discovery response missing issuer".to_owned())
+        })?;
 
-        if provider.jwks_url.is_none() {
-            let jwks_url = document.jwks_uri().ok_or_else(|| {
-                auth::AuthError::Upstream("OIDC discovery response missing jwks_uri".to_owned())
-            })?;
-            discovered.jwks_urls.insert(provider.name.clone(), jwks_url);
-        }
+        let jwks_url = match provider.jwks_url.clone() {
+            Some(jwks_url) => jwks_url,
+            None => {
+                let jwks_url = document.jwks_uri().ok_or_else(|| {
+                    auth::AuthError::Upstream("OIDC discovery response missing jwks_uri".to_owned())
+                })?;
+                discovered
+                    .jwks_urls
+                    .insert(provider.name.clone(), jwks_url.clone());
+                jwks_url
+            }
+        };
 
-        if is_admin_login_provider {
-            let authorization_endpoint = document.authorization_endpoint().ok_or_else(|| {
-                auth::AuthError::Upstream(
-                    "OIDC discovery response missing authorization_endpoint".to_owned(),
-                )
-            })?;
-            let token_endpoint = document.token_endpoint().ok_or_else(|| {
-                auth::AuthError::Upstream(
-                    "OIDC discovery response missing token_endpoint".to_owned(),
-                )
-            })?;
-            discovered.admin_login = Some(DiscoveredAdminLoginEndpoints {
-                provider_name: provider.name.clone(),
-                authorization_endpoint,
-                token_endpoint,
-            });
-        }
+        let authorization_endpoint = document.authorization_endpoint().ok_or_else(|| {
+            auth::AuthError::Upstream(
+                "OIDC discovery response missing authorization_endpoint".to_owned(),
+            )
+        })?;
+        let token_endpoint = document.token_endpoint().ok_or_else(|| {
+            auth::AuthError::Upstream("OIDC discovery response missing token_endpoint".to_owned())
+        })?;
+        discovered.admin_login = Some(DiscoveredAdminLoginEndpoints {
+            provider_name: provider.name.clone(),
+            issuer: issuer.to_owned(),
+            jwks_url,
+            authorization_endpoint,
+            token_endpoint,
+        });
     }
 
     if let Some(admin_login_provider) = config.admin_login_provider.as_deref() {
@@ -7049,6 +7060,7 @@ mod tests {
     #[derive(Clone)]
     struct MockOidcTokenState {
         access_token: Arc<Mutex<Option<String>>>,
+        id_token: Arc<Mutex<Option<String>>>,
         requests: Arc<Mutex<Vec<CapturedTokenRequest>>>,
     }
 
@@ -7056,6 +7068,7 @@ mod tests {
     struct MockOidcTokenEndpoint {
         url: String,
         access_token: Arc<Mutex<Option<String>>>,
+        id_token: Arc<Mutex<Option<String>>>,
         requests: Arc<Mutex<Vec<CapturedTokenRequest>>>,
         handle: Arc<tokio::task::JoinHandle<()>>,
     }
@@ -7073,6 +7086,10 @@ mod tests {
                 .access_token
                 .lock()
                 .expect("mock token state should lock") = Some(token);
+        }
+
+        fn set_id_token(&self, token: String) {
+            *self.id_token.lock().expect("mock token state should lock") = Some(token);
         }
 
         fn requests(&self) -> Vec<CapturedTokenRequest> {
@@ -7132,9 +7149,11 @@ mod tests {
             .expect("mock OIDC token endpoint address should be available");
         let url = format!("http://{}:{}/token", host, addr.port());
         let access_token = Arc::new(Mutex::new(access_token));
+        let id_token = Arc::new(Mutex::new(None));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = MockOidcTokenState {
             access_token: Arc::clone(&access_token),
+            id_token: Arc::clone(&id_token),
             requests: Arc::clone(&requests),
         };
         let router = Router::new()
@@ -7149,6 +7168,7 @@ mod tests {
         MockOidcTokenEndpoint {
             url,
             access_token,
+            id_token,
             requests,
             handle,
         }
@@ -7175,17 +7195,29 @@ mod tests {
             .expect("mock token state should lock")
             .clone()
             .expect("mock access token should be set before token exchange");
+        let id_token = state
+            .id_token
+            .lock()
+            .expect("mock token state should lock")
+            .clone();
 
-        Json(json!({
+        let mut response = json!({
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": 3600
-        }))
-        .into_response()
+        });
+        if let Some(id_token) = id_token {
+            response["id_token"] = json!(id_token);
+        }
+
+        Json(response).into_response()
     }
 
     fn admin_oidc_login_router(issuer: &str) -> Router {
-        let mut config = admin_oidc_login_config(issuer);
+        admin_oidc_login_router_from_config(admin_oidc_login_config(issuer))
+    }
+
+    fn admin_oidc_login_router_from_config(mut config: config::Config) -> Router {
         config.egress_deny_private_ips = false;
         let recorder = PrometheusBuilder::new().build_recorder();
         app(
@@ -7226,6 +7258,62 @@ mod tests {
         }];
 
         config
+    }
+
+    async fn admin_oidc_id_token_callback_response(
+        id_token_for_nonce: impl FnOnce(&str, &str) -> String,
+    ) -> (Response, String) {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let jwks_url = format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port());
+        let token_endpoint =
+            spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
+        let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
+        let access_token = signed_token_with_issuer("admin-operator", &["admin"], &oidc.issuer);
+        token_endpoint.set_access_token(access_token.clone());
+
+        let mut config = admin_oidc_login_config(&oidc.issuer);
+        config.auth_providers[0].jwks_url = Some(jwks_url);
+        let router = admin_oidc_login_router_from_config(config);
+
+        let login_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/auth/login")
+                    .body(Body::empty())
+                    .expect("login request should build"),
+            )
+            .await
+            .expect("login request should complete");
+        let login_location = response_location(&login_response);
+        let authorization_url =
+            Url::parse(&login_location).expect("authorization redirect should be absolute");
+        let authorization_query = url_query_pairs(&authorization_url);
+        let state = authorization_query
+            .get("state")
+            .expect("authorization redirect should include state");
+        let nonce = authorization_query
+            .get("nonce")
+            .expect("authorization redirect should include nonce");
+        token_endpoint.set_id_token(id_token_for_nonce(nonce, &oidc.issuer));
+
+        let callback_response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/admin/auth/callback?code=admin-code&state={}",
+                        query_encode(state)
+                    ))
+                    .body(Body::empty())
+                    .expect("callback request should build"),
+            )
+            .await
+            .expect("callback request should complete");
+
+        oidc.finish();
+        token_endpoint.abort();
+
+        (callback_response, access_token)
     }
 
     fn response_location(response: &Response) -> String {
@@ -16258,6 +16346,103 @@ paths:
             .expect("OIDC discovery test server should finish");
     }
 
+    #[test]
+    fn auth_validator_rejects_oidc_discovery_with_mismatched_issuer() {
+        let (issuer, server) = spawn_oidc_discovery_server(
+            json!({
+                "issuer": "http://attacker.example.test",
+                "jwks_uri": "http://127.0.0.1:1/jwks.json"
+            }),
+            1,
+        );
+        let mut config = test_config(Vec::new());
+        config.auth_providers = vec![config::AuthProviderConfig {
+            name: "oidc".to_owned(),
+            provider_type: config::AuthProviderType::Jwt,
+            jwks_url: None,
+            issuer: Some(issuer),
+            audience: None,
+            jwks_timeout_ms: 2000,
+            require_jti: false,
+            roles_claim: "roles".to_owned(),
+            roles_claim_delimiter: None,
+            org_claim: None,
+            introspection_url: None,
+            introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+            user_id_claim: None,
+            email_claim: None,
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
+        }];
+        config.egress_deny_private_ips = false;
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::from_config(&config))
+                .expect("egress client should build"),
+        );
+
+        let error = discover_oidc_jwks_urls_from_config(&config, egress_client)
+            .expect_err("mismatched discovery issuer should fail provider construction");
+
+        assert!(matches!(
+            error,
+            auth::AuthError::Upstream(message)
+                if message.contains("OIDC discovery issuer mismatch")
+        ));
+        server
+            .join()
+            .expect("OIDC discovery test server should finish");
+    }
+
+    #[test]
+    fn auth_validator_rejects_oidc_discovery_without_issuer() {
+        let (issuer, server) = spawn_oidc_discovery_server(
+            json!({
+                "jwks_uri": "http://127.0.0.1:1/jwks.json"
+            }),
+            1,
+        );
+        let mut config = test_config(Vec::new());
+        config.auth_providers = vec![config::AuthProviderConfig {
+            name: "oidc".to_owned(),
+            provider_type: config::AuthProviderType::Jwt,
+            jwks_url: None,
+            issuer: Some(issuer),
+            audience: None,
+            jwks_timeout_ms: 2000,
+            require_jti: false,
+            roles_claim: "roles".to_owned(),
+            roles_claim_delimiter: None,
+            org_claim: None,
+            introspection_url: None,
+            introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+            user_id_claim: None,
+            email_claim: None,
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
+        }];
+        config.egress_deny_private_ips = false;
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::from_config(&config))
+                .expect("egress client should build"),
+        );
+
+        let error = discover_oidc_jwks_urls_from_config(&config, egress_client)
+            .expect_err("discovery without issuer should fail provider construction");
+
+        assert!(matches!(
+            error,
+            auth::AuthError::Upstream(message)
+                if message.contains("OIDC discovery response missing issuer")
+        ));
+        server
+            .join()
+            .expect("OIDC discovery test server should finish");
+    }
+
     #[tokio::test]
     async fn oidc_discovery_allowlists_jwks_uri_host_when_it_differs_from_issuer() {
         let (jwks_url, jwks_server) = spawn_blocking_jwks_server(Ipv4Addr::new(127, 0, 0, 2), 1);
@@ -16474,6 +16659,85 @@ paths:
     }
 
     #[tokio::test]
+    async fn admin_oidc_login_accepts_valid_id_token_with_matching_nonce_audience_and_issuer() {
+        let (callback_response, access_token) =
+            admin_oidc_id_token_callback_response(|nonce, issuer| {
+                signed_admin_id_token(issuer, "admin-ui", nonce)
+            })
+            .await;
+
+        assert_eq!(callback_response.status(), StatusCode::FOUND);
+        let callback_location = response_location(&callback_response);
+        let completion = fragment_query_pairs(&callback_location, "/auth/complete")
+            .expect("callback should redirect to auth completion fragment");
+        assert_eq!(completion.get("token"), Some(&access_token));
+    }
+
+    #[tokio::test]
+    async fn admin_oidc_login_rejects_id_token_with_mismatched_nonce() {
+        let (callback_response, _) = admin_oidc_id_token_callback_response(|_, issuer| {
+            signed_admin_id_token(issuer, "admin-ui", "other-nonce")
+        })
+        .await;
+
+        assert_eq!(callback_response.status(), StatusCode::FOUND);
+        assert!(
+            fragment_query_pairs(&response_location(&callback_response), "/auth/error")
+                .expect("invalid id_token should redirect to auth error fragment")
+                .get("error")
+                .is_some_and(|error| error == "token_exchange_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_oidc_login_rejects_id_token_with_mismatched_audience() {
+        let (callback_response, _) = admin_oidc_id_token_callback_response(|nonce, issuer| {
+            signed_admin_id_token(issuer, "other-client", nonce)
+        })
+        .await;
+
+        assert_eq!(callback_response.status(), StatusCode::FOUND);
+        assert!(
+            fragment_query_pairs(&response_location(&callback_response), "/auth/error")
+                .expect("invalid id_token should redirect to auth error fragment")
+                .get("error")
+                .is_some_and(|error| error == "token_exchange_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_oidc_login_rejects_id_token_with_mismatched_issuer() {
+        let (callback_response, _) = admin_oidc_id_token_callback_response(|nonce, _| {
+            signed_admin_id_token("http://other-issuer.example.test", "admin-ui", nonce)
+        })
+        .await;
+
+        assert_eq!(callback_response.status(), StatusCode::FOUND);
+        assert!(
+            fragment_query_pairs(&response_location(&callback_response), "/auth/error")
+                .expect("invalid id_token should redirect to auth error fragment")
+                .get("error")
+                .is_some_and(|error| error == "token_exchange_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_oidc_login_rejects_id_token_with_invalid_signature() {
+        let (callback_response, _) = admin_oidc_id_token_callback_response(|nonce, issuer| {
+            corrupt_jwt_signature(&signed_admin_id_token(issuer, "admin-ui", nonce))
+        })
+        .await;
+
+        assert_eq!(callback_response.status(), StatusCode::FOUND);
+        assert!(
+            fragment_query_pairs(&response_location(&callback_response), "/auth/error")
+                .expect("invalid id_token should redirect to auth error fragment")
+                .get("error")
+                .is_some_and(|error| error == "token_exchange_failed")
+        );
+    }
+
+    #[tokio::test]
     async fn admin_oidc_callback_with_unknown_state_does_not_exchange_token() {
         let token_endpoint = spawn_mock_oidc_token_endpoint(Ipv4Addr::LOCALHOST, None).await;
         let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
@@ -16508,12 +16772,74 @@ paths:
     }
 
     #[test]
-    fn admin_oidc_login_provider_requires_discovered_authorize_and_token_endpoints() {
+    fn admin_oidc_login_provider_rejects_discovery_with_mismatched_issuer() {
+        let (issuer, server) = spawn_oidc_discovery_server(
+            json!({
+                "issuer": "http://attacker.example.test",
+                "jwks_uri": "http://127.0.0.1:1/jwks.json",
+                "authorization_endpoint": "http://127.0.0.1:1/authorize",
+                "token_endpoint": "http://127.0.0.1:1/token"
+            }),
+            1,
+        );
+        let mut config = admin_oidc_login_config(&issuer);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+
+        let error = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect_err("admin login discovery with mismatched issuer should fail startup");
+
+        assert!(error.to_string().contains("OIDC discovery issuer mismatch"));
+        server
+            .join()
+            .expect("OIDC discovery test server should finish");
+    }
+
+    #[test]
+    fn admin_oidc_login_provider_rejects_discovery_without_issuer() {
         let (issuer, server) = spawn_oidc_discovery_server(
             json!({
                 "jwks_uri": "http://127.0.0.1:1/jwks.json",
-                "authorization_endpoint": "http://127.0.0.1:1/authorize"
+                "authorization_endpoint": "http://127.0.0.1:1/authorize",
+                "token_endpoint": "http://127.0.0.1:1/token"
             }),
+            1,
+        );
+        let mut config = admin_oidc_login_config(&issuer);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+
+        let error = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect_err("admin login discovery without issuer should fail startup");
+
+        assert!(error
+            .to_string()
+            .contains("OIDC discovery response missing issuer"));
+        server
+            .join()
+            .expect("OIDC discovery test server should finish");
+    }
+
+    #[test]
+    fn admin_oidc_login_provider_requires_discovered_authorize_and_token_endpoints() {
+        let (issuer, server) = spawn_oidc_discovery_server_with(
+            |issuer| {
+                json!({
+                    "issuer": issuer,
+                    "jwks_uri": "http://127.0.0.1:1/jwks.json",
+                    "authorization_endpoint": "http://127.0.0.1:1/authorize"
+                })
+            },
             1,
         );
         let mut config = admin_oidc_login_config(&issuer);
@@ -16642,7 +16968,8 @@ paths:
 
     #[test]
     fn auth_validator_reports_construction_error_when_oidc_discovery_lacks_jwks_uri() {
-        let (issuer, server) = spawn_oidc_discovery_server(json!({"issuer": "test"}), 1);
+        let (issuer, server) =
+            spawn_oidc_discovery_server_with(|issuer| json!({"issuer": issuer}), 1);
         let mut config = test_config(Vec::new());
         config.auth_providers = vec![config::AuthProviderConfig {
             name: "oidc".to_owned(),
@@ -18954,8 +19281,23 @@ O2gecI9QwDJNpm29J9wJB2F8
         discovery: Value,
         request_count: usize,
     ) -> (String, std::thread::JoinHandle<()>) {
+        spawn_oidc_discovery_server_with(|_| discovery, request_count)
+    }
+
+    fn spawn_oidc_discovery_server_with(
+        discovery: impl FnOnce(&str) -> Value,
+        request_count: usize,
+    ) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
             .expect("OIDC discovery test server should bind");
+        let issuer = format!(
+            "http://127.0.0.1:{}",
+            listener
+                .local_addr()
+                .expect("OIDC discovery test server address should be available")
+                .port()
+        );
+        let discovery = discovery(&issuer);
         spawn_oidc_server(listener, discovery, None, request_count)
     }
 
@@ -19226,6 +19568,26 @@ O2gecI9QwDJNpm29J9wJB2F8
             "roles": roles,
             "iss": issuer
         }))
+    }
+
+    fn signed_admin_id_token(issuer: &str, audience: &str, nonce: &str) -> String {
+        signed_token_with_claims(json!({
+            "sub": "admin-operator",
+            "email": "admin-operator@example.test",
+            "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+            "iss": issuer,
+            "aud": audience,
+            "nonce": nonce
+        }))
+    }
+
+    fn corrupt_jwt_signature(token: &str) -> String {
+        let mut parts = token.split('.').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(parts.len(), 3);
+        let replacement = if parts[2].ends_with('A') { 'B' } else { 'A' };
+        parts[2].pop();
+        parts[2].push(replacement);
+        parts.join(".")
     }
 
     fn signed_token_with_claims(claims: Value) -> String {

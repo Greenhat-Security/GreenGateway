@@ -316,6 +316,18 @@ impl JwtValidator {
             auth_method: AuthMethod::Bearer,
         })
     }
+
+    pub(crate) async fn validate_oidc_id_token_nonce(
+        &self,
+        token: &str,
+        expected_nonce: &str,
+    ) -> Result<(), AuthError> {
+        let claims = self.decode(token).await?;
+        match extract_string_claim(&claims.extra, Some("nonce")).as_deref() {
+            Some(nonce) if nonce == expected_nonce => Ok(()),
+            _ => Err(invalid_token()),
+        }
+    }
 }
 
 #[async_trait::async_trait]

@@ -24,6 +24,8 @@ use uuid::Uuid;
 
 use crate::{egress::EgressClient, metrics::LOCK_POISON_RECOVERIES_TOTAL};
 
+use super::{AuthError, JwtAuthConfig, JwtValidator};
+
 const ADMIN_LOGIN_PENDING_TTL: Duration = Duration::from_secs(5 * 60);
 const ADMIN_LOGIN_PENDING_MAX_ENTRIES: usize = 1024;
 const PKCE_VERIFIER_RANDOM_BYTES: usize = 32;
@@ -34,6 +36,8 @@ pub struct OidcLoginConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_uri: String,
+    pub issuer: String,
+    pub jwks_url: String,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub http_timeout: Duration,
@@ -57,6 +61,7 @@ impl fmt::Debug for OidcLoginConfig {
 pub struct OidcLoginState {
     cfg: Arc<OidcLoginConfig>,
     egress_client: Arc<EgressClient>,
+    id_token_validator: Arc<JwtValidator>,
     pending: Arc<PendingLoginStore>,
 }
 
@@ -79,6 +84,7 @@ pub enum OidcLoginError {
     TokenExchangeFailed,
     InvalidTokenResponse,
     MissingAccessToken,
+    InvalidIdToken,
 }
 
 impl fmt::Display for OidcLoginError {
@@ -95,6 +101,7 @@ impl fmt::Display for OidcLoginError {
             Self::MissingAccessToken => {
                 write!(formatter, "OIDC token response missing access_token")
             }
+            Self::InvalidIdToken => write!(formatter, "OIDC id_token validation failed"),
         }
     }
 }
@@ -115,12 +122,27 @@ impl OidcLoginError {
 }
 
 impl OidcLoginState {
-    pub fn new(cfg: OidcLoginConfig, egress_client: Arc<EgressClient>) -> Self {
-        Self {
+    pub fn new(cfg: OidcLoginConfig, egress_client: Arc<EgressClient>) -> Result<Self, AuthError> {
+        let id_token_validator = JwtValidator::new(
+            JwtAuthConfig {
+                jwks_url: cfg.jwks_url.clone(),
+                issuer: Some(cfg.issuer.clone()),
+                audience: Some(cfg.client_id.clone()),
+                http_timeout: cfg.http_timeout,
+                require_jti: false,
+                roles_claim: "roles".to_owned(),
+                roles_claim_delimiter: None,
+                org_claim: None,
+            },
+            Arc::clone(&egress_client),
+        )?;
+
+        Ok(Self {
             cfg: Arc::new(cfg),
             egress_client,
+            id_token_validator: Arc::new(id_token_validator),
             pending: Arc::new(PendingLoginStore::new(ADMIN_LOGIN_PENDING_TTL)),
-        }
+        })
     }
 
     pub fn begin_login(&self) -> Result<LoginStart, OidcLoginError> {
@@ -184,7 +206,6 @@ impl OidcLoginState {
             nonce,
             created_at: _,
         } = pending;
-        drop(nonce);
 
         let body = token_exchange_body(
             code,
@@ -224,6 +245,20 @@ impl OidcLoginState {
             .map(|token| token.trim().to_owned())
             .filter(|token| !token.is_empty())
             .ok_or(OidcLoginError::MissingAccessToken)?;
+
+        if let Some(id_token) = token_response.id_token {
+            let id_token = id_token.trim();
+            if id_token.is_empty() {
+                return Err(OidcLoginError::InvalidIdToken);
+            }
+            self.id_token_validator
+                .validate_oidc_id_token_nonce(id_token, &nonce)
+                .await
+                .map_err(|err| {
+                    tracing::warn!(error = %err, "OIDC id_token validation failed");
+                    OidcLoginError::InvalidIdToken
+                })?;
+        }
 
         Ok(TokenExchange { access_token })
     }
@@ -309,6 +344,7 @@ impl PendingLoginStore {
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: Option<String>,
+    id_token: Option<String>,
 }
 
 fn remove_expired_pending_logins(inner: &mut HashMap<String, PendingLogin>, ttl: Duration) {
