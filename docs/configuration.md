@@ -448,6 +448,18 @@ By default, list entries omit full policy snapshots. Add `include_policy=true` t
 
 Concurrent policy mutations through this API are safely serialized against each other, including whole-policy `PUT` and granular rule create/update/delete/reorder. A losing request with an ETag from the same starting policy receives `412 Precondition Failed`, never a silently-overwritten update. The `If-Match` guard does not order against a direct edit of the `POLICY_FILE` on disk racing an in-flight API mutation. The file's own atomic write (temp file + rename) means a concurrent reader, including the background file watcher, never observes a torn/partial file, but if something outside this API writes to `POLICY_FILE` at the same moment an API mutation completes, the file watcher's next debounced reload may pick up either write, and the ETag a caller received may no longer describe the live policy a moment later. Treat the returned `ETag` as best-effort freshness, not a guarantee against external file edits, if anything outside this API also writes to `POLICY_FILE`.
 
+### TOOLS_FILE
+
+Optional tool definition registry JSON file path.
+
+Default: empty, which means the tool registry is disabled and empty.
+
+A copyable starter registry is available at `docs/examples/tools.starter.json`. The development fixture is `dev/tools.json`.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. The registry loader reads the file as JSON, validates it against `docs/schemas/tools.v0.schema.json`, rejects duplicate tool names, rejects unknown HTTP methods, and compiles each tool's `input_json_schema` as a JSON Schema document at load time.
+
+This is deliberately separate from `POLICY_FILE`. `TOOLS_FILE` defines what a tool is and how its future executor will map arguments onto an upstream HTTP request. The RBAC policy's `tools` section controls whether a configured tool may run and with what runtime limits. This PR does not execute tool calls or enforce per-tool RBAC.
+
 ### POLICY_HISTORY_SQLITE_PATH
 
 Optional SQLite policy version history store path.

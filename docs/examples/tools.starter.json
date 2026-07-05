@@ -1,0 +1,26 @@
+{
+  "schema_version": "0.1.0",
+  "tools": [
+    {
+      "name": "echo",
+      "description": "Echoes a message through a generic upstream endpoint.",
+      "input_json_schema": {
+        "type": "object",
+        "required": ["message"],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "upstream": {
+        "method": "POST",
+        "path_template": "/v1/echo",
+        "body": {
+          "mode": "whole_args_json"
+        }
+      }
+    }
+  ]
+}
