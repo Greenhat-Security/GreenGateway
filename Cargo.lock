@@ -465,6 +465,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "mime_guess",
  "notify",
+ "percent-encoding",
  "proptest",
  "rcgen",
  "reqwest",
