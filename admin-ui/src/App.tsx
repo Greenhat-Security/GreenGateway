@@ -14,6 +14,7 @@ import {
   setStoredToken,
 } from './lib/auth';
 import { adminBasePath } from './lib/config';
+import { IdentitiesView } from './views/IdentitiesView';
 import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
 import { PolicyHistoryView } from './views/PolicyHistoryView';
@@ -80,6 +81,9 @@ export function AdminShell() {
           <NavLink to="/tokens" className={navItemClassName}>
             Tokens
           </NavLink>
+          <NavLink to="/identities" className={navItemClassName}>
+            Identities
+          </NavLink>
           <NavLink to="/policy/history" className={navItemClassName}>
             History
           </NavLink>
@@ -129,6 +133,7 @@ export function AdminShell() {
           <Route path="/traffic/detail" element={<TrafficEndpointDetail />} />
           <Route path="/rules" element={<RuleTable />} />
           <Route path="/tokens" element={<TokensView />} />
+          <Route path="/identities" element={<IdentitiesView />} />
           <Route path="/policy/history" element={<PolicyHistoryView />} />
           <Route path="/policy/shadow-review" element={<ShadowReviewView />} />
           <Route path="/signals" element={<SignalsView />} />
@@ -168,6 +173,10 @@ function Dashboard() {
           <Link to="/tokens">
             <span>Tokens</span>
             <small>Create, rotate, and revoke service tokens</small>
+          </Link>
+          <Link to="/identities">
+            <span>Identities</span>
+            <small>Users, bots, issuers, and auth methods</small>
           </Link>
           <Link to="/policy/history">
             <span>Policy history</span>
@@ -317,6 +326,9 @@ function pageTitleForPath(pathname: string): string {
   }
   if (pathname === '/tokens') {
     return 'Tokens';
+  }
+  if (pathname === '/identities') {
+    return 'Identity directory';
   }
   if (pathname === '/policy/history') {
     return 'Policy history';
