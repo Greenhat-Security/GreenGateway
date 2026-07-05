@@ -13,7 +13,7 @@ import {
   getStoredToken,
   setStoredToken,
 } from './lib/auth';
-import { adminBasePath } from './lib/config';
+import { adminApiUrl, adminBasePath } from './lib/config';
 import { IdentitiesView } from './views/IdentitiesView';
 import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
@@ -42,12 +42,26 @@ export function App() {
 export function AdminShell() {
   const location = useLocation();
   const [theme, setTheme] = useState<ThemeName>(() => readStoredTheme());
+  const [authRefreshKey, setAuthRefreshKey] = useState(0);
+  const [authCompletionStatus, setAuthCompletionStatus] = useState<string | null>(
+    null,
+  );
   const pageTitle = pageTitleForPath(location.pathname);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorageOrNull()?.setItem(THEME_STORAGE_KEY, theme);
   }, [theme]);
+
+  useEffect(() => {
+    const result = completeAuthFromFragment();
+    if (!result) {
+      return;
+    }
+
+    setAuthCompletionStatus(result.status);
+    setAuthRefreshKey((current) => current + 1);
+  }, []);
 
   function toggleTheme() {
     setTheme((current) => (current === 'dark' ? 'light' : 'dark'));
@@ -127,7 +141,15 @@ export function AdminShell() {
         </header>
 
         <Routes>
-          <Route path="/" element={<Dashboard />} />
+          <Route
+            path="/"
+            element={
+              <Dashboard
+                authRefreshKey={authRefreshKey}
+                authCompletionStatus={authCompletionStatus}
+              />
+            }
+          />
           <Route path="/logs" element={<LogExplorer />} />
           <Route path="/traffic" element={<TrafficInventory />} />
           <Route path="/traffic/detail" element={<TrafficEndpointDetail />} />
@@ -147,10 +169,19 @@ export function AdminShell() {
   );
 }
 
-function Dashboard() {
+function Dashboard({
+  authRefreshKey,
+  authCompletionStatus,
+}: {
+  authRefreshKey: number;
+  authCompletionStatus: string | null;
+}) {
   return (
     <main className="content-grid page-content">
-      <TokenPanel />
+      <TokenPanel
+        authRefreshKey={authRefreshKey}
+        authCompletionStatus={authCompletionStatus}
+      />
 
       <section className="panel" aria-labelledby="views-heading">
         <div className="section-heading">
@@ -208,11 +239,56 @@ function Dashboard() {
   );
 }
 
-function TokenPanel() {
+function TokenPanel({
+  authRefreshKey,
+  authCompletionStatus,
+}: {
+  authRefreshKey: number;
+  authCompletionStatus: string | null;
+}) {
   const initialToken = useMemo(() => getStoredToken() ?? '', []);
   const [token, setToken] = useState(initialToken);
   const [hasStoredToken, setHasStoredToken] = useState(initialToken.length > 0);
   const [status, setStatus] = useState<string | null>(null);
+  const [ssoConfigured, setSsoConfigured] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadVersion() {
+      try {
+        const response = await fetch('/version');
+        if (!response.ok) {
+          return;
+        }
+        const body: unknown = await response.json();
+        if (!cancelled && isVersionResponse(body)) {
+          setSsoConfigured(body.admin_login_configured);
+        }
+      } catch {
+        if (!cancelled) {
+          setSsoConfigured(false);
+        }
+      }
+    }
+
+    void loadVersion();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (authRefreshKey === 0) {
+      return;
+    }
+
+    const storedToken = getStoredToken() ?? '';
+    setToken(storedToken);
+    setHasStoredToken(storedToken.length > 0);
+    setStatus(authCompletionStatus);
+  }, [authRefreshKey, authCompletionStatus]);
 
   function saveToken(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -252,6 +328,14 @@ function TokenPanel() {
         it as an Authorization header.
       </p>
 
+      {ssoConfigured ? (
+        <div className="sso-login-row">
+          <a className="secondary-button" href={adminApiUrl('/auth/login')}>
+            Log in with SSO
+          </a>
+        </div>
+      ) : null}
+
       <form className="token-form" onSubmit={saveToken}>
         <label htmlFor="admin-token" className="field-label">
           Token
@@ -290,6 +374,67 @@ function TokenPanel() {
         </span>
       </div>
     </section>
+  );
+}
+
+type AuthCompletionResult = {
+  status: string;
+};
+
+function completeAuthFromFragment(): AuthCompletionResult | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  const hash = window.location.hash;
+  if (hash.startsWith('#/auth/complete?')) {
+    const token = new URLSearchParams(hash.slice('#/auth/complete?'.length))
+      .get('token')
+      ?.trim();
+    if (!token) {
+      clearLocationHash();
+      return {
+        status: 'SSO sign-in did not return a token.',
+      };
+    }
+
+    const saved = setStoredToken(token);
+    clearLocationHash();
+    return {
+      status: saved
+        ? 'Signed in with SSO for this browser session.'
+        : 'Session storage is unavailable in this browser context.',
+    };
+  }
+
+  if (hash.startsWith('#/auth/error?')) {
+    clearLocationHash();
+    return {
+      status: 'SSO sign-in did not complete.',
+    };
+  }
+
+  return null;
+}
+
+function clearLocationHash() {
+  window.history.replaceState(
+    null,
+    document.title,
+    `${window.location.pathname}${window.location.search}`,
+  );
+}
+
+type VersionResponse = {
+  admin_login_configured: boolean;
+};
+
+function isVersionResponse(value: unknown): value is VersionResponse {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    'admin_login_configured' in value &&
+    typeof value.admin_login_configured === 'boolean'
   );
 }
 

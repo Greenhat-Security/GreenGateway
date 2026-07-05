@@ -3,6 +3,7 @@ pub mod claims;
 pub mod cookie_session_validator;
 pub mod jwt;
 pub mod oidc;
+pub mod oidc_login;
 pub mod principal;
 pub mod principal_directory;
 pub mod service_token_validator;
@@ -15,6 +16,8 @@ pub use chain::ChainValidator;
 pub use cookie_session_validator::{CookieSessionAuthConfig, CookieSessionValidator};
 #[allow(unused_imports)] // Public JWT API re-export reserved for PR 3 auth middleware.
 pub use jwt::{JwtAuthConfig, JwtValidator, NoopRevocationStore, RevocationStore};
+#[allow(unused_imports)] // Public OIDC-login API is wired by gateway startup.
+pub use oidc_login::{OidcLoginConfig, OidcLoginState};
 #[allow(unused_imports)] // Public auth API re-export reserved for later identity integration.
 pub use principal::{actor_from_principal, AuthMethod, Principal};
 #[allow(unused_imports)] // Public principal directory handle is wired by gateway startup.

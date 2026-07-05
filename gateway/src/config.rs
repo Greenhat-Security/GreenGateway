@@ -62,6 +62,7 @@ const DEFAULT_EGRESS_MAX_RESPONSE_BYTES: usize = 5_242_880;
 const DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_EGRESS_DENY_PRIVATE_IPS: bool = true;
 const ADMIN_LISTEN_ADDR: &str = "ADMIN_LISTEN_ADDR";
+const ADMIN_LOGIN_PROVIDER: &str = "ADMIN_LOGIN_PROVIDER";
 const ADMIN_PREFIX: &str = "ADMIN_PREFIX";
 const AUDIT_LOG_FILE: &str = "AUDIT_LOG_FILE";
 const AUDIT_SQLITE_PATH: &str = "AUDIT_SQLITE_PATH";
@@ -131,6 +132,7 @@ pub struct Config {
     pub listen_addr: SocketAddr,
     pub admin_listen_addr: Option<SocketAddr>,
     pub admin_prefix: String,
+    pub admin_login_provider: Option<String>,
     pub audit_log_file: Option<String>,
     pub audit_sqlite_path: Option<String>,
     pub audit_sqlite_retention_days: Option<u32>,
@@ -234,6 +236,9 @@ pub struct AuthProviderConfig {
     pub cache_ttl_ms: u64,
     pub user_id_claim: Option<String>,
     pub email_claim: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub redirect_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +279,12 @@ struct RawAuthProviderConfig {
     user_id_claim: Option<String>,
     #[serde(default)]
     email_claim: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret: Option<String>,
+    #[serde(default)]
+    redirect_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +343,11 @@ impl Config {
             ADMIN_PREFIX,
             get_var(ADMIN_PREFIX),
             DEFAULT_ADMIN_PREFIX,
+            &mut problems,
+        );
+        let admin_login_provider = parse_optional_string(
+            ADMIN_LOGIN_PROVIDER,
+            get_var(ADMIN_LOGIN_PROVIDER),
             &mut problems,
         );
         let audit_log_file =
@@ -505,11 +521,16 @@ impl Config {
             "boolean",
             &mut problems,
         );
-        let rbac_exempt_paths = parse_comma_separated_paths(
+        let mut rbac_exempt_paths = parse_comma_separated_paths(
             RBAC_EXEMPT_PATHS,
             get_var(RBAC_EXEMPT_PATHS),
-            &default_admin_exempt_paths(&admin_prefix),
+            &default_admin_exempt_paths(&admin_prefix, admin_login_provider.is_some()),
             &mut problems,
+        );
+        append_admin_login_exempt_paths(
+            &mut rbac_exempt_paths,
+            &admin_prefix,
+            admin_login_provider.is_some(),
         );
         let session_cookie_name = parse_var(
             SESSION_COOKIE_NAME,
@@ -544,11 +565,16 @@ impl Config {
             DEFAULT_AUTH_COOKIE_NAME,
             &mut problems,
         );
-        let auth_exempt_paths = parse_comma_separated_paths(
+        let mut auth_exempt_paths = parse_comma_separated_paths(
             AUTH_EXEMPT_PATHS,
             get_var(AUTH_EXEMPT_PATHS),
-            &default_admin_exempt_paths(&admin_prefix),
+            &default_admin_exempt_paths(&admin_prefix, admin_login_provider.is_some()),
             &mut problems,
+        );
+        append_admin_login_exempt_paths(
+            &mut auth_exempt_paths,
+            &admin_prefix,
+            admin_login_provider.is_some(),
         );
         let jwt_jwks_url =
             parse_optional_string(JWT_JWKS_URL, get_var(JWT_JWKS_URL), &mut problems);
@@ -652,6 +678,11 @@ impl Config {
                         &roles_claim,
                     )
                 });
+        validate_admin_login_provider(
+            admin_login_provider.as_deref(),
+            &auth_providers,
+            &mut problems,
+        );
         let csrf_enabled = parse_var(
             CSRF_ENABLED,
             get_var(CSRF_ENABLED),
@@ -762,6 +793,7 @@ impl Config {
                 listen_addr,
                 admin_listen_addr,
                 admin_prefix,
+                admin_login_provider,
                 audit_log_file,
                 audit_sqlite_path,
                 audit_sqlite_retention_days,
@@ -1093,6 +1125,9 @@ fn validate_auth_providers(
         let mut cache_ttl_ms = DEFAULT_COOKIE_SESSION_CACHE_TTL_MS;
         let mut user_id_claim = None;
         let mut email_claim = None;
+        let client_id = normalize_optional_config_string(provider.client_id);
+        let client_secret = normalize_optional_config_string(provider.client_secret);
+        let redirect_uri = normalize_optional_config_string(provider.redirect_uri);
 
         match provider_type {
             AuthProviderType::Jwt => {
@@ -1151,10 +1186,55 @@ fn validate_auth_providers(
             cache_ttl_ms,
             user_id_claim,
             email_claim,
+            client_id,
+            client_secret,
+            redirect_uri,
         });
     }
 
     validated
+}
+
+fn validate_admin_login_provider(
+    admin_login_provider: Option<&str>,
+    providers: &[AuthProviderConfig],
+    problems: &mut Vec<String>,
+) {
+    let Some(provider_name) = admin_login_provider else {
+        return;
+    };
+
+    let Some(provider) = providers
+        .iter()
+        .find(|provider| provider.name == provider_name)
+    else {
+        problems.push(format!(
+            "{ADMIN_LOGIN_PROVIDER} references unknown auth provider '{provider_name}'"
+        ));
+        return;
+    };
+
+    if provider.provider_type != AuthProviderType::Jwt {
+        problems.push(format!(
+            "{ADMIN_LOGIN_PROVIDER} references provider '{provider_name}' which must be type 'jwt'"
+        ));
+    }
+    for (field_name, value) in [
+        ("client_id", &provider.client_id),
+        ("client_secret", &provider.client_secret),
+        ("redirect_uri", &provider.redirect_uri),
+    ] {
+        if value.as_deref().is_none_or(str::is_empty) {
+            problems.push(format!(
+                "{ADMIN_LOGIN_PROVIDER} provider '{provider_name}' must set {field_name}"
+            ));
+        }
+    }
+    if provider.issuer.as_deref().is_none_or(str::is_empty) {
+        problems.push(format!(
+            "{ADMIN_LOGIN_PROVIDER} provider '{provider_name}' must set issuer for OIDC discovery"
+        ));
+    }
 }
 
 fn normalize_optional_config_string(value: Option<String>) -> Option<String> {
@@ -1244,6 +1324,9 @@ fn legacy_auth_providers(
         cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
         user_id_claim: None,
         email_claim: None,
+        client_id: None,
+        client_secret: None,
+        redirect_uri: None,
     }]
 }
 
@@ -1894,10 +1977,32 @@ fn parse_comma_separated_paths(
     values
 }
 
-fn default_admin_exempt_paths(admin_prefix: &str) -> Vec<String> {
+fn default_admin_exempt_paths(admin_prefix: &str, admin_login_enabled: bool) -> Vec<String> {
     let mut paths = default_paths(DEFAULT_EXEMPT_PROBE_PATHS);
     paths.push(admin_prefix.to_owned());
+    if admin_login_enabled {
+        paths.extend(admin_login_exempt_paths(admin_prefix));
+    }
     paths
+}
+
+fn admin_login_exempt_paths(admin_prefix: &str) -> [String; 2] {
+    [
+        format!("/v1{admin_prefix}/auth/login"),
+        format!("/v1{admin_prefix}/auth/callback"),
+    ]
+}
+
+fn append_admin_login_exempt_paths(paths: &mut Vec<String>, admin_prefix: &str, enabled: bool) {
+    if !enabled {
+        return;
+    }
+
+    for path in admin_login_exempt_paths(admin_prefix) {
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
 }
 
 fn default_paths(paths: &[&str]) -> Vec<String> {
@@ -3035,6 +3140,9 @@ mod tests {
                     cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
                     user_id_claim: None,
                     email_claim: None,
+                    client_id: None,
+                    client_secret: None,
+                    redirect_uri: None,
                 },
                 AuthProviderConfig {
                     name: "secondary".to_owned(),
@@ -3054,9 +3162,105 @@ mod tests {
                     cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
                     user_id_claim: None,
                     email_claim: None,
+                    client_id: None,
+                    client_secret: None,
+                    redirect_uri: None,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn admin_login_provider_parses_oidc_client_settings() {
+        let config = Config::from_env_vars(|name| match name {
+            "ADMIN_LOGIN_PROVIDER" => Ok("primary".to_owned()),
+            "AUTH_PROVIDERS" => Ok(r#"[
+                    {
+                        "name": "primary",
+                        "type": "jwt",
+                        "issuer": " https://issuer.example.test/ ",
+                        "jwks_url": "https://issuer.example.test/.well-known/jwks.json",
+                        "client_id": " admin-ui ",
+                        "client_secret": " secret-value ",
+                        "redirect_uri": " https://gateway.example.test/v1/admin/auth/callback "
+                    }
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("admin login provider should parse");
+
+        assert_eq!(config.admin_login_provider.as_deref(), Some("primary"));
+        assert_eq!(
+            config.auth_providers[0].client_id.as_deref(),
+            Some("admin-ui")
+        );
+        assert_eq!(
+            config.auth_providers[0].client_secret.as_deref(),
+            Some("secret-value")
+        );
+        assert_eq!(
+            config.auth_providers[0].redirect_uri.as_deref(),
+            Some("https://gateway.example.test/v1/admin/auth/callback")
+        );
+    }
+
+    #[test]
+    fn admin_login_provider_collects_static_validation_problems() {
+        let error = Config::from_env_vars(|name| match name {
+            "ADMIN_LOGIN_PROVIDER" => Ok("session-provider".to_owned()),
+            "AUTH_PROVIDERS" => Ok(r#"[
+                    {
+                        "name": "session-provider",
+                        "type": "cookie_session",
+                        "introspection_url": "https://session.example.test/introspect",
+                        "user_id_claim": "sub"
+                    }
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("admin login provider should reject non-OIDC client config");
+
+        let message = error.to_string();
+        assert!(message.contains(
+            "ADMIN_LOGIN_PROVIDER references provider 'session-provider' which must be type 'jwt'"
+        ));
+        assert!(
+            message.contains("ADMIN_LOGIN_PROVIDER provider 'session-provider' must set client_id")
+        );
+        assert!(message
+            .contains("ADMIN_LOGIN_PROVIDER provider 'session-provider' must set client_secret"));
+        assert!(message
+            .contains("ADMIN_LOGIN_PROVIDER provider 'session-provider' must set redirect_uri"));
+        assert!(message.contains(
+            "ADMIN_LOGIN_PROVIDER provider 'session-provider' must set issuer for OIDC discovery"
+        ));
+        assert_eq!(error.problems.len(), 5);
+    }
+
+    #[test]
+    fn admin_login_provider_must_reference_existing_provider() {
+        let error = Config::from_env_vars(|name| match name {
+            "ADMIN_LOGIN_PROVIDER" => Ok("missing".to_owned()),
+            "AUTH_PROVIDERS" => Ok(r#"[
+                    {
+                        "name": "primary",
+                        "type": "jwt",
+                        "issuer": "https://issuer.example.test/",
+                        "client_id": "admin-ui",
+                        "client_secret": "secret-value",
+                        "redirect_uri": "https://gateway.example.test/v1/admin/auth/callback"
+                    }
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("admin login provider should require a known provider name");
+
+        assert!(error
+            .to_string()
+            .contains("ADMIN_LOGIN_PROVIDER references unknown auth provider 'missing'"));
     }
 
     #[test]
@@ -3092,6 +3296,9 @@ mod tests {
                 cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
                 user_id_claim: None,
                 email_claim: None,
+                client_id: None,
+                client_secret: None,
+                redirect_uri: None,
             }]
         );
     }
@@ -3134,6 +3341,9 @@ mod tests {
                 cache_ttl_ms: 750,
                 user_id_claim: Some("account.id".to_owned()),
                 email_claim: Some("account.email".to_owned()),
+                client_id: None,
+                client_secret: None,
+                redirect_uri: None,
             }]
         );
     }
@@ -3350,6 +3560,9 @@ mod tests {
             cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
             user_id_claim: None,
             email_claim: None,
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
         }
     }
 
@@ -3385,6 +3598,9 @@ mod tests {
                 cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
                 user_id_claim: None,
                 email_claim: None,
+                client_id: None,
+                client_secret: None,
+                redirect_uri: None,
             }]
         );
     }
@@ -3495,6 +3711,9 @@ mod tests {
                 cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
                 user_id_claim: None,
                 email_claim: None,
+                client_id: None,
+                client_secret: None,
+                redirect_uri: None,
             }]
         );
     }
@@ -3543,6 +3762,9 @@ mod tests {
                 cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
                 user_id_claim: None,
                 email_claim: None,
+                client_id: None,
+                client_secret: None,
+                redirect_uri: None,
             }]
         );
     }
