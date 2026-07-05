@@ -18,6 +18,7 @@ import { IdentitiesView } from './views/IdentitiesView';
 import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
 import { PolicyHistoryView } from './views/PolicyHistoryView';
+import { PrincipalDetail } from './views/PrincipalDetail';
 import { RuleEditor } from './views/RuleEditor';
 import { RuleTable } from './views/RuleTable';
 import { ShadowReviewView } from './views/ShadowReviewView';
@@ -156,6 +157,7 @@ export function AdminShell() {
           <Route path="/rules" element={<RuleTable />} />
           <Route path="/tokens" element={<TokensView />} />
           <Route path="/identities" element={<IdentitiesView />} />
+          <Route path="/identities/detail" element={<PrincipalDetail />} />
           <Route path="/policy/history" element={<PolicyHistoryView />} />
           <Route path="/policy/shadow-review" element={<ShadowReviewView />} />
           <Route path="/signals" element={<SignalsView />} />
@@ -474,6 +476,9 @@ function pageTitleForPath(pathname: string): string {
   }
   if (pathname === '/identities') {
     return 'Identity directory';
+  }
+  if (pathname === '/identities/detail') {
+    return 'Identity detail';
   }
   if (pathname === '/policy/history') {
     return 'Policy history';

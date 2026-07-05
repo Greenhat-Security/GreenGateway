@@ -1,5 +1,6 @@
 import { adminFetchJson } from './api';
 import { adminApiUrl } from './config';
+import type { DiscoverySignal } from './signals';
 
 export type PrincipalTypeFilter = 'human' | 'service';
 
@@ -20,12 +21,33 @@ export type PrincipalPage = {
   anonymous_request_count: number;
 };
 
+export type PrincipalEndpointTouch = {
+  method: string;
+  path: string;
+  request_count: number;
+  last_seen: string;
+};
+
+export type PrincipalDetailResponse = {
+  principal: PrincipalRecord;
+  endpoints_touched: PrincipalEndpointTouch[];
+  rules_hit: string[];
+  anomaly_history: DiscoverySignal[];
+  tools_called: unknown[];
+};
+
 export type PrincipalFilters = {
   issuer?: string;
   authMethod?: string;
   principalType?: PrincipalTypeFilter;
   lastSeenAfter?: string;
   lastSeenBefore?: string;
+};
+
+export type PrincipalDetailRequest = {
+  subject: string;
+  issuer: string;
+  authMethod: string;
 };
 
 export function fetchPrincipals(
@@ -51,6 +73,39 @@ export function fetchPrincipals(
   return adminFetchJson<PrincipalPage>(
     `${adminApiUrl('/principals')}${query ? `?${query}` : ''}`,
   );
+}
+
+export function buildPrincipalDetailQueryParams(
+  request: PrincipalDetailRequest,
+): URLSearchParams {
+  const params = new URLSearchParams();
+
+  params.set('subject', request.subject.trim());
+  params.set('issuer', request.issuer);
+  params.set('auth_method', request.authMethod.trim());
+
+  return params;
+}
+
+export function fetchPrincipalDetail(
+  request: PrincipalDetailRequest,
+): Promise<PrincipalDetailResponse> {
+  const params = buildPrincipalDetailQueryParams(request);
+
+  return adminFetchJson<PrincipalDetailResponse>(
+    adminApiUrl(`/principal?${params.toString()}`),
+  );
+}
+
+export function principalDetailPath(
+  principal: Pick<PrincipalRecord, 'subject' | 'issuer' | 'auth_method'>,
+): string {
+  const params = new URLSearchParams();
+  params.set('subject', principal.subject);
+  params.set('issuer', principal.issuer);
+  params.set('auth_method', principal.auth_method);
+
+  return `/identities/detail?${params.toString()}`;
 }
 
 function appendTrimmed(

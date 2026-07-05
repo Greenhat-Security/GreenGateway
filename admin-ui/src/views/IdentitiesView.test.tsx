@@ -113,6 +113,35 @@ describe('IdentitiesView', () => {
     ]);
   });
 
+  it('links each subject to the encoded principal detail route', async () => {
+    vi.stubGlobal(
+      'fetch',
+      principalsFetchMock({
+        page: principalPage({
+          principals: [
+            principalRecord({
+              subject: 'bot/reporter@example.test',
+              issuer: '',
+              auth_method: 'service_token',
+            }),
+          ],
+        }),
+      }).fetch,
+    );
+
+    renderIdentitiesView();
+
+    expect(
+      (
+        await screen.findByRole('link', {
+          name: 'View detail for principal bot/reporter@example.test',
+        })
+      ).getAttribute('href'),
+    ).toBe(
+      '/identities/detail?subject=bot%2Freporter%40example.test&issuer=&auth_method=service_token',
+    );
+  });
+
   it('loads the next page and appends principal rows', async () => {
     const fetcher = principalsFetchMock({
       page: principalPage({

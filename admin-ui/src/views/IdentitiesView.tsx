@@ -9,6 +9,7 @@ import {
   type PrincipalRecord,
   type PrincipalTypeFilter,
   fetchPrincipals,
+  principalDetailPath,
 } from '../lib/principals';
 
 type PrincipalLoadError = {
@@ -263,9 +264,13 @@ export function IdentitiesView() {
                     >
                       <td>
                         <div className="traffic-endpoint-cell">
-                          <span className="endpoint-template">
+                          <Link
+                            className="endpoint-template endpoint-detail-link"
+                            to={principalDetailPath(principal)}
+                            aria-label={`View detail for principal ${principal.subject}`}
+                          >
                             {principal.subject}
-                          </span>
+                          </Link>
                           <time
                             className="timestamp-cell"
                             dateTime={principal.first_seen}
@@ -339,7 +344,7 @@ export function IdentitiesView() {
   );
 }
 
-function PrincipalAuthMethodBadge({
+export function PrincipalAuthMethodBadge({
   authMethod,
 }: {
   authMethod: string;
