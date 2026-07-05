@@ -1,0 +1,55 @@
+{
+  "schema_version": "0.1.0",
+  "tools": [
+    {
+      "name": "echo",
+      "description": "Echoes a message through a generic upstream endpoint.",
+      "input_json_schema": {
+        "type": "object",
+        "required": ["message"],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "upstream": {
+        "method": "POST",
+        "path_template": "/v1/echo",
+        "body": {
+          "mode": "whole_args_json"
+        }
+      }
+    },
+    {
+      "name": "get_widget",
+      "description": "Looks up an illustrative widget by identifier.",
+      "input_json_schema": {
+        "type": "object",
+        "required": ["widget_id"],
+        "properties": {
+          "widget_id": {
+            "type": "string"
+          },
+          "include_details": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "upstream": {
+        "method": "GET",
+        "path_template": "/v1/widgets/{widget_id}",
+        "query_params": [
+          {
+            "arg_name": "include_details",
+            "query_name": "include_details",
+            "required": false
+          }
+        ]
+      }
+    }
+  ]
+}

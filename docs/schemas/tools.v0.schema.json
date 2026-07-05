@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/tools.v0.schema.json",
+  "title": "GreenGateway Tool Definitions",
+  "description": "Draft 2020-12 JSON Schema for provider-agnostic MCP/API tool definitions. This file describes what tools are and how their calls map to upstream HTTP requests; runtime policy remains in the separate RBAC policy document.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "tools"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^0\\."
+    },
+    "tools": {
+      "type": "array",
+      "description": "Tool definitions. Tool names must be unique; that cross-entry check is enforced by the Rust loader.",
+      "items": {
+        "$ref": "#/$defs/tool_definition"
+      }
+    }
+  },
+  "$defs": {
+    "tool_definition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "description",
+        "input_json_schema",
+        "upstream"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "description": "Stable tool name used by callers and policy. Names are unique within one tools file."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable tool description exposed to future MCP callers."
+        },
+        "input_json_schema": {
+          "$ref": "#/$defs/json_schema_document",
+          "description": "A complete JSON Schema document for this tool's argument object. The loader also compiles this schema to reject malformed schemas at load time."
+        },
+        "upstream": {
+          "$ref": "#/$defs/upstream_mapping"
+        }
+      }
+    },
+    "json_schema_document": {
+      "description": "JSON Schema documents may be objects or boolean schemas. Semantic schema validity is enforced by jsonschema::validator_for at registry load time.",
+      "anyOf": [
+        {
+          "type": "object"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    },
+    "upstream_mapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "path_template"
+      ],
+      "properties": {
+        "method": {
+          "type": "string",
+          "minLength": 1,
+          "description": "HTTP method used for the future upstream request executor. The Rust loader rejects methods outside the known HTTP method set."
+        },
+        "path_template": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute upstream path template using {param}-style placeholders, such as /v1/widgets/{widget_id}."
+        },
+        "query_params": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/query_param_mapping"
+          }
+        },
+        "body": {
+          "$ref": "#/$defs/body_mapping"
+        }
+      }
+    },
+    "query_param_mapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "arg_name",
+        "query_name"
+      ],
+      "properties": {
+        "arg_name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Tool-call argument field to read."
+        },
+        "query_name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Outbound query parameter name to write."
+        },
+        "required": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether the future executor should require this argument before constructing the request."
+        }
+      }
+    },
+    "body_mapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "whole_args_json"
+          ],
+          "description": "Construct the future outbound request body by serializing the entire tool arguments object as JSON."
+        }
+      }
+    }
+  }
+}
