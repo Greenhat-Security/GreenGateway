@@ -1264,6 +1264,9 @@ fn gateway_app_with_process_started_at(
     }
     let tool_registry =
         tools::definitions::ToolRegistry::from_config_with_audit(&config, audit_log.clone())?;
+    let mcp_upstream_definitions =
+        tools::mcp_upstream::discover_upstream_tools_blocking(&config, Arc::clone(&egress_client))?;
+    tool_registry.merge_definitions(mcp_upstream_definitions)?;
     if let Some(tools_file) = config.tools_file.as_ref() {
         tools::definitions::spawn_tool_registry_reload_tasks(
             tools_file.clone(),
@@ -7319,6 +7322,23 @@ mod tests {
     use axum::{body::Body, http::StatusCode};
     use futures_util::StreamExt;
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use rmcp::{
+        model::{
+            CallToolRequestParams as RmcpCallToolRequestParams,
+            CallToolResult as RmcpCallToolResult, ErrorData as RmcpErrorData, Implementation,
+            JsonObject as RmcpJsonObject, ListToolsResult as RmcpListToolsResult,
+            PaginatedRequestParams as RmcpPaginatedRequestParams,
+            ServerCapabilities as RmcpServerCapabilities, ServerInfo as RmcpServerInfo,
+            Tool as RmcpTool,
+        },
+        service::{RequestContext as RmcpRequestContext, RoleServer as RmcpRoleServer},
+        transport::streamable_http_server::{
+            session::never::NeverSessionManager as RmcpNeverSessionManager,
+            StreamableHttpServerConfig as RmcpStreamableHttpServerConfig,
+            StreamableHttpService as RmcpStreamableHttpService,
+        },
+        ServerHandler as RmcpServerHandler,
+    };
     use rusqlite::{params, Connection};
     use serde_json::Value;
     use std::{
@@ -7417,6 +7437,7 @@ mod tests {
             ],
             upstream_url: None,
             upstream_routes: Vec::new(),
+            mcp_upstream_servers: Vec::new(),
             upstream_timeout_ms: None,
             upstream_response_idle_timeout_ms: None,
             upstream_connect_timeout_ms: None,
@@ -10869,6 +10890,323 @@ mod tests {
                     && event.payload["status"] == json!(200)
             })
         });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tools_are_discovered_and_namespaced_in_tools_list() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let harness =
+            mcp_upstream_test_harness("alpha", upstream.url.clone(), &["admin", "reader"]).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            20,
+            "tools/list",
+            None,
+            "mcp-upstream-list",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let tools = body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        let remote = tools
+            .iter()
+            .find(|tool| tool["name"] == json!("alpha:remote_echo"))
+            .expect("upstream tool should be listed under its namespace");
+        assert_eq!(remote["description"], json!("Remote test tool"));
+        assert_eq!(remote["inputSchema"]["required"], json!(["message"]));
+        assert_eq!(
+            remote["inputSchema"]["properties"]["message"]["type"],
+            json!("string")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tools_call_forwards_to_remote_tool_and_returns_result() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let calls = Arc::clone(&upstream.calls);
+        let harness =
+            mcp_upstream_test_harness("alpha", upstream.url.clone(), &["admin", "reader"]).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            21,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "proxied hello"
+                }
+            })),
+            "mcp-upstream-call",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["result"]["isError"], json!(false));
+        assert_eq!(
+            body["result"]["structuredContent"],
+            json!({
+                "remote_tool": "remote_echo",
+                "arguments": {
+                    "message": "proxied hello"
+                }
+            })
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("upstream calls lock should not poison")
+                .as_slice(),
+            &[json!({
+                "name": "remote_echo",
+                "arguments": {
+                    "message": "proxied hello"
+                }
+            })]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_call_emits_mcp_upstream_audit_event() {
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let harness = mcp_upstream_test_harness_with_audit(
+            "alpha",
+            upstream.url.clone(),
+            &["admin"],
+            audit_log,
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            25,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "audit me"
+                }
+            })),
+            "mcp-upstream-audit",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], json!(false));
+        assert_eventually(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == audit::event::TOOL_UPSTREAM_REQUEST
+                    && event.request_id == "mcp-upstream-audit"
+                    && event.payload["tool_name"] == json!("alpha:remote_echo")
+                    && event.payload["method"] == json!("MCP")
+                    && event.payload["upstream_type"] == json!("mcp")
+                    && event.payload["mcp_server_name"] == json!("alpha")
+                    && event.payload["mcp_tool_name"] == json!("remote_echo")
+                    && event.payload["outcome"] == json!("success")
+            })
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_role_policy_is_enforced_before_forwarding() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let calls = Arc::clone(&upstream.calls);
+        let harness = mcp_upstream_test_harness("alpha", upstream.url.clone(), &["admin"]).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.reader_token),
+            22,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "reader should not forward"
+                }
+            })),
+            "mcp-upstream-role-denied",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32001));
+        assert_eq!(
+            body["error"]["message"],
+            json!("tool invocation is denied by role policy")
+        );
+        assert_eq!(
+            body["error"]["data"]["tool_name"],
+            json!("alpha:remote_echo")
+        );
+        assert_eq!(body["error"]["data"]["reason"], json!("role_denied"));
+        assert!(
+            calls
+                .lock()
+                .expect("upstream calls lock should not poison")
+                .is_empty(),
+            "role-denied proxy call must not reach upstream"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_schema_validation_applies_before_forwarding() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let calls = Arc::clone(&upstream.calls);
+        let harness =
+            mcp_upstream_test_harness("alpha", upstream.url.clone(), &["admin", "reader"]).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            23,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "valid field",
+                    "unexpected": true
+                }
+            })),
+            "mcp-upstream-schema-denied",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32602));
+        assert_eq!(
+            body["error"]["data"]["tool_name"],
+            json!("alpha:remote_echo")
+        );
+        assert!(body["error"]["message"]
+            .as_str()
+            .expect("invalid params error should include a message")
+            .contains("failed input schema validation"));
+        assert!(
+            calls
+                .lock()
+                .expect("upstream calls lock should not poison")
+                .is_empty(),
+            "schema-invalid proxy call must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_upstream_url_rejected_by_egress_allowlist_fails_startup() {
+        let mut config = test_config(Vec::new());
+        config.mcp_upstream_servers = vec![config::McpUpstreamServerConfig {
+            name: "alpha".to_owned(),
+            url: "http://blocked.example.test/mcp".to_owned(),
+            timeout_ms: Some(500),
+            response_idle_timeout_ms: Some(500),
+            connect_timeout_ms: Some(500),
+        }];
+        config.egress_allowed_hosts = Vec::new();
+        config.egress_deny_private_ips = false;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let error = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect_err("non-allowlisted MCP upstream should fail startup");
+        let message = error.to_string();
+        assert!(
+            message.contains("MCP upstream server 'alpha' URL is rejected by egress policy"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("egress host is not allowed: blocked.example.test"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_namespaced_name_collision_fails_startup() {
+        let first = spawn_test_mcp_upstream("beta:echo").await;
+        let second = spawn_test_mcp_upstream("echo").await;
+        let mut config = test_config(Vec::new());
+        config.mcp_upstream_servers = vec![
+            config::McpUpstreamServerConfig {
+                name: "alpha".to_owned(),
+                url: first.url,
+                timeout_ms: Some(1000),
+                response_idle_timeout_ms: Some(1000),
+                connect_timeout_ms: Some(1000),
+            },
+            config::McpUpstreamServerConfig {
+                name: "alpha:beta".to_owned(),
+                url: second.url,
+                timeout_ms: Some(1000),
+                response_idle_timeout_ms: Some(1000),
+                connect_timeout_ms: Some(1000),
+            },
+        ];
+        config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
+        config.egress_deny_private_ips = false;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let error = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect_err("namespaced MCP upstream tool collision should fail startup");
+        let message = error.to_string();
+        assert!(
+            message.contains("duplicate tool name 'alpha:beta:echo'"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_unreachable_call_uses_sanitized_error() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let port = upstream.addr.port();
+        let url = upstream.url.clone();
+        let harness = mcp_upstream_test_harness("alpha", url, &["admin"]).await;
+        upstream.shutdown().await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            24,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "after shutdown"
+                }
+            })),
+            "mcp-upstream-unreachable",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32603));
+        assert_eq!(body["error"]["message"], json!("tool invocation failed"));
+        assert_eq!(
+            body["error"]["data"]["tool_name"],
+            json!("alpha:remote_echo")
+        );
+        assert_eq!(body["error"]["data"]["reason"], json!("connect_failed"));
+        let body_string = body.to_string();
+        assert!(!body_string.contains("127.0.0.1"));
+        assert!(!body_string.contains(&port.to_string()));
+        assert!(!body_string.contains("connection"));
+        assert!(!body_string.contains("reqwest"));
     }
 
     #[tokio::test]
@@ -20528,6 +20866,197 @@ paths:
         }
     }
 
+    struct McpUpstreamTestHarness {
+        router: Router,
+        admin_token: String,
+        reader_token: String,
+        _blocked_token: String,
+        _policy: TempPolicyFile,
+        _token_db: TempDb,
+    }
+
+    async fn mcp_upstream_test_harness(
+        server_name: &str,
+        upstream_url: String,
+        allowed_roles: &[&str],
+    ) -> McpUpstreamTestHarness {
+        mcp_upstream_test_harness_with_audit(
+            server_name,
+            upstream_url,
+            allowed_roles,
+            test_audit_log(),
+        )
+        .await
+    }
+
+    async fn mcp_upstream_test_harness_with_audit(
+        server_name: &str,
+        upstream_url: String,
+        allowed_roles: &[&str],
+        audit_log: audit::AuditLog,
+    ) -> McpUpstreamTestHarness {
+        let token_db = TempDb::new("mcp-upstream-service-tokens");
+        let token_store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        let admin_token = create_service_token(&token_store, &["admin"]);
+        let reader_token = create_service_token(&token_store, &["reader"]);
+        let blocked_token = create_service_token(&token_store, &["blocked"]);
+        let tool_name = format!("{server_name}:remote_echo");
+        let policy = TempPolicyFile::new(&mcp_upstream_policy_document(&tool_name, allowed_roles));
+
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        config.service_token_cache_ttl_ms = 20;
+        config.mcp_upstream_servers = vec![config::McpUpstreamServerConfig {
+            name: server_name.to_owned(),
+            url: upstream_url,
+            timeout_ms: Some(2_000),
+            response_idle_timeout_ms: Some(2_000),
+            connect_timeout_ms: Some(2_000),
+        }];
+        config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
+        config.egress_deny_private_ips = false;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("MCP upstream test app should build");
+
+        McpUpstreamTestHarness {
+            router,
+            admin_token,
+            reader_token,
+            _blocked_token: blocked_token,
+            _policy: policy,
+            _token_db: token_db,
+        }
+    }
+
+    struct TestMcpUpstream {
+        addr: std::net::SocketAddr,
+        url: String,
+        calls: Arc<Mutex<Vec<Value>>>,
+        shutdown: tokio_util::sync::CancellationToken,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestMcpUpstream {
+        async fn shutdown(self) {
+            self.shutdown.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(1), self.handle).await;
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestMcpUpstreamServer {
+        tool_name: String,
+        calls: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl RmcpServerHandler for TestMcpUpstreamServer {
+        fn get_info(&self) -> RmcpServerInfo {
+            RmcpServerInfo::new(RmcpServerCapabilities::builder().enable_tools().build())
+                .with_server_info(
+                    Implementation::new("greengateway-test-upstream", "0.0.0")
+                        .with_title("GreenGateway Test Upstream"),
+                )
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<RmcpPaginatedRequestParams>,
+            _context: RmcpRequestContext<RmcpRoleServer>,
+        ) -> Result<RmcpListToolsResult, RmcpErrorData> {
+            Ok(RmcpListToolsResult::with_all_items(vec![RmcpTool::new(
+                self.tool_name.clone(),
+                "Remote test tool",
+                Arc::new(remote_echo_input_schema()),
+            )]))
+        }
+
+        async fn call_tool(
+            &self,
+            request: RmcpCallToolRequestParams,
+            _context: RmcpRequestContext<RmcpRoleServer>,
+        ) -> Result<RmcpCallToolResult, RmcpErrorData> {
+            let arguments = request.arguments.unwrap_or_default();
+            let call = json!({
+                "name": request.name.to_string(),
+                "arguments": Value::Object(arguments.clone()),
+            });
+            self.calls
+                .lock()
+                .expect("upstream calls lock should not poison")
+                .push(call);
+
+            Ok(RmcpCallToolResult::structured(json!({
+                "remote_tool": request.name.to_string(),
+                "arguments": Value::Object(arguments),
+            })))
+        }
+    }
+
+    async fn spawn_test_mcp_upstream(tool_name: &str) -> TestMcpUpstream {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handler = TestMcpUpstreamServer {
+            tool_name: tool_name.to_owned(),
+            calls: Arc::clone(&calls),
+        };
+        let config = RmcpStreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(true)
+            .disable_allowed_hosts();
+        let service = RmcpStreamableHttpService::new(
+            move || Ok(handler.clone()),
+            Arc::new(RmcpNeverSessionManager::default()),
+            config,
+        );
+        let router = Router::new().nest_service("/mcp", service);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test MCP upstream should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test MCP upstream address should be available");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown_task = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown_task.cancelled_owned())
+                .await
+                .expect("test MCP upstream should serve");
+        });
+
+        TestMcpUpstream {
+            addr,
+            url: format!("http://{addr}/mcp"),
+            calls,
+            shutdown,
+            handle,
+        }
+    }
+
+    fn remote_echo_input_schema() -> RmcpJsonObject {
+        let Value::Object(schema) = json!({
+            "type": "object",
+            "required": ["message"],
+            "properties": {
+                "message": {
+                    "type": "string"
+                }
+            }
+        }) else {
+            unreachable!("remote echo schema is always an object")
+        };
+
+        schema
+    }
+
     fn create_service_token(store: &auth::SqliteTokenStore, roles: &[&str]) -> String {
         store
             .create(auth::tokens::CreateTokenRequest {
@@ -20765,6 +21294,41 @@ paths:
                 },
                 "get_widget": {
                     "allowed_roles": ["admin"],
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn mcp_upstream_policy_document(tool_name: &str, allowed_roles: &[&str]) -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "id": "mcp-upstream-test-policy",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "admin": {
+                    "permissions": [ADMIN_MCP_USE_PERMISSION]
+                },
+                "reader": {
+                    "permissions": [ADMIN_MCP_USE_PERMISSION]
+                },
+                "blocked": {
+                    "permissions": []
+                }
+            },
+            "routes": [
+                {
+                    "methods": ["POST"],
+                    "path_prefix": MCP_ROUTE,
+                    "permission": ADMIN_MCP_USE_PERMISSION
+                }
+            ],
+            "tools": {
+                tool_name: {
+                    "allowed_roles": allowed_roles,
                     "timeout_ms": 5000,
                     "max_concurrent": 2
                 }

@@ -23,6 +23,7 @@ use crate::{
 const TOOL_REGISTRY_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 const MAX_TOOLS_FILE_BYTES: u64 = 1_048_576;
 const TOOLS_FILE_SCHEMA_JSON: &str = include_str!("../../../docs/schemas/tools.v0.schema.json");
+const MCP_PROXY_METHOD: &str = "MCP_PROXY";
 
 static TOOLS_FILE_SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
     let schema = serde_json::from_str(TOOLS_FILE_SCHEMA_JSON)
@@ -49,6 +50,69 @@ pub struct UpstreamMapping {
     pub query_params: Vec<QueryParamMapping>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<BodyMapping>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpProxyMapping {
+    pub server_name: String,
+    pub tool_name: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SerializedMcpProxyMapping {
+    server_name: String,
+    tool_name: String,
+}
+
+impl ToolDefinition {
+    pub fn mcp_proxy(
+        name: String,
+        description: String,
+        input_schema: Value,
+        server_name: String,
+        tool_name: String,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            input_schema,
+            upstream: UpstreamMapping::mcp_proxy(server_name, tool_name),
+        }
+    }
+}
+
+impl UpstreamMapping {
+    pub fn mcp_proxy(server_name: String, tool_name: String) -> Self {
+        let path_template = serde_json::to_string(&SerializedMcpProxyMapping {
+            server_name,
+            tool_name,
+        })
+        .expect("serialized MCP proxy mapping should be valid JSON");
+
+        Self {
+            method: MCP_PROXY_METHOD.to_owned(),
+            path_template,
+            query_params: Vec::new(),
+            body: None,
+        }
+    }
+
+    pub fn mcp_proxy_mapping(&self) -> Option<McpProxyMapping> {
+        if self.method != MCP_PROXY_METHOD {
+            return None;
+        }
+
+        let mapping =
+            serde_json::from_str::<SerializedMcpProxyMapping>(&self.path_template).ok()?;
+        Some(McpProxyMapping {
+            server_name: mapping.server_name,
+            tool_name: mapping.tool_name,
+        })
+    }
+
+    pub fn is_mcp_proxy(&self) -> bool {
+        self.method == MCP_PROXY_METHOD
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -224,6 +288,46 @@ impl ToolRegistry {
     #[allow(dead_code)] // Future MCP list-tools handling will expose registry contents.
     pub fn list(&self) -> Vec<Arc<ToolDefinition>> {
         self.state.load().tools.values().cloned().collect()
+    }
+
+    pub fn has_http_tools(&self) -> bool {
+        self.state
+            .load()
+            .tools
+            .values()
+            .any(|definition| !definition.upstream.is_mcp_proxy())
+    }
+
+    pub fn merge_definitions(
+        &self,
+        definitions: Vec<ToolDefinition>,
+    ) -> Result<(), ToolRegistryError> {
+        if definitions.is_empty() {
+            return Ok(());
+        }
+
+        let _guard = match self.write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let mut merged = self
+            .state
+            .load()
+            .tools
+            .values()
+            .map(|definition| definition.as_ref().clone())
+            .collect::<Vec<_>>();
+        merged.extend(definitions);
+
+        let semantic_problems = tool_definition_problems(&merged);
+        if !semantic_problems.is_empty() {
+            return Err(ToolRegistryError::invalid(semantic_problems));
+        }
+
+        self.state
+            .store(Arc::new(ToolRegistryState::from_definitions(merged)));
+        Ok(())
     }
 
     fn from_definitions_with_audit(
@@ -514,7 +618,22 @@ fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
             ));
         }
 
-        if !is_known_http_method(&definition.upstream.method) {
+        if let Some(mapping) = definition.upstream.mcp_proxy_mapping() {
+            if mapping.server_name.trim().is_empty() {
+                problems.push(format!(
+                    "tools[{index}].upstream MCP proxy server_name must be non-empty"
+                ));
+            }
+            if mapping.tool_name.trim().is_empty() {
+                problems.push(format!(
+                    "tools[{index}].upstream MCP proxy tool_name must be non-empty"
+                ));
+            }
+        } else if definition.upstream.is_mcp_proxy() {
+            problems.push(format!(
+                "tools[{index}].upstream MCP proxy mapping is invalid"
+            ));
+        } else if !is_known_http_method(&definition.upstream.method) {
             problems.push(format!(
                 "tools[{index}].upstream.method contains unknown HTTP method '{}'",
                 definition.upstream.method
@@ -1074,6 +1193,7 @@ mod tests {
             ],
             upstream_url: None,
             upstream_routes: Vec::new(),
+            mcp_upstream_servers: Vec::new(),
             upstream_timeout_ms: None,
             upstream_response_idle_timeout_ms: None,
             upstream_connect_timeout_ms: None,

@@ -27,6 +27,7 @@ use crate::{
     tools::{
         definitions::{ToolDefinition, ToolRegistry},
         executor::{ToolExecutor, ToolExecutorError},
+        mcp_upstream::MCP_CALL_TOOL_RESULT_HEADER,
         runtime::{ToolInvocationContext, ToolRuntimeError},
     },
 };
@@ -203,6 +204,14 @@ fn invocation_context_from_request(
 }
 
 fn call_tool_result_from_egress_response(response: EgressResponse) -> CallToolResult {
+    if response.headers.contains_key(MCP_CALL_TOOL_RESULT_HEADER) {
+        return serde_json::from_slice::<CallToolResult>(&response.body).unwrap_or_else(|_| {
+            CallToolResult::structured_error(json!({
+                "summary": "upstream MCP result could not be decoded"
+            }))
+        });
+    }
+
     let body = if response.status.is_success() {
         response_body_value(&response)
     } else {

@@ -15,10 +15,11 @@ use url::Url;
 
 use crate::{
     audit::{self, AuditEvent, AuditLog},
-    config::Config,
+    config::{Config, McpUpstreamServerConfig},
     egress::{EgressClient, EgressError, EgressResponse},
     tools::{
-        definitions::{BodyMappingMode, ToolDefinition, ToolRegistry},
+        definitions::{BodyMappingMode, McpProxyMapping, ToolDefinition, ToolRegistry},
+        mcp_upstream::{self, McpUpstreamRuntimeConfig},
         runtime::{ToolInvocationContext, ToolRuntime, ToolRuntimeError},
     },
 };
@@ -57,7 +58,9 @@ pub struct ToolExecutor {
     runtime: ToolRuntime,
     egress_client: Arc<EgressClient>,
     audit: AuditLog,
-    upstream_origin: String,
+    upstream_origin: Option<String>,
+    mcp_upstream_servers: Arc<HashMap<String, McpUpstreamServerConfig>>,
+    mcp_upstream_runtime_config: Arc<McpUpstreamRuntimeConfig>,
     validator_cache: Arc<Mutex<ValidatorCache>>,
 }
 
@@ -118,6 +121,11 @@ pub enum ToolExecutorError {
     Egress {
         tool_name: String,
         source: EgressError,
+    },
+    McpUpstream {
+        tool_name: String,
+        server_name: String,
+        reason: &'static str,
     },
 }
 
@@ -193,6 +201,14 @@ impl fmt::Display for ToolExecutorError {
             Self::Egress { tool_name, source } => {
                 write!(formatter, "tool '{tool_name}' upstream request failed: {source}")
             }
+            Self::McpUpstream {
+                tool_name,
+                server_name,
+                reason,
+            } => write!(
+                formatter,
+                "tool '{tool_name}' upstream MCP server '{server_name}' request failed: {reason}"
+            ),
         }
     }
 }
@@ -236,12 +252,31 @@ impl ToolExecutor {
         egress_client: Arc<EgressClient>,
         audit: AuditLog,
     ) -> Result<Self, ToolExecutorError> {
-        let upstream_url = config
-            .upstream_url
-            .as_deref()
-            .ok_or(ToolExecutorError::MissingUpstreamUrl)?;
+        let upstream_url = if registry.has_http_tools() {
+            Some(
+                config
+                    .upstream_url
+                    .as_deref()
+                    .ok_or(ToolExecutorError::MissingUpstreamUrl)?,
+            )
+        } else {
+            config.upstream_url.as_deref()
+        };
+        let mcp_upstream_servers = config
+            .mcp_upstream_servers
+            .iter()
+            .map(|server| (server.name.clone(), server.clone()))
+            .collect();
 
-        Self::new(registry, runtime, egress_client, audit, upstream_url)
+        Self::new_inner(
+            registry,
+            runtime,
+            egress_client,
+            audit,
+            upstream_url,
+            mcp_upstream_servers,
+            McpUpstreamRuntimeConfig::from_config(config),
+        )
     }
 
     #[allow(dead_code)] // Tests and future app wiring construct the executor directly.
@@ -252,12 +287,38 @@ impl ToolExecutor {
         audit: AuditLog,
         upstream_url: &str,
     ) -> Result<Self, ToolExecutorError> {
+        Self::new_inner(
+            registry,
+            runtime,
+            egress_client,
+            audit,
+            Some(upstream_url),
+            HashMap::new(),
+            McpUpstreamRuntimeConfig {
+                timeout: Duration::from_secs(30),
+                response_idle_timeout: Duration::from_secs(30),
+                connect_timeout: Duration::from_secs(10),
+            },
+        )
+    }
+
+    fn new_inner(
+        registry: ToolRegistry,
+        runtime: ToolRuntime,
+        egress_client: Arc<EgressClient>,
+        audit: AuditLog,
+        upstream_url: Option<&str>,
+        mcp_upstream_servers: HashMap<String, McpUpstreamServerConfig>,
+        mcp_upstream_runtime_config: McpUpstreamRuntimeConfig,
+    ) -> Result<Self, ToolExecutorError> {
         Ok(Self {
             registry,
             runtime,
             egress_client,
             audit,
-            upstream_origin: upstream_origin_from_url(upstream_url)?,
+            upstream_origin: upstream_url.map(upstream_origin_from_url).transpose()?,
+            mcp_upstream_servers: Arc::new(mcp_upstream_servers),
+            mcp_upstream_runtime_config: Arc::new(mcp_upstream_runtime_config),
             validator_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -319,6 +380,10 @@ impl ToolExecutor {
             return Err(error);
         }
 
+        if let Some(mapping) = tool.upstream.mcp_proxy_mapping() {
+            return self.execute_mcp_proxy(context, &tool, mapping, args).await;
+        }
+
         let request = self.build_request(&tool, &args)?;
         let started = Instant::now();
         let result = self
@@ -368,6 +433,69 @@ impl ToolExecutor {
         }
     }
 
+    async fn execute_mcp_proxy(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        mapping: McpProxyMapping,
+        args: Value,
+    ) -> Result<EgressResponse, ToolExecutorError> {
+        let Some(server) = self.mcp_upstream_servers.get(&mapping.server_name) else {
+            return Err(ToolExecutorError::McpUpstream {
+                tool_name: tool.name.clone(),
+                server_name: mapping.server_name,
+                reason: "unknown_mcp_upstream_server",
+            });
+        };
+
+        let started = Instant::now();
+        let result = mcp_upstream::call_tool(
+            server,
+            &self.mcp_upstream_runtime_config,
+            Arc::clone(&self.egress_client),
+            &mapping.tool_name,
+            args,
+        )
+        .await;
+        let latency_ms = duration_millis(started.elapsed());
+
+        match result {
+            Ok(response) => {
+                self.emit_mcp_upstream_audit(
+                    context,
+                    tool,
+                    &mapping,
+                    UpstreamAuditOutcome {
+                        outcome: "success",
+                        status: Some(response.status.as_u16()),
+                        latency_ms,
+                        reason: None,
+                    },
+                );
+                Ok(response)
+            }
+            Err(source) => {
+                let reason = source.reason();
+                self.emit_mcp_upstream_audit(
+                    context,
+                    tool,
+                    &mapping,
+                    UpstreamAuditOutcome {
+                        outcome: "failure",
+                        status: None,
+                        latency_ms,
+                        reason: Some(reason),
+                    },
+                );
+                Err(ToolExecutorError::McpUpstream {
+                    tool_name: tool.name.clone(),
+                    server_name: mapping.server_name,
+                    reason,
+                })
+            }
+        }
+    }
+
     fn validator_for(
         &self,
         tool: &ToolDefinition,
@@ -409,7 +537,10 @@ impl ToolExecutor {
             }
         })?;
         let path = render_path_template(tool, args)?;
-        let mut url = Url::parse(&format!("{}{}", self.upstream_origin, path)).map_err(|err| {
+        let Some(upstream_origin) = self.upstream_origin.as_ref() else {
+            return Err(ToolExecutorError::MissingUpstreamUrl);
+        };
+        let mut url = Url::parse(&format!("{}{}", upstream_origin, path)).map_err(|err| {
             ToolExecutorError::UrlBuild {
                 tool_name: tool.name.clone(),
                 message: err.to_string(),
@@ -488,6 +619,39 @@ impl ToolExecutor {
             "tool_name": tool.name,
             "method": method.as_str(),
             "path_template": tool.upstream.path_template,
+            "outcome": outcome.outcome,
+            "latency_ms": outcome.latency_ms,
+        });
+
+        if let Some(status) = outcome.status {
+            payload["upstream_status"] = json!(status);
+        }
+        if let Some(reason) = outcome.reason {
+            payload["reason"] = json!(reason);
+        }
+
+        self.audit.emit(AuditEvent::new(
+            audit::event::TOOL_UPSTREAM_REQUEST,
+            &context.request_id,
+            &context.source_ip,
+            context.actor.clone(),
+            payload,
+        ));
+    }
+
+    fn emit_mcp_upstream_audit(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        mapping: &McpProxyMapping,
+        outcome: UpstreamAuditOutcome,
+    ) {
+        let mut payload = json!({
+            "tool_name": tool.name,
+            "method": MCP_TOOL_OBSERVATION_METHOD,
+            "upstream_type": "mcp",
+            "mcp_server_name": mapping.server_name,
+            "mcp_tool_name": mapping.tool_name,
             "outcome": outcome.outcome,
             "latency_ms": outcome.latency_ms,
         });
@@ -793,6 +957,7 @@ fn executor_work_failure_reason(error: &ToolExecutorError) -> &'static str {
         | ToolExecutorError::UnsupportedArgumentValue { .. }
         | ToolExecutorError::PathSegmentIsDotSegment { .. } => "invalid_params",
         ToolExecutorError::Egress { source, .. } => egress_error_reason(source),
+        ToolExecutorError::McpUpstream { reason, .. } => reason,
         ToolExecutorError::MissingUpstreamUrl
         | ToolExecutorError::InvalidUpstreamUrl { .. }
         | ToolExecutorError::SchemaCacheKey { .. }
