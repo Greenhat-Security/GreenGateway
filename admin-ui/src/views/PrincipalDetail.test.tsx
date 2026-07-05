@@ -70,6 +70,34 @@ describe('PrincipalDetail', () => {
     expect(url.searchParams.get('auth_method')).toBe('bearer');
   });
 
+  it('links to a deny rule prefilled for the current principal', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        jsonResponse(
+          200,
+          principalDetailResponse({
+            principal: principalRecord({
+              subject: 'alice/prod@example.test',
+              auth_method: 'service_token',
+            }),
+          }),
+        ),
+      ),
+    );
+
+    renderPrincipalDetail(
+      '/identities/detail?subject=alice%2Fprod%40example.test&issuer=&auth_method=service_token',
+    );
+
+    const blockLink = await screen.findByRole('link', {
+      name: 'Block this principal',
+    });
+    expect(blockLink.getAttribute('href')).toBe(
+      '/policy/rules/editor?prefill_principal_id=alice%2Fprod%40example.test&prefill_action=deny&prefill_path=%2F**',
+    );
+  });
+
   it('shows a query error without fetching when required params are missing', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);

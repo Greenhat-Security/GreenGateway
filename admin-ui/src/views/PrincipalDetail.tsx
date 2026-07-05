@@ -137,9 +137,17 @@ function PrincipalSummary({ detail }: { detail: PrincipalDetailResponse }) {
       className="traffic-detail-section"
       aria-labelledby="principal-summary-heading"
     >
-      <div className="section-heading">
-        <p className="eyebrow">Principal</p>
-        <h3 id="principal-summary-heading">Summary</h3>
+      <div className="section-heading logs-heading">
+        <div>
+          <p className="eyebrow">Principal</p>
+          <h3 id="principal-summary-heading">Summary</h3>
+        </div>
+        <Link
+          className="rule-danger-button"
+          to={blockPrincipalRuleEditorPath(principal.subject)}
+        >
+          Block this principal
+        </Link>
       </div>
 
       <div className="traffic-endpoint-summary">
@@ -533,6 +541,15 @@ function toPrincipalDetailLoadError(
 function ruleEditorPathForRule(ruleId: string): string {
   const params = new URLSearchParams();
   params.set('rule_id', ruleId);
+
+  return `/policy/rules/editor?${params.toString()}`;
+}
+
+function blockPrincipalRuleEditorPath(subject: string): string {
+  const params = new URLSearchParams();
+  params.set('prefill_principal_id', subject);
+  params.set('prefill_action', 'deny');
+  params.set('prefill_path', '/**');
 
   return `/policy/rules/editor?${params.toString()}`;
 }
