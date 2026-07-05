@@ -2793,6 +2793,195 @@ mod tests {
     }
 
     #[test]
+    fn auth_provider_doc_examples_parse_as_configured_providers() {
+        let examples = auth_provider_doc_examples();
+        let found_labels = examples
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>();
+        let mut expected = HashMap::from([
+            (
+                "keycloak-realm",
+                vec![jwt_doc_provider(
+                    "keycloak",
+                    "https://keycloak.example.com/realms/acme",
+                    Some("greengateway-api"),
+                    "realm_access.roles",
+                    None,
+                    None,
+                )],
+            ),
+            (
+                "keycloak-client-roles",
+                vec![jwt_doc_provider(
+                    "keycloak-client-roles",
+                    "https://keycloak.example.com/realms/acme",
+                    Some("greengateway-api"),
+                    "resource_access.greengateway-api.roles",
+                    None,
+                    None,
+                )],
+            ),
+            (
+                "keycloak-scope",
+                vec![jwt_doc_provider(
+                    "keycloak-scope",
+                    "https://keycloak.example.com/realms/acme",
+                    Some("greengateway-api"),
+                    "scope",
+                    Some(" "),
+                    None,
+                )],
+            ),
+            (
+                "auth0-namespaced-roles",
+                vec![jwt_doc_provider(
+                    "auth0",
+                    "https://your-tenant.us.auth0.com/",
+                    Some("https://api.example.com"),
+                    "https://greengateway.example.com/roles",
+                    None,
+                    Some("org_id"),
+                )],
+            ),
+            (
+                "entra-app-roles",
+                vec![jwt_doc_provider(
+                    "entra-app-roles",
+                    "https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/v2.0",
+                    Some("api://22222222-2222-2222-2222-222222222222"),
+                    "roles",
+                    None,
+                    Some("tid"),
+                )],
+            ),
+            (
+                "entra-groups",
+                vec![jwt_doc_provider(
+                    "entra-groups",
+                    "https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/v2.0",
+                    Some("api://22222222-2222-2222-2222-222222222222"),
+                    "groups",
+                    None,
+                    Some("tid"),
+                )],
+            ),
+            (
+                "okta-groups",
+                vec![jwt_doc_provider(
+                    "okta",
+                    "https://your-org.okta.com/oauth2/default",
+                    Some("api://greengateway"),
+                    "groups",
+                    None,
+                    None,
+                )],
+            ),
+        ]);
+
+        assert_eq!(
+            examples.len(),
+            expected.len(),
+            "unexpected doc example set: {found_labels:?}"
+        );
+
+        for (label, json) in examples {
+            let expected_providers = expected
+                .remove(label.as_str())
+                .unwrap_or_else(|| panic!("unexpected AUTH_PROVIDERS doc example: {label}"));
+            let config = Config::from_env_vars(|name| match name {
+                AUTH_PROVIDERS => Ok(json.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .unwrap_or_else(|err| panic!("{label} AUTH_PROVIDERS example should parse: {err}"));
+
+            assert_eq!(
+                config.auth_providers, expected_providers,
+                "{label} AUTH_PROVIDERS example parsed to an unexpected provider config"
+            );
+        }
+
+        assert!(
+            expected.is_empty(),
+            "missing AUTH_PROVIDERS doc examples: {:?}",
+            expected.keys().collect::<Vec<_>>()
+        );
+    }
+
+    fn auth_provider_doc_examples() -> Vec<(String, &'static str)> {
+        [
+            ("keycloak", include_str!("../../docs/auth/keycloak.md")),
+            ("auth0", include_str!("../../docs/auth/auth0.md")),
+            ("entra-id", include_str!("../../docs/auth/entra-id.md")),
+            ("okta", include_str!("../../docs/auth/okta.md")),
+        ]
+        .into_iter()
+        .flat_map(|(doc_name, markdown)| extract_auth_provider_doc_examples(doc_name, markdown))
+        .collect()
+    }
+
+    fn extract_auth_provider_doc_examples(
+        doc_name: &str,
+        markdown: &'static str,
+    ) -> Vec<(String, &'static str)> {
+        const MARKER_PREFIX: &str = "<!-- auth-providers-example:";
+        const MARKER_SUFFIX: &str = "-->";
+        const JSON_FENCE: &str = "```json";
+        const FENCE: &str = "```";
+
+        let mut examples = Vec::new();
+        let mut remaining = markdown;
+
+        while let Some(marker_start) = remaining.find(MARKER_PREFIX) {
+            let after_prefix = &remaining[marker_start + MARKER_PREFIX.len()..];
+            let marker_end = after_prefix
+                .find(MARKER_SUFFIX)
+                .unwrap_or_else(|| panic!("{doc_name} auth provider example marker is unclosed"));
+            let label = after_prefix[..marker_end].trim().to_owned();
+            let after_marker = &after_prefix[marker_end + MARKER_SUFFIX.len()..];
+            let fence_start = after_marker.find(JSON_FENCE).unwrap_or_else(|| {
+                panic!("{doc_name} auth provider example {label} is missing a json code fence")
+            });
+            let after_fence = &after_marker[fence_start + JSON_FENCE.len()..];
+            let json_start = after_fence
+                .strip_prefix("\r\n")
+                .or_else(|| after_fence.strip_prefix('\n'))
+                .unwrap_or(after_fence);
+            let fence_end = json_start.find(FENCE).unwrap_or_else(|| {
+                panic!("{doc_name} auth provider example {label} json fence is unclosed")
+            });
+            let json = &json_start[..fence_end];
+
+            examples.push((label, json));
+            remaining = &json_start[fence_end + FENCE.len()..];
+        }
+
+        examples
+    }
+
+    fn jwt_doc_provider(
+        name: &str,
+        issuer: &str,
+        audience: Option<&str>,
+        roles_claim: &str,
+        roles_claim_delimiter: Option<&str>,
+        org_claim: Option<&str>,
+    ) -> AuthProviderConfig {
+        AuthProviderConfig {
+            name: name.to_owned(),
+            provider_type: AuthProviderType::Jwt,
+            jwks_url: None,
+            issuer: Some(issuer.to_owned()),
+            audience: audience.map(str::to_owned),
+            jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
+            require_jti: false,
+            roles_claim: roles_claim.to_owned(),
+            roles_claim_delimiter: roles_claim_delimiter.map(str::to_owned),
+            org_claim: org_claim.map(str::to_owned),
+        }
+    }
+
+    #[test]
     fn auth_providers_accept_issuer_only_jwt_provider_for_oidc_discovery() {
         let config = Config::from_env_vars(|name| match name {
             "AUTH_PROVIDERS" => Ok(r#"[{
