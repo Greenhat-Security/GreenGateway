@@ -83,6 +83,7 @@ struct PrincipalDirectoryInner {
 struct PrincipalDirectoryShared {
     path: PathBuf,
     connection: Mutex<Connection>,
+    read_connection: Mutex<Connection>,
 }
 
 #[derive(Debug)]
@@ -257,9 +258,21 @@ impl PrincipalDirectory {
             path: path.clone(),
             source,
         })?;
+        let read_connection =
+            Connection::open(&path).map_err(|source| PrincipalDirectoryError::Open {
+                path: path.clone(),
+                source,
+            })?;
+        configure_connection(&read_connection).map_err(|source| {
+            PrincipalDirectoryError::Setup {
+                path: path.clone(),
+                source,
+            }
+        })?;
         let shared = Arc::new(PrincipalDirectoryShared {
             path: path.clone(),
             connection: Mutex::new(connection),
+            read_connection: Mutex::new(read_connection),
         });
 
         let (tx, rx) =
@@ -350,7 +363,7 @@ impl PrincipalDirectoryShared {
             .transpose()?;
         let (sql, params) = build_principal_list_query(filters, cursor.as_ref());
         let rows = {
-            let connection = self.connection_guard();
+            let connection = self.read_connection_guard();
             let mut statement = connection.prepare(&sql).map_err(|source| {
                 PrincipalDirectoryQueryError::Sqlite {
                     path: self.path.clone(),
@@ -402,7 +415,7 @@ impl PrincipalDirectoryShared {
         &self,
         key: &PrincipalDirectoryKey,
     ) -> Result<Option<PrincipalDirectoryRecord>, PrincipalDirectoryQueryError> {
-        let connection = self.connection_guard();
+        let connection = self.read_connection_guard();
         connection
             .query_row(
                 r#"
@@ -437,6 +450,25 @@ impl PrincipalDirectoryShared {
                 tracing::error!(
                     path = %self.path.display(),
                     "SQLite principal directory connection lock poisoned; recovering"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn read_connection_guard(&self) -> MutexGuard<'_, Connection> {
+        match self.read_connection.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                ::metrics::counter!(
+                    LOCK_POISON_RECOVERIES_TOTAL,
+                    "component" => "principal_directory",
+                    "lock" => "read_connection"
+                )
+                .increment(1);
+                tracing::error!(
+                    path = %self.path.display(),
+                    "SQLite principal directory read connection lock poisoned; recovering"
                 );
                 poisoned.into_inner()
             }
@@ -762,7 +794,7 @@ fn take_mutex_value<T>(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, time::Duration};
+    use std::{path::Path, sync::mpsc, time::Duration};
 
     use rusqlite::Connection;
 
@@ -1089,6 +1121,70 @@ mod tests {
 
         assert_eq!(record.email.as_deref(), Some("b@example.test"));
         assert_eq!(record.issuer, "https://issuer-b.example.test/");
+    }
+
+    #[test]
+    fn read_queries_use_connection_independent_from_writer_connection() {
+        let directory = seeded_directory(
+            "read-write-connection-separation",
+            &[observation(
+                "alpha",
+                Some("https://issuer.example.test/"),
+                "bearer",
+                Some("alpha@example.test"),
+                None,
+                "2026-01-01T00:00:00Z",
+            )],
+        );
+        let shared = &directory
+            .inner
+            .as_ref()
+            .expect("directory should be enabled")
+            .shared;
+        let writer_connection = shared.connection_guard();
+        writer_connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("writer transaction should start");
+
+        let reader = directory.directory.clone();
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let list_result = reader.list(&PrincipalDirectoryListFilters {
+                issuer: None,
+                auth_method: None,
+                principal_type: None,
+                last_seen_after: None,
+                last_seen_before: None,
+                limit: 50,
+                cursor: None,
+            });
+            let get_result = reader.get(&PrincipalDirectoryKey {
+                subject: "alpha".to_owned(),
+                issuer: "https://issuer.example.test/".to_owned(),
+                auth_method: "bearer".to_owned(),
+            });
+
+            tx.send((
+                list_result.map(|page| page.principals.len()),
+                get_result.map(|record| record.map(|record| record.subject)),
+            ))
+            .expect("read result should send");
+        });
+
+        let read_result = rx.recv_timeout(Duration::from_millis(250));
+        writer_connection
+            .execute_batch("ROLLBACK")
+            .expect("writer transaction should roll back");
+        drop(writer_connection);
+        handle.join().expect("reader thread should finish");
+
+        let (list_result, get_result) =
+            read_result.expect("read queries should finish while writer connection is busy");
+        assert_eq!(list_result.expect("list query should succeed"), 1);
+        assert_eq!(
+            get_result.expect("get query should succeed").as_deref(),
+            Some("alpha")
+        );
     }
 
     #[test]

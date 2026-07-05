@@ -3805,13 +3805,19 @@ async fn principal_list_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    let page = match state.directory.list(&query.filters) {
-        Ok(page) => page,
-        Err(auth::principal_directory::PrincipalDirectoryQueryError::InvalidCursor {
+    let directory = state.directory.clone();
+    let filters = query.filters.clone();
+    let page = match tokio::task::spawn_blocking(move || directory.list(&filters)).await {
+        Ok(Ok(page)) => page,
+        Ok(Err(auth::principal_directory::PrincipalDirectoryQueryError::InvalidCursor {
             parameter,
-        }) => return bad_request(&format!("invalid query parameter: {parameter}")),
-        Err(err) => {
+        })) => return bad_request(&format!("invalid query parameter: {parameter}")),
+        Ok(Err(err)) => {
             tracing::error!(error = %err, "failed to query principal directory");
+            return internal_server_error("principal directory query failed");
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "principal directory query task failed");
             return internal_server_error("principal directory query failed");
         }
     };
@@ -3864,11 +3870,17 @@ async fn principal_detail_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    let principal_record = match state.directory.get(&query.key) {
-        Ok(Some(principal)) => principal,
-        Ok(None) => return not_found("principal was not found"),
-        Err(err) => {
+    let directory = state.directory.clone();
+    let key = query.key.clone();
+    let principal_record = match tokio::task::spawn_blocking(move || directory.get(&key)).await {
+        Ok(Ok(Some(principal))) => principal,
+        Ok(Ok(None)) => return not_found("principal was not found"),
+        Ok(Err(err)) => {
             tracing::error!(error = %err, "failed to query principal detail");
+            return internal_server_error("principal detail query failed");
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "principal detail query task failed");
             return internal_server_error("principal detail query failed");
         }
     };
