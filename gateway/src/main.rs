@@ -9734,6 +9734,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_tools_list_filters_tools_by_allowed_roles() {
+        let harness = mcp_test_harness(&[], test_audit_log()).await;
+
+        let (reader_status, reader_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.reader_token),
+            11,
+            "tools/list",
+            None,
+            "mcp-list-reader",
+        )
+        .await;
+        assert_eq!(reader_status, StatusCode::OK);
+        let reader_tools = reader_body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        assert!(
+            reader_tools
+                .iter()
+                .any(|tool| tool["name"] == json!("echo")),
+            "unrestricted tool should be listed"
+        );
+        assert!(
+            !reader_tools
+                .iter()
+                .any(|tool| tool["name"] == json!("get_widget")),
+            "admin-only tool should not be listed to reader"
+        );
+
+        let (admin_status, admin_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            12,
+            "tools/list",
+            None,
+            "mcp-list-admin",
+        )
+        .await;
+        assert_eq!(admin_status, StatusCode::OK);
+        let admin_tools = admin_body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        assert!(
+            admin_tools
+                .iter()
+                .any(|tool| tool["name"] == json!("get_widget")),
+            "matching role should see role-restricted tool"
+        );
+    }
+
+    #[tokio::test]
     async fn mcp_route_rejects_missing_authentication_and_missing_permission() {
         let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
 
@@ -9843,6 +9894,10 @@ mod tests {
         assert_eq!(unknown_status, StatusCode::OK);
         assert_eq!(unknown_body["error"]["code"], json!(-32601));
         assert_eq!(
+            unknown_body["error"]["message"],
+            json!("tool 'missing_tool' is not defined")
+        );
+        assert_eq!(
             unknown_body["error"]["data"]["tool_name"],
             json!("missing_tool")
         );
@@ -9862,6 +9917,10 @@ mod tests {
         assert_eq!(schema_status, StatusCode::OK);
         assert_eq!(schema_body["error"]["code"], json!(-32602));
         assert_eq!(schema_body["error"]["data"]["tool_name"], json!("echo"));
+        assert!(schema_body["error"]["message"]
+            .as_str()
+            .expect("invalid params error should include a message")
+            .contains("failed input schema validation"));
 
         let (role_status, role_body) = mcp_rpc(
             &harness.router,
@@ -9879,8 +9938,174 @@ mod tests {
         .await;
         assert_eq!(role_status, StatusCode::OK);
         assert_eq!(role_body["error"]["code"], json!(-32001));
+        assert_eq!(
+            role_body["error"]["message"],
+            json!("tool invocation is denied by role policy")
+        );
         assert_eq!(role_body["error"]["data"]["tool_name"], json!("echo"));
         assert_eq!(role_body["error"]["data"]["reason"], json!("role_denied"));
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_transport_failure_uses_sanitized_error_reason() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let upstream_addr = listener
+            .local_addr()
+            .expect("listener address should be available");
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("test server should accept a connection");
+                drop(stream);
+            }
+        });
+        let harness = mcp_test_harness_with_upstream_url(
+            &["admin"],
+            test_audit_log(),
+            format!("http://{upstream_addr}"),
+            mcp_tools_document(),
+            vec!["127.0.0.1".to_owned()],
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            13,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "trigger reset"
+                }
+            })),
+            "mcp-call-reset-upstream",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32603));
+        assert_eq!(body["error"]["message"], json!("tool invocation failed"));
+        assert_eq!(body["error"]["data"]["tool_name"], json!("echo"));
+        assert_eq!(body["error"]["data"]["reason"], json!("http_error"));
+        let body_string = body.to_string();
+        assert!(!body_string.contains("127.0.0.1"));
+        assert!(!body_string.contains(&upstream_addr.port().to_string()));
+        assert!(!body_string.contains("connection"));
+        assert!(!body_string.contains("reqwest"));
+        assert!(!body_string.contains("error sending request"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_sanitizes_non_success_upstream_error_body() {
+        let upstream_addr = spawn_fixed_echo_upstream(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            json!({
+                "message": "validation failed against api.internal.example.test",
+                "errors": [
+                    {
+                        "detail": "bad value used secret=gg_test_fake_secret_400"
+                    }
+                ],
+                "debug": "stack trace from api.internal.example.test with gg_test_fake_secret_400"
+            })
+            .to_string(),
+        )
+        .await;
+        let harness = mcp_test_harness_with_upstream_url(
+            &["admin"],
+            test_audit_log(),
+            format!("http://{upstream_addr}"),
+            mcp_tools_document(),
+            vec!["127.0.0.1".to_owned()],
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            14,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "bad input"
+                }
+            })),
+            "mcp-call-upstream-400",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["result"]["isError"], json!(true));
+        assert_eq!(body["result"]["structuredContent"]["status"], json!(400));
+        assert_eq!(
+            body["result"]["structuredContent"]["body"]["message"],
+            json!("validation failed against [redacted]")
+        );
+        assert_eq!(
+            body["result"]["structuredContent"]["body"]["errors"][0]["detail"],
+            json!("bad value used [redacted]")
+        );
+        let body_string = body.to_string();
+        assert!(!body_string.contains("api.internal.example.test"));
+        assert!(!body_string.contains("gg_test_fake_secret_400"));
+        assert!(!body_string.contains("stack trace"));
+        assert!(!mcp_content_text(&body).contains("api.internal.example.test"));
+        assert!(!mcp_content_text(&body).contains("gg_test_fake_secret_400"));
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_success_body_is_forwarded_faithfully() {
+        let upstream_body = json!({
+            "message": "ok",
+            "diagnostic": "api.internal.example.test",
+            "marker": "gg_test_fake_secret_success"
+        });
+        let upstream_addr = spawn_fixed_echo_upstream(
+            StatusCode::OK,
+            "application/json",
+            upstream_body.to_string(),
+        )
+        .await;
+        let harness = mcp_test_harness_with_upstream_url(
+            &["admin"],
+            test_audit_log(),
+            format!("http://{upstream_addr}"),
+            mcp_tools_document(),
+            vec!["127.0.0.1".to_owned()],
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            15,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "successful output"
+                }
+            })),
+            "mcp-call-success-passthrough",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["result"]["isError"], json!(false));
+        assert_eq!(body["result"]["structuredContent"]["status"], json!(200));
+        assert_eq!(body["result"]["structuredContent"]["body"], upstream_body);
+        assert!(mcp_content_text(&body).contains("api.internal.example.test"));
+        assert!(mcp_content_text(&body).contains("gg_test_fake_secret_success"));
     }
 
     #[tokio::test]
@@ -18572,6 +18797,23 @@ paths:
         audit_log: audit::AuditLog,
     ) -> McpTestHarness {
         let upstream_addr = spawn_echo_json_upstream().await;
+        mcp_test_harness_with_upstream_url(
+            echo_allowed_roles,
+            audit_log,
+            format!("http://{upstream_addr}"),
+            mcp_tools_document(),
+            vec!["127.0.0.1".to_owned()],
+        )
+        .await
+    }
+
+    async fn mcp_test_harness_with_upstream_url(
+        echo_allowed_roles: &[&str],
+        audit_log: audit::AuditLog,
+        upstream_url: String,
+        tools_document: String,
+        egress_allowed_hosts: Vec<String>,
+    ) -> McpTestHarness {
         let token_db = TempDb::new("mcp-service-tokens");
         let token_store =
             auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
@@ -18579,15 +18821,15 @@ paths:
         let reader_token = create_service_token(&token_store, &["reader"]);
         let blocked_token = create_service_token(&token_store, &["blocked"]);
         let policy = TempPolicyFile::new(&mcp_policy_document(echo_allowed_roles));
-        let tools = TempToolsFile::new(&mcp_tools_document());
+        let tools = TempToolsFile::new(&tools_document);
 
         let mut config = test_config(Vec::new());
         config.policy_file = Some(policy.path.to_string_lossy().into_owned());
         config.tools_file = Some(tools.path.to_string_lossy().into_owned());
         config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
         config.service_token_cache_ttl_ms = 20;
-        config.upstream_url = Some(format!("http://{upstream_addr}"));
-        config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
+        config.upstream_url = Some(upstream_url);
+        config.egress_allowed_hosts = egress_allowed_hosts;
         config.egress_deny_private_ips = false;
 
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -18649,6 +18891,29 @@ paths:
                 .route("/v1/echo", post(echo))
                 .route("/v1/widgets/{widget_id}", get(get_widget)),
         )
+        .await
+    }
+
+    async fn spawn_fixed_echo_upstream(
+        status: StatusCode,
+        content_type: &'static str,
+        body: String,
+    ) -> std::net::SocketAddr {
+        let body = Arc::new(body);
+
+        spawn_router(Router::new().route(
+            "/v1/echo",
+            post(move || {
+                let body = Arc::clone(&body);
+                async move {
+                    Response::builder()
+                        .status(status)
+                        .header(header::CONTENT_TYPE, content_type)
+                        .body(Body::from(body.as_ref().clone()))
+                        .expect("fixed upstream response should build")
+                }
+            }),
+        ))
         .await
     }
 
@@ -18714,6 +18979,12 @@ paths:
         builder
             .body(Body::from(body.to_string()))
             .expect("MCP request should build")
+    }
+
+    fn mcp_content_text(body: &Value) -> &str {
+        body["result"]["content"][0]["text"]
+            .as_str()
+            .expect("MCP result should include text content")
     }
 
     fn mcp_initialize_params() -> Value {

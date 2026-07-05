@@ -17,7 +17,7 @@ use rmcp::{
     },
     ServerHandler,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
@@ -96,12 +96,19 @@ impl ServerHandler for McpServer {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        let invocation_context =
+            invocation_context_from_request(&context, self.trust_proxy_headers);
         let tools = self
             .registry
             .list()
             .into_iter()
+            .filter(|definition| {
+                self.executor.as_ref().is_none_or(|executor| {
+                    executor.can_list_tool(&definition.name, &invocation_context)
+                })
+            })
             .map(|definition| mcp_tool_from_definition(definition.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -196,7 +203,11 @@ fn invocation_context_from_request(
 }
 
 fn call_tool_result_from_egress_response(response: EgressResponse) -> CallToolResult {
-    let body = response_body_value(&response);
+    let body = if response.status.is_success() {
+        response_body_value(&response)
+    } else {
+        sanitized_error_body_value(&response)
+    };
     let result = json!({
         "status": response.status.as_u16(),
         "body": body,
@@ -227,7 +238,188 @@ fn response_is_json(response: &EgressResponse) -> bool {
         .is_some_and(|value| {
             let media_type = value.split(';').next().map(str::trim).unwrap_or_default();
             media_type.eq_ignore_ascii_case(JSON_MIME)
+                || media_type.to_ascii_lowercase().ends_with("+json")
         })
+}
+
+const MAX_ERROR_TEXT_CHARS: usize = 512;
+const MAX_ERROR_ARRAY_ITEMS: usize = 8;
+const MAX_ERROR_OBJECT_FIELDS: usize = 16;
+const MAX_ERROR_NESTING_DEPTH: usize = 4;
+const REDACTED: &str = "[redacted]";
+
+fn sanitized_error_body_value(response: &EgressResponse) -> Value {
+    if response_is_json(response) {
+        if let Ok(body) = serde_json::from_slice::<Value>(&response.body) {
+            match body {
+                Value::Object(body) => {
+                    let mut sanitized = Map::new();
+                    for key in [
+                        "type",
+                        "title",
+                        "code",
+                        "error",
+                        "error_code",
+                        "message",
+                        "detail",
+                        "details",
+                        "errors",
+                    ] {
+                        if let Some(value) = body.get(key) {
+                            sanitized
+                                .insert(key.to_owned(), sanitize_error_json_value(key, value, 0));
+                        }
+                    }
+
+                    return if sanitized.is_empty() {
+                        generic_upstream_error_body()
+                    } else {
+                        Value::Object(sanitized)
+                    };
+                }
+                Value::String(value) => {
+                    return Value::String(sanitize_error_text(&value, MAX_ERROR_TEXT_CHARS));
+                }
+                _ => return generic_upstream_error_body(),
+            }
+        }
+    }
+
+    Value::String(sanitize_error_text(
+        &String::from_utf8_lossy(&response.body),
+        MAX_ERROR_TEXT_CHARS,
+    ))
+}
+
+fn generic_upstream_error_body() -> Value {
+    json!({ "summary": "upstream returned an error response" })
+}
+
+fn sanitize_error_json_value(key: &str, value: &Value, depth: usize) -> Value {
+    if sensitive_json_key(key) {
+        return Value::String(REDACTED.to_owned());
+    }
+
+    if depth >= MAX_ERROR_NESTING_DEPTH {
+        return Value::String("[omitted]".to_owned());
+    }
+
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+        Value::String(value) => Value::String(sanitize_error_text(value, MAX_ERROR_TEXT_CHARS)),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .take(MAX_ERROR_ARRAY_ITEMS)
+                .map(|value| sanitize_error_json_value("", value, depth + 1))
+                .collect(),
+        ),
+        Value::Object(values) => {
+            let mut sanitized = Map::new();
+            for (key, value) in values.iter().take(MAX_ERROR_OBJECT_FIELDS) {
+                let sanitized_key = sanitize_error_text(key, 80);
+                sanitized.insert(
+                    sanitized_key,
+                    sanitize_error_json_value(key, value, depth + 1),
+                );
+            }
+            Value::Object(sanitized)
+        }
+    }
+}
+
+fn sanitize_error_text(value: &str, max_chars: usize) -> String {
+    let (truncated, was_truncated) = truncate_chars(value, max_chars);
+    let redacted = redact_sensitive_tokens(&truncated);
+
+    if was_truncated {
+        format!("{redacted}...[truncated]")
+    } else {
+        redacted
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    let was_truncated = chars.next().is_some();
+
+    (truncated, was_truncated)
+}
+
+fn redact_sensitive_tokens(value: &str) -> String {
+    let mut redacted = String::with_capacity(value.len());
+    let mut token = String::new();
+
+    for ch in value.chars() {
+        if is_error_token_char(ch) {
+            token.push(ch);
+        } else {
+            push_redacted_token(&mut redacted, &mut token);
+            redacted.push(ch);
+        }
+    }
+    push_redacted_token(&mut redacted, &mut token);
+
+    redacted
+}
+
+fn push_redacted_token(redacted: &mut String, token: &mut String) {
+    if token.is_empty() {
+        return;
+    }
+
+    if sensitive_error_token(token) {
+        redacted.push_str(REDACTED);
+    } else {
+        redacted.push_str(token);
+    }
+    token.clear();
+}
+
+fn is_error_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            '.' | '-' | '_' | ':' | '/' | '?' | '&' | '=' | '%' | '+' | '@'
+        )
+}
+
+fn sensitive_json_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("authorization")
+        || key.contains("credential")
+        || key.contains("password")
+        || key.contains("secret")
+        || key.contains("session")
+        || key.contains("cookie")
+        || key.contains("api_key")
+        || key.contains("apikey")
+        || key.ends_with("token")
+        || key.contains("_token")
+}
+
+fn sensitive_error_token(token: &str) -> bool {
+    let token = token
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ',' | ';' | ')' | '(' | '[' | ']'))
+        .to_ascii_lowercase();
+
+    token.starts_with("http://")
+        || token.starts_with("https://")
+        || token.starts_with("sk_")
+        || token.starts_with("pk_")
+        || token.starts_with("ghp_")
+        || token.starts_with("github_pat_")
+        || token.starts_with("xoxb-")
+        || token.starts_with("xoxp-")
+        || token.contains("secret=")
+        || token.contains("token=")
+        || token.contains("password=")
+        || token.contains("api_key=")
+        || token.contains("apikey=")
+        || token.contains(".internal")
+        || token.contains("internal.")
+        || token.ends_with(".local")
 }
 
 fn runtime_error_to_mcp_error(error: ToolRuntimeError) -> ErrorData {
@@ -264,16 +456,20 @@ fn runtime_error_to_mcp_error(error: ToolRuntimeError) -> ErrorData {
         ToolRuntimeError::Cancelled { tool_name } => {
             runtime_unavailable_error(tool_name, "tool invocation was cancelled", "cancelled")
         }
-        ToolRuntimeError::WorkFailed { tool_name, message } => {
-            let executor_error = classify_executor_work_failure(&message);
+        ToolRuntimeError::WorkFailed {
+            tool_name,
+            message,
+            reason,
+        } => {
+            let executor_error = classify_executor_work_failure(reason.as_deref(), &message);
             match executor_error {
                 ExecutorWorkFailure::InvalidParams => {
                     ErrorData::invalid_params(message, Some(json!({ "tool_name": tool_name })))
                 }
                 ExecutorWorkFailure::UnknownTool => unknown_tool_error(&tool_name),
-                ExecutorWorkFailure::Internal => ErrorData::internal_error(
+                ExecutorWorkFailure::Internal { reason } => ErrorData::internal_error(
                     "tool invocation failed",
-                    Some(json!({ "tool_name": tool_name, "message": message })),
+                    Some(json!({ "tool_name": tool_name, "reason": reason })),
                 ),
             }
         }
@@ -327,10 +523,21 @@ fn runtime_unavailable_error(
 enum ExecutorWorkFailure {
     UnknownTool,
     InvalidParams,
-    Internal,
+    Internal { reason: String },
 }
 
-fn classify_executor_work_failure(message: &str) -> ExecutorWorkFailure {
+fn classify_executor_work_failure(reason: Option<&str>, message: &str) -> ExecutorWorkFailure {
+    match reason {
+        Some("unknown_tool") => return ExecutorWorkFailure::UnknownTool,
+        Some("invalid_params") => return ExecutorWorkFailure::InvalidParams,
+        Some(reason) => {
+            return ExecutorWorkFailure::Internal {
+                reason: reason.to_owned(),
+            };
+        }
+        None => {}
+    }
+
     if message.contains("is not defined in the tool registry") {
         return ExecutorWorkFailure::UnknownTool;
     }
@@ -343,7 +550,9 @@ fn classify_executor_work_failure(message: &str) -> ExecutorWorkFailure {
         return ExecutorWorkFailure::InvalidParams;
     }
 
-    ExecutorWorkFailure::Internal
+    ExecutorWorkFailure::Internal {
+        reason: "internal_error".to_owned(),
+    }
 }
 
 pub(crate) fn mcp_executor_from_config(
