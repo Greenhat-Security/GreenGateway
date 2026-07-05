@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeMap,
     error::Error,
-    fmt, fs, io,
+    fmt, fs,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
@@ -20,6 +21,7 @@ use crate::{
 };
 
 const TOOL_REGISTRY_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
+const MAX_TOOLS_FILE_BYTES: u64 = 1_048_576;
 const TOOLS_FILE_SCHEMA_JSON: &str = include_str!("../../../docs/schemas/tools.v0.schema.json");
 
 static TOOLS_FILE_SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
@@ -417,16 +419,51 @@ fn spawn_sighup_reload_task(tools_file: PathBuf, registry: ToolRegistry) {
 fn spawn_sighup_reload_task(_tools_file: PathBuf, _registry: ToolRegistry) {}
 
 fn definitions_from_file(path: &Path) -> Result<Vec<ToolDefinition>, ToolRegistryError> {
-    let contents = fs::read_to_string(path).map_err(|source| ToolRegistryError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
+    let contents = read_tools_file_to_string(path)?;
     let value = serde_json::from_str(&contents).map_err(|source| ToolRegistryError::Parse {
         path: Some(path.to_owned()),
         source,
     })?;
 
     definitions_from_json_value(value, Some(path))
+}
+
+fn read_tools_file_to_string(path: &Path) -> Result<String, ToolRegistryError> {
+    let file = fs::File::open(path).map_err(|source| ToolRegistryError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| ToolRegistryError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    if metadata.len() > MAX_TOOLS_FILE_BYTES {
+        return Err(tools_file_too_large(path));
+    }
+
+    let mut contents = String::new();
+    let mut reader = file.take(MAX_TOOLS_FILE_BYTES + 1);
+    reader
+        .read_to_string(&mut contents)
+        .map_err(|source| ToolRegistryError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    if contents.len() as u64 > MAX_TOOLS_FILE_BYTES {
+        return Err(tools_file_too_large(path));
+    }
+
+    Ok(contents)
+}
+
+fn tools_file_too_large(path: &Path) -> ToolRegistryError {
+    ToolRegistryError::Io {
+        path: path.to_owned(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("tools file exceeds maximum size of {MAX_TOOLS_FILE_BYTES} bytes"),
+        ),
+    }
 }
 
 fn definitions_from_json_value(
@@ -523,6 +560,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
+        sync::Arc,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -530,6 +568,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
+    use crate::audit::sink::tests::CaptureSink;
     use crate::config::{self, AuthMode, Config};
 
     #[test]
@@ -611,11 +650,7 @@ mod tests {
 
     #[test]
     fn malformed_input_schema_is_rejected_and_names_tool() {
-        let mut tool = echo_tool("bad_schema", "POST", "/v1/echo");
-        tool["input_json_schema"] = json!({
-            "type": "not-a-json-schema-type",
-            "properties": {}
-        });
+        let tool = malformed_input_schema_tool("bad_schema", "POST", "/v1/echo");
         let file = TempToolsFile::new(&tools_document(&[tool]));
 
         let error = ToolRegistry::from_file(file.path())
@@ -629,6 +664,34 @@ mod tests {
         assert!(
             message.contains("not-a-json-schema-type"),
             "schema compiler error should be included: {message}"
+        );
+    }
+
+    #[test]
+    fn semantic_validation_reports_all_tool_definition_problems() {
+        let file = TempToolsFile::new(&tools_document(&[
+            echo_tool("echo", "POST", "/v1/echo"),
+            echo_tool("echo", "BREW", "/v1/other"),
+        ]));
+
+        let error = ToolRegistry::from_file(file.path())
+            .expect_err("multiple semantic problems should reject");
+        let ToolRegistryError::Invalid { problems } = error else {
+            panic!("semantic problems should return ToolRegistryError::Invalid");
+        };
+
+        assert_eq!(problems.len(), 2, "unexpected problems: {problems:?}");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("duplicate tool name 'echo' at tools[1]")),
+            "duplicate tool name problem missing: {problems:?}"
+        );
+        assert!(
+            problems.iter().any(|problem| {
+                problem.contains("tools[1].upstream.method contains unknown HTTP method 'BREW'")
+            }),
+            "unknown HTTP method problem missing: {problems:?}"
         );
     }
 
@@ -678,23 +741,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_watch_invalid_update_keeps_old_registry_and_accepts_later_valid_update() {
+    async fn file_watch_invalid_updates_keep_old_registry_and_accept_later_valid_update() {
         let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
-        let registry = ToolRegistry::from_file(file.path()).expect("initial registry should load");
+        let capture = CaptureSink::new();
+        let audit_log = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let registry = ToolRegistry::from_file_with_audit(file.path(), audit_log)
+            .expect("initial registry should load");
         spawn_tool_registry_reload_tasks(file.path().to_owned(), registry.clone())
             .expect("tool registry watcher should start");
 
-        file.write(r#"{ "schema_version": "#);
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        for invalid_update in [
+            r#"{ "schema_version": "#.to_owned(),
+            tools_document(&[
+                echo_tool("echo", "POST", "/v1/echo"),
+                echo_tool("echo", "GET", "/v1/other"),
+            ]),
+            tools_document(&[echo_tool("get_widget", "BREW", "/v1/widgets/{widget_id}")]),
+            tools_document(&[malformed_input_schema_tool(
+                "bad_schema",
+                "POST",
+                "/v1/echo",
+            )]),
+        ] {
+            let failure_count =
+                audit_event_count(&capture, audit::event::TOOL_REGISTRY_RELOAD_FAILED);
 
-        assert!(
-            registry.get("echo").is_some(),
-            "invalid watched reload must keep last-known-good registry"
-        );
-        assert!(
-            registry.get("get_widget").is_none(),
-            "invalid watched reload must not partially apply"
-        );
+            file.write(&invalid_update);
+
+            wait_until(Duration::from_secs(2), || {
+                audit_event_count(&capture, audit::event::TOOL_REGISTRY_RELOAD_FAILED)
+                    > failure_count
+            })
+            .await;
+
+            assert!(
+                registry.get("echo").is_some(),
+                "invalid watched reload must keep last-known-good registry"
+            );
+            assert!(
+                registry.get("get_widget").is_none(),
+                "invalid watched reload must not partially apply"
+            );
+            assert_eq!(
+                registry.list().len(),
+                1,
+                "invalid watched reload must not change tool count"
+            );
+        }
 
         file.write(&tools_document(&[echo_tool(
             "get_widget",
@@ -715,6 +808,24 @@ mod tests {
 
         assert!(registry.get("anything").is_none());
         assert!(registry.list().is_empty());
+    }
+
+    #[test]
+    fn from_config_with_audit_returns_disabled_empty_registry_when_tools_file_unset() {
+        let config = test_config(None);
+        let capture = CaptureSink::new();
+        let audit_log = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+
+        let registry = ToolRegistry::from_config_with_audit(&config, audit_log)
+            .expect("unset TOOLS_FILE should not error");
+
+        assert!(registry.get("anything").is_none());
+        assert!(registry.list().is_empty());
+        assert_eq!(
+            capture.len(),
+            0,
+            "unset TOOLS_FILE should not emit load events"
+        );
     }
 
     #[test]
@@ -779,6 +890,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn oversized_tools_file_is_rejected_with_clear_error() {
+        let file = TempToolsFile::new(&" ".repeat(1_048_577));
+
+        let error =
+            ToolRegistry::from_file(file.path()).expect_err("oversized tools file should reject");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("tools file exceeds maximum size of 1048576 bytes"),
+            "unexpected error: {message}"
+        );
+    }
+
     fn tools_document(tools: &[Value]) -> String {
         serde_json::to_string_pretty(&json!({
             "schema_version": "0.1.0",
@@ -817,6 +942,15 @@ mod tests {
         })
     }
 
+    fn malformed_input_schema_tool(name: &str, method: &str, path_template: &str) -> Value {
+        let mut tool = echo_tool(name, method, path_template);
+        tool["input_json_schema"] = json!({
+            "type": "not-a-json-schema-type",
+            "properties": {}
+        });
+        tool
+    }
+
     fn tools_schema_validator() -> Validator {
         let schema_path = repo_root().join("docs/schemas/tools.v0.schema.json");
         let schema = fs::read_to_string(&schema_path)
@@ -832,6 +966,14 @@ mod tests {
         if let Err(error) = validator.validate(value) {
             panic!("published schema should accept tools document: {error}");
         }
+    }
+
+    fn audit_event_count(capture: &CaptureSink, event_type: &str) -> usize {
+        capture
+            .events()
+            .iter()
+            .filter(|event| event.event_type == event_type)
+            .count()
     }
 
     async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
