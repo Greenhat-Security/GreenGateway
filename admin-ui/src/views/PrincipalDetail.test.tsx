@@ -115,6 +115,14 @@ describe('PrincipalDetail', () => {
 
   it.each([
     {
+      status: 401,
+      body: { error: 'missing bearer token' },
+      heading: 'Bearer token required',
+      message: /Paste a bearer token before viewing identities\./,
+      linkName: 'token panel',
+      linkHref: '/',
+    },
+    {
       status: 403,
       body: { error: 'forbidden' },
       heading: 'Principal detail permission required',
@@ -128,7 +136,7 @@ describe('PrincipalDetail', () => {
     },
   ])(
     'renders a distinct $status error state',
-    async ({ status, body, heading, message }) => {
+    async ({ status, body, heading, message, linkName, linkHref }) => {
       vi.stubGlobal(
         'fetch',
         vi.fn().mockResolvedValue(jsonResponse(status, body)),
@@ -138,6 +146,11 @@ describe('PrincipalDetail', () => {
 
       expect(await screen.findByText(heading)).toBeTruthy();
       expect(screen.getByText(message)).toBeTruthy();
+      if (linkName && linkHref) {
+        expect(screen.getByRole('link', { name: linkName }).getAttribute('href')).toBe(
+          linkHref,
+        );
+      }
     },
   );
 
