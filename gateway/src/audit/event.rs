@@ -14,6 +14,7 @@ pub const TOOL_INVOKE_SUCCESS: &str = "tool.invoke_success";
 pub const TOOL_INVOKE_FAILURE: &str = "tool.invoke_failure";
 pub const TOOL_INVOKE_REJECTED: &str = "tool.invoke_rejected";
 pub const TOOL_UPSTREAM_REQUEST: &str = "tool.upstream_request";
+pub const TOOL_REGISTRY_CHANGED: &str = "tool_registry.changed";
 pub const TOOL_REGISTRY_LOADED: &str = "tool_registry.loaded";
 pub const TOOL_REGISTRY_RELOAD_FAILED: &str = "tool_registry.reload_failed";
 

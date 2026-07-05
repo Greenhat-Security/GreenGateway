@@ -17,6 +17,7 @@ import { adminApiUrl, adminBasePath } from './lib/config';
 import { IdentitiesView } from './views/IdentitiesView';
 import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
+import { OpenApiToolsView } from './views/OpenApiToolsView';
 import { PolicyHistoryView } from './views/PolicyHistoryView';
 import { PrincipalDetail } from './views/PrincipalDetail';
 import { RuleEditor } from './views/RuleEditor';
@@ -96,6 +97,9 @@ export function AdminShell() {
           <NavLink to="/tokens" className={navItemClassName}>
             Tokens
           </NavLink>
+          <NavLink to="/tools/openapi" className={navItemClassName}>
+            OpenAPI tools
+          </NavLink>
           <NavLink to="/identities" className={navItemClassName}>
             Identities
           </NavLink>
@@ -156,6 +160,7 @@ export function AdminShell() {
           <Route path="/traffic/detail" element={<TrafficEndpointDetail />} />
           <Route path="/rules" element={<RuleTable />} />
           <Route path="/tokens" element={<TokensView />} />
+          <Route path="/tools/openapi" element={<OpenApiToolsView />} />
           <Route path="/identities" element={<IdentitiesView />} />
           <Route path="/identities/detail" element={<PrincipalDetail />} />
           <Route path="/policy/history" element={<PolicyHistoryView />} />
@@ -206,6 +211,10 @@ function Dashboard({
           <Link to="/tokens">
             <span>Tokens</span>
             <small>Create, rotate, and revoke service tokens</small>
+          </Link>
+          <Link to="/tools/openapi">
+            <span>OpenAPI tools</span>
+            <small>Preview and register generated tools</small>
           </Link>
           <Link to="/identities">
             <span>Identities</span>
@@ -473,6 +482,9 @@ function pageTitleForPath(pathname: string): string {
   }
   if (pathname === '/tokens') {
     return 'Tokens';
+  }
+  if (pathname === '/tools/openapi') {
+    return 'OpenAPI tools';
   }
   if (pathname === '/identities') {
     return 'Identity directory';

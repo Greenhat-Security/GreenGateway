@@ -38,7 +38,10 @@ pub async fn validate_request(State(config): State<Config>, req: Request, next: 
         }
     }
 
-    if is_mutating(req.method()) && !is_allowed_content_type(req.headers(), &config) {
+    if is_mutating(req.method())
+        && !is_allowed_content_type(req.headers(), &config)
+        && !is_openapi_preview_content_type(req.uri().path(), req.headers())
+    {
         return unsupported_media_type(&config.validation_allowed_content_types);
     }
 
@@ -60,6 +63,21 @@ fn is_allowed_content_type(headers: &HeaderMap, config: &Config) -> bool {
 
     config
         .validation_allowed_content_types
+        .iter()
+        .any(|allowed| content_type_matches(content_type, allowed))
+}
+
+fn is_openapi_preview_content_type(path: &str, headers: &HeaderMap) -> bool {
+    if !path.ends_with("/tools/openapi/preview") {
+        return false;
+    }
+
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+
+    ["text/plain", "application/yaml", "application/x-yaml"]
         .iter()
         .any(|allowed| content_type_matches(content_type, allowed))
 }

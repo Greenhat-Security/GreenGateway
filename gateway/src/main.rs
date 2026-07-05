@@ -1,9 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
+    fs,
     net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
+    path::{Path as FsPath, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -73,6 +74,8 @@ const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
 const TOKENS_ADMIN_ROUTE: &str = "/v1/admin/tokens";
 const TOKEN_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}";
 const TOKEN_ROTATE_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}/rotate";
+const TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/preview";
+const TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/register";
 const SCHEMA_COVERAGE_ADMIN_ROUTE: &str = "/v1/admin/schema/coverage";
 const SIGNALS_ADMIN_ROUTE: &str = "/v1/admin/signals";
 const SIGNAL_ACKNOWLEDGE_ADMIN_ROUTE: &str = "/v1/admin/signals/{id}/acknowledge";
@@ -94,6 +97,8 @@ const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
 const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
 const ADMIN_TOKENS_READ_PERMISSION: &str = "admin:tokens:read";
 const ADMIN_TOKENS_WRITE_PERMISSION: &str = "admin:tokens:write";
+const ADMIN_TOOLS_READ_PERMISSION: &str = "admin:tools:read";
+const ADMIN_TOOLS_WRITE_PERMISSION: &str = "admin:tools:write";
 const ADMIN_SCHEMA_READ_PERMISSION: &str = "admin:schema:read";
 const ADMIN_SIGNALS_READ_PERMISSION: &str = "admin:signals:read";
 const ADMIN_SIGNALS_WRITE_PERMISSION: &str = "admin:signals:write";
@@ -203,6 +208,8 @@ struct AdminRoutes {
     tokens_route: String,
     token_route: String,
     token_rotate_route: String,
+    tools_openapi_preview_route: String,
+    tools_openapi_register_route: String,
     schema_coverage_route: String,
     signals_route: String,
     signal_acknowledge_route: String,
@@ -278,6 +285,8 @@ impl AdminRoutes {
             tokens_route: format!("{api_prefix}/tokens"),
             token_route: format!("{api_prefix}/tokens/{{id}}"),
             token_rotate_route: format!("{api_prefix}/tokens/{{id}}/rotate"),
+            tools_openapi_preview_route: format!("{api_prefix}/tools/openapi/preview"),
+            tools_openapi_register_route: format!("{api_prefix}/tools/openapi/register"),
             schema_coverage_route: format!("{api_prefix}/schema/coverage"),
             signals_route: format!("{api_prefix}/signals"),
             signal_acknowledge_route: format!("{api_prefix}/signals/{{id}}/acknowledge"),
@@ -335,6 +344,17 @@ struct TokenAdminState {
 }
 
 #[derive(Clone)]
+struct ToolAdminState {
+    tools_file: Option<PathBuf>,
+    registry: tools::definitions::ToolRegistry,
+    rbac_state: Option<middleware::rbac::RbacState>,
+    audit: audit::AuditLog,
+    trust_proxy_headers: bool,
+    max_body_size: usize,
+    write_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone)]
 struct AdminAuthState {
     login: auth::OidcLoginState,
     admin_prefix: String,
@@ -387,6 +407,7 @@ struct AdminApiStates {
     status: StatusAdminState,
     policy: PolicyAdminState,
     tokens: TokenAdminState,
+    tools: ToolAdminState,
     schema: SchemaAdminState,
     signals: SignalsAdminState,
     suggestions: SuggestionsAdminState,
@@ -761,6 +782,71 @@ struct CreatedTokenAdminResponse {
 }
 
 #[derive(Serialize)]
+struct OpenApiToolsPreviewResponse {
+    tools: Vec<tools::definitions::ToolDefinition>,
+    operation_id_fallbacks: Vec<OpenApiToolNameFallbackResponse>,
+    skipped_operations: Vec<OpenApiSkippedOperationResponse>,
+    api_key_header_auth_requirements: Vec<OpenApiApiKeyHeaderAuthRequirementResponse>,
+}
+
+#[derive(Serialize)]
+struct OpenApiToolNameFallbackResponse {
+    method: String,
+    path_template: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_operation_id: Option<String>,
+    generated_name: String,
+    reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct OpenApiSkippedOperationResponse {
+    method: String,
+    path_template: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_operation_id: Option<String>,
+    reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    property_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OpenApiApiKeyHeaderAuthRequirementResponse {
+    tool_name: String,
+    method: String,
+    path_template: String,
+    scheme_name: String,
+    header_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenApiToolsRegisterRequest {
+    spec: String,
+    selected_tool_names: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct OpenApiToolsRegisterResponse {
+    registered_tool_names: Vec<String>,
+    tool_count: usize,
+}
+
+#[derive(Serialize)]
+struct ToolNameConflictResponse {
+    error: &'static str,
+    conflicts: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ToolsFileAdminDocument {
+    schema_version: String,
+    #[serde(default)]
+    tools: Vec<tools::definitions::ToolDefinition>,
+}
+
+#[derive(Serialize)]
 struct RuleDeletedResponse {
     deleted_rule_id: String,
 }
@@ -816,6 +902,12 @@ enum PolicyAdminAuthzError {
 enum TokenAdminAuthzError {
     StoreNotConfigured,
     RbacNotConfigured,
+    Forbidden,
+}
+
+enum ToolAdminAuthzError {
+    RbacNotConfigured,
+    ToolsFileNotConfigured,
     Forbidden,
 }
 
@@ -1208,6 +1300,15 @@ fn gateway_app_with_process_started_at(
         trust_proxy_headers: config.trust_proxy_headers,
         max_body_size: config.max_body_size,
     };
+    let tool_admin_state = ToolAdminState {
+        tools_file: config.tools_file.as_ref().map(PathBuf::from),
+        registry: tool_registry,
+        rbac_state: rbac_state.clone(),
+        audit: audit_log.clone(),
+        trust_proxy_headers: config.trust_proxy_headers,
+        max_body_size: config.max_body_size,
+        write_lock: Arc::new(Mutex::new(())),
+    };
     let schema_admin_state = SchemaAdminState {
         coverage: schema_coverage,
         query_store: discovery_query_store.clone(),
@@ -1282,6 +1383,7 @@ fn gateway_app_with_process_started_at(
         status: status_state,
         policy: policy_admin_state,
         tokens: token_admin_state,
+        tools: tool_admin_state,
         schema: schema_admin_state,
         signals: signals_admin_state,
         suggestions: suggestions_admin_state,
@@ -1760,6 +1862,18 @@ fn add_admin_api_routes(
                     post(token_rotate_endpoint),
                 )
                 .with_state(admin_api_states.tokens),
+        )
+        .merge(
+            Router::new()
+                .route(
+                    routes.admin.tools_openapi_preview_route.as_str(),
+                    post(tools_openapi_preview_endpoint),
+                )
+                .route(
+                    routes.admin.tools_openapi_register_route.as_str(),
+                    post(tools_openapi_register_endpoint),
+                )
+                .with_state(admin_api_states.tools),
         )
         .merge(
             Router::new()
@@ -3420,6 +3534,195 @@ async fn token_rotate_endpoint(
     }
 }
 
+async fn tools_openapi_preview_endpoint(
+    State(state): State<ToolAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    let tools_file = match authorized_tools_file(&state, principal, ADMIN_TOOLS_READ_PERMISSION) {
+        Ok(tools_file) => tools_file,
+        Err(error) => return tool_admin_authz_error_response(error),
+    };
+    let tools_file_value = match read_valid_tools_file_value(tools_file) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(tools_file = %tools_file.display(), error = %error, "failed to read current tools file for OpenAPI preview");
+            return internal_server_error("tools file read failed");
+        }
+    };
+    let current_etag = match tools_file_etag(&tools_file_value) {
+        Ok(etag) => etag,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to compute tools file ETag");
+            return internal_server_error("tools file ETag computation failed");
+        }
+    };
+
+    let body = match read_request_body(body, state.max_body_size).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let spec = match std::str::from_utf8(&body) {
+        Ok(spec) => spec,
+        Err(err) => return bad_request(&format!("invalid OpenAPI spec UTF-8: {err}")),
+    };
+    let generation =
+        match tools::openapi::generate_tools_from_openapi_str("admin-openapi-preview", spec) {
+            Ok(generation) => generation,
+            Err(err) => return bad_request(&format!("invalid OpenAPI spec: {err}")),
+        };
+
+    (
+        StatusCode::OK,
+        [(header::ETAG, etag_header_value(&current_etag))],
+        Json(openapi_tools_preview_response(generation)),
+    )
+        .into_response()
+}
+
+async fn tools_openapi_register_endpoint(
+    State(state): State<ToolAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    let tools_file = match authorized_tools_file(&state, &principal, ADMIN_TOOLS_WRITE_PERMISSION) {
+        Ok(tools_file) => tools_file,
+        Err(error) => return tool_admin_authz_error_response(error),
+    };
+
+    let body = match read_request_body(body, state.max_body_size).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let requested = match parse_openapi_tools_register_body(&body) {
+        Ok(requested) => requested,
+        Err(response) => return *response,
+    };
+    if requested.selected_tool_names.is_empty() {
+        return bad_request("selected_tool_names must include at least one tool name");
+    }
+
+    let generation = match tools::openapi::generate_tools_from_openapi_str(
+        "admin-openapi-register",
+        &requested.spec,
+    ) {
+        Ok(generation) => generation,
+        Err(err) => return bad_request(&format!("invalid OpenAPI spec: {err}")),
+    };
+    let selected = match selected_generated_tools(&generation.definitions, &requested) {
+        Ok(selected) => selected,
+        Err(response) => return *response,
+    };
+
+    let _tools_write_guard = match state.write_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let (current_value, mut current_document) = match read_tools_file_document(tools_file) {
+        Ok(document) => document,
+        Err(error) => {
+            tracing::error!(tools_file = %tools_file.display(), error = %error, "failed to read current tools file for OpenAPI registration");
+            return internal_server_error("tools file read failed");
+        }
+    };
+    let current_etag = match tools_file_etag(&current_value) {
+        Ok(etag) => etag,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to compute current tools file ETag");
+            return internal_server_error("tools file ETag computation failed");
+        }
+    };
+    match if_match_matches(&parts.headers, &current_etag) {
+        Ok(true) => {}
+        Ok(false) => {
+            return precondition_failed("If-Match does not match the current tools ETag");
+        }
+        Err(error) => return if_match_error_response(error),
+    }
+
+    let conflicts = conflicting_tool_names(&current_document.tools, &selected);
+    if !conflicts.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(ToolNameConflictResponse {
+                error: "tool name collision",
+                conflicts,
+            }),
+        )
+            .into_response();
+    }
+
+    let registered_tool_names = selected
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    current_document.tools.extend(selected);
+    let candidate_value = match serde_json::to_value(&current_document) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to serialize merged tools file");
+            return internal_server_error("tools file merge failed");
+        }
+    };
+    if let Err(err) = tools::definitions::ToolRegistry::from_json_value(candidate_value.clone()) {
+        tracing::error!(tools_file = %tools_file.display(), error = %err, "merged OpenAPI tools file failed validation");
+        return internal_server_error("tools file validation failed");
+    }
+    let candidate_contents = match serde_json::to_string_pretty(&candidate_value) {
+        Ok(contents) => contents,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to render merged tools file");
+            return internal_server_error("tools file merge failed");
+        }
+    };
+    if let Err(err) = fs::write(tools_file, candidate_contents) {
+        tracing::error!(tools_file = %tools_file.display(), error = %err, "failed to persist merged tools file");
+        return internal_server_error("tools file persist failed");
+    }
+    if let Err(err) =
+        tools::definitions::reload_tool_registry_from_file(&state.registry, tools_file)
+    {
+        tracing::error!(tools_file = %tools_file.display(), error = %err, "failed to reload persisted tools file");
+        return internal_server_error("tools registry reload failed");
+    }
+
+    emit_tool_registry_changed(
+        &state,
+        &parts,
+        &principal,
+        tools_file,
+        &registered_tool_names,
+        current_document.tools.len(),
+    );
+    let new_etag = match tools_file_etag(&candidate_value) {
+        Ok(etag) => etag,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to compute updated tools file ETag");
+            return internal_server_error("tools file ETag computation failed");
+        }
+    };
+
+    (
+        StatusCode::CREATED,
+        [(header::ETAG, etag_header_value(&new_etag))],
+        Json(OpenApiToolsRegisterResponse {
+            registered_tool_names,
+            tool_count: current_document.tools.len(),
+        }),
+    )
+        .into_response()
+}
+
 async fn policy_rule_preview_endpoint(
     State(state): State<PolicyAdminState>,
     request: AxumRequest,
@@ -5033,6 +5336,25 @@ fn authorized_token_store<'a>(
         .ok_or(TokenAdminAuthzError::StoreNotConfigured)
 }
 
+fn authorized_tools_file<'a>(
+    state: &'a ToolAdminState,
+    principal: &auth::Principal,
+    permission: &str,
+) -> Result<&'a FsPath, ToolAdminAuthzError> {
+    let Some(rbac_state) = state.rbac_state.as_ref() else {
+        return Err(ToolAdminAuthzError::RbacNotConfigured);
+    };
+
+    if !rbac_state.principal_has_permission(principal, permission) {
+        return Err(ToolAdminAuthzError::Forbidden);
+    }
+
+    state
+        .tools_file
+        .as_deref()
+        .ok_or(ToolAdminAuthzError::ToolsFileNotConfigured)
+}
+
 fn authorized_schema_reader(state: &SchemaAdminState, principal: &auth::Principal) -> bool {
     state.rbac_state.as_ref().is_some_and(|rbac_state| {
         rbac_state.principal_has_permission(principal, ADMIN_SCHEMA_READ_PERMISSION)
@@ -5132,6 +5454,14 @@ fn token_admin_authz_error_response(error: TokenAdminAuthzError) -> Response {
     }
 }
 
+fn tool_admin_authz_error_response(error: ToolAdminAuthzError) -> Response {
+    match error {
+        ToolAdminAuthzError::RbacNotConfigured => tools_rbac_not_configured(),
+        ToolAdminAuthzError::ToolsFileNotConfigured => tools_file_not_configured(),
+        ToolAdminAuthzError::Forbidden => forbidden(),
+    }
+}
+
 fn traffic_admin_authz_error_response(error: TrafficAdminAuthzError) -> Response {
     match error {
         TrafficAdminAuthzError::NotConfigured => traffic_rbac_not_configured(),
@@ -5198,6 +5528,14 @@ fn split_authorized_policy_mutation_request(
 fn parse_create_token_body(body: &Bytes) -> ResponseResult<CreateTokenAdminRequest> {
     serde_json::from_slice::<CreateTokenAdminRequest>(body)
         .map_err(|err| Box::new(bad_request(&format!("invalid token create JSON: {err}"))))
+}
+
+fn parse_openapi_tools_register_body(body: &Bytes) -> ResponseResult<OpenApiToolsRegisterRequest> {
+    serde_json::from_slice::<OpenApiToolsRegisterRequest>(body).map_err(|err| {
+        Box::new(bad_request(&format!(
+            "invalid OpenAPI tools register JSON: {err}"
+        )))
+    })
 }
 
 fn parse_policy_body(body: &Bytes) -> Result<rbac::Policy, Vec<String>> {
@@ -5672,6 +6010,142 @@ fn policy_error_message(error: &rbac::policy::PolicyError) -> String {
     }
 }
 
+fn openapi_tools_preview_response(
+    generation: tools::openapi::OpenApiToolGeneration,
+) -> OpenApiToolsPreviewResponse {
+    OpenApiToolsPreviewResponse {
+        tools: generation.definitions,
+        operation_id_fallbacks: generation
+            .operation_id_fallbacks
+            .into_iter()
+            .map(openapi_tool_name_fallback_response)
+            .collect(),
+        skipped_operations: generation
+            .skipped_operations
+            .into_iter()
+            .map(openapi_skipped_operation_response)
+            .collect(),
+        api_key_header_auth_requirements: generation
+            .api_key_header_auth_requirements
+            .into_iter()
+            .map(|requirement| OpenApiApiKeyHeaderAuthRequirementResponse {
+                tool_name: requirement.tool_name,
+                method: requirement.method,
+                path_template: requirement.path_template,
+                scheme_name: requirement.scheme_name,
+                header_name: requirement.header_name,
+            })
+            .collect(),
+    }
+}
+
+fn openapi_tool_name_fallback_response(
+    fallback: tools::openapi::OpenApiToolNameFallback,
+) -> OpenApiToolNameFallbackResponse {
+    OpenApiToolNameFallbackResponse {
+        method: fallback.method,
+        path_template: fallback.path_template,
+        original_operation_id: fallback.original_operation_id,
+        generated_name: fallback.generated_name,
+        reason: match fallback.reason {
+            tools::openapi::OpenApiToolNameFallbackReason::MissingOperationId => {
+                "missing_operation_id"
+            }
+            tools::openapi::OpenApiToolNameFallbackReason::InvalidOperationId => {
+                "invalid_operation_id"
+            }
+            tools::openapi::OpenApiToolNameFallbackReason::DuplicateToolName => {
+                "duplicate_tool_name"
+            }
+        },
+    }
+}
+
+fn openapi_skipped_operation_response(
+    skipped: tools::openapi::OpenApiSkippedOperation,
+) -> OpenApiSkippedOperationResponse {
+    match skipped.reason {
+        tools::openapi::OpenApiSkippedOperationReason::BodyPropertyParameterNameCollision {
+            property_name,
+        } => OpenApiSkippedOperationResponse {
+            method: skipped.method,
+            path_template: skipped.path_template,
+            original_operation_id: skipped.original_operation_id,
+            reason: "body_property_parameter_name_collision",
+            property_name: Some(property_name),
+        },
+    }
+}
+
+fn selected_generated_tools(
+    definitions: &[tools::definitions::ToolDefinition],
+    request: &OpenApiToolsRegisterRequest,
+) -> ResponseResult<Vec<tools::definitions::ToolDefinition>> {
+    let duplicates = duplicate_strings(&request.selected_tool_names);
+    if !duplicates.is_empty() {
+        return Err(Box::new(bad_request(&format!(
+            "selected_tool_names contains duplicate names: {}",
+            duplicates.join(", ")
+        ))));
+    }
+
+    let generated_names = definitions
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let selected_names = request
+        .selected_tool_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let unknown = selected_names
+        .iter()
+        .filter(|name| !generated_names.contains(**name))
+        .copied()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(Box::new(bad_request(&format!(
+            "selected tool names were not generated: {}",
+            unknown.join(", ")
+        ))));
+    }
+
+    Ok(definitions
+        .iter()
+        .filter(|definition| selected_names.contains(definition.name.as_str()))
+        .cloned()
+        .collect())
+}
+
+fn duplicate_strings(values: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+
+    for value in values {
+        if !seen.insert(value.as_str()) {
+            duplicates.insert(value.clone());
+        }
+    }
+
+    duplicates.into_iter().collect()
+}
+
+fn conflicting_tool_names(
+    existing: &[tools::definitions::ToolDefinition],
+    selected: &[tools::definitions::ToolDefinition],
+) -> Vec<String> {
+    let existing_names = existing
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect::<BTreeSet<_>>();
+
+    selected
+        .iter()
+        .filter(|definition| existing_names.contains(definition.name.as_str()))
+        .map(|definition| definition.name.clone())
+        .collect()
+}
+
 impl RulePatch {
     fn is_empty(&self) -> bool {
         self.methods.is_none()
@@ -6060,6 +6534,38 @@ fn policy_etag(policy: &rbac::Policy) -> Result<String, serde_json::Error> {
     Ok(format!("\"sha256:{}\"", hex::encode(digest)))
 }
 
+fn tools_file_etag(value: &Value) -> Result<String, serde_json::Error> {
+    let mut value = value.clone();
+    sort_json_value(&mut value);
+    let bytes = serde_json::to_vec(&value)?;
+    let digest = Sha256::digest(&bytes);
+
+    Ok(format!("\"sha256:{}\"", hex::encode(digest)))
+}
+
+fn read_valid_tools_file_value(path: &FsPath) -> Result<Value, String> {
+    let (value, _) = read_tools_file_document(path)?;
+    Ok(value)
+}
+
+fn read_tools_file_document(path: &FsPath) -> Result<(Value, ToolsFileAdminDocument), String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read tools file {}: {err}", path.display()))?;
+    let value = serde_json::from_str::<Value>(&contents).map_err(|err| {
+        format!(
+            "failed to parse tools file {} as JSON: {err}",
+            path.display()
+        )
+    })?;
+
+    tools::definitions::ToolRegistry::from_json_value(value.clone())
+        .map_err(|err| err.to_string())?;
+    let document = serde_json::from_value::<ToolsFileAdminDocument>(value.clone())
+        .map_err(|err| format!("failed to decode tools file {}: {err}", path.display()))?;
+
+    Ok((value, document))
+}
+
 fn sort_json_value(value: &mut Value) {
     match value {
         Value::Array(values) => {
@@ -6206,6 +6712,38 @@ fn emit_service_token_changed(
 
     state.audit.emit(audit::AuditEvent::new(
         audit::event::SERVICE_TOKEN_CHANGED,
+        request_id,
+        source_ip,
+        actor,
+        payload,
+    ));
+}
+
+fn emit_tool_registry_changed(
+    state: &ToolAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    tools_file: &FsPath,
+    registered_tool_names: &[String],
+    tool_count: usize,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip = client_ip::canonical_client_ip(
+        &parts.headers,
+        &parts.extensions,
+        state.trust_proxy_headers,
+    );
+    let actor = Some(auth::actor_from_principal(principal));
+    let payload = json!({
+        "action": "openapi_tools_registered",
+        "tools_file": tools_file.display().to_string(),
+        "registered_tool_names": registered_tool_names,
+        "registered_tool_count": registered_tool_names.len(),
+        "tool_count": tool_count,
+    });
+
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::TOOL_REGISTRY_CHANGED,
         request_id,
         source_ip,
         actor,
@@ -6463,6 +7001,26 @@ fn token_store_not_configured() -> Response {
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
             error: "token API requires SERVICE_TOKEN_SQLITE_PATH to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn tools_rbac_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "tools API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn tools_file_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "tools API requires TOOLS_FILE to be configured".to_owned(),
         }),
     )
         .into_response()
@@ -8139,6 +8697,14 @@ mod tests {
         assert_eq!(default_routes.token_route, TOKEN_ADMIN_ROUTE);
         assert_eq!(default_routes.token_rotate_route, TOKEN_ROTATE_ADMIN_ROUTE);
         assert_eq!(
+            default_routes.tools_openapi_preview_route,
+            TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE
+        );
+        assert_eq!(
+            default_routes.tools_openapi_register_route,
+            TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE
+        );
+        assert_eq!(
             default_routes.schema_coverage_route,
             SCHEMA_COVERAGE_ADMIN_ROUTE
         );
@@ -8213,6 +8779,14 @@ mod tests {
         assert_eq!(
             custom_routes.token_rotate_route,
             "/v1/ops/tokens/{id}/rotate"
+        );
+        assert_eq!(
+            custom_routes.tools_openapi_preview_route,
+            "/v1/ops/tools/openapi/preview"
+        );
+        assert_eq!(
+            custom_routes.tools_openapi_register_route,
+            "/v1/ops/tools/openapi/register"
         );
         assert_eq!(
             custom_routes.schema_coverage_route,
@@ -12878,6 +13452,320 @@ mod tests {
         assert_eq!(actor["email"], json!("sso-admin@example.test"));
         assert_eq!(actor["roles"], json!(["admin"]));
         assert_eq!(actor["auth_mode"], json!("bearer_token"));
+    }
+
+    #[tokio::test]
+    async fn openapi_tools_preview_returns_generated_tools_and_current_tools_etag() {
+        let harness = tools_admin_harness(empty_tools_document(), test_audit_log()).await;
+
+        let response = harness
+            .router
+            .clone()
+            .oneshot(tools_openapi_preview_request(
+                &harness.admin_token,
+                widget_openapi_spec(),
+            ))
+            .await
+            .expect("OpenAPI tools preview request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("preview response should include current tools ETag")
+            .to_owned();
+        assert!(
+            etag.starts_with("\"sha256:"),
+            "tools ETag should be a quoted sha256 digest: {etag}"
+        );
+        let body = json_body(response).await;
+
+        let tools = body["tools"]
+            .as_array()
+            .expect("preview response should include tools");
+        assert_eq!(tools.len(), 2);
+        let create_widget = tools
+            .iter()
+            .find(|tool| tool["name"] == json!("createWidget"))
+            .expect("createWidget should be generated");
+        assert_eq!(create_widget["upstream"]["method"], json!("POST"));
+        assert_eq!(
+            create_widget["upstream"]["path_template"],
+            json!("/widgets")
+        );
+        let get_widget = tools
+            .iter()
+            .find(|tool| tool["name"] == json!("getWidget"))
+            .expect("getWidget should be generated");
+        assert_eq!(get_widget["upstream"]["method"], json!("GET"));
+        assert_eq!(
+            body["api_key_header_auth_requirements"],
+            json!([
+                {
+                    "tool_name": "getWidget",
+                    "method": "GET",
+                    "path_template": "/widgets/{widgetId}",
+                    "scheme_name": "ApiKeyAuth",
+                    "header_name": "X-API-Key"
+                }
+            ])
+        );
+        assert_eq!(body["skipped_operations"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn openapi_tools_preview_rejects_invalid_spec_without_500() {
+        let harness = tools_admin_harness(empty_tools_document(), test_audit_log()).await;
+
+        let response = harness
+            .router
+            .oneshot(tools_openapi_preview_request(
+                &harness.admin_token,
+                "openapi: [",
+            ))
+            .await
+            .expect("invalid OpenAPI tools preview request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error response should include message")
+                .contains("invalid OpenAPI spec"),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openapi_tools_preview_requires_read_permission_and_tools_file() {
+        let harness = tools_admin_harness(empty_tools_document(), test_audit_log()).await;
+
+        let forbidden = harness
+            .router
+            .clone()
+            .oneshot(tools_openapi_preview_request(
+                &harness.blocked_token,
+                widget_openapi_spec(),
+            ))
+            .await
+            .expect("read-forbidden OpenAPI tools preview request should complete");
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let policy = TempPolicyFile::new(&tools_policy_document());
+        let token_db = TempDb::new("tools-preview-no-tools-file-token");
+        let token_store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        let admin_token = create_service_token(&token_store, &["admin"]);
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build without TOOLS_FILE");
+
+        let not_configured = router
+            .oneshot(tools_openapi_preview_request(
+                &admin_token,
+                widget_openapi_spec(),
+            ))
+            .await
+            .expect("tools-file-unconfigured OpenAPI tools preview request should complete");
+        assert_eq!(not_configured.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_string(not_configured).await,
+            r#"{"error":"tools API requires TOOLS_FILE to be configured"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn openapi_tools_register_persists_selection_reloads_registry_and_audits() {
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
+        let harness = tools_admin_harness(empty_tools_document(), audit_log).await;
+        let preview = harness
+            .router
+            .clone()
+            .oneshot(tools_openapi_preview_request(
+                &harness.admin_token,
+                widget_openapi_spec(),
+            ))
+            .await
+            .expect("OpenAPI tools preview request should complete");
+        assert_eq!(preview.status(), StatusCode::OK);
+        let etag = preview
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("preview should include ETag")
+            .to_owned();
+
+        let register = harness
+            .router
+            .clone()
+            .oneshot(tools_openapi_register_request(
+                &harness.admin_token,
+                json!({
+                    "spec": widget_openapi_spec(),
+                    "selected_tool_names": ["createWidget"]
+                }),
+                Some(&etag),
+            ))
+            .await
+            .expect("OpenAPI tools register request should complete");
+
+        assert_eq!(register.status(), StatusCode::CREATED);
+        let register_body = json_body(register).await;
+        assert_eq!(
+            register_body["registered_tool_names"],
+            json!(["createWidget"])
+        );
+        assert_eq!(register_body["tool_count"], json!(1));
+        let persisted = fs::read_to_string(&harness.tools.path).expect("tools file should read");
+        let persisted: Value =
+            serde_json::from_str(&persisted).expect("tools file should remain JSON");
+        assert_eq!(persisted["tools"][0]["name"], json!("createWidget"));
+
+        let (list_status, list_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            41,
+            "tools/list",
+            None,
+            "mcp-list-after-openapi-register",
+        )
+        .await;
+        assert_eq!(list_status, StatusCode::OK);
+        let listed_tools = list_body["result"]["tools"]
+            .as_array()
+            .expect("tools/list response should include tools");
+        assert!(
+            listed_tools
+                .iter()
+                .any(|tool| tool["name"] == json!("createWidget")),
+            "registered tool should be visible through live MCP tools/list: {list_body}"
+        );
+
+        let event = captured_tool_registry_change(&capture, "openapi_tools_registered");
+        assert_eq!(
+            event.payload["registered_tool_names"],
+            json!(["createWidget"])
+        );
+        assert_eq!(event.payload["registered_tool_count"], json!(1));
+        assert_eq!(event.payload["tool_count"], json!(1));
+        let actor = event.actor.as_ref().expect("actor should be set");
+        assert_eq!(actor.roles, Some(vec!["admin".to_owned()]));
+    }
+
+    #[tokio::test]
+    async fn openapi_tools_register_rejects_name_collisions_without_partial_persist() {
+        let harness = tools_admin_harness(
+            json!({
+                "schema_version": "0.1.0",
+                "tools": [
+                    {
+                        "name": "createWidget",
+                        "description": "Existing hand-authored widget creator.",
+                        "input_json_schema": {
+                            "type": "object",
+                            "properties": {
+                                "message": { "type": "string" }
+                            },
+                            "additionalProperties": false
+                        },
+                        "upstream": {
+                            "method": "POST",
+                            "path_template": "/manual/widgets",
+                            "body": { "mode": "whole_args_json" }
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+            test_audit_log(),
+        )
+        .await;
+        let before_contents =
+            fs::read_to_string(&harness.tools.path).expect("tools file should read");
+        let preview = harness
+            .router
+            .clone()
+            .oneshot(tools_openapi_preview_request(
+                &harness.admin_token,
+                widget_openapi_spec(),
+            ))
+            .await
+            .expect("OpenAPI tools preview request should complete");
+        let etag = preview
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("preview should include ETag")
+            .to_owned();
+
+        let response = harness
+            .router
+            .oneshot(tools_openapi_register_request(
+                &harness.admin_token,
+                json!({
+                    "spec": widget_openapi_spec(),
+                    "selected_tool_names": ["createWidget", "getWidget"]
+                }),
+                Some(&etag),
+            ))
+            .await
+            .expect("colliding OpenAPI tools register request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert_eq!(body["error"], json!("tool name collision"));
+        assert_eq!(body["conflicts"], json!(["createWidget"]));
+        assert_eq!(
+            fs::read_to_string(&harness.tools.path).expect("tools file should read"),
+            before_contents,
+            "colliding register must not partially persist selected tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn openapi_tools_register_requires_write_permission() {
+        let harness = tools_admin_harness(empty_tools_document(), test_audit_log()).await;
+        let preview = harness
+            .router
+            .clone()
+            .oneshot(tools_openapi_preview_request(
+                &harness.admin_token,
+                widget_openapi_spec(),
+            ))
+            .await
+            .expect("OpenAPI tools preview request should complete");
+        let etag = preview
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("preview should include ETag")
+            .to_owned();
+
+        let forbidden = harness
+            .router
+            .oneshot(tools_openapi_register_request(
+                &harness.reader_token,
+                json!({
+                    "spec": widget_openapi_spec(),
+                    "selected_tool_names": ["createWidget"]
+                }),
+                Some(&etag),
+            ))
+            .await
+            .expect("write-forbidden OpenAPI tools register request should complete");
+
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -19237,6 +20125,188 @@ paths:
         .to_string()
     }
 
+    struct ToolsAdminTestHarness {
+        router: Router,
+        admin_token: String,
+        reader_token: String,
+        blocked_token: String,
+        tools: TempToolsFile,
+        _policy: TempPolicyFile,
+        _token_db: TempDb,
+    }
+
+    async fn tools_admin_harness(
+        tools_document: String,
+        audit_log: audit::AuditLog,
+    ) -> ToolsAdminTestHarness {
+        let token_db = TempDb::new("tools-admin-service-tokens");
+        let token_store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        let admin_token = create_service_token(&token_store, &["admin"]);
+        let reader_token = create_service_token(&token_store, &["tools-reader"]);
+        let blocked_token = create_service_token(&token_store, &["blocked"]);
+        let policy = TempPolicyFile::new(&tools_policy_document());
+        let tools = TempToolsFile::new(&tools_document);
+
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.tools_file = Some(tools.path.to_string_lossy().into_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        config.service_token_cache_ttl_ms = 20;
+        config.upstream_url = Some("http://127.0.0.1:65535".to_owned());
+        config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
+        config.egress_deny_private_ips = false;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("tools admin test app should build");
+
+        ToolsAdminTestHarness {
+            router,
+            admin_token,
+            reader_token,
+            blocked_token,
+            tools,
+            _policy: policy,
+            _token_db: token_db,
+        }
+    }
+
+    fn tools_openapi_preview_request(token: &str, spec: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Body::from(spec.to_owned()))
+            .expect("OpenAPI tools preview request should build")
+    }
+
+    fn tools_openapi_register_request(
+        token: &str,
+        body: Value,
+        if_match: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(if_match) = if_match {
+            builder = builder.header(header::IF_MATCH, if_match);
+        }
+
+        builder
+            .body(Body::from(body.to_string()))
+            .expect("OpenAPI tools register request should build")
+    }
+
+    fn empty_tools_document() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "tools": []
+        })
+        .to_string()
+    }
+
+    fn tools_policy_document() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "id": "tools-admin-policy",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "admin": {
+                    "permissions": [
+                        ADMIN_TOOLS_READ_PERMISSION,
+                        ADMIN_TOOLS_WRITE_PERMISSION,
+                        ADMIN_MCP_USE_PERMISSION
+                    ]
+                },
+                "tools-reader": {
+                    "permissions": [ADMIN_TOOLS_READ_PERMISSION]
+                }
+            },
+            "routes": [
+                {
+                    "methods": ["POST"],
+                    "path_prefix": TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE,
+                    "permission": ADMIN_TOOLS_READ_PERMISSION
+                },
+                {
+                    "methods": ["POST"],
+                    "path_prefix": TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE,
+                    "permission": ADMIN_TOOLS_WRITE_PERMISSION
+                },
+                {
+                    "methods": ["POST"],
+                    "path_prefix": MCP_ROUTE,
+                    "permission": ADMIN_MCP_USE_PERMISSION
+                }
+            ],
+            "tools": {
+                "createWidget": {
+                    "allowed_roles": ["admin"],
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                },
+                "getWidget": {
+                    "allowed_roles": ["admin"],
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn widget_openapi_spec() -> &'static str {
+        r#"
+openapi: 3.0.3
+info:
+  title: Widget API
+  version: 1.0.0
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+paths:
+  /widgets:
+    post:
+      operationId: createWidget
+      summary: Create a widget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+  /widgets/{widgetId}:
+    get:
+      operationId: getWidget
+      summary: Fetch a widget
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - in: path
+          name: widgetId
+          required: true
+          schema:
+            type: string
+"#
+    }
+
     struct McpTestHarness {
         router: Router,
         admin_token: String,
@@ -19714,6 +20784,27 @@ paths:
                     && event.payload["action"] == json!(action)
             })
             .expect("service_token.changed event should be captured")
+    }
+
+    fn captured_tool_registry_change(
+        capture: &audit::sink::tests::CaptureSink,
+        action: &str,
+    ) -> audit::AuditEvent {
+        assert_eventually(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == audit::event::TOOL_REGISTRY_CHANGED
+                    && event.payload["action"] == json!(action)
+            })
+        });
+
+        capture
+            .events()
+            .into_iter()
+            .find(|event| {
+                event.event_type == audit::event::TOOL_REGISTRY_CHANGED
+                    && event.payload["action"] == json!(action)
+            })
+            .expect("tool_registry.changed event should be captured")
     }
 
     fn assert_token_change_actor(event: &audit::AuditEvent) {
