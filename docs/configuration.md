@@ -478,6 +478,8 @@ Format and validation: unset, empty, or whitespace-only values become `None`. No
 
 This is deliberately separate from `POLICY_FILE`. `TOOLS_FILE` defines what a tool is and how the generic executor maps arguments onto an upstream HTTP request. The RBAC policy's `tools` section controls whether a configured tool may run, which roles may invoke it through `allowed_roles`, and its runtime timeout and concurrency limits. Empty or omitted `allowed_roles` means no role constraint beyond `enabled`.
 
+`allowed_roles` matching is exact-string and case-sensitive, consistent with role matching elsewhere in the RBAC system. If your identity provider's role claims don't match your policy file's casing exactly (e.g. an IdP emitting `Admin` against a policy file expecting `admin`), the mismatch will silently deny access rather than error — double-check casing when a tool call is unexpectedly rejected by role policy.
+
 ### POLICY_HISTORY_SQLITE_PATH
 
 Optional SQLite policy version history store path.
