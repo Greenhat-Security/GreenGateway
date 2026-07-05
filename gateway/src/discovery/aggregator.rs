@@ -1007,7 +1007,10 @@ impl AggregatorState {
     }
 
     fn observe(&mut self, observation: ObservedRequest) -> bool {
-        let endpoint_template = self.endpoint_template(&observation.method, &observation.path);
+        let endpoint_template = observation
+            .endpoint_template
+            .clone()
+            .unwrap_or_else(|| self.endpoint_template(&observation.method, &observation.path));
         let key = EndpointKey::new(observation.method.clone(), endpoint_template);
         let is_new_endpoint = !self.aggregates.contains_key(&key);
         let principal = observation
@@ -1250,6 +1253,7 @@ struct ObservedRequest {
     latency_ms: u64,
     timestamp: String,
     user_id: Option<String>,
+    endpoint_template: Option<String>,
     payload_shape: Option<Value>,
     schema_mismatch: bool,
 }
@@ -1276,6 +1280,13 @@ impl ObservedRequest {
             latency_ms,
             timestamp: event.timestamp.clone(),
             user_id: event.actor.as_ref().map(|actor| actor.user_id.clone()),
+            endpoint_template: event
+                .payload
+                .get("endpoint_template")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|endpoint_template| !endpoint_template.is_empty())
+                .map(str::to_owned),
             payload_shape: event.payload.get("payload_shape").cloned(),
             schema_mismatch: event
                 .payload

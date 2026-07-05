@@ -44,6 +44,10 @@ const PATH_SEGMENT_ARGUMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'/')
     .add(b'\\');
 
+const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
+const MCP_TOOL_OBSERVATION_METHOD: &str = "MCP";
+const TOOL_INPUT_VALIDATION_STATUS: u16 = 400;
+
 type ValidatorCache = HashMap<ValidatorCacheKey, Arc<jsonschema::Validator>>;
 
 #[allow(dead_code)] // Issue #33 will call this from the MCP endpoint.
@@ -302,8 +306,18 @@ impl ToolExecutor {
             .ok_or_else(|| ToolExecutorError::UnknownTool {
                 tool_name: tool_name.to_owned(),
             })?;
+        let validation_started = Instant::now();
         let validator = self.validator_for(&tool)?;
-        validate_args(&tool, &validator, &args)?;
+        if let Err(error) = validate_args(&tool, &validator, &args) {
+            if matches!(error, ToolExecutorError::InputValidation { .. }) {
+                self.emit_schema_mismatch_observation(
+                    context,
+                    &tool,
+                    duration_millis(validation_started.elapsed()),
+                );
+            }
+            return Err(error);
+        }
 
         let request = self.build_request(&tool, &args)?;
         let started = Instant::now();
@@ -358,20 +372,19 @@ impl ToolExecutor {
         &self,
         tool: &ToolDefinition,
     ) -> Result<Arc<jsonschema::Validator>, ToolExecutorError> {
-        let key = ValidatorCacheKey::new(tool)?;
+        let effective_schema = effective_input_schema(&tool.input_schema);
+        let key = ValidatorCacheKey::new(tool, &effective_schema)?;
 
         if let Some(validator) = self.validator_cache_guard().get(&key).cloned() {
             return Ok(validator);
         }
 
-        let validator = Arc::new(
-            jsonschema::validator_for(&tool.input_schema).map_err(|err| {
-                ToolExecutorError::SchemaCompile {
-                    tool_name: tool.name.clone(),
-                    message: err.to_string(),
-                }
-            })?,
-        );
+        let validator = Arc::new(jsonschema::validator_for(&effective_schema).map_err(|err| {
+            ToolExecutorError::SchemaCompile {
+                tool_name: tool.name.clone(),
+                message: err.to_string(),
+            }
+        })?);
         let mut cache = self.validator_cache_guard();
         Ok(cache.entry(key).or_insert(validator).clone())
     }
@@ -494,16 +507,41 @@ impl ToolExecutor {
             payload,
         ));
     }
+
+    fn emit_schema_mismatch_observation(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        latency_ms: u64,
+    ) {
+        let path = tool_observation_path(&tool.name);
+        let endpoint_template = path.clone();
+        self.audit.emit(AuditEvent::new(
+            HTTP_REQUEST_OBSERVED,
+            &context.request_id,
+            &context.source_ip,
+            context.actor.clone(),
+            json!({
+                "method": MCP_TOOL_OBSERVATION_METHOD,
+                "path": path,
+                "endpoint_template": endpoint_template,
+                "status": TOOL_INPUT_VALIDATION_STATUS,
+                "latency_ms": latency_ms,
+                "tool_name": tool.name,
+                "schema_mismatch": true,
+                "reason": "input_validation",
+            }),
+        ));
+    }
 }
 
 impl ValidatorCacheKey {
-    fn new(tool: &ToolDefinition) -> Result<Self, ToolExecutorError> {
-        let schema = serde_json::to_vec(&tool.input_schema).map_err(|err| {
-            ToolExecutorError::SchemaCacheKey {
+    fn new(tool: &ToolDefinition, schema: &Value) -> Result<Self, ToolExecutorError> {
+        let schema =
+            serde_json::to_vec(schema).map_err(|err| ToolExecutorError::SchemaCacheKey {
                 tool_name: tool.name.clone(),
                 message: err.to_string(),
-            }
-        })?;
+            })?;
         let digest = Sha256::digest(schema);
         let mut schema_sha256 = [0; 32];
         schema_sha256.copy_from_slice(&digest);
@@ -512,6 +550,17 @@ impl ValidatorCacheKey {
             tool_name: tool.name.clone(),
             schema_sha256,
         })
+    }
+}
+
+fn effective_input_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(schema) if !schema.contains_key("additionalProperties") => {
+            let mut schema = schema.clone();
+            schema.insert("additionalProperties".to_owned(), Value::Bool(false));
+            Value::Object(schema)
+        }
+        _ => schema.clone(),
     }
 }
 
@@ -759,11 +808,16 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn tool_observation_path(tool_name: &str) -> String {
+    format!("/mcp/tools/{tool_name}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         collections::HashMap,
         net::SocketAddr,
+        path::{Path, PathBuf},
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, Mutex, MutexGuard,
@@ -772,6 +826,7 @@ mod tests {
     };
 
     use http::StatusCode;
+    use rusqlite::{params, Connection};
     use serde_json::json;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -784,6 +839,10 @@ mod tests {
         audit::{
             sink::{tests::CaptureSink, AuditSink},
             AuditLog,
+        },
+        discovery::{
+            aggregator::{EndpointAggregatorSink, EndpointAggregatorSinkConfig},
+            signals::{DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD, SCHEMA_MISMATCH_SIGNAL_TYPE},
         },
         egress::EgressConfig,
         tools::runtime::{DefaultToolPolicy, ToolRuntimeConfig, ToolRuntimeToolConfig},
@@ -861,6 +920,149 @@ mod tests {
                 .await
                 .is_err(),
             "schema rejection must not reach the upstream listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_validation_rejects_unexpected_args_by_default_before_network() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"should-not-run").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [echo_tool_without_additional_properties()],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+
+        let error = executor
+            .execute(
+                "echo",
+                json!({
+                    "message": "hello",
+                    "unexpected": "value"
+                }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("unexpected args should fail without an explicit schema opt-in");
+
+        let message = work_failed_message(error);
+        assert!(message.contains("arguments failed input schema validation"));
+        assert!(
+            message.contains("unexpected"),
+            "validation message should identify the extra argument: {message}"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "strict schema rejection must not reach the upstream listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_validation_respects_explicit_additional_properties_true() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"ok").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [echo_tool_with_additional_properties(true)],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+
+        let response = executor
+            .execute(
+                "echo",
+                json!({
+                    "message": "hello",
+                    "unexpected": "allowed"
+                }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("explicit additionalProperties=true should allow extra args");
+
+        assert_eq!(response.status, StatusCode::OK);
+        let request = server.await.expect("server task should join");
+        assert_eq!(request.target, "/v1/echo");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("request body should be JSON"),
+            json!({
+                "message": "hello",
+                "unexpected": "allowed"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_validation_failure_feeds_schema_mismatch_aggregate_and_signal() {
+        let db = TempDiscoveryDb::new("tool-schema-mismatch-signal");
+        let aggregator = EndpointAggregatorSink::new(EndpointAggregatorSinkConfig {
+            path: db.path.clone(),
+            payload_capture_enabled: false,
+            signal_event_sender: None,
+            signal_detector_config: Default::default(),
+        })
+        .expect("discovery aggregator sink should build");
+        let audit = AuditLog::new(Arc::new(aggregator) as Arc<dyn AuditSink>);
+        let executor = executor_for_tools_with_audit(
+            socket_addr(1),
+            [echo_tool()],
+            runtime_config([("echo", enabled_tool(500, 1))], 8, 1, 100),
+            audit,
+        );
+
+        for _ in 0..DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD {
+            let error = executor
+                .execute(
+                    "echo",
+                    json!({ "unexpected": "value" }),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect_err("schema validation should reject invalid args");
+            let message = work_failed_message(error);
+            assert!(message.contains("arguments failed input schema validation"));
+        }
+
+        wait_until(Duration::from_secs(2), || {
+            discovery_aggregate_snapshot(&db.path, "MCP", "/mcp/tools/echo").is_some_and(
+                |aggregate| {
+                    aggregate.call_count
+                        == i64::try_from(DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD)
+                            .expect("default threshold should fit i64")
+                        && aggregate.schema_mismatch_count
+                            == i64::try_from(DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD)
+                                .expect("default threshold should fit i64")
+                },
+            ) && discovery_signal_rows_by_type(&db.path, SCHEMA_MISMATCH_SIGNAL_TYPE).len() == 1
+        })
+        .await;
+
+        let aggregate = discovery_aggregate_snapshot(&db.path, "MCP", "/mcp/tools/echo")
+            .expect("tool schema mismatch aggregate should be present");
+        assert_eq!(
+            aggregate.call_count,
+            i64::try_from(DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD)
+                .expect("default threshold should fit i64")
+        );
+        assert_eq!(aggregate.call_count, aggregate.schema_mismatch_count);
+
+        let rows = discovery_signal_rows_by_type(&db.path, SCHEMA_MISMATCH_SIGNAL_TYPE);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target_kind, "endpoint");
+        assert_eq!(rows[0].target_key, "MCP /mcp/tools/echo");
+        let evidence: serde_json::Value =
+            serde_json::from_str(&rows[0].evidence_json).expect("signal evidence should be JSON");
+        assert_eq!(
+            evidence["schema_mismatch_count"],
+            json!(DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD)
+        );
+        assert_eq!(
+            evidence["threshold"],
+            json!(DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD)
         );
     }
 
@@ -1171,13 +1373,24 @@ mod tests {
         tools: [Value; N],
         runtime_config: ToolRuntimeConfig,
     ) -> (ToolExecutor, CaptureSink) {
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let executor = executor_for_tools_with_audit(addr, tools, runtime_config, audit);
+
+        (executor, capture)
+    }
+
+    fn executor_for_tools_with_audit<const N: usize>(
+        addr: SocketAddr,
+        tools: [Value; N],
+        runtime_config: ToolRuntimeConfig,
+        audit: AuditLog,
+    ) -> ToolExecutor {
         let registry = ToolRegistry::from_json_value(json!({
             "schema_version": "0.1.0",
             "tools": Value::Array(tools.into_iter().collect())
         }))
         .expect("test tools should load");
-        let capture = CaptureSink::new();
-        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
         let runtime = ToolRuntime::new(runtime_config, audit.clone());
         let egress_client = Arc::new(
             EgressClient::new(EgressConfig {
@@ -1196,7 +1409,7 @@ mod tests {
         )
         .expect("tool executor should build");
 
-        (executor, capture)
+        executor
     }
 
     fn runtime_config<const N: usize>(
@@ -1258,6 +1471,21 @@ mod tests {
                 }
             }
         })
+    }
+
+    fn echo_tool_without_additional_properties() -> Value {
+        let mut tool = echo_tool();
+        tool["input_json_schema"]
+            .as_object_mut()
+            .expect("input schema should be an object")
+            .remove("additionalProperties");
+        tool
+    }
+
+    fn echo_tool_with_additional_properties(additional_properties: bool) -> Value {
+        let mut tool = echo_tool();
+        tool["input_json_schema"]["additionalProperties"] = json!(additional_properties);
+        tool
     }
 
     fn widget_tool(query_required: bool, widget_required: bool) -> Value {
@@ -1524,6 +1752,93 @@ mod tests {
 
     fn socket_addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[derive(Debug)]
+    struct DiscoveryAggregateSnapshot {
+        call_count: i64,
+        schema_mismatch_count: i64,
+    }
+
+    fn discovery_aggregate_snapshot(
+        path: &Path,
+        method: &str,
+        endpoint_template: &str,
+    ) -> Option<DiscoveryAggregateSnapshot> {
+        let connection = Connection::open(path).expect("test database should open");
+        connection
+            .query_row(
+                r#"
+                SELECT call_count, schema_mismatch_count
+                FROM discovery_endpoint_aggregates
+                WHERE method = ?1 AND endpoint_template = ?2
+                "#,
+                params![method, endpoint_template],
+                |row| {
+                    Ok(DiscoveryAggregateSnapshot {
+                        call_count: row.get(0)?,
+                        schema_mismatch_count: row.get(1)?,
+                    })
+                },
+            )
+            .ok()
+    }
+
+    #[derive(Debug)]
+    struct DiscoverySignalRow {
+        target_kind: String,
+        target_key: String,
+        evidence_json: String,
+    }
+
+    fn discovery_signal_rows_by_type(path: &Path, signal_type: &str) -> Vec<DiscoverySignalRow> {
+        let connection = Connection::open(path).expect("test database should open");
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT target_kind, target_key, evidence_json
+                FROM discovery_signals
+                WHERE signal_type = ?1
+                ORDER BY created_at, id
+                "#,
+            )
+            .expect("signal query should prepare");
+
+        statement
+            .query_map(params![signal_type], |row| {
+                Ok(DiscoverySignalRow {
+                    target_kind: row.get(0)?,
+                    target_key: row.get(1)?,
+                    evidence_json: row.get(2)?,
+                })
+            })
+            .expect("signal query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("signal rows should read")
+    }
+
+    struct TempDiscoveryDb {
+        path: PathBuf,
+    }
+
+    impl TempDiscoveryDb {
+        fn new(test_name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "greengateway-tool-executor-{test_name}-{}.sqlite",
+                uuid::Uuid::new_v4()
+            ));
+
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDiscoveryDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let path = PathBuf::from(format!("{}{}", self.path.display(), suffix));
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 
     fn requests_guard(
