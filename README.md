@@ -209,6 +209,8 @@ GreenGateway reads all configuration from environment variables — no config fi
 
 For real deployments that want to enable RBAC without immediately blocking unmatched traffic, start from [docs/examples/policy.starter.json](docs/examples/policy.starter.json) — see [docs/examples/policy.starter.README.md](docs/examples/policy.starter.README.md) for what `default_action: "allow"` does and doesn't protect against.
 
+Provider-specific `AUTH_PROVIDERS` recipes for Keycloak, Auth0, Microsoft Entra ID, and Okta live in [docs/auth/README.md](docs/auth/README.md).
+
 `docs/configuration.md` and `.env.example` are kept in sync with the actual code by an automated CI drift test, so they should never silently fall out of date.
 
 ## Contributing

@@ -572,6 +572,8 @@ OAuth2 scope string as roles: `[{"name":"oauth","type":"jwt","issuer":"https://i
 
 Auth0-style namespaced claims: `[{"name":"auth0","type":"jwt","issuer":"https://tenant.auth0.com/","audience":"https://api.example.com","roles_claim":"https://myapp.example.com/roles","org_claim":"https://myapp.example.com/org_id"}]`
 
+Provider-specific setup recipes for Keycloak, Auth0, Microsoft Entra ID, and Okta are in [docs/auth/README.md](auth/README.md).
+
 When `AUTH_PROVIDERS` is set, it defines the ordered auth provider chain and takes precedence over the legacy single-provider JWT settings for validator assembly. The legacy settings remain supported for backward compatibility.
 
 OIDC discovery: when a provider has `issuer` but no `jwks_url`, startup fetches `{issuer}/.well-known/openid-configuration` through the egress client, adds the returned `jwks_uri` host to the effective egress allowlist, and uses that `jwks_uri` for later JWKS refreshes. Discovery failure or a discovery document without `jwks_uri` prevents the provider from being constructed.
