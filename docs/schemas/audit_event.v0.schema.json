@@ -64,6 +64,9 @@
         "user_id": {
           "type": "string"
         },
+        "email": {
+          "type": "string"
+        },
         "roles": {
           "type": "array",
           "items": {

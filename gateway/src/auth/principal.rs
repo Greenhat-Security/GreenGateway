@@ -47,6 +47,7 @@ pub struct Principal {
 pub fn actor_from_principal(principal: &Principal) -> crate::audit::Actor {
     crate::audit::Actor {
         user_id: principal.user_id.clone(),
+        email: principal.email.clone(),
         roles: if principal.roles.is_empty() {
             None
         } else {
@@ -67,6 +68,7 @@ mod tests {
         let actor = actor_from_principal(&principal);
 
         assert_eq!(actor.user_id, "user-123");
+        assert_eq!(actor.email, Some("user@example.com".to_owned()));
         assert_eq!(
             actor.roles,
             Some(vec!["admin".to_owned(), "member".to_owned()])
@@ -81,6 +83,7 @@ mod tests {
         let actor = actor_from_principal(&principal);
 
         assert_eq!(actor.user_id, "user-123");
+        assert_eq!(actor.email, Some("user@example.com".to_owned()));
         assert_eq!(actor.roles, None);
         assert_eq!(actor.auth_mode, "bearer_token");
     }
@@ -93,6 +96,16 @@ mod tests {
 
         assert_eq!(actor.auth_mode, "service_token");
         assert_eq!(actor.roles, Some(vec!["admin:tokens:read".to_owned()]));
+    }
+
+    #[test]
+    fn actor_from_principal_omits_absent_email() {
+        let mut principal = test_principal(AuthMethod::Bearer, vec!["admin"]);
+        principal.email = None;
+
+        let actor = actor_from_principal(&principal);
+
+        assert_eq!(actor.email, None);
     }
 
     fn test_principal(auth_method: AuthMethod, roles: Vec<&str>) -> Principal {
