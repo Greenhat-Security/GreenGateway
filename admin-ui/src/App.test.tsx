@@ -208,6 +208,69 @@ describe('AdminShell', () => {
     ).toBeTruthy();
   });
 
+  it('registers the token management route and navigation entry', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), 'http://localhost');
+        if (url.pathname === '/v1/admin/policy') {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                schema_version: '0.1.0',
+                id: 'test-policy',
+                default_action: 'deny',
+                enforcement_mode: 'enforce',
+                roles: {},
+                routes: [],
+                rules: [],
+              }),
+              {
+                status: 200,
+                headers: {
+                  'Content-Type': 'application/json',
+                  ETag: '"etag-initial"',
+                },
+              },
+            ),
+          );
+        }
+        if (url.pathname === '/v1/admin/tokens') {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                tokens: [],
+                next_cursor: null,
+              }),
+              {
+                status: 200,
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+              },
+            ),
+          );
+        }
+
+        return Promise.reject(new Error(`unexpected fetch: ${url.pathname}`));
+      }),
+    );
+
+    render(
+      <MemoryRouter initialEntries={['/tokens']}>
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: 'Tokens' })).toBeTruthy();
+    expect(
+      await screen.findByRole('heading', {
+        level: 2,
+        name: 'Service tokens',
+      }),
+    ).toBeTruthy();
+  });
+
   it('registers the policy history route and navigation entry', async () => {
     vi.stubGlobal(
       'fetch',

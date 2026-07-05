@@ -24,6 +24,7 @@ import { SignalsView } from './views/SignalsView';
 import { StatusPage } from './views/StatusPage';
 import { TrafficEndpointDetail } from './views/TrafficEndpointDetail';
 import { TrafficInventory } from './views/TrafficInventory';
+import { TokensView } from './views/TokensView';
 
 const THEME_STORAGE_KEY = 'greengateway_admin_theme';
 
@@ -76,6 +77,9 @@ export function AdminShell() {
           <NavLink to="/rules" className={navItemClassName}>
             Rules
           </NavLink>
+          <NavLink to="/tokens" className={navItemClassName}>
+            Tokens
+          </NavLink>
           <NavLink to="/policy/history" className={navItemClassName}>
             History
           </NavLink>
@@ -124,6 +128,7 @@ export function AdminShell() {
           <Route path="/traffic" element={<TrafficInventory />} />
           <Route path="/traffic/detail" element={<TrafficEndpointDetail />} />
           <Route path="/rules" element={<RuleTable />} />
+          <Route path="/tokens" element={<TokensView />} />
           <Route path="/policy/history" element={<PolicyHistoryView />} />
           <Route path="/policy/shadow-review" element={<ShadowReviewView />} />
           <Route path="/signals" element={<SignalsView />} />
@@ -159,6 +164,10 @@ function Dashboard() {
           <Link to="/rules">
             <span>Rule table</span>
             <small>Ordered firewall policy and hit counts</small>
+          </Link>
+          <Link to="/tokens">
+            <span>Tokens</span>
+            <small>Create, rotate, and revoke service tokens</small>
           </Link>
           <Link to="/policy/history">
             <span>Policy history</span>
@@ -305,6 +314,9 @@ function pageTitleForPath(pathname: string): string {
   }
   if (pathname === '/rules') {
     return 'Rule table';
+  }
+  if (pathname === '/tokens') {
+    return 'Tokens';
   }
   if (pathname === '/policy/history') {
     return 'Policy history';
