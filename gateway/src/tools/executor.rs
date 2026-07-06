@@ -298,6 +298,7 @@ impl ToolExecutor {
                 timeout: Duration::from_secs(30),
                 response_idle_timeout: Duration::from_secs(30),
                 connect_timeout: Duration::from_secs(10),
+                max_response_bytes: 5_242_880,
             },
         )
     }

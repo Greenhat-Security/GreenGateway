@@ -7347,7 +7347,10 @@ mod tests {
         io::{Read, Write},
         net::{IpAddr, Ipv4Addr},
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
         time::{Duration, Instant},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10969,6 +10972,128 @@ mod tests {
                     "message": "proxied hello"
                 }
             })]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_call_rejects_response_larger_than_egress_limit() {
+        const RESPONSE_LIMIT: usize = 512;
+
+        let upstream = spawn_raw_mcp_upstream(RawMcpOversizeTarget::ToolCall, RESPONSE_LIMIT).await;
+        let harness = mcp_upstream_test_harness_with_response_limit(
+            "alpha",
+            upstream.url.clone(),
+            &["admin", "reader"],
+            RESPONSE_LIMIT,
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            31,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "oversized upstream response"
+                }
+            })),
+            "mcp-upstream-call-too-large",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32603));
+        assert_eq!(body["error"]["message"], json!("tool invocation failed"));
+        assert_eq!(
+            body["error"]["data"]["tool_name"],
+            json!("alpha:remote_echo")
+        );
+        assert_eq!(body["error"]["data"]["reason"], json!("response_too_large"));
+        assert!(
+            !upstream.oversized_body_started.load(Ordering::SeqCst),
+            "Content-Length precheck should reject before the oversized call body is sent"
+        );
+
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tools_list_discovery_rejects_response_larger_than_egress_limit() {
+        const RESPONSE_LIMIT: usize = 512;
+
+        let upstream =
+            spawn_raw_mcp_upstream(RawMcpOversizeTarget::ToolsList, RESPONSE_LIMIT).await;
+        let harness = mcp_upstream_test_harness_with_response_limit(
+            "alpha",
+            upstream.url.clone(),
+            &["admin", "reader"],
+            RESPONSE_LIMIT,
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            32,
+            "tools/list",
+            None,
+            "mcp-upstream-list-too-large",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let tools = body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool["name"] != json!("alpha:remote_echo")),
+            "oversized discovery response must not import upstream tools"
+        );
+
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_call_under_egress_limit_still_returns_result() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let harness = mcp_upstream_test_harness_with_response_limit(
+            "alpha",
+            upstream.url.clone(),
+            &["admin", "reader"],
+            16 * 1024,
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            33,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "small proxied hello"
+                }
+            })),
+            "mcp-upstream-call-under-limit",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["result"]["isError"], json!(false));
+        assert_eq!(
+            body["result"]["structuredContent"],
+            json!({
+                "remote_tool": "remote_echo",
+                "arguments": {
+                    "message": "small proxied hello"
+                }
+            })
         );
     }
 
@@ -20889,11 +21014,44 @@ paths:
         .await
     }
 
+    async fn mcp_upstream_test_harness_with_response_limit(
+        server_name: &str,
+        upstream_url: String,
+        allowed_roles: &[&str],
+        max_response_bytes: usize,
+    ) -> McpUpstreamTestHarness {
+        mcp_upstream_test_harness_with_audit_and_response_limit(
+            server_name,
+            upstream_url,
+            allowed_roles,
+            test_audit_log(),
+            Some(max_response_bytes),
+        )
+        .await
+    }
+
     async fn mcp_upstream_test_harness_with_audit(
         server_name: &str,
         upstream_url: String,
         allowed_roles: &[&str],
         audit_log: audit::AuditLog,
+    ) -> McpUpstreamTestHarness {
+        mcp_upstream_test_harness_with_audit_and_response_limit(
+            server_name,
+            upstream_url,
+            allowed_roles,
+            audit_log,
+            None,
+        )
+        .await
+    }
+
+    async fn mcp_upstream_test_harness_with_audit_and_response_limit(
+        server_name: &str,
+        upstream_url: String,
+        allowed_roles: &[&str],
+        audit_log: audit::AuditLog,
+        max_response_bytes: Option<usize>,
     ) -> McpUpstreamTestHarness {
         let token_db = TempDb::new("mcp-upstream-service-tokens");
         let token_store =
@@ -20917,6 +21075,9 @@ paths:
         }];
         config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
         config.egress_deny_private_ips = false;
+        if let Some(max_response_bytes) = max_response_bytes {
+            config.egress_max_response_bytes = max_response_bytes;
+        }
 
         let recorder = PrometheusBuilder::new().build_recorder();
         let router = app(
@@ -20935,6 +21096,318 @@ paths:
             _policy: policy,
             _token_db: token_db,
         }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RawMcpOversizeTarget {
+        ToolsList,
+        ToolCall,
+    }
+
+    struct RawMcpUpstream {
+        url: String,
+        oversized_body_started: Arc<AtomicBool>,
+        shutdown: tokio_util::sync::CancellationToken,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl RawMcpUpstream {
+        async fn shutdown(self) {
+            self.shutdown.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(1), self.handle).await;
+        }
+    }
+
+    async fn spawn_raw_mcp_upstream(
+        oversize_target: RawMcpOversizeTarget,
+        max_response_bytes: usize,
+    ) -> RawMcpUpstream {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("raw MCP upstream should bind");
+        let addr = listener
+            .local_addr()
+            .expect("raw MCP upstream address should be available");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown_task = shutdown.clone();
+        let oversized_body_started = Arc::new(AtomicBool::new(false));
+        let oversized_body_started_task = Arc::clone(&oversized_body_started);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_task.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else {
+                            break;
+                        };
+                        let shutdown_connection = shutdown_task.clone();
+                        let oversized_body_started_connection =
+                            Arc::clone(&oversized_body_started_task);
+                        tokio::spawn(async move {
+                            handle_raw_mcp_connection(
+                                &mut stream,
+                                oversize_target,
+                                max_response_bytes,
+                                oversized_body_started_connection,
+                                shutdown_connection,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            }
+        });
+
+        RawMcpUpstream {
+            url: format!("http://{addr}/mcp"),
+            oversized_body_started,
+            shutdown,
+            handle,
+        }
+    }
+
+    async fn handle_raw_mcp_connection(
+        stream: &mut tokio::net::TcpStream,
+        oversize_target: RawMcpOversizeTarget,
+        max_response_bytes: usize,
+        oversized_body_started: Arc<AtomicBool>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        let Some(request) = read_raw_mcp_http_request(stream).await else {
+            return;
+        };
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        match method {
+            "initialize" => {
+                write_raw_mcp_json_response(stream, raw_mcp_initialize_response(&request)).await;
+            }
+            "notifications/initialized" => {
+                write_raw_mcp_accepted_response(stream).await;
+            }
+            "tools/list" if oversize_target == RawMcpOversizeTarget::ToolsList => {
+                write_raw_mcp_oversized_response(
+                    stream,
+                    raw_mcp_oversized_tools_list_response(&request, max_response_bytes),
+                    true,
+                    oversized_body_started,
+                    shutdown,
+                )
+                .await;
+            }
+            "tools/list" => {
+                write_raw_mcp_json_response(stream, raw_mcp_tools_list_response(&request)).await;
+            }
+            "tools/call" if oversize_target == RawMcpOversizeTarget::ToolCall => {
+                write_raw_mcp_oversized_response(
+                    stream,
+                    raw_mcp_oversized_call_response(&request, max_response_bytes),
+                    false,
+                    oversized_body_started,
+                    shutdown,
+                )
+                .await;
+            }
+            "tools/call" => {
+                write_raw_mcp_json_response(stream, raw_mcp_call_response(&request)).await;
+            }
+            _ => {
+                write_raw_mcp_json_response(
+                    stream,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": raw_mcp_request_id(&request),
+                        "error": {
+                            "code": -32601,
+                            "message": "method not found"
+                        }
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn read_raw_mcp_http_request(stream: &mut tokio::net::TcpStream) -> Option<Value> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .expect("raw MCP upstream should read request");
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index;
+            }
+            assert!(
+                buffer.len() <= 16 * 1024,
+                "raw MCP request headers should stay bounded"
+            );
+        };
+        let raw_headers = std::str::from_utf8(&buffer[..header_end])
+            .expect("raw MCP request headers should be UTF-8");
+        let content_length = raw_headers
+            .split("\r\n")
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body_start = header_end + 4;
+        while buffer.len() < body_start + content_length {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .expect("raw MCP upstream should read request body");
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+
+        Some(
+            serde_json::from_slice::<Value>(&buffer[body_start..body_start + content_length])
+                .unwrap_or_else(|err| panic!("raw MCP request body should be JSON: {err}")),
+        )
+    }
+
+    async fn write_raw_mcp_json_response(stream: &mut tokio::net::TcpStream, body: Value) {
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("raw MCP upstream should write JSON response");
+    }
+
+    async fn write_raw_mcp_accepted_response(stream: &mut tokio::net::TcpStream) {
+        stream
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("raw MCP upstream should write accepted response");
+    }
+
+    async fn write_raw_mcp_oversized_response(
+        stream: &mut tokio::net::TcpStream,
+        body: Value,
+        send_body: bool,
+        oversized_body_started: Arc<AtomicBool>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        let body = body.to_string();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .expect("raw MCP upstream should write oversized response headers");
+
+        if send_body {
+            oversized_body_started.store(true, Ordering::SeqCst);
+            stream
+                .write_all(body.as_bytes())
+                .await
+                .expect("raw MCP upstream should write oversized response body");
+            return;
+        }
+
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+    }
+
+    fn raw_mcp_request_id(request: &Value) -> Value {
+        request.get("id").cloned().unwrap_or(Value::Null)
+    }
+
+    fn raw_mcp_initialize_response(request: &Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": raw_mcp_request_id(request),
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "raw-greengateway-test-upstream",
+                    "version": "0.0.0"
+                }
+            }
+        })
+    }
+
+    fn raw_mcp_tools_list_response(request: &Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": raw_mcp_request_id(request),
+            "result": {
+                "tools": [raw_mcp_tool("Remote test tool")]
+            }
+        })
+    }
+
+    fn raw_mcp_oversized_tools_list_response(request: &Value, max_response_bytes: usize) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": raw_mcp_request_id(request),
+            "result": {
+                "tools": [raw_mcp_tool("x".repeat(max_response_bytes + 256))]
+            }
+        })
+    }
+
+    fn raw_mcp_tool(description: impl Into<String>) -> Value {
+        json!({
+            "name": "remote_echo",
+            "description": description.into(),
+            "inputSchema": remote_echo_input_schema()
+        })
+    }
+
+    fn raw_mcp_call_response(request: &Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": raw_mcp_request_id(request),
+            "result": {
+                "content": [],
+                "structuredContent": {
+                    "remote_tool": "remote_echo",
+                    "arguments": {}
+                },
+                "isError": false
+            }
+        })
+    }
+
+    fn raw_mcp_oversized_call_response(request: &Value, max_response_bytes: usize) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": raw_mcp_request_id(request),
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "x".repeat(max_response_bytes + 256)
+                }],
+                "isError": false
+            }
+        })
     }
 
     struct TestMcpUpstream {
