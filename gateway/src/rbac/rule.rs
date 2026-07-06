@@ -8,14 +8,12 @@ pub const AUTH_METHOD_SERVICE_TOKEN: &str = "service_token";
 
 /// Action applied by a first-match-wins firewall rule.
 ///
-/// Direct rules run before, and take precedence over, the routes/permission
-/// model: once a rule matches, it is the sole authority for the request and
-/// routes are never consulted. `Allow` and `Shadow` both forward the request
-/// unconditionally (no downstream permission check) — `Shadow` differs only
-/// in recording a would-deny observation event instead of an allowed one, for
-/// policy-authoring dry runs. An overly broad rule (e.g. an unconstrained
-/// principal matcher on a sensitive path) can therefore grant access the
-/// routes-based permission model would have denied.
+/// HTTP path rules run before, and take precedence over, the routes/permission
+/// model: once a path rule matches, it is the sole authority for the HTTP
+/// request and routes are never consulted. MCP tool-name rules are an
+/// additional restriction layered after per-tool `allowed_roles`; an `Allow` or
+/// `Shadow` tool rule does not override a failed role check. `Shadow` records a
+/// would-deny observation event while still permitting the rule layer.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleAction {
@@ -80,7 +78,7 @@ impl PrincipalMatcher {
     }
 }
 
-/// Direct firewall rule model.
+/// Direct firewall rule model for HTTP paths or exact MCP tool names.
 ///
 /// Rules are stored in policy order and are intended to be evaluated with
 /// first-match-wins semantics.
@@ -101,7 +99,7 @@ pub struct Rule {
     /// HTTP methods this rule matches. Empty or ["*"] matches any method.
     #[serde(default)]
     pub methods: Vec<String>,
-    /// Absolute path pattern matched against the whole request path.
+    /// Absolute HTTP path pattern matched against the whole request path.
     ///
     /// Syntax is segment-based and anchored, never substring-based. Literal
     /// segments match exactly and case-sensitively. `*` matches exactly one
@@ -109,7 +107,14 @@ pub struct Rule {
     /// segments. `{name}` matches exactly one non-empty path segment and names
     /// the capture for future rule-preview/discovery UI; capture names use
     /// ASCII letters, digits, and `_`, and must start with a letter or `_`.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub path: String,
+    /// Exact MCP tool name this rule matches. Tool-name rules apply only to
+    /// MCP tool calls and never to HTTP requests.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
     /// Optional principal constraints. Empty or omitted means any principal,
     /// authenticated or not.
     #[serde(default)]
@@ -241,6 +246,7 @@ mod tests {
             enabled: true,
             methods: vec!["GET".to_owned(), "HEAD".to_owned()],
             path: "/data".to_owned(),
+            tool_name: None,
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
@@ -254,6 +260,7 @@ mod tests {
             enabled: true,
             methods: vec!["*".to_owned()],
             path: "/data".to_owned(),
+            tool_name: None,
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
@@ -268,6 +275,7 @@ mod tests {
             enabled: true,
             methods: Vec::new(),
             path: "/api/users/{id}".to_owned(),
+            tool_name: None,
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
@@ -276,6 +284,7 @@ mod tests {
             enabled: true,
             methods: Vec::new(),
             path: "/assets/*".to_owned(),
+            tool_name: None,
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
@@ -284,6 +293,7 @@ mod tests {
             enabled: true,
             methods: Vec::new(),
             path: "/admin/**".to_owned(),
+            tool_name: None,
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
@@ -303,6 +313,7 @@ mod tests {
             enabled: true,
             methods: Vec::new(),
             path: "/api/users/{id}".to_owned(),
+            tool_name: None,
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };

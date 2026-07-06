@@ -875,8 +875,29 @@ struct RulePatch {
     enabled: Option<bool>,
     methods: Option<Vec<String>>,
     path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_rule_tool_name_patch")]
+    tool_name: Option<RuleToolNamePatch>,
     principal: Option<rbac::PrincipalMatcher>,
     action: Option<rbac::RuleAction>,
+}
+
+enum RuleToolNamePatch {
+    Set(String),
+    Clear,
+}
+
+fn deserialize_rule_tool_name_patch<'de, D>(
+    deserializer: D,
+) -> Result<Option<RuleToolNamePatch>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|value| {
+        Some(match value {
+            Some(value) => RuleToolNamePatch::Set(value),
+            None => RuleToolNamePatch::Clear,
+        })
+    })
 }
 
 type ResponseResult<T> = Result<T, Box<Response>>;
@@ -3163,7 +3184,7 @@ async fn policy_rule_patch_endpoint(
     };
     if patch.is_empty() {
         return bad_request(
-            "rule patch must include at least one of enabled, methods, path, principal, action",
+            "rule patch must include at least one of enabled, methods, path, tool_name, principal, action",
         );
     }
 
@@ -5583,7 +5604,15 @@ fn validate_rule_preview_request(request: &PolicyRulePreviewRequest) -> Result<(
     if let Err(parameter) = validate_rfc3339("to", request.to.clone()) {
         errors.push(format!("invalid {parameter}: expected RFC 3339 timestamp"));
     }
-    if !request.rule.path.starts_with('/') {
+    let has_path = !request.rule.path.is_empty();
+    let has_tool_name = request.rule.tool_name.is_some();
+    if has_path == has_tool_name {
+        errors.push("rule must set exactly one of path or tool_name".to_owned());
+    }
+    if has_tool_name {
+        errors.push("rule preview currently supports HTTP path rules only".to_owned());
+    }
+    if has_path && !request.rule.path.starts_with('/') {
         errors.push(format!(
             "rule.path must start with '/', got '{}'",
             request.rule.path
@@ -6187,6 +6216,7 @@ impl RulePatch {
         self.methods.is_none()
             && self.enabled.is_none()
             && self.path.is_none()
+            && self.tool_name.is_none()
             && self.principal.is_none()
             && self.action.is_none()
     }
@@ -6201,6 +6231,12 @@ fn apply_rule_patch(rule: &mut rbac::Rule, patch: RulePatch) {
     }
     if let Some(path) = patch.path {
         rule.path = path;
+    }
+    if let Some(tool_name) = patch.tool_name {
+        rule.tool_name = match tool_name {
+            RuleToolNamePatch::Set(value) => Some(value),
+            RuleToolNamePatch::Clear => None,
+        };
     }
     if let Some(principal) = patch.principal {
         rule.principal = principal;
@@ -6221,6 +6257,9 @@ fn changed_rule_fields(before: &rbac::Rule, after: &rbac::Rule) -> Vec<&'static 
     }
     if before.path != after.path {
         fields.push("path");
+    }
+    if before.tool_name != after.tool_name {
+        fields.push("tool_name");
     }
     if before.principal != after.principal {
         fields.push("principal");
@@ -14679,6 +14718,7 @@ mod tests {
                 enabled: true,
                 methods: vec!["GET".to_owned()],
                 path: "/load/{id}".to_owned(),
+                tool_name: None,
                 principal: rbac::PrincipalMatcher {
                     roles: vec!["reader".to_owned()],
                     auth_methods: vec!["bearer_token".to_owned()],

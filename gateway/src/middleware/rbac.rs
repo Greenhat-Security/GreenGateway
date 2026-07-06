@@ -2016,6 +2016,7 @@ mod tests {
             enabled: true,
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
             path: path.to_owned(),
+            tool_name: None,
             principal: PrincipalMatcher::default(),
             action,
         }

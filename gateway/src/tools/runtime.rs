@@ -9,12 +9,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     audit::{self, Actor, AuditEvent, AuditLog},
+    auth::{AuthMethod, Principal},
     config::{
         Config, DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS, DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
         DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH, DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
     },
-    rbac::{policy, Policy},
+    rbac::{policy, Policy, Rule, RuleAction, RuleMatcher},
 };
+
+const AUTHZ_ALLOWED: &str = "authz.allowed";
+const AUTHZ_DENIED: &str = "authz.denied";
+const AUTHZ_WOULD_DENY: &str = "authz.would_deny";
+const MCP_TOOL_OBSERVATION_METHOD: &str = "MCP";
 
 #[allow(dead_code)] // Issue #32's tool registry and issue #33's MCP endpoint will invoke this.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +46,7 @@ pub struct ToolRuntimeConfig {
     pub max_concurrent_global: usize,
     pub default_policy: DefaultToolPolicy,
     pub default_timeout: Duration,
+    pub rules: Vec<Rule>,
     pub tools: HashMap<String, ToolRuntimeToolConfig>,
 }
 
@@ -51,6 +58,7 @@ impl Default for ToolRuntimeConfig {
             max_concurrent_global: DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
             default_policy: DefaultToolPolicy::Deny,
             default_timeout: Duration::from_millis(DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS),
+            rules: Vec::new(),
             tools: HashMap::new(),
         }
     }
@@ -70,11 +78,12 @@ impl ToolRuntimeConfig {
 
     #[allow(dead_code)] // Issue #32's tool registry and issue #33's MCP endpoint will invoke this.
     pub fn from_policy(policy: &Policy) -> Option<Self> {
-        if policy.tools.is_empty() {
+        if policy.tools.is_empty() && !policy.rules.iter().any(|rule| rule.tool_name.is_some()) {
             return None;
         }
 
         Some(Self {
+            rules: policy.rules.clone(),
             tools: policy
                 .tools
                 .iter()
@@ -86,6 +95,7 @@ impl ToolRuntimeConfig {
 
     #[allow(dead_code)] // Issue #32's tool registry and issue #33's MCP endpoint will invoke this.
     pub fn with_policy_tools(mut self, policy: &Policy) -> Self {
+        self.rules = policy.rules.clone();
         self.tools = policy
             .tools
             .iter()
@@ -202,6 +212,8 @@ struct ToolRuntimeInner {
     queue: Arc<Semaphore>,
     global: Arc<Semaphore>,
     per_tool: HashMap<String, Arc<Semaphore>>,
+    rule_matcher: RuleMatcher,
+    rule_ids: Vec<String>,
 }
 
 struct ToolExecutionState {
@@ -234,6 +246,13 @@ impl ToolRuntime {
                 (name.clone(), Arc::new(Semaphore::new(permits)))
             })
             .collect();
+        let rule_matcher = RuleMatcher::new(&config.rules);
+        let rule_ids = config
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(rule_index, rule)| rule.id.clone().unwrap_or_else(|| rule_index.to_string()))
+            .collect();
 
         Self {
             inner: Arc::new(ToolRuntimeInner {
@@ -242,6 +261,8 @@ impl ToolRuntime {
                 per_tool,
                 config,
                 audit,
+                rule_matcher,
+                rule_ids,
             }),
         }
     }
@@ -475,6 +496,49 @@ impl ToolRuntime {
             });
         }
 
+        let principal = principal_from_tool_context(context);
+        if let Some(rule_decision) = self
+            .inner
+            .rule_matcher
+            .evaluate_tool(tool_name, principal.as_ref())
+        {
+            let matched_rule_id = self.rule_id(rule_decision.rule_index);
+            match rule_decision.action {
+                RuleAction::Allow => {
+                    self.emit_tool_rule_event(
+                        AUTHZ_ALLOWED,
+                        context,
+                        tool_name,
+                        principal.as_ref(),
+                        &matched_rule_id,
+                    );
+                }
+                RuleAction::Shadow => {
+                    self.emit_tool_rule_event(
+                        AUTHZ_WOULD_DENY,
+                        context,
+                        tool_name,
+                        principal.as_ref(),
+                        &matched_rule_id,
+                    );
+                }
+                RuleAction::Deny => {
+                    self.emit_tool_rule_event(
+                        AUTHZ_DENIED,
+                        context,
+                        tool_name,
+                        principal.as_ref(),
+                        &matched_rule_id,
+                    );
+                    self.emit_rejected(context, tool_name, "matched_rule");
+                    return Err(ToolRuntimeError::Rejected {
+                        tool_name: tool_name.to_owned(),
+                        reason: "matched_rule".to_owned(),
+                    });
+                }
+            }
+        }
+
         let queue_permit = match Arc::clone(&self.inner.queue).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -521,6 +585,14 @@ impl ToolRuntime {
             config: state.config,
             _permits: permits,
         })
+    }
+
+    fn rule_id(&self, rule_index: usize) -> String {
+        self.inner
+            .rule_ids
+            .get(rule_index)
+            .cloned()
+            .unwrap_or_else(|| rule_index.to_string())
     }
 
     pub(crate) fn tool_visible_to_context(
@@ -622,6 +694,28 @@ impl ToolRuntime {
         );
     }
 
+    fn emit_tool_rule_event(
+        &self,
+        event_type: &'static str,
+        context: &ToolInvocationContext,
+        tool_name: &str,
+        principal: Option<&Principal>,
+        matched_rule_id: &str,
+    ) {
+        self.inner.audit.emit(AuditEvent::new(
+            event_type,
+            &context.request_id,
+            &context.source_ip,
+            principal.map(crate::auth::actor_from_principal),
+            json!({
+                "path": tool_observation_path(tool_name),
+                "method": MCP_TOOL_OBSERVATION_METHOD,
+                "reason": "matched_rule",
+                "matched_rule_id": matched_rule_id,
+            }),
+        ));
+    }
+
     fn emit(
         &self,
         event_type: &'static str,
@@ -665,6 +759,30 @@ fn allowed_roles_match(allowed_roles: &[String], context: &ToolInvocationContext
         })
 }
 
+fn principal_from_tool_context(context: &ToolInvocationContext) -> Option<Principal> {
+    let actor = context.actor.as_ref()?;
+    let auth_method = auth_method_from_audit_mode(&actor.auth_mode)?;
+
+    Some(Principal {
+        user_id: actor.user_id.clone(),
+        issuer: None,
+        email: actor.email.clone(),
+        org_id: None,
+        roles: actor.roles.clone().unwrap_or_default(),
+        session_id: context.request_id.clone(),
+        auth_method,
+    })
+}
+
+fn auth_method_from_audit_mode(auth_mode: &str) -> Option<AuthMethod> {
+    match auth_mode {
+        crate::rbac::rule::AUTH_METHOD_BEARER_TOKEN => Some(AuthMethod::Bearer),
+        crate::rbac::rule::AUTH_METHOD_SESSION_COOKIE => Some(AuthMethod::Cookie),
+        crate::rbac::rule::AUTH_METHOD_SERVICE_TOKEN => Some(AuthMethod::ServiceToken),
+        _ => None,
+    }
+}
+
 fn tool_audit_payload(tool_name: &str, outcome: &'static str, reason: Option<&str>) -> Value {
     let mut payload = json!({
         "tool_name": tool_name,
@@ -676,6 +794,10 @@ fn tool_audit_payload(tool_name: &str, outcome: &'static str, reason: Option<&st
     }
 
     payload
+}
+
+fn tool_observation_path(tool_name: &str) -> String {
+    format!("/mcp/tools/{tool_name}")
 }
 
 #[cfg(test)]
@@ -698,7 +820,7 @@ mod tests {
         sink::{tests::CaptureSink, AuditSink},
         Actor, AuditEvent, AuditLog,
     };
-    use crate::rbac::Policy;
+    use crate::rbac::{Policy, PrincipalMatcher, Rule, RuleAction};
 
     #[tokio::test]
     async fn unknown_tool_is_rejected_and_audited_once() {
@@ -794,6 +916,84 @@ mod tests {
 
         assert_eq!(empty_roles_actor, "empty-roles");
         assert_eq!(unauthenticated, "unauthenticated");
+    }
+
+    #[tokio::test]
+    async fn tool_name_deny_rule_blocks_tool_allowed_by_empty_allowed_roles() {
+        let (runtime, capture) = runtime_with_tools_and_rules(
+            [("tool", enabled_tool(100, 1))],
+            vec![tool_rule(
+                Some("deny-tool-for-viewers"),
+                "tool",
+                &["viewer"],
+                RuleAction::Deny,
+            )],
+            2,
+            1,
+            100,
+        );
+
+        let denied = runtime
+            .execute_with_context(
+                "tool",
+                context_with_roles(&["viewer"]),
+                CancellationToken::new(),
+                || async { "should not run" },
+            )
+            .await
+            .expect_err("matching Deny rule should block even with empty allowed_roles");
+
+        assert!(matches!(
+            denied,
+            ToolRuntimeError::Rejected { ref reason, .. } if reason == "matched_rule"
+        ));
+        assert_rejected_events(&capture, "tool", "matched_rule", 1).await;
+        let events = audit_events(&capture, 2).await;
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == "authz.denied"
+                    && event.payload["method"] == json!("MCP")
+                    && event.payload["path"] == json!("/mcp/tools/tool")
+                    && event.payload["matched_rule_id"] == json!("deny-tool-for-viewers")
+            }),
+            "tool Deny rule should emit an authz.denied direct-rule event: {events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_roles_still_blocks_tool_call_even_when_tool_rule_allows() {
+        let (runtime, capture) = runtime_with_tools_and_rules(
+            [("tool", role_restricted_tool(100, 1, &["operator"]))],
+            vec![tool_rule(
+                Some("allow-viewer-tool"),
+                "tool",
+                &["viewer"],
+                RuleAction::Allow,
+            )],
+            2,
+            1,
+            100,
+        );
+
+        let denied = runtime
+            .execute_with_context(
+                "tool",
+                context_with_roles(&["viewer"]),
+                CancellationToken::new(),
+                || async { "should not run" },
+            )
+            .await
+            .expect_err("allowed_roles should remain an independent restriction");
+
+        assert!(matches!(denied, ToolRuntimeError::RoleDenied { .. }));
+        assert_rejected_events(&capture, "tool", "role_not_allowed", 1).await;
+        assert!(
+            capture
+                .events()
+                .iter()
+                .all(|event| event.event_type != "authz.allowed"),
+            "allowed_roles denial should not be overridden by a matching Allow rule"
+        );
     }
 
     #[tokio::test]
@@ -1336,6 +1536,22 @@ mod tests {
         max_concurrent_global: usize,
         queue_timeout_ms: u64,
     ) -> (ToolRuntime, CaptureSink) {
+        runtime_with_tools_and_rules(
+            tools,
+            Vec::new(),
+            max_queue,
+            max_concurrent_global,
+            queue_timeout_ms,
+        )
+    }
+
+    fn runtime_with_tools_and_rules<const N: usize>(
+        tools: [(&str, ToolRuntimeToolConfig); N],
+        rules: Vec<Rule>,
+        max_queue: usize,
+        max_concurrent_global: usize,
+        queue_timeout_ms: u64,
+    ) -> (ToolRuntime, CaptureSink) {
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
         let runtime = ToolRuntime::new(
@@ -1345,6 +1561,7 @@ mod tests {
                 max_concurrent_global,
                 default_policy: DefaultToolPolicy::Deny,
                 default_timeout: Duration::from_millis(100),
+                rules,
                 tools: tools
                     .into_iter()
                     .map(|(name, config)| (name.to_owned(), config))
@@ -1397,7 +1614,24 @@ mod tests {
             max_concurrent_global: 1,
             default_policy: DefaultToolPolicy::Deny,
             default_timeout: Duration::from_millis(100),
+            rules: Vec::new(),
             tools: HashMap::new(),
+        }
+    }
+
+    fn tool_rule(id: Option<&str>, tool_name: &str, roles: &[&str], action: RuleAction) -> Rule {
+        Rule {
+            id: id.map(str::to_owned),
+            enabled: true,
+            methods: Vec::new(),
+            path: String::new(),
+            tool_name: Some(tool_name.to_owned()),
+            principal: PrincipalMatcher {
+                roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+                auth_methods: Vec::new(),
+                principal_ids: Vec::new(),
+            },
+            action,
         }
     }
 

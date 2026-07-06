@@ -269,6 +269,7 @@ impl Policy {
 
     fn from_json_value(value: Value, path: Option<&Path>) -> Result<Self, PolicyError> {
         warn_unknown_top_level_keys(&value);
+        validate_rule_target_properties(&value)?;
 
         let policy: Self = serde_json::from_value(value).map_err(|source| PolicyError::Parse {
             path: path.map(Path::to_owned),
@@ -296,23 +297,63 @@ impl Policy {
     }
 }
 
+fn validate_rule_target_properties(value: &Value) -> Result<(), PolicyError> {
+    let Some(rules) = value.get("rules").and_then(Value::as_array) else {
+        return Ok(());
+    };
+
+    for (rule_index, rule) in rules.iter().enumerate() {
+        let Some(rule) = rule.as_object() else {
+            continue;
+        };
+        let has_path = rule.contains_key("path");
+        let has_tool_name = rule.contains_key("tool_name");
+
+        if has_path == has_tool_name {
+            return Err(PolicyError::Invalid(format!(
+                "rules[{rule_index}] must set exactly one of path or tool_name"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_rules(rules: &[Rule]) -> Result<(), PolicyError> {
     for (rule_index, rule) in rules.iter().enumerate() {
-        if !rule.path.starts_with('/') {
+        let has_path = !rule.path.is_empty();
+        let has_tool_name = rule.tool_name.is_some();
+
+        if has_path == has_tool_name {
+            return Err(PolicyError::Invalid(format!(
+                "rules[{rule_index}] must set exactly one of path or tool_name"
+            )));
+        }
+
+        if let Some(tool_name) = rule.tool_name.as_deref() {
+            if tool_name.trim().is_empty() {
+                return Err(PolicyError::Invalid(format!(
+                    "rules[{rule_index}].tool_name must not be empty"
+                )));
+            }
+        }
+
+        if has_path && !rule.path.starts_with('/') {
             return Err(PolicyError::Invalid(format!(
                 "rules[{rule_index}].path must start with '/', got '{}'",
                 rule.path
             )));
         }
-        if let Some(segment) = super::matcher::find_malformed_capture_segment(&rule.path) {
-            return Err(PolicyError::Invalid(format!(
-                "rules[{rule_index}].path segment '{segment}' looks like a capture but is not \
-                 valid (capture names must start with a letter or underscore and contain only \
-                 ASCII letters, digits, and underscores, e.g. '{{id}}'); as written this rule \
-                 would never match any request"
-            )));
+        if has_path {
+            if let Some(segment) = super::matcher::find_malformed_capture_segment(&rule.path) {
+                return Err(PolicyError::Invalid(format!(
+                    "rules[{rule_index}].path segment '{segment}' looks like a capture but is not \
+                     valid (capture names must start with a letter or underscore and contain only \
+                     ASCII letters, digits, and underscores, e.g. '{{id}}'); as written this rule \
+                     would never match any request"
+                )));
+            }
         }
-
         validate_principal_matcher(&rule.principal, &format!("rules[{rule_index}].principal"))?;
     }
 
@@ -973,6 +1014,13 @@ mod tests {
                         "path": "/admin/**",
                         "principal": {},
                         "action": "deny"
+                    },
+                    {
+                        "tool_name": "reports.export",
+                        "principal": {
+                            "roles": ["operator"]
+                        },
+                        "action": "deny"
                     }
                 ]
             }"#,
@@ -980,7 +1028,7 @@ mod tests {
 
         let policy = Policy::from_file(file.path()).expect("rules section should parse");
 
-        assert_eq!(policy.rules.len(), 3);
+        assert_eq!(policy.rules.len(), 4);
         assert_eq!(policy.rules[0].id.as_deref(), Some("support-user-read"));
         assert_eq!(
             policy.rules[0].methods,
@@ -1000,6 +1048,9 @@ mod tests {
         assert_eq!(policy.rules[2].action, RuleAction::Deny);
         assert!(policy.rules[2].methods.is_empty());
         assert!(policy.rules[2].principal.is_unconstrained());
+        assert_eq!(policy.rules[3].tool_name.as_deref(), Some("reports.export"));
+        assert_eq!(policy.rules[3].principal.roles, vec!["operator".to_owned()]);
+        assert_eq!(policy.rules[3].action, RuleAction::Deny);
 
         let round_trip_value =
             serde_json::to_value(&policy).expect("policy with rules should serialize");
@@ -1297,6 +1348,34 @@ mod tests {
                     ]
                 }),
                 "invalid type",
+            ),
+            (
+                "path and tool_name both set",
+                json!({
+                    "schema_version": "0.1.0",
+                    "rules": [
+                        {
+                            "path": "/admin/**",
+                            "tool_name": "reports.export",
+                            "action": "deny"
+                        }
+                    ]
+                }),
+                "rules[0] must set exactly one of path or tool_name",
+            ),
+            (
+                "empty path and tool_name both set",
+                json!({
+                    "schema_version": "0.1.0",
+                    "rules": [
+                        {
+                            "path": "",
+                            "tool_name": "reports.export",
+                            "action": "deny"
+                        }
+                    ]
+                }),
+                "rules[0] must set exactly one of path or tool_name",
             ),
         ];
         let validator = policy_schema_validator();
@@ -1750,6 +1829,13 @@ mod tests {
                 {
                     "path": "/admin/**",
                     "principal": {},
+                    "action": "deny"
+                },
+                {
+                    "tool_name": "reports.export",
+                    "principal": {
+                        "roles": ["operator"]
+                    },
                     "action": "deny"
                 }
             ]
