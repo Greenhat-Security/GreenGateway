@@ -18,6 +18,7 @@ use crate::{
 
 const TOOLS_FILE_SCHEMA_VERSION: &str = "0.1.0";
 const MAX_TOOL_NAME_LENGTH: usize = 128;
+const MAX_OPENAPI_REFERENCE_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenApiToolGeneration {
@@ -672,10 +673,25 @@ fn resolve_reference<'a>(
     value: &'a Value,
     seen_references: &mut BTreeSet<String>,
 ) -> Result<&'a Value, OpenApiToolGenerationError> {
+    resolve_reference_with_depth(document, value, seen_references, 0)
+}
+
+fn resolve_reference_with_depth<'a>(
+    document: &'a Value,
+    value: &'a Value,
+    seen_references: &mut BTreeSet<String>,
+    depth: usize,
+) -> Result<&'a Value, OpenApiToolGenerationError> {
     let Some(reference) = value.get("$ref").and_then(Value::as_str) else {
         return Ok(value);
     };
 
+    if depth >= MAX_OPENAPI_REFERENCE_DEPTH {
+        return Err(OpenApiToolGenerationError::Reference {
+            reference: reference.to_owned(),
+            message: format!("reference depth exceeds {MAX_OPENAPI_REFERENCE_DEPTH}"),
+        });
+    }
     if !seen_references.insert(reference.to_owned()) {
         return Err(OpenApiToolGenerationError::Reference {
             reference: reference.to_owned(),
@@ -695,7 +711,7 @@ fn resolve_reference<'a>(
         });
     };
 
-    resolve_reference(document, resolved, seen_references)
+    resolve_reference_with_depth(document, resolved, seen_references, depth + 1)
 }
 
 fn api_key_header_requirements(
@@ -1106,6 +1122,25 @@ paths:
     }
 
     #[test]
+    fn rejects_deep_request_body_reference_chain() {
+        let spec = deep_request_body_reference_chain_spec(65);
+        let error = generate_tools_from_openapi_str("deep-refs.json", &spec)
+            .expect_err("overly deep OpenAPI schema references should reject");
+
+        let OpenApiToolGenerationError::Reference { reference, message } = error else {
+            panic!("deep references should return a reference error");
+        };
+        assert!(
+            reference.starts_with("#/components/schemas/S"),
+            "unexpected reference: {reference}"
+        );
+        assert!(
+            message.contains("reference depth exceeds"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
     fn continues_generating_other_operations_when_collision_is_skipped() {
         let generation =
             generate_tools_from_openapi_str("mixed-batch.yaml", colliding_and_valid_spec())
@@ -1340,5 +1375,50 @@ paths:
       operationId: getStatus
       summary: Read status
 "#
+    }
+
+    fn deep_request_body_reference_chain_spec(depth: usize) -> String {
+        let mut schemas = serde_json::Map::new();
+        for index in 0..depth {
+            schemas.insert(
+                format!("S{index}"),
+                json!({ "$ref": format!("#/components/schemas/S{}", index + 1) }),
+            );
+        }
+        schemas.insert(
+            format!("S{depth}"),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" }
+                }
+            }),
+        );
+
+        json!({
+            "openapi": "3.0.3",
+            "info": {
+                "title": "Deep Ref API",
+                "version": "1.0.0"
+            },
+            "paths": {
+                "/widgets": {
+                    "post": {
+                        "operationId": "createWidget",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/S0" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": schemas
+            }
+        })
+        .to_string()
     }
 }

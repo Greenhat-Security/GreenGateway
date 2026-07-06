@@ -998,7 +998,12 @@ fn stricten_property_schemas(schema: &mut Map<String, Value>, depth: usize) {
 }
 
 fn stricten_array_item_schemas(schema: &mut Map<String, Value>, depth: usize) {
-    match schema.get_mut("items") {
+    stricten_array_items_keyword(schema, "items", depth);
+    stricten_tuple_item_schemas(schema, "prefixItems", depth);
+}
+
+fn stricten_array_items_keyword(schema: &mut Map<String, Value>, keyword: &str, depth: usize) {
+    match schema.get_mut(keyword) {
         Some(items_schema @ Value::Object(_)) => {
             *items_schema = schema_with_strict_object_defaults(items_schema, false, depth + 1);
         }
@@ -1008,6 +1013,14 @@ fn stricten_array_item_schemas(schema: &mut Map<String, Value>, depth: usize) {
             }
         }
         _ => {}
+    }
+}
+
+fn stricten_tuple_item_schemas(schema: &mut Map<String, Value>, keyword: &str, depth: usize) {
+    if let Some(Value::Array(item_schemas)) = schema.get_mut(keyword) {
+        for item_schema in item_schemas {
+            *item_schema = schema_with_strict_object_defaults(item_schema, false, depth + 1);
+        }
     }
 }
 
@@ -1574,15 +1587,17 @@ mod tests {
             runtime_config([("echo_one_of", enabled_tool(500, 1))], 2, 1, 100),
         );
 
-        let response = executor
-            .execute(
-                "echo_one_of",
-                json!({ "message": "hello" }),
-                invocation_context(),
-                CancellationToken::new(),
-            )
-            .await
-            .expect("top-level oneOf schema should validate through its branch");
+        let response = http_response(
+            executor
+                .execute(
+                    "echo_one_of",
+                    json!({ "message": "hello" }),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("top-level oneOf schema should validate through its branch"),
+        );
 
         assert_eq!(response.status, StatusCode::OK);
         let request = server.await.expect("server task should join");
@@ -1748,6 +1763,47 @@ mod tests {
                 .await
                 .is_err(),
             "array item strict schema rejection must not reach the upstream listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_validation_rejects_unexpected_prefix_item_object_args_before_network() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"should-not-run").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [prefix_items_tool_without_item_additional_properties()],
+            runtime_config([("tuple_configure", enabled_tool(500, 1))], 2, 1, 100),
+        );
+
+        let error = executor
+            .execute(
+                "tuple_configure",
+                json!({
+                    "items": [
+                        {
+                            "name": "primary",
+                            "unexpected": "value"
+                        }
+                    ]
+                }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("unexpected prefix item object args should fail by default");
+
+        let message = work_failed_message(error);
+        assert!(message.contains("arguments failed input schema validation"));
+        assert!(
+            message.contains("unexpected"),
+            "validation message should identify the prefix item extra argument: {message}"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "prefix item strict schema rejection must not reach the upstream listener"
         );
     }
 
@@ -2814,6 +2870,38 @@ mod tests {
             "upstream": {
                 "method": "POST",
                 "path_template": "/v1/bulk-configure",
+                "body": {
+                    "mode": "whole_args_json"
+                }
+            }
+        })
+    }
+
+    fn prefix_items_tool_without_item_additional_properties() -> Value {
+        json!({
+            "name": "tuple_configure",
+            "description": "Configures a tuple-style list of named items.",
+            "input_json_schema": {
+                "type": "object",
+                "required": ["items"],
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "prefixItems": [
+                            {
+                                "type": "object",
+                                "required": ["name"],
+                                "properties": {
+                                    "name": { "type": "string" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+            "upstream": {
+                "method": "POST",
+                "path_template": "/v1/tuple-configure",
                 "body": {
                     "mode": "whole_args_json"
                 }

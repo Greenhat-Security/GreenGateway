@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt, fs,
     io::{self, Read},
@@ -22,6 +22,7 @@ use crate::{
 
 const TOOL_REGISTRY_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 const MAX_TOOLS_FILE_BYTES: u64 = 1_048_576;
+const MAX_INPUT_SCHEMA_REFERENCE_DEPTH: usize = 64;
 const TOOLS_FILE_SCHEMA_JSON: &str = include_str!("../../../docs/schemas/tools.v0.schema.json");
 const MCP_PROXY_METHOD: &str = "MCP_PROXY";
 
@@ -713,6 +714,14 @@ fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
             ));
         }
 
+        if let Some(problem) = input_schema_reference_depth_problem(&definition.input_schema) {
+            problems.push(format!(
+                "tool '{}' input_json_schema {problem}",
+                definition.name
+            ));
+            continue;
+        }
+
         if let Err(err) = jsonschema::validator_for(&definition.input_schema) {
             problems.push(format!(
                 "tool '{}' input_json_schema is not a valid JSON Schema: {err}",
@@ -722,6 +731,50 @@ fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
     }
 
     problems
+}
+
+fn input_schema_reference_depth_problem(schema: &Value) -> Option<String> {
+    let mut stack = vec![schema];
+
+    while let Some(value) = stack.pop() {
+        if let Some(reference) = value.get("$ref").and_then(Value::as_str) {
+            if let Some(problem) = local_reference_chain_depth_problem(schema, reference) {
+                return Some(problem);
+            }
+        }
+
+        match value {
+            Value::Array(values) => stack.extend(values.iter()),
+            Value::Object(object) => stack.extend(object.values()),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn local_reference_chain_depth_problem(root: &Value, first_reference: &str) -> Option<String> {
+    let mut reference = first_reference;
+    let mut seen_references = BTreeSet::new();
+    let mut depth = 1;
+
+    loop {
+        if depth > MAX_INPUT_SCHEMA_REFERENCE_DEPTH {
+            return Some(format!(
+                "reference depth exceeds {MAX_INPUT_SCHEMA_REFERENCE_DEPTH} at {reference}"
+            ));
+        }
+        if !seen_references.insert(reference.to_owned()) {
+            return Some(format!("contains circular local reference at {reference}"));
+        }
+
+        let pointer = reference.strip_prefix('#')?;
+        let target = root.pointer(pointer)?;
+        let next_reference = target.get("$ref").and_then(Value::as_str)?;
+
+        reference = next_reference;
+        depth += 1;
+    }
 }
 
 fn is_known_http_method(method: &str) -> bool {
@@ -856,6 +909,24 @@ mod tests {
         assert!(
             message.contains("not-a-json-schema-type"),
             "schema compiler error should be included: {message}"
+        );
+    }
+
+    #[test]
+    fn deep_input_schema_reference_chain_is_rejected_before_jsonschema_compile() {
+        let mut tool = echo_tool("deep_schema", "POST", "/v1/echo");
+        tool["input_json_schema"] = deep_ref_schema(65);
+
+        let error = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect_err("overly deep input_json_schema references should reject");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("tool 'deep_schema' input_json_schema reference depth exceeds"),
+            "unexpected error: {message}"
         );
     }
 
@@ -1312,6 +1383,23 @@ mod tests {
             "properties": {}
         });
         tool
+    }
+
+    fn deep_ref_schema(depth: usize) -> Value {
+        let mut defs = serde_json::Map::new();
+        for index in 0..depth {
+            defs.insert(
+                format!("S{index}"),
+                json!({ "$ref": format!("#/$defs/S{}", index + 1) }),
+            );
+        }
+        defs.insert(format!("S{depth}"), json!({ "type": "string" }));
+
+        json!({
+            "$ref": "#/$defs/S0",
+            "properties": {},
+            "$defs": defs
+        })
     }
 
     fn mcp_proxy_tool(name: &str, server_name: &str, tool_name: &str) -> ToolDefinition {
