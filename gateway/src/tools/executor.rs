@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::{Duration, Instant},
 };
 
@@ -54,6 +57,14 @@ const TOOL_EXECUTOR_CONFIGURATION_ERROR_STATUS: u16 = 520;
 const TOOL_EXECUTOR_CONFIGURATION_ERROR_REASON: &str = "internal_configuration_error";
 const TOOL_INVALID_PARAMS_REASON: &str = "invalid_params";
 const TOOL_UNKNOWN_TOOL_REASON: &str = "unknown_tool";
+const TOOL_DISABLED_REASON: &str = "disabled";
+const TOOL_ROLE_NOT_ALLOWED_REASON: &str = "role_not_allowed";
+const TOOL_MATCHED_RULE_REASON: &str = "matched_rule";
+const TOOL_QUEUE_FULL_REASON: &str = "queue_full";
+const TOOL_QUEUE_TIMEOUT_REASON: &str = "queue_timeout";
+const TOOL_CANCELLED_REASON: &str = "cancelled";
+const TOOL_RUNTIME_CLOSED_REASON: &str = "runtime_closed";
+const TOOL_RUNTIME_REJECTED_REASON: &str = "runtime_rejected";
 
 type ValidatorCache = HashMap<ValidatorCacheKey, Arc<jsonschema::Validator>>;
 
@@ -352,24 +363,42 @@ impl ToolExecutor {
         context: ToolInvocationContext,
         cancel: CancellationToken,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let started = Instant::now();
         let runtime_tool_name = tool_name.to_owned();
         let work_tool_name = runtime_tool_name.clone();
+        let observation_context = context.clone();
         let work_context = context.clone();
+        let work_started = Arc::new(AtomicBool::new(false));
+        let work_started_for_closure = Arc::clone(&work_started);
         let executor = self.clone();
 
-        self.runtime
+        let result = self
+            .runtime
             .execute_result_with_context_and_reason(
                 &runtime_tool_name,
                 context,
                 cancel,
                 move || async move {
+                    work_started_for_closure.store(true, Ordering::SeqCst);
                     executor
                         .execute_inner(&work_tool_name, args, &work_context)
                         .await
                 },
                 |error| Some(executor_work_failure_reason(error).to_owned()),
             )
-            .await
+            .await;
+
+        if let Err(error) = &result {
+            self.emit_runtime_admission_failure_observation(
+                &observation_context,
+                &runtime_tool_name,
+                duration_millis(started.elapsed()),
+                error,
+                work_started.load(Ordering::SeqCst),
+            );
+        }
+
+        result
     }
 
     pub(crate) fn can_list_tool(&self, tool_name: &str, context: &ToolInvocationContext) -> bool {
@@ -872,6 +901,31 @@ impl ToolExecutor {
         let outcome = executor_failure_observation_outcome(latency_ms, error);
         self.emit_tool_observation(context, tool, outcome);
     }
+
+    fn emit_runtime_admission_failure_observation(
+        &self,
+        context: &ToolInvocationContext,
+        tool_name: &str,
+        latency_ms: u64,
+        error: &ToolRuntimeError,
+        work_started: bool,
+    ) {
+        if matches!(error, ToolRuntimeError::UnknownTool { .. }) {
+            self.emit_unknown_tool_observation(context, tool_name, latency_ms);
+            return;
+        }
+
+        let Some(outcome) =
+            runtime_admission_failure_observation_outcome(latency_ms, error, work_started)
+        else {
+            return;
+        };
+
+        match self.registry.get(tool_name) {
+            Some(tool) => self.emit_tool_observation(context, &tool, outcome),
+            None => self.emit_named_tool_observation(context, tool_name, outcome),
+        }
+    }
 }
 
 impl ValidatorCacheKey {
@@ -1184,6 +1238,68 @@ fn executor_failure_observation_outcome(
     }
 }
 
+fn runtime_admission_failure_observation_outcome(
+    latency_ms: u64,
+    error: &ToolRuntimeError,
+    work_started: bool,
+) -> Option<ToolObservationOutcome> {
+    match error {
+        ToolRuntimeError::Disabled { .. } => Some(ToolObservationOutcome {
+            status: StatusCode::FORBIDDEN.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_DISABLED_REASON),
+        }),
+        ToolRuntimeError::RoleDenied { .. } => Some(ToolObservationOutcome {
+            status: StatusCode::FORBIDDEN.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_ROLE_NOT_ALLOWED_REASON),
+        }),
+        ToolRuntimeError::Rejected { reason, .. } => {
+            let (status, reason) = match reason.as_str() {
+                TOOL_QUEUE_FULL_REASON => (
+                    StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                    TOOL_QUEUE_FULL_REASON,
+                ),
+                TOOL_MATCHED_RULE_REASON => {
+                    (StatusCode::FORBIDDEN.as_u16(), TOOL_MATCHED_RULE_REASON)
+                }
+                TOOL_RUNTIME_CLOSED_REASON => (
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    TOOL_RUNTIME_CLOSED_REASON,
+                ),
+                _ => (
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    TOOL_RUNTIME_REJECTED_REASON,
+                ),
+            };
+            Some(ToolObservationOutcome {
+                status,
+                latency_ms,
+                schema_mismatch: false,
+                reason: Some(reason),
+            })
+        }
+        ToolRuntimeError::QueueTimeout { .. } => Some(ToolObservationOutcome {
+            status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_QUEUE_TIMEOUT_REASON),
+        }),
+        ToolRuntimeError::Cancelled { .. } if !work_started => Some(ToolObservationOutcome {
+            status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_CANCELLED_REASON),
+        }),
+        ToolRuntimeError::UnknownTool { .. }
+        | ToolRuntimeError::Timeout { .. }
+        | ToolRuntimeError::Cancelled { .. }
+        | ToolRuntimeError::WorkFailed { .. } => None,
+    }
+}
+
 fn executor_work_failure_reason(error: &ToolExecutorError) -> &'static str {
     match error {
         ToolExecutorError::UnknownTool { .. } => TOOL_UNKNOWN_TOOL_REASON,
@@ -1238,13 +1354,14 @@ mod tests {
     use crate::{
         audit::{
             sink::{tests::CaptureSink, AuditSink, CompositeSink},
-            AuditLog,
+            Actor, AuditLog,
         },
         discovery::{
             aggregator::{EndpointAggregatorSink, EndpointAggregatorSinkConfig},
             signals::{DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD, SCHEMA_MISMATCH_SIGNAL_TYPE},
         },
         egress::EgressConfig,
+        rbac::Policy,
         tools::runtime::{DefaultToolPolicy, ToolRuntimeConfig, ToolRuntimeToolConfig},
     };
 
@@ -1642,6 +1759,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_live_policy_tool_feeds_inventory_observation() {
+        let (audit, capture, db) = inventory_audit("tool-disabled-policy-inventory");
+        let runtime = live_policy_runtime(
+            json!({
+                "schema_version": "0.1.0",
+                "tools": {
+                    "echo": {
+                        "enabled": false,
+                        "timeout_ms": 500,
+                        "max_concurrent": 1
+                    }
+                }
+            }),
+            audit.clone(),
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let executor =
+            executor_for_tools_with_runtime(socket_addr(1), [echo_tool()], runtime, audit);
+
+        let error = executor
+            .execute(
+                "echo",
+                json!({ "message": "hello" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("live policy enabled=false should reject before execution");
+
+        assert!(matches!(error, ToolRuntimeError::Disabled { .. }));
+        assert_inventory_observation(&capture, &db.path, "echo", 403, "disabled").await;
+    }
+
+    #[tokio::test]
+    async fn role_denied_live_policy_tool_feeds_inventory_observation() {
+        let (audit, capture, db) = inventory_audit("tool-role-denied-policy-inventory");
+        let runtime = live_policy_runtime(
+            json!({
+                "schema_version": "0.1.0",
+                "tools": {
+                    "echo": {
+                        "allowed_roles": ["operator"],
+                        "timeout_ms": 500,
+                        "max_concurrent": 1
+                    }
+                }
+            }),
+            audit.clone(),
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let executor =
+            executor_for_tools_with_runtime(socket_addr(1), [echo_tool()], runtime, audit);
+
+        let error = executor
+            .execute(
+                "echo",
+                json!({ "message": "hello" }),
+                invocation_context_with_roles(&["viewer"]),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("viewer should not satisfy the live policy allowed_roles");
+
+        assert!(matches!(error, ToolRuntimeError::RoleDenied { .. }));
+        assert_inventory_observation(&capture, &db.path, "echo", 403, "role_not_allowed").await;
+    }
+
+    #[tokio::test]
+    async fn live_policy_unknown_tool_feeds_inventory_observation() {
+        let (audit, capture, db) = inventory_audit("tool-live-policy-unknown-inventory");
+        let runtime = live_policy_runtime(
+            json!({ "schema_version": "0.1.0" }),
+            audit.clone(),
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let executor =
+            executor_for_tools_with_runtime(socket_addr(1), [echo_tool()], runtime, audit);
+
+        let error = executor
+            .execute(
+                "echo",
+                json!({ "message": "hello" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("registered tool absent from live policy tools map should reject");
+
+        assert!(matches!(error, ToolRuntimeError::UnknownTool { .. }));
+        assert_inventory_observation(&capture, &db.path, "echo", 404, "unknown_tool").await;
+    }
+
+    #[tokio::test]
+    async fn queue_full_rejection_feeds_inventory_observation() {
+        let server = gated_server().await;
+        let (audit, capture, db) = inventory_audit("tool-queue-full-inventory");
+        let executor = executor_for_tools_with_audit(
+            server.addr,
+            [widget_tool(false, true)],
+            runtime_config([("get_widget", enabled_tool(1_000, 1))], 1, 1, 100),
+            audit,
+        );
+
+        let first = tokio::spawn({
+            let executor = executor.clone();
+            async move {
+                executor
+                    .execute(
+                        "get_widget",
+                        json!({ "widget_id": "first" }),
+                        invocation_context(),
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        wait_until(Duration::from_secs(1), || server.request_count() == 1).await;
+
+        let error = executor
+            .execute(
+                "get_widget",
+                json!({ "widget_id": "second" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("full runtime queue should reject before execution");
+
+        assert!(matches!(
+            error,
+            ToolRuntimeError::Rejected { ref reason, .. } if reason == "queue_full"
+        ));
+        assert_inventory_observation(&capture, &db.path, "get_widget", 429, "queue_full").await;
+
+        server.release.release();
+        first
+            .await
+            .expect("first invocation task should join")
+            .expect("first invocation should complete after server release");
+        server.stop.cancel();
+        server.handle.abort();
+    }
+
+    #[tokio::test]
     async fn missing_required_query_arg_is_rejected() {
         let (executor, _capture) = executor_for_tools(
             socket_addr(1),
@@ -1974,6 +2235,34 @@ mod tests {
         }))
         .expect("test tools should load");
         let runtime = ToolRuntime::new(runtime_config, audit.clone());
+        executor_for_registry_with_runtime(registry, runtime, audit, upstream_url)
+    }
+
+    fn executor_for_tools_with_runtime<const N: usize>(
+        addr: SocketAddr,
+        tools: [Value; N],
+        runtime: ToolRuntime,
+        audit: AuditLog,
+    ) -> ToolExecutor {
+        let registry = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": Value::Array(tools.into_iter().collect())
+        }))
+        .expect("test tools should load");
+        executor_for_registry_with_runtime(
+            registry,
+            runtime,
+            audit,
+            Some(format!("http://127.0.0.1:{}/ignored-base", addr.port())),
+        )
+    }
+
+    fn executor_for_registry_with_runtime(
+        registry: ToolRegistry,
+        runtime: ToolRuntime,
+        audit: AuditLog,
+        upstream_url: Option<String>,
+    ) -> ToolExecutor {
         let egress_client = Arc::new(
             EgressClient::new(EgressConfig {
                 allowed_hosts: ["127.0.0.1".to_owned()].into_iter().collect(),
@@ -2000,6 +2289,38 @@ mod tests {
         .expect("tool executor should build");
 
         executor
+    }
+
+    fn live_policy_runtime(
+        policy_document: Value,
+        audit: AuditLog,
+        runtime_config: ToolRuntimeConfig,
+    ) -> ToolRuntime {
+        let policy =
+            Policy::validate_json_value(policy_document).expect("test live policy should validate");
+        let rbac_state =
+            crate::middleware::rbac::RbacState::new(policy, Vec::new(), false, audit.clone());
+        ToolRuntime::new_with_rbac_state(runtime_config, audit, Some(rbac_state))
+    }
+
+    fn inventory_audit(test_name: &str) -> (AuditLog, CaptureSink, TempDiscoveryDb) {
+        let db = TempDiscoveryDb::new(test_name);
+        let aggregator = Arc::new(
+            EndpointAggregatorSink::new(EndpointAggregatorSinkConfig {
+                path: db.path.clone(),
+                payload_capture_enabled: false,
+                signal_event_sender: None,
+                signal_detector_config: Default::default(),
+            })
+            .expect("discovery aggregator sink should build"),
+        ) as Arc<dyn AuditSink>;
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(CompositeSink::new(vec![
+            Arc::new(capture.clone()) as Arc<dyn AuditSink>,
+            aggregator,
+        ])) as Arc<dyn AuditSink>);
+
+        (audit, capture, db)
     }
 
     fn runtime_config<const N: usize>(
@@ -2342,6 +2663,19 @@ mod tests {
         }
     }
 
+    fn invocation_context_with_roles(roles: &[&str]) -> ToolInvocationContext {
+        ToolInvocationContext {
+            request_id: "request-tool-test".to_owned(),
+            source_ip: "203.0.113.10".to_owned(),
+            actor: Some(Actor {
+                user_id: "user-123".to_owned(),
+                email: None,
+                roles: Some(roles.iter().map(|role| (*role).to_owned()).collect()),
+                auth_mode: "bearer_token".to_owned(),
+            }),
+        }
+    }
+
     fn socket_addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
@@ -2407,6 +2741,62 @@ mod tests {
             .expect("signal query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("signal rows should read")
+    }
+
+    async fn assert_inventory_observation(
+        capture: &CaptureSink,
+        db_path: &Path,
+        tool_name: &str,
+        status: u16,
+        reason: &str,
+    ) {
+        wait_until(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == HTTP_REQUEST_OBSERVED
+                    && event.payload["tool_name"] == json!(tool_name)
+                    && event.payload["status"] == json!(status)
+                    && event.payload["reason"] == json!(reason)
+            })
+        })
+        .await;
+
+        let events = capture.events();
+        let observation = events
+            .iter()
+            .find(|event| {
+                event.event_type == HTTP_REQUEST_OBSERVED
+                    && event.payload["tool_name"] == json!(tool_name)
+            })
+            .unwrap_or_else(|| panic!("expected inventory observation in {events:#?}"));
+        assert_eq!(observation.payload["method"], json!("MCP"));
+        assert_eq!(
+            observation.payload["path"],
+            json!(format!("/mcp/tools/{tool_name}"))
+        );
+        assert_eq!(
+            observation.payload["endpoint_template"],
+            json!(format!("/mcp/tools/{tool_name}"))
+        );
+        assert_eq!(observation.payload["status"], json!(status));
+        assert_eq!(observation.payload["schema_mismatch"], json!(false));
+        assert_eq!(observation.payload["reason"], json!(reason));
+        assert!(
+            observation.payload["latency_ms"].as_u64().is_some(),
+            "tool observation event should include latency_ms"
+        );
+
+        wait_until(Duration::from_secs(2), || {
+            discovery_aggregate_snapshot(db_path, "MCP", &format!("/mcp/tools/{tool_name}"))
+                .is_some_and(|aggregate| {
+                    aggregate.call_count == 1 && aggregate.schema_mismatch_count == 0
+                })
+        })
+        .await;
+        let aggregate =
+            discovery_aggregate_snapshot(db_path, "MCP", &format!("/mcp/tools/{tool_name}"))
+                .expect("inventory aggregate should be present");
+        assert_eq!(aggregate.call_count, 1);
+        assert_eq!(aggregate.schema_mismatch_count, 0);
     }
 
     struct TempDiscoveryDb {
