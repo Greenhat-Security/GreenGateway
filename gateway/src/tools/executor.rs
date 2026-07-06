@@ -376,6 +376,15 @@ impl ToolExecutor {
         self.runtime.tool_visible_to_context(tool_name, context)
     }
 
+    pub(crate) fn record_unknown_tool_call(
+        &self,
+        context: &ToolInvocationContext,
+        tool_name: &str,
+        elapsed: Duration,
+    ) {
+        self.emit_unknown_tool_observation(context, tool_name, duration_millis(elapsed));
+    }
+
     async fn execute_inner(
         &self,
         tool_name: &str,
@@ -1984,6 +1993,8 @@ mod tests {
                 timeout: Duration::from_secs(30),
                 response_idle_timeout: Duration::from_secs(30),
                 connect_timeout: Duration::from_secs(10),
+                max_request_body_bytes: 1_048_576,
+                max_response_bytes: 5_242_880,
             },
         )
         .expect("tool executor should build");

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use axum::{
     body::Body,
@@ -121,8 +121,18 @@ impl ServerHandler for McpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let tool_name = request.name.to_string();
+        let lookup_started = Instant::now();
+        let invocation_context =
+            invocation_context_from_request(&context, self.trust_proxy_headers);
 
         if self.registry.get(&tool_name).is_none() {
+            if let Some(executor) = self.executor.as_ref() {
+                executor.record_unknown_tool_call(
+                    &invocation_context,
+                    &tool_name,
+                    lookup_started.elapsed(),
+                );
+            }
             return Err(unknown_tool_error(&tool_name));
         }
 
@@ -134,8 +144,6 @@ impl ServerHandler for McpServer {
         };
 
         let arguments = Value::Object(request.arguments.unwrap_or_default());
-        let invocation_context =
-            invocation_context_from_request(&context, self.trust_proxy_headers);
 
         match executor
             .execute(

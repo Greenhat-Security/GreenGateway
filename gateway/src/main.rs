@@ -11712,6 +11712,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_mcp_tool_call_appears_as_inventory_row() {
+        let harness = mcp_inventory_test_harness(McpInventoryHarnessConfig {
+            upstream_url: Some("http://127.0.0.1:1".to_owned()),
+            tools_document: mcp_tools_document(),
+            mcp_upstream_servers: Vec::new(),
+            egress_allowed_hosts: vec!["127.0.0.1".to_owned()],
+        })
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            36,
+            "tools/call",
+            Some(json!({
+                "name": "missing_tool",
+                "arguments": {}
+            })),
+            "mcp-inventory-unknown-tool",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32601));
+        assert_eq!(body["error"]["data"]["tool_name"], json!("missing_tool"));
+
+        let row = wait_for_mcp_tool_inventory_row(
+            &harness.router,
+            &harness.admin_token,
+            "missing_tool",
+            |row| row["call_count"] == json!(1) && status_count(row, 404) == Some(1),
+        )
+        .await;
+        assert_eq!(row["method"], json!("MCP"));
+        assert_eq!(row["endpoint_template"], json!("/mcp/tools/missing_tool"));
+        assert_eq!(row["call_count"], json!(1));
+        assert_eq!(row["schema_mismatch_count"], json!(0));
+        assert_eq!(row["distinct_principal_count"], json!(1));
+        assert_eq!(status_count(&row, 404), Some(1));
+    }
+
+    #[tokio::test]
     async fn repeated_mcp_tool_calls_accumulate_into_one_inventory_row() {
         let upstream_addr = spawn_echo_json_upstream().await;
         let harness = mcp_inventory_test_harness(McpInventoryHarnessConfig {
