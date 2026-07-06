@@ -2004,6 +2004,8 @@ paths:
                     audit: audit.clone(),
                     principal_directory: crate::auth::PrincipalDirectory::disabled(),
                     trust_proxy_headers: false,
+                    mcp_resource: None,
+                    mcp_resource_metadata_url: None,
                 },
                 auth::auth_middleware,
             ))

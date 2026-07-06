@@ -2029,6 +2029,7 @@ mod tests {
             admin_listen_addr: None,
             admin_prefix: "/admin".to_owned(),
             admin_login_provider: None,
+            gateway_public_url: None,
             audit_log_file: None,
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,

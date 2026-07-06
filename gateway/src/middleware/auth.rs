@@ -21,8 +21,8 @@ use serde_json::json;
 use crate::{
     audit::{AuditEvent, AuditLog},
     auth::{
-        actor_from_principal, AuthError, Principal, PrincipalDirectory, SessionCredential,
-        SessionValidator,
+        actor_from_principal, protected_resource, AuthError, Principal, PrincipalDirectory,
+        SessionCredential, SessionValidator,
     },
     client_ip::{canonical_client_ip, request_id},
     config::{AuthMode, Config},
@@ -43,6 +43,8 @@ pub struct AuthState {
     pub audit: AuditLog,
     pub principal_directory: PrincipalDirectory,
     pub trust_proxy_headers: bool,
+    pub mcp_resource: Option<String>,
+    pub mcp_resource_metadata_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -64,6 +66,8 @@ impl AuthState {
         audit: AuditLog,
         principal_directory: PrincipalDirectory,
     ) -> Self {
+        let protected_resource_metadata =
+            protected_resource::ProtectedResourceMetadataConfig::from_config(config);
         Self {
             validator,
             mode: config.auth_mode,
@@ -72,7 +76,27 @@ impl AuthState {
             audit,
             principal_directory,
             trust_proxy_headers: config.trust_proxy_headers,
+            mcp_resource: protected_resource_metadata
+                .as_ref()
+                .map(protected_resource::ProtectedResourceMetadataConfig::mcp_resource),
+            mcp_resource_metadata_url: protected_resource_metadata
+                .as_ref()
+                .map(protected_resource::ProtectedResourceMetadataConfig::metadata_url),
         }
+    }
+}
+
+impl AuthState {
+    fn mcp_resource_for_path(&self, path: &str) -> Option<String> {
+        (path == protected_resource::MCP_RESOURCE_PATH)
+            .then(|| self.mcp_resource.clone())
+            .flatten()
+    }
+
+    fn mcp_resource_metadata_url_for_path(&self, path: &str) -> Option<&str> {
+        (path == protected_resource::MCP_RESOURCE_PATH)
+            .then_some(self.mcp_resource_metadata_url.as_deref())
+            .flatten()
     }
 }
 
@@ -82,6 +106,10 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Response {
     let path = req.uri().path().to_owned();
+    if path == protected_resource::WELL_KNOWN_PATH {
+        return next.run(req).await;
+    }
+
     if state
         .exempt_paths
         .iter()
@@ -90,6 +118,7 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
+    let resource = state.mcp_resource_for_path(&path);
     let audit = audit_context(&req, path, state.trust_proxy_headers);
     let Some(credential) = extract_credential(req.headers(), &state.cookie_name) else {
         return auth_failure_response(&state, &audit, "missing_credential", req, next).await;
@@ -111,7 +140,10 @@ pub async fn auth_middleware(
         _ => {}
     }
 
-    match validator.validate_session(&credential).await {
+    match validator
+        .validate_session_for_resource(&credential, resource.as_deref())
+        .await
+    {
         Ok(principal) => {
             emit_success(&state, &audit, &credential, &principal);
             req.extensions_mut().insert(principal.clone());
@@ -218,7 +250,10 @@ async fn auth_failure_response(
     emit_failure(state, context, &reason);
 
     match state.mode {
-        AuthMode::Required => unauthorized_with_auth_outcome(reason),
+        AuthMode::Required => unauthorized_with_auth_outcome(
+            reason,
+            state.mcp_resource_metadata_url_for_path(&context.path),
+        ),
         AuthMode::Observe => forward_with_auth_outcome(req, next, reason).await,
     }
 }
@@ -247,25 +282,42 @@ fn with_optional_user_agent(event: AuditEvent, user_agent: Option<&str>) -> Audi
     }
 }
 
-fn unauthorized() -> Response {
-    (
+fn unauthorized(resource_metadata_url: Option<&str>) -> Response {
+    let mut response = (
         StatusCode::UNAUTHORIZED,
-        [(WWW_AUTHENTICATE, "Bearer")],
         Json(UnauthorizedBody {
             error: "unauthorized",
         }),
     )
-        .into_response()
+        .into_response();
+    response
+        .headers_mut()
+        .insert(WWW_AUTHENTICATE, bearer_challenge(resource_metadata_url));
+    response
 }
 
-fn unauthorized_with_auth_outcome(reason: impl Into<String>) -> Response {
-    let mut response = unauthorized();
+fn unauthorized_with_auth_outcome(
+    reason: impl Into<String>,
+    resource_metadata_url: Option<&str>,
+) -> Response {
+    let mut response = unauthorized(resource_metadata_url);
     response.extensions_mut().insert(AuthOutcome {
         principal: None,
         authenticated: false,
         reason: Some(reason.into()),
     });
     response
+}
+
+fn bearer_challenge(resource_metadata_url: Option<&str>) -> HeaderValue {
+    let Some(resource_metadata_url) = resource_metadata_url else {
+        return HeaderValue::from_static("Bearer");
+    };
+
+    HeaderValue::from_str(&format!(
+        "Bearer realm=\"mcp\", resource_metadata=\"{resource_metadata_url}\""
+    ))
+    .unwrap_or_else(|_| HeaderValue::from_static("Bearer"))
 }
 
 fn header_to_trimmed_string(value: Option<&HeaderValue>) -> Option<String> {
@@ -390,6 +442,8 @@ mod tests {
                 audit,
                 principal_directory: PrincipalDirectory::disabled(),
                 trust_proxy_headers: false,
+                mcp_resource: None,
+                mcp_resource_metadata_url: None,
             },
             capture,
         )

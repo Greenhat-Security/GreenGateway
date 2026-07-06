@@ -47,6 +47,14 @@ pub trait SessionValidator: Send + Sync {
         credential: &SessionCredential,
     ) -> Result<Principal, AuthError>;
 
+    async fn validate_session_for_resource(
+        &self,
+        credential: &SessionCredential,
+        _resource: Option<&str>,
+    ) -> Result<Principal, AuthError> {
+        self.validate_session(credential).await
+    }
+
     /// Routing hint for whether this validator should receive cookie credentials.
     /// This is not an authorization decision: every offered credential must still pass
     /// `validate_session`, so the default only opts into receiving this channel.

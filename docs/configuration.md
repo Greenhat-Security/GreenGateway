@@ -48,6 +48,16 @@ The admin UI login flow uses OAuth2 authorization-code with PKCE. `GET /v1{ADMIN
 
 The pending-login state is intentionally process-local and bounded in memory. It is suitable for a single GreenGateway instance; multi-instance deployments need sticky routing or a future shared state store for the login callback.
 
+### GATEWAY_PUBLIC_URL
+
+Optional public base URL clients use to reach this gateway.
+
+Default: empty, which disables the OAuth protected-resource metadata document. In this mode `GET /.well-known/oauth-protected-resource` returns a clear not-configured error, MCP 401 responses keep the same plain bearer challenge as other endpoints, and JWT validation behavior is unchanged.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be a valid `http` or `https` URL with a host. The configured URL may include a path prefix; GreenGateway appends `/mcp` to compute the MCP protected resource identifier and appends `/.well-known/oauth-protected-resource` to compute the metadata document URL advertised to MCP clients.
+
+When set, `GET /.well-known/oauth-protected-resource` is public and unauthenticated. The response advertises `resource` as `{GATEWAY_PUBLIC_URL}/mcp`, `authorization_servers` from configured JWT/OIDC provider issuers when present, `scopes_supported` as `["mcp:tools"]`, and `bearer_methods_supported` as `["Bearer"]`. MCP authentication failures include a `WWW-Authenticate` challenge with `realm="mcp"` and `resource_metadata` pointing at `{GATEWAY_PUBLIC_URL}/.well-known/oauth-protected-resource`. JWT bearer tokens presented to `/mcp` must also include the MCP resource identifier in the `aud` claim, in addition to any existing provider-level static `audience` requirement.
+
 ### AUDIT_LOG_FILE
 
 Optional JSON Lines audit log file path.

@@ -6,6 +6,7 @@ pub mod oidc;
 pub mod oidc_login;
 pub mod principal;
 pub mod principal_directory;
+pub mod protected_resource;
 pub mod service_token_validator;
 pub mod tokens;
 pub mod validator;

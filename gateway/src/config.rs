@@ -87,6 +87,7 @@ const EGRESS_MAX_REQUEST_BODY_BYTES: &str = "EGRESS_MAX_REQUEST_BODY_BYTES";
 const EGRESS_MAX_RESPONSE_BYTES: &str = "EGRESS_MAX_RESPONSE_BYTES";
 const EGRESS_RESPONSE_IDLE_TIMEOUT_MS: &str = "EGRESS_RESPONSE_IDLE_TIMEOUT_MS";
 const EGRESS_TIMEOUT_MS: &str = "EGRESS_TIMEOUT_MS";
+const GATEWAY_PUBLIC_URL: &str = "GATEWAY_PUBLIC_URL";
 const JWT_AUDIENCE: &str = "JWT_AUDIENCE";
 const JWT_ISSUER: &str = "JWT_ISSUER";
 const JWT_JWKS_TIMEOUT_MS: &str = "JWT_JWKS_TIMEOUT_MS";
@@ -133,6 +134,7 @@ pub struct Config {
     pub admin_listen_addr: Option<SocketAddr>,
     pub admin_prefix: String,
     pub admin_login_provider: Option<String>,
+    pub gateway_public_url: Option<String>,
     pub audit_log_file: Option<String>,
     pub audit_sqlite_path: Option<String>,
     pub audit_sqlite_retention_days: Option<u32>,
@@ -404,6 +406,11 @@ impl Config {
         let admin_login_provider = parse_optional_string(
             ADMIN_LOGIN_PROVIDER,
             get_var(ADMIN_LOGIN_PROVIDER),
+            &mut problems,
+        );
+        let gateway_public_url = parse_optional_upstream_url(
+            GATEWAY_PUBLIC_URL,
+            get_var(GATEWAY_PUBLIC_URL),
             &mut problems,
         );
         let audit_log_file =
@@ -850,6 +857,7 @@ impl Config {
                 admin_listen_addr,
                 admin_prefix,
                 admin_login_provider,
+                gateway_public_url,
                 audit_log_file,
                 audit_sqlite_path,
                 audit_sqlite_retention_days,
@@ -2162,6 +2170,7 @@ mod tests {
             )
         );
         assert_eq!(config.admin_prefix, DEFAULT_ADMIN_PREFIX);
+        assert_eq!(config.gateway_public_url, None);
         assert_eq!(config.audit_log_file, None);
         assert_eq!(config.audit_sqlite_path, None);
         assert_eq!(config.audit_sqlite_retention_days, None);
@@ -3148,6 +3157,48 @@ mod tests {
         assert_eq!(config.jwt_jwks_timeout_ms, 5000);
         assert!(config.jwt_require_jti);
         assert_eq!(config.roles_claim, "groups");
+    }
+
+    #[test]
+    fn gateway_public_url_parses_optional_http_url() {
+        let config = Config::from_env_vars(|name| match name {
+            "GATEWAY_PUBLIC_URL" => Ok("  https://gateway.example.test/base/  ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.gateway_public_url,
+            Some("https://gateway.example.test/base/".to_owned())
+        );
+    }
+
+    #[test]
+    fn invalid_gateway_public_url_values_are_rejected() {
+        for (value, expected) in [
+            (
+                "not a url",
+                "GATEWAY_PUBLIC_URL must be a valid http or https URL",
+            ),
+            (
+                "mailto:ops@example.test",
+                "GATEWAY_PUBLIC_URL must be a valid http or https URL with a host",
+            ),
+            (
+                "ftp://gateway.example.test",
+                "GATEWAY_PUBLIC_URL must use http or https",
+            ),
+        ] {
+            let error = Config::from_env_vars(|name| match name {
+                "GATEWAY_PUBLIC_URL" => Ok(value.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect_err("config should reject invalid public URL");
+
+            let message = error.to_string();
+            assert!(message.contains(expected), "{message}");
+            assert_eq!(error.problems.len(), 1);
+        }
     }
 
     #[test]
