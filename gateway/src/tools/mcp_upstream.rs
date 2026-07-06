@@ -60,6 +60,10 @@ pub enum McpUpstreamDiscoveryError {
         server_name: String,
         source: EgressError,
     },
+    UpstreamListFailed {
+        server_name: String,
+        source: McpUpstreamCallError,
+    },
 }
 
 impl fmt::Display for McpUpstreamDiscoveryError {
@@ -79,6 +83,13 @@ impl fmt::Display for McpUpstreamDiscoveryError {
                 formatter,
                 "MCP upstream server '{server_name}' URL is rejected by egress policy: {source}"
             ),
+            Self::UpstreamListFailed {
+                server_name,
+                source,
+            } => write!(
+                formatter,
+                "MCP upstream server '{server_name}' tools/list discovery failed: {source}"
+            ),
         }
     }
 }
@@ -87,6 +98,7 @@ impl Error for McpUpstreamDiscoveryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::EgressRejected { source, .. } => Some(source),
+            Self::UpstreamListFailed { source, .. } => Some(source),
             Self::RuntimeBuild { .. } | Self::ThreadPanicked => None,
         }
     }
@@ -179,6 +191,35 @@ pub fn discover_upstream_tools_blocking(
     config: &Config,
     egress_client: Arc<EgressClient>,
 ) -> Result<Vec<ToolDefinition>, McpUpstreamDiscoveryError> {
+    discover_upstream_tools_blocking_with_failure_mode(
+        config,
+        egress_client,
+        DiscoveryFailureMode::WarnAndSkip,
+    )
+}
+
+pub fn discover_upstream_tools_strict_blocking(
+    config: &Config,
+    egress_client: Arc<EgressClient>,
+) -> Result<Vec<ToolDefinition>, McpUpstreamDiscoveryError> {
+    discover_upstream_tools_blocking_with_failure_mode(
+        config,
+        egress_client,
+        DiscoveryFailureMode::FailOnListError,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum DiscoveryFailureMode {
+    WarnAndSkip,
+    FailOnListError,
+}
+
+fn discover_upstream_tools_blocking_with_failure_mode(
+    config: &Config,
+    egress_client: Arc<EgressClient>,
+    failure_mode: DiscoveryFailureMode,
+) -> Result<Vec<ToolDefinition>, McpUpstreamDiscoveryError> {
     if config.mcp_upstream_servers.is_empty() {
         return Ok(Vec::new());
     }
@@ -191,7 +232,11 @@ pub fn discover_upstream_tools_blocking(
             .map_err(|err| McpUpstreamDiscoveryError::RuntimeBuild {
                 message: err.to_string(),
             })?
-            .block_on(discover_upstream_tools(&config, egress_client))
+            .block_on(discover_upstream_tools(
+                &config,
+                egress_client,
+                failure_mode,
+            ))
     });
 
     handle
@@ -202,6 +247,7 @@ pub fn discover_upstream_tools_blocking(
 async fn discover_upstream_tools(
     config: &Config,
     egress_client: Arc<EgressClient>,
+    failure_mode: DiscoveryFailureMode,
 ) -> Result<Vec<ToolDefinition>, McpUpstreamDiscoveryError> {
     let runtime_config = McpUpstreamRuntimeConfig::from_config(config);
     let mut definitions = Vec::new();
@@ -219,13 +265,21 @@ async fn discover_upstream_tools(
             Ok(tools) => {
                 definitions.extend(tools.into_iter().map(|tool| proxy_definition(server, tool)));
             }
-            Err(error) => {
-                tracing::warn!(
-                    server_name = %server.name,
-                    reason = %error,
-                    "MCP upstream discovery failed; no tools imported from this server"
-                );
-            }
+            Err(error) => match failure_mode {
+                DiscoveryFailureMode::WarnAndSkip => {
+                    tracing::warn!(
+                        server_name = %server.name,
+                        reason = %error,
+                        "MCP upstream discovery failed; no tools imported from this server"
+                    );
+                }
+                DiscoveryFailureMode::FailOnListError => {
+                    return Err(McpUpstreamDiscoveryError::UpstreamListFailed {
+                        server_name: server.name.clone(),
+                        source: error,
+                    });
+                }
+            },
         }
     }
 
