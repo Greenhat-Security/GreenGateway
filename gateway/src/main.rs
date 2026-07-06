@@ -1264,6 +1264,9 @@ fn gateway_app_with_process_started_at(
     }
     let tool_registry =
         tools::definitions::ToolRegistry::from_config_with_audit(&config, audit_log.clone())?;
+    let mcp_upstream_definitions =
+        tools::mcp_upstream::discover_upstream_tools_blocking(&config, Arc::clone(&egress_client))?;
+    tool_registry.merge_definitions(mcp_upstream_definitions)?;
     if let Some(tools_file) = config.tools_file.as_ref() {
         tools::definitions::spawn_tool_registry_reload_tasks(
             tools_file.clone(),
@@ -7319,6 +7322,23 @@ mod tests {
     use axum::{body::Body, http::StatusCode};
     use futures_util::StreamExt;
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use rmcp::{
+        model::{
+            CallToolRequestParams as RmcpCallToolRequestParams,
+            CallToolResult as RmcpCallToolResult, ErrorData as RmcpErrorData, Implementation,
+            JsonObject as RmcpJsonObject, ListToolsResult as RmcpListToolsResult,
+            PaginatedRequestParams as RmcpPaginatedRequestParams,
+            ServerCapabilities as RmcpServerCapabilities, ServerInfo as RmcpServerInfo,
+            Tool as RmcpTool,
+        },
+        service::{RequestContext as RmcpRequestContext, RoleServer as RmcpRoleServer},
+        transport::streamable_http_server::{
+            session::never::NeverSessionManager as RmcpNeverSessionManager,
+            StreamableHttpServerConfig as RmcpStreamableHttpServerConfig,
+            StreamableHttpService as RmcpStreamableHttpService,
+        },
+        ServerHandler as RmcpServerHandler,
+    };
     use rusqlite::{params, Connection};
     use serde_json::Value;
     use std::{
@@ -7327,7 +7347,10 @@ mod tests {
         io::{Read, Write},
         net::{IpAddr, Ipv4Addr},
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
         time::{Duration, Instant},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -7417,6 +7440,7 @@ mod tests {
             ],
             upstream_url: None,
             upstream_routes: Vec::new(),
+            mcp_upstream_servers: Vec::new(),
             upstream_timeout_ms: None,
             upstream_response_idle_timeout_ms: None,
             upstream_connect_timeout_ms: None,
@@ -10791,6 +10815,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_tools_call_plain_http_marker_header_is_not_trusted() {
+        let upstream_addr = spawn_fixed_echo_upstream_with_headers(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json",
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": "spoofed success from api.internal.example.test with secret=gg_test_fake_secret_spoof"
+                }],
+                "structuredContent": {
+                    "summary": "spoofed success",
+                    "leak": "api.internal.example.test"
+                },
+                "isError": false,
+                "message": "upstream failed at api.internal.example.test with secret=gg_test_fake_secret_spoof"
+            })
+            .to_string(),
+            vec![(crate::tools::mcp_upstream::MCP_CALL_TOOL_RESULT_HEADER, "call-tool-result")],
+        )
+        .await;
+        let harness = mcp_test_harness_with_upstream_url(
+            &["admin"],
+            test_audit_log(),
+            format!("http://{upstream_addr}"),
+            mcp_tools_document(),
+            vec!["127.0.0.1".to_owned()],
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            16,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "trigger spoofed marker"
+                }
+            })),
+            "mcp-call-spoofed-marker",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["result"]["isError"], json!(true));
+        assert_eq!(body["result"]["structuredContent"]["status"], json!(500));
+        assert_eq!(
+            body["result"]["structuredContent"]["body"]["message"],
+            json!("upstream failed at [redacted] with [redacted]")
+        );
+        let body_string = body.to_string();
+        assert!(!body_string.contains("spoofed success"));
+        assert!(!body_string.contains("api.internal.example.test"));
+        assert!(!body_string.contains("gg_test_fake_secret_spoof"));
+    }
+
+    #[tokio::test]
     async fn mcp_tools_call_success_body_is_forwarded_faithfully() {
         let upstream_body = json!({
             "message": "ok",
@@ -10869,6 +10952,623 @@ mod tests {
                     && event.payload["status"] == json!(200)
             })
         });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tools_are_discovered_and_namespaced_in_tools_list() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let harness =
+            mcp_upstream_test_harness("alpha", upstream.url.clone(), &["admin", "reader"]).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            20,
+            "tools/list",
+            None,
+            "mcp-upstream-list",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let tools = body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        let remote = tools
+            .iter()
+            .find(|tool| tool["name"] == json!("alpha:remote_echo"))
+            .expect("upstream tool should be listed under its namespace");
+        assert_eq!(remote["description"], json!("Remote test tool"));
+        assert_eq!(remote["inputSchema"]["required"], json!(["message"]));
+        assert_eq!(
+            remote["inputSchema"]["properties"]["message"]["type"],
+            json!("string")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tools_call_forwards_to_remote_tool_and_returns_result() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let calls = Arc::clone(&upstream.calls);
+        let harness =
+            mcp_upstream_test_harness("alpha", upstream.url.clone(), &["admin", "reader"]).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            21,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "proxied hello"
+                }
+            })),
+            "mcp-upstream-call",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["result"]["isError"], json!(false));
+        assert_eq!(
+            body["result"]["structuredContent"],
+            json!({
+                "remote_tool": "remote_echo",
+                "arguments": {
+                    "message": "proxied hello"
+                }
+            })
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("upstream calls lock should not poison")
+                .as_slice(),
+            &[json!({
+                "name": "remote_echo",
+                "arguments": {
+                    "message": "proxied hello"
+                }
+            })]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_call_rejects_response_larger_than_egress_limit() {
+        const RESPONSE_LIMIT: usize = 512;
+
+        let upstream = spawn_raw_mcp_upstream(RawMcpOversizeTarget::ToolCall, RESPONSE_LIMIT).await;
+        let harness = mcp_upstream_test_harness_with_response_limit(
+            "alpha",
+            upstream.url.clone(),
+            &["admin", "reader"],
+            RESPONSE_LIMIT,
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            31,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "oversized upstream response"
+                }
+            })),
+            "mcp-upstream-call-too-large",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32603));
+        assert_eq!(body["error"]["message"], json!("tool invocation failed"));
+        assert_eq!(
+            body["error"]["data"]["tool_name"],
+            json!("alpha:remote_echo")
+        );
+        assert_eq!(body["error"]["data"]["reason"], json!("response_too_large"));
+        assert!(
+            !upstream.oversized_body_started.load(Ordering::SeqCst),
+            "Content-Length precheck should reject before the oversized call body is sent"
+        );
+
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_call_rejects_request_larger_than_egress_limit_before_send() {
+        const REQUEST_LIMIT: usize = 1024;
+
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let upstream = spawn_raw_mcp_upstream(RawMcpOversizeTarget::None, 0).await;
+        let tool_call_request_count = Arc::clone(&upstream.tool_call_request_count);
+        let harness = mcp_upstream_test_harness_with_audit_and_limits(
+            "alpha",
+            upstream.url.clone(),
+            &["admin", "reader"],
+            audit_log,
+            None,
+            Some(REQUEST_LIMIT),
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            34,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "x".repeat(REQUEST_LIMIT)
+                }
+            })),
+            "mcp-upstream-call-request-too-large",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32603));
+        assert_eq!(body["error"]["message"], json!("tool invocation failed"));
+        assert_eq!(
+            body["error"]["data"]["tool_name"],
+            json!("alpha:remote_echo")
+        );
+        assert_eq!(
+            body["error"]["data"]["reason"],
+            json!("request_body_too_large")
+        );
+        assert_eq!(
+            tool_call_request_count.load(Ordering::SeqCst),
+            0,
+            "oversized MCP tools/call request must not reach the upstream"
+        );
+        assert_eventually(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == audit::event::TOOL_UPSTREAM_REQUEST
+                    && event.request_id == "mcp-upstream-call-request-too-large"
+                    && event.payload["tool_name"] == json!("alpha:remote_echo")
+                    && event.payload["method"] == json!("MCP")
+                    && event.payload["outcome"] == json!("failure")
+                    && event.payload["reason"] == json!("request_body_too_large")
+            })
+        });
+
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tools_list_discovery_rejects_response_larger_than_egress_limit() {
+        const RESPONSE_LIMIT: usize = 512;
+
+        let upstream =
+            spawn_raw_mcp_upstream(RawMcpOversizeTarget::ToolsList, RESPONSE_LIMIT).await;
+        let harness = mcp_upstream_test_harness_with_response_limit(
+            "alpha",
+            upstream.url.clone(),
+            &["admin", "reader"],
+            RESPONSE_LIMIT,
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            32,
+            "tools/list",
+            None,
+            "mcp-upstream-list-too-large",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let tools = body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool["name"] != json!("alpha:remote_echo")),
+            "oversized discovery response must not import upstream tools"
+        );
+
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tools_list_discovery_rejects_excessive_pagination() {
+        let upstream = spawn_raw_mcp_upstream(RawMcpOversizeTarget::TooManyToolsListPages, 0).await;
+        let list_request_count = Arc::clone(&upstream.tools_list_request_count);
+        let harness =
+            mcp_upstream_test_harness("alpha", upstream.url.clone(), &["admin", "reader"]).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            36,
+            "tools/list",
+            None,
+            "mcp-upstream-list-too-many-pages",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let tools = body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool["name"] != json!("alpha:remote_echo")),
+            "excessive paginated discovery must fail closed and import no upstream tools"
+        );
+        assert!(
+            list_request_count.load(Ordering::SeqCst) < RAW_MCP_EXCESSIVE_TOOLS_LIST_PAGES,
+            "discovery should stop at its aggregate pagination cap"
+        );
+
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tools_list_discovery_accepts_small_pagination() {
+        let upstream = spawn_raw_mcp_upstream(RawMcpOversizeTarget::TwoPageToolsList, 0).await;
+        let harness =
+            mcp_upstream_test_harness("alpha", upstream.url.clone(), &["admin", "reader"]).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            37,
+            "tools/list",
+            None,
+            "mcp-upstream-list-small-pages",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let tools = body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["name"] == json!("alpha:remote_echo")),
+            "small paginated discovery should import the upstream tool"
+        );
+
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_call_under_egress_limit_still_returns_result() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let harness = mcp_upstream_test_harness_with_response_limit(
+            "alpha",
+            upstream.url.clone(),
+            &["admin", "reader"],
+            16 * 1024,
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            33,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "small proxied hello"
+                }
+            })),
+            "mcp-upstream-call-under-limit",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["result"]["isError"], json!(false));
+        assert_eq!(
+            body["result"]["structuredContent"],
+            json!({
+                "remote_tool": "remote_echo",
+                "arguments": {
+                    "message": "small proxied hello"
+                }
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_call_under_request_egress_limit_still_returns_result() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let calls = Arc::clone(&upstream.calls);
+        let harness = mcp_upstream_test_harness_with_request_limit(
+            "alpha",
+            upstream.url.clone(),
+            &["admin", "reader"],
+            16 * 1024,
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            35,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "small proxied hello"
+                }
+            })),
+            "mcp-upstream-call-under-request-limit",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["result"]["isError"], json!(false));
+        assert_eq!(
+            body["result"]["structuredContent"],
+            json!({
+                "remote_tool": "remote_echo",
+                "arguments": {
+                    "message": "small proxied hello"
+                }
+            })
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("upstream calls lock should not poison")
+                .len(),
+            1,
+            "under-limit MCP tools/call request should reach upstream"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_call_emits_mcp_upstream_audit_event() {
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let harness = mcp_upstream_test_harness_with_audit(
+            "alpha",
+            upstream.url.clone(),
+            &["admin"],
+            audit_log,
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            25,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "audit me"
+                }
+            })),
+            "mcp-upstream-audit",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], json!(false));
+        assert_eventually(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == audit::event::TOOL_UPSTREAM_REQUEST
+                    && event.request_id == "mcp-upstream-audit"
+                    && event.payload["tool_name"] == json!("alpha:remote_echo")
+                    && event.payload["method"] == json!("MCP")
+                    && event.payload["upstream_type"] == json!("mcp")
+                    && event.payload["mcp_server_name"] == json!("alpha")
+                    && event.payload["mcp_tool_name"] == json!("remote_echo")
+                    && event.payload["outcome"] == json!("success")
+            })
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_role_policy_is_enforced_before_forwarding() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let calls = Arc::clone(&upstream.calls);
+        let harness = mcp_upstream_test_harness("alpha", upstream.url.clone(), &["admin"]).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.reader_token),
+            22,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "reader should not forward"
+                }
+            })),
+            "mcp-upstream-role-denied",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32001));
+        assert_eq!(
+            body["error"]["message"],
+            json!("tool invocation is denied by role policy")
+        );
+        assert_eq!(
+            body["error"]["data"]["tool_name"],
+            json!("alpha:remote_echo")
+        );
+        assert_eq!(body["error"]["data"]["reason"], json!("role_denied"));
+        assert!(
+            calls
+                .lock()
+                .expect("upstream calls lock should not poison")
+                .is_empty(),
+            "role-denied proxy call must not reach upstream"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_schema_validation_applies_before_forwarding() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let calls = Arc::clone(&upstream.calls);
+        let harness =
+            mcp_upstream_test_harness("alpha", upstream.url.clone(), &["admin", "reader"]).await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            23,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "valid field",
+                    "unexpected": true
+                }
+            })),
+            "mcp-upstream-schema-denied",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32602));
+        assert_eq!(
+            body["error"]["data"]["tool_name"],
+            json!("alpha:remote_echo")
+        );
+        assert!(body["error"]["message"]
+            .as_str()
+            .expect("invalid params error should include a message")
+            .contains("failed input schema validation"));
+        assert!(
+            calls
+                .lock()
+                .expect("upstream calls lock should not poison")
+                .is_empty(),
+            "schema-invalid proxy call must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_upstream_url_rejected_by_egress_allowlist_fails_startup() {
+        let mut config = test_config(Vec::new());
+        config.mcp_upstream_servers = vec![config::McpUpstreamServerConfig {
+            name: "alpha".to_owned(),
+            url: "http://blocked.example.test/mcp".to_owned(),
+            timeout_ms: Some(500),
+            response_idle_timeout_ms: Some(500),
+            connect_timeout_ms: Some(500),
+        }];
+        config.egress_allowed_hosts = Vec::new();
+        config.egress_deny_private_ips = false;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let error = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect_err("non-allowlisted MCP upstream should fail startup");
+        let message = error.to_string();
+        assert!(
+            message.contains("MCP upstream server 'alpha' URL is rejected by egress policy"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("egress host is not allowed: blocked.example.test"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_namespaced_name_collision_fails_startup() {
+        let first = spawn_test_mcp_upstream("beta:echo").await;
+        let second = spawn_test_mcp_upstream("echo").await;
+        let mut config = test_config(Vec::new());
+        config.mcp_upstream_servers = vec![
+            config::McpUpstreamServerConfig {
+                name: "alpha".to_owned(),
+                url: first.url,
+                timeout_ms: Some(1000),
+                response_idle_timeout_ms: Some(1000),
+                connect_timeout_ms: Some(1000),
+            },
+            config::McpUpstreamServerConfig {
+                name: "alpha:beta".to_owned(),
+                url: second.url,
+                timeout_ms: Some(1000),
+                response_idle_timeout_ms: Some(1000),
+                connect_timeout_ms: Some(1000),
+            },
+        ];
+        config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
+        config.egress_deny_private_ips = false;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let error = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect_err("namespaced MCP upstream tool collision should fail startup");
+        let message = error.to_string();
+        assert!(
+            message.contains("duplicate tool name 'alpha:beta:echo'"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_unreachable_call_uses_sanitized_error() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let port = upstream.addr.port();
+        let url = upstream.url.clone();
+        let harness = mcp_upstream_test_harness("alpha", url, &["admin"]).await;
+        upstream.shutdown().await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            24,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "after shutdown"
+                }
+            })),
+            "mcp-upstream-unreachable",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32603));
+        assert_eq!(body["error"]["message"], json!("tool invocation failed"));
+        assert_eq!(
+            body["error"]["data"]["tool_name"],
+            json!("alpha:remote_echo")
+        );
+        assert_eq!(body["error"]["data"]["reason"], json!("connect_failed"));
+        let body_string = body.to_string();
+        assert!(!body_string.contains("127.0.0.1"));
+        assert!(!body_string.contains(&port.to_string()));
+        assert!(!body_string.contains("connection"));
+        assert!(!body_string.contains("reqwest"));
     }
 
     #[tokio::test]
@@ -20528,6 +21228,676 @@ paths:
         }
     }
 
+    struct McpUpstreamTestHarness {
+        router: Router,
+        admin_token: String,
+        reader_token: String,
+        _blocked_token: String,
+        _policy: TempPolicyFile,
+        _token_db: TempDb,
+    }
+
+    async fn mcp_upstream_test_harness(
+        server_name: &str,
+        upstream_url: String,
+        allowed_roles: &[&str],
+    ) -> McpUpstreamTestHarness {
+        mcp_upstream_test_harness_with_audit(
+            server_name,
+            upstream_url,
+            allowed_roles,
+            test_audit_log(),
+        )
+        .await
+    }
+
+    async fn mcp_upstream_test_harness_with_response_limit(
+        server_name: &str,
+        upstream_url: String,
+        allowed_roles: &[&str],
+        max_response_bytes: usize,
+    ) -> McpUpstreamTestHarness {
+        mcp_upstream_test_harness_with_audit_and_response_limit(
+            server_name,
+            upstream_url,
+            allowed_roles,
+            test_audit_log(),
+            Some(max_response_bytes),
+        )
+        .await
+    }
+
+    async fn mcp_upstream_test_harness_with_request_limit(
+        server_name: &str,
+        upstream_url: String,
+        allowed_roles: &[&str],
+        max_request_body_bytes: usize,
+    ) -> McpUpstreamTestHarness {
+        mcp_upstream_test_harness_with_audit_and_limits(
+            server_name,
+            upstream_url,
+            allowed_roles,
+            test_audit_log(),
+            None,
+            Some(max_request_body_bytes),
+        )
+        .await
+    }
+
+    async fn mcp_upstream_test_harness_with_audit(
+        server_name: &str,
+        upstream_url: String,
+        allowed_roles: &[&str],
+        audit_log: audit::AuditLog,
+    ) -> McpUpstreamTestHarness {
+        mcp_upstream_test_harness_with_audit_and_response_limit(
+            server_name,
+            upstream_url,
+            allowed_roles,
+            audit_log,
+            None,
+        )
+        .await
+    }
+
+    async fn mcp_upstream_test_harness_with_audit_and_response_limit(
+        server_name: &str,
+        upstream_url: String,
+        allowed_roles: &[&str],
+        audit_log: audit::AuditLog,
+        max_response_bytes: Option<usize>,
+    ) -> McpUpstreamTestHarness {
+        mcp_upstream_test_harness_with_audit_and_limits(
+            server_name,
+            upstream_url,
+            allowed_roles,
+            audit_log,
+            max_response_bytes,
+            None,
+        )
+        .await
+    }
+
+    async fn mcp_upstream_test_harness_with_audit_and_limits(
+        server_name: &str,
+        upstream_url: String,
+        allowed_roles: &[&str],
+        audit_log: audit::AuditLog,
+        max_response_bytes: Option<usize>,
+        max_request_body_bytes: Option<usize>,
+    ) -> McpUpstreamTestHarness {
+        let token_db = TempDb::new("mcp-upstream-service-tokens");
+        let token_store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        let admin_token = create_service_token(&token_store, &["admin"]);
+        let reader_token = create_service_token(&token_store, &["reader"]);
+        let blocked_token = create_service_token(&token_store, &["blocked"]);
+        let tool_name = format!("{server_name}:remote_echo");
+        let policy = TempPolicyFile::new(&mcp_upstream_policy_document(&tool_name, allowed_roles));
+
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        config.service_token_cache_ttl_ms = 20;
+        config.mcp_upstream_servers = vec![config::McpUpstreamServerConfig {
+            name: server_name.to_owned(),
+            url: upstream_url,
+            timeout_ms: Some(2_000),
+            response_idle_timeout_ms: Some(2_000),
+            connect_timeout_ms: Some(2_000),
+        }];
+        config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
+        config.egress_deny_private_ips = false;
+        if let Some(max_response_bytes) = max_response_bytes {
+            config.egress_max_response_bytes = max_response_bytes;
+        }
+        if let Some(max_request_body_bytes) = max_request_body_bytes {
+            config.egress_max_request_body_bytes = max_request_body_bytes;
+        }
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("MCP upstream test app should build");
+
+        McpUpstreamTestHarness {
+            router,
+            admin_token,
+            reader_token,
+            _blocked_token: blocked_token,
+            _policy: policy,
+            _token_db: token_db,
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RawMcpOversizeTarget {
+        None,
+        ToolsList,
+        ToolCall,
+        TooManyToolsListPages,
+        TwoPageToolsList,
+    }
+
+    const RAW_MCP_EXCESSIVE_TOOLS_LIST_PAGES: usize = 40;
+
+    struct RawMcpUpstream {
+        url: String,
+        oversized_body_started: Arc<AtomicBool>,
+        tool_call_request_count: Arc<AtomicUsize>,
+        tools_list_request_count: Arc<AtomicUsize>,
+        shutdown: tokio_util::sync::CancellationToken,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl RawMcpUpstream {
+        async fn shutdown(self) {
+            self.shutdown.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(1), self.handle).await;
+        }
+    }
+
+    async fn spawn_raw_mcp_upstream(
+        oversize_target: RawMcpOversizeTarget,
+        max_response_bytes: usize,
+    ) -> RawMcpUpstream {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("raw MCP upstream should bind");
+        let addr = listener
+            .local_addr()
+            .expect("raw MCP upstream address should be available");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown_task = shutdown.clone();
+        let oversized_body_started = Arc::new(AtomicBool::new(false));
+        let oversized_body_started_task = Arc::clone(&oversized_body_started);
+        let tool_call_request_count = Arc::new(AtomicUsize::new(0));
+        let tool_call_request_count_task = Arc::clone(&tool_call_request_count);
+        let tools_list_request_count = Arc::new(AtomicUsize::new(0));
+        let tools_list_request_count_task = Arc::clone(&tools_list_request_count);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_task.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else {
+                            break;
+                        };
+                        let shutdown_connection = shutdown_task.clone();
+                        let oversized_body_started_connection =
+                            Arc::clone(&oversized_body_started_task);
+                        let tool_call_request_count_connection =
+                            Arc::clone(&tool_call_request_count_task);
+                        let tools_list_request_count_connection =
+                            Arc::clone(&tools_list_request_count_task);
+                        tokio::spawn(async move {
+                            handle_raw_mcp_connection(
+                                &mut stream,
+                                oversize_target,
+                                max_response_bytes,
+                                oversized_body_started_connection,
+                                tool_call_request_count_connection,
+                                tools_list_request_count_connection,
+                                shutdown_connection,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            }
+        });
+
+        RawMcpUpstream {
+            url: format!("http://{addr}/mcp"),
+            oversized_body_started,
+            tool_call_request_count,
+            tools_list_request_count,
+            shutdown,
+            handle,
+        }
+    }
+
+    async fn handle_raw_mcp_connection(
+        stream: &mut tokio::net::TcpStream,
+        oversize_target: RawMcpOversizeTarget,
+        max_response_bytes: usize,
+        oversized_body_started: Arc<AtomicBool>,
+        tool_call_request_count: Arc<AtomicUsize>,
+        tools_list_request_count: Arc<AtomicUsize>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        let Some(request) = read_raw_mcp_http_request(stream).await else {
+            return;
+        };
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if method == "tools/call" {
+            tool_call_request_count.fetch_add(1, Ordering::SeqCst);
+        }
+        if method == "tools/list" {
+            tools_list_request_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        match method {
+            "initialize" => {
+                write_raw_mcp_json_response(stream, raw_mcp_initialize_response(&request)).await;
+            }
+            "notifications/initialized" => {
+                write_raw_mcp_accepted_response(stream).await;
+            }
+            "tools/list" if oversize_target == RawMcpOversizeTarget::ToolsList => {
+                write_raw_mcp_oversized_response(
+                    stream,
+                    raw_mcp_oversized_tools_list_response(&request, max_response_bytes),
+                    true,
+                    oversized_body_started,
+                    shutdown,
+                )
+                .await;
+            }
+            "tools/list" if oversize_target == RawMcpOversizeTarget::TooManyToolsListPages => {
+                write_raw_mcp_json_response(
+                    stream,
+                    raw_mcp_excessive_tools_list_page_response(&request),
+                )
+                .await;
+            }
+            "tools/list" if oversize_target == RawMcpOversizeTarget::TwoPageToolsList => {
+                write_raw_mcp_json_response(stream, raw_mcp_two_page_tools_list_response(&request))
+                    .await;
+            }
+            "tools/list" => {
+                write_raw_mcp_json_response(stream, raw_mcp_tools_list_response(&request)).await;
+            }
+            "tools/call" if oversize_target == RawMcpOversizeTarget::ToolCall => {
+                write_raw_mcp_oversized_response(
+                    stream,
+                    raw_mcp_oversized_call_response(&request, max_response_bytes),
+                    false,
+                    oversized_body_started,
+                    shutdown,
+                )
+                .await;
+            }
+            "tools/call" => {
+                write_raw_mcp_json_response(stream, raw_mcp_call_response(&request)).await;
+            }
+            _ => {
+                write_raw_mcp_json_response(
+                    stream,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": raw_mcp_request_id(&request),
+                        "error": {
+                            "code": -32601,
+                            "message": "method not found"
+                        }
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn read_raw_mcp_http_request(stream: &mut tokio::net::TcpStream) -> Option<Value> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .expect("raw MCP upstream should read request");
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index;
+            }
+            assert!(
+                buffer.len() <= 16 * 1024,
+                "raw MCP request headers should stay bounded"
+            );
+        };
+        let raw_headers = std::str::from_utf8(&buffer[..header_end])
+            .expect("raw MCP request headers should be UTF-8");
+        let content_length = raw_headers
+            .split("\r\n")
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body_start = header_end + 4;
+        while buffer.len() < body_start + content_length {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .expect("raw MCP upstream should read request body");
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+
+        Some(
+            serde_json::from_slice::<Value>(&buffer[body_start..body_start + content_length])
+                .unwrap_or_else(|err| panic!("raw MCP request body should be JSON: {err}")),
+        )
+    }
+
+    async fn write_raw_mcp_json_response(stream: &mut tokio::net::TcpStream, body: Value) {
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("raw MCP upstream should write JSON response");
+    }
+
+    async fn write_raw_mcp_accepted_response(stream: &mut tokio::net::TcpStream) {
+        stream
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("raw MCP upstream should write accepted response");
+    }
+
+    async fn write_raw_mcp_oversized_response(
+        stream: &mut tokio::net::TcpStream,
+        body: Value,
+        send_body: bool,
+        oversized_body_started: Arc<AtomicBool>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        let body = body.to_string();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .expect("raw MCP upstream should write oversized response headers");
+
+        if send_body {
+            oversized_body_started.store(true, Ordering::SeqCst);
+            stream
+                .write_all(body.as_bytes())
+                .await
+                .expect("raw MCP upstream should write oversized response body");
+            return;
+        }
+
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+    }
+
+    fn raw_mcp_request_id(request: &Value) -> Value {
+        request.get("id").cloned().unwrap_or(Value::Null)
+    }
+
+    fn raw_mcp_initialize_response(request: &Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": raw_mcp_request_id(request),
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "raw-greengateway-test-upstream",
+                    "version": "0.0.0"
+                }
+            }
+        })
+    }
+
+    fn raw_mcp_tools_list_response(request: &Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": raw_mcp_request_id(request),
+            "result": {
+                "tools": [raw_mcp_tool("Remote test tool")]
+            }
+        })
+    }
+
+    fn raw_mcp_excessive_tools_list_page_response(request: &Value) -> Value {
+        let page = raw_mcp_request_page(request);
+        let tool_name = if page == 0 {
+            "remote_echo".to_owned()
+        } else {
+            format!("remote_echo_page_{page}")
+        };
+        let mut result = json!({
+            "tools": [raw_mcp_named_tool(tool_name, "Remote paginated test tool")]
+        });
+        if page + 1 < RAW_MCP_EXCESSIVE_TOOLS_LIST_PAGES {
+            result["nextCursor"] = json!((page + 1).to_string());
+        }
+
+        json!({
+            "jsonrpc": "2.0",
+            "id": raw_mcp_request_id(request),
+            "result": result
+        })
+    }
+
+    fn raw_mcp_two_page_tools_list_response(request: &Value) -> Value {
+        let page = raw_mcp_request_page(request);
+        let result = if page == 0 {
+            json!({
+                "tools": [],
+                "nextCursor": "1"
+            })
+        } else {
+            json!({
+                "tools": [raw_mcp_tool("Remote paginated test tool")]
+            })
+        };
+
+        json!({
+            "jsonrpc": "2.0",
+            "id": raw_mcp_request_id(request),
+            "result": result
+        })
+    }
+
+    fn raw_mcp_request_page(request: &Value) -> usize {
+        request
+            .get("params")
+            .and_then(|params| params.get("cursor"))
+            .and_then(Value::as_str)
+            .and_then(|cursor| cursor.parse::<usize>().ok())
+            .unwrap_or(0)
+    }
+
+    fn raw_mcp_oversized_tools_list_response(request: &Value, max_response_bytes: usize) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": raw_mcp_request_id(request),
+            "result": {
+                "tools": [raw_mcp_tool("x".repeat(max_response_bytes + 256))]
+            }
+        })
+    }
+
+    fn raw_mcp_tool(description: impl Into<String>) -> Value {
+        raw_mcp_named_tool("remote_echo", description)
+    }
+
+    fn raw_mcp_named_tool(name: impl Into<String>, description: impl Into<String>) -> Value {
+        json!({
+            "name": name.into(),
+            "description": description.into(),
+            "inputSchema": remote_echo_input_schema()
+        })
+    }
+
+    fn raw_mcp_call_response(request: &Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": raw_mcp_request_id(request),
+            "result": {
+                "content": [],
+                "structuredContent": {
+                    "remote_tool": "remote_echo",
+                    "arguments": {}
+                },
+                "isError": false
+            }
+        })
+    }
+
+    fn raw_mcp_oversized_call_response(request: &Value, max_response_bytes: usize) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": raw_mcp_request_id(request),
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "x".repeat(max_response_bytes + 256)
+                }],
+                "isError": false
+            }
+        })
+    }
+
+    struct TestMcpUpstream {
+        addr: std::net::SocketAddr,
+        url: String,
+        calls: Arc<Mutex<Vec<Value>>>,
+        shutdown: tokio_util::sync::CancellationToken,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestMcpUpstream {
+        async fn shutdown(self) {
+            self.shutdown.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(1), self.handle).await;
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestMcpUpstreamServer {
+        tool_name: String,
+        calls: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl RmcpServerHandler for TestMcpUpstreamServer {
+        fn get_info(&self) -> RmcpServerInfo {
+            RmcpServerInfo::new(RmcpServerCapabilities::builder().enable_tools().build())
+                .with_server_info(
+                    Implementation::new("greengateway-test-upstream", "0.0.0")
+                        .with_title("GreenGateway Test Upstream"),
+                )
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<RmcpPaginatedRequestParams>,
+            _context: RmcpRequestContext<RmcpRoleServer>,
+        ) -> Result<RmcpListToolsResult, RmcpErrorData> {
+            Ok(RmcpListToolsResult::with_all_items(vec![RmcpTool::new(
+                self.tool_name.clone(),
+                "Remote test tool",
+                Arc::new(remote_echo_input_schema()),
+            )]))
+        }
+
+        async fn call_tool(
+            &self,
+            request: RmcpCallToolRequestParams,
+            _context: RmcpRequestContext<RmcpRoleServer>,
+        ) -> Result<RmcpCallToolResult, RmcpErrorData> {
+            let arguments = request.arguments.unwrap_or_default();
+            let call = json!({
+                "name": request.name.to_string(),
+                "arguments": Value::Object(arguments.clone()),
+            });
+            self.calls
+                .lock()
+                .expect("upstream calls lock should not poison")
+                .push(call);
+
+            Ok(RmcpCallToolResult::structured(json!({
+                "remote_tool": request.name.to_string(),
+                "arguments": Value::Object(arguments),
+            })))
+        }
+    }
+
+    async fn spawn_test_mcp_upstream(tool_name: &str) -> TestMcpUpstream {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handler = TestMcpUpstreamServer {
+            tool_name: tool_name.to_owned(),
+            calls: Arc::clone(&calls),
+        };
+        let config = RmcpStreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(true)
+            .disable_allowed_hosts();
+        let service = RmcpStreamableHttpService::new(
+            move || Ok(handler.clone()),
+            Arc::new(RmcpNeverSessionManager::default()),
+            config,
+        );
+        let router = Router::new().nest_service("/mcp", service);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test MCP upstream should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test MCP upstream address should be available");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown_task = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown_task.cancelled_owned())
+                .await
+                .expect("test MCP upstream should serve");
+        });
+
+        TestMcpUpstream {
+            addr,
+            url: format!("http://{addr}/mcp"),
+            calls,
+            shutdown,
+            handle,
+        }
+    }
+
+    fn remote_echo_input_schema() -> RmcpJsonObject {
+        let Value::Object(schema) = json!({
+            "type": "object",
+            "required": ["message"],
+            "properties": {
+                "message": {
+                    "type": "string"
+                }
+            }
+        }) else {
+            unreachable!("remote echo schema is always an object")
+        };
+
+        schema
+    }
+
     fn create_service_token(store: &auth::SqliteTokenStore, roles: &[&str]) -> String {
         store
             .create(auth::tokens::CreateTokenRequest {
@@ -20575,16 +21945,32 @@ paths:
         content_type: &'static str,
         body: String,
     ) -> std::net::SocketAddr {
+        spawn_fixed_echo_upstream_with_headers(status, content_type, body, Vec::new()).await
+    }
+
+    async fn spawn_fixed_echo_upstream_with_headers(
+        status: StatusCode,
+        content_type: &'static str,
+        body: String,
+        headers: Vec<(&'static str, &'static str)>,
+    ) -> std::net::SocketAddr {
         let body = Arc::new(body);
+        let headers = Arc::new(headers);
 
         spawn_router(Router::new().route(
             "/v1/echo",
             post(move || {
                 let body = Arc::clone(&body);
+                let headers = Arc::clone(&headers);
                 async move {
-                    Response::builder()
+                    let mut builder = Response::builder()
                         .status(status)
-                        .header(header::CONTENT_TYPE, content_type)
+                        .header(header::CONTENT_TYPE, content_type);
+                    for (name, value) in headers.iter() {
+                        builder = builder.header(*name, *value);
+                    }
+
+                    builder
                         .body(Body::from(body.as_ref().clone()))
                         .expect("fixed upstream response should build")
                 }
@@ -20765,6 +22151,41 @@ paths:
                 },
                 "get_widget": {
                     "allowed_roles": ["admin"],
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn mcp_upstream_policy_document(tool_name: &str, allowed_roles: &[&str]) -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "id": "mcp-upstream-test-policy",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "admin": {
+                    "permissions": [ADMIN_MCP_USE_PERMISSION]
+                },
+                "reader": {
+                    "permissions": [ADMIN_MCP_USE_PERMISSION]
+                },
+                "blocked": {
+                    "permissions": []
+                }
+            },
+            "routes": [
+                {
+                    "methods": ["POST"],
+                    "path_prefix": MCP_ROUTE,
+                    "permission": ADMIN_MCP_USE_PERMISSION
+                }
+            ],
+            "tools": {
+                tool_name: {
+                    "allowed_roles": allowed_roles,
                     "timeout_ms": 5000,
                     "max_concurrent": 2
                 }

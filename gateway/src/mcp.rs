@@ -26,7 +26,7 @@ use crate::{
     egress::EgressResponse,
     tools::{
         definitions::{ToolDefinition, ToolRegistry},
-        executor::{ToolExecutor, ToolExecutorError},
+        executor::{ToolExecutionResult, ToolExecutor, ToolExecutorError},
         runtime::{ToolInvocationContext, ToolRuntimeError},
     },
 };
@@ -146,7 +146,10 @@ impl ServerHandler for McpServer {
             )
             .await
         {
-            Ok(response) => Ok(call_tool_result_from_egress_response(response)),
+            Ok(ToolExecutionResult::Http(response)) => {
+                Ok(call_tool_result_from_egress_response(response))
+            }
+            Ok(ToolExecutionResult::McpCallToolResult(result)) => Ok(result),
             Err(error) => Err(runtime_error_to_mcp_error(error)),
         }
     }

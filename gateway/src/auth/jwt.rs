@@ -1539,6 +1539,7 @@ RowSUZV5FSmOGJ7JyROZ80k=
             ],
             upstream_url: None,
             upstream_routes: Vec::new(),
+            mcp_upstream_servers: Vec::new(),
             upstream_timeout_ms: None,
             upstream_response_idle_timeout_ms: None,
             upstream_connect_timeout_ms: None,

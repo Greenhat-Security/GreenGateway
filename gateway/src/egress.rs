@@ -417,6 +417,12 @@ pub struct EgressClient {
     base_client: reqwest::Client,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedEgressDestination {
+    pub host: String,
+    pub pinned_addr: SocketAddr,
+}
+
 impl EgressClient {
     pub fn new(config: EgressConfig) -> Result<Self, EgressError> {
         let base_client = base_client_builder(&config).build()?;
@@ -468,6 +474,29 @@ impl EgressClient {
 
         self.send_with_client(client, method, parsed, headers, body)
             .await
+    }
+
+    pub async fn checked_destination(
+        &self,
+        url: &str,
+    ) -> Result<CheckedEgressDestination, EgressError> {
+        let parsed = self.checked_url(url)?;
+        let host = checked_host(
+            &parsed,
+            &self.config.allowed_hosts,
+            &self.config.allowed_host_globs,
+        )?;
+        let port = checked_port(&parsed)?;
+        checked_policy_port(port, &self.config.allowed_ports)?;
+        let resolved = resolve_host(&host, port).await?;
+        let pinned_addr = checked_socket_addr(
+            &host,
+            &resolved,
+            self.config.deny_private_ips,
+            &self.config.private_ip_allow_cidrs,
+        )?;
+
+        Ok(CheckedEgressDestination { host, pinned_addr })
     }
 
     pub async fn stream_request_with_headers(
@@ -1931,6 +1960,7 @@ mod tests {
             ],
             upstream_url: None,
             upstream_routes: Vec::new(),
+            mcp_upstream_servers: Vec::new(),
             upstream_timeout_ms: None,
             upstream_response_idle_timeout_ms: None,
             upstream_connect_timeout_ms: None,

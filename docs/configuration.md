@@ -480,6 +480,35 @@ This is deliberately separate from `POLICY_FILE`. `TOOLS_FILE` defines what a to
 
 `allowed_roles` matching is exact-string and case-sensitive, consistent with role matching elsewhere in the RBAC system. If your identity provider's role claims don't match your policy file's casing exactly (e.g. an IdP emitting `Admin` against a policy file expecting `admin`), the mismatch will silently deny access rather than error — double-check casing when a tool call is unexpectedly rejected by role policy.
 
+### MCP_UPSTREAM_SERVERS
+
+Optional JSON array of upstream MCP streamable-HTTP servers whose tools should be discovered and proxied through GreenGateway's MCP endpoint.
+
+Default: empty, which disables upstream MCP discovery.
+
+Each entry requires:
+
+- `name`: stable non-empty server name. Names must be unique. Discovered tool names are namespaced as `{name}:{remote_tool_name}`.
+- `url`: the upstream MCP server's streamable-HTTP endpoint URL. It must be a valid `http` or `https` URL with a host.
+
+Each entry may also set `timeout_ms`, `response_idle_timeout_ms`, and `connect_timeout_ms`; when unset, these inherit `EGRESS_TIMEOUT_MS`, `EGRESS_RESPONSE_IDLE_TIMEOUT_MS`, and `EGRESS_CONNECT_TIMEOUT_MS`.
+
+Example:
+
+```json
+[
+  {
+    "name": "prod",
+    "url": "https://mcp.example.test/mcp",
+    "timeout_ms": 5000
+  }
+]
+```
+
+Security note: MCP upstream hosts are not auto-seeded into the egress allowlist. Their URLs are checked at startup and again before each call through the same egress URL, host, port, DNS, and private-IP validation used by normal gateway-originated HTTP requests. Configure `EGRESS_ALLOWED_HOSTS` or policy `egress.hosts` for every allowed MCP upstream host.
+
+Startup discovery imports each upstream tool into the same tool registry as `TOOLS_FILE` tools. Namespaced collisions with local tools or other MCP upstream tools fail startup rather than overwriting.
+
 ### POLICY_HISTORY_SQLITE_PATH
 
 Optional SQLite policy version history store path.

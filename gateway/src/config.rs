@@ -93,6 +93,7 @@ const JWT_JWKS_TIMEOUT_MS: &str = "JWT_JWKS_TIMEOUT_MS";
 const JWT_JWKS_URL: &str = "JWT_JWKS_URL";
 const JWT_REQUIRE_JTI: &str = "JWT_REQUIRE_JTI";
 const MAX_BODY_SIZE: &str = "MAX_BODY_SIZE";
+const MCP_UPSTREAM_SERVERS: &str = "MCP_UPSTREAM_SERVERS";
 const OPENAPI_SPEC_PATH: &str = "OPENAPI_SPEC_PATH";
 const PAYLOAD_CAPTURE_ENABLED: &str = "PAYLOAD_CAPTURE_ENABLED";
 const PAYLOAD_CAPTURE_SAMPLE_RATE: &str = "PAYLOAD_CAPTURE_SAMPLE_RATE";
@@ -183,6 +184,7 @@ pub struct Config {
     pub csrf_exempt_paths: Vec<String>,
     pub upstream_url: Option<String>,
     pub upstream_routes: Vec<UpstreamRouteConfig>,
+    pub mcp_upstream_servers: Vec<McpUpstreamServerConfig>,
     pub upstream_timeout_ms: Option<u64>,
     pub upstream_response_idle_timeout_ms: Option<u64>,
     pub upstream_connect_timeout_ms: Option<u64>,
@@ -193,6 +195,19 @@ pub struct Config {
     pub egress_max_response_bytes: usize,
     pub egress_max_request_body_bytes: usize,
     pub egress_deny_private_ips: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpUpstreamServerConfig {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub response_idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -773,6 +788,11 @@ impl Config {
             parse_optional_upstream_url(UPSTREAM_URL, get_var(UPSTREAM_URL), &mut problems);
         let upstream_routes =
             parse_upstream_routes(UPSTREAM_ROUTES, get_var(UPSTREAM_ROUTES), &mut problems);
+        let mcp_upstream_servers = parse_mcp_upstream_servers(
+            MCP_UPSTREAM_SERVERS,
+            get_var(MCP_UPSTREAM_SERVERS),
+            &mut problems,
+        );
         if upstream_url.is_some() && !upstream_routes.is_empty() {
             problems.push(format!(
                 "{UPSTREAM_URL} and {UPSTREAM_ROUTES} are mutually exclusive; set one proxy routing source"
@@ -900,6 +920,7 @@ impl Config {
                 csrf_exempt_paths,
                 upstream_url,
                 upstream_routes,
+                mcp_upstream_servers,
                 upstream_timeout_ms,
                 upstream_response_idle_timeout_ms,
                 upstream_connect_timeout_ms,
@@ -1688,6 +1709,94 @@ fn parse_upstream_routes(
     };
 
     validate_upstream_routes(name, routes, problems)
+}
+
+fn parse_mcp_upstream_servers(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Vec<McpUpstreamServerConfig> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return Vec::new(),
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return Vec::new();
+        }
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        return Vec::new();
+    }
+
+    let servers = match serde_json::from_str::<Vec<McpUpstreamServerConfig>>(value) {
+        Ok(servers) => servers,
+        Err(err) => {
+            problems.push(format!(
+                "{name} must be a JSON array of MCP upstream server objects with required name and url fields plus optional timeout_ms, response_idle_timeout_ms, and connect_timeout_ms: {err}"
+            ));
+            return Vec::new();
+        }
+    };
+
+    validate_mcp_upstream_servers(name, servers, problems)
+}
+
+fn validate_mcp_upstream_servers(
+    name: &str,
+    servers: Vec<McpUpstreamServerConfig>,
+    problems: &mut Vec<String>,
+) -> Vec<McpUpstreamServerConfig> {
+    let mut validated = Vec::with_capacity(servers.len());
+    let mut seen_names = HashMap::<String, usize>::new();
+
+    for (index, server) in servers.into_iter().enumerate() {
+        let server_name = format!("{name}[{index}]");
+        let normalized_name = server.name.trim().to_owned();
+
+        if normalized_name.is_empty() {
+            problems.push(format!("{server_name}.name must be non-empty"));
+        } else if let Some(previous_index) = seen_names.insert(normalized_name.clone(), index) {
+            problems.push(format!(
+                "{server_name}.name duplicates {name}[{previous_index}].name"
+            ));
+        }
+
+        let url = validate_upstream_url(&format!("{server_name}.url"), &server.url, problems)
+            .unwrap_or_else(|| server.url.trim().to_owned());
+        validate_optional_positive_duration(
+            &format!("{server_name}.timeout_ms"),
+            server.timeout_ms,
+            problems,
+        );
+        validate_optional_positive_duration(
+            &format!("{server_name}.response_idle_timeout_ms"),
+            server.response_idle_timeout_ms,
+            problems,
+        );
+        validate_optional_positive_duration(
+            &format!("{server_name}.connect_timeout_ms"),
+            server.connect_timeout_ms,
+            problems,
+        );
+
+        validated.push(McpUpstreamServerConfig {
+            name: normalized_name,
+            url,
+            timeout_ms: server.timeout_ms,
+            response_idle_timeout_ms: server.response_idle_timeout_ms,
+            connect_timeout_ms: server.connect_timeout_ms,
+        });
+    }
+
+    validated
+}
+
+fn validate_optional_positive_duration(name: &str, value: Option<u64>, problems: &mut Vec<String>) {
+    if matches!(value, Some(0)) {
+        problems.push(format!("{name} must be greater than 0"));
+    }
 }
 
 fn validate_upstream_routes(
@@ -4121,6 +4230,70 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn mcp_upstream_servers_parse_json_array_and_validate_names() {
+        let config = Config::from_env_vars(|name| match name {
+            "MCP_UPSTREAM_SERVERS" => Ok(r#"[
+                    {
+                        "name": " tools ",
+                        "url": " http://mcp-tools.example.test/mcp ",
+                        "timeout_ms": 1500,
+                        "response_idle_timeout_ms": 400,
+                        "connect_timeout_ms": 300
+                    },
+                    {
+                        "name": "reports",
+                        "url": "https://reports.example.test/mcp"
+                    }
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse MCP upstream servers");
+
+        assert_eq!(
+            config.mcp_upstream_servers,
+            vec![
+                McpUpstreamServerConfig {
+                    name: "tools".to_owned(),
+                    url: "http://mcp-tools.example.test/mcp".to_owned(),
+                    timeout_ms: Some(1500),
+                    response_idle_timeout_ms: Some(400),
+                    connect_timeout_ms: Some(300),
+                },
+                McpUpstreamServerConfig {
+                    name: "reports".to_owned(),
+                    url: "https://reports.example.test/mcp".to_owned(),
+                    timeout_ms: None,
+                    response_idle_timeout_ms: None,
+                    connect_timeout_ms: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_mcp_upstream_servers_are_rejected_with_clear_errors() {
+        let error = Config::from_env_vars(|name| match name {
+            "MCP_UPSTREAM_SERVERS" => Ok(r#"[
+                    {"name":"","url":"https://empty-name.example.test/mcp"},
+                    {"name":"dup","url":"ftp://bad-scheme.example.test/mcp"},
+                    {"name":"dup","url":"https://duplicate.example.test/mcp"},
+                    {"name":"bad-timeout","url":"https://timeout.example.test/mcp","timeout_ms":0}
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid MCP upstream servers");
+
+        let message = error.to_string();
+        assert!(message.contains("MCP_UPSTREAM_SERVERS[0].name must be non-empty"));
+        assert!(message.contains("MCP_UPSTREAM_SERVERS[1].url must use http or https"));
+        assert!(message
+            .contains("MCP_UPSTREAM_SERVERS[2].name duplicates MCP_UPSTREAM_SERVERS[1].name"));
+        assert!(message.contains("MCP_UPSTREAM_SERVERS[3].timeout_ms must be greater than 0"));
     }
 
     #[test]
