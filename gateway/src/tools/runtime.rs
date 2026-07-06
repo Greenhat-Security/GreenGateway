@@ -765,6 +765,16 @@ impl ToolRuntime {
             return false;
         }
 
+        let principal = principal_from_tool_context(context);
+        let rule_action = self
+            .inner
+            .rule_matcher
+            .evaluate_tool(tool_name, principal.as_ref())
+            .map(|decision| decision.action);
+        if !tool_rule_allows_visibility(rule_action.as_ref()) {
+            return false;
+        }
+
         allowed_roles_match(&state.config.allowed_roles, context)
     }
 
@@ -886,6 +896,7 @@ impl ToolRuntime {
             &context.source_ip,
             principal.map(crate::auth::actor_from_principal),
             json!({
+                "tool_name": tool_name,
                 "path": tool_observation_path(tool_name),
                 "method": MCP_TOOL_OBSERVATION_METHOD,
                 "reason": "matched_rule",
@@ -964,6 +975,16 @@ fn tool_visible_for_snapshot(
     authorization
         .tool
         .is_some_and(|tool| tool.enabled && allowed_roles_match(tool.allowed_roles, context))
+        && tool_rule_allows_visibility(
+            authorization
+                .rule_decision
+                .as_ref()
+                .map(|decision| &decision.action),
+        )
+}
+
+fn tool_rule_allows_visibility(rule_action: Option<&RuleAction>) -> bool {
+    !matches!(rule_action, Some(RuleAction::Deny))
 }
 
 fn allowed_roles_match(allowed_roles: &[String], context: &ToolInvocationContext) -> bool {
@@ -1182,6 +1203,83 @@ mod tests {
                     && event.payload["matched_rule_id"] == json!("deny-tool-for-viewers")
             }),
             "tool Deny rule should emit an authz.denied direct-rule event: {events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_name_deny_rule_hides_tool_from_matching_context() {
+        let (runtime, _capture) = runtime_with_tools_and_rules(
+            [("tool", enabled_tool(100, 1))],
+            vec![tool_rule(
+                Some("deny-tool-for-viewers"),
+                "tool",
+                &["viewer"],
+                RuleAction::Deny,
+            )],
+            2,
+            1,
+            100,
+        );
+
+        assert!(
+            !runtime.tool_visible_to_context("tool", &context_with_roles(&["viewer"])),
+            "matching deny rule should hide tool from discovery"
+        );
+        assert!(
+            runtime.tool_visible_to_context("tool", &context_with_roles(&["operator"])),
+            "non-matching context should still see the tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_name_shadow_rule_emits_would_deny_and_allows_execution() {
+        let (runtime, capture) = runtime_with_tools_and_rules(
+            [("tool", enabled_tool(100, 1))],
+            vec![tool_rule(
+                Some("shadow-tool-for-viewers"),
+                "tool",
+                &["viewer"],
+                RuleAction::Shadow,
+            )],
+            2,
+            1,
+            100,
+        );
+        let work_ran = Arc::new(AtomicBool::new(false));
+        let work_ran_in_closure = Arc::clone(&work_ran);
+
+        let result = runtime
+            .execute_with_context(
+                "tool",
+                context_with_roles(&["viewer"]),
+                CancellationToken::new(),
+                || async move {
+                    work_ran_in_closure.store(true, Ordering::SeqCst);
+                    "allowed"
+                },
+            )
+            .await
+            .expect("shadow tool_name rule should not block execution");
+
+        assert_eq!(result, "allowed");
+        assert!(
+            work_ran.load(Ordering::SeqCst),
+            "work closure should run under shadow tool_name rule"
+        );
+
+        let events = audit_events(&capture, 3).await;
+        let would_deny: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "authz.would_deny")
+            .collect();
+        assert_eq!(would_deny.len(), 1, "{events:#?}");
+        let event = would_deny[0];
+        assert_eq!(event.payload["tool_name"], json!("tool"));
+        assert_eq!(event.payload["method"], json!("MCP"));
+        assert_eq!(event.payload["path"], json!("/mcp/tools/tool"));
+        assert_eq!(
+            event.payload["matched_rule_id"],
+            json!("shadow-tool-for-viewers")
         );
     }
 

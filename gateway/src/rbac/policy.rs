@@ -372,6 +372,12 @@ fn validate_rules(rules: &[Rule]) -> Result<(), PolicyError> {
                     "rules[{rule_index}].tool_name must not be empty"
                 )));
             }
+
+            if !rule.methods.is_empty() {
+                return Err(PolicyError::Invalid(format!(
+                    "rules[{rule_index}].methods must be empty when tool_name is set"
+                )));
+            }
         }
 
         if has_path && !rule.path.starts_with('/') {
@@ -754,7 +760,6 @@ mod tests {
         collections::HashMap,
         fs,
         path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
     };
 
     use jsonschema::Validator;
@@ -1449,6 +1454,41 @@ mod tests {
     }
 
     #[test]
+    fn tool_name_rules_reject_non_empty_methods() {
+        let error = Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "rules": [
+                {
+                    "methods": ["MCP"],
+                    "tool_name": "reports.export",
+                    "action": "deny"
+                }
+            ]
+        }))
+        .expect_err("tool_name rules should not accept HTTP method constraints");
+
+        assert!(matches!(error, PolicyError::Invalid(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("rules[0].methods must be empty when tool_name is set"),
+            "unexpected error: {error}"
+        );
+
+        Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "rules": [
+                {
+                    "methods": [],
+                    "tool_name": "reports.export",
+                    "action": "deny"
+                }
+            ]
+        }))
+        .expect("empty methods should remain valid for tool_name rules");
+    }
+
+    #[test]
     fn malformed_path_capture_segment_is_rejected() {
         let cases = [
             (
@@ -1904,6 +1944,7 @@ mod tests {
                 },
                 {
                     "tool_name": "reports.export",
+                    "methods": [],
                     "principal": {
                         "roles": ["operator"]
                     },
@@ -1913,6 +1954,27 @@ mod tests {
         });
 
         assert_schema_accepts(&validator, &policy);
+    }
+
+    #[test]
+    fn published_schema_rejects_tool_name_rule_with_non_empty_methods() {
+        let validator = policy_schema_validator();
+        let policy = json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "rules": [
+                {
+                    "tool_name": "reports.export",
+                    "methods": ["POST"],
+                    "action": "deny"
+                }
+            ]
+        });
+
+        assert!(
+            !validator.is_valid(&policy),
+            "published schema should reject tool_name rules with non-empty methods"
+        );
     }
 
     #[test]
@@ -2296,10 +2358,7 @@ mod tests {
         }
     }
 
-    fn unique_suffix() -> u128 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after Unix epoch")
-            .as_nanos()
+    fn unique_suffix() -> String {
+        uuid::Uuid::new_v4().to_string()
     }
 }
