@@ -1087,7 +1087,22 @@ fn tool_name_from_mcp_endpoint<'a>(method: &str, path_pattern: &'a str) -> Optio
     }
 
     let tool_name = path_pattern.strip_prefix(MCP_TOOL_OBSERVATION_PATH_PREFIX)?;
-    (!tool_name.is_empty() && !tool_name.contains('/')).then_some(tool_name)
+    if tool_name.is_empty() {
+        return None;
+    }
+    // Tool names are currently slash-free by schema validation and OpenAPI
+    // sanitization. Warn here if that upstream invariant ever drifts.
+    if tool_name.contains('/') {
+        tracing::warn!(
+            method,
+            path_pattern,
+            tool_name_remainder = tool_name,
+            "MCP tool observation path contains slash in tool-name position"
+        );
+        return None;
+    }
+
+    Some(tool_name)
 }
 
 fn tool_observation_path(tool_name: &str) -> String {
@@ -1285,10 +1300,15 @@ fn utc_timestamp_rfc3339() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs, io,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
 
     use rusqlite::{params, Connection};
     use serde_json::{json, Value};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
     use crate::rbac::{Policy, PrincipalMatcher, Rule, RuleAction};
@@ -1596,6 +1616,65 @@ mod tests {
         assert!(
             proposed_rule.get("path").is_none(),
             "tool-name anomaly suggestions must not serialize an HTTP path matcher: {proposed_rule}"
+        );
+    }
+
+    #[test]
+    fn anomaly_generation_warns_and_skips_tool_name_for_slash_mcp_tool_remainder() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+
+        let (run, suggestions) = tracing::subscriber::with_default(subscriber, || {
+            let discovery_db = TempDb::new("anomaly-tool-slash-discovery");
+            seed_signal(
+                &discovery_db.path,
+                SeedSignal {
+                    id: "sig-tool-slash",
+                    signal_type: "schema_mismatch",
+                    target_kind: "endpoint",
+                    target_identity: json!({
+                        "method": "MCP",
+                        "endpoint_template": "/mcp/tools/foo/bar"
+                    }),
+                    evidence: json!({
+                        "schema_mismatch_count": 5
+                    }),
+                    state: "open",
+                },
+            );
+
+            let engine = suggestion_engine(&discovery_db.path, None);
+            let run = engine
+                .generate(&empty_policy())
+                .expect("suggestion generation should succeed");
+            let suggestions = engine.list_suggestions().expect("suggestions should query");
+            (run, suggestions)
+        });
+
+        assert_eq!(run.anomaly.open_signal_count, 1);
+        assert_eq!(run.inserted_count, 1);
+        assert_eq!(suggestions.len(), 1);
+        let proposed_rule =
+            serde_json::to_value(&suggestions[0].proposed_rule).expect("rule should serialize");
+        assert_ne!(proposed_rule.get("tool_name"), Some(&json!("foo/bar")));
+        assert!(proposed_rule.get("tool_name").is_none());
+        assert_eq!(
+            proposed_rule.get("path"),
+            Some(&json!("/mcp/tools/foo/bar"))
+        );
+
+        let logs = logs.to_string();
+        assert!(
+            logs.contains("MCP tool observation path contains slash in tool-name position"),
+            "missing slash invariant warning in logs: {logs}"
+        );
+        assert!(
+            logs.contains("/mcp/tools/foo/bar"),
+            "warning should include the rejected endpoint path: {logs}"
         );
     }
 
@@ -1988,6 +2067,50 @@ mod tests {
                 let path = PathBuf::from(format!("{}{}", self.path.display(), suffix));
                 let _ = fs::remove_file(path);
             }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn to_string(&self) -> String {
+            let bytes = self
+                .buffer
+                .lock()
+                .expect("captured logs should not be poisoned")
+                .clone();
+            String::from_utf8(bytes).expect("captured logs should be UTF-8")
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: self.buffer.clone(),
+            }
+        }
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .map_err(|_| io::Error::other("captured logs lock poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 }
