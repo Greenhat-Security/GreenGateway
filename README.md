@@ -10,7 +10,6 @@
 [![Status](https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square)](#project-status)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-DEA584?style=flat-square&logo=rust&logoColor=black)](gateway)
 [![Roadmap](https://img.shields.io/badge/roadmap-7%20phases-blueviolet?style=flat-square)](https://github.com/Greenhat-Security/GreenGateway/issues/44)
-[![CI](https://img.shields.io/github/actions/workflow/status/Greenhat-Security/GreenGateway/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/Greenhat-Security/GreenGateway/actions/workflows/ci.yml)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
 
 **Auth, authorization, audit, and traffic visibility in front of any API or MCP server — without hand-rolling a control plane yourself.**
@@ -49,13 +48,13 @@ It is designed to sit between clients and existing HTTP backends or MCP servers,
 
 **GreenGateway is pre-alpha and under active initial development.** It is not production ready yet.
 
-Development follows a 7-phase roadmap. **Phases 1 through 5 and 7 are complete** — a real security middleware stack, authentication, a hot-reloadable RBAC engine (including shadow-enforcement, observe-only auth modes, and data-driven direct firewall rules), an egress firewall with policy-driven overrides, a full audit/observability pipeline, a streaming reverse proxy with multi-upstream routing and per-upstream settings, a complete policy administration API (read/replace/validate, granular rule operations, and rule preview against historical traffic), full traffic discovery — endpoint inventory, a discovery UI, OpenAPI-based and inferred schema conformance checking, and a deterministic anomaly-signal engine with detectors, admin API, SSE surfacing, and UI — a complete visual rule builder — traffic-derived rule suggestions, a visual rule table/editor with live historical preview and one-click create-from-context, versioned policy history with rollback, and a shadow-mode review queue with real would-deny data and one-click promote/disable — and full identity/auth integration — pluggable OIDC providers with discovery, a generic cookie-session validator, managed API/service tokens, a directory and UI of every user and bot that has traversed the gateway with a principal drill-down and identity-based rule shortcuts, and operator SSO login (authorization-code + PKCE) into the admin dashboard with role-gated admin actions attributed to the operator's real identity in the audit trail — all exist and run today (see [What's Real Today](#whats-real-today)). **Phase 6 (native MCP protocol support) is in progress** — the tool runtime and dynamic tool registry (with per-tool role policy) are built and tested, but there is no live MCP endpoint yet; nothing described as MCP support below is reachable by a real client until that lands.
+Development follows a 7-phase roadmap. **Phases 1 through 5 and 7 are complete** — a real security middleware stack, authentication, a hot-reloadable RBAC engine (including shadow-enforcement, observe-only auth modes, and data-driven direct firewall rules), an egress firewall with policy-driven overrides, a full audit/observability pipeline, a streaming reverse proxy with multi-upstream routing and per-upstream settings, a complete policy administration API (read/replace/validate, granular rule operations, and rule preview against historical traffic), full traffic discovery — endpoint inventory, a discovery UI, OpenAPI-based and inferred schema conformance checking, and a deterministic anomaly-signal engine with detectors, admin API, SSE surfacing, and UI — a complete visual rule builder — traffic-derived rule suggestions, a visual rule table/editor with live historical preview and one-click create-from-context, versioned policy history with rollback, and a shadow-mode review queue with real would-deny data and one-click promote/disable — and full identity/auth integration — pluggable OIDC providers with discovery, a generic cookie-session validator, managed API/service tokens, a directory and UI of every user and bot that has traversed the gateway with a principal drill-down and identity-based rule shortcuts, and operator SSO login (authorization-code + PKCE) into the admin dashboard with role-gated admin actions attributed to the operator's real identity in the audit trail — all exist and run today (see [What's Real Today](#whats-real-today)). **Phase 6 (native MCP protocol support) is in progress**: the native `/mcp` endpoint and major supporting pieces have landed, but MCP client conformance coverage and UI integration work remain before treating Phase 6 as v1-complete.
 
 Progress is tracked in the pinned roadmap issue: [Roadmap / project plan (#44)](https://github.com/Greenhat-Security/GreenGateway/issues/44).
 
 ## What's Real Today
 
-This is what's actually built, working, and covered by CI as of Phases 1 through 5 and Phase 7:
+This is what's actually built and working today across Phases 1 through 5, Phase 7, and the landed parts of Phase 6:
 
 | Area | What's implemented |
 | --- | --- |
@@ -66,6 +65,7 @@ This is what's actually built, working, and covered by CI as of Phases 1 through
 | **Admin UI SSO** | Operators sign into the admin dashboard via their configured IdP using a real authorization-code + PKCE flow (RFC 7636 S256, no fallback to `plain`), with the resulting token validated by the same bearer-token pipeline as any other credential; admin actions are gated by the same granular RBAC permission model as every other admin endpoint and attributed to the operator's real identity (subject, email) in the audit trail; the pre-existing manual paste-a-token flow still works as a fallback |
 | **Authorization** | A deny-by-default RBAC policy engine with config-driven route-to-permission rules, data-driven direct firewall rules (fuzz-tested, anchored glob/`{param}` path matching, first-match-wins) with an `action: shadow` per-rule override that logs would-be denials without blocking, and hot reload (file-watch + `SIGHUP`) with validate-before-swap so an invalid edit never takes down the last-known-good policy |
 | **Reverse proxy** | A multi-upstream routing table (longest-prefix and host-based selection, per-upstream timeouts, request header add/strip rules, and custom TLS trust bundles), or a single catch-all `UPSTREAM_URL` for simple deployments — all HTTP verbs, streamed responses and binary bodies, hop-by-hop header stripping, request-id propagation, a 502/504 error taxonomy, per-upstream health reporting, and upstream latency recorded on every observation event. Gateway-owned routes (health/version/metrics, the admin UI and its API) always take precedence over the proxy, and the admin surface's own path is remappable via `ADMIN_PREFIX` |
+| **Native MCP support** | A gateway-owned `/mcp` streamable-HTTP endpoint handles MCP `initialize`, `tools/list`, and `tools/call` flows through the same auth/RBAC middleware; optional OAuth protected-resource metadata advertises MCP resource binding; `TOOLS_FILE` provides a dynamic tool registry with JSON Schema validation and a bounded tool runtime; configured upstream MCP servers can be discovered and proxied with namespaced tools; OpenAPI-to-tools preview/register APIs are present, with upstream API-key header injection still a known limitation for generated tools that require it; MCP tool observations feed the discovery/anomaly inventory plumbing |
 | **Egress firewall** | An SSRF-hardened outbound HTTP client: host allowlisting (including policy-driven wildcard host globs and CIDR-scoped private-IP exceptions), private/special-use IP blocking (including IPv4-mapped-IPv6/NAT64), pinned-IP resolution with a fresh, per-request DNS resolve to close rebinding windows |
 | **Audit pipeline** | A versioned audit-event envelope with SHA-256 redaction, delivered asynchronously off the request hot path |
 | **Queryable audit store** | A SQLite audit sink (batched writes, retention pruning) with an admin API — `GET /v1/admin/audit` — supporting time-range, event-type, actor, path, and status filters with keyset pagination |
@@ -80,17 +80,17 @@ This is what's actually built, working, and covered by CI as of Phases 1 through
 | **Policy versioning & rollback** | Every policy mutation appends an append-only, actor/timestamp/diff-stamped version to a dedicated store; a version-history timeline UI with human-readable per-action diffs and one-click rollback validated against the current live policy ETag |
 | **Shadow-mode review** | A review queue over the direct-firewall-rule engine's live `action: shadow` enforcement — real would-deny counts, affected principals, and sample requests per shadow rule, aggregated in a single bounded scan, with one-click promote (behind an explicit confirmation) and disable |
 | **Admin UI** | An embedded Vite + React + TypeScript app, built into the binary and served at `/admin` (or `ADMIN_PREFIX`): a log explorer, live tail, a traffic inventory table and per-endpoint drill-down (with schema-mismatch and signal badges), a signals view (filter, evidence, acknowledge/dismiss, live updates), the visual rule builder and policy-history/shadow-review views above, and a status page reporting real running-config values |
-| **Local dev harness** | Checked-in JWKS/RBAC fixtures, a `docker-compose.dev.yml` profile that brings up a fully authenticated gateway with a sample echo upstream in one command, and a traffic-generator/CI smoke test |
+| **Local dev harness** | Checked-in JWKS/RBAC fixtures, a `docker-compose.dev.yml` profile that brings up a fully authenticated gateway with a sample echo upstream in one command, and a traffic-generator smoke test |
 
 None of this requires a real backend to try — the dev harness in [Quick Start](#quick-start) is self-contained.
 
 ## Planned Scope
 
-Everything below is roadmap and vision beyond what's listed in [What's Real Today](#whats-real-today) — mostly **not yet implemented**, except where a phase is explicitly marked in progress. It is what GreenGateway is being built toward, tracked phase-by-phase in the [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44):
+Everything below is roadmap and vision beyond what's listed in [What's Real Today](#whats-real-today). For Phase 6, the remaining scope is follow-up work around conformance coverage and UI workflows, not the whole MCP endpoint. It is tracked phase-by-phase in the [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44):
 
 | Phase | Capability | Status |
 | --- | --- | --- |
-| 6 | **Native MCP support** — speak the real MCP protocol instead of a bespoke REST facade, with a dynamic tool registry, JSON Schema validation, and OpenAPI-to-tools generation | In progress — tool runtime and dynamic tool registry (with per-tool role policy) are built and tested; no live MCP endpoint yet |
+| 6 | **Native MCP support** — finish v1 confidence around the native MCP endpoint, dynamic tool registry, JSON Schema validation, upstream MCP proxying, OpenAPI-to-tools generation, and tool traffic inventory | In progress — endpoint/runtime/registry/proxy/generation/validation/inventory plumbing is present; remaining follow-ups include MCP client conformance tests and UI integration for tool inventory and create-rule-from-tool flows |
 
 Do not evaluate GG today assuming any capability not explicitly listed in [What's Real Today](#whats-real-today) already works.
 
@@ -110,11 +110,11 @@ GreenGateway
 your backend API or MCP server
 ```
 
-The HTTP half of the proxy layer above is real today — multi-upstream routing (or a single catch-all `UPSTREAM_URL`) forwards traffic, and rules-as-data (policy-driven RBAC and direct firewall rules, evaluated and hot-reloadable through a full CRUD API, with a visual builder, versioned history, and shadow-mode review on top) governs what's allowed. The MCP-protocol half is still ahead, targeted for Phase 6 — see [What's Real Today](#whats-real-today) for exactly what's implemented now.
+The HTTP half of the proxy layer above is real today — multi-upstream routing (or a single catch-all `UPSTREAM_URL`) forwards traffic, and rules-as-data (policy-driven RBAC and direct firewall rules, evaluated and hot-reloadable through a full CRUD API, with a visual builder, versioned history, and shadow-mode review on top) governs what's allowed. The MCP-protocol half is now partially real through the native `/mcp` endpoint and tool runtime/registry/proxy pieces listed in [What's Real Today](#whats-real-today), while conformance and UI follow-ups remain in Phase 6.
 
 ## Quick Start
 
-GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI at `/admin` (traffic inventory, signals, log explorer, live tail, the visual rule builder, policy history, shadow review, status), a working reverse proxy — either a single catch-all `UPSTREAM_URL` or a full multi-upstream routing table — and optional traffic discovery (endpoint inventory, schema awareness, anomaly signals) when `DISCOVERY_SQLITE_PATH` is set (see [What's Real Today](#whats-real-today)). The remaining capabilities described in [Planned Scope](#planned-scope) are still pre-alpha roadmap work.
+GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI at `/admin` (traffic inventory, signals, log explorer, live tail, the visual rule builder, policy history, shadow review, status), a working reverse proxy — either a single catch-all `UPSTREAM_URL` or a full multi-upstream routing table — optional traffic discovery (endpoint inventory, schema awareness, anomaly signals) when `DISCOVERY_SQLITE_PATH` is set, and the landed MCP runtime/registry endpoint pieces described in [What's Real Today](#whats-real-today). The remaining capabilities described in [Planned Scope](#planned-scope) are still pre-alpha roadmap work.
 
 For the full list of environment variables, see [docs/configuration.md](docs/configuration.md). As more variables land, that document and [.env.example](.env.example) are kept in sync with the code by an automated test.
 
@@ -204,6 +204,7 @@ GreenGateway reads all configuration from environment variables — no config fi
 - Auth (`JWT_JWKS_URL`, `JWT_ISSUER`, `JWT_AUDIENCE`, `ROLES_CLAIM`, `AUTH_MODE`, ...)
 - RBAC (`POLICY_FILE`, `RBAC_EXEMPT_PATHS`)
 - Reverse proxy (`UPSTREAM_URL`, `ADMIN_PREFIX`)
+- MCP and tools (`GATEWAY_PUBLIC_URL`, `TOOLS_FILE`, `MCP_UPSTREAM_SERVERS`, `TOOL_RUNTIME_*`)
 - Rate limiting, CORS, CSRF, and body validation
 - Egress firewall (`EGRESS_ALLOWED_HOSTS`, `EGRESS_DENY_PRIVATE_IPS`, ...)
 - Audit sinks (`AUDIT_LOG_FILE`, `AUDIT_SQLITE_PATH`, `AUDIT_SQLITE_RETENTION_DAYS`)
@@ -212,7 +213,7 @@ For real deployments that want to enable RBAC without immediately blocking unmat
 
 Provider-specific `AUTH_PROVIDERS` recipes for Keycloak, Auth0, Microsoft Entra ID, and Okta live in [docs/auth/README.md](docs/auth/README.md).
 
-`docs/configuration.md` and `.env.example` are kept in sync with the actual code by an automated CI drift test, so they should never silently fall out of date.
+`docs/configuration.md` and `.env.example` are kept in sync with the actual code by the `gateway/tests/env_example.rs` drift test, so they should never silently fall out of date.
 
 ## Contributing
 

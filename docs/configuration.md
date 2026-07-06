@@ -1,6 +1,6 @@
 # Configuration
 
-GreenGateway reads configuration from environment variables. Each variable is documented below with its own level-3 heading of the exact form `### VAR_NAME`. This document is kept in sync with the code by the automated drift test in `gateway/tests/env_example.rs`, so drift here is a CI failure, not just a documentation staleness risk.
+GreenGateway reads configuration from environment variables. Each variable is documented below with its own level-3 heading of the exact form `### VAR_NAME`. This document is kept in sync with the code by the drift test in `gateway/tests/env_example.rs`, so drift here is a test failure, not just a documentation staleness risk.
 
 ### LISTEN_ADDR
 
@@ -366,7 +366,7 @@ Principal directory admin API: when `PRINCIPAL_SQLITE_PATH` is set, `GET /v1{ADM
 
 `GET /v1{ADMIN_PREFIX}/principals` supports `issuer`, `auth_method`, `principal_type=human|service`, `last_seen_after`, `last_seen_before`, `limit`, and `cursor`. `issuer` is an exact match and `issuer=` matches the empty no-issuer sentinel. Timestamp filters must be RFC 3339. `principal_type=service` maps to `auth_method=service_token`; `principal_type=human` maps to `auth_method` in `bearer` or `cookie`, which is a simple operational grouping rather than proof that a JWT caller is a human. Results sort by `last_seen` descending with stable identity-key tie-breakers and use the same opaque limit-plus-cursor pagination shape as traffic inventory: `{"principals":[...],"next_cursor":...,"anonymous_request_count":N}`. `anonymous_request_count` counts `http.request_observed` audit rows with no actor over the same `last_seen_after`/`last_seen_before` window when `AUDIT_SQLITE_PATH` is configured; otherwise it is `0`.
 
-Principal detail uses query parameters for the full identity key: `GET /v1{ADMIN_PREFIX}/principal?subject=user-123&issuer=&auth_method=bearer`. The response contains `principal` for the directory row, `endpoints_touched` aggregated from recent audit events for the same `actor_user_id`, `rules_hit` for distinct matched rule ids in that same bounded audit scan, `anomaly_history` for recent `principal_new_to_endpoint` discovery signals involving that subject, and `tools_called: []`. The tools field is a placeholder until the MCP gateway phase adds backing tool-call telemetry. Audit enrichment is a convenience view keyed only by `actor_user_id`; the audit schema does not currently carry `issuer` or `auth_method`, so same-subject principals from different issuers or auth methods can share the same enrichment results.
+Principal detail uses query parameters for the full identity key: `GET /v1{ADMIN_PREFIX}/principal?subject=user-123&issuer=&auth_method=bearer`. The response contains `principal` for the directory row, `endpoints_touched` aggregated from recent audit events for the same `actor_user_id`, `rules_hit` for distinct matched rule ids in that same bounded audit scan, `anomaly_history` for recent `principal_new_to_endpoint` discovery signals involving that subject, and `tools_called: []`. Tool-call telemetry now feeds the traffic inventory path, but this principal-detail field is not yet wired to it. Audit enrichment is a convenience view keyed only by `actor_user_id`; the audit schema does not currently carry `issuer` or `auth_method`, so same-subject principals from different issuers or auth methods can share the same enrichment results.
 
 Traffic inventory admin API: when `DISCOVERY_SQLITE_PATH` is set, `GET /v1{ADMIN_PREFIX}/traffic/endpoints` lists discovered endpoint aggregates, and `GET /v1{ADMIN_PREFIX}/traffic/endpoint` returns one endpoint detail. These read routes require a principal with the dedicated `admin:traffic:read` permission. `POST /v1{ADMIN_PREFIX}/traffic/endpoints/review` marks or clears an endpoint review flag and requires `admin:traffic:write`. All traffic admin routes return `401 Unauthorized` with no authenticated principal, return `404 Not Found` with `{"error":"traffic endpoint inventory requires POLICY_FILE to be configured"}` when RBAC is not configured, and return `403 Forbidden` when the principal lacks the route's required permission. If `DISCOVERY_SQLITE_PATH` is unset, the traffic inventory routes return `404 Not Found` with `{"error":"traffic endpoint inventory requires DISCOVERY_SQLITE_PATH to be configured"}` after authentication and permission checks.
 
@@ -765,7 +765,7 @@ Maximum queued plus running tool invocations admitted by the generic tool runtim
 
 Default: `1024`
 
-Format and validation: must parse as an integer greater than `0`. This is an admission backpressure cap: once all queue slots are held by queued or running invocations, new invocations are rejected immediately instead of waiting. The runtime is available even when no tool registry or MCP endpoint is wired yet.
+Format and validation: must parse as an integer greater than `0`. This is an admission backpressure cap: once all queue slots are held by queued or running invocations, new invocations are rejected immediately instead of waiting. This controls the runtime used by the native `/mcp` endpoint for configured tools; when no tools are configured, there are no local HTTP tool invocations to admit.
 
 ### TOOL_RUNTIME_GLOBAL_CONCURRENCY
 
@@ -931,10 +931,11 @@ The current gateway-owned paths are:
 - `/health`
 - `/version`
 - `/metrics`
+- `/mcp`
 - The effective `ADMIN_PREFIX` UI path and its subpaths, defaulting to `/admin`
 - The effective admin API prefix. With the default admin prefix this is `/v1/admin`; with `ADMIN_PREFIX=/ops` this is `/v1/ops`
 
-The `/mcp` surface is reserved by the roadmap for Phase 6, but this codebase does not serve an `/mcp` route yet. When it lands, it should be added to the same gateway-owned path list rather than handled by scattered proxy checks.
+The `/mcp` endpoint is mounted at bare `/mcp` and is gateway-owned, so it is matched before the reverse proxy fallback. In public path-prefix deployments, keep the `GATEWAY_PUBLIC_URL` caveat above: the front reverse proxy must strip the public prefix before forwarding MCP traffic to GreenGateway.
 
 ### EGRESS_ALLOWED_HOSTS
 

@@ -7,11 +7,40 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
-Phase 6 (native MCP support) is in progress: the tool runtime and dynamic
-tool registry (with per-tool role policy) have landed, but there is no live
-MCP endpoint yet. See the
+Phase 6 (native MCP support) remains in progress, but the live endpoint and
+major runtime pieces have landed since 0.6.0. See the
 [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44)
 for full phase-by-phase status.
+
+### Added — Phase 6 (native MCP support)
+
+- Native MCP streamable-HTTP endpoint at `/mcp`, wired through the gateway's
+  existing auth/RBAC middleware and the tool runtime for `initialize`,
+  `tools/list`, and `tools/call`.
+- OAuth protected-resource discovery for MCP clients, including public
+  `/.well-known/oauth-protected-resource` metadata, MCP-specific
+  `WWW-Authenticate` challenges, JWT audience binding, and `mcp:tools`
+  scope checks for service tokens.
+- Dynamic tool registry and runtime wiring for `TOOLS_FILE`, including
+  schema-validated tool definitions, hot reload, per-tool role policy,
+  bounded queue/concurrency/timeout controls, and JSON Schema validation of
+  tool-call arguments before upstream dispatch.
+- MCP upstream proxying through `MCP_UPSTREAM_SERVERS`, with namespaced
+  discovered tools, per-tool policy enforcement, egress validation, and
+  sanitized upstream failure handling.
+- OpenAPI-to-tools generation through protected admin preview/register APIs,
+  with generated HTTP tool definitions merged into the live registry.
+- Tool traffic inventory plumbing: MCP tool observations feed the existing
+  discovery/anomaly pipeline, and policy rules can match tool names.
+
+### Remaining — Phase 6 follow-ups
+
+- MCP client conformance coverage still needs to drive a real client SDK
+  through connect, list, and call flows.
+- UI integration is still needed for tool inventory, tool-call metrics, and
+  create-rule-from-tool workflows.
+- Generated tools that require upstream API-key header injection still need
+  explicit support before those generated tools are fully usable end-to-end.
 
 ## [0.6.0] - 2026-07-05
 
