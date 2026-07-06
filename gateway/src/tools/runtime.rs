@@ -1,8 +1,15 @@
-use std::{collections::HashMap, error::Error, fmt, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt,
+    future::Future,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
 
 use serde_json::{json, Value};
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore},
     time,
 };
 use tokio_util::sync::CancellationToken;
@@ -214,7 +221,7 @@ struct ToolRuntimeInner {
     audit: AuditLog,
     queue: Arc<Semaphore>,
     global: Arc<Semaphore>,
-    per_tool: HashMap<String, Arc<Semaphore>>,
+    per_tool: Mutex<HashMap<String, Arc<ToolLimiter>>>,
     rbac_state: Option<RbacState>,
     rule_matcher: RuleMatcher,
     rule_ids: Vec<String>,
@@ -222,7 +229,7 @@ struct ToolRuntimeInner {
 
 struct ToolExecutionState {
     config: ToolRuntimeToolConfig,
-    semaphore: Option<Arc<Semaphore>>,
+    limiter: Option<Arc<ToolLimiter>>,
 }
 
 struct AdmittedInvocation {
@@ -238,7 +245,96 @@ struct AuthorizedToolInvocation {
 struct ExecutionPermits {
     _queue: OwnedSemaphorePermit,
     _global: OwnedSemaphorePermit,
-    _tool: Option<OwnedSemaphorePermit>,
+    _tool: Option<ToolPermit>,
+}
+
+struct ToolLimiter {
+    state: Mutex<ToolLimiterState>,
+    notify: Notify,
+}
+
+struct ToolLimiterState {
+    max_concurrent: usize,
+    running: usize,
+}
+
+struct ToolPermit {
+    limiter: Arc<ToolLimiter>,
+}
+
+impl ToolLimiter {
+    fn new(max_concurrent: usize) -> Self {
+        Self {
+            state: Mutex::new(ToolLimiterState {
+                max_concurrent: normalized_tool_limit(max_concurrent),
+                running: 0,
+            }),
+            notify: Notify::new(),
+        }
+    }
+
+    fn set_limit(&self, max_concurrent: usize) {
+        let should_notify = {
+            let mut state = lock_unpoisoned(&self.state);
+            let max_concurrent = normalized_tool_limit(max_concurrent);
+            let increased = max_concurrent > state.max_concurrent;
+            state.max_concurrent = max_concurrent;
+
+            increased && state.running < state.max_concurrent
+        };
+
+        if should_notify {
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn acquire(self: Arc<Self>) -> ToolPermit {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = lock_unpoisoned(&self.state);
+                if state.running < state.max_concurrent {
+                    state.running += 1;
+                    return ToolPermit {
+                        limiter: Arc::clone(&self),
+                    };
+                }
+            }
+
+            notified.await;
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        lock_unpoisoned(&self.state).running == 0
+    }
+}
+
+impl Drop for ToolPermit {
+    fn drop(&mut self) {
+        let should_notify = {
+            let mut state = lock_unpoisoned(&self.limiter.state);
+            debug_assert!(state.running > 0);
+            state.running = state.running.saturating_sub(1);
+            state.running < state.max_concurrent
+        };
+
+        if should_notify {
+            self.limiter.notify.notify_one();
+        }
+    }
+}
+
+fn normalized_tool_limit(max_concurrent: usize) -> usize {
+    max_concurrent.max(1)
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl ToolRuntime {
@@ -257,11 +353,10 @@ impl ToolRuntime {
             .tools
             .iter()
             .map(|(name, tool_config)| {
-                // Never create a zero-permit per-tool semaphore: a configured
-                // zero would otherwise wait forever instead of behaving as the
-                // documented minimum of one concurrent execution.
-                let permits = tool_config.max_concurrent.max(1);
-                (name.clone(), Arc::new(Semaphore::new(permits)))
+                (
+                    name.clone(),
+                    Arc::new(ToolLimiter::new(tool_config.max_concurrent)),
+                )
             })
             .collect();
         let rule_matcher = RuleMatcher::new(&config.rules);
@@ -276,7 +371,7 @@ impl ToolRuntime {
             inner: Arc::new(ToolRuntimeInner {
                 queue: Arc::new(Semaphore::new(config.max_queue.max(1))),
                 global: Arc::new(Semaphore::new(config.max_concurrent_global.max(1))),
-                per_tool,
+                per_tool: Mutex::new(per_tool),
                 config,
                 audit,
                 rbac_state,
@@ -552,7 +647,7 @@ impl ToolRuntime {
         let acquire = Self::acquire_execution_permits(
             queue_permit,
             Arc::clone(&self.inner.global),
-            state.semaphore.clone(),
+            state.limiter.clone(),
             tool_name.to_owned(),
         );
 
@@ -597,11 +692,13 @@ impl ToolRuntime {
                 tool_name,
                 principal.as_ref(),
                 |authorization| {
+                    self.prune_idle_limiters(authorization.tools.keys());
                     let config = authorize_tool_snapshot(tool_name, context, &authorization)?;
+                    let limiter = self.limiter_for_tool(tool_name, config.max_concurrent);
                     Ok(AuthorizedToolInvocation {
                         state: ToolExecutionState {
                             config,
-                            semaphore: self.inner.per_tool.get(tool_name).cloned(),
+                            limiter: Some(limiter),
                         },
                         rule_decision: authorization.rule_decision,
                     })
@@ -674,7 +771,7 @@ impl ToolRuntime {
     async fn acquire_execution_permits(
         queue: OwnedSemaphorePermit,
         global: Arc<Semaphore>,
-        tool: Option<Arc<Semaphore>>,
+        tool: Option<Arc<ToolLimiter>>,
         tool_name: String,
     ) -> Result<ExecutionPermits, ToolRuntimeError> {
         let global = global
@@ -685,16 +782,7 @@ impl ToolRuntime {
                 reason: "runtime_closed".to_owned(),
             })?;
         let tool = match tool {
-            Some(tool) => {
-                Some(
-                    tool.acquire_owned()
-                        .await
-                        .map_err(|_| ToolRuntimeError::Rejected {
-                            tool_name,
-                            reason: "runtime_closed".to_owned(),
-                        })?,
-                )
-            }
+            Some(tool) => Some(tool.acquire().await),
             None => None,
         };
 
@@ -706,10 +794,11 @@ impl ToolRuntime {
     }
 
     fn lookup_tool(&self, tool_name: &str) -> Result<ToolExecutionState, ToolRuntimeError> {
-        if let Some(tool_config) = self.inner.config.tools.get(tool_name) {
+        if let Some(tool_config) = self.inner.config.tools.get(tool_name).cloned() {
+            let limiter = self.limiter_for_tool(tool_name, tool_config.max_concurrent);
             return Ok(ToolExecutionState {
-                config: tool_config.clone(),
-                semaphore: self.inner.per_tool.get(tool_name).cloned(),
+                config: tool_config,
+                limiter: Some(limiter),
             });
         }
 
@@ -724,9 +813,34 @@ impl ToolRuntime {
                     timeout: self.inner.config.default_timeout,
                     max_concurrent: self.inner.config.max_concurrent_global,
                 },
-                semaphore: None,
+                limiter: None,
             }),
         }
+    }
+
+    fn limiter_for_tool(&self, tool_name: &str, max_concurrent: usize) -> Arc<ToolLimiter> {
+        let limiter = {
+            let mut per_tool = lock_unpoisoned(&self.inner.per_tool);
+            per_tool
+                .entry(tool_name.to_owned())
+                .or_insert_with(|| Arc::new(ToolLimiter::new(max_concurrent)))
+                .clone()
+        };
+        limiter.set_limit(max_concurrent);
+        limiter
+    }
+
+    fn prune_idle_limiters<'a>(&self, active_tool_names: impl IntoIterator<Item = &'a String>) {
+        let active_tool_names = active_tool_names
+            .into_iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut per_tool = lock_unpoisoned(&self.inner.per_tool);
+        per_tool.retain(|tool_name, limiter| {
+            active_tool_names.contains(tool_name)
+                || Arc::strong_count(limiter) > 1
+                || !limiter.is_idle()
+        });
     }
 
     fn emit_rejected_error(
@@ -1250,6 +1364,10 @@ mod tests {
             .await
             .expect("tool call should be allowed before removal reload");
         assert_eq!(allowed, "allowed-before-reload");
+        assert!(
+            lock_unpoisoned(&runtime.inner.per_tool).contains_key("echo"),
+            "initial call should populate an echo limiter"
+        );
 
         file.write(&tool_policy_document_without_tools());
         crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
@@ -1264,6 +1382,223 @@ mod tests {
 
         assert!(matches!(removed, ToolRuntimeError::UnknownTool { .. }));
         assert_rejected_events(&capture, "echo", "unknown_tool", 1).await;
+        assert!(
+            !lock_unpoisoned(&runtime.inner.per_tool).contains_key("echo"),
+            "idle limiter for removed tool should be pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_reload_updates_live_max_concurrent_for_same_runtime() {
+        let file = TempPolicyFile::new(&tool_policy_document_with_echo_max_concurrent(1));
+        let initial_policy =
+            Policy::from_file(file.path()).expect("initial tool policy should parse");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            initial_policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let mut runtime_config = ToolRuntimeConfig::from_policy(&initial_policy)
+            .expect("initial tool policy should configure runtime");
+        runtime_config.max_queue = 4;
+        runtime_config.max_concurrent_global = 2;
+        runtime_config.queue_timeout = Duration::from_secs(1);
+        let runtime =
+            ToolRuntime::new_with_rbac_state(runtime_config, audit, Some(rbac_state.clone()));
+
+        file.write(&tool_policy_document_with_echo_max_concurrent(2));
+        crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .expect("valid tool policy reload should succeed");
+
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let release = ReleaseGate::new();
+        let handles = vec![
+            spawn_tracked_invocation(
+                runtime.clone(),
+                "echo",
+                Arc::clone(&tracker),
+                release.clone(),
+            ),
+            spawn_tracked_invocation(
+                runtime.clone(),
+                "echo",
+                Arc::clone(&tracker),
+                release.clone(),
+            ),
+        ];
+
+        tracker.wait_for_started(2).await;
+        release.release();
+
+        for handle in handles {
+            handle
+                .await
+                .expect("invocation task should join")
+                .expect("invocation should succeed");
+        }
+        assert_eq!(tracker.max_running.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn policy_reload_readd_keeps_limiter_owned_by_globally_queued_call() {
+        let file = TempPolicyFile::new(&tool_policy_document_with_echo_max_concurrent(1));
+        let initial_policy =
+            Policy::from_file(file.path()).expect("initial tool policy should parse");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            initial_policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let mut runtime_config = ToolRuntimeConfig::from_policy(&initial_policy)
+            .expect("initial tool policy should configure runtime");
+        runtime_config.max_queue = 4;
+        runtime_config.max_concurrent_global = 1;
+        runtime_config.queue_timeout = Duration::from_secs(2);
+        let runtime =
+            ToolRuntime::new_with_rbac_state(runtime_config, audit, Some(rbac_state.clone()));
+
+        let blocker_release = ReleaseGate::new();
+        let blocker = spawn_blocking_invocation(runtime.clone(), "echo", blocker_release.clone());
+        wait_until(Duration::from_secs(1), || {
+            runtime.inner.global.available_permits() == 0
+        })
+        .await;
+
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let queued_release = ReleaseGate::new();
+        let queued_before_reload = spawn_tracked_invocation(
+            runtime.clone(),
+            "echo",
+            Arc::clone(&tracker),
+            queued_release.clone(),
+        );
+        wait_until(Duration::from_secs(1), || {
+            lock_unpoisoned(&runtime.inner.per_tool)
+                .get("echo")
+                .is_some_and(|limiter| Arc::strong_count(limiter) > 1)
+        })
+        .await;
+
+        file.write(&tool_policy_document_without_tools());
+        crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .expect("valid tool removal reload should succeed");
+        let _ = runtime
+            .execute_with_context("missing", context(), CancellationToken::new(), || async {
+                "trigger-prune"
+            })
+            .await
+            .expect_err("unknown tool should be rejected");
+        assert!(
+            lock_unpoisoned(&runtime.inner.per_tool).contains_key("echo"),
+            "queued call's limiter should not be pruned while it has outside owners"
+        );
+
+        file.write(&tool_policy_document_with_echo_max_concurrent(1));
+        crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .expect("valid tool re-add reload should succeed");
+
+        let after_readd_release = ReleaseGate::new();
+        let after_readd = spawn_tracked_invocation(
+            runtime.clone(),
+            "echo",
+            Arc::clone(&tracker),
+            after_readd_release.clone(),
+        );
+
+        blocker_release.release();
+        blocker
+            .await
+            .expect("blocker task should join")
+            .expect("blocker invocation should succeed");
+        tracker.wait_for_started(1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            tracker.started.load(Ordering::SeqCst),
+            1,
+            "re-added tool should reuse the limiter owned by the queued call"
+        );
+
+        queued_release.release();
+        queued_before_reload
+            .await
+            .expect("queued invocation task should join")
+            .expect("queued invocation should succeed");
+
+        tracker.wait_for_started(2).await;
+        after_readd_release.release();
+        after_readd
+            .await
+            .expect("post-readd invocation task should join")
+            .expect("post-readd invocation should succeed");
+        assert_eq!(tracker.max_running.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn policy_reload_added_tool_uses_reloaded_max_concurrent() {
+        let file = TempPolicyFile::new(&tool_policy_document_with_echo_max_concurrent(2));
+        let initial_policy =
+            Policy::from_file(file.path()).expect("initial tool policy should parse");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            initial_policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let mut runtime_config = ToolRuntimeConfig::from_policy(&initial_policy)
+            .expect("initial tool policy should configure runtime");
+        runtime_config.max_queue = 4;
+        runtime_config.max_concurrent_global = 4;
+        runtime_config.queue_timeout = Duration::from_secs(1);
+        let runtime =
+            ToolRuntime::new_with_rbac_state(runtime_config, audit, Some(rbac_state.clone()));
+
+        file.write(&tool_policy_document_with_echo_and_search_max_concurrent(
+            2, 1,
+        ));
+        crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .expect("valid tool policy reload should succeed");
+
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let release = ReleaseGate::new();
+        let handles = vec![
+            spawn_tracked_invocation(
+                runtime.clone(),
+                "search",
+                Arc::clone(&tracker),
+                release.clone(),
+            ),
+            spawn_tracked_invocation(
+                runtime.clone(),
+                "search",
+                Arc::clone(&tracker),
+                release.clone(),
+            ),
+        ];
+
+        tracker.wait_for_started(1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            tracker.started.load(Ordering::SeqCst),
+            1,
+            "the reloaded tool should enforce its per-tool limit instead of falling back to the global limit"
+        );
+        release.release();
+
+        for handle in handles {
+            handle
+                .await
+                .expect("invocation task should join")
+                .expect("invocation should succeed");
+        }
+        assert!(tracker.max_running.load(Ordering::SeqCst) <= 1);
     }
 
     #[tokio::test]
@@ -2015,6 +2350,39 @@ mod tests {
         .to_string()
     }
 
+    fn tool_policy_document_with_echo_max_concurrent(max_concurrent: u32) -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "echo": {
+                    "timeout_ms": 5000,
+                    "max_concurrent": max_concurrent
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn tool_policy_document_with_echo_and_search_max_concurrent(
+        echo_max_concurrent: u32,
+        search_max_concurrent: u32,
+    ) -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "echo": {
+                    "timeout_ms": 5000,
+                    "max_concurrent": echo_max_concurrent
+                },
+                "search": {
+                    "timeout_ms": 5000,
+                    "max_concurrent": search_max_concurrent
+                }
+            }
+        })
+        .to_string()
+    }
+
     fn tool_policy_document_with_allowed_roles(allowed_roles: &[&str]) -> String {
         json!({
             "schema_version": "0.1.0",
@@ -2214,6 +2582,20 @@ mod tests {
             runtime
                 .execute_with_context(tool_name, context(), CancellationToken::new(), || async {
                     let _guard = tracker.enter();
+                    release.wait().await;
+                })
+                .await
+        })
+    }
+
+    fn spawn_blocking_invocation(
+        runtime: ToolRuntime,
+        tool_name: &'static str,
+        release: ReleaseGate,
+    ) -> tokio::task::JoinHandle<Result<(), ToolRuntimeError>> {
+        tokio::spawn(async move {
+            runtime
+                .execute_with_context(tool_name, context(), CancellationToken::new(), || async {
                     release.wait().await;
                 })
                 .await
