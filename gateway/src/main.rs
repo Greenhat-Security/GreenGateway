@@ -10492,7 +10492,7 @@ mod tests {
                 "resource": "https://gateway.example.test/base/mcp",
                 "authorization_servers": ["https://auth.example.test"],
                 "scopes_supported": ["mcp:tools"],
-                "bearer_methods_supported": ["Bearer"]
+                "bearer_methods_supported": ["header"]
             })
         );
     }

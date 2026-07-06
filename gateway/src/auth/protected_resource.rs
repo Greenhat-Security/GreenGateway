@@ -8,7 +8,7 @@ pub(crate) const MCP_RESOURCE_PATH: &str = "/mcp";
 pub(crate) const WELL_KNOWN_PATH: &str = "/.well-known/oauth-protected-resource";
 
 pub(crate) const MCP_SCOPE: &str = "mcp:tools";
-const BEARER_METHOD: &str = "Bearer";
+const BEARER_METHOD: &str = "header";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProtectedResourceMetadataConfig {

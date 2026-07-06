@@ -408,7 +408,7 @@ impl Config {
             get_var(ADMIN_LOGIN_PROVIDER),
             &mut problems,
         );
-        let gateway_public_url = parse_optional_upstream_url(
+        let gateway_public_url = parse_optional_gateway_public_url(
             GATEWAY_PUBLIC_URL,
             get_var(GATEWAY_PUBLIC_URL),
             &mut problems,
@@ -1664,6 +1664,28 @@ fn parse_optional_upstream_url(
     }
 
     validate_upstream_url(name, value, problems)
+}
+
+fn parse_optional_gateway_public_url(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Option<String> {
+    let value = parse_optional_upstream_url(name, value, problems)?;
+    if url_has_fragment(&value) {
+        problems.push(format!(
+            "{name} must not include a URL fragment, got '{value}'"
+        ));
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn url_has_fragment(value: &str) -> bool {
+    url::Url::parse(value)
+        .map(|url| url.fragment().is_some())
+        .unwrap_or(false)
 }
 
 fn parse_upstream_routes(
@@ -3202,6 +3224,23 @@ mod tests {
     }
 
     #[test]
+    fn gateway_public_url_rejects_fragment() {
+        let error = Config::from_env_vars(|name| match name {
+            "GATEWAY_PUBLIC_URL" => Ok("https://gateway.example.test/#metadata".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject public URL fragments");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("GATEWAY_PUBLIC_URL must not include a URL fragment"),
+            "{message}"
+        );
+        assert!(message.contains("https://gateway.example.test/#metadata"));
+        assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
     fn auth_providers_parse_ordered_jwt_list() {
         let config = Config::from_env_vars(|name| match name {
             "AUTH_PROVIDERS" => Ok(r#"[
@@ -4108,6 +4147,20 @@ mod tests {
         assert_eq!(
             config.upstream_url,
             Some("https://upstream.example.test:8443/base/path".to_owned())
+        );
+    }
+
+    #[test]
+    fn upstream_url_still_accepts_fragment() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_URL" => Ok("https://upstream.example.test/base/path#allowed".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("shared upstream URL validation should still accept fragments");
+
+        assert_eq!(
+            config.upstream_url,
+            Some("https://upstream.example.test/base/path#allowed".to_owned())
         );
     }
 
