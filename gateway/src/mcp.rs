@@ -120,6 +120,9 @@ impl ServerHandler for McpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        // SEP-1319 task-style calls are routed by rmcp to enqueue_task before this method.
+        // GreenGateway does not implement task execution yet, so this inventory path covers
+        // ordinary, non-task tools/call requests only.
         let tool_name = request.name.to_string();
         let lookup_started = Instant::now();
         let invocation_context =
@@ -578,4 +581,190 @@ pub(crate) fn mcp_executor_from_config(
     }
 
     ToolExecutor::from_config(config, registry, runtime, egress_client, audit).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::*;
+    use crate::{
+        audit::{self, AuditSink},
+        config,
+        discovery::{self, suggestions::DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS},
+        egress,
+        tools::runtime::ToolRuntime,
+    };
+
+    #[test]
+    fn empty_registry_does_not_configure_mcp_executor() {
+        let config = test_config();
+        let registry = ToolRegistry::disabled();
+        let runtime = ToolRuntime::new(Default::default(), test_audit_log());
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::from_config(&config))
+                .expect("test egress client should build"),
+        );
+
+        let executor =
+            mcp_executor_from_config(&config, registry, runtime, egress_client, test_audit_log())
+                .expect("empty registry should be a valid no-executor configuration");
+
+        assert!(
+            executor.is_none(),
+            "empty registry intentionally skips inventory persistence because no executor/audit path exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_registry_tool_call_returns_unknown_tool_without_executor() {
+        let state = McpState::new(ToolRegistry::disabled(), None, false);
+        let request = AxumRequest::builder()
+            .method(http::Method::POST)
+            .uri("/mcp")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, JSON_MIME)
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "missing_tool",
+                        "arguments": {}
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("MCP request should build");
+
+        let response = state
+            .service
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("MCP service should respond")
+            .map(Body::new);
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("MCP error body should be readable");
+        let body: Value = serde_json::from_slice(&body).unwrap_or_else(|err| {
+            panic!(
+                "MCP response body should be JSON, status={status}, body={:?}: {err}",
+                String::from_utf8_lossy(&body)
+            )
+        });
+
+        assert_eq!(body["error"]["code"], json!(ErrorCode::METHOD_NOT_FOUND.0));
+        assert_eq!(
+            body["error"]["message"],
+            json!("tool 'missing_tool' is not defined")
+        );
+        assert_eq!(body["error"]["data"]["tool_name"], json!("missing_tool"));
+    }
+
+    #[derive(Clone)]
+    struct NoopSink;
+
+    impl AuditSink for NoopSink {
+        fn emit(&self, _event: &audit::AuditEvent) {}
+    }
+
+    fn test_audit_log() -> audit::AuditLog {
+        audit::AuditLog::new(Arc::new(NoopSink))
+    }
+
+    fn test_config() -> config::Config {
+        config::Config {
+            listen_addr: "127.0.0.1:0"
+                .parse::<SocketAddr>()
+                .expect("test listen address should parse"),
+            admin_listen_addr: None,
+            admin_prefix: config::DEFAULT_ADMIN_PREFIX.to_owned(),
+            admin_login_provider: None,
+            gateway_public_url: None,
+            audit_log_file: None,
+            audit_sqlite_path: None,
+            audit_sqlite_retention_days: None,
+            discovery_sqlite_path: None,
+            principal_sqlite_path: None,
+            payload_capture_enabled: false,
+            payload_capture_sample_rate: config::DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
+            schema_mismatch_signal_threshold:
+                discovery::signals::DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
+            error_rate_spike_signal_threshold:
+                discovery::signals::DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
+            principal_new_to_endpoint_signal_threshold:
+                discovery::signals::DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
+            volume_outlier_signal_threshold:
+                discovery::signals::DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+            rule_suggestion_baseline_window_hours: DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
+            openapi_spec_path: None,
+            policy_file: None,
+            tools_file: None,
+            policy_history_sqlite_path: None,
+            cors_allow_origins: Vec::new(),
+            max_body_size: 1_048_576,
+            rate_limit_read_rps: 50.0,
+            rate_limit_read_burst: 100,
+            rate_limit_write_rps: 10.0,
+            rate_limit_write_burst: 20,
+            trust_proxy_headers: false,
+            rbac_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+                "/admin".to_owned(),
+            ],
+            session_cookie_name: String::new(),
+            validation_allowed_content_types: vec!["application/json".to_owned()],
+            auth_enabled: true,
+            auth_mode: config::AuthMode::Required,
+            auth_cookie_name: "session".to_owned(),
+            auth_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+                "/admin".to_owned(),
+            ],
+            auth_providers: Vec::new(),
+            jwt_jwks_url: None,
+            jwt_issuer: None,
+            jwt_audience: None,
+            jwt_jwks_timeout_ms: 2000,
+            jwt_require_jti: false,
+            roles_claim: "roles".to_owned(),
+            service_token_sqlite_path: None,
+            service_token_cache_ttl_ms: config::DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS,
+            tool_runtime_queue_depth: config::DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH,
+            tool_runtime_global_concurrency: config::DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
+            tool_runtime_queue_timeout_ms: config::DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
+            tool_runtime_default_timeout_ms: config::DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
+            csrf_enabled: true,
+            csrf_cookie_name: "csrf_token".to_owned(),
+            csrf_header_name: "x-csrf-token".to_owned(),
+            csrf_cookie_domain: None,
+            csrf_exempt_paths: vec![
+                "/health".to_owned(),
+                "/version".to_owned(),
+                "/metrics".to_owned(),
+            ],
+            upstream_url: None,
+            upstream_routes: Vec::new(),
+            mcp_upstream_servers: Vec::new(),
+            upstream_timeout_ms: None,
+            upstream_response_idle_timeout_ms: None,
+            upstream_connect_timeout_ms: None,
+            egress_allowed_hosts: Vec::new(),
+            egress_timeout_ms: 30_000,
+            egress_response_idle_timeout_ms: 30_000,
+            egress_connect_timeout_ms: 10_000,
+            egress_max_response_bytes: 5_242_880,
+            egress_max_request_body_bytes: 1_048_576,
+            egress_deny_private_ips: true,
+        }
+    }
 }
