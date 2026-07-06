@@ -73,8 +73,10 @@ const ACTION_OPTIONS: Array<{
 ];
 
 type RuleFormState = {
+  matcherType: 'path' | 'tool';
   methods: string[];
   path: string;
+  toolName: string;
   roles: string[];
   roleDraft: string;
   authMethods: AuthMethodName[];
@@ -85,6 +87,7 @@ type RuleFormState = {
 
 type FormErrors = {
   path?: string;
+  toolName?: string;
 };
 
 type LoadState =
@@ -208,17 +211,21 @@ export function RuleEditor() {
     [
       form.action,
       form.authMethods,
+      form.matcherType,
       form.methods,
       form.path,
       form.principalIds,
       form.roles,
+      form.toolName,
     ],
   );
   const candidateKey = useMemo(
     () => JSON.stringify(candidateRule),
     [candidateRule],
   );
-  const pathError = validatePathPattern(form.path);
+  const matcherError = validateMatcher(form);
+  const matcherValue =
+    form.matcherType === 'tool' ? form.toolName.trim() : form.path.trim();
 
   // Invalidate stale preview promises before passive effect cleanup runs.
   useLayoutEffect(() => {
@@ -226,24 +233,23 @@ export function RuleEditor() {
     return () => {
       previewGenerationRef.current += 1;
     };
-  }, [candidateKey, candidateRule, form.path, pathError, previewWindowHours]);
+  }, [candidateKey, candidateRule, matcherError, matcherValue, previewWindowHours]);
 
   useEffect(() => {
     const previewGeneration = previewGenerationRef.current;
     const isCurrentPreview = () =>
       previewGenerationRef.current === previewGeneration;
-    const normalizedPath = form.path.trim();
-    if (normalizedPath.length === 0) {
+    if (matcherValue.length === 0) {
       setPreviewState({
         kind: 'idle',
-        message: 'Enter a path pattern to preview matched traffic.',
+        message: 'Enter a matcher to preview matched traffic.',
       });
       return;
     }
-    if (pathError) {
+    if (matcherError) {
       setPreviewState({
         kind: 'invalid',
-        message: pathError,
+        message: matcherError,
       });
       return;
     }
@@ -289,11 +295,23 @@ export function RuleEditor() {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [candidateKey, candidateRule, form.path, pathError, previewWindowHours]);
+  }, [candidateKey, candidateRule, matcherError, matcherValue, previewWindowHours]);
 
   function updatePath(value: string) {
     setForm((current) => ({ ...current, path: value }));
     setErrors((current) => ({ ...current, path: undefined }));
+    setSaveState({ kind: 'idle' });
+  }
+
+  function updateToolName(value: string) {
+    setForm((current) => ({ ...current, toolName: value }));
+    setErrors((current) => ({ ...current, toolName: undefined }));
+    setSaveState({ kind: 'idle' });
+  }
+
+  function updateMatcherType(matcherType: RuleFormState['matcherType']) {
+    setForm((current) => ({ ...current, matcherType }));
+    setErrors({});
     setSaveState({ kind: 'idle' });
   }
 
@@ -453,57 +471,109 @@ export function RuleEditor() {
                 </div>
 
                 <fieldset className="rule-fieldset">
-                  <legend>HTTP methods</legend>
-                  <div className="rule-check-grid">
+                  <legend>Rule target</legend>
+                  <div className="rule-check-grid two-column">
                     <label className="rule-check-row">
                       <input
-                        type="checkbox"
-                        className="rule-checkbox"
-                        checked={form.methods.length === 0}
-                        onChange={setAnyMethod}
+                        type="radio"
+                        className="rule-radio"
+                        name="rule-matcher-type"
+                        checked={form.matcherType === 'path'}
+                        onChange={() => updateMatcherType('path')}
                       />
-                      Any method
+                      HTTP path
                     </label>
-                    {METHOD_OPTIONS.map((method) => (
-                      <label className="rule-check-row" key={method}>
-                        <input
-                          type="checkbox"
-                          className="rule-checkbox"
-                          checked={form.methods.includes(method)}
-                          onChange={() => toggleMethod(method)}
-                        />
-                        {method}
-                      </label>
-                    ))}
+                    <label className="rule-check-row">
+                      <input
+                        type="radio"
+                        className="rule-radio"
+                        name="rule-matcher-type"
+                        checked={form.matcherType === 'tool'}
+                        onChange={() => updateMatcherType('tool')}
+                      />
+                      MCP tool
+                    </label>
                   </div>
                 </fieldset>
 
-                <label className="rule-field" htmlFor="rule-path">
-                  <span className="field-label">Path pattern</span>
-                  <input
-                    id="rule-path"
-                    className={`rule-input ${errors.path ? 'is-error' : ''}`}
-                    type="text"
-                    value={form.path}
-                    list="rule-path-suggestions"
-                    placeholder="/api/users/{id}"
-                    spellCheck={false}
-                    onChange={(event) => updatePath(event.target.value)}
-                  />
-                </label>
-                <datalist id="rule-path-suggestions">
-                  {endpointTemplates.map((template) => (
-                    <option key={template} value={template} />
-                  ))}
-                </datalist>
-                {errors.path ? (
-                  <p className="rule-hint is-error">{errors.path}</p>
+                {form.matcherType === 'path' ? (
+                  <>
+                    <fieldset className="rule-fieldset">
+                      <legend>HTTP methods</legend>
+                      <div className="rule-check-grid">
+                        <label className="rule-check-row">
+                          <input
+                            type="checkbox"
+                            className="rule-checkbox"
+                            checked={form.methods.length === 0}
+                            onChange={setAnyMethod}
+                          />
+                          Any method
+                        </label>
+                        {METHOD_OPTIONS.map((method) => (
+                          <label className="rule-check-row" key={method}>
+                            <input
+                              type="checkbox"
+                              className="rule-checkbox"
+                              checked={form.methods.includes(method)}
+                              onChange={() => toggleMethod(method)}
+                            />
+                            {method}
+                          </label>
+                        ))}
+                      </div>
+                    </fieldset>
+
+                    <label className="rule-field" htmlFor="rule-path">
+                      <span className="field-label">Path pattern</span>
+                      <input
+                        id="rule-path"
+                        className={`rule-input ${errors.path ? 'is-error' : ''}`}
+                        type="text"
+                        value={form.path}
+                        list="rule-path-suggestions"
+                        placeholder="/api/users/{id}"
+                        spellCheck={false}
+                        onChange={(event) => updatePath(event.target.value)}
+                      />
+                    </label>
+                    <datalist id="rule-path-suggestions">
+                      {endpointTemplates.map((template) => (
+                        <option key={template} value={template} />
+                      ))}
+                    </datalist>
+                    {errors.path ? (
+                      <p className="rule-hint is-error">{errors.path}</p>
+                    ) : (
+                      <p className="rule-hint">
+                        Use literal segments, <code>*</code> for one segment,{' '}
+                        <code>**</code> for zero or more segments, and{' '}
+                        <code>{'{name}'}</code> for a named segment.
+                      </p>
+                    )}
+                  </>
                 ) : (
-                  <p className="rule-hint">
-                    Use literal segments, <code>*</code> for one segment,{' '}
-                    <code>**</code> for zero or more segments, and{' '}
-                    <code>{'{name}'}</code> for a named segment.
-                  </p>
+                  <>
+                    <label className="rule-field" htmlFor="rule-tool-name">
+                      <span className="field-label">Tool name</span>
+                      <input
+                        id="rule-tool-name"
+                        className={`rule-input ${errors.toolName ? 'is-error' : ''}`}
+                        type="text"
+                        value={form.toolName}
+                        placeholder="reports.export"
+                        spellCheck={false}
+                        onChange={(event) => updateToolName(event.target.value)}
+                      />
+                    </label>
+                    {errors.toolName ? (
+                      <p className="rule-hint is-error">{errors.toolName}</p>
+                    ) : (
+                      <p className="rule-hint">
+                        Match one exact MCP tool name.
+                      </p>
+                    )}
+                  </>
                 )}
               </section>
 
@@ -876,8 +946,10 @@ function EditorAlert({
 
 function emptyRuleForm(): RuleFormState {
   return {
+    matcherType: 'path',
     methods: [],
     path: '',
+    toolName: '',
     roles: [],
     roleDraft: '',
     authMethods: [],
@@ -899,7 +971,15 @@ function formFromPrefillParams(
 
   const path = trimmedSearchParam(searchParams, 'prefill_path');
   if (path !== null) {
+    form.matcherType = 'path';
     form.path = path;
+  }
+
+  const toolName = trimmedSearchParam(searchParams, 'prefill_tool_name');
+  if (toolName !== null) {
+    form.matcherType = 'tool';
+    form.methods = [];
+    form.toolName = toolName;
   }
 
   const role = trimmedSearchParam(searchParams, 'prefill_role');
@@ -926,9 +1006,12 @@ function formFromPrefillParams(
 }
 
 function formFromRule(rule: PolicyRule): RuleFormState {
+  const toolName = rule.tool_name?.trim() ?? '';
   return {
+    matcherType: toolName.length > 0 ? 'tool' : 'path',
     methods: normalizeMethods(rule.methods ?? []),
-    path: rule.path,
+    path: rule.path ?? '',
+    toolName,
     roles: normalizeStrings(rule.principal?.roles ?? []),
     roleDraft: '',
     authMethods: normalizeAuthMethods(rule.principal?.auth_methods ?? []),
@@ -939,6 +1022,15 @@ function formFromRule(rule: PolicyRule): RuleFormState {
 }
 
 function ruleFromForm(form: RuleFormState): PolicyRule {
+  if (form.matcherType === 'tool') {
+    return {
+      methods: [],
+      tool_name: form.toolName.trim(),
+      principal: principalFromForm(form),
+      action: form.action,
+    };
+  }
+
   return {
     methods: normalizeMethods(form.methods),
     path: form.path.trim(),
@@ -948,12 +1040,15 @@ function ruleFromForm(form: RuleFormState): PolicyRule {
 }
 
 function rulePatchFromRule(rule: PolicyRule) {
-  return {
+  const patch = {
     methods: rule.methods,
-    path: rule.path,
     principal: rule.principal,
     action: rule.action,
   };
+
+  return rule.tool_name
+    ? { ...patch, path: null, tool_name: rule.tool_name }
+    : { ...patch, path: rule.path, tool_name: null };
 }
 
 function principalFromForm(form: RuleFormState): PrincipalMatcher {
@@ -965,8 +1060,21 @@ function principalFromForm(form: RuleFormState): PrincipalMatcher {
 }
 
 function validateForm(form: RuleFormState): FormErrors {
+  if (form.matcherType === 'tool') {
+    const toolName = validateToolName(form.toolName);
+    return toolName ? { toolName } : {};
+  }
+
   const path = validatePathPattern(form.path);
   return path ? { path } : {};
+}
+
+function validateMatcher(form: RuleFormState): string | undefined {
+  if (form.matcherType === 'tool') {
+    return validateToolName(form.toolName);
+  }
+
+  return validatePathPattern(form.path);
 }
 
 function validatePathPattern(value: string): string | undefined {
@@ -995,6 +1103,14 @@ function validatePathPattern(value: string): string | undefined {
         return 'Capture names must start with a letter or underscore and contain only ASCII letters, digits, and underscores.';
       }
     }
+  }
+
+  return undefined;
+}
+
+function validateToolName(value: string): string | undefined {
+  if (value.trim().length === 0) {
+    return 'Tool name is required.';
   }
 
   return undefined;
@@ -1039,6 +1155,7 @@ function uniqueEndpointTemplates(endpoints: TrafficEndpoint[]): string[] {
   return Array.from(
     new Set(
       endpoints
+        .filter((endpoint) => endpoint.method.trim().toUpperCase() !== 'MCP')
         .map((endpoint) => endpoint.endpoint_template.trim())
         .filter(Boolean),
     ),

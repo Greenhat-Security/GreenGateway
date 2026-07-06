@@ -16,7 +16,8 @@ export type PolicyRule = {
   id?: string | null;
   enabled?: boolean;
   methods?: string[];
-  path: string;
+  path?: string;
+  tool_name?: string;
   principal?: PrincipalMatcher;
   action: PolicyRuleAction;
 };
@@ -45,7 +46,8 @@ export type PolicyMutationResult<T> = {
 export type PolicyRulePatch = {
   enabled?: boolean;
   methods?: string[];
-  path?: string;
+  path?: string | null;
+  tool_name?: string | null;
   principal?: PrincipalMatcher;
   action?: PolicyRuleAction;
 };

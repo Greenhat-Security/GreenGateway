@@ -878,7 +878,8 @@ struct RuleSuggestionAcceptResponse {
 struct RulePatch {
     enabled: Option<bool>,
     methods: Option<Vec<String>>,
-    path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_rule_path_patch")]
+    path: Option<RulePathPatch>,
     #[serde(default, deserialize_with = "deserialize_rule_tool_name_patch")]
     tool_name: Option<RuleToolNamePatch>,
     principal: Option<rbac::PrincipalMatcher>,
@@ -888,6 +889,23 @@ struct RulePatch {
 enum RuleToolNamePatch {
     Set(String),
     Clear,
+}
+
+enum RulePathPatch {
+    Set(String),
+    Clear,
+}
+
+fn deserialize_rule_path_patch<'de, D>(deserializer: D) -> Result<Option<RulePathPatch>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|value| {
+        Some(match value {
+            Some(value) => RulePathPatch::Set(value),
+            None => RulePathPatch::Clear,
+        })
+    })
 }
 
 fn deserialize_rule_tool_name_patch<'de, D>(
@@ -6307,7 +6325,10 @@ fn apply_rule_patch(rule: &mut rbac::Rule, patch: RulePatch) {
         rule.methods = methods;
     }
     if let Some(path) = patch.path {
-        rule.path = path;
+        rule.path = match path {
+            RulePathPatch::Set(value) => value,
+            RulePathPatch::Clear => String::new(),
+        };
     }
     if let Some(tool_name) = patch.tool_name {
         rule.tool_name = match tool_name {
@@ -14628,6 +14649,65 @@ mod tests {
                 "action": "rule_updated",
                 "rule_id": "managed-rule",
                 "changed_fields": ["action"]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_rule_patch_can_replace_path_matcher_with_tool_name_matcher() {
+        let initial_policy = policy_document_with_rules_string(
+            "initial-policy",
+            json!([{
+                "id": "managed-rule",
+                "methods": ["GET"],
+                "path": "/patch",
+                "principal": { "roles": ["admin"] },
+                "action": "allow"
+            }]),
+        );
+        let policy = TempPolicyFile::new(&initial_policy);
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = policy_admin_router(Some(&policy), audit_log);
+        let (current_etag, _) = current_policy(&router).await;
+
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PATCH,
+                &format!("{POLICY_RULES_ADMIN_ROUTE}/managed-rule"),
+                Some(test_principal(&["admin"])),
+                Some(
+                    json!({
+                        "methods": [],
+                        "path": null,
+                        "tool_name": "reports.export",
+                        "action": "deny"
+                    })
+                    .to_string(),
+                ),
+                Some(&current_etag),
+            ))
+            .await
+            .expect("rule PATCH should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let patched_rule = json_body(response).await;
+        assert_eq!(patched_rule["id"], json!("managed-rule"));
+        assert_eq!(patched_rule.get("path"), None);
+        assert_eq!(patched_rule["tool_name"], json!("reports.export"));
+        assert_eq!(patched_rule["methods"], json!([]));
+        assert_eq!(patched_rule["action"], json!("deny"));
+
+        let event = captured_policy_change(&capture, "rule_updated");
+        assert_policy_change_actor(&event);
+        assert_eq!(
+            event.payload["diff_summary"],
+            json!({
+                "action": "rule_updated",
+                "rule_id": "managed-rule",
+                "changed_fields": ["methods", "path", "tool_name", "action"]
             })
         );
     }

@@ -262,7 +262,7 @@ export function RuleTable() {
                 <tr>
                   <th aria-label="Reorder" />
                   <th>Methods</th>
-                  <th>Path pattern</th>
+                  <th>Target</th>
                   <th>Principal</th>
                   <th>Action</th>
                   <th>Hits</th>
@@ -305,11 +305,15 @@ export function RuleTable() {
                       </span>
                     </td>
                     <td>
-                      <MethodList methods={row.rule.methods ?? []} />
+                      {row.rule.tool_name ? (
+                        <span className="badge neutral">MCP tool</span>
+                      ) : (
+                        <MethodList methods={row.rule.methods ?? []} />
+                      )}
                     </td>
                     <td>
                       <code className="endpoint-template rule-path">
-                        {row.rule.path}
+                        {ruleTarget(row.rule)}
                       </code>
                     </td>
                     <td>{formatPrincipal(row.rule.principal)}</td>
@@ -378,6 +382,10 @@ export function MethodList({ methods }: { methods: string[] }) {
       ))}
     </div>
   );
+}
+
+export function ruleTarget(rule: PolicyRule): string {
+  return rule.tool_name ?? rule.path ?? '-';
 }
 
 function ActionBadge({ action }: { action: PolicyRule['action'] }) {

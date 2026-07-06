@@ -106,6 +106,83 @@ describe('TrafficInventory', () => {
     );
   });
 
+  it('renders MCP tool traffic rows and navigates with a tool-name rule prefill', async () => {
+    const fetcher = trafficInventoryFetchMock({
+      endpoints: [
+        trafficEndpoint({
+          method: 'MCP',
+          endpoint_template: '/mcp/tools/reports.export',
+          call_count: 42,
+          distinct_principal_count: 5,
+          covered_by_rule: false,
+          open_signals: {
+            count: 1,
+            signal_types: ['schema_mismatch'],
+          },
+          status_counts: [
+            { status: 200, count: 40 },
+            { status: 500, count: 2 },
+          ],
+        }),
+      ],
+      policy: policyDocument({
+        roles: {
+          writer: { permissions: ['admin:policy:write'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderTrafficInventory({ token: jwtWithRoles(['writer']) });
+
+    expect(await screen.findByText('reports.export')).toBeTruthy();
+    expect(screen.getByText('MCP tool')).toBeTruthy();
+    expect(screen.getByText('42')).toBeTruthy();
+    expect(screen.getByText('4.8%')).toBeTruthy();
+    expect(screen.getByText('5')).toBeTruthy();
+    expect(screen.getByText('1 open signal')).toBeTruthy();
+
+    const createRuleButton = screen.getByRole('button', {
+      name: 'Create rule for tool reports.export',
+    }) as HTMLButtonElement;
+    await waitFor(() => expect(createRuleButton.disabled).toBe(false));
+
+    fireEvent.click(createRuleButton);
+
+    expect(screen.getByTestId('location').textContent).toBe(
+      '/policy/rules/editor?prefill_tool_name=reports.export',
+    );
+  });
+
+  it('disables tool rule creation for a read-only policy principal', async () => {
+    const fetcher = trafficInventoryFetchMock({
+      endpoints: [
+        trafficEndpoint({
+          method: 'MCP',
+          endpoint_template: '/mcp/tools/reports.export',
+        }),
+      ],
+      policy: policyDocument({
+        roles: {
+          reader: { permissions: ['admin:policy:read'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderTrafficInventory({ token: jwtWithRoles(['reader']) });
+
+    expect(await screen.findByText('reports.export')).toBeTruthy();
+    const createRuleButton = screen.getByRole('button', {
+      name: 'Create rule for tool reports.export',
+    }) as HTMLButtonElement;
+
+    expect(createRuleButton.disabled).toBe(true);
+    expect(createRuleButton.getAttribute('title')).toBe(
+      'Requires admin:policy:write',
+    );
+  });
+
   it('disables endpoint rule creation for a read-only policy principal', async () => {
     const fetcher = trafficInventoryFetchMock({
       endpoints: [
