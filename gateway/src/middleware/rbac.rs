@@ -1,6 +1,7 @@
 //! Route-level RBAC authorization middleware.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, LockResult, Mutex, MutexGuard},
     time::Duration,
@@ -26,7 +27,8 @@ use crate::{
     config::Config,
     path_match::path_prefix_matches,
     rbac::{
-        DefaultAction, EnforcementMode, Policy, PolicyEngine, RouteRule, RuleAction, RuleMatcher,
+        policy::ToolPolicyEntry, DefaultAction, EnforcementMode, Policy, PolicyEngine, RouteRule,
+        RuleAction, RuleMatcher,
     },
 };
 
@@ -68,6 +70,7 @@ pub(crate) struct ToolRuleDecision {
 pub(crate) struct ToolAuthorizationSnapshot<'a> {
     pub tool: Option<ToolPolicySnapshot<'a>>,
     pub rule_decision: Option<ToolRuleDecision>,
+    pub tools: &'a HashMap<String, ToolPolicyEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +161,7 @@ impl RbacState {
         evaluate(ToolAuthorizationSnapshot {
             tool,
             rule_decision,
+            tools: &policy.engine.policy().tools,
         })
     }
 }
