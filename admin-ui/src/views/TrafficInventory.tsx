@@ -30,6 +30,7 @@ type TrafficLoadError = {
 };
 
 const METHOD_OPTIONS = [
+  'MCP',
   'GET',
   'POST',
   'PUT',
@@ -370,7 +371,7 @@ export function TrafficInventory() {
                             <button
                               type="button"
                               className="secondary-button row-action-button"
-                              aria-label={`Create rule for ${endpoint.method} ${endpoint.endpoint_template}`}
+                              aria-label={`Create rule for ${ruleTargetLabel(endpoint)}`}
                               title={
                                 canCreateRules
                                   ? undefined
@@ -453,6 +454,27 @@ function FilterToggle({
 }
 
 function EndpointCell({ endpoint }: { endpoint: TrafficEndpoint }) {
+  const toolName = mcpToolName(endpoint);
+
+  if (toolName !== null) {
+    return (
+      <div className="traffic-endpoint-cell">
+        <div className="endpoint-title">
+          <span className="badge neutral">MCP tool</span>
+          <Link
+            className="endpoint-template endpoint-detail-link"
+            to={trafficEndpointDetailPath(endpoint)}
+            aria-label={`View detail for tool ${toolName}`}
+          >
+            {toolName}
+          </Link>
+        </div>
+        <EndpointLifecycleBadges endpoint={endpoint} />
+        <EndpointSignalBadge endpoint={endpoint} />
+      </div>
+    );
+  }
+
   return (
     <div className="traffic-endpoint-cell">
       <div className="endpoint-title">
@@ -481,10 +503,25 @@ function trafficEndpointDetailPath(endpoint: TrafficEndpoint): string {
 
 function ruleEditorPathForTrafficEndpoint(endpoint: TrafficEndpoint): string {
   const params = new URLSearchParams();
+  const toolName = mcpToolName(endpoint);
+  if (toolName !== null) {
+    params.set('prefill_tool_name', toolName);
+    return `/policy/rules/editor?${params.toString()}`;
+  }
+
   params.set('prefill_method', endpoint.method);
   params.set('prefill_path', endpoint.endpoint_template);
 
   return `/policy/rules/editor?${params.toString()}`;
+}
+
+function ruleTargetLabel(endpoint: TrafficEndpoint): string {
+  const toolName = mcpToolName(endpoint);
+  if (toolName !== null) {
+    return `tool ${toolName}`;
+  }
+
+  return `${endpoint.method} ${endpoint.endpoint_template}`;
 }
 
 function TrafficErrorMessage({ error }: { error: TrafficLoadError }) {
@@ -580,6 +617,23 @@ function toTrafficLoadError(error: unknown): TrafficLoadError {
 
 function endpointKey(endpoint: TrafficEndpoint): string {
   return `${endpoint.method}\n${endpoint.endpoint_template}`;
+}
+
+function mcpToolName(endpoint: TrafficEndpoint): string | null {
+  if (endpoint.method.trim().toUpperCase() !== 'MCP') {
+    return null;
+  }
+
+  const toolName = endpoint.endpoint_template.trim().replace(/^\/mcp\/tools\//, '');
+  if (
+    toolName.length === 0 ||
+    toolName === endpoint.endpoint_template.trim() ||
+    toolName.includes('/')
+  ) {
+    return null;
+  }
+
+  return toolName;
 }
 
 function isTrafficEndpointSort(value: string): value is TrafficEndpointSort {

@@ -84,6 +84,43 @@ describe('RuleEditor', () => {
     ).toBe(true);
   });
 
+  it('saves a tool-name prefilled rule without HTTP method or path matchers', async () => {
+    const fetchMock = policyBackedFetch(policyFixture(), 'W/"policy-1"');
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderRuleEditor(
+      '/policy/rules/editor?prefill_tool_name=reports.export&prefill_role=support&prefill_action=deny',
+    );
+
+    expect(await screen.findByDisplayValue('reports.export')).toBeTruthy();
+    expect(
+      (screen.getByLabelText('MCP tool') as HTMLInputElement).checked,
+    ).toBe(true);
+    expect(screen.queryByLabelText('Path pattern')).toBeNull();
+    expect(
+      screen.getByLabelText('Role constraints selected values').textContent,
+    ).toContain('support');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save rule' }));
+
+    expect(await screen.findByText('Rule saved.')).toBeTruthy();
+    const createCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        String(input).endsWith('/policy/rules') && init?.method === 'POST',
+    );
+    expect(createCall).toBeTruthy();
+    expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({
+      methods: [],
+      tool_name: 'reports.export',
+      principal: {
+        roles: ['support'],
+        auth_methods: [],
+        principal_ids: [],
+      },
+      action: 'deny',
+    });
+  });
+
   it('ignores invalid prefill auth method and action values', async () => {
     vi.stubGlobal('fetch', policyBackedFetch(policyFixture(), 'W/"policy-1"'));
 
@@ -386,12 +423,70 @@ describe('RuleEditor', () => {
     expect(JSON.parse(String(patchCall?.[1]?.body))).toEqual({
       methods: ['GET'],
       path: '/api/users/{id}',
+      tool_name: null,
       principal: {
         roles: ['support'],
         auth_methods: ['bearer_token'],
         principal_ids: [],
       },
       action: 'shadow',
+    });
+  });
+
+  it('clears the old path matcher when editing an existing rule into a tool rule', async () => {
+    const existingRule: PolicyRule = {
+      id: 'support-read',
+      methods: ['GET'],
+      path: '/api/users/{id}',
+      principal: {
+        roles: ['support'],
+        auth_methods: ['bearer_token'],
+        principal_ids: [],
+      },
+      action: 'allow',
+    };
+    const fetchMock = policyBackedFetch(
+      policyFixture({ rules: [existingRule] }),
+      'W/"policy-1"',
+      {
+        patchRule: {
+          id: 'support-read',
+          methods: [],
+          tool_name: 'reports.export',
+          principal: existingRule.principal,
+          action: 'deny',
+        },
+      },
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderRuleEditor('/policy/rules/editor?rule_id=support-read');
+
+    expect(await screen.findByDisplayValue('/api/users/{id}')).toBeTruthy();
+    fireEvent.click(screen.getByLabelText('MCP tool'));
+    fireEvent.change(screen.getByLabelText('Tool name'), {
+      target: { value: 'reports.export' },
+    });
+    fireEvent.click(screen.getByRole('radio', { name: /Deny/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save rule' }));
+
+    expect(await screen.findByText('Rule saved.')).toBeTruthy();
+    const patchCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        String(input).endsWith('/policy/rules/support-read') &&
+        init?.method === 'PATCH',
+    );
+    expect(patchCall).toBeTruthy();
+    expect(JSON.parse(String(patchCall?.[1]?.body))).toEqual({
+      methods: [],
+      path: null,
+      tool_name: 'reports.export',
+      principal: {
+        roles: ['support'],
+        auth_methods: ['bearer_token'],
+        principal_ids: [],
+      },
+      action: 'deny',
     });
   });
 

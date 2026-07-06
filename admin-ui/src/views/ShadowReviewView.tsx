@@ -10,7 +10,7 @@ import {
   fetchPolicyRuleShadowReview,
   patchPolicyRule,
 } from '../lib/policy';
-import { MethodList, formatPrincipal } from './RuleTable';
+import { MethodList, formatPrincipal, ruleTarget } from './RuleTable';
 
 type ShadowReviewError = {
   kind:
@@ -250,13 +250,19 @@ function ShadowReviewEntry({
           <div>
             <dt>Methods</dt>
             <dd>
-              <MethodList methods={summary.rule.methods ?? []} />
+              {summary.rule.tool_name ? (
+                <span className="badge neutral">MCP tool</span>
+              ) : (
+                <MethodList methods={summary.rule.methods ?? []} />
+              )}
             </dd>
           </div>
           <div>
-            <dt>Path</dt>
+            <dt>Target</dt>
             <dd>
-              <code className="endpoint-template rule-path">{summary.rule.path}</code>
+              <code className="endpoint-template rule-path">
+                {ruleTarget(summary.rule)}
+              </code>
             </dd>
           </div>
           <div>
