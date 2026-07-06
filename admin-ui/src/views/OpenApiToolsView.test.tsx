@@ -99,6 +99,30 @@ describe('OpenApiToolsView', () => {
     expect(fetcher.registerIfMatches).toEqual(['"etag-preview"']);
   });
 
+  it('blocks registration after the spec changes from the previewed text', async () => {
+    const fetcher = openApiToolsFetchMock();
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderOpenApiToolsView();
+
+    fireEvent.change(screen.getByLabelText('OpenAPI spec'), {
+      target: { value: widgetSpec },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+    await screen.findByText('createWidget');
+
+    fireEvent.change(screen.getByLabelText('OpenAPI spec'), {
+      target: { value: `${widgetSpec}\n# edited after preview\n` },
+    });
+
+    expect(
+      (screen.getByRole('button', {
+        name: 'Register selected',
+      }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(fetcher.registerBodies).toEqual([]);
+  });
+
   it('renders per-tool conflict errors from register failures', async () => {
     vi.stubGlobal(
       'fetch',

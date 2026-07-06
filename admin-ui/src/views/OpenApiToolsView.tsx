@@ -34,6 +34,7 @@ export function OpenApiToolsView() {
     null,
   );
   const [previewEtag, setPreviewEtag] = useState<string | null>(null);
+  const [previewedSpec, setPreviewedSpec] = useState<string | null>(null);
   const [selectedToolNames, setSelectedToolNames] = useState<Set<string>>(
     () => new Set(),
   );
@@ -86,6 +87,7 @@ export function OpenApiToolsView() {
     canWriteTools &&
     preview !== null &&
     previewEtag !== null &&
+    previewedSpec === spec &&
     selectedCount > 0 &&
     !isRegistering;
   const showWritePermissionNotice =
@@ -106,10 +108,12 @@ export function OpenApiToolsView() {
       const result = await previewOpenApiTools(spec);
       setPreview(result.preview);
       setPreviewEtag(result.etag);
+      setPreviewedSpec(spec);
       setSelectedToolNames(defaultSelectedTools(result.preview));
     } catch (error) {
       setPreview(null);
       setPreviewEtag(null);
+      setPreviewedSpec(null);
       setSelectedToolNames(new Set());
       setLoadError(toOpenApiToolsViewError(error));
     } finally {
@@ -164,6 +168,19 @@ export function OpenApiToolsView() {
     });
   }
 
+  function updateSpec(nextSpec: string) {
+    setSpec(nextSpec);
+
+    if (previewedSpec !== null && nextSpec !== previewedSpec) {
+      setPreview(null);
+      setPreviewEtag(null);
+      setPreviewedSpec(null);
+      setSelectedToolNames(new Set());
+      setMutationError(null);
+      setSuccessMessage(null);
+    }
+  }
+
   return (
     <main className="logs-page openapi-tools-page">
       <section
@@ -186,7 +203,7 @@ export function OpenApiToolsView() {
               value={spec}
               placeholder="Paste an OpenAPI 3.x YAML or JSON document"
               spellCheck={false}
-              onChange={(event) => setSpec(event.target.value)}
+              onChange={(event) => updateSpec(event.target.value)}
             />
           </label>
 

@@ -40,7 +40,7 @@ pub async fn validate_request(State(config): State<Config>, req: Request, next: 
 
     if is_mutating(req.method())
         && !is_allowed_content_type(req.headers(), &config)
-        && !is_openapi_preview_content_type(req.uri().path(), req.headers())
+        && !is_openapi_preview_content_type(req.uri().path(), req.headers(), &config)
     {
         return unsupported_media_type(&config.validation_allowed_content_types);
     }
@@ -67,8 +67,8 @@ fn is_allowed_content_type(headers: &HeaderMap, config: &Config) -> bool {
         .any(|allowed| content_type_matches(content_type, allowed))
 }
 
-fn is_openapi_preview_content_type(path: &str, headers: &HeaderMap) -> bool {
-    if !path.ends_with("/tools/openapi/preview") {
+fn is_openapi_preview_content_type(path: &str, headers: &HeaderMap, config: &Config) -> bool {
+    if path != openapi_preview_admin_route(config) {
         return false;
     }
 
@@ -80,6 +80,10 @@ fn is_openapi_preview_content_type(path: &str, headers: &HeaderMap) -> bool {
     ["text/plain", "application/yaml", "application/x-yaml"]
         .iter()
         .any(|allowed| content_type_matches(content_type, allowed))
+}
+
+fn openapi_preview_admin_route(config: &Config) -> String {
+    format!("/v1{}/tools/openapi/preview", config.admin_prefix)
 }
 
 fn content_type_matches(content_type: &str, allowed: &str) -> bool {
@@ -306,6 +310,23 @@ mod tests {
                     .uri("/")
                     .header(CONTENT_TYPE, "text/plain")
                     .body(Body::from("hello"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn rejects_openapi_preview_suffix_on_non_admin_path() {
+        let response = test_router(test_config(1024, vec!["application/json"]))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/some/other/prefix/tools/openapi/preview")
+                    .header(CONTENT_TYPE, "application/yaml")
+                    .body(Body::from("openapi: 3.0.3"))
                     .expect("request should build"),
             )
             .await

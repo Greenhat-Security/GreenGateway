@@ -9465,6 +9465,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_path_ending_in_openapi_preview_does_not_get_preview_content_type_exception() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut config = proxy_config(upstream_addr);
+        config.validation_allowed_content_types = vec!["application/json".to_owned()];
+        let router = proxy_router(config, test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/some/other/prefix/tools/openapi/preview")
+                    .header(header::CONTENT_TYPE, "application/yaml")
+                    .body(Body::from("openapi: 3.0.3"))
+                    .expect("proxy request should build"),
+            )
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "content-type validation should reject suffix-confused proxy path",
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn routing_table_selects_two_upstreams_by_path_prefix() {
         let (api_addr, mut api_captured) = spawn_capture_upstream().await;
         let (assets_addr, mut assets_captured) = spawn_capture_upstream().await;
@@ -13548,6 +13575,38 @@ mod tests {
             ])
         );
         assert_eq!(body["skipped_operations"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn openapi_tools_preview_accepts_spec_content_types() {
+        for content_type in [
+            "text/plain; charset=utf-8",
+            "application/yaml",
+            "application/x-yaml",
+        ] {
+            let harness = tools_admin_harness(empty_tools_document(), test_audit_log()).await;
+
+            let response = harness
+                .router
+                .oneshot(tools_openapi_preview_request_with_content_type(
+                    &harness.admin_token,
+                    widget_openapi_spec(),
+                    content_type,
+                ))
+                .await
+                .expect("OpenAPI tools preview request should complete");
+
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            let body = json_body(response).await;
+            assert!(
+                body["tools"]
+                    .as_array()
+                    .expect("preview response should include tools")
+                    .iter()
+                    .any(|tool| tool["name"] == json!("createWidget")),
+                "preview response should include createWidget for {content_type}: {body}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -20262,11 +20321,19 @@ paths:
     }
 
     fn tools_openapi_preview_request(token: &str, spec: &str) -> Request<Body> {
+        tools_openapi_preview_request_with_content_type(token, spec, "text/plain; charset=utf-8")
+    }
+
+    fn tools_openapi_preview_request_with_content_type(
+        token: &str,
+        spec: &str,
+        content_type: &str,
+    ) -> Request<Body> {
         Request::builder()
             .method(Method::POST)
             .uri(TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE)
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(header::CONTENT_TYPE, content_type)
             .body(Body::from(spec.to_owned()))
             .expect("OpenAPI tools preview request should build")
     }
