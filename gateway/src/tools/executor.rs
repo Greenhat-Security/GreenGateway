@@ -2,11 +2,14 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::{Duration, Instant},
 };
 
-use http::{header, HeaderMap, HeaderValue, Method};
+use http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use rmcp::model::CallToolResult;
 use serde_json::{json, Value};
@@ -49,6 +52,19 @@ const PATH_SEGMENT_ARGUMENT_ENCODE_SET: &AsciiSet = &CONTROLS
 const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
 const MCP_TOOL_OBSERVATION_METHOD: &str = "MCP";
 const TOOL_INPUT_VALIDATION_STATUS: u16 = 400;
+const TOOL_INPUT_VALIDATION_REASON: &str = "input_validation";
+const TOOL_EXECUTOR_CONFIGURATION_ERROR_STATUS: u16 = 520;
+const TOOL_EXECUTOR_CONFIGURATION_ERROR_REASON: &str = "internal_configuration_error";
+const TOOL_INVALID_PARAMS_REASON: &str = "invalid_params";
+const TOOL_UNKNOWN_TOOL_REASON: &str = "unknown_tool";
+const TOOL_DISABLED_REASON: &str = "disabled";
+const TOOL_ROLE_NOT_ALLOWED_REASON: &str = "role_not_allowed";
+const TOOL_MATCHED_RULE_REASON: &str = "matched_rule";
+const TOOL_QUEUE_FULL_REASON: &str = "queue_full";
+const TOOL_QUEUE_TIMEOUT_REASON: &str = "queue_timeout";
+const TOOL_CANCELLED_REASON: &str = "cancelled";
+const TOOL_RUNTIME_CLOSED_REASON: &str = "runtime_closed";
+const TOOL_RUNTIME_REJECTED_REASON: &str = "runtime_rejected";
 
 type ValidatorCache = HashMap<ValidatorCacheKey, Arc<jsonschema::Validator>>;
 
@@ -244,6 +260,13 @@ struct UpstreamAuditOutcome {
     reason: Option<&'static str>,
 }
 
+struct ToolObservationOutcome {
+    status: u16,
+    latency_ms: u64,
+    schema_mismatch: bool,
+    reason: Option<&'static str>,
+}
+
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 struct ValidatorCacheKey {
     tool_name: String,
@@ -340,28 +363,55 @@ impl ToolExecutor {
         context: ToolInvocationContext,
         cancel: CancellationToken,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        let started = Instant::now();
         let runtime_tool_name = tool_name.to_owned();
         let work_tool_name = runtime_tool_name.clone();
+        let observation_context = context.clone();
         let work_context = context.clone();
+        let work_started = Arc::new(AtomicBool::new(false));
+        let work_started_for_closure = Arc::clone(&work_started);
         let executor = self.clone();
 
-        self.runtime
+        let result = self
+            .runtime
             .execute_result_with_context_and_reason(
                 &runtime_tool_name,
                 context,
                 cancel,
                 move || async move {
+                    work_started_for_closure.store(true, Ordering::SeqCst);
                     executor
                         .execute_inner(&work_tool_name, args, &work_context)
                         .await
                 },
                 |error| Some(executor_work_failure_reason(error).to_owned()),
             )
-            .await
+            .await;
+
+        if let Err(error) = &result {
+            self.emit_runtime_admission_failure_observation(
+                &observation_context,
+                &runtime_tool_name,
+                duration_millis(started.elapsed()),
+                error,
+                work_started.load(Ordering::SeqCst),
+            );
+        }
+
+        result
     }
 
     pub(crate) fn can_list_tool(&self, tool_name: &str, context: &ToolInvocationContext) -> bool {
         self.runtime.tool_visible_to_context(tool_name, context)
+    }
+
+    pub(crate) fn record_unknown_tool_call(
+        &self,
+        context: &ToolInvocationContext,
+        tool_name: &str,
+        elapsed: Duration,
+    ) {
+        self.emit_unknown_tool_observation(context, tool_name, duration_millis(elapsed));
     }
 
     async fn execute_inner(
@@ -370,14 +420,33 @@ impl ToolExecutor {
         args: Value,
         context: &ToolInvocationContext,
     ) -> Result<ToolExecutionResult, ToolExecutorError> {
-        let tool = self
-            .registry
-            .get(tool_name)
-            .ok_or_else(|| ToolExecutorError::UnknownTool {
-                tool_name: tool_name.to_owned(),
-            })?;
+        let lookup_started = Instant::now();
+        let tool = match self.registry.get(tool_name) {
+            Some(tool) => tool,
+            None => {
+                self.emit_unknown_tool_observation(
+                    context,
+                    tool_name,
+                    duration_millis(lookup_started.elapsed()),
+                );
+                return Err(ToolExecutorError::UnknownTool {
+                    tool_name: tool_name.to_owned(),
+                });
+            }
+        };
         let validation_started = Instant::now();
-        let validator = self.validator_for(&tool)?;
+        let validator = match self.validator_for(&tool) {
+            Ok(validator) => validator,
+            Err(error) => {
+                self.emit_executor_failure_observation(
+                    context,
+                    &tool,
+                    duration_millis(validation_started.elapsed()),
+                    &error,
+                );
+                return Err(error);
+            }
+        };
         if let Err(error) = validate_args(&tool, &validator, &args) {
             if matches!(error, ToolExecutorError::InputValidation { .. }) {
                 self.emit_schema_mismatch_observation(
@@ -393,7 +462,19 @@ impl ToolExecutor {
             return self.execute_mcp_proxy(context, &tool, mapping, args).await;
         }
 
-        let request = self.build_request(&tool, &args)?;
+        let request_build_started = Instant::now();
+        let request = match self.build_request(&tool, &args) {
+            Ok(request) => request,
+            Err(error) => {
+                self.emit_executor_failure_observation(
+                    context,
+                    &tool,
+                    duration_millis(request_build_started.elapsed()),
+                    &error,
+                );
+                return Err(error);
+            }
+        };
         let started = Instant::now();
         let result = self
             .egress_client
@@ -408,14 +489,25 @@ impl ToolExecutor {
 
         match result {
             Ok(response) => {
+                let status = response.status.as_u16();
                 self.emit_upstream_audit(
                     context,
                     &tool,
                     &request.method,
                     UpstreamAuditOutcome {
                         outcome: "success",
-                        status: Some(response.status.as_u16()),
+                        status: Some(status),
                         latency_ms,
+                        reason: None,
+                    },
+                );
+                self.emit_tool_observation(
+                    context,
+                    &tool,
+                    ToolObservationOutcome {
+                        status,
+                        latency_ms,
+                        schema_mismatch: false,
                         reason: None,
                     },
                 );
@@ -423,6 +515,7 @@ impl ToolExecutor {
             }
             Err(source) => {
                 let reason = egress_error_reason(&source);
+                let status = egress_error_observation_status(&source);
                 self.emit_upstream_audit(
                     context,
                     &tool,
@@ -431,6 +524,16 @@ impl ToolExecutor {
                         outcome: "failure",
                         status: None,
                         latency_ms,
+                        reason: Some(reason),
+                    },
+                );
+                self.emit_tool_observation(
+                    context,
+                    &tool,
+                    ToolObservationOutcome {
+                        status,
+                        latency_ms,
+                        schema_mismatch: false,
                         reason: Some(reason),
                     },
                 );
@@ -450,6 +553,16 @@ impl ToolExecutor {
         args: Value,
     ) -> Result<ToolExecutionResult, ToolExecutorError> {
         let Some(server) = self.mcp_upstream_servers.get(&mapping.server_name) else {
+            self.emit_tool_observation(
+                context,
+                tool,
+                ToolObservationOutcome {
+                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                    latency_ms: 0,
+                    schema_mismatch: false,
+                    reason: Some("unknown_mcp_upstream_server"),
+                },
+            );
             return Err(ToolExecutorError::McpUpstream {
                 tool_name: tool.name.clone(),
                 server_name: mapping.server_name,
@@ -481,10 +594,21 @@ impl ToolExecutor {
                         reason: None,
                     },
                 );
+                self.emit_tool_observation(
+                    context,
+                    tool,
+                    ToolObservationOutcome {
+                        status: StatusCode::OK.as_u16(),
+                        latency_ms,
+                        schema_mismatch: false,
+                        reason: None,
+                    },
+                );
                 Ok(ToolExecutionResult::McpCallToolResult(result))
             }
             Err(source) => {
                 let reason = source.reason();
+                let status = mcp_upstream_error_observation_status(&source);
                 self.emit_mcp_upstream_audit(
                     context,
                     tool,
@@ -493,6 +617,16 @@ impl ToolExecutor {
                         outcome: "failure",
                         status: None,
                         latency_ms,
+                        reason: Some(reason),
+                    },
+                );
+                self.emit_tool_observation(
+                    context,
+                    tool,
+                    ToolObservationOutcome {
+                        status,
+                        latency_ms,
+                        schema_mismatch: false,
                         reason: Some(reason),
                     },
                 );
@@ -681,30 +815,116 @@ impl ToolExecutor {
         ));
     }
 
+    fn emit_tool_observation(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        outcome: ToolObservationOutcome,
+    ) {
+        self.emit_named_tool_observation(context, &tool.name, outcome);
+    }
+
+    fn emit_unknown_tool_observation(
+        &self,
+        context: &ToolInvocationContext,
+        tool_name: &str,
+        latency_ms: u64,
+    ) {
+        self.emit_named_tool_observation(
+            context,
+            tool_name,
+            ToolObservationOutcome {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                latency_ms,
+                schema_mismatch: false,
+                reason: Some(TOOL_UNKNOWN_TOOL_REASON),
+            },
+        );
+    }
+
+    fn emit_named_tool_observation(
+        &self,
+        context: &ToolInvocationContext,
+        tool_name: &str,
+        outcome: ToolObservationOutcome,
+    ) {
+        let path = tool_observation_path(tool_name);
+        let endpoint_template = path.clone();
+        let mut payload = json!({
+                "method": MCP_TOOL_OBSERVATION_METHOD,
+                "path": path,
+                "endpoint_template": endpoint_template,
+                "status": outcome.status,
+                "latency_ms": outcome.latency_ms,
+                "tool_name": tool_name,
+                "schema_mismatch": outcome.schema_mismatch,
+        });
+
+        if let Some(reason) = outcome.reason {
+            payload["reason"] = json!(reason);
+        }
+
+        self.audit.emit(AuditEvent::new(
+            HTTP_REQUEST_OBSERVED,
+            &context.request_id,
+            &context.source_ip,
+            context.actor.clone(),
+            payload,
+        ));
+    }
+
     fn emit_schema_mismatch_observation(
         &self,
         context: &ToolInvocationContext,
         tool: &ToolDefinition,
         latency_ms: u64,
     ) {
-        let path = tool_observation_path(&tool.name);
-        let endpoint_template = path.clone();
-        self.audit.emit(AuditEvent::new(
-            HTTP_REQUEST_OBSERVED,
-            &context.request_id,
-            &context.source_ip,
-            context.actor.clone(),
-            json!({
-                "method": MCP_TOOL_OBSERVATION_METHOD,
-                "path": path,
-                "endpoint_template": endpoint_template,
-                "status": TOOL_INPUT_VALIDATION_STATUS,
-                "latency_ms": latency_ms,
-                "tool_name": tool.name,
-                "schema_mismatch": true,
-                "reason": "input_validation",
-            }),
-        ));
+        self.emit_tool_observation(
+            context,
+            tool,
+            ToolObservationOutcome {
+                status: TOOL_INPUT_VALIDATION_STATUS,
+                latency_ms,
+                schema_mismatch: true,
+                reason: Some(TOOL_INPUT_VALIDATION_REASON),
+            },
+        );
+    }
+
+    fn emit_executor_failure_observation(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        latency_ms: u64,
+        error: &ToolExecutorError,
+    ) {
+        let outcome = executor_failure_observation_outcome(latency_ms, error);
+        self.emit_tool_observation(context, tool, outcome);
+    }
+
+    fn emit_runtime_admission_failure_observation(
+        &self,
+        context: &ToolInvocationContext,
+        tool_name: &str,
+        latency_ms: u64,
+        error: &ToolRuntimeError,
+        work_started: bool,
+    ) {
+        if matches!(error, ToolRuntimeError::UnknownTool { .. }) {
+            self.emit_unknown_tool_observation(context, tool_name, latency_ms);
+            return;
+        }
+
+        let Some(outcome) =
+            runtime_admission_failure_observation_outcome(latency_ms, error, work_started)
+        else {
+            return;
+        };
+
+        match self.registry.get(tool_name) {
+            Some(tool) => self.emit_tool_observation(context, &tool, outcome),
+            None => self.emit_named_tool_observation(context, tool_name, outcome),
+        }
     }
 }
 
@@ -958,13 +1178,135 @@ fn egress_error_reason(error: &EgressError) -> &'static str {
     }
 }
 
-fn executor_work_failure_reason(error: &ToolExecutorError) -> &'static str {
+fn egress_error_observation_status(error: &EgressError) -> u16 {
+    if error.is_timeout() {
+        StatusCode::GATEWAY_TIMEOUT.as_u16()
+    } else {
+        StatusCode::BAD_GATEWAY.as_u16()
+    }
+}
+
+fn mcp_upstream_error_observation_status(_error: &mcp_upstream::McpUpstreamCallError) -> u16 {
+    StatusCode::BAD_GATEWAY.as_u16()
+}
+
+fn executor_failure_observation_outcome(
+    latency_ms: u64,
+    error: &ToolExecutorError,
+) -> ToolObservationOutcome {
     match error {
-        ToolExecutorError::UnknownTool { .. } => "unknown_tool",
         ToolExecutorError::InputValidation { .. }
         | ToolExecutorError::MissingArgument { .. }
         | ToolExecutorError::UnsupportedArgumentValue { .. }
-        | ToolExecutorError::PathSegmentIsDotSegment { .. } => "invalid_params",
+        | ToolExecutorError::PathSegmentIsDotSegment { .. } => ToolObservationOutcome {
+            status: TOOL_INPUT_VALIDATION_STATUS,
+            latency_ms,
+            schema_mismatch: true,
+            reason: Some(TOOL_INPUT_VALIDATION_REASON),
+        },
+        ToolExecutorError::UnknownTool { .. } => ToolObservationOutcome {
+            status: StatusCode::NOT_FOUND.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_UNKNOWN_TOOL_REASON),
+        },
+        ToolExecutorError::Egress { source, .. } => ToolObservationOutcome {
+            status: egress_error_observation_status(source),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(egress_error_reason(source)),
+        },
+        ToolExecutorError::McpUpstream { reason, .. } => ToolObservationOutcome {
+            status: StatusCode::BAD_GATEWAY.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(reason),
+        },
+        ToolExecutorError::MissingUpstreamUrl
+        | ToolExecutorError::InvalidUpstreamUrl { .. }
+        | ToolExecutorError::SchemaCacheKey { .. }
+        | ToolExecutorError::SchemaCompile { .. }
+        | ToolExecutorError::InvalidMapping { .. }
+        | ToolExecutorError::InvalidMethod { .. }
+        | ToolExecutorError::BodySerialize { .. }
+        | ToolExecutorError::UrlBuild { .. } => ToolObservationOutcome {
+            status: TOOL_EXECUTOR_CONFIGURATION_ERROR_STATUS,
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_EXECUTOR_CONFIGURATION_ERROR_REASON),
+        },
+    }
+}
+
+fn runtime_admission_failure_observation_outcome(
+    latency_ms: u64,
+    error: &ToolRuntimeError,
+    work_started: bool,
+) -> Option<ToolObservationOutcome> {
+    match error {
+        ToolRuntimeError::Disabled { .. } => Some(ToolObservationOutcome {
+            status: StatusCode::FORBIDDEN.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_DISABLED_REASON),
+        }),
+        ToolRuntimeError::RoleDenied { .. } => Some(ToolObservationOutcome {
+            status: StatusCode::FORBIDDEN.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_ROLE_NOT_ALLOWED_REASON),
+        }),
+        ToolRuntimeError::Rejected { reason, .. } => {
+            let (status, reason) = match reason.as_str() {
+                TOOL_QUEUE_FULL_REASON => (
+                    StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                    TOOL_QUEUE_FULL_REASON,
+                ),
+                TOOL_MATCHED_RULE_REASON => {
+                    (StatusCode::FORBIDDEN.as_u16(), TOOL_MATCHED_RULE_REASON)
+                }
+                TOOL_RUNTIME_CLOSED_REASON => (
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    TOOL_RUNTIME_CLOSED_REASON,
+                ),
+                _ => (
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    TOOL_RUNTIME_REJECTED_REASON,
+                ),
+            };
+            Some(ToolObservationOutcome {
+                status,
+                latency_ms,
+                schema_mismatch: false,
+                reason: Some(reason),
+            })
+        }
+        ToolRuntimeError::QueueTimeout { .. } => Some(ToolObservationOutcome {
+            status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_QUEUE_TIMEOUT_REASON),
+        }),
+        ToolRuntimeError::Cancelled { .. } if !work_started => Some(ToolObservationOutcome {
+            status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_CANCELLED_REASON),
+        }),
+        ToolRuntimeError::UnknownTool { .. }
+        | ToolRuntimeError::Timeout { .. }
+        | ToolRuntimeError::Cancelled { .. }
+        | ToolRuntimeError::WorkFailed { .. } => None,
+    }
+}
+
+fn executor_work_failure_reason(error: &ToolExecutorError) -> &'static str {
+    match error {
+        ToolExecutorError::UnknownTool { .. } => TOOL_UNKNOWN_TOOL_REASON,
+        ToolExecutorError::InputValidation { .. }
+        | ToolExecutorError::MissingArgument { .. }
+        | ToolExecutorError::UnsupportedArgumentValue { .. }
+        | ToolExecutorError::PathSegmentIsDotSegment { .. } => TOOL_INVALID_PARAMS_REASON,
         ToolExecutorError::Egress { source, .. } => egress_error_reason(source),
         ToolExecutorError::McpUpstream { reason, .. } => reason,
         ToolExecutorError::MissingUpstreamUrl
@@ -974,7 +1316,7 @@ fn executor_work_failure_reason(error: &ToolExecutorError) -> &'static str {
         | ToolExecutorError::InvalidMapping { .. }
         | ToolExecutorError::InvalidMethod { .. }
         | ToolExecutorError::BodySerialize { .. }
-        | ToolExecutorError::UrlBuild { .. } => "internal_configuration_error",
+        | ToolExecutorError::UrlBuild { .. } => TOOL_EXECUTOR_CONFIGURATION_ERROR_REASON,
     }
 }
 
@@ -1011,14 +1353,15 @@ mod tests {
     use super::*;
     use crate::{
         audit::{
-            sink::{tests::CaptureSink, AuditSink},
-            AuditLog,
+            sink::{tests::CaptureSink, AuditSink, CompositeSink},
+            Actor, AuditLog,
         },
         discovery::{
             aggregator::{EndpointAggregatorSink, EndpointAggregatorSinkConfig},
             signals::{DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD, SCHEMA_MISMATCH_SIGNAL_TYPE},
         },
         egress::EgressConfig,
+        rbac::Policy,
         tools::runtime::{DefaultToolPolicy, ToolRuntimeConfig, ToolRuntimeToolConfig},
     };
 
@@ -1052,10 +1395,11 @@ mod tests {
         assert_eq!(request.header("content-type"), Some("application/json"));
         assert_eq!(request.body, br#"{"message":"hello"}"#);
 
-        let events = audit_events(&capture, 3).await;
+        let events = audit_events(&capture, 4).await;
         assert_eq!(events[0].event_type, audit::event::TOOL_INVOKE_START);
         assert_eq!(events[1].event_type, audit::event::TOOL_UPSTREAM_REQUEST);
-        assert_eq!(events[2].event_type, audit::event::TOOL_INVOKE_SUCCESS);
+        assert_eq!(events[2].event_type, HTTP_REQUEST_OBSERVED);
+        assert_eq!(events[3].event_type, audit::event::TOOL_INVOKE_SUCCESS);
         assert_eq!(events[1].payload["tool_name"], json!("echo"));
         assert_eq!(events[1].payload["method"], json!("POST"));
         assert_eq!(events[1].payload["path_template"], json!("/v1/echo"));
@@ -1064,6 +1408,19 @@ mod tests {
         assert!(
             events[1].payload["latency_ms"].as_u64().is_some(),
             "upstream audit event should include latency_ms"
+        );
+        assert_eq!(events[2].payload["tool_name"], json!("echo"));
+        assert_eq!(events[2].payload["method"], json!("MCP"));
+        assert_eq!(events[2].payload["path"], json!("/mcp/tools/echo"));
+        assert_eq!(
+            events[2].payload["endpoint_template"],
+            json!("/mcp/tools/echo")
+        );
+        assert_eq!(events[2].payload["status"], json!(201));
+        assert_eq!(events[2].payload["schema_mismatch"], json!(false));
+        assert!(
+            events[2].payload["latency_ms"].as_u64().is_some(),
+            "tool observation event should include latency_ms"
         );
         assert_eq!(executor.validator_cache_guard().len(), 1);
     }
@@ -1246,7 +1603,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_path_placeholder_arg_is_rejected() {
-        let (executor, _capture) = executor_for_tools(
+        let (executor, capture) = executor_for_tools(
             socket_addr(1),
             [widget_tool(false, false)],
             runtime_config([("get_widget", enabled_tool(500, 1))], 2, 1, 100),
@@ -1264,6 +1621,285 @@ mod tests {
 
         let message = work_failed_message(error);
         assert!(message.contains("missing required path argument 'widget_id'"));
+
+        let events = audit_events(&capture, 3).await;
+        assert_eq!(events[0].event_type, audit::event::TOOL_INVOKE_START);
+        assert_eq!(events[1].event_type, HTTP_REQUEST_OBSERVED);
+        assert_eq!(events[2].event_type, audit::event::TOOL_INVOKE_FAILURE);
+        assert_eq!(events[1].payload["tool_name"], json!("get_widget"));
+        assert_eq!(events[1].payload["method"], json!("MCP"));
+        assert_eq!(events[1].payload["path"], json!("/mcp/tools/get_widget"));
+        assert_eq!(
+            events[1].payload["endpoint_template"],
+            json!("/mcp/tools/get_widget")
+        );
+        assert_eq!(events[1].payload["status"], json!(400));
+        assert_eq!(events[1].payload["schema_mismatch"], json!(true));
+        assert_eq!(events[1].payload["reason"], json!("input_validation"));
+        assert!(
+            events[1].payload["latency_ms"].as_u64().is_some(),
+            "tool observation event should include latency_ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_upstream_url_reports_configuration_error_observation() {
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let executor = executor_for_tools_with_optional_upstream(
+            [echo_tool()],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+            audit,
+            None,
+        );
+
+        let error = executor
+            .execute(
+                "echo",
+                json!({ "message": "hello" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("missing upstream URL should fail during request build");
+
+        let message = work_failed_message(error);
+        assert!(message.contains("requires UPSTREAM_URL to be set"));
+
+        let events = audit_events(&capture, 3).await;
+        assert_eq!(events[0].event_type, audit::event::TOOL_INVOKE_START);
+        assert_eq!(events[1].event_type, HTTP_REQUEST_OBSERVED);
+        assert_eq!(events[2].event_type, audit::event::TOOL_INVOKE_FAILURE);
+        assert_eq!(events[1].payload["tool_name"], json!("echo"));
+        assert_eq!(events[1].payload["method"], json!("MCP"));
+        assert_eq!(events[1].payload["path"], json!("/mcp/tools/echo"));
+        assert_eq!(
+            events[1].payload["endpoint_template"],
+            json!("/mcp/tools/echo")
+        );
+        assert_eq!(events[1].payload["status"], json!(520));
+        assert_eq!(events[1].payload["schema_mismatch"], json!(false));
+        assert_eq!(
+            events[1].payload["reason"],
+            json!("internal_configuration_error")
+        );
+        assert!(
+            events[1].payload["latency_ms"].as_u64().is_some(),
+            "tool observation event should include latency_ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_emits_raw_name_inventory_observation() {
+        let db = TempDiscoveryDb::new("tool-unknown-tool-inventory");
+        let aggregator = Arc::new(
+            EndpointAggregatorSink::new(EndpointAggregatorSinkConfig {
+                path: db.path.clone(),
+                payload_capture_enabled: false,
+                signal_event_sender: None,
+                signal_detector_config: Default::default(),
+            })
+            .expect("discovery aggregator sink should build"),
+        ) as Arc<dyn AuditSink>;
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(CompositeSink::new(vec![
+            Arc::new(capture.clone()) as Arc<dyn AuditSink>,
+            aggregator,
+        ])) as Arc<dyn AuditSink>);
+        let executor = executor_for_tools_with_audit(
+            socket_addr(1),
+            [echo_tool()],
+            runtime_config_without_tools(DefaultToolPolicy::Allow),
+            audit,
+        );
+
+        let error = executor
+            .execute(
+                "missing_tool",
+                json!({}),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("unknown registry tool should fail inside the executor");
+
+        let message = work_failed_message(error);
+        assert!(message.contains("tool 'missing_tool' is not defined"));
+
+        let events = audit_events(&capture, 3).await;
+        assert_eq!(events[0].event_type, audit::event::TOOL_INVOKE_START);
+        assert_eq!(events[1].event_type, HTTP_REQUEST_OBSERVED);
+        assert_eq!(events[2].event_type, audit::event::TOOL_INVOKE_FAILURE);
+        assert_eq!(events[1].payload["tool_name"], json!("missing_tool"));
+        assert_eq!(events[1].payload["method"], json!("MCP"));
+        assert_eq!(events[1].payload["path"], json!("/mcp/tools/missing_tool"));
+        assert_eq!(
+            events[1].payload["endpoint_template"],
+            json!("/mcp/tools/missing_tool")
+        );
+        assert_eq!(events[1].payload["status"], json!(404));
+        assert_eq!(events[1].payload["schema_mismatch"], json!(false));
+        assert_eq!(events[1].payload["reason"], json!("unknown_tool"));
+        assert!(
+            events[1].payload["latency_ms"].as_u64().is_some(),
+            "tool observation event should include latency_ms"
+        );
+
+        wait_until(Duration::from_secs(2), || {
+            discovery_aggregate_snapshot(&db.path, "MCP", "/mcp/tools/missing_tool").is_some_and(
+                |aggregate| aggregate.call_count == 1 && aggregate.schema_mismatch_count == 0,
+            )
+        })
+        .await;
+
+        let aggregate = discovery_aggregate_snapshot(&db.path, "MCP", "/mcp/tools/missing_tool")
+            .expect("unknown tool inventory aggregate should be present");
+        assert_eq!(aggregate.call_count, 1);
+        assert_eq!(aggregate.schema_mismatch_count, 0);
+    }
+
+    #[tokio::test]
+    async fn disabled_live_policy_tool_feeds_inventory_observation() {
+        let (audit, capture, db) = inventory_audit("tool-disabled-policy-inventory");
+        let runtime = live_policy_runtime(
+            json!({
+                "schema_version": "0.1.0",
+                "tools": {
+                    "echo": {
+                        "enabled": false,
+                        "timeout_ms": 500,
+                        "max_concurrent": 1
+                    }
+                }
+            }),
+            audit.clone(),
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let executor =
+            executor_for_tools_with_runtime(socket_addr(1), [echo_tool()], runtime, audit);
+
+        let error = executor
+            .execute(
+                "echo",
+                json!({ "message": "hello" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("live policy enabled=false should reject before execution");
+
+        assert!(matches!(error, ToolRuntimeError::Disabled { .. }));
+        assert_inventory_observation(&capture, &db.path, "echo", 403, "disabled").await;
+    }
+
+    #[tokio::test]
+    async fn role_denied_live_policy_tool_feeds_inventory_observation() {
+        let (audit, capture, db) = inventory_audit("tool-role-denied-policy-inventory");
+        let runtime = live_policy_runtime(
+            json!({
+                "schema_version": "0.1.0",
+                "tools": {
+                    "echo": {
+                        "allowed_roles": ["operator"],
+                        "timeout_ms": 500,
+                        "max_concurrent": 1
+                    }
+                }
+            }),
+            audit.clone(),
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let executor =
+            executor_for_tools_with_runtime(socket_addr(1), [echo_tool()], runtime, audit);
+
+        let error = executor
+            .execute(
+                "echo",
+                json!({ "message": "hello" }),
+                invocation_context_with_roles(&["viewer"]),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("viewer should not satisfy the live policy allowed_roles");
+
+        assert!(matches!(error, ToolRuntimeError::RoleDenied { .. }));
+        assert_inventory_observation(&capture, &db.path, "echo", 403, "role_not_allowed").await;
+    }
+
+    #[tokio::test]
+    async fn live_policy_unknown_tool_feeds_inventory_observation() {
+        let (audit, capture, db) = inventory_audit("tool-live-policy-unknown-inventory");
+        let runtime = live_policy_runtime(
+            json!({ "schema_version": "0.1.0" }),
+            audit.clone(),
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let executor =
+            executor_for_tools_with_runtime(socket_addr(1), [echo_tool()], runtime, audit);
+
+        let error = executor
+            .execute(
+                "echo",
+                json!({ "message": "hello" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("registered tool absent from live policy tools map should reject");
+
+        assert!(matches!(error, ToolRuntimeError::UnknownTool { .. }));
+        assert_inventory_observation(&capture, &db.path, "echo", 404, "unknown_tool").await;
+    }
+
+    #[tokio::test]
+    async fn queue_full_rejection_feeds_inventory_observation() {
+        let server = gated_server().await;
+        let (audit, capture, db) = inventory_audit("tool-queue-full-inventory");
+        let executor = executor_for_tools_with_audit(
+            server.addr,
+            [widget_tool(false, true)],
+            runtime_config([("get_widget", enabled_tool(1_000, 1))], 1, 1, 100),
+            audit,
+        );
+
+        let first = tokio::spawn({
+            let executor = executor.clone();
+            async move {
+                executor
+                    .execute(
+                        "get_widget",
+                        json!({ "widget_id": "first" }),
+                        invocation_context(),
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        wait_until(Duration::from_secs(1), || server.request_count() == 1).await;
+
+        let error = executor
+            .execute(
+                "get_widget",
+                json!({ "widget_id": "second" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("full runtime queue should reject before execution");
+
+        assert!(matches!(
+            error,
+            ToolRuntimeError::Rejected { ref reason, .. } if reason == "queue_full"
+        ));
+        assert_inventory_observation(&capture, &db.path, "get_widget", 429, "queue_full").await;
+
+        server.release.release();
+        first
+            .await
+            .expect("first invocation task should join")
+            .expect("first invocation should complete after server release");
+        server.stop.cancel();
+        server.handle.abort();
     }
 
     #[tokio::test]
@@ -1579,12 +2215,54 @@ mod tests {
         runtime_config: ToolRuntimeConfig,
         audit: AuditLog,
     ) -> ToolExecutor {
+        executor_for_tools_with_optional_upstream(
+            tools,
+            runtime_config,
+            audit,
+            Some(format!("http://127.0.0.1:{}/ignored-base", addr.port())),
+        )
+    }
+
+    fn executor_for_tools_with_optional_upstream<const N: usize>(
+        tools: [Value; N],
+        runtime_config: ToolRuntimeConfig,
+        audit: AuditLog,
+        upstream_url: Option<String>,
+    ) -> ToolExecutor {
         let registry = ToolRegistry::from_json_value(json!({
             "schema_version": "0.1.0",
             "tools": Value::Array(tools.into_iter().collect())
         }))
         .expect("test tools should load");
         let runtime = ToolRuntime::new(runtime_config, audit.clone());
+        executor_for_registry_with_runtime(registry, runtime, audit, upstream_url)
+    }
+
+    fn executor_for_tools_with_runtime<const N: usize>(
+        addr: SocketAddr,
+        tools: [Value; N],
+        runtime: ToolRuntime,
+        audit: AuditLog,
+    ) -> ToolExecutor {
+        let registry = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": Value::Array(tools.into_iter().collect())
+        }))
+        .expect("test tools should load");
+        executor_for_registry_with_runtime(
+            registry,
+            runtime,
+            audit,
+            Some(format!("http://127.0.0.1:{}/ignored-base", addr.port())),
+        )
+    }
+
+    fn executor_for_registry_with_runtime(
+        registry: ToolRegistry,
+        runtime: ToolRuntime,
+        audit: AuditLog,
+        upstream_url: Option<String>,
+    ) -> ToolExecutor {
         let egress_client = Arc::new(
             EgressClient::new(EgressConfig {
                 allowed_hosts: ["127.0.0.1".to_owned()].into_iter().collect(),
@@ -1593,16 +2271,56 @@ mod tests {
             })
             .expect("test egress client should build"),
         );
-        let executor = ToolExecutor::new(
+        let executor = ToolExecutor::new_inner(
             registry,
             runtime,
             egress_client,
             audit,
-            &format!("http://127.0.0.1:{}/ignored-base", addr.port()),
+            upstream_url.as_deref(),
+            HashMap::new(),
+            McpUpstreamRuntimeConfig {
+                timeout: Duration::from_secs(30),
+                response_idle_timeout: Duration::from_secs(30),
+                connect_timeout: Duration::from_secs(10),
+                max_request_body_bytes: 1_048_576,
+                max_response_bytes: 5_242_880,
+            },
         )
         .expect("tool executor should build");
 
         executor
+    }
+
+    fn live_policy_runtime(
+        policy_document: Value,
+        audit: AuditLog,
+        runtime_config: ToolRuntimeConfig,
+    ) -> ToolRuntime {
+        let policy =
+            Policy::validate_json_value(policy_document).expect("test live policy should validate");
+        let rbac_state =
+            crate::middleware::rbac::RbacState::new(policy, Vec::new(), false, audit.clone());
+        ToolRuntime::new_with_rbac_state(runtime_config, audit, Some(rbac_state))
+    }
+
+    fn inventory_audit(test_name: &str) -> (AuditLog, CaptureSink, TempDiscoveryDb) {
+        let db = TempDiscoveryDb::new(test_name);
+        let aggregator = Arc::new(
+            EndpointAggregatorSink::new(EndpointAggregatorSinkConfig {
+                path: db.path.clone(),
+                payload_capture_enabled: false,
+                signal_event_sender: None,
+                signal_detector_config: Default::default(),
+            })
+            .expect("discovery aggregator sink should build"),
+        ) as Arc<dyn AuditSink>;
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(CompositeSink::new(vec![
+            Arc::new(capture.clone()) as Arc<dyn AuditSink>,
+            aggregator,
+        ])) as Arc<dyn AuditSink>);
+
+        (audit, capture, db)
     }
 
     fn runtime_config<const N: usize>(
@@ -1945,6 +2663,19 @@ mod tests {
         }
     }
 
+    fn invocation_context_with_roles(roles: &[&str]) -> ToolInvocationContext {
+        ToolInvocationContext {
+            request_id: "request-tool-test".to_owned(),
+            source_ip: "203.0.113.10".to_owned(),
+            actor: Some(Actor {
+                user_id: "user-123".to_owned(),
+                email: None,
+                roles: Some(roles.iter().map(|role| (*role).to_owned()).collect()),
+                auth_mode: "bearer_token".to_owned(),
+            }),
+        }
+    }
+
     fn socket_addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
@@ -2010,6 +2741,62 @@ mod tests {
             .expect("signal query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("signal rows should read")
+    }
+
+    async fn assert_inventory_observation(
+        capture: &CaptureSink,
+        db_path: &Path,
+        tool_name: &str,
+        status: u16,
+        reason: &str,
+    ) {
+        wait_until(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == HTTP_REQUEST_OBSERVED
+                    && event.payload["tool_name"] == json!(tool_name)
+                    && event.payload["status"] == json!(status)
+                    && event.payload["reason"] == json!(reason)
+            })
+        })
+        .await;
+
+        let events = capture.events();
+        let observation = events
+            .iter()
+            .find(|event| {
+                event.event_type == HTTP_REQUEST_OBSERVED
+                    && event.payload["tool_name"] == json!(tool_name)
+            })
+            .unwrap_or_else(|| panic!("expected inventory observation in {events:#?}"));
+        assert_eq!(observation.payload["method"], json!("MCP"));
+        assert_eq!(
+            observation.payload["path"],
+            json!(format!("/mcp/tools/{tool_name}"))
+        );
+        assert_eq!(
+            observation.payload["endpoint_template"],
+            json!(format!("/mcp/tools/{tool_name}"))
+        );
+        assert_eq!(observation.payload["status"], json!(status));
+        assert_eq!(observation.payload["schema_mismatch"], json!(false));
+        assert_eq!(observation.payload["reason"], json!(reason));
+        assert!(
+            observation.payload["latency_ms"].as_u64().is_some(),
+            "tool observation event should include latency_ms"
+        );
+
+        wait_until(Duration::from_secs(2), || {
+            discovery_aggregate_snapshot(db_path, "MCP", &format!("/mcp/tools/{tool_name}"))
+                .is_some_and(|aggregate| {
+                    aggregate.call_count == 1 && aggregate.schema_mismatch_count == 0
+                })
+        })
+        .await;
+        let aggregate =
+            discovery_aggregate_snapshot(db_path, "MCP", &format!("/mcp/tools/{tool_name}"))
+                .expect("inventory aggregate should be present");
+        assert_eq!(aggregate.call_count, 1);
+        assert_eq!(aggregate.schema_mismatch_count, 0);
     }
 
     struct TempDiscoveryDb {
