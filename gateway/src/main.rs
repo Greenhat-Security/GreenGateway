@@ -22103,6 +22103,9 @@ O2gecI9QwDJNpm29J9wJB2F8
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 };
+                stream
+                    .set_nonblocking(false)
+                    .expect("OIDC discovery test stream should use blocking reads");
                 let path = read_blocking_http_path(&mut stream);
                 let (status, body) = match path.as_str() {
                     "/.well-known/openid-configuration" => ("200 OK", discovery.as_str()),

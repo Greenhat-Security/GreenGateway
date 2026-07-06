@@ -1693,7 +1693,12 @@ fn url_host_is_loopback(url: &url::Url) -> bool {
     match url.host() {
         Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped_ip| mapped_ip.is_loopback())
+        }
         None => false,
     }
 }
@@ -3265,6 +3270,18 @@ mod tests {
 
             assert_eq!(config.gateway_public_url, Some(value.to_owned()));
         }
+    }
+
+    #[test]
+    fn gateway_public_url_allows_http_ipv4_mapped_ipv6_loopback_for_local_development() {
+        let value = "http://[::ffff:127.0.0.1]:8080/base";
+        let config = Config::from_env_vars(|name| match name {
+            "GATEWAY_PUBLIC_URL" => Ok(value.to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("IPv4-mapped IPv6 loopback HTTP public URL should parse");
+
+        assert_eq!(config.gateway_public_url, Some(value.to_owned()));
     }
 
     #[test]

@@ -80,8 +80,8 @@ fn public_url_with_path(public_url: &str, path: &str) -> String {
     debug_assert!(path.starts_with('/'));
 
     let mut url = Url::parse(public_url).expect("GATEWAY_PUBLIC_URL should have been validated");
-    let resource_path = url.path();
-    let metadata_path = if resource_path == "/" {
+    let resource_path = url.path().trim_end_matches('/');
+    let metadata_path = if resource_path.is_empty() {
         path.to_owned()
     } else {
         format!("{path}{resource_path}")
@@ -124,6 +124,23 @@ mod tests {
             authorization_servers: Vec::new(),
         };
 
+        assert_eq!(
+            metadata.metadata_url(),
+            "https://gateway.example.test/.well-known/oauth-protected-resource/base"
+        );
+    }
+
+    #[test]
+    fn metadata_url_trims_public_url_path_trailing_slash_to_match_mcp_resource() {
+        let metadata = ProtectedResourceMetadataConfig {
+            public_url: "https://gateway.example.test/base/".to_owned(),
+            authorization_servers: Vec::new(),
+        };
+
+        assert_eq!(
+            metadata.mcp_resource(),
+            "https://gateway.example.test/base/mcp"
+        );
         assert_eq!(
             metadata.metadata_url(),
             "https://gateway.example.test/.well-known/oauth-protected-resource/base"
