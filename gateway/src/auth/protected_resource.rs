@@ -43,7 +43,7 @@ impl ProtectedResourceMetadataConfig {
     }
 
     pub(crate) fn metadata_url(&self) -> String {
-        public_url_with_path(&self.public_url, WELL_KNOWN_PATH)
+        public_url_with_path(&self.mcp_resource(), WELL_KNOWN_PATH)
     }
 
     pub(crate) fn document(&self) -> ProtectedResourceMetadataDocument {
@@ -118,16 +118,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metadata_url_inserts_well_known_path_before_public_url_path() {
+    fn metadata_url_uses_mcp_resource_path_for_public_url_path() {
         let metadata = ProtectedResourceMetadataConfig {
             public_url: "https://gateway.example.test/base".to_owned(),
             authorization_servers: Vec::new(),
         };
 
         assert_eq!(
-            metadata.metadata_url(),
-            "https://gateway.example.test/.well-known/oauth-protected-resource/base"
+            metadata.mcp_resource(),
+            "https://gateway.example.test/base/mcp"
         );
+        assert_eq!(
+            metadata.metadata_url(),
+            "https://gateway.example.test/.well-known/oauth-protected-resource/base/mcp"
+        );
+        assert_metadata_suffix_matches_resource_path(&metadata);
     }
 
     #[test]
@@ -143,20 +148,33 @@ mod tests {
         );
         assert_eq!(
             metadata.metadata_url(),
-            "https://gateway.example.test/.well-known/oauth-protected-resource/base"
+            "https://gateway.example.test/.well-known/oauth-protected-resource/base/mcp"
         );
+        assert_metadata_suffix_matches_resource_path(&metadata);
     }
 
     #[test]
-    fn metadata_url_without_public_url_path_uses_origin_well_known_path() {
+    fn metadata_url_uses_mcp_resource_path_for_bare_origin() {
         let metadata = ProtectedResourceMetadataConfig {
             public_url: "https://gateway.example.test".to_owned(),
             authorization_servers: Vec::new(),
         };
 
+        assert_eq!(metadata.mcp_resource(), "https://gateway.example.test/mcp");
         assert_eq!(
             metadata.metadata_url(),
-            "https://gateway.example.test/.well-known/oauth-protected-resource"
+            "https://gateway.example.test/.well-known/oauth-protected-resource/mcp"
+        );
+        assert_metadata_suffix_matches_resource_path(&metadata);
+    }
+
+    fn assert_metadata_suffix_matches_resource_path(metadata: &ProtectedResourceMetadataConfig) {
+        let resource = Url::parse(&metadata.mcp_resource()).expect("resource URL should parse");
+        let metadata_url = Url::parse(&metadata.metadata_url()).expect("metadata URL should parse");
+
+        assert_eq!(
+            metadata_url.path().strip_prefix(WELL_KNOWN_PATH),
+            Some(resource.path())
         );
     }
 }

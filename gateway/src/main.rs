@@ -10506,7 +10506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_protected_resource_metadata_serves_rfc9728_path_for_public_url_path_component() {
+    async fn oauth_protected_resource_metadata_serves_rfc9728_path_for_mcp_resource_path() {
         let mut config = test_config(Vec::new());
         config.gateway_public_url = Some("https://gateway.example.test/base".to_owned());
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -10521,7 +10521,7 @@ mod tests {
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/.well-known/oauth-protected-resource/base")
+                    .uri("/.well-known/oauth-protected-resource/base/mcp")
                     .body(Body::empty())
                     .expect("metadata request should build"),
             )
@@ -10592,7 +10592,7 @@ mod tests {
         assert_eq!(
             mcp_response.headers().get(header::WWW_AUTHENTICATE),
             Some(&HeaderValue::from_static(
-                "Bearer realm=\"mcp\", resource_metadata=\"https://gateway.example.test/.well-known/oauth-protected-resource\""
+                "Bearer realm=\"mcp\", resource_metadata=\"https://gateway.example.test/.well-known/oauth-protected-resource/mcp\""
             ))
         );
 
@@ -10614,7 +10614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_unauthorized_challenge_inserts_metadata_path_before_public_url_path_component() {
+    async fn mcp_unauthorized_challenge_inserts_metadata_path_before_mcp_resource_path() {
         let mut config = test_config(Vec::new());
         config.gateway_public_url = Some("https://gateway.example.test/base".to_owned());
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -10640,7 +10640,7 @@ mod tests {
         assert_eq!(
             response.headers().get(header::WWW_AUTHENTICATE),
             Some(&HeaderValue::from_static(
-                "Bearer realm=\"mcp\", resource_metadata=\"https://gateway.example.test/.well-known/oauth-protected-resource/base\""
+                "Bearer realm=\"mcp\", resource_metadata=\"https://gateway.example.test/.well-known/oauth-protected-resource/base/mcp\""
             ))
         );
     }
