@@ -58,6 +58,16 @@
     },
     {
       "methods": ["POST"],
+      "path_prefix": "/v1/admin/tools/openapi/preview",
+      "permission": "admin:tools:read"
+    },
+    {
+      "methods": ["POST"],
+      "path_prefix": "/v1/admin/tools/openapi/register",
+      "permission": "admin:tools:write"
+    },
+    {
+      "methods": ["POST"],
       "path_prefix": "/v1/admin/traffic/endpoints/review",
       "permission": "admin:traffic:write"
     },

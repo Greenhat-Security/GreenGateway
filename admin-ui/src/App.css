@@ -206,7 +206,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -594,10 +595,10 @@ select:focus-visible {
 
 .token-row input,
 .filter-form input,
-.filter-form select {
+.filter-form select,
+.filter-form textarea {
   width: 100%;
   min-width: 0;
-  height: 40px;
   border: 1px solid var(--gh-sys-border);
   border-radius: var(--gh-comp-input-radius);
   padding: 0 12px;
@@ -609,20 +610,37 @@ select:focus-visible {
     box-shadow var(--gh-ref-duration-base) var(--gh-ref-ease-standard);
 }
 
+.token-row input,
+.filter-form input,
+.filter-form select {
+  height: 40px;
+}
+
+.filter-form textarea {
+  min-height: 220px;
+  resize: vertical;
+  padding: 10px 12px;
+  font-family: var(--gh-ref-font-mono);
+  line-height: 1.5;
+}
+
 .token-row input::placeholder,
-.filter-form input::placeholder {
+.filter-form input::placeholder,
+.filter-form textarea::placeholder {
   color: var(--gh-sys-fg-subtle);
 }
 
 .token-row input:hover:not(:disabled),
 .filter-form input:hover:not(:disabled),
-.filter-form select:hover:not(:disabled) {
+.filter-form select:hover:not(:disabled),
+.filter-form textarea:hover:not(:disabled) {
   border-color: var(--gh-sys-border-hover);
 }
 
 .token-row input:focus,
 .filter-form input:focus,
-.filter-form select:focus {
+.filter-form select:focus,
+.filter-form textarea:focus {
   outline: none;
   border-color: var(--gh-sys-primary);
   box-shadow: 0 0 0 2px

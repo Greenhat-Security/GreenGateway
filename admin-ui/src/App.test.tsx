@@ -380,6 +380,70 @@ describe('AdminShell', () => {
     ).toBeTruthy();
   });
 
+  it('registers the OpenAPI tools route, navigation entry, and dashboard link', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), 'http://localhost');
+        if (url.pathname === '/v1/admin/policy') {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                schema_version: '0.1.0',
+                id: 'test-policy',
+                default_action: 'deny',
+                enforcement_mode: 'enforce',
+                roles: {},
+                routes: [],
+                rules: [],
+              }),
+              {
+                status: 200,
+                headers: {
+                  'Content-Type': 'application/json',
+                  ETag: '"etag-initial"',
+                },
+              },
+            ),
+          );
+        }
+
+        return Promise.reject(new Error(`unexpected fetch: ${url.pathname}`));
+      }),
+    );
+
+    render(
+      <MemoryRouter initialEntries={['/tools/openapi']}>
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: 'OpenAPI tools' })).toBeTruthy();
+    expect(
+      screen.getByRole('heading', {
+        level: 1,
+        name: 'OpenAPI tools',
+      }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole('heading', {
+        level: 2,
+        name: 'OpenAPI tools',
+      }),
+    ).toBeTruthy();
+
+    cleanup();
+    vi.stubGlobal('fetch', versionFetchMock(false));
+
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('Preview and register generated tools')).toBeTruthy();
+  });
+
   it('registers the identity directory route and navigation entry', async () => {
     vi.stubGlobal(
       'fetch',
