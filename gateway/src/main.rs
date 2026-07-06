@@ -351,6 +351,7 @@ struct TokenAdminState {
 struct ToolAdminState {
     tools_file: Option<PathBuf>,
     registry: tools::definitions::ToolRegistry,
+    mcp_proxy_definitions_provider: Option<tools::definitions::McpProxyDefinitionsProvider>,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
     trust_proxy_headers: bool,
@@ -1291,10 +1292,13 @@ fn gateway_app_with_process_started_at(
     let mcp_upstream_definitions =
         tools::mcp_upstream::discover_upstream_tools_blocking(&config, Arc::clone(&egress_client))?;
     tool_registry.merge_definitions(mcp_upstream_definitions)?;
+    let mcp_proxy_definitions_provider =
+        mcp_proxy_definitions_provider(&config, Arc::clone(&egress_client));
     if let Some(tools_file) = config.tools_file.as_ref() {
-        tools::definitions::spawn_tool_registry_reload_tasks(
+        tools::definitions::spawn_tool_registry_reload_tasks_with_mcp_proxy_definitions_provider(
             tools_file.clone(),
             tool_registry.clone(),
+            mcp_proxy_definitions_provider.clone(),
         )?;
     }
     let tool_runtime = tools::runtime::ToolRuntime::new_with_rbac_state(
@@ -1343,6 +1347,7 @@ fn gateway_app_with_process_started_at(
     let tool_admin_state = ToolAdminState {
         tools_file: config.tools_file.as_ref().map(PathBuf::from),
         registry: tool_registry,
+        mcp_proxy_definitions_provider,
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
         trust_proxy_headers: config.trust_proxy_headers,
@@ -1577,6 +1582,28 @@ fn required_admin_login_provider_field(
                 provider.name
             ))
         })
+}
+
+fn mcp_proxy_definitions_provider(
+    config: &config::Config,
+    egress_client: Arc<egress::EgressClient>,
+) -> Option<tools::definitions::McpProxyDefinitionsProvider> {
+    let config = config.clone();
+    Some(Arc::new(
+        move || match tools::mcp_upstream::discover_upstream_tools_strict_blocking(
+            &config,
+            Arc::clone(&egress_client),
+        ) {
+            Ok(definitions) => Some(definitions),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "MCP upstream rediscovery failed during tool registry reload; preserving existing MCP proxy tools"
+                );
+                None
+            }
+        },
+    ))
 }
 
 fn discover_oidc_from_config(
@@ -3764,7 +3791,11 @@ async fn tools_openapi_register_endpoint(
         return internal_server_error("tools file persist failed");
     }
     if let Err(err) =
-        tools::definitions::reload_tool_registry_from_file(&state.registry, tools_file)
+        tools::definitions::reload_tool_registry_from_file_with_mcp_proxy_definitions_provider(
+            &state.registry,
+            tools_file,
+            state.mcp_proxy_definitions_provider.as_ref(),
+        )
     {
         tracing::error!(tools_file = %tools_file.display(), error = %err, "failed to reload persisted tools file");
         return internal_server_error("tools registry reload failed");

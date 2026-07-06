@@ -214,6 +214,9 @@ pub struct ToolRegistry {
     audit: Option<AuditLog>,
 }
 
+pub type McpProxyDefinitionsProvider =
+    Arc<dyn Fn() -> Option<Vec<ToolDefinition>> + Send + Sync + 'static>;
+
 impl fmt::Debug for ToolRegistry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -366,6 +369,27 @@ impl ToolRegistry {
         let mcp_proxy_definitions = state.mcp_proxy_definitions.clone();
         drop(state);
 
+        self.replace_definition_sources_locked(local_definitions, mcp_proxy_definitions)
+    }
+
+    fn replace_definition_sources(
+        &self,
+        local_definitions: Vec<ToolDefinition>,
+        mcp_proxy_definitions: Vec<ToolDefinition>,
+    ) -> Result<(), ToolRegistryError> {
+        let _guard = match self.write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        self.replace_definition_sources_locked(local_definitions, mcp_proxy_definitions)
+    }
+
+    fn replace_definition_sources_locked(
+        &self,
+        local_definitions: Vec<ToolDefinition>,
+        mcp_proxy_definitions: Vec<ToolDefinition>,
+    ) -> Result<(), ToolRegistryError> {
         let merged = combined_definitions(&local_definitions, &mcp_proxy_definitions);
         let semantic_problems = tool_definition_problems(&merged);
         if !semantic_problems.is_empty() {
@@ -453,16 +477,57 @@ fn combined_definitions(
         .collect()
 }
 
+#[allow(dead_code)] // Retained for callers that only reload local tool definitions.
 pub fn reload_tool_registry_from_file(
     registry: &ToolRegistry,
     path: impl AsRef<Path>,
+) -> Result<(), ToolRegistryError> {
+    reload_tool_registry_from_file_with_optional_mcp_proxy_definitions(registry, path, None)
+}
+
+#[allow(dead_code)] // Used by config reload paths that can rediscover upstream MCP tools.
+pub fn reload_tool_registry_from_file_with_mcp_proxy_definitions(
+    registry: &ToolRegistry,
+    path: impl AsRef<Path>,
+    mcp_proxy_definitions: Vec<ToolDefinition>,
+) -> Result<(), ToolRegistryError> {
+    reload_tool_registry_from_file_with_optional_mcp_proxy_definitions(
+        registry,
+        path,
+        Some(mcp_proxy_definitions),
+    )
+}
+
+pub fn reload_tool_registry_from_file_with_mcp_proxy_definitions_provider(
+    registry: &ToolRegistry,
+    path: impl AsRef<Path>,
+    mcp_proxy_definitions_provider: Option<&McpProxyDefinitionsProvider>,
+) -> Result<(), ToolRegistryError> {
+    let mcp_proxy_definitions = mcp_proxy_definitions_provider.and_then(|provider| provider());
+    reload_tool_registry_from_file_with_optional_mcp_proxy_definitions(
+        registry,
+        path,
+        mcp_proxy_definitions,
+    )
+}
+
+fn reload_tool_registry_from_file_with_optional_mcp_proxy_definitions(
+    registry: &ToolRegistry,
+    path: impl AsRef<Path>,
+    mcp_proxy_definitions: Option<Vec<ToolDefinition>>,
 ) -> Result<(), ToolRegistryError> {
     let path = path.as_ref();
 
     match definitions_from_file(path) {
         Ok(definitions) => {
             let tool_count = definitions.len();
-            if let Err(err) = registry.replace_local_definitions(definitions) {
+            let replace_result = match mcp_proxy_definitions {
+                Some(mcp_proxy_definitions) => {
+                    registry.replace_definition_sources(definitions, mcp_proxy_definitions)
+                }
+                None => registry.replace_local_definitions(definitions),
+            };
+            if let Err(err) = replace_result {
                 registry.emit_reload_failed(path, &err);
                 tracing::error!(
                     tools_file = %path.display(),
@@ -491,19 +556,33 @@ pub fn reload_tool_registry_from_file(
     }
 }
 
+#[allow(dead_code)] // Retained for callers that do not refresh MCP proxy definitions.
 pub fn spawn_tool_registry_reload_tasks(
     tools_file: impl Into<PathBuf>,
     registry: ToolRegistry,
 ) -> notify::Result<()> {
+    spawn_tool_registry_reload_tasks_with_mcp_proxy_definitions_provider(tools_file, registry, None)
+}
+
+pub fn spawn_tool_registry_reload_tasks_with_mcp_proxy_definitions_provider(
+    tools_file: impl Into<PathBuf>,
+    registry: ToolRegistry,
+    mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
+) -> notify::Result<()> {
     let tools_file = tools_file.into();
-    spawn_tool_registry_file_watcher(tools_file.clone(), registry.clone())?;
-    spawn_sighup_reload_task(tools_file, registry);
+    spawn_tool_registry_file_watcher(
+        tools_file.clone(),
+        registry.clone(),
+        mcp_proxy_definitions_provider.clone(),
+    )?;
+    spawn_sighup_reload_task(tools_file, registry, mcp_proxy_definitions_provider);
     Ok(())
 }
 
 fn spawn_tool_registry_file_watcher(
     tools_file: PathBuf,
     registry: ToolRegistry,
+    mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
 ) -> notify::Result<()> {
     let (sender, receiver) = mpsc::unbounded_channel();
     let mut watcher = notify::recommended_watcher(move |event| {
@@ -512,7 +591,11 @@ fn spawn_tool_registry_file_watcher(
     watcher.watch(&watch_directory(&tools_file), RecursiveMode::NonRecursive)?;
 
     tokio::spawn(tool_registry_file_watch_loop(
-        tools_file, registry, receiver, watcher,
+        tools_file,
+        registry,
+        mcp_proxy_definitions_provider,
+        receiver,
+        watcher,
     ));
 
     Ok(())
@@ -521,6 +604,7 @@ fn spawn_tool_registry_file_watcher(
 async fn tool_registry_file_watch_loop(
     tools_file: PathBuf,
     registry: ToolRegistry,
+    mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
     mut events: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
     _watcher: notify::RecommendedWatcher,
 ) {
@@ -534,7 +618,11 @@ async fn tool_registry_file_watch_loop(
             let _ = handle_tool_registry_watch_event(&tools_file, event);
         }
 
-        let _ = reload_tool_registry_from_file(&registry, &tools_file);
+        let _ = reload_tool_registry_from_file_with_mcp_proxy_definitions_provider(
+            &registry,
+            &tools_file,
+            mcp_proxy_definitions_provider.as_ref(),
+        );
     }
 }
 
@@ -575,7 +663,11 @@ fn watch_directory(tools_file: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn spawn_sighup_reload_task(tools_file: PathBuf, registry: ToolRegistry) {
+fn spawn_sighup_reload_task(
+    tools_file: PathBuf,
+    registry: ToolRegistry,
+    mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
+) {
     tokio::spawn(async move {
         let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
@@ -590,13 +682,22 @@ fn spawn_sighup_reload_task(tools_file: PathBuf, registry: ToolRegistry) {
         };
 
         while sighup.recv().await.is_some() {
-            let _ = reload_tool_registry_from_file(&registry, &tools_file);
+            let _ = reload_tool_registry_from_file_with_mcp_proxy_definitions_provider(
+                &registry,
+                &tools_file,
+                mcp_proxy_definitions_provider.as_ref(),
+            );
         }
     });
 }
 
 #[cfg(not(unix))]
-fn spawn_sighup_reload_task(_tools_file: PathBuf, _registry: ToolRegistry) {}
+fn spawn_sighup_reload_task(
+    _tools_file: PathBuf,
+    _registry: ToolRegistry,
+    _mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
+) {
+}
 
 fn definitions_from_file(path: &Path) -> Result<Vec<ToolDefinition>, ToolRegistryError> {
     let contents = read_tools_file_to_string(path)?;
@@ -1638,6 +1739,113 @@ mod tests {
             2,
             "rejected collision reload must keep last-known-good registry"
         );
+    }
+
+    #[test]
+    fn refreshed_mcp_proxy_reload_prunes_missing_proxy_tools_and_keeps_local_tools() {
+        let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
+        let registry = ToolRegistry::from_file(file.path()).expect("initial registry should load");
+        registry
+            .merge_definitions(vec![
+                mcp_proxy_tool("weather:get_forecast", "weather", "get_forecast"),
+                mcp_proxy_tool("weather:get_alerts", "weather", "get_alerts"),
+            ])
+            .expect("MCP proxy tools should merge");
+
+        file.write(&tools_document(&[
+            echo_tool("echo", "POST", "/v1/echo"),
+            echo_tool("get_widget", "GET", "/v1/widgets/{widget_id}"),
+        ]));
+
+        reload_tool_registry_from_file_with_mcp_proxy_definitions(
+            &registry,
+            file.path(),
+            vec![mcp_proxy_tool(
+                "weather:get_forecast",
+                "weather",
+                "get_forecast",
+            )],
+        )
+        .expect("refreshed MCP proxy reload should apply");
+
+        assert!(registry.get("echo").is_some());
+        assert!(registry.get("get_widget").is_some());
+        assert!(registry.get("weather:get_forecast").is_some());
+        assert!(
+            registry.get("weather:get_alerts").is_none(),
+            "refreshed MCP proxy set should prune missing proxy tools"
+        );
+        assert_eq!(registry.list().len(), 3);
+    }
+
+    #[test]
+    fn refreshed_mcp_proxy_reload_rejects_collision_and_keeps_last_known_good_registry() {
+        let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
+        let registry = ToolRegistry::from_file(file.path()).expect("initial registry should load");
+        registry
+            .merge_definitions(vec![mcp_proxy_tool(
+                "weather:get_forecast",
+                "weather",
+                "get_forecast",
+            )])
+            .expect("MCP proxy tool should merge");
+
+        let error = reload_tool_registry_from_file_with_mcp_proxy_definitions(
+            &registry,
+            file.path(),
+            vec![mcp_proxy_tool("echo", "weather", "echo")],
+        )
+        .expect_err("refreshed MCP proxy collision should reject");
+
+        assert!(
+            error.to_string().contains("duplicate tool name 'echo'"),
+            "unexpected error: {error}"
+        );
+        let local_tool = registry
+            .get("echo")
+            .expect("rejected refresh must keep local tool");
+        assert!(
+            !local_tool.upstream.is_mcp_proxy(),
+            "collision must not replace local HTTP tool with MCP proxy tool"
+        );
+        assert!(registry.get("weather:get_forecast").is_some());
+        assert_eq!(
+            registry.list().len(),
+            2,
+            "rejected refreshed reload must keep last-known-good registry"
+        );
+    }
+
+    #[test]
+    fn provider_backed_reload_preserves_mcp_proxy_tools_when_refresh_is_unavailable() {
+        let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
+        let registry = ToolRegistry::from_file(file.path()).expect("initial registry should load");
+        registry
+            .merge_definitions(vec![
+                mcp_proxy_tool("weather:get_forecast", "weather", "get_forecast"),
+                mcp_proxy_tool("weather:get_alerts", "weather", "get_alerts"),
+            ])
+            .expect("MCP proxy tools should merge");
+        let unavailable_provider: McpProxyDefinitionsProvider = Arc::new(|| None);
+
+        file.write(&tools_document(&[echo_tool(
+            "get_widget",
+            "GET",
+            "/v1/widgets/{widget_id}",
+        )]));
+
+        reload_tool_registry_from_file_with_mcp_proxy_definitions_provider(
+            &registry,
+            file.path(),
+            Some(&unavailable_provider),
+        )
+        .expect("local reload should still apply when MCP proxy refresh is unavailable");
+
+        assert!(registry.get("echo").is_none());
+        assert!(registry.get("get_widget").is_some());
+        assert!(registry.get("weather:get_forecast").is_some());
+        assert!(registry.get("weather:get_alerts").is_some());
+        assert_eq!(registry.list().len(), 3);
     }
 
     #[test]
