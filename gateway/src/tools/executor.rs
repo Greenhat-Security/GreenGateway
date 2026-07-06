@@ -62,6 +62,7 @@ const TOOL_ROLE_NOT_ALLOWED_REASON: &str = "role_not_allowed";
 const TOOL_MATCHED_RULE_REASON: &str = "matched_rule";
 const TOOL_QUEUE_FULL_REASON: &str = "queue_full";
 const TOOL_QUEUE_TIMEOUT_REASON: &str = "queue_timeout";
+const TOOL_TIMEOUT_REASON: &str = "timeout";
 const TOOL_CANCELLED_REASON: &str = "cancelled";
 const TOOL_RUNTIME_CLOSED_REASON: &str = "runtime_closed";
 const TOOL_RUNTIME_REJECTED_REASON: &str = "runtime_rejected";
@@ -1370,7 +1371,13 @@ fn runtime_admission_failure_observation_outcome(
             schema_mismatch: false,
             reason: Some(TOOL_QUEUE_TIMEOUT_REASON),
         }),
-        ToolRuntimeError::Cancelled { .. } if !work_started => Some(ToolObservationOutcome {
+        ToolRuntimeError::Timeout { .. } if work_started => Some(ToolObservationOutcome {
+            status: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_TIMEOUT_REASON),
+        }),
+        ToolRuntimeError::Cancelled { .. } => Some(ToolObservationOutcome {
             status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
             latency_ms,
             schema_mismatch: false,
@@ -1378,7 +1385,6 @@ fn runtime_admission_failure_observation_outcome(
         }),
         ToolRuntimeError::UnknownTool { .. }
         | ToolRuntimeError::Timeout { .. }
-        | ToolRuntimeError::Cancelled { .. }
         | ToolRuntimeError::WorkFailed { .. } => None,
     }
 }
@@ -2261,6 +2267,85 @@ mod tests {
             .await
             .expect("first invocation task should join")
             .expect("first invocation should complete after server release");
+        server.stop.cancel();
+        server.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn execution_timeout_after_work_started_feeds_inventory_observation() {
+        let server = gated_server().await;
+        let (audit, capture, db) = inventory_audit("tool-execution-timeout-inventory");
+        let executor = executor_for_tools_with_audit(
+            server.addr,
+            [widget_tool(false, true)],
+            runtime_config([("get_widget", enabled_tool(100, 1))], 2, 1, 100),
+            audit,
+        );
+
+        let running = tokio::spawn({
+            let executor = executor.clone();
+            async move {
+                executor
+                    .execute(
+                        "get_widget",
+                        json!({ "widget_id": "timeout" }),
+                        invocation_context(),
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        wait_until(Duration::from_secs(1), || server.request_count() == 1).await;
+
+        let error = running
+            .await
+            .expect("timed-out invocation task should join")
+            .expect_err("runtime timeout should abort slow upstream work");
+
+        assert!(matches!(error, ToolRuntimeError::Timeout { .. }));
+        assert_inventory_observation(&capture, &db.path, "get_widget", 504, "timeout").await;
+
+        server.stop.cancel();
+        server.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mid_execution_cancellation_feeds_inventory_observation() {
+        let server = gated_server().await;
+        let (audit, capture, db) = inventory_audit("tool-execution-cancelled-inventory");
+        let executor = executor_for_tools_with_audit(
+            server.addr,
+            [widget_tool(false, true)],
+            runtime_config([("get_widget", enabled_tool(1_000, 1))], 2, 1, 100),
+            audit,
+        );
+        let cancel = CancellationToken::new();
+
+        let running = tokio::spawn({
+            let executor = executor.clone();
+            let cancel = cancel.clone();
+            async move {
+                executor
+                    .execute(
+                        "get_widget",
+                        json!({ "widget_id": "cancelled" }),
+                        invocation_context(),
+                        cancel,
+                    )
+                    .await
+            }
+        });
+        wait_until(Duration::from_secs(1), || server.request_count() == 1).await;
+        cancel.cancel();
+
+        let error = running
+            .await
+            .expect("cancelled invocation task should join")
+            .expect_err("mid-execution cancellation should abort upstream work");
+
+        assert!(matches!(error, ToolRuntimeError::Cancelled { .. }));
+        assert_inventory_observation(&capture, &db.path, "get_widget", 429, "cancelled").await;
+
         server.stop.cancel();
         server.handle.abort();
     }
