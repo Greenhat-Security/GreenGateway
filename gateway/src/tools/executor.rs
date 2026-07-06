@@ -12,7 +12,7 @@ use std::{
 use http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use rmcp::model::CallToolResult;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -65,6 +65,8 @@ const TOOL_QUEUE_TIMEOUT_REASON: &str = "queue_timeout";
 const TOOL_CANCELLED_REASON: &str = "cancelled";
 const TOOL_RUNTIME_CLOSED_REASON: &str = "runtime_closed";
 const TOOL_RUNTIME_REJECTED_REASON: &str = "runtime_rejected";
+const STRICT_SCHEMA_INJECTION_SKIP_KEYWORDS: &[&str] =
+    &["$ref", "oneOf", "anyOf", "allOf", "patternProperties"];
 
 type ValidatorCache = HashMap<ValidatorCacheKey, Arc<jsonschema::Validator>>;
 
@@ -947,13 +949,55 @@ impl ValidatorCacheKey {
 }
 
 fn effective_input_schema(schema: &Value) -> Value {
+    schema_with_strict_object_defaults(schema, true)
+}
+
+fn schema_with_strict_object_defaults(schema: &Value, is_root: bool) -> Value {
     match schema {
-        Value::Object(schema) if !schema.contains_key("additionalProperties") => {
+        Value::Object(schema) if schema_has_strict_injection_skip_keyword(schema) => {
+            // Sibling additionalProperties changes jsonschema 0.46.9 behavior for
+            // composition, reference, and pattern-based schemas. Leave that schema
+            // level and its branches unchanged rather than pretending strictness is
+            // safely enforceable there.
+            Value::Object(schema.clone())
+        }
+        Value::Object(schema) => {
             let mut schema = schema.clone();
-            schema.insert("additionalProperties".to_owned(), Value::Bool(false));
+            stricten_property_schemas(&mut schema);
+            if !schema.contains_key("additionalProperties")
+                && (is_root || schema_type_includes_object(&schema))
+            {
+                schema.insert("additionalProperties".to_owned(), Value::Bool(false));
+            }
             Value::Object(schema)
         }
         _ => schema.clone(),
+    }
+}
+
+fn stricten_property_schemas(schema: &mut Map<String, Value>) {
+    let Some(Value::Object(properties)) = schema.get_mut("properties") else {
+        return;
+    };
+
+    for property_schema in properties.values_mut() {
+        *property_schema = schema_with_strict_object_defaults(property_schema, false);
+    }
+}
+
+fn schema_has_strict_injection_skip_keyword(schema: &Map<String, Value>) -> bool {
+    STRICT_SCHEMA_INJECTION_SKIP_KEYWORDS
+        .iter()
+        .any(|keyword| schema.contains_key(*keyword))
+}
+
+fn schema_type_includes_object(schema: &Map<String, Value>) -> bool {
+    match schema.get("type") {
+        Some(Value::String(schema_type)) => schema_type == "object",
+        Some(Value::Array(schema_types)) => schema_types
+            .iter()
+            .any(|schema_type| schema_type.as_str() == Some("object")),
+        _ => false,
     }
 }
 
@@ -1490,6 +1534,115 @@ mod tests {
                 .await
                 .is_err(),
             "strict schema rejection must not reach the upstream listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_validation_skips_strict_injection_for_top_level_one_of_schema() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"ok").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [one_of_echo_tool_without_additional_properties()],
+            runtime_config([("echo_one_of", enabled_tool(500, 1))], 2, 1, 100),
+        );
+
+        let response = executor
+            .execute(
+                "echo_one_of",
+                json!({ "message": "hello" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("top-level oneOf schema should validate through its branch");
+
+        assert_eq!(response.status, StatusCode::OK);
+        let request = server.await.expect("server task should join");
+        assert_eq!(request.target, "/v1/echo");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("request body should be JSON"),
+            json!({ "message": "hello" })
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_validation_rejects_unexpected_nested_object_args_by_default_before_network() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"should-not-run").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [nested_config_tool_without_nested_additional_properties()],
+            runtime_config([("configure", enabled_tool(500, 1))], 2, 1, 100),
+        );
+
+        let error = executor
+            .execute(
+                "configure",
+                json!({
+                    "settings": {
+                        "name": "primary",
+                        "unexpected": "value"
+                    }
+                }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("unexpected nested object args should fail by default");
+
+        let message = work_failed_message(error);
+        assert!(message.contains("arguments failed input schema validation"));
+        assert!(
+            message.contains("unexpected"),
+            "validation message should identify the nested extra argument: {message}"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "nested strict schema rejection must not reach the upstream listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_validation_rejects_unexpected_deeply_nested_object_args_by_default() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"should-not-run").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [deeply_nested_config_tool_without_additional_properties()],
+            runtime_config([("deep_configure", enabled_tool(500, 1))], 2, 1, 100),
+        );
+
+        let error = executor
+            .execute(
+                "deep_configure",
+                json!({
+                    "settings": {
+                        "limits": {
+                            "rate": 10,
+                            "unexpected": true
+                        }
+                    }
+                }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("unexpected deeply nested object args should fail by default");
+
+        let message = work_failed_message(error);
+        assert!(message.contains("arguments failed input schema validation"));
+        assert!(
+            message.contains("unexpected"),
+            "validation message should identify the deeply nested extra argument: {message}"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "deeply nested strict schema rejection must not reach the upstream listener"
         );
     }
 
@@ -2399,6 +2552,93 @@ mod tests {
         let mut tool = echo_tool();
         tool["input_json_schema"]["additionalProperties"] = json!(additional_properties);
         tool
+    }
+
+    fn one_of_echo_tool_without_additional_properties() -> Value {
+        json!({
+            "name": "echo_one_of",
+            "description": "Echoes a message through a oneOf input schema.",
+            "input_json_schema": {
+                "properties": {},
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "required": ["message"],
+                        "properties": {
+                            "message": { "type": "string" }
+                        },
+                        "additionalProperties": false
+                    }
+                ]
+            },
+            "upstream": {
+                "method": "POST",
+                "path_template": "/v1/echo",
+                "body": {
+                    "mode": "whole_args_json"
+                }
+            }
+        })
+    }
+
+    fn nested_config_tool_without_nested_additional_properties() -> Value {
+        json!({
+            "name": "configure",
+            "description": "Configures nested settings.",
+            "input_json_schema": {
+                "type": "object",
+                "required": ["settings"],
+                "properties": {
+                    "settings": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {
+                            "name": { "type": "string" }
+                        }
+                    }
+                }
+            },
+            "upstream": {
+                "method": "POST",
+                "path_template": "/v1/configure",
+                "body": {
+                    "mode": "whole_args_json"
+                }
+            }
+        })
+    }
+
+    fn deeply_nested_config_tool_without_additional_properties() -> Value {
+        json!({
+            "name": "deep_configure",
+            "description": "Configures deeply nested settings.",
+            "input_json_schema": {
+                "type": "object",
+                "required": ["settings"],
+                "properties": {
+                    "settings": {
+                        "type": "object",
+                        "required": ["limits"],
+                        "properties": {
+                            "limits": {
+                                "type": "object",
+                                "required": ["rate"],
+                                "properties": {
+                                    "rate": { "type": "integer" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "upstream": {
+                "method": "POST",
+                "path_template": "/v1/configure",
+                "body": {
+                    "mode": "whole_args_json"
+                }
+            }
+        })
     }
 
     fn widget_tool(query_required: bool, widget_required: bool) -> Value {

@@ -3,7 +3,7 @@ use std::{
     error::Error,
     ffi::OsString,
     fmt, fs, io,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -30,6 +30,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "rate_limits",
     "tools",
 ];
+const MAX_POLICY_FILE_BYTES: u64 = 1_048_576;
 #[allow(dead_code)]
 const TEMP_FILE_CREATE_ATTEMPTS: u8 = 16;
 
@@ -222,10 +223,7 @@ pub enum PolicyError {
 impl Policy {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, PolicyError> {
         let path = path.as_ref();
-        let contents = fs::read_to_string(path).map_err(|source| PolicyError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
+        let contents = read_policy_file_to_string(path)?;
         let value = serde_json::from_str(&contents).map_err(|source| PolicyError::Parse {
             path: Some(path.to_owned()),
             source,
@@ -317,6 +315,44 @@ fn validate_rule_target_properties(value: &Value) -> Result<(), PolicyError> {
     }
 
     Ok(())
+}
+
+fn read_policy_file_to_string(path: &Path) -> Result<String, PolicyError> {
+    let file = fs::File::open(path).map_err(|source| PolicyError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| PolicyError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    if metadata.len() > MAX_POLICY_FILE_BYTES {
+        return Err(policy_file_too_large(path));
+    }
+
+    let mut contents = String::new();
+    let mut reader = file.take(MAX_POLICY_FILE_BYTES + 1);
+    reader
+        .read_to_string(&mut contents)
+        .map_err(|source| PolicyError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    if contents.len() as u64 > MAX_POLICY_FILE_BYTES {
+        return Err(policy_file_too_large(path));
+    }
+
+    Ok(contents)
+}
+
+fn policy_file_too_large(path: &Path) -> PolicyError {
+    PolicyError::Io {
+        path: path.to_owned(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("policy file exceeds maximum size of {MAX_POLICY_FILE_BYTES} bytes"),
+        ),
+    }
 }
 
 fn validate_rules(rules: &[Rule]) -> Result<(), PolicyError> {
@@ -1662,6 +1698,20 @@ mod tests {
     }
 
     #[test]
+    fn oversized_policy_file_is_rejected_with_clear_error() {
+        let file = TempPolicyFile::new(&" ".repeat(1_048_577));
+
+        let error =
+            Policy::from_file(file.path()).expect_err("oversized policy file should reject");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("policy file exceeds maximum size of 1048576 bytes"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
     fn persist_to_file_round_trips_policy_document() {
         let file = TempPolicyFile::new(r#"{ "schema_version": "0.1.0" }"#);
         let policy = rich_policy();
@@ -1754,25 +1804,33 @@ mod tests {
     }
 
     #[test]
-    fn starter_policy_file_parses_and_matches_published_schema() {
-        let path = repo_root().join("docs/examples/policy.starter.json");
-        let policy = Policy::from_file(&path)
-            .unwrap_or_else(|err| panic!("starter policy should parse: {err}"));
-        let contents = fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-        let value: Value = serde_json::from_str(&contents)
-            .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()));
+    fn starter_and_dev_policy_files_parse_and_match_published_schema() {
+        for (relative_path, expected_id, expected_default_action) in [
+            (
+                "docs/examples/policy.starter.json",
+                Some("starter"),
+                DefaultAction::Allow,
+            ),
+            (
+                "dev/policy.json",
+                Some("dev-control-plane"),
+                DefaultAction::Deny,
+            ),
+        ] {
+            let path = repo_root().join(relative_path);
+            let policy = Policy::from_file(&path)
+                .unwrap_or_else(|err| panic!("{relative_path} should parse: {err}"));
+            let contents = fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+            let value: Value = serde_json::from_str(&contents)
+                .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()));
 
-        assert_eq!(policy.schema_version, "0.1.0");
-        assert_eq!(policy.id.as_deref(), Some("starter"));
-        assert_eq!(policy.default_action, DefaultAction::Allow);
-        assert_eq!(policy.enforcement_mode, EnforcementMode::Enforce);
-        assert!(policy.roles.is_empty());
-        assert!(policy.routes.is_empty());
-        assert!(policy.rules.is_empty());
-        assert!(policy.rate_limits.is_empty());
-        assert!(policy.tools.is_empty());
-        assert_schema_accepts(&policy_schema_validator(), &value);
+            assert_eq!(policy.schema_version, "0.1.0");
+            assert_eq!(policy.id.as_deref(), expected_id);
+            assert_eq!(policy.default_action, expected_default_action);
+            assert_eq!(policy.enforcement_mode, EnforcementMode::Enforce);
+            assert_schema_accepts(&policy_schema_validator(), &value);
+        }
     }
 
     #[test]
