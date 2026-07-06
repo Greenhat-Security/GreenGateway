@@ -65,6 +65,11 @@ pub(crate) struct ToolRuleDecision {
     pub matched_rule_id: String,
 }
 
+pub(crate) struct ToolAuthorizationSnapshot<'a> {
+    pub allowed_roles: &'a [String],
+    pub rule_decision: Option<ToolRuleDecision>,
+}
+
 #[derive(Serialize)]
 struct ForbiddenBody {
     error: &'static str,
@@ -132,19 +137,29 @@ impl RbacState {
             .principal_has_permission(principal, permission)
     }
 
-    pub(crate) fn evaluate_tool_rule(
+    pub(crate) fn evaluate_tool_authorization<R>(
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
-    ) -> Option<ToolRuleDecision> {
+        evaluate: impl FnOnce(ToolAuthorizationSnapshot<'_>) -> R,
+    ) -> R {
         let policy = self.policy.load();
-        policy
-            .rule_matcher
-            .evaluate_tool(tool_name, principal)
-            .map(|decision| ToolRuleDecision {
-                action: decision.action,
-                matched_rule_id: policy.rule_id(decision.rule_index),
-            })
+        let allowed_roles = policy.tool_allowed_roles(tool_name);
+        let rule_decision = policy.evaluate_tool_rule(tool_name, principal);
+
+        evaluate(ToolAuthorizationSnapshot {
+            allowed_roles,
+            rule_decision,
+        })
+    }
+
+    pub(crate) fn with_tool_allowed_roles<R>(
+        &self,
+        tool_name: &str,
+        evaluate: impl FnOnce(&[String]) -> R,
+    ) -> R {
+        let policy = self.policy.load();
+        evaluate(policy.tool_allowed_roles(tool_name))
     }
 }
 
@@ -176,6 +191,28 @@ impl RbacPolicyState {
             .get(rule_index)
             .cloned()
             .unwrap_or_else(|| rule_index.to_string())
+    }
+
+    fn tool_allowed_roles(&self, tool_name: &str) -> &[String] {
+        self.engine
+            .policy()
+            .tools
+            .get(tool_name)
+            .map(|entry| entry.allowed_roles.as_slice())
+            .unwrap_or_default()
+    }
+
+    fn evaluate_tool_rule(
+        &self,
+        tool_name: &str,
+        principal: Option<&auth::Principal>,
+    ) -> Option<ToolRuleDecision> {
+        self.rule_matcher
+            .evaluate_tool(tool_name, principal)
+            .map(|decision| ToolRuleDecision {
+                action: decision.action,
+                matched_rule_id: self.rule_id(decision.rule_index),
+            })
     }
 }
 
