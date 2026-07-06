@@ -43,6 +43,7 @@ pub struct AuthState {
     pub audit: AuditLog,
     pub principal_directory: PrincipalDirectory,
     pub trust_proxy_headers: bool,
+    pub mcp_route_paths: Vec<String>,
     pub mcp_resource: Option<String>,
     pub mcp_resource_metadata_url: Option<String>,
 }
@@ -76,6 +77,7 @@ impl AuthState {
             audit,
             principal_directory,
             trust_proxy_headers: config.trust_proxy_headers,
+            mcp_route_paths: protected_resource::mcp_route_paths(config),
             mcp_resource: protected_resource_metadata
                 .as_ref()
                 .map(protected_resource::ProtectedResourceMetadataConfig::mcp_resource),
@@ -88,13 +90,17 @@ impl AuthState {
 
 impl AuthState {
     fn mcp_resource_for_path(&self, path: &str) -> Option<String> {
-        (path == protected_resource::MCP_RESOURCE_PATH)
+        self.mcp_route_paths
+            .iter()
+            .any(|route_path| path == route_path)
             .then(|| self.mcp_resource.clone())
             .flatten()
     }
 
     fn mcp_resource_metadata_url_for_path(&self, path: &str) -> Option<&str> {
-        (path == protected_resource::MCP_RESOURCE_PATH)
+        self.mcp_route_paths
+            .iter()
+            .any(|route_path| path == route_path)
             .then_some(self.mcp_resource_metadata_url.as_deref())
             .flatten()
     }
@@ -442,6 +448,7 @@ mod tests {
                 audit,
                 principal_directory: PrincipalDirectory::disabled(),
                 trust_proxy_headers: false,
+                mcp_route_paths: vec![protected_resource::MCP_RESOURCE_PATH.to_owned()],
                 mcp_resource: None,
                 mcp_resource_metadata_url: None,
             },
