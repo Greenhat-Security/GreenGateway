@@ -7445,12 +7445,16 @@ mod tests {
             Tool as RmcpTool,
         },
         service::{RequestContext as RmcpRequestContext, RoleServer as RmcpRoleServer},
-        transport::streamable_http_server::{
-            session::never::NeverSessionManager as RmcpNeverSessionManager,
-            StreamableHttpServerConfig as RmcpStreamableHttpServerConfig,
-            StreamableHttpService as RmcpStreamableHttpService,
+        transport::{
+            streamable_http_client::StreamableHttpClientTransportConfig,
+            streamable_http_server::{
+                session::never::NeverSessionManager as RmcpNeverSessionManager,
+                StreamableHttpServerConfig as RmcpStreamableHttpServerConfig,
+                StreamableHttpService as RmcpStreamableHttpService,
+            },
+            StreamableHttpClientTransport,
         },
-        ServerHandler as RmcpServerHandler,
+        ServerHandler as RmcpServerHandler, ServiceExt as RmcpServiceExt,
     };
     use rusqlite::{params, Connection};
     use serde_json::Value;
@@ -11657,6 +11661,110 @@ mod tests {
                     && event.payload["status"] == json!(200)
             })
         });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_real_client_connects_lists_calls_and_records_observability() {
+        let upstream_addr = spawn_echo_json_upstream().await;
+        let harness = mcp_inventory_test_harness(McpInventoryHarnessConfig {
+            upstream_url: Some(format!("http://{upstream_addr}")),
+            tools_document: mcp_tools_document(),
+            mcp_upstream_servers: Vec::new(),
+            egress_allowed_hosts: vec!["127.0.0.1".to_owned()],
+        })
+        .await;
+        let (gateway_addr, gateway_server) = spawn_gateway_router(harness.router.clone()).await;
+        let request_id = "mcp-sdk-conformance";
+        let custom_headers = HashMap::from([
+            (
+                HeaderName::from_static(REQUEST_ID_HEADER),
+                HeaderValue::from_static(request_id),
+            ),
+            (
+                header::COOKIE,
+                HeaderValue::from_static("csrf_token=mcp-test-csrf"),
+            ),
+            (
+                HeaderName::from_static("x-csrf-token"),
+                HeaderValue::from_static("mcp-test-csrf"),
+            ),
+        ]);
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(format!(
+                "http://{gateway_addr}{MCP_ROUTE}"
+            ))
+            .auth_header(harness.admin_token.clone())
+            .custom_headers(custom_headers),
+        );
+        let client = ().serve(transport).await.expect("rmcp client should initialize");
+
+        let tools = client
+            .list_all_tools()
+            .await
+            .expect("rmcp client should list tools");
+        assert!(
+            tools.iter().any(|tool| tool.name == "echo"),
+            "rmcp tools/list should include echo: {tools:?}"
+        );
+
+        let arguments: RmcpJsonObject =
+            serde_json::from_value(json!({ "message": "hello from real rmcp client" }))
+                .expect("tool arguments should be a JSON object");
+        let result = client
+            .call_tool(RmcpCallToolRequestParams::new("echo").with_arguments(arguments))
+            .await
+            .expect("rmcp client should call echo");
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            result.structured_content,
+            Some(json!({
+                "status": 200,
+                "body": {
+                    "message": "hello from real rmcp client"
+                }
+            }))
+        );
+
+        assert_eventually(Duration::from_secs(2), || {
+            let events = harness.capture.events();
+            let has_start = events.iter().any(|event| {
+                event.event_type == audit::event::TOOL_INVOKE_START
+                    && event.request_id == request_id
+                    && event.payload["tool_name"] == json!("echo")
+            });
+            let has_success = events.iter().any(|event| {
+                event.event_type == audit::event::TOOL_INVOKE_SUCCESS
+                    && event.request_id == request_id
+                    && event.payload["tool_name"] == json!("echo")
+            });
+            let has_tool_observation = events.iter().any(|event| {
+                event.event_type == "http.request_observed"
+                    && event.request_id == request_id
+                    && event.payload["method"] == json!("MCP")
+                    && event.payload["path"] == json!("/mcp/tools/echo")
+                    && event.payload["status"] == json!(200)
+            });
+
+            has_start && has_success && has_tool_observation
+        });
+
+        let row =
+            wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
+                row["call_count"] == json!(1) && status_count(row, 200) == Some(1)
+            })
+            .await;
+        assert_eq!(row["method"], json!("MCP"));
+        assert_eq!(row["endpoint_template"], json!("/mcp/tools/echo"));
+        assert_eq!(row["call_count"], json!(1));
+        assert_eq!(row["schema_mismatch_count"], json!(0));
+        assert_eq!(row["distinct_principal_count"], json!(1));
+        assert_eq!(status_count(&row, 200), Some(1));
+
+        client
+            .cancel()
+            .await
+            .expect("rmcp client should cancel cleanly");
+        gateway_server.abort();
     }
 
     #[tokio::test]
@@ -22230,6 +22338,7 @@ paths:
     struct McpInventoryTestHarness {
         router: Router,
         admin_token: String,
+        capture: audit::sink::tests::CaptureSink,
         _policy: TempPolicyFile,
         _tools: TempToolsFile,
         _token_db: TempDb,
@@ -22260,7 +22369,11 @@ paths:
 
         let (sink, audit_event_sender) =
             audit::sink::build_sink_from_config(&config).expect("audit sink should build");
-        let audit_log = audit::AuditLog::new(sink);
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log = audit::AuditLog::new(Arc::new(audit::sink::CompositeSink::new(vec![
+            sink,
+            Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>,
+        ])) as Arc<dyn audit::AuditSink>);
         let recorder = PrometheusBuilder::new().build_recorder();
         let router = app(config, recorder.handle(), audit_log, audit_event_sender)
             .expect("MCP inventory test app should build");
@@ -22268,6 +22381,7 @@ paths:
         McpInventoryTestHarness {
             router,
             admin_token,
+            capture,
             _policy: policy,
             _tools: tools,
             _token_db: token_db,
