@@ -67,6 +67,10 @@ const TOOL_RUNTIME_CLOSED_REASON: &str = "runtime_closed";
 const TOOL_RUNTIME_REJECTED_REASON: &str = "runtime_rejected";
 const STRICT_SCHEMA_INJECTION_SKIP_KEYWORDS: &[&str] =
     &["$ref", "oneOf", "anyOf", "allOf", "patternProperties"];
+// OpenAPI-generated schemas can come from externally supplied specs. Sixty-four
+// child-schema edges is far deeper than realistic tool input shapes, while
+// still bounding strict-default injection well below stack-overflow territory.
+const MAX_STRICT_SCHEMA_INJECTION_DEPTH: usize = 64;
 
 type ValidatorCache = HashMap<ValidatorCacheKey, Arc<jsonschema::Validator>>;
 
@@ -949,10 +953,14 @@ impl ValidatorCacheKey {
 }
 
 fn effective_input_schema(schema: &Value) -> Value {
-    schema_with_strict_object_defaults(schema, true)
+    schema_with_strict_object_defaults(schema, true, 0)
 }
 
-fn schema_with_strict_object_defaults(schema: &Value, is_root: bool) -> Value {
+fn schema_with_strict_object_defaults(schema: &Value, is_root: bool, depth: usize) -> Value {
+    if depth > MAX_STRICT_SCHEMA_INJECTION_DEPTH {
+        return schema.clone();
+    }
+
     match schema {
         Value::Object(schema) if schema_has_strict_injection_skip_keyword(schema) => {
             // Sibling additionalProperties changes jsonschema 0.46.9 behavior for
@@ -963,7 +971,7 @@ fn schema_with_strict_object_defaults(schema: &Value, is_root: bool) -> Value {
         }
         Value::Object(schema) => {
             let mut schema = schema.clone();
-            stricten_property_schemas(&mut schema);
+            stricten_child_schemas(&mut schema, depth);
             if !schema.contains_key("additionalProperties")
                 && (is_root || schema_type_includes_object(&schema))
             {
@@ -975,13 +983,31 @@ fn schema_with_strict_object_defaults(schema: &Value, is_root: bool) -> Value {
     }
 }
 
-fn stricten_property_schemas(schema: &mut Map<String, Value>) {
-    let Some(Value::Object(properties)) = schema.get_mut("properties") else {
-        return;
-    };
+fn stricten_child_schemas(schema: &mut Map<String, Value>, depth: usize) {
+    stricten_property_schemas(schema, depth);
+    stricten_array_item_schemas(schema, depth);
+}
 
-    for property_schema in properties.values_mut() {
-        *property_schema = schema_with_strict_object_defaults(property_schema, false);
+fn stricten_property_schemas(schema: &mut Map<String, Value>, depth: usize) {
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        for property_schema in properties.values_mut() {
+            *property_schema =
+                schema_with_strict_object_defaults(property_schema, false, depth + 1);
+        }
+    }
+}
+
+fn stricten_array_item_schemas(schema: &mut Map<String, Value>, depth: usize) {
+    match schema.get_mut("items") {
+        Some(items_schema @ Value::Object(_)) => {
+            *items_schema = schema_with_strict_object_defaults(items_schema, false, depth + 1);
+        }
+        Some(Value::Array(item_schemas)) => {
+            for item_schema in item_schemas {
+                *item_schema = schema_with_strict_object_defaults(item_schema, false, depth + 1);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1409,6 +1435,8 @@ mod tests {
         tools::runtime::{DefaultToolPolicy, ToolRuntimeConfig, ToolRuntimeToolConfig},
     };
 
+    const EXPECTED_STRICT_SCHEMA_INJECTION_MAX_DEPTH: usize = 64;
+
     #[tokio::test]
     async fn valid_args_are_mapped_to_upstream_request_and_audited() {
         let (addr, server) = one_request_server(StatusCode::CREATED, br#"{"ok":true}"#).await;
@@ -1643,6 +1671,128 @@ mod tests {
                 .await
                 .is_err(),
             "deeply nested strict schema rejection must not reach the upstream listener"
+        );
+    }
+
+    #[test]
+    fn strict_schema_injection_depth_cap_leaves_deeper_branch_unmodified_without_crashing() {
+        let nested_depth = EXPECTED_STRICT_SCHEMA_INJECTION_MAX_DEPTH + 2;
+        let tool = tool_definition(
+            deep_schema_tool(nested_object_schema(nested_depth)),
+            "deep_schema",
+        );
+        let effective_schema = effective_input_schema(&tool.input_schema);
+        let validator = jsonschema::validator_for(&effective_schema)
+            .expect("capped strict schema injection should compile without crashing");
+        let args = nested_object_args_with_extra_at_depth(nested_depth, nested_depth);
+        let problems = validation_problem_messages(&validator, &args);
+
+        assert!(
+            problems.is_empty(),
+            "extra fields beyond the strict injection depth cap should be left to the original schema: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn strict_schema_injection_applies_at_every_level_below_depth_cap() {
+        let nested_depth = EXPECTED_STRICT_SCHEMA_INJECTION_MAX_DEPTH - 1;
+        let effective_schema = effective_input_schema(&nested_object_schema(nested_depth));
+        let validator = jsonschema::validator_for(&effective_schema)
+            .expect("below-cap strict schema should compile");
+
+        for extra_depth in 0..=nested_depth {
+            let args = nested_object_args_with_extra_at_depth(nested_depth, extra_depth);
+            let problems = validation_problem_messages(&validator, &args);
+            assert!(
+                !problems.is_empty(),
+                "extra field at object depth {extra_depth} should be rejected below the strict injection depth cap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_validation_rejects_unexpected_array_item_object_args_before_network() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"should-not-run").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [array_items_tool_without_item_additional_properties()],
+            runtime_config([("bulk_configure", enabled_tool(500, 1))], 2, 1, 100),
+        );
+
+        let error = executor
+            .execute(
+                "bulk_configure",
+                json!({
+                    "items": [
+                        {
+                            "name": "primary",
+                            "unexpected": "value"
+                        }
+                    ]
+                }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("unexpected array item object args should fail by default");
+
+        let message = work_failed_message(error);
+        assert!(message.contains("arguments failed input schema validation"));
+        assert!(
+            message.contains("unexpected"),
+            "validation message should identify the array item extra argument: {message}"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "array item strict schema rejection must not reach the upstream listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_validation_rejects_unexpected_nested_array_item_object_args_before_network() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"should-not-run").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [nested_array_items_tool_without_item_additional_properties()],
+            runtime_config([("group_configure", enabled_tool(500, 1))], 2, 1, 100),
+        );
+
+        let error = executor
+            .execute(
+                "group_configure",
+                json!({
+                    "groups": [
+                        {
+                            "members": [
+                                {
+                                    "name": "alice",
+                                    "unexpected": "value"
+                                }
+                            ]
+                        }
+                    ]
+                }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("unexpected nested array item object args should fail by default");
+
+        let message = work_failed_message(error);
+        assert!(message.contains("arguments failed input schema validation"));
+        assert!(
+            message.contains("unexpected"),
+            "validation message should identify the nested array item extra argument: {message}"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "nested array item strict schema rejection must not reach the upstream listener"
         );
     }
 
@@ -2639,6 +2789,147 @@ mod tests {
                 }
             }
         })
+    }
+
+    fn array_items_tool_without_item_additional_properties() -> Value {
+        json!({
+            "name": "bulk_configure",
+            "description": "Configures a list of named items.",
+            "input_json_schema": {
+                "type": "object",
+                "required": ["items"],
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["name"],
+                            "properties": {
+                                "name": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            },
+            "upstream": {
+                "method": "POST",
+                "path_template": "/v1/bulk-configure",
+                "body": {
+                    "mode": "whole_args_json"
+                }
+            }
+        })
+    }
+
+    fn nested_array_items_tool_without_item_additional_properties() -> Value {
+        json!({
+            "name": "group_configure",
+            "description": "Configures groups with nested member arrays.",
+            "input_json_schema": {
+                "type": "object",
+                "required": ["groups"],
+                "properties": {
+                    "groups": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["members"],
+                            "properties": {
+                                "members": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["name"],
+                                        "properties": {
+                                            "name": { "type": "string" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "upstream": {
+                "method": "POST",
+                "path_template": "/v1/group-configure",
+                "body": {
+                    "mode": "whole_args_json"
+                }
+            }
+        })
+    }
+
+    fn deep_schema_tool(input_schema: Value) -> Value {
+        json!({
+            "name": "deep_schema",
+            "description": "Exercises strict schema depth handling.",
+            "input_json_schema": input_schema,
+            "upstream": {
+                "method": "POST",
+                "path_template": "/v1/deep-schema",
+                "body": {
+                    "mode": "whole_args_json"
+                }
+            }
+        })
+    }
+
+    fn nested_object_schema(nested_depth: usize) -> Value {
+        let mut schema = json!({
+            "type": "object",
+            "required": ["value"],
+            "properties": {
+                "value": { "type": "string" }
+            }
+        });
+
+        for depth in (0..nested_depth).rev() {
+            let property_name = format!("level_{depth}");
+            schema = json!({
+                "type": "object",
+                "required": [property_name],
+                "properties": {
+                    property_name: schema
+                }
+            });
+        }
+
+        schema
+    }
+
+    fn nested_object_args_with_extra_at_depth(nested_depth: usize, extra_depth: usize) -> Value {
+        assert!(extra_depth <= nested_depth);
+        nested_object_args_at_depth(0, nested_depth, extra_depth)
+    }
+
+    fn nested_object_args_at_depth(
+        current_depth: usize,
+        nested_depth: usize,
+        extra_depth: usize,
+    ) -> Value {
+        let mut object = Map::new();
+        if current_depth == nested_depth {
+            object.insert("value".to_owned(), json!("ok"));
+        } else {
+            object.insert(
+                format!("level_{current_depth}"),
+                nested_object_args_at_depth(current_depth + 1, nested_depth, extra_depth),
+            );
+        }
+
+        if current_depth == extra_depth {
+            object.insert("unexpected".to_owned(), json!("value"));
+        }
+
+        Value::Object(object)
+    }
+
+    fn validation_problem_messages(validator: &jsonschema::Validator, args: &Value) -> Vec<String> {
+        validator
+            .iter_errors(args)
+            .map(|error| format!("{}: {error}", error.instance_path()))
+            .collect()
     }
 
     fn widget_tool(query_required: bool, widget_required: bool) -> Value {
