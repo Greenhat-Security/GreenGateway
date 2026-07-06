@@ -875,8 +875,29 @@ struct RulePatch {
     enabled: Option<bool>,
     methods: Option<Vec<String>>,
     path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_rule_tool_name_patch")]
+    tool_name: Option<RuleToolNamePatch>,
     principal: Option<rbac::PrincipalMatcher>,
     action: Option<rbac::RuleAction>,
+}
+
+enum RuleToolNamePatch {
+    Set(String),
+    Clear,
+}
+
+fn deserialize_rule_tool_name_patch<'de, D>(
+    deserializer: D,
+) -> Result<Option<RuleToolNamePatch>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|value| {
+        Some(match value {
+            Some(value) => RuleToolNamePatch::Set(value),
+            None => RuleToolNamePatch::Clear,
+        })
+    })
 }
 
 type ResponseResult<T> = Result<T, Box<Response>>;
@@ -1273,7 +1294,11 @@ fn gateway_app_with_process_started_at(
             tool_registry.clone(),
         )?;
     }
-    let tool_runtime = tools::runtime::ToolRuntime::new(tool_runtime_config, audit_log.clone());
+    let tool_runtime = tools::runtime::ToolRuntime::new_with_rbac_state(
+        tool_runtime_config,
+        audit_log.clone(),
+        rbac_state.clone(),
+    );
     let mcp_executor = mcp::mcp_executor_from_config(
         &config,
         tool_registry.clone(),
@@ -3166,7 +3191,7 @@ async fn policy_rule_patch_endpoint(
     };
     if patch.is_empty() {
         return bad_request(
-            "rule patch must include at least one of enabled, methods, path, principal, action",
+            "rule patch must include at least one of enabled, methods, path, tool_name, principal, action",
         );
     }
 
@@ -5586,7 +5611,15 @@ fn validate_rule_preview_request(request: &PolicyRulePreviewRequest) -> Result<(
     if let Err(parameter) = validate_rfc3339("to", request.to.clone()) {
         errors.push(format!("invalid {parameter}: expected RFC 3339 timestamp"));
     }
-    if !request.rule.path.starts_with('/') {
+    let has_path = !request.rule.path.is_empty();
+    let has_tool_name = request.rule.tool_name.is_some();
+    if has_path == has_tool_name {
+        errors.push("rule must set exactly one of path or tool_name".to_owned());
+    }
+    if has_tool_name {
+        errors.push("rule preview currently supports HTTP path rules only".to_owned());
+    }
+    if has_path && !request.rule.path.starts_with('/') {
         errors.push(format!(
             "rule.path must start with '/', got '{}'",
             request.rule.path
@@ -6190,6 +6223,7 @@ impl RulePatch {
         self.methods.is_none()
             && self.enabled.is_none()
             && self.path.is_none()
+            && self.tool_name.is_none()
             && self.principal.is_none()
             && self.action.is_none()
     }
@@ -6204,6 +6238,12 @@ fn apply_rule_patch(rule: &mut rbac::Rule, patch: RulePatch) {
     }
     if let Some(path) = patch.path {
         rule.path = path;
+    }
+    if let Some(tool_name) = patch.tool_name {
+        rule.tool_name = match tool_name {
+            RuleToolNamePatch::Set(value) => Some(value),
+            RuleToolNamePatch::Clear => None,
+        };
     }
     if let Some(principal) = patch.principal {
         rule.principal = principal;
@@ -6224,6 +6264,9 @@ fn changed_rule_fields(before: &rbac::Rule, after: &rbac::Rule) -> Vec<&'static 
     }
     if before.path != after.path {
         fields.push("path");
+    }
+    if before.tool_name != after.tool_name {
+        fields.push("tool_name");
     }
     if before.principal != after.principal {
         fields.push("principal");
@@ -10537,6 +10580,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_tools_list_follows_live_tool_enabled_and_membership_policy() {
+        let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
+
+        let (before_status, before_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            53,
+            "tools/list",
+            None,
+            "mcp-list-before-tool-membership-reload",
+        )
+        .await;
+        assert_eq!(before_status, StatusCode::OK);
+        let before_tools = before_body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        assert!(before_tools
+            .iter()
+            .any(|tool| tool["name"] == json!("echo")));
+        assert!(before_tools
+            .iter()
+            .any(|tool| tool["name"] == json!("get_widget")));
+
+        let current_policy = rbac::Policy::from_file(&harness._policy.path)
+            .expect("current MCP policy should parse");
+        let etag = policy_etag(&current_policy).expect("current MCP policy ETag should compute");
+        let mut policy =
+            serde_json::to_value(&current_policy).expect("current MCP policy should serialize");
+        policy["tools"]["echo"]["enabled"] = json!(false);
+        policy["tools"]
+            .as_object_mut()
+            .expect("tools policy should be an object")
+            .remove("get_widget");
+
+        let put_response = harness
+            .router
+            .clone()
+            .oneshot(authenticated_json_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                &harness.admin_token,
+                Some(policy.to_string()),
+                Some(&etag),
+            ))
+            .await
+            .expect("policy PUT should complete");
+        assert_eq!(put_response.status(), StatusCode::OK);
+
+        let (after_status, after_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            54,
+            "tools/list",
+            None,
+            "mcp-list-after-tool-membership-reload",
+        )
+        .await;
+        assert_eq!(after_status, StatusCode::OK);
+        let after_tools = after_body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        assert!(
+            !after_tools.iter().any(|tool| tool["name"] == json!("echo")),
+            "disabled echo tool should not be listed after policy reload: {after_body}"
+        );
+        assert!(
+            !after_tools
+                .iter()
+                .any(|tool| tool["name"] == json!("get_widget")),
+            "removed get_widget tool should not be listed after policy reload: {after_body}"
+        );
+    }
+
+    #[tokio::test]
     async fn mcp_route_rejects_missing_authentication_and_missing_permission() {
         let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
 
@@ -10592,6 +10709,80 @@ mod tests {
             body["result"]["structuredContent"]["body"],
             json!({ "message": "hello from mcp" })
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_name_rules_follow_policy_admin_reload() {
+        let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
+
+        let (before_status, before_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            51,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "before reload"
+                }
+            })),
+            "mcp-call-before-tool-rule-reload",
+        )
+        .await;
+
+        assert_eq!(before_status, StatusCode::OK);
+        assert_eq!(before_body["error"], Value::Null);
+        assert_eq!(before_body["result"]["isError"], json!(false));
+
+        let current_policy = rbac::Policy::from_file(&harness._policy.path)
+            .expect("current MCP policy should parse");
+        let etag = policy_etag(&current_policy).expect("current MCP policy ETag should compute");
+        let mut policy =
+            serde_json::to_value(&current_policy).expect("current MCP policy should serialize");
+        policy["rules"] = json!([
+            {
+                "id": "deny-echo-after-reload",
+                "tool_name": "echo",
+                "principal": {
+                    "roles": ["admin"]
+                },
+                "action": "deny"
+            }
+        ]);
+
+        let put_response = harness
+            .router
+            .clone()
+            .oneshot(authenticated_json_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                &harness.admin_token,
+                Some(policy.to_string()),
+                Some(&etag),
+            ))
+            .await
+            .expect("policy PUT should complete");
+        assert_eq!(put_response.status(), StatusCode::OK);
+
+        let (after_status, after_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            52,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "after reload"
+                }
+            })),
+            "mcp-call-after-tool-rule-reload",
+        )
+        .await;
+
+        assert_eq!(after_status, StatusCode::OK);
+        assert_eq!(after_body["error"]["code"], json!(-32001));
+        assert_eq!(after_body["error"]["data"]["tool_name"], json!("echo"));
+        assert_eq!(after_body["error"]["data"]["reason"], json!("matched_rule"));
     }
 
     #[tokio::test]
@@ -15379,6 +15570,7 @@ mod tests {
                 enabled: true,
                 methods: vec!["GET".to_owned()],
                 path: "/load/{id}".to_owned(),
+                tool_name: None,
                 principal: rbac::PrincipalMatcher {
                     roles: vec!["reader".to_owned()],
                     auth_methods: vec!["bearer_token".to_owned()],
@@ -22006,6 +22198,30 @@ paths:
         (status, body)
     }
 
+    fn authenticated_json_request(
+        method: Method,
+        uri: &str,
+        token: &str,
+        body: Option<String>,
+        if_match: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::COOKIE, "csrf_token=mcp-test-csrf")
+            .header("x-csrf-token", "mcp-test-csrf");
+
+        if let Some(if_match) = if_match {
+            builder = builder.header(header::IF_MATCH, if_match);
+        }
+
+        builder
+            .body(Body::from(body.unwrap_or_default()))
+            .expect("authenticated JSON request should build")
+    }
+
     fn mcp_request(
         token: Option<&str>,
         id: u64,
@@ -22127,7 +22343,11 @@ paths:
             "enforcement_mode": "enforce",
             "roles": {
                 "admin": {
-                    "permissions": [ADMIN_MCP_USE_PERMISSION]
+                    "permissions": [
+                        ADMIN_MCP_USE_PERMISSION,
+                        ADMIN_POLICY_READ_PERMISSION,
+                        ADMIN_POLICY_WRITE_PERMISSION
+                    ]
                 },
                 "reader": {
                     "permissions": [ADMIN_MCP_USE_PERMISSION]
@@ -22141,6 +22361,11 @@ paths:
                     "methods": ["POST"],
                     "path_prefix": MCP_ROUTE,
                     "permission": ADMIN_MCP_USE_PERMISSION
+                },
+                {
+                    "methods": ["PUT"],
+                    "path_prefix": POLICY_ADMIN_ROUTE,
+                    "permission": ADMIN_POLICY_WRITE_PERMISSION
                 }
             ],
             "tools": {

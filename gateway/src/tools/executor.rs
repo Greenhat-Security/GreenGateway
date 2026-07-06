@@ -1617,6 +1617,7 @@ mod tests {
             max_concurrent_global,
             default_policy: DefaultToolPolicy::Deny,
             default_timeout: Duration::from_millis(500),
+            rules: Vec::new(),
             tools: tools
                 .into_iter()
                 .map(|(name, config)| (name.to_owned(), config))
@@ -1631,6 +1632,7 @@ mod tests {
             max_concurrent_global: 1,
             default_policy,
             default_timeout: Duration::from_millis(500),
+            rules: Vec::new(),
             tools: HashMap::new(),
         }
     }

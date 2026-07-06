@@ -59,6 +59,25 @@ struct RbacPolicyState {
     routes: Vec<RouteRule>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolRuleDecision {
+    pub action: RuleAction,
+    pub matched_rule_id: String,
+}
+
+pub(crate) struct ToolAuthorizationSnapshot<'a> {
+    pub tool: Option<ToolPolicySnapshot<'a>>,
+    pub rule_decision: Option<ToolRuleDecision>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolPolicySnapshot<'a> {
+    pub enabled: bool,
+    pub allowed_roles: &'a [String],
+    pub timeout_ms: u64,
+    pub max_concurrent: u32,
+}
+
 #[derive(Serialize)]
 struct ForbiddenBody {
     error: &'static str,
@@ -125,6 +144,22 @@ impl RbacState {
             .engine
             .principal_has_permission(principal, permission)
     }
+
+    pub(crate) fn evaluate_tool_authorization<R>(
+        &self,
+        tool_name: &str,
+        principal: Option<&auth::Principal>,
+        evaluate: impl FnOnce(ToolAuthorizationSnapshot<'_>) -> R,
+    ) -> R {
+        let policy = self.policy.load();
+        let tool = policy.tool_policy(tool_name);
+        let rule_decision = policy.evaluate_tool_rule(tool_name, principal);
+
+        evaluate(ToolAuthorizationSnapshot {
+            tool,
+            rule_decision,
+        })
+    }
 }
 
 impl RbacPolicyState {
@@ -155,6 +190,32 @@ impl RbacPolicyState {
             .get(rule_index)
             .cloned()
             .unwrap_or_else(|| rule_index.to_string())
+    }
+
+    fn tool_policy(&self, tool_name: &str) -> Option<ToolPolicySnapshot<'_>> {
+        self.engine
+            .policy()
+            .tools
+            .get(tool_name)
+            .map(|entry| ToolPolicySnapshot {
+                enabled: entry.enabled,
+                allowed_roles: entry.allowed_roles.as_slice(),
+                timeout_ms: entry.timeout_ms,
+                max_concurrent: entry.max_concurrent,
+            })
+    }
+
+    fn evaluate_tool_rule(
+        &self,
+        tool_name: &str,
+        principal: Option<&auth::Principal>,
+    ) -> Option<ToolRuleDecision> {
+        self.rule_matcher
+            .evaluate_tool(tool_name, principal)
+            .map(|decision| ToolRuleDecision {
+                action: decision.action,
+                matched_rule_id: self.rule_id(decision.rule_index),
+            })
     }
 }
 
@@ -2016,6 +2077,7 @@ mod tests {
             enabled: true,
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
             path: path.to_owned(),
+            tool_name: None,
             principal: PrincipalMatcher::default(),
             action,
         }

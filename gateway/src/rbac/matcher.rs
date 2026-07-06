@@ -42,6 +42,21 @@ impl RuleMatcher {
                 action: rule.action.clone(),
             })
     }
+
+    #[allow(dead_code)]
+    pub fn evaluate_tool(
+        &self,
+        tool_name: &str,
+        principal: Option<&Principal>,
+    ) -> Option<RuleDecision> {
+        self.rules
+            .iter()
+            .find(|rule| rule.matches_tool(tool_name, principal))
+            .map(|rule| RuleDecision {
+                rule_index: rule.rule_index,
+                action: rule.action.clone(),
+            })
+    }
 }
 
 pub(super) fn rule_matches(
@@ -70,7 +85,7 @@ pub(crate) fn path_pattern_matches(pattern: &str, path: &str) -> bool {
 /// Returns the first path segment that looks like a capture (contains `{`
 /// or `}`) but does not parse as a valid one, if any. `PathSegment::new`
 /// silently compiles such a segment to `PathSegment::Never`, which never
-/// matches any request — reused here so policy validation can reject a
+/// matches any request - reused here so policy validation can reject a
 /// malformed pattern up front instead of persisting a rule that can never
 /// fire.
 pub(crate) fn find_malformed_capture_segment(pattern: &str) -> Option<&str> {
@@ -91,29 +106,67 @@ pub(crate) fn find_malformed_capture_segment(pattern: &str) -> Option<&str> {
 struct CompiledRule {
     rule_index: usize,
     enabled: bool,
-    methods: MethodMatcher,
-    path: PathPattern,
+    target: RuleTarget,
     principal: PrincipalMatcher,
     action: RuleAction,
 }
 
+#[derive(Debug, Clone)]
+enum RuleTarget {
+    Http {
+        methods: MethodMatcher,
+        path: PathPattern,
+    },
+    Tool {
+        tool_name: String,
+    },
+}
+
 impl CompiledRule {
     fn new(rule_index: usize, rule: &Rule) -> Self {
+        let target = match rule.tool_name.as_ref() {
+            Some(tool_name) => RuleTarget::Tool {
+                tool_name: tool_name.clone(),
+            },
+            None => RuleTarget::Http {
+                methods: MethodMatcher::new(&rule.methods),
+                path: PathPattern::new(&rule.path),
+            },
+        };
+
         Self {
             rule_index,
             enabled: rule.enabled,
-            methods: MethodMatcher::new(&rule.methods),
-            path: PathPattern::new(&rule.path),
+            target,
             principal: rule.principal.clone(),
             action: rule.action.clone(),
         }
     }
 
     fn matches(&self, method: &str, path: &str, principal: Option<&Principal>) -> bool {
+        let RuleTarget::Http {
+            methods,
+            path: rule_path,
+        } = &self.target
+        else {
+            return false;
+        };
+
         self.enabled
-            && self.methods.matches(method)
-            && self.path.matches(path)
+            && methods.matches(method)
+            && rule_path.matches(path)
             && self.principal.matches(principal)
+    }
+
+    fn matches_tool(&self, tool_name: &str, principal: Option<&Principal>) -> bool {
+        let RuleTarget::Tool {
+            tool_name: rule_tool_name,
+        } = &self.target
+        else {
+            return false;
+        };
+
+        self.enabled && rule_tool_name == tool_name && self.principal.matches(principal)
     }
 }
 
@@ -287,6 +340,7 @@ mod tests {
             enabled: true,
             methods: vec!["GET".to_owned()],
             path: "/api/users/*".to_owned(),
+            tool_name: None,
             principal: PrincipalMatcher {
                 roles: vec!["support".to_owned()],
                 auth_methods: Vec::new(),
@@ -424,6 +478,40 @@ mod tests {
     }
 
     #[test]
+    fn tool_name_rules_and_http_path_rules_do_not_cross_match() {
+        let principal = test_principal("user-123", &["operator"], AuthMethod::Bearer);
+        let tool_only = RuleMatcher::new(&[tool_rule(
+            Some("deny-export"),
+            "reports.export",
+            &["operator"],
+            RuleAction::Deny,
+        )]);
+        let path_only = RuleMatcher::new(&[rule(
+            &["MCP"],
+            "/mcp/tools/reports.export",
+            RuleAction::Deny,
+        )]);
+
+        assert_eq!(
+            tool_only.evaluate("MCP", "/mcp/tools/reports.export", Some(&principal)),
+            None,
+            "tool_name rules must not match HTTP-shaped requests"
+        );
+        assert_eq!(
+            path_only.evaluate_tool("reports.export", Some(&principal)),
+            None,
+            "HTTP path rules must not match MCP tool calls"
+        );
+        assert_eq!(
+            tool_only.evaluate_tool("reports.export", Some(&principal)),
+            Some(RuleDecision {
+                rule_index: 0,
+                action: RuleAction::Deny,
+            })
+        );
+    }
+
+    #[test]
     fn malformed_capture_segments_never_match() {
         let matcher = RuleMatcher::new(&[rule(&[], "/api/{bad-name}", RuleAction::Allow)]);
 
@@ -542,7 +630,8 @@ mod tests {
         path: &str,
         principal: Option<&Principal>,
     ) -> bool {
-        reference_method_matches(&rule.methods, method)
+        rule.tool_name.is_none()
+            && reference_method_matches(&rule.methods, method)
             && rule.enabled
             && reference_pattern_matches(&rule.path, path)
             && rule.principal.matches(principal)
@@ -708,6 +797,7 @@ mod tests {
                 enabled,
                 methods,
                 path,
+                tool_name: None,
                 principal,
                 action,
             })
@@ -822,7 +912,24 @@ mod tests {
             enabled: true,
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
             path: path.to_owned(),
+            tool_name: None,
             principal: PrincipalMatcher::default(),
+            action,
+        }
+    }
+
+    fn tool_rule(id: Option<&str>, tool_name: &str, roles: &[&str], action: RuleAction) -> Rule {
+        Rule {
+            id: id.map(str::to_owned),
+            enabled: true,
+            methods: Vec::new(),
+            path: String::new(),
+            tool_name: Some(tool_name.to_owned()),
+            principal: PrincipalMatcher {
+                roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+                auth_methods: Vec::new(),
+                principal_ids: Vec::new(),
+            },
             action,
         }
     }

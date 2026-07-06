@@ -30,6 +30,8 @@ pub const BASELINE_AUDIT_UNAVAILABLE_REASON: &str =
 pub const DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS: u64 = 24;
 pub const MAX_RULE_SUGGESTION_BASELINE_WINDOW_HOURS: u64 = 876_000;
 
+const MCP_TOOL_OBSERVATION_METHOD: &str = "MCP";
+const MCP_TOOL_OBSERVATION_PATH_PREFIX: &str = "/mcp/tools/";
 const RULE_SUGGESTION_STATE_OPEN: &str = "open";
 const RULE_SUGGESTION_STATE_DISMISSED: &str = "dismissed";
 const RULE_SUGGESTION_STATE_ACCEPTED: &str = "accepted";
@@ -335,14 +337,12 @@ impl RuleSuggestionEngine {
                 continue;
             }
 
-            let proposed_rule = Rule {
-                id: None,
-                enabled: true,
-                methods: vec![observation.method.clone()],
-                path: observation.endpoint_template.clone(),
+            let proposed_rule = rule_suggestion_for_endpoint(
+                &observation.method,
+                &observation.endpoint_template,
                 principal,
-                action: RuleAction::Allow,
-            };
+                RuleAction::Allow,
+            );
             let rationale = baseline_rationale(
                 &observation.method,
                 &observation.endpoint_template,
@@ -410,14 +410,12 @@ impl RuleSuggestionEngine {
                 continue;
             }
 
-            let proposed_rule = Rule {
-                id: None,
-                enabled: true,
-                methods: vec![target.method.clone()],
-                path: target.path_pattern.clone(),
-                principal: target.principal,
-                action: RuleAction::Shadow,
-            };
+            let proposed_rule = rule_suggestion_for_endpoint(
+                &target.method,
+                &target.path_pattern,
+                target.principal,
+                RuleAction::Shadow,
+            );
             let suggestion_type = signal_shadow_suggestion_type(&signal.signal_type);
             let rationale = anomaly_rationale(&signal, &target.method, &target.path_pattern);
             let evidence = json!({
@@ -566,16 +564,13 @@ impl NewRuleSuggestion {
         source_signal_id: Option<String>,
     ) -> Result<Self, RuleSuggestionError> {
         let principal_key = principal_key(&proposed_rule.principal)?;
+        let (method, path_pattern) = suggestion_identity_from_rule(&proposed_rule);
 
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),
             suggestion_type: suggestion_type.into(),
-            method: proposed_rule
-                .methods
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "*".to_owned()),
-            path_pattern: proposed_rule.path.clone(),
+            method,
+            path_pattern,
             principal_key,
             proposed_rule,
             rationale: rationale.into(),
@@ -1026,12 +1021,77 @@ fn policy_has_covering_action(
     }
 
     let matcher = RuleMatcher::new(&policy.rules);
-    let path = representative_path_from_endpoint_template(path_pattern);
     let principal = representative_principal_for_matcher(principal);
 
-    matcher
-        .evaluate(method, &path, principal.as_ref())
-        .is_some_and(|decision| covering_actions.contains(&decision.action))
+    if let Some(tool_name) = tool_name_from_mcp_endpoint(method, path_pattern) {
+        matcher
+            .evaluate_tool(tool_name, principal.as_ref())
+            .is_some_and(|decision| covering_actions.contains(&decision.action))
+    } else {
+        let path = representative_path_from_endpoint_template(path_pattern);
+        matcher
+            .evaluate(method, &path, principal.as_ref())
+            .is_some_and(|decision| covering_actions.contains(&decision.action))
+    }
+}
+
+fn rule_suggestion_for_endpoint(
+    method: &str,
+    endpoint_template: &str,
+    principal: PrincipalMatcher,
+    action: RuleAction,
+) -> Rule {
+    if let Some(tool_name) = tool_name_from_mcp_endpoint(method, endpoint_template) {
+        Rule {
+            id: None,
+            enabled: true,
+            methods: Vec::new(),
+            path: String::new(),
+            tool_name: Some(tool_name.to_owned()),
+            principal,
+            action,
+        }
+    } else {
+        Rule {
+            id: None,
+            enabled: true,
+            methods: vec![method.to_owned()],
+            path: endpoint_template.to_owned(),
+            tool_name: None,
+            principal,
+            action,
+        }
+    }
+}
+
+fn suggestion_identity_from_rule(rule: &Rule) -> (String, String) {
+    if let Some(tool_name) = rule.tool_name.as_deref() {
+        (
+            MCP_TOOL_OBSERVATION_METHOD.to_owned(),
+            tool_observation_path(tool_name),
+        )
+    } else {
+        (
+            rule.methods
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "*".to_owned()),
+            rule.path.clone(),
+        )
+    }
+}
+
+fn tool_name_from_mcp_endpoint<'a>(method: &str, path_pattern: &'a str) -> Option<&'a str> {
+    if !method.eq_ignore_ascii_case(MCP_TOOL_OBSERVATION_METHOD) {
+        return None;
+    }
+
+    let tool_name = path_pattern.strip_prefix(MCP_TOOL_OBSERVATION_PATH_PREFIX)?;
+    (!tool_name.is_empty() && !tool_name.contains('/')).then_some(tool_name)
+}
+
+fn tool_observation_path(tool_name: &str) -> String {
+    format!("{MCP_TOOL_OBSERVATION_PATH_PREFIX}{tool_name}")
 }
 
 fn representative_path_from_endpoint_template(endpoint_template: &str) -> String {
@@ -1326,6 +1386,48 @@ mod tests {
     }
 
     #[test]
+    fn baseline_generation_suggests_tool_name_rule_for_mcp_tool_observation() {
+        let discovery_db = TempDb::new("baseline-tool-discovery");
+        let audit_db = TempDb::new("baseline-tool-audit");
+        seed_discovery_endpoint(&discovery_db.path, "MCP", "/mcp/tools/echo");
+        create_audit_schema(&audit_db.path);
+        insert_observation_event(
+            &audit_db.path,
+            SeedObservationEvent {
+                event_id: "tool-operator",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: "alice",
+                roles: &["operator"],
+                method: "MCP",
+                request_path: "/mcp/tools/echo",
+                status: 200,
+                policy_decision: Some("allowed"),
+            },
+        );
+
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        let run = engine
+            .generate(&empty_policy())
+            .expect("suggestion generation should succeed");
+
+        assert_eq!(run.inserted_count, 1);
+        let suggestions = engine.list_suggestions().expect("suggestions should query");
+        let suggestion = suggestion_for(&suggestions, "MCP", "/mcp/tools/echo", "operator");
+        assert_eq!(suggestion.proposed_rule.action, RuleAction::Allow);
+        assert!(
+            suggestion.proposed_rule.methods.is_empty(),
+            "tool-name rules should not carry HTTP method matchers"
+        );
+        let proposed_rule =
+            serde_json::to_value(&suggestion.proposed_rule).expect("rule should serialize");
+        assert_eq!(proposed_rule.get("tool_name"), Some(&json!("echo")));
+        assert!(
+            proposed_rule.get("path").is_none(),
+            "tool-name suggestions must not serialize an HTTP path matcher: {proposed_rule}"
+        );
+    }
+
+    #[test]
     fn baseline_generation_skips_combinations_already_covered_by_allow_or_shadow_rules() {
         let discovery_db = TempDb::new("baseline-dedup-discovery");
         let audit_db = TempDb::new("baseline-dedup-audit");
@@ -1363,6 +1465,7 @@ mod tests {
             enabled: true,
             methods: vec!["GET".to_owned()],
             path: "/invoices/{id}".to_owned(),
+            tool_name: None,
             principal: PrincipalMatcher {
                 roles: vec!["billing-reader".to_owned()],
                 auth_methods: Vec::new(),
@@ -1451,6 +1554,52 @@ mod tests {
     }
 
     #[test]
+    fn anomaly_generation_suggests_tool_name_rule_for_mcp_tool_signal() {
+        let discovery_db = TempDb::new("anomaly-tool-discovery");
+        seed_signal(
+            &discovery_db.path,
+            SeedSignal {
+                id: "sig-tool-schema-mismatch",
+                signal_type: "schema_mismatch",
+                target_kind: "endpoint",
+                target_identity: json!({
+                    "method": "MCP",
+                    "endpoint_template": "/mcp/tools/echo"
+                }),
+                evidence: json!({
+                    "schema_mismatch_count": 5
+                }),
+                state: "open",
+            },
+        );
+
+        let engine = suggestion_engine(&discovery_db.path, None);
+        let run = engine
+            .generate(&empty_policy())
+            .expect("suggestion generation should succeed");
+
+        assert_eq!(run.anomaly.open_signal_count, 1);
+        assert_eq!(run.inserted_count, 1);
+        let suggestions = engine.list_suggestions().expect("suggestions should query");
+        assert_eq!(suggestions.len(), 1);
+        let suggestion = &suggestions[0];
+        assert_eq!(suggestion.method, "MCP");
+        assert_eq!(suggestion.path_pattern, "/mcp/tools/echo");
+        assert_eq!(suggestion.proposed_rule.action, RuleAction::Shadow);
+        assert!(
+            suggestion.proposed_rule.methods.is_empty(),
+            "tool-name anomaly rules should not carry HTTP method matchers"
+        );
+        let proposed_rule =
+            serde_json::to_value(&suggestion.proposed_rule).expect("rule should serialize");
+        assert_eq!(proposed_rule.get("tool_name"), Some(&json!("echo")));
+        assert!(
+            proposed_rule.get("path").is_none(),
+            "tool-name anomaly suggestions must not serialize an HTTP path matcher: {proposed_rule}"
+        );
+    }
+
+    #[test]
     fn anomaly_generation_targets_signal_principal_and_skips_existing_shadow_coverage() {
         let discovery_db = TempDb::new("anomaly-principal-discovery");
         seed_discovery_endpoint(&discovery_db.path, "GET", "/invoices/{id}");
@@ -1490,6 +1639,7 @@ mod tests {
             enabled: true,
             methods: vec!["GET".to_owned()],
             path: "/invoices/{id}".to_owned(),
+            tool_name: None,
             principal: PrincipalMatcher {
                 roles: Vec::new(),
                 auth_methods: Vec::new(),
