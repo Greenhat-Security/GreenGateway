@@ -1979,7 +1979,11 @@ mod tests {
             .expect_err("missing path arg should fail");
 
         let message = work_failed_message(error);
-        assert!(message.contains("missing required path argument 'widget_id'"));
+        assert!(message.contains("arguments failed input schema validation"));
+        assert!(
+            message.contains("widget_id"),
+            "schema validation error should name the missing path argument: {message}"
+        );
 
         let events = audit_events(&capture, 3).await;
         assert_eq!(events[0].event_type, audit::event::TOOL_INVOKE_START);
@@ -2280,7 +2284,11 @@ mod tests {
             .expect_err("missing required query arg should fail");
 
         let message = work_failed_message(error);
-        assert!(message.contains("missing required query argument 'include_details'"));
+        assert!(message.contains("arguments failed input schema validation"));
+        assert!(
+            message.contains("include_details"),
+            "schema validation error should name the missing query argument: {message}"
+        );
     }
 
     #[tokio::test]
@@ -3020,11 +3028,11 @@ mod tests {
             .collect()
     }
 
-    fn widget_tool(query_required: bool, widget_required: bool) -> Value {
-        let required = if widget_required {
-            json!(["widget_id"])
+    fn widget_tool(query_required: bool, _widget_required: bool) -> Value {
+        let required = if query_required {
+            json!(["widget_id", "include_details"])
         } else {
-            json!([])
+            json!(["widget_id"])
         };
 
         json!({

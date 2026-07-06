@@ -688,6 +688,8 @@ fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
     let mut input_schema_precheck_budget = MAX_INPUT_SCHEMA_PRECHECK_NODES;
 
     for (index, definition) in definitions.iter().enumerate() {
+        let is_http_mapping = !definition.upstream.is_mcp_proxy();
+
         if let Some(first_index) = seen.insert(definition.name.as_str(), index) {
             problems.push(format!(
                 "duplicate tool name '{}' at tools[{index}] (first defined at tools[{first_index}])",
@@ -733,10 +735,145 @@ fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
                 "tool '{}' input_json_schema is not a valid JSON Schema: {err}",
                 definition.name
             ));
+            continue;
+        }
+
+        if is_http_mapping {
+            problems.extend(tool_mapping_schema_problems(index, definition));
         }
     }
 
     problems
+}
+
+fn tool_mapping_schema_problems(index: usize, definition: &ToolDefinition) -> Vec<String> {
+    let mut problems = Vec::new();
+    let required_args = input_schema_required_args(&definition.input_schema);
+
+    match path_template_placeholders(&definition.upstream.path_template) {
+        Ok(placeholders) => {
+            for arg_name in placeholders {
+                if !required_args.contains(arg_name.as_str()) {
+                    problems.push(format!(
+                        "tool '{}' path_template placeholder '{}' must be listed in input_json_schema.required",
+                        definition.name, arg_name
+                    ));
+                }
+                if let Some(problem) = mapped_arg_schema_problem(definition, "path", &arg_name) {
+                    problems.push(problem);
+                }
+            }
+        }
+        Err(problem) => problems.push(format!("tools[{index}].upstream.path_template {problem}")),
+    }
+
+    for mapping in &definition.upstream.query_params {
+        if mapping.required && !required_args.contains(mapping.arg_name.as_str()) {
+            problems.push(format!(
+                "tool '{}' required query argument '{}' must be listed in input_json_schema.required",
+                definition.name, mapping.arg_name
+            ));
+        }
+        if let Some(problem) = mapped_arg_schema_problem(definition, "query", &mapping.arg_name) {
+            problems.push(problem);
+        }
+    }
+
+    problems
+}
+
+fn path_template_placeholders(path_template: &str) -> Result<Vec<String>, String> {
+    if !path_template.starts_with('/') {
+        return Err("must start with '/'".to_owned());
+    }
+    if path_template.contains('?') || path_template.contains('#') {
+        return Err("must not include query strings or fragments".to_owned());
+    }
+
+    let mut placeholders = Vec::new();
+    let mut rest = path_template;
+    loop {
+        if let Some(close) = rest.find('}') {
+            match rest.find('{') {
+                Some(open) if open < close => {}
+                _ => return Err("contains an unmatched '}'".to_owned()),
+            }
+        }
+
+        let Some(open) = rest.find('{') else {
+            break;
+        };
+
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            return Err("contains an unmatched '{'".to_owned());
+        };
+        let arg_name = &after_open[..close];
+        if arg_name.is_empty() {
+            return Err("contains an empty placeholder".to_owned());
+        }
+        if arg_name.contains('{') || arg_name.contains('}') {
+            return Err(format!("placeholder '{arg_name}' contains a brace"));
+        }
+
+        placeholders.push(arg_name.to_owned());
+        rest = &after_open[close + 1..];
+    }
+
+    Ok(placeholders)
+}
+
+fn input_schema_required_args(schema: &Value) -> BTreeSet<&str> {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+fn input_schema_property<'a>(schema: &'a Value, arg_name: &str) -> Option<&'a Value> {
+    schema.get("properties")?.as_object()?.get(arg_name)
+}
+
+fn mapped_arg_schema_problem(
+    definition: &ToolDefinition,
+    location: &'static str,
+    arg_name: &str,
+) -> Option<String> {
+    let Some(schema) = input_schema_property(&definition.input_schema, arg_name) else {
+        return Some(format!(
+            "tool '{}' {location} argument '{}' must be declared in input_json_schema.properties",
+            definition.name, arg_name
+        ));
+    };
+
+    if is_scalar_constrained_schema(schema) {
+        None
+    } else {
+        Some(format!(
+            "tool '{}' {location} argument '{}' must be constrained to scalar JSON Schema types",
+            definition.name, arg_name
+        ))
+    }
+}
+
+fn is_scalar_constrained_schema(schema: &Value) -> bool {
+    match schema.get("type") {
+        Some(Value::String(schema_type)) => is_scalar_json_schema_type(schema_type),
+        Some(Value::Array(schema_types)) => {
+            !schema_types.is_empty()
+                && schema_types
+                    .iter()
+                    .all(|schema_type| schema_type.as_str().is_some_and(is_scalar_json_schema_type))
+        }
+        _ => false,
+    }
+}
+
+fn is_scalar_json_schema_type(schema_type: &str) -> bool {
+    matches!(schema_type, "string" | "number" | "integer" | "boolean")
 }
 
 fn input_schema_precheck_problem(schema: &Value, remaining_budget: &mut usize) -> Option<String> {
@@ -1266,6 +1403,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn path_placeholder_missing_from_required_is_rejected_at_load_time() {
+        let mut tool = echo_tool("get_widget", "GET", "/v1/widgets/{widget_id}");
+        tool["input_json_schema"] = json!({
+            "type": "object",
+            "required": ["message"],
+            "properties": {
+                "message": { "type": "string" },
+                "widget_id": { "type": "string" }
+            },
+            "additionalProperties": false
+        });
+
+        let error = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect_err("path placeholders missing from required should reject");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "tool 'get_widget' path_template placeholder 'widget_id' must be listed in input_json_schema.required"
+            ),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn required_query_mapping_missing_from_required_is_rejected_at_load_time() {
+        let mut tool = echo_tool("get_widget", "GET", "/v1/widgets");
+        tool["upstream"]["query_params"][0]["required"] = json!(true);
+
+        let error = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect_err("required query mappings missing from required should reject");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "tool 'get_widget' required query argument 'include_details' must be listed in input_json_schema.required"
+            ),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn path_mapped_argument_with_object_schema_is_rejected_at_load_time() {
+        let mut tool = echo_tool("get_widget", "GET", "/v1/widgets/{widget_id}");
+        tool["input_json_schema"] = json!({
+            "type": "object",
+            "required": ["message", "widget_id"],
+            "properties": {
+                "message": { "type": "string" },
+                "widget_id": { "type": "object" }
+            },
+            "additionalProperties": false
+        });
+
+        let error = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect_err("path mapped object arguments should reject");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "tool 'get_widget' path argument 'widget_id' must be constrained to scalar JSON Schema types"
+            ),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn query_mapped_argument_with_array_schema_is_rejected_at_load_time() {
+        let mut tool = echo_tool("get_widget", "GET", "/v1/widgets");
+        tool["input_json_schema"]["properties"]["include_details"] = json!({ "type": "array" });
+
+        let error = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect_err("query mapped array arguments should reject");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "tool 'get_widget' query argument 'include_details' must be constrained to scalar JSON Schema types"
+            ),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn optional_query_params_may_remain_optional_when_mapped_schemas_are_scalar() {
+        let mut tool = echo_tool("get_widget", "GET", "/v1/widgets/{widget_id}");
+        tool["input_json_schema"] = json!({
+            "type": "object",
+            "required": ["message", "widget_id"],
+            "properties": {
+                "message": { "type": "string" },
+                "widget_id": { "type": "integer" },
+                "include_details": { "type": ["boolean", "string"] }
+            },
+            "additionalProperties": false
+        });
+
+        ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect("optional query mappings with scalar schemas should load");
+    }
+
     #[tokio::test]
     async fn file_watch_reload_applies_valid_tools_update() {
         let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
@@ -1417,6 +1671,41 @@ mod tests {
         assert!(
             mcp_tool.upstream.is_mcp_proxy(),
             "schema rejection must not replace MCP proxy tool with local HTTP tool"
+        );
+    }
+
+    #[test]
+    fn reload_rejects_invalid_tool_mapping_without_replacing_existing_registry() {
+        let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
+        let registry = ToolRegistry::from_file(file.path()).expect("initial registry should load");
+        let mut invalid_tool = echo_tool("get_widget", "GET", "/v1/widgets/{widget_id}");
+        invalid_tool["input_json_schema"] = json!({
+            "type": "object",
+            "required": ["message"],
+            "properties": {
+                "message": { "type": "string" },
+                "widget_id": { "type": "string" },
+                "include_details": { "type": "boolean" }
+            },
+            "additionalProperties": false
+        });
+
+        file.write(&tools_document(&[invalid_tool]));
+
+        let error = reload_tool_registry_from_file(&registry, file.path())
+            .expect_err("invalid path mapping should reject reload");
+        assert!(
+            error.to_string().contains(
+                "tool 'get_widget' path_template placeholder 'widget_id' must be listed in input_json_schema.required"
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(registry.get("echo").is_some());
+        assert!(registry.get("get_widget").is_none());
+        assert_eq!(
+            registry.list().len(),
+            1,
+            "mapping validation failure must keep last-known-good registry"
         );
     }
 
@@ -1630,7 +1919,7 @@ mod tests {
     }
 
     fn echo_tool(name: &str, method: &str, path_template: &str) -> Value {
-        json!({
+        let mut tool = json!({
             "name": name,
             "description": "Echoes the provided message.",
             "input_json_schema": {
@@ -1656,7 +1945,14 @@ mod tests {
                     "mode": "whole_args_json"
                 }
             }
-        })
+        });
+
+        if path_template.contains("{widget_id}") {
+            tool["input_json_schema"]["required"] = json!(["message", "widget_id"]);
+            tool["input_json_schema"]["properties"]["widget_id"] = json!({ "type": "string" });
+        }
+
+        tool
     }
 
     fn malformed_input_schema_tool(name: &str, method: &str, path_template: &str) -> Value {
@@ -1768,6 +2064,9 @@ mod tests {
                 "example_value": {
                     "type": "object",
                     "examples": [{ "$anchor": "literal" }]
+                },
+                "include_details": {
+                    "type": "boolean"
                 }
             },
             "additionalProperties": false
@@ -1814,9 +2113,10 @@ mod tests {
     }
 
     fn object_schema_with_properties(property_count: usize) -> Value {
-        let properties = (0..property_count)
+        let mut properties = (0..property_count)
             .map(|index| (format!("field_{index}"), json!({ "type": "string" })))
             .collect::<serde_json::Map<_, _>>();
+        properties.insert("include_details".to_owned(), json!({ "type": "boolean" }));
 
         json!({
             "type": "object",
