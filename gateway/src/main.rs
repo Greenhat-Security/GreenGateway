@@ -7348,7 +7348,7 @@ mod tests {
         net::{IpAddr, Ipv4Addr},
         path::PathBuf,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
         },
         time::{Duration, Instant},
@@ -11020,6 +11020,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_call_rejects_request_larger_than_egress_limit_before_send() {
+        const REQUEST_LIMIT: usize = 1024;
+
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let upstream = spawn_raw_mcp_upstream(RawMcpOversizeTarget::None, 0).await;
+        let tool_call_request_count = Arc::clone(&upstream.tool_call_request_count);
+        let harness = mcp_upstream_test_harness_with_audit_and_limits(
+            "alpha",
+            upstream.url.clone(),
+            &["admin", "reader"],
+            audit_log,
+            None,
+            Some(REQUEST_LIMIT),
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            34,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "x".repeat(REQUEST_LIMIT)
+                }
+            })),
+            "mcp-upstream-call-request-too-large",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32603));
+        assert_eq!(body["error"]["message"], json!("tool invocation failed"));
+        assert_eq!(
+            body["error"]["data"]["tool_name"],
+            json!("alpha:remote_echo")
+        );
+        assert_eq!(
+            body["error"]["data"]["reason"],
+            json!("request_body_too_large")
+        );
+        assert_eq!(
+            tool_call_request_count.load(Ordering::SeqCst),
+            0,
+            "oversized MCP tools/call request must not reach the upstream"
+        );
+        assert_eventually(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == audit::event::TOOL_UPSTREAM_REQUEST
+                    && event.request_id == "mcp-upstream-call-request-too-large"
+                    && event.payload["tool_name"] == json!("alpha:remote_echo")
+                    && event.payload["method"] == json!("MCP")
+                    && event.payload["outcome"] == json!("failure")
+                    && event.payload["reason"] == json!("request_body_too_large")
+            })
+        });
+
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_upstream_tools_list_discovery_rejects_response_larger_than_egress_limit() {
         const RESPONSE_LIMIT: usize = 512;
 
@@ -11094,6 +11158,55 @@ mod tests {
                     "message": "small proxied hello"
                 }
             })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_upstream_tool_call_under_request_egress_limit_still_returns_result() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let calls = Arc::clone(&upstream.calls);
+        let harness = mcp_upstream_test_harness_with_request_limit(
+            "alpha",
+            upstream.url.clone(),
+            &["admin", "reader"],
+            16 * 1024,
+        )
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            35,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "small proxied hello"
+                }
+            })),
+            "mcp-upstream-call-under-request-limit",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["result"]["isError"], json!(false));
+        assert_eq!(
+            body["result"]["structuredContent"],
+            json!({
+                "remote_tool": "remote_echo",
+                "arguments": {
+                    "message": "small proxied hello"
+                }
+            })
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("upstream calls lock should not poison")
+                .len(),
+            1,
+            "under-limit MCP tools/call request should reach upstream"
         );
     }
 
@@ -21030,6 +21143,23 @@ paths:
         .await
     }
 
+    async fn mcp_upstream_test_harness_with_request_limit(
+        server_name: &str,
+        upstream_url: String,
+        allowed_roles: &[&str],
+        max_request_body_bytes: usize,
+    ) -> McpUpstreamTestHarness {
+        mcp_upstream_test_harness_with_audit_and_limits(
+            server_name,
+            upstream_url,
+            allowed_roles,
+            test_audit_log(),
+            None,
+            Some(max_request_body_bytes),
+        )
+        .await
+    }
+
     async fn mcp_upstream_test_harness_with_audit(
         server_name: &str,
         upstream_url: String,
@@ -21052,6 +21182,25 @@ paths:
         allowed_roles: &[&str],
         audit_log: audit::AuditLog,
         max_response_bytes: Option<usize>,
+    ) -> McpUpstreamTestHarness {
+        mcp_upstream_test_harness_with_audit_and_limits(
+            server_name,
+            upstream_url,
+            allowed_roles,
+            audit_log,
+            max_response_bytes,
+            None,
+        )
+        .await
+    }
+
+    async fn mcp_upstream_test_harness_with_audit_and_limits(
+        server_name: &str,
+        upstream_url: String,
+        allowed_roles: &[&str],
+        audit_log: audit::AuditLog,
+        max_response_bytes: Option<usize>,
+        max_request_body_bytes: Option<usize>,
     ) -> McpUpstreamTestHarness {
         let token_db = TempDb::new("mcp-upstream-service-tokens");
         let token_store =
@@ -21078,6 +21227,9 @@ paths:
         if let Some(max_response_bytes) = max_response_bytes {
             config.egress_max_response_bytes = max_response_bytes;
         }
+        if let Some(max_request_body_bytes) = max_request_body_bytes {
+            config.egress_max_request_body_bytes = max_request_body_bytes;
+        }
 
         let recorder = PrometheusBuilder::new().build_recorder();
         let router = app(
@@ -21100,6 +21252,7 @@ paths:
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum RawMcpOversizeTarget {
+        None,
         ToolsList,
         ToolCall,
     }
@@ -21107,6 +21260,7 @@ paths:
     struct RawMcpUpstream {
         url: String,
         oversized_body_started: Arc<AtomicBool>,
+        tool_call_request_count: Arc<AtomicUsize>,
         shutdown: tokio_util::sync::CancellationToken,
         handle: tokio::task::JoinHandle<()>,
     }
@@ -21132,6 +21286,8 @@ paths:
         let shutdown_task = shutdown.clone();
         let oversized_body_started = Arc::new(AtomicBool::new(false));
         let oversized_body_started_task = Arc::clone(&oversized_body_started);
+        let tool_call_request_count = Arc::new(AtomicUsize::new(0));
+        let tool_call_request_count_task = Arc::clone(&tool_call_request_count);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -21144,12 +21300,15 @@ paths:
                         let shutdown_connection = shutdown_task.clone();
                         let oversized_body_started_connection =
                             Arc::clone(&oversized_body_started_task);
+                        let tool_call_request_count_connection =
+                            Arc::clone(&tool_call_request_count_task);
                         tokio::spawn(async move {
                             handle_raw_mcp_connection(
                                 &mut stream,
                                 oversize_target,
                                 max_response_bytes,
                                 oversized_body_started_connection,
+                                tool_call_request_count_connection,
                                 shutdown_connection,
                             )
                             .await;
@@ -21162,6 +21321,7 @@ paths:
         RawMcpUpstream {
             url: format!("http://{addr}/mcp"),
             oversized_body_started,
+            tool_call_request_count,
             shutdown,
             handle,
         }
@@ -21172,6 +21332,7 @@ paths:
         oversize_target: RawMcpOversizeTarget,
         max_response_bytes: usize,
         oversized_body_started: Arc<AtomicBool>,
+        tool_call_request_count: Arc<AtomicUsize>,
         shutdown: tokio_util::sync::CancellationToken,
     ) {
         let Some(request) = read_raw_mcp_http_request(stream).await else {
@@ -21181,6 +21342,9 @@ paths:
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if method == "tools/call" {
+            tool_call_request_count.fetch_add(1, Ordering::SeqCst);
+        }
 
         match method {
             "initialize" => {

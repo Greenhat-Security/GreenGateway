@@ -96,6 +96,7 @@ pub enum McpUpstreamCallError {
     ClientBuild,
     Connect,
     Call,
+    RequestBodyTooLarge { size: usize, max: usize },
     ResponseTooLarge { max: usize },
     Serialize,
 }
@@ -107,6 +108,7 @@ impl McpUpstreamCallError {
             Self::ClientBuild => "client_build_failed",
             Self::Connect => "connect_failed",
             Self::Call => "call_failed",
+            Self::RequestBodyTooLarge { .. } => "request_body_too_large",
             Self::ResponseTooLarge { .. } => "response_too_large",
             Self::Serialize => "result_serialize_failed",
         }
@@ -125,6 +127,12 @@ impl fmt::Display for McpUpstreamCallError {
             Self::ClientBuild => write!(formatter, "upstream MCP client could not be built"),
             Self::Connect => write!(formatter, "upstream MCP server could not be reached"),
             Self::Call => write!(formatter, "upstream MCP tool call failed"),
+            Self::RequestBodyTooLarge { size, max } => {
+                write!(
+                    formatter,
+                    "upstream MCP request body is too large: {size} > {max}"
+                )
+            }
             Self::ResponseTooLarge { max } => {
                 write!(formatter, "upstream MCP response body exceeded {max} bytes")
             }
@@ -140,6 +148,7 @@ pub struct McpUpstreamRuntimeConfig {
     pub timeout: Duration,
     pub response_idle_timeout: Duration,
     pub connect_timeout: Duration,
+    pub max_request_body_bytes: usize,
     pub max_response_bytes: usize,
 }
 
@@ -149,6 +158,7 @@ impl McpUpstreamRuntimeConfig {
             timeout: Duration::from_millis(config.egress_timeout_ms),
             response_idle_timeout: Duration::from_millis(config.egress_response_idle_timeout_ms),
             connect_timeout: Duration::from_millis(config.egress_connect_timeout_ms),
+            max_request_body_bytes: config.egress_max_request_body_bytes,
             max_response_bytes: config.egress_max_response_bytes,
         }
     }
@@ -265,7 +275,11 @@ async fn connect(
         .resolve(&destination.host, destination.pinned_addr)
         .build()
         .map_err(|_| McpUpstreamCallError::ClientBuild)?;
-    let client = LimitedMcpHttpClient::new(client, runtime_config.max_response_bytes);
+    let client = LimitedMcpHttpClient::new(
+        client,
+        runtime_config.max_request_body_bytes,
+        runtime_config.max_response_bytes,
+    );
     let transport = StreamableHttpClientTransport::with_client(
         client,
         StreamableHttpClientTransportConfig::with_uri(server.url.clone()),
@@ -284,13 +298,19 @@ async fn connect(
 #[derive(Clone)]
 struct LimitedMcpHttpClient {
     inner: rmcp_reqwest::Client,
+    max_request_body_bytes: usize,
     max_response_bytes: usize,
 }
 
 impl LimitedMcpHttpClient {
-    fn new(inner: rmcp_reqwest::Client, max_response_bytes: usize) -> Self {
+    fn new(
+        inner: rmcp_reqwest::Client,
+        max_request_body_bytes: usize,
+        max_response_bytes: usize,
+    ) -> Self {
         Self {
             inner,
+            max_request_body_bytes,
             max_response_bytes,
         }
     }
@@ -299,6 +319,8 @@ impl LimitedMcpHttpClient {
 #[derive(Debug)]
 enum LimitedMcpHttpError {
     Http(rmcp_reqwest::Error),
+    Serialize(serde_json::Error),
+    RequestBodyTooLarge { size: usize, max: usize },
     ResponseTooLarge { max: usize },
 }
 
@@ -306,6 +328,15 @@ impl fmt::Display for LimitedMcpHttpError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Http(error) => write!(formatter, "MCP upstream HTTP error: {error}"),
+            Self::Serialize(error) => {
+                write!(formatter, "MCP upstream JSON serialize error: {error}")
+            }
+            Self::RequestBodyTooLarge { size, max } => {
+                write!(
+                    formatter,
+                    "egress request body is too large: {size} > {max}"
+                )
+            }
             Self::ResponseTooLarge { max } => {
                 write!(formatter, "egress response body exceeded {max} bytes")
             }
@@ -317,7 +348,8 @@ impl Error for LimitedMcpHttpError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Http(error) => Some(error),
-            Self::ResponseTooLarge { .. } => None,
+            Self::Serialize(error) => Some(error),
+            Self::RequestBodyTooLarge { .. } | Self::ResponseTooLarge { .. } => None,
         }
     }
 }
@@ -325,6 +357,12 @@ impl Error for LimitedMcpHttpError {
 impl From<rmcp_reqwest::Error> for LimitedMcpHttpError {
     fn from(error: rmcp_reqwest::Error) -> Self {
         Self::Http(error)
+    }
+}
+
+impl From<serde_json::Error> for LimitedMcpHttpError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Serialize(error)
     }
 }
 
@@ -406,16 +444,20 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
             request = request.bearer_auth(auth_header);
         }
 
+        let custom_content_type = custom_headers
+            .keys()
+            .any(|name| name.as_str().eq_ignore_ascii_case(CONTENT_TYPE.as_str()));
         request = apply_mcp_custom_headers(request, custom_headers)?;
         let session_was_attached = session_id.is_some();
         if let Some(session_id) = session_id {
             request = request.header(HEADER_SESSION_ID, session_id.as_ref());
         }
-        let response = request
-            .json(&message)
-            .send()
-            .await
-            .map_err(mcp_http_error)?;
+        let body = serialize_mcp_request_body(&message)?;
+        enforce_mcp_request_body_size(body.len(), self.max_request_body_bytes)?;
+        if !custom_content_type {
+            request = request.header(CONTENT_TYPE, JSON_MIME);
+        }
+        let response = request.body(body).send().await.map_err(mcp_http_error)?;
         if response.status() == StatusCode::UNAUTHORIZED {
             if let Some(header) = response.headers().get(WWW_AUTHENTICATE) {
                 let header = header
@@ -617,6 +659,34 @@ async fn read_limited_mcp_response_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&body).map_err(StreamableHttpError::Deserialize)
 }
 
+fn serialize_mcp_request_body(
+    message: &ClientJsonRpcMessage,
+) -> Result<Vec<u8>, StreamableHttpError<LimitedMcpHttpError>> {
+    serde_json::to_vec(message)
+        .map_err(|error| StreamableHttpError::Client(LimitedMcpHttpError::Serialize(error)))
+}
+
+fn enforce_mcp_request_body_size(
+    size: usize,
+    max_request_body_bytes: usize,
+) -> Result<(), StreamableHttpError<LimitedMcpHttpError>> {
+    if size > max_request_body_bytes {
+        tracing::warn!(
+            size,
+            max = max_request_body_bytes,
+            "egress blocked oversized request body"
+        );
+        return Err(StreamableHttpError::Client(
+            LimitedMcpHttpError::RequestBodyTooLarge {
+                size,
+                max: max_request_body_bytes,
+            },
+        ));
+    }
+
+    Ok(())
+}
+
 fn enforce_mcp_response_content_length(
     response: &rmcp_reqwest::Response,
     max_response_bytes: usize,
@@ -716,7 +786,9 @@ fn mcp_service_error<E>(error: E, fallback: McpUpstreamCallError) -> McpUpstream
 where
     E: Error + 'static,
 {
-    if let Some(max) = mcp_response_too_large_max(&error) {
+    if let Some((size, max)) = mcp_request_body_too_large_size_max(&error) {
+        McpUpstreamCallError::RequestBodyTooLarge { size, max }
+    } else if let Some(max) = mcp_response_too_large_max(&error) {
         McpUpstreamCallError::ResponseTooLarge { max }
     } else {
         fallback
@@ -727,6 +799,46 @@ fn mcp_streamable_error_response_too_large(
     error: &StreamableHttpError<LimitedMcpHttpError>,
 ) -> Option<usize> {
     mcp_response_too_large_max(error)
+}
+
+fn mcp_request_body_too_large_size_max(error: &(dyn Error + 'static)) -> Option<(usize, usize)> {
+    let mut current = Some(error);
+
+    while let Some(error) = current {
+        if let Some(ServiceError::TransportSend(error)) = error.downcast_ref::<ServiceError>() {
+            if let Some(size_max) = mcp_request_body_too_large_size_max(error.error.as_ref()) {
+                return Some(size_max);
+            }
+        }
+        if let Some(ClientInitializeError::TransportError { error, .. }) =
+            error.downcast_ref::<ClientInitializeError>()
+        {
+            if let Some(size_max) = mcp_request_body_too_large_size_max(error.error.as_ref()) {
+                return Some(size_max);
+            }
+        }
+        if let Some(error) = error.downcast_ref::<DynamicTransportError>() {
+            if let Some(size_max) = mcp_request_body_too_large_size_max(error.error.as_ref()) {
+                return Some(size_max);
+            }
+        }
+        if let Some(LimitedMcpHttpError::RequestBodyTooLarge { size, max }) =
+            error.downcast_ref::<LimitedMcpHttpError>()
+        {
+            return Some((*size, *max));
+        }
+        if let Some(StreamableHttpError::Client(LimitedMcpHttpError::RequestBodyTooLarge {
+            size,
+            max,
+        })) = error.downcast_ref::<StreamableHttpError<LimitedMcpHttpError>>()
+        {
+            return Some((*size, *max));
+        }
+
+        current = error.source();
+    }
+
+    None
 }
 
 fn mcp_response_too_large_max(error: &(dyn Error + 'static)) -> Option<usize> {
