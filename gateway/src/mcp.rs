@@ -8,8 +8,9 @@ use axum::{
 use http::{header, request::Parts};
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, ErrorCode, ErrorData, Implementation, JsonObject,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResult, CreateTaskResult, ErrorCode, ErrorData,
+        Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
+        ServerInfo, Tool,
     },
     service::{RequestContext, RoleServer},
     transport::streamable_http_server::{
@@ -33,6 +34,7 @@ use crate::{
 
 const TOOL_POLICY_DENIED_CODE: ErrorCode = ErrorCode(-32001);
 const TOOL_RUNTIME_UNAVAILABLE_CODE: ErrorCode = ErrorCode(-32000);
+const TOOL_TASK_UNSUPPORTED_REASON: &str = "task_unsupported";
 const JSON_MIME: &str = "application/json";
 
 type McpHttpService = StreamableHttpService<McpServer, NeverSessionManager>;
@@ -120,9 +122,6 @@ impl ServerHandler for McpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        // SEP-1319 task-style calls are routed by rmcp to enqueue_task before this method.
-        // GreenGateway does not implement task execution yet, so this inventory path covers
-        // ordinary, non-task tools/call requests only.
         let tool_name = request.name.to_string();
         let lookup_started = Instant::now();
         let invocation_context =
@@ -165,10 +164,53 @@ impl ServerHandler for McpServer {
         }
     }
 
-    fn get_tool(&self, name: &str) -> Option<Tool> {
-        self.registry
-            .get(name)
-            .and_then(|definition| mcp_tool_from_definition(definition.as_ref()).ok())
+    async fn enqueue_task(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CreateTaskResult, ErrorData> {
+        let tool_name = request.name.to_string();
+        let lookup_started = Instant::now();
+        let invocation_context =
+            invocation_context_from_request(&context, self.trust_proxy_headers);
+
+        if self.registry.get(&tool_name).is_none() {
+            if let Some(executor) = self.executor.as_ref() {
+                executor.record_unknown_tool_call(
+                    &invocation_context,
+                    &tool_name,
+                    lookup_started.elapsed(),
+                );
+            }
+            return Err(unknown_tool_error(&tool_name));
+        }
+
+        let Some(executor) = self.executor.as_ref() else {
+            return Err(ErrorData::internal_error(
+                "tool executor is not configured",
+                Some(json!({ "tool_name": tool_name })),
+            ));
+        };
+
+        match executor
+            .reject_task_tool_call(invocation_context, &tool_name)
+            .await
+        {
+            Ok(()) => Err(task_unsupported_error(tool_name)),
+            Err(ToolRuntimeError::WorkFailed {
+                tool_name,
+                reason: Some(reason),
+                ..
+            }) if reason == TOOL_TASK_UNSUPPORTED_REASON => Err(task_unsupported_error(tool_name)),
+            Err(error) => Err(runtime_error_to_mcp_error(error)),
+        }
+    }
+
+    fn get_tool(&self, _name: &str) -> Option<Tool> {
+        // rmcp uses this hook only for taskSupport prevalidation. GreenGateway
+        // intentionally owns SEP-1319 task rejection so rejected task calls feed
+        // the same audit/inventory path as ordinary tool calls.
+        None
     }
 }
 
@@ -495,6 +537,16 @@ fn unknown_tool_error(tool_name: &str) -> ErrorData {
         ErrorCode::METHOD_NOT_FOUND,
         format!("tool '{tool_name}' is not defined"),
         Some(json!({ "tool_name": tool_name })),
+    )
+}
+
+fn task_unsupported_error(tool_name: String) -> ErrorData {
+    ErrorData::invalid_params(
+        "task-based tool invocation is not supported by GreenGateway",
+        Some(json!({
+            "tool_name": tool_name,
+            "reason": TOOL_TASK_UNSUPPORTED_REASON,
+        })),
     )
 }
 

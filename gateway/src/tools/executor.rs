@@ -66,6 +66,8 @@ const TOOL_TIMEOUT_REASON: &str = "timeout";
 const TOOL_CANCELLED_REASON: &str = "cancelled";
 const TOOL_RUNTIME_CLOSED_REASON: &str = "runtime_closed";
 const TOOL_RUNTIME_REJECTED_REASON: &str = "runtime_rejected";
+const TOOL_TASK_UNSUPPORTED_STATUS: u16 = 400;
+const TOOL_TASK_UNSUPPORTED_REASON: &str = "task_unsupported";
 const STRICT_SCHEMA_INJECTION_SKIP_KEYWORDS: &[&str] =
     &["$ref", "oneOf", "anyOf", "allOf", "patternProperties"];
 // OpenAPI-generated schemas can come from externally supplied specs. Sixty-four
@@ -274,6 +276,14 @@ struct ToolObservationOutcome {
     reason: Option<&'static str>,
 }
 
+struct UnsupportedTaskInvocation;
+
+impl fmt::Display for UnsupportedTaskInvocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("task-based tool invocation is not supported by GreenGateway")
+    }
+}
+
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 struct ValidatorCacheKey {
     tool_name: String,
@@ -419,6 +429,55 @@ impl ToolExecutor {
         elapsed: Duration,
     ) {
         self.emit_unknown_tool_observation(context, tool_name, duration_millis(elapsed));
+    }
+
+    pub(crate) async fn reject_task_tool_call(
+        &self,
+        context: ToolInvocationContext,
+        tool_name: &str,
+    ) -> Result<(), ToolRuntimeError> {
+        let started = Instant::now();
+        let result: Result<(), ToolRuntimeError> = self
+            .runtime
+            .execute_result_with_context_and_reason(
+                tool_name,
+                context.clone(),
+                CancellationToken::new(),
+                || async { Err(UnsupportedTaskInvocation) },
+                |_| Some(TOOL_TASK_UNSUPPORTED_REASON.to_owned()),
+            )
+            .await;
+
+        if let Err(error) = &result {
+            if matches!(
+                error,
+                ToolRuntimeError::WorkFailed {
+                    reason: Some(reason),
+                    ..
+                } if reason == TOOL_TASK_UNSUPPORTED_REASON
+            ) {
+                self.emit_named_tool_observation(
+                    &context,
+                    tool_name,
+                    ToolObservationOutcome {
+                        status: TOOL_TASK_UNSUPPORTED_STATUS,
+                        latency_ms: duration_millis(started.elapsed()),
+                        schema_mismatch: false,
+                        reason: Some(TOOL_TASK_UNSUPPORTED_REASON),
+                    },
+                );
+            } else {
+                self.emit_runtime_admission_failure_observation(
+                    &context,
+                    tool_name,
+                    duration_millis(started.elapsed()),
+                    error,
+                    false,
+                );
+            }
+        }
+
+        result
     }
 
     async fn execute_inner(
