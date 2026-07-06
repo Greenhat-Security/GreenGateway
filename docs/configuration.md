@@ -56,7 +56,9 @@ Default: empty, which disables the OAuth protected-resource metadata document. I
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be a valid `http` or `https` URL with a host. The configured URL may include a path prefix; GreenGateway appends `/mcp` to compute the MCP protected resource identifier and appends `/.well-known/oauth-protected-resource` to compute the metadata document URL advertised to MCP clients.
 
-When set, `GET /.well-known/oauth-protected-resource` is public and unauthenticated. The response advertises `resource` as `{GATEWAY_PUBLIC_URL}/mcp`, `authorization_servers` from configured JWT/OIDC provider issuers when present, `scopes_supported` as `["mcp:tools"]`, and `bearer_methods_supported` as `["Bearer"]`. MCP authentication failures include a `WWW-Authenticate` challenge with `realm="mcp"` and `resource_metadata` pointing at `{GATEWAY_PUBLIC_URL}/.well-known/oauth-protected-resource`. JWT bearer tokens presented to `/mcp` must also include the MCP resource identifier in the `aud` claim, in addition to any existing provider-level static `audience` requirement.
+When set, `GET /.well-known/oauth-protected-resource` is public and unauthenticated. The response advertises `resource` as `{GATEWAY_PUBLIC_URL}/mcp`, `authorization_servers` from configured JWT/OIDC provider issuers when present, `scopes_supported` as `["mcp:tools"]`, and `bearer_methods_supported` as `["Bearer"]`. MCP authentication failures include a `WWW-Authenticate` challenge with `realm="mcp"` and `resource_metadata` pointing at `{GATEWAY_PUBLIC_URL}/.well-known/oauth-protected-resource`.
+
+The protected-resource requirement applies to every credential type that can otherwise authenticate to `/mcp`. JWT bearer tokens must include the MCP resource identifier in the `aud` claim, in addition to any existing provider-level static `audience` requirement. GreenGateway `ggw_` service tokens must include the exact `mcp:tools` scope. Cookie-session credentials are not accepted for `/mcp` when protected-resource binding is active; browser admin sessions remain valid for non-MCP routes. Non-MCP endpoints are unchanged by this setting.
 
 ### AUDIT_LOG_FILE
 
@@ -713,6 +715,8 @@ Optional SQLite store path for service tokens managed by `POST /v1{ADMIN_PREFIX}
 Default: empty, which disables the service-token admin API storage backend and does not add the service-token validator to the auth chain.
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. When set, GreenGateway creates or opens the SQLite database at startup and initializes the `service_tokens` table if needed.
+
+When `GATEWAY_PUBLIC_URL` is configured, a service token used against `/mcp` must carry the exact `mcp:tools` scope advertised by the OAuth protected-resource metadata document. This scope is a credential-binding requirement for MCP access; route and tool authorization still uses the normal RBAC policy and tool `allowed_roles` checks after authentication.
 
 ### SERVICE_TOKEN_CACHE_TTL_MS
 

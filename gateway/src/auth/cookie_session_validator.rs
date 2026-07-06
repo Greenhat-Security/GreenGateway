@@ -201,6 +201,20 @@ impl SessionValidator for CookieSessionValidator {
         result.into_principal()
     }
 
+    async fn validate_session_for_resource(
+        &self,
+        credential: &SessionCredential,
+        resource: Option<&str>,
+    ) -> Result<Principal, AuthError> {
+        if resource.is_some() && matches!(credential, SessionCredential::Cookie(_)) {
+            return Err(AuthError::InvalidSession(
+                "cookie sessions cannot access MCP resources".to_owned(),
+            ));
+        }
+
+        self.validate_session(credential).await
+    }
+
     fn supports_cookie(&self) -> bool {
         true
     }
@@ -429,6 +443,56 @@ mod tests {
         assert!(requests[0].contains("content-type: application/json"));
         let body = request_body(&requests[0]);
         assert_eq!(body["session"], json!("session-secret-123"));
+    }
+
+    #[tokio::test]
+    async fn cookie_session_is_rejected_for_mcp_resource_without_introspection() {
+        let (url, server) = introspection_server(
+            [TestResponse::json(
+                StatusLine::Ok,
+                json!({"user_id": "user-123"}),
+            )],
+            "127.0.0.1",
+        )
+        .await;
+        let validator = validator(config(&url));
+
+        let error = validator
+            .validate_session_for_resource(
+                &SessionCredential::Cookie("session-secret-123".to_owned()),
+                Some("https://gateway.example.test/mcp"),
+            )
+            .await
+            .expect_err("cookie sessions should not authenticate to MCP resources");
+
+        assert_invalid_session(error, "cookie sessions cannot access MCP resources");
+        assert_eq!(server.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cookie_session_still_authenticates_without_resource() {
+        let (url, server) = introspection_server(
+            [TestResponse::json(
+                StatusLine::Ok,
+                json!({"user_id": "user-123", "roles": ["admin"]}),
+            )],
+            "127.0.0.1",
+        )
+        .await;
+        let validator = validator(config(&url));
+
+        let principal = validator
+            .validate_session_for_resource(
+                &SessionCredential::Cookie("session-secret-123".to_owned()),
+                None,
+            )
+            .await
+            .expect("cookie sessions should still authenticate without resource binding");
+
+        assert_eq!(principal.user_id, "user-123");
+        assert_eq!(principal.roles, vec!["admin"]);
+        assert_eq!(principal.auth_method, AuthMethod::Cookie);
+        assert_eq!(server.call_count(), 1);
     }
 
     #[tokio::test]
@@ -752,5 +816,14 @@ mod tests {
             .map(|(_, body)| body)
             .expect("request should contain body separator");
         serde_json::from_str(body).expect("request body should be JSON")
+    }
+
+    fn assert_invalid_session(error: AuthError, expected: &str) {
+        match error {
+            AuthError::InvalidSession(message) => assert_eq!(message, expected),
+            AuthError::Upstream(message) => {
+                panic!("expected invalid session, got upstream error: {message}")
+            }
+        }
     }
 }

@@ -10644,6 +10644,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_service_token_requires_mcp_scope_when_public_url_is_configured() {
+        let token_db = TempDb::new("mcp-resource-service-token");
+        let token_store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        let token_without_mcp_scope = create_service_token(&token_store, &["admin"]);
+        let token_with_mcp_scope = create_service_token(&token_store, &["admin", "mcp:tools"]);
+        let mut config = test_config(Vec::new());
+        config.gateway_public_url = Some("https://gateway.example.test".to_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        config.service_token_cache_ttl_ms = 20;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let (missing_scope_status, missing_scope_body) = mcp_rpc(
+            &router,
+            Some(&token_without_mcp_scope),
+            94,
+            "initialize",
+            Some(mcp_initialize_params()),
+            "mcp-service-token-missing-scope",
+        )
+        .await;
+        assert_eq!(missing_scope_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(missing_scope_body, json!({ "error": "unauthorized" }));
+
+        let non_mcp_response =
+            authenticated_principal_probe(&router, &token_without_mcp_scope).await;
+        assert_eq!(non_mcp_response.status(), StatusCode::OK);
+        let non_mcp_body = json_body(non_mcp_response).await;
+        assert_eq!(non_mcp_body["auth_method"], json!("service_token"));
+        assert_eq!(non_mcp_body["roles"], json!(["admin"]));
+
+        let (matching_scope_status, matching_scope_body) = mcp_rpc(
+            &router,
+            Some(&token_with_mcp_scope),
+            95,
+            "initialize",
+            Some(mcp_initialize_params()),
+            "mcp-service-token-matching-scope",
+        )
+        .await;
+
+        assert_eq!(matching_scope_status, StatusCode::OK);
+        assert_eq!(
+            matching_scope_body["result"]["serverInfo"]["name"],
+            json!("greengateway")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_cookie_session_is_rejected_when_public_url_is_configured() {
+        let (introspection_url, introspection_server) =
+            spawn_blocking_cookie_session_server(Ipv4Addr::LOCALHOST, 1);
+        let mut config = test_config(Vec::new());
+        config.gateway_public_url = Some("https://gateway.example.test".to_owned());
+        configure_test_cookie_session_provider(&mut config, introspection_url);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let mcp_response = router
+            .clone()
+            .oneshot(mcp_cookie_request(
+                "session=session-secret-123",
+                96,
+                "initialize",
+                Some(mcp_initialize_params()),
+                "mcp-cookie-session",
+            ))
+            .await
+            .expect("MCP cookie request should complete");
+
+        assert_eq!(mcp_response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            json_body(mcp_response).await,
+            json!({ "error": "unauthorized" })
+        );
+
+        let non_mcp_response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .header(header::COOKIE, "session=session-secret-123")
+                    .body(Body::empty())
+                    .expect("non-MCP cookie request should build"),
+            )
+            .await
+            .expect("non-MCP cookie request should complete");
+
+        assert_eq!(non_mcp_response.status(), StatusCode::OK);
+        let non_mcp_body = json_body(non_mcp_response).await;
+        assert_eq!(non_mcp_body["user_id"], json!("cookie-user"));
+        assert_eq!(non_mcp_body["auth_method"], json!("session_cookie"));
+        assert_eq!(
+            introspection_server
+                .join()
+                .expect("cookie-session introspection server should finish"),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn mcp_tools_list_returns_registry_tools_and_schemas() {
         let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
 
@@ -20880,6 +20994,22 @@ paths:
         builder
             .body(Body::from(body.to_string()))
             .expect("MCP request should build")
+    }
+
+    fn mcp_cookie_request(
+        session_cookie: &str,
+        id: u64,
+        method: &str,
+        params: Option<Value>,
+        request_id: &str,
+    ) -> Request<Body> {
+        let mut request = mcp_request(None, id, method, params, request_id);
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{session_cookie}; csrf_token=mcp-test-csrf"))
+                .expect("test cookie header should be valid"),
+        );
+        request
     }
 
     fn mcp_content_text(body: &Value) -> &str {

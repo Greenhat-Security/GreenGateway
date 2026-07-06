@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use super::{
+    protected_resource,
     tokens::{TokenStore, TokenStoreError, TokenVerification, TokenVerificationFailure},
     AuthError, AuthMethod, Principal, SessionCredential, SessionValidator,
 };
@@ -64,6 +65,27 @@ impl SessionValidator for ServiceTokenValidator {
         let cached = CachedVerification::from_verification(verification);
         self.cache.insert(cache_key, cached.clone());
         cached.into_principal()
+    }
+
+    async fn validate_session_for_resource(
+        &self,
+        credential: &SessionCredential,
+        resource: Option<&str>,
+    ) -> Result<Principal, AuthError> {
+        let principal = self.validate_session(credential).await?;
+
+        if resource.is_some()
+            && !principal
+                .roles
+                .iter()
+                .any(|scope| scope == protected_resource::MCP_SCOPE)
+        {
+            return Err(AuthError::InvalidSession(
+                "service token lacks required MCP scope".to_owned(),
+            ));
+        }
+
+        Ok(principal)
     }
 
     fn supports_cookie(&self) -> bool {
@@ -286,6 +308,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_token_without_mcp_scope_is_rejected_for_mcp_resource() {
+        let db = TempDb::new("missing-mcp-scope");
+        let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
+        let created = store
+            .create(create_request(&["admin:tokens:read"]))
+            .expect("token should create");
+        let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
+
+        let error = validator
+            .validate_session_for_resource(
+                &SessionCredential::Bearer(created.plaintext_token),
+                Some("https://gateway.example.test/mcp"),
+            )
+            .await
+            .expect_err("service token without MCP scope should be rejected for MCP resource");
+
+        assert_invalid_session(error, "service token lacks required MCP scope");
+    }
+
+    #[tokio::test]
+    async fn service_token_with_mcp_scope_is_accepted_for_mcp_resource() {
+        let db = TempDb::new("with-mcp-scope");
+        let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
+        let created = store
+            .create(create_request(&["admin:tokens:read", "mcp:tools"]))
+            .expect("token should create");
+        let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
+
+        let principal = validator
+            .validate_session_for_resource(
+                &SessionCredential::Bearer(created.plaintext_token),
+                Some("https://gateway.example.test/mcp"),
+            )
+            .await
+            .expect("service token with MCP scope should validate for MCP resource");
+
+        assert_eq!(
+            principal.roles,
+            vec!["admin:tokens:read".to_owned(), "mcp:tools".to_owned()]
+        );
+        assert_eq!(principal.auth_method, AuthMethod::ServiceToken);
+    }
+
+    #[tokio::test]
+    async fn service_token_without_mcp_scope_still_authenticates_without_resource() {
+        let db = TempDb::new("non-mcp-no-scope");
+        let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
+        let created = store
+            .create(create_request(&["admin:tokens:read"]))
+            .expect("token should create");
+        let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
+
+        let principal = validator
+            .validate_session_for_resource(
+                &SessionCredential::Bearer(created.plaintext_token),
+                None,
+            )
+            .await
+            .expect("service token without MCP scope should still validate without resource");
+
+        assert_eq!(principal.roles, vec!["admin:tokens:read".to_owned()]);
+        assert_eq!(principal.auth_method, AuthMethod::ServiceToken);
+    }
+
+    #[tokio::test]
     async fn invalid_and_revoked_service_tokens_are_rejected() {
         let db = TempDb::new("invalid-revoked");
         let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
@@ -460,6 +547,15 @@ mod tests {
             expires_at: None,
             last_used_at: None,
         })
+    }
+
+    fn assert_invalid_session(error: AuthError, expected: &str) {
+        match error {
+            AuthError::InvalidSession(message) => assert_eq!(message, expected),
+            AuthError::Upstream(message) => {
+                panic!("expected invalid session, got upstream error: {message}")
+            }
+        }
     }
 
     struct TempDb {
