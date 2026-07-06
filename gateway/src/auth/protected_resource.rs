@@ -1,4 +1,5 @@
 use serde::Serialize;
+use url::Url;
 
 use crate::config::{AuthProviderType, Config};
 
@@ -6,6 +7,8 @@ use super::oidc;
 
 pub(crate) const MCP_RESOURCE_PATH: &str = "/mcp";
 pub(crate) const WELL_KNOWN_PATH: &str = "/.well-known/oauth-protected-resource";
+pub(crate) const WELL_KNOWN_SUFFIX_ROUTE: &str =
+    "/.well-known/oauth-protected-resource/{*resource_path}";
 
 pub(crate) const MCP_SCOPE: &str = "mcp:tools";
 const BEARER_METHOD: &str = "header";
@@ -36,7 +39,7 @@ impl ProtectedResourceMetadataConfig {
     }
 
     pub(crate) fn mcp_resource(&self) -> String {
-        public_url_with_path(&self.public_url, MCP_RESOURCE_PATH)
+        public_url_with_appended_path(&self.public_url, MCP_RESOURCE_PATH)
     }
 
     pub(crate) fn metadata_url(&self) -> String {
@@ -75,5 +78,68 @@ fn authorization_servers(config: &Config) -> Vec<String> {
 
 fn public_url_with_path(public_url: &str, path: &str) -> String {
     debug_assert!(path.starts_with('/'));
-    format!("{}{}", public_url.trim_end_matches('/'), path)
+
+    let mut url = Url::parse(public_url).expect("GATEWAY_PUBLIC_URL should have been validated");
+    let resource_path = url.path();
+    let metadata_path = if resource_path == "/" {
+        path.to_owned()
+    } else {
+        format!("{path}{resource_path}")
+    };
+
+    url.set_path(&metadata_path);
+    url.to_string()
+}
+
+fn public_url_with_appended_path(public_url: &str, path: &str) -> String {
+    debug_assert!(path.starts_with('/'));
+
+    let mut url = Url::parse(public_url).expect("GATEWAY_PUBLIC_URL should have been validated");
+    let base_path = url.path().trim_end_matches('/');
+    let resource_path = if base_path.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{base_path}{path}")
+    };
+
+    url.set_path(&resource_path);
+    url.to_string()
+}
+
+pub(crate) fn is_well_known_path(path: &str) -> bool {
+    path == WELL_KNOWN_PATH
+        || path
+            .strip_prefix(WELL_KNOWN_PATH)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_url_inserts_well_known_path_before_public_url_path() {
+        let metadata = ProtectedResourceMetadataConfig {
+            public_url: "https://gateway.example.test/base".to_owned(),
+            authorization_servers: Vec::new(),
+        };
+
+        assert_eq!(
+            metadata.metadata_url(),
+            "https://gateway.example.test/.well-known/oauth-protected-resource/base"
+        );
+    }
+
+    #[test]
+    fn metadata_url_without_public_url_path_uses_origin_well_known_path() {
+        let metadata = ProtectedResourceMetadataConfig {
+            public_url: "https://gateway.example.test".to_owned(),
+            authorization_servers: Vec::new(),
+        };
+
+        assert_eq!(
+            metadata.metadata_url(),
+            "https://gateway.example.test/.well-known/oauth-protected-resource"
+        );
+    }
 }

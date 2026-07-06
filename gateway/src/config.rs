@@ -1672,9 +1672,16 @@ fn parse_optional_gateway_public_url(
     problems: &mut Vec<String>,
 ) -> Option<String> {
     let value = parse_optional_upstream_url(name, value, problems)?;
-    if url_has_fragment(&value) {
+    let parsed = url::Url::parse(&value).expect("gateway public URL should have been validated");
+
+    if parsed.fragment().is_some() {
         problems.push(format!(
             "{name} must not include a URL fragment, got '{value}'"
+        ));
+        None
+    } else if parsed.scheme() == "http" && !url_host_is_loopback(&parsed) {
+        problems.push(format!(
+            "{name} must use https unless the host is loopback, got '{value}'"
         ));
         None
     } else {
@@ -1682,10 +1689,13 @@ fn parse_optional_gateway_public_url(
     }
 }
 
-fn url_has_fragment(value: &str) -> bool {
-    url::Url::parse(value)
-        .map(|url| url.fragment().is_some())
-        .unwrap_or(false)
+fn url_host_is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 fn parse_upstream_routes(
@@ -3182,7 +3192,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_public_url_parses_optional_http_url() {
+    fn gateway_public_url_parses_optional_https_url() {
         let config = Config::from_env_vars(|name| match name {
             "GATEWAY_PUBLIC_URL" => Ok("  https://gateway.example.test/base/  ".to_owned()),
             _ => Err(VarError::NotPresent),
@@ -3237,6 +3247,40 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("https://gateway.example.test/#metadata"));
+        assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
+    fn gateway_public_url_allows_http_loopback_for_local_development() {
+        for value in [
+            "http://localhost:8080/base",
+            "http://127.0.0.1:8080/base",
+            "http://[::1]:8080/base",
+        ] {
+            let config = Config::from_env_vars(|name| match name {
+                "GATEWAY_PUBLIC_URL" => Ok(value.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect("loopback HTTP public URL should parse");
+
+            assert_eq!(config.gateway_public_url, Some(value.to_owned()));
+        }
+    }
+
+    #[test]
+    fn gateway_public_url_rejects_http_non_loopback_hosts() {
+        let error = Config::from_env_vars(|name| match name {
+            "GATEWAY_PUBLIC_URL" => Ok("http://gateway.example.test/base".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("non-loopback HTTP public URL should be rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("GATEWAY_PUBLIC_URL must use https unless the host is loopback"),
+            "{message}"
+        );
+        assert!(message.contains("http://gateway.example.test/base"));
         assert_eq!(error.problems.len(), 1);
     }
 

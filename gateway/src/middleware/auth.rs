@@ -106,7 +106,7 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Response {
     let path = req.uri().path().to_owned();
-    if path == protected_resource::WELL_KNOWN_PATH {
+    if protected_resource::is_well_known_path(&path) {
         return next.run(req).await;
     }
 
