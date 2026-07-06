@@ -173,6 +173,11 @@
           "required": [
             "tool_name"
           ],
+          "properties": {
+            "methods": {
+              "maxItems": 0
+            }
+          },
           "not": {
             "required": [
               "path"
