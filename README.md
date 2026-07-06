@@ -48,13 +48,13 @@ It is designed to sit between clients and existing HTTP backends or MCP servers,
 
 **GreenGateway is pre-alpha and under active initial development.** It is not production ready yet.
 
-Development follows a 7-phase roadmap. **Phases 1 through 7 are complete for the v1 roadmap** — a real security middleware stack, authentication, a hot-reloadable RBAC engine (including shadow-enforcement, observe-only auth modes, and data-driven direct firewall rules), an egress firewall with policy-driven overrides, a full audit/observability pipeline, a streaming reverse proxy with multi-upstream routing and per-upstream settings, a complete policy administration API (read/replace/validate, granular rule operations, and rule preview against historical traffic), full traffic discovery — endpoint inventory, a discovery UI, OpenAPI-based and inferred schema conformance checking, and a deterministic anomaly-signal engine with detectors, admin API, SSE surfacing, and UI — a complete visual rule builder — traffic-derived rule suggestions, a visual rule table/editor with live historical preview and one-click create-from-context, versioned policy history with rollback, and a shadow-mode review queue with real would-deny data and one-click promote/disable — native MCP protocol support — a gateway-owned `/mcp` endpoint, dynamic tool registry, JSON Schema validation, upstream MCP proxying, OpenAPI-to-tools generation, client conformance coverage, and MCP tool traffic discovery/rule-builder integration — and full identity/auth integration — pluggable OIDC providers with discovery, a generic cookie-session validator, managed API/service tokens, a directory and UI of every user and bot that has traversed the gateway with a principal drill-down and identity-based rule shortcuts, and operator SSO login (authorization-code + PKCE) into the admin dashboard with role-gated admin actions attributed to the operator's real identity in the audit trail — all exist and run today (see [What's Real Today](#whats-real-today)).
+Development follows a 7-phase roadmap. **Phase 6 (native MCP protocol support) is v1-complete**, and the core gateway/security/discovery/rule-builder/identity surface across the roadmap exists today: a real security middleware stack, authentication, a hot-reloadable RBAC engine (including shadow-enforcement, observe-only auth modes, and data-driven direct firewall rules), an egress firewall with policy-driven overrides, a full audit/observability pipeline, a streaming reverse proxy with multi-upstream routing and per-upstream settings, a complete policy administration API (read/replace/validate, granular rule operations, and rule preview against historical traffic), full traffic discovery — endpoint inventory, a discovery UI, OpenAPI-based and inferred schema conformance checking, and a deterministic anomaly-signal engine with detectors, admin API, SSE surfacing, and UI — a complete visual rule builder — traffic-derived rule suggestions, a visual rule table/editor with live historical preview and one-click create-from-context, versioned policy history with rollback, and a shadow-mode review queue with real would-deny data and one-click promote/disable — native MCP protocol support — a gateway-owned `/mcp` endpoint, dynamic tool registry, JSON Schema validation, upstream MCP proxying, OpenAPI-to-tools generation, client conformance coverage, and MCP tool traffic discovery/rule-builder integration — and full identity/auth integration — pluggable OIDC providers with discovery, a generic cookie-session validator, managed API/service tokens, a directory and UI of every user and bot that has traversed the gateway with a principal drill-down and identity-based rule shortcuts, and operator SSO login (authorization-code + PKCE) into the admin dashboard with role-gated admin actions attributed to the operator's real identity in the audit trail (see [What's Real Today](#whats-real-today)). The remaining open roadmap checkbox is #11 PR3: a feature-flagged Postgres audit sink for multi-instance deployments; the SQLite audit sink and admin query API are already present.
 
 Progress is tracked in the pinned roadmap issue: [Roadmap / project plan (#44)](https://github.com/Greenhat-Security/GreenGateway/issues/44).
 
 ## What's Real Today
 
-This is what's actually built and working today across Phases 1 through 7:
+This is what's actually built and working today across the roadmap:
 
 | Area | What's implemented |
 | --- | --- |
@@ -86,10 +86,11 @@ None of this requires a real backend to try — the dev harness in [Quick Start]
 
 ## Planned Scope
 
-Everything below is roadmap and vision beyond what's listed in [What's Real Today](#whats-real-today). The seven-phase v1 roadmap is complete; remaining work is post-v1 hardening and product expansion tracked in the [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44):
+Everything below is roadmap and vision beyond what's listed in [What's Real Today](#whats-real-today). Phase 6 is now v1-complete; the remaining tracked roadmap gap is #11 PR3, and longer-term MCP follow-ups are tracked separately from the v1 MCP endpoint work in the [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44):
 
 | Area | Capability | Status |
 | --- | --- | --- |
+| Audit store follow-up | Feature-flagged Postgres audit sink for multi-instance deployments | Open on #11; SQLite audit durability and the admin query API are complete today |
 | MCP follow-ups | Async SEP-1319 task execution and upstream API-key injection for generated OpenAPI tools | Post-v1: task-style `tools/call` is deliberately rejected today with policy/audit/inventory semantics, and generated-tool API-key injection remains a known limitation |
 
 Do not evaluate GG today assuming any capability not explicitly listed in [What's Real Today](#whats-real-today) already works.
@@ -114,7 +115,7 @@ The HTTP half of the proxy layer above is real today — multi-upstream routing 
 
 ## Quick Start
 
-GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI at `/admin` (traffic inventory, signals, log explorer, live tail, the visual rule builder, policy history, shadow review, status), a working reverse proxy — either a single catch-all `UPSTREAM_URL` or a full multi-upstream routing table — optional traffic discovery (endpoint inventory, schema awareness, anomaly signals) when `DISCOVERY_SQLITE_PATH` is set, and the native MCP support described in [What's Real Today](#whats-real-today). The remaining capabilities described in [Planned Scope](#planned-scope) are post-v1 roadmap work.
+GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI at `/admin` (traffic inventory, signals, log explorer, live tail, the visual rule builder, policy history, shadow review, status), a working reverse proxy — either a single catch-all `UPSTREAM_URL` or a full multi-upstream routing table — optional traffic discovery (endpoint inventory, schema awareness, anomaly signals) when `DISCOVERY_SQLITE_PATH` is set, and the native MCP support described in [What's Real Today](#whats-real-today). The remaining capabilities described in [Planned Scope](#planned-scope) are still roadmap work.
 
 For the full list of environment variables, see [docs/configuration.md](docs/configuration.md). As more variables land, that document and [.env.example](.env.example) are kept in sync with the code by an automated test.
 
