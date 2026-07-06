@@ -66,8 +66,16 @@ pub(crate) struct ToolRuleDecision {
 }
 
 pub(crate) struct ToolAuthorizationSnapshot<'a> {
-    pub allowed_roles: &'a [String],
+    pub tool: Option<ToolPolicySnapshot<'a>>,
     pub rule_decision: Option<ToolRuleDecision>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolPolicySnapshot<'a> {
+    pub enabled: bool,
+    pub allowed_roles: &'a [String],
+    pub timeout_ms: u64,
+    pub max_concurrent: u32,
 }
 
 #[derive(Serialize)]
@@ -144,22 +152,13 @@ impl RbacState {
         evaluate: impl FnOnce(ToolAuthorizationSnapshot<'_>) -> R,
     ) -> R {
         let policy = self.policy.load();
-        let allowed_roles = policy.tool_allowed_roles(tool_name);
+        let tool = policy.tool_policy(tool_name);
         let rule_decision = policy.evaluate_tool_rule(tool_name, principal);
 
         evaluate(ToolAuthorizationSnapshot {
-            allowed_roles,
+            tool,
             rule_decision,
         })
-    }
-
-    pub(crate) fn with_tool_allowed_roles<R>(
-        &self,
-        tool_name: &str,
-        evaluate: impl FnOnce(&[String]) -> R,
-    ) -> R {
-        let policy = self.policy.load();
-        evaluate(policy.tool_allowed_roles(tool_name))
     }
 }
 
@@ -193,13 +192,17 @@ impl RbacPolicyState {
             .unwrap_or_else(|| rule_index.to_string())
     }
 
-    fn tool_allowed_roles(&self, tool_name: &str) -> &[String] {
+    fn tool_policy(&self, tool_name: &str) -> Option<ToolPolicySnapshot<'_>> {
         self.engine
             .policy()
             .tools
             .get(tool_name)
-            .map(|entry| entry.allowed_roles.as_slice())
-            .unwrap_or_default()
+            .map(|entry| ToolPolicySnapshot {
+                enabled: entry.enabled,
+                allowed_roles: entry.allowed_roles.as_slice(),
+                timeout_ms: entry.timeout_ms,
+                max_concurrent: entry.max_concurrent,
+            })
     }
 
     fn evaluate_tool_rule(

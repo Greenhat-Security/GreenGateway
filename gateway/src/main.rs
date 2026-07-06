@@ -10556,6 +10556,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_tools_list_follows_live_tool_enabled_and_membership_policy() {
+        let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
+
+        let (before_status, before_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            53,
+            "tools/list",
+            None,
+            "mcp-list-before-tool-membership-reload",
+        )
+        .await;
+        assert_eq!(before_status, StatusCode::OK);
+        let before_tools = before_body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        assert!(before_tools
+            .iter()
+            .any(|tool| tool["name"] == json!("echo")));
+        assert!(before_tools
+            .iter()
+            .any(|tool| tool["name"] == json!("get_widget")));
+
+        let current_policy = rbac::Policy::from_file(&harness._policy.path)
+            .expect("current MCP policy should parse");
+        let etag = policy_etag(&current_policy).expect("current MCP policy ETag should compute");
+        let mut policy =
+            serde_json::to_value(&current_policy).expect("current MCP policy should serialize");
+        policy["tools"]["echo"]["enabled"] = json!(false);
+        policy["tools"]
+            .as_object_mut()
+            .expect("tools policy should be an object")
+            .remove("get_widget");
+
+        let put_response = harness
+            .router
+            .clone()
+            .oneshot(authenticated_json_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                &harness.admin_token,
+                Some(policy.to_string()),
+                Some(&etag),
+            ))
+            .await
+            .expect("policy PUT should complete");
+        assert_eq!(put_response.status(), StatusCode::OK);
+
+        let (after_status, after_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            54,
+            "tools/list",
+            None,
+            "mcp-list-after-tool-membership-reload",
+        )
+        .await;
+        assert_eq!(after_status, StatusCode::OK);
+        let after_tools = after_body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result should include tools array");
+        assert!(
+            !after_tools.iter().any(|tool| tool["name"] == json!("echo")),
+            "disabled echo tool should not be listed after policy reload: {after_body}"
+        );
+        assert!(
+            !after_tools
+                .iter()
+                .any(|tool| tool["name"] == json!("get_widget")),
+            "removed get_widget tool should not be listed after policy reload: {after_body}"
+        );
+    }
+
+    #[tokio::test]
     async fn mcp_route_rejects_missing_authentication_and_missing_permission() {
         let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
 
