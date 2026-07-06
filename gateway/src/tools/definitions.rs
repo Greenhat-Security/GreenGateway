@@ -223,6 +223,8 @@ impl fmt::Debug for ToolRegistry {
 #[allow(dead_code)] // Future MCP executor and admin surfaces will query this registry state.
 struct ToolRegistryState {
     tools: BTreeMap<String, Arc<ToolDefinition>>,
+    local_definitions: Vec<ToolDefinition>,
+    mcp_proxy_definitions: Vec<ToolDefinition>,
 }
 
 impl ToolRegistry {
@@ -311,22 +313,27 @@ impl ToolRegistry {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        let mut merged = self
-            .state
-            .load()
-            .tools
-            .values()
-            .map(|definition| definition.as_ref().clone())
-            .collect::<Vec<_>>();
-        merged.extend(definitions);
+        let state = self.state.load();
+        let mut local_definitions = state.local_definitions.clone();
+        let mut mcp_proxy_definitions = state.mcp_proxy_definitions.clone();
+        drop(state);
 
+        let (new_local_definitions, new_mcp_proxy_definitions) =
+            split_definitions_by_source(definitions);
+        local_definitions.extend(new_local_definitions);
+        mcp_proxy_definitions.extend(new_mcp_proxy_definitions);
+
+        let merged = combined_definitions(&local_definitions, &mcp_proxy_definitions);
         let semantic_problems = tool_definition_problems(&merged);
         if !semantic_problems.is_empty() {
             return Err(ToolRegistryError::invalid(semantic_problems));
         }
 
         self.state
-            .store(Arc::new(ToolRegistryState::from_definitions(merged)));
+            .store(Arc::new(ToolRegistryState::from_definition_sources(
+                local_definitions,
+                mcp_proxy_definitions,
+            )));
         Ok(())
     }
 
@@ -343,14 +350,31 @@ impl ToolRegistry {
         }
     }
 
-    fn replace_definitions(&self, definitions: Vec<ToolDefinition>) {
+    fn replace_local_definitions(
+        &self,
+        local_definitions: Vec<ToolDefinition>,
+    ) -> Result<(), ToolRegistryError> {
         let _guard = match self.write_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
 
+        let state = self.state.load();
+        let mcp_proxy_definitions = state.mcp_proxy_definitions.clone();
+        drop(state);
+
+        let merged = combined_definitions(&local_definitions, &mcp_proxy_definitions);
+        let semantic_problems = tool_definition_problems(&merged);
+        if !semantic_problems.is_empty() {
+            return Err(ToolRegistryError::invalid(semantic_problems));
+        }
+
         self.state
-            .store(Arc::new(ToolRegistryState::from_definitions(definitions)));
+            .store(Arc::new(ToolRegistryState::from_definition_sources(
+                local_definitions,
+                mcp_proxy_definitions,
+            )));
+        Ok(())
     }
 
     fn emit_loaded(&self, path: &Path, tool_count: usize) {
@@ -376,13 +400,54 @@ impl ToolRegistry {
 
 impl ToolRegistryState {
     fn from_definitions(definitions: Vec<ToolDefinition>) -> Self {
+        let (local_definitions, mcp_proxy_definitions) = split_definitions_by_source(definitions);
+        Self::from_definition_sources(local_definitions, mcp_proxy_definitions)
+    }
+
+    fn from_definition_sources(
+        local_definitions: Vec<ToolDefinition>,
+        mcp_proxy_definitions: Vec<ToolDefinition>,
+    ) -> Self {
+        let tools = local_definitions
+            .iter()
+            .chain(mcp_proxy_definitions.iter())
+            .map(|definition| (definition.name.clone(), Arc::new(definition.clone())))
+            .collect();
+
         Self {
-            tools: definitions
-                .into_iter()
-                .map(|definition| (definition.name.clone(), Arc::new(definition)))
-                .collect(),
+            tools,
+            local_definitions,
+            mcp_proxy_definitions,
         }
     }
+}
+
+fn split_definitions_by_source(
+    definitions: Vec<ToolDefinition>,
+) -> (Vec<ToolDefinition>, Vec<ToolDefinition>) {
+    let mut local_definitions = Vec::new();
+    let mut mcp_proxy_definitions = Vec::new();
+
+    for definition in definitions {
+        if definition.upstream.is_mcp_proxy() {
+            mcp_proxy_definitions.push(definition);
+        } else {
+            local_definitions.push(definition);
+        }
+    }
+
+    (local_definitions, mcp_proxy_definitions)
+}
+
+fn combined_definitions(
+    local_definitions: &[ToolDefinition],
+    mcp_proxy_definitions: &[ToolDefinition],
+) -> Vec<ToolDefinition> {
+    local_definitions
+        .iter()
+        .chain(mcp_proxy_definitions.iter())
+        .cloned()
+        .collect()
 }
 
 pub fn reload_tool_registry_from_file(
@@ -394,7 +459,15 @@ pub fn reload_tool_registry_from_file(
     match definitions_from_file(path) {
         Ok(definitions) => {
             let tool_count = definitions.len();
-            registry.replace_definitions(definitions);
+            if let Err(err) = registry.replace_local_definitions(definitions) {
+                registry.emit_reload_failed(path, &err);
+                tracing::error!(
+                    tools_file = %path.display(),
+                    error = %err,
+                    "tool registry reload rejected; existing registry remains active"
+                );
+                return Err(err);
+            }
             registry.emit_loaded(path, tool_count);
             tracing::info!(
                 tools_file = %path.display(),
@@ -860,6 +933,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_watch_reload_preserves_merged_mcp_proxy_tools() {
+        let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
+        let registry = ToolRegistry::from_file(file.path()).expect("initial registry should load");
+        registry
+            .merge_definitions(vec![mcp_proxy_tool(
+                "weather:get_forecast",
+                "weather",
+                "get_forecast",
+            )])
+            .expect("MCP proxy tool should merge");
+        spawn_tool_registry_reload_tasks(file.path().to_owned(), registry.clone())
+            .expect("tool registry watcher should start");
+
+        file.write(&tools_document(&[
+            echo_tool("echo", "POST", "/v1/echo"),
+            echo_tool("get_widget", "GET", "/v1/widgets/{widget_id}"),
+        ]));
+
+        wait_until(Duration::from_secs(2), || {
+            registry.get("get_widget").is_some()
+        })
+        .await;
+        let mcp_tool = registry
+            .get("weather:get_forecast")
+            .expect("local reload must preserve merged MCP proxy tool");
+        assert_eq!(
+            mcp_tool.upstream.mcp_proxy_mapping().unwrap().server_name,
+            "weather"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_watch_reload_updates_local_tools_when_mcp_proxy_tools_are_present() {
+        let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
+        let registry = ToolRegistry::from_file(file.path()).expect("initial registry should load");
+        registry
+            .merge_definitions(vec![mcp_proxy_tool(
+                "weather:get_forecast",
+                "weather",
+                "get_forecast",
+            )])
+            .expect("MCP proxy tool should merge");
+        spawn_tool_registry_reload_tasks(file.path().to_owned(), registry.clone())
+            .expect("tool registry watcher should start");
+
+        file.write(&tools_document(&[echo_tool(
+            "get_widget",
+            "GET",
+            "/v1/widgets/{widget_id}",
+        )]));
+
+        wait_until(Duration::from_secs(2), || {
+            registry.get("echo").is_none() && registry.get("get_widget").is_some()
+        })
+        .await;
+        assert!(registry.get("weather:get_forecast").is_some());
+    }
+
+    #[test]
+    fn reload_rejects_local_tool_colliding_with_preserved_mcp_proxy_tool_name() {
+        let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
+        let registry = ToolRegistry::from_file(file.path()).expect("initial registry should load");
+        registry
+            .merge_definitions(vec![mcp_proxy_tool(
+                "weather.get_forecast",
+                "weather",
+                "get_forecast",
+            )])
+            .expect("MCP proxy tool should merge");
+
+        file.write(&tools_document(&[echo_tool(
+            "weather.get_forecast",
+            "GET",
+            "/v1/widgets/{widget_id}",
+        )]));
+
+        let error = reload_tool_registry_from_file(&registry, file.path())
+            .expect_err("local collision with preserved MCP proxy name should reject");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate tool name 'weather.get_forecast'"),
+            "unexpected error: {error}"
+        );
+        assert!(registry.get("echo").is_some());
+        let mcp_tool = registry
+            .get("weather.get_forecast")
+            .expect("rejected reload must keep existing MCP proxy tool");
+        assert!(
+            mcp_tool.upstream.is_mcp_proxy(),
+            "collision must not replace MCP proxy tool with local HTTP tool"
+        );
+        assert_eq!(
+            registry.list().len(),
+            2,
+            "rejected collision reload must keep last-known-good registry"
+        );
+    }
+
+    #[test]
+    fn reload_rejects_colon_namespaced_local_tool_name_without_replacing_mcp_proxy_tool() {
+        let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
+        let registry = ToolRegistry::from_file(file.path()).expect("initial registry should load");
+        registry
+            .merge_definitions(vec![mcp_proxy_tool(
+                "weather:get_forecast",
+                "weather",
+                "get_forecast",
+            )])
+            .expect("MCP proxy tool should merge");
+
+        file.write(&tools_document(&[echo_tool(
+            "weather:get_forecast",
+            "GET",
+            "/v1/widgets/{widget_id}",
+        )]));
+
+        let error = reload_tool_registry_from_file(&registry, file.path())
+            .expect_err("colon namespaced local tool names should reject");
+        assert!(
+            error.to_string().contains("/tools/0/name"),
+            "unexpected error: {error}"
+        );
+        assert!(registry.get("echo").is_some());
+        let mcp_tool = registry
+            .get("weather:get_forecast")
+            .expect("schema-rejected reload must keep existing MCP proxy tool");
+        assert!(
+            mcp_tool.upstream.is_mcp_proxy(),
+            "schema rejection must not replace MCP proxy tool with local HTTP tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_watch_invalid_update_keeps_local_and_mcp_proxy_tools() {
+        let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
+        let capture = CaptureSink::new();
+        let audit_log = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let registry = ToolRegistry::from_file_with_audit(file.path(), audit_log)
+            .expect("initial registry should load");
+        registry
+            .merge_definitions(vec![mcp_proxy_tool(
+                "weather:get_forecast",
+                "weather",
+                "get_forecast",
+            )])
+            .expect("MCP proxy tool should merge");
+        spawn_tool_registry_reload_tasks(file.path().to_owned(), registry.clone())
+            .expect("tool registry watcher should start");
+
+        let failure_count = audit_event_count(&capture, audit::event::TOOL_REGISTRY_RELOAD_FAILED);
+        file.write(&tools_document(&[
+            echo_tool("echo", "POST", "/v1/echo"),
+            echo_tool("echo", "GET", "/v1/other"),
+        ]));
+
+        wait_until(Duration::from_secs(2), || {
+            audit_event_count(&capture, audit::event::TOOL_REGISTRY_RELOAD_FAILED) > failure_count
+        })
+        .await;
+
+        assert!(registry.get("echo").is_some());
+        assert!(registry.get("weather:get_forecast").is_some());
+        assert_eq!(
+            registry.list().len(),
+            2,
+            "invalid watched reload must keep local and MCP proxy tools"
+        );
+    }
+
+    #[tokio::test]
     async fn file_watch_invalid_updates_keep_old_registry_and_accept_later_valid_update() {
         let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
         let capture = CaptureSink::new();
@@ -1068,6 +1312,22 @@ mod tests {
             "properties": {}
         });
         tool
+    }
+
+    fn mcp_proxy_tool(name: &str, server_name: &str, tool_name: &str) -> ToolDefinition {
+        ToolDefinition::mcp_proxy(
+            name.to_owned(),
+            "Gets the forecast from an upstream MCP server.".to_owned(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "city": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            server_name.to_owned(),
+            tool_name.to_owned(),
+        )
     }
 
     fn tools_schema_validator() -> Validator {
