@@ -15,13 +15,13 @@ use futures_util::{
     Stream, StreamExt,
 };
 use http::{
-    header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, WWW_AUTHENTICATE},
+    header::{HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, WWW_AUTHENTICATE},
     StatusCode,
 };
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, JsonObject, JsonRpcMessage,
-        ServerJsonRpcMessage, Tool,
+        PaginatedRequestParams, ServerJsonRpcMessage, Tool,
     },
     service::{ClientInitializeError, ServiceError},
     transport::{
@@ -37,16 +37,18 @@ use sse_stream::{Sse, SseStream};
 
 use crate::{
     config::{Config, McpUpstreamServerConfig},
-    egress::{CheckedEgressDestination, EgressClient, EgressError, EgressResponse},
+    egress::{CheckedEgressDestination, EgressClient, EgressError},
     tools::definitions::ToolDefinition,
 };
 
+#[cfg(test)]
 pub const MCP_CALL_TOOL_RESULT_HEADER: &str = "x-greengateway-mcp-call-tool-result";
-const MCP_CALL_TOOL_RESULT_HEADER_VALUE: &str = "call-tool-result";
 const EVENT_STREAM_MIME: &str = "text/event-stream";
 const HEADER_LAST_EVENT_ID: &str = "Last-Event-Id";
 const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
 const JSON_MIME: &str = "application/json";
+const MAX_DISCOVERY_PAGES_PER_UPSTREAM: usize = 32;
+const MAX_DISCOVERY_TOOLS_PER_UPSTREAM: usize = 1024;
 
 #[derive(Debug)]
 pub enum McpUpstreamDiscoveryError {
@@ -96,9 +98,10 @@ pub enum McpUpstreamCallError {
     ClientBuild,
     Connect,
     Call,
+    DiscoveryPageLimitExceeded { max: usize },
+    DiscoveryToolLimitExceeded { max: usize },
     RequestBodyTooLarge { size: usize, max: usize },
     ResponseTooLarge { max: usize },
-    Serialize,
 }
 
 impl McpUpstreamCallError {
@@ -108,9 +111,10 @@ impl McpUpstreamCallError {
             Self::ClientBuild => "client_build_failed",
             Self::Connect => "connect_failed",
             Self::Call => "call_failed",
+            Self::DiscoveryPageLimitExceeded { .. } => "discovery_page_limit_exceeded",
+            Self::DiscoveryToolLimitExceeded { .. } => "discovery_tool_limit_exceeded",
             Self::RequestBodyTooLarge { .. } => "request_body_too_large",
             Self::ResponseTooLarge { .. } => "response_too_large",
-            Self::Serialize => "result_serialize_failed",
         }
     }
 }
@@ -127,6 +131,14 @@ impl fmt::Display for McpUpstreamCallError {
             Self::ClientBuild => write!(formatter, "upstream MCP client could not be built"),
             Self::Connect => write!(formatter, "upstream MCP server could not be reached"),
             Self::Call => write!(formatter, "upstream MCP tool call failed"),
+            Self::DiscoveryPageLimitExceeded { max } => write!(
+                formatter,
+                "upstream MCP tools/list pagination exceeded {max} pages"
+            ),
+            Self::DiscoveryToolLimitExceeded { max } => write!(
+                formatter,
+                "upstream MCP tools/list discovery exceeded {max} tools"
+            ),
             Self::RequestBodyTooLarge { size, max } => {
                 write!(
                     formatter,
@@ -136,7 +148,6 @@ impl fmt::Display for McpUpstreamCallError {
             Self::ResponseTooLarge { max } => {
                 write!(formatter, "upstream MCP response body exceeded {max} bytes")
             }
-            Self::Serialize => write!(formatter, "upstream MCP result could not be serialized"),
         }
     }
 }
@@ -227,7 +238,7 @@ pub async fn call_tool(
     egress_client: Arc<EgressClient>,
     remote_tool_name: &str,
     args: Value,
-) -> Result<EgressResponse, McpUpstreamCallError> {
+) -> Result<CallToolResult, McpUpstreamCallError> {
     let destination = egress_client
         .checked_destination(&server.url)
         .await
@@ -245,7 +256,7 @@ pub async fn call_tool(
         .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
     let _ = service.close_with_timeout(Duration::from_millis(250)).await;
 
-    response_from_call_tool_result(result)
+    Ok(result)
 }
 
 async fn list_tools(
@@ -254,12 +265,47 @@ async fn list_tools(
     destination: &CheckedEgressDestination,
 ) -> Result<Vec<Tool>, McpUpstreamCallError> {
     let mut service = connect(server, runtime_config, destination).await?;
-    let tools = service
-        .list_all_tools()
-        .await
-        .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call));
+    let tools = list_tools_with_limits(&mut service).await;
     let _ = service.close_with_timeout(Duration::from_millis(250)).await;
     tools
+}
+
+async fn list_tools_with_limits(
+    service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> Result<Vec<Tool>, McpUpstreamCallError> {
+    let mut tools = Vec::new();
+    let mut cursor = None;
+
+    for _ in 0..MAX_DISCOVERY_PAGES_PER_UPSTREAM {
+        let result = service
+            .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor)))
+            .await
+            .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+
+        if tools.len().saturating_add(result.tools.len()) > MAX_DISCOVERY_TOOLS_PER_UPSTREAM {
+            tracing::warn!(
+                max_tools = MAX_DISCOVERY_TOOLS_PER_UPSTREAM,
+                "MCP upstream discovery exceeded aggregate tool limit"
+            );
+            return Err(McpUpstreamCallError::DiscoveryToolLimitExceeded {
+                max: MAX_DISCOVERY_TOOLS_PER_UPSTREAM,
+            });
+        }
+
+        tools.extend(result.tools);
+        cursor = result.next_cursor;
+        if cursor.is_none() {
+            return Ok(tools);
+        }
+    }
+
+    tracing::warn!(
+        max_pages = MAX_DISCOVERY_PAGES_PER_UPSTREAM,
+        "MCP upstream discovery exceeded aggregate page limit"
+    );
+    Err(McpUpstreamCallError::DiscoveryPageLimitExceeded {
+        max: MAX_DISCOVERY_PAGES_PER_UPSTREAM,
+    })
 }
 
 async fn connect(
@@ -877,24 +923,6 @@ fn mcp_response_too_large_max(error: &(dyn Error + 'static)) -> Option<usize> {
     }
 
     None
-}
-
-fn response_from_call_tool_result(
-    result: CallToolResult,
-) -> Result<EgressResponse, McpUpstreamCallError> {
-    let body = serde_json::to_vec(&result).map_err(|_| McpUpstreamCallError::Serialize)?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static(JSON_MIME));
-    headers.insert(
-        MCP_CALL_TOOL_RESULT_HEADER,
-        HeaderValue::from_static(MCP_CALL_TOOL_RESULT_HEADER_VALUE),
-    );
-
-    Ok(EgressResponse {
-        status: StatusCode::OK,
-        headers,
-        body,
-    })
 }
 
 fn proxy_definition(server: &McpUpstreamServerConfig, tool: Tool) -> ToolDefinition {

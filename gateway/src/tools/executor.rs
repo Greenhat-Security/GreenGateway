@@ -8,6 +8,7 @@ use std::{
 
 use http::{header, HeaderMap, HeaderValue, Method};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use rmcp::model::CallToolResult;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -127,6 +128,12 @@ pub enum ToolExecutorError {
         server_name: String,
         reason: &'static str,
     },
+}
+
+#[derive(Debug)]
+pub enum ToolExecutionResult {
+    Http(EgressResponse),
+    McpCallToolResult(CallToolResult),
 }
 
 impl fmt::Display for ToolExecutorError {
@@ -332,7 +339,7 @@ impl ToolExecutor {
         args: Value,
         context: ToolInvocationContext,
         cancel: CancellationToken,
-    ) -> Result<EgressResponse, ToolRuntimeError> {
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let runtime_tool_name = tool_name.to_owned();
         let work_tool_name = runtime_tool_name.clone();
         let work_context = context.clone();
@@ -362,7 +369,7 @@ impl ToolExecutor {
         tool_name: &str,
         args: Value,
         context: &ToolInvocationContext,
-    ) -> Result<EgressResponse, ToolExecutorError> {
+    ) -> Result<ToolExecutionResult, ToolExecutorError> {
         let tool = self
             .registry
             .get(tool_name)
@@ -412,7 +419,7 @@ impl ToolExecutor {
                         reason: None,
                     },
                 );
-                Ok(response)
+                Ok(ToolExecutionResult::Http(response))
             }
             Err(source) => {
                 let reason = egress_error_reason(&source);
@@ -441,7 +448,7 @@ impl ToolExecutor {
         tool: &ToolDefinition,
         mapping: McpProxyMapping,
         args: Value,
-    ) -> Result<EgressResponse, ToolExecutorError> {
+    ) -> Result<ToolExecutionResult, ToolExecutorError> {
         let Some(server) = self.mcp_upstream_servers.get(&mapping.server_name) else {
             return Err(ToolExecutorError::McpUpstream {
                 tool_name: tool.name.clone(),
@@ -462,19 +469,19 @@ impl ToolExecutor {
         let latency_ms = duration_millis(started.elapsed());
 
         match result {
-            Ok(response) => {
+            Ok(result) => {
                 self.emit_mcp_upstream_audit(
                     context,
                     tool,
                     &mapping,
                     UpstreamAuditOutcome {
                         outcome: "success",
-                        status: Some(response.status.as_u16()),
+                        status: Some(http::StatusCode::OK.as_u16()),
                         latency_ms,
                         reason: None,
                     },
                 );
-                Ok(response)
+                Ok(ToolExecutionResult::McpCallToolResult(result))
             }
             Err(source) => {
                 let reason = source.reason();
@@ -1024,15 +1031,17 @@ mod tests {
             runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
         );
 
-        let response = executor
-            .execute(
-                "echo",
-                json!({ "message": "hello" }),
-                invocation_context(),
-                CancellationToken::new(),
-            )
-            .await
-            .expect("valid tool invocation should succeed");
+        let response = http_response(
+            executor
+                .execute(
+                    "echo",
+                    json!({ "message": "hello" }),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("valid tool invocation should succeed"),
+        );
 
         assert_eq!(response.status, StatusCode::CREATED);
         assert_eq!(response.body, br#"{"ok":true}"#);
@@ -1136,18 +1145,20 @@ mod tests {
             runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
         );
 
-        let response = executor
-            .execute(
-                "echo",
-                json!({
-                    "message": "hello",
-                    "unexpected": "allowed"
-                }),
-                invocation_context(),
-                CancellationToken::new(),
-            )
-            .await
-            .expect("explicit additionalProperties=true should allow extra args");
+        let response = http_response(
+            executor
+                .execute(
+                    "echo",
+                    json!({
+                        "message": "hello",
+                        "unexpected": "allowed"
+                    }),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("explicit additionalProperties=true should allow extra args"),
+        );
 
         assert_eq!(response.status, StatusCode::OK);
         let request = server.await.expect("server task should join");
@@ -1313,18 +1324,20 @@ mod tests {
                 runtime_config([("get_widget", enabled_tool(500, 1))], 2, 1, 100),
             );
 
-            let response = executor
-                .execute(
-                    "get_widget",
-                    json!({
-                        "widget_id": value,
-                        "include_details": true
-                    }),
-                    invocation_context(),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("non-dot-segment value should make a valid request");
+            let response = http_response(
+                executor
+                    .execute(
+                        "get_widget",
+                        json!({
+                            "widget_id": value,
+                            "include_details": true
+                        }),
+                        invocation_context(),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .expect("non-dot-segment value should make a valid request"),
+            );
 
             assert_eq!(response.status, StatusCode::OK);
             let request = server.await.expect("server task should join");
@@ -1370,18 +1383,20 @@ mod tests {
         );
 
         let malicious = "../../../etc/passwd?host=evil.example.com#frag";
-        let response = executor
-            .execute(
-                "get_widget",
-                json!({
-                    "widget_id": malicious,
-                    "include_details": true
-                }),
-                invocation_context(),
-                CancellationToken::new(),
-            )
-            .await
-            .expect("encoded malicious value should still make a valid request");
+        let response = http_response(
+            executor
+                .execute(
+                    "get_widget",
+                    json!({
+                        "widget_id": malicious,
+                        "include_details": true
+                    }),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("encoded malicious value should still make a valid request"),
+        );
 
         assert_eq!(response.status, StatusCode::OK);
         let request = server.await.expect("server task should join");
@@ -1520,19 +1535,30 @@ mod tests {
             runtime_config_without_tools(DefaultToolPolicy::Allow),
         );
 
-        let response = executor
-            .execute(
-                "echo",
-                json!({ "message": "hello" }),
-                invocation_context(),
-                CancellationToken::new(),
-            )
-            .await
-            .expect("default allow should admit a registered tool absent from policy map");
+        let response = http_response(
+            executor
+                .execute(
+                    "echo",
+                    json!({ "message": "hello" }),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("default allow should admit a registered tool absent from policy map"),
+        );
 
         assert_eq!(response.status, StatusCode::OK);
         let request = server.await.expect("server task should join");
         assert_eq!(request.target, "/v1/echo");
+    }
+
+    fn http_response(result: ToolExecutionResult) -> EgressResponse {
+        match result {
+            ToolExecutionResult::Http(response) => response,
+            ToolExecutionResult::McpCallToolResult(_) => {
+                panic!("expected HTTP tool execution result")
+            }
+        }
     }
 
     fn executor_for_tools<const N: usize>(
