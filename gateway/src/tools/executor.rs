@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use http::{header, HeaderMap, HeaderValue, Method};
+use http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use rmcp::model::CallToolResult;
 use serde_json::{json, Value};
@@ -244,6 +244,13 @@ struct UpstreamAuditOutcome {
     reason: Option<&'static str>,
 }
 
+struct ToolObservationOutcome {
+    status: u16,
+    latency_ms: u64,
+    schema_mismatch: bool,
+    reason: Option<&'static str>,
+}
+
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 struct ValidatorCacheKey {
     tool_name: String,
@@ -408,14 +415,25 @@ impl ToolExecutor {
 
         match result {
             Ok(response) => {
+                let status = response.status.as_u16();
                 self.emit_upstream_audit(
                     context,
                     &tool,
                     &request.method,
                     UpstreamAuditOutcome {
                         outcome: "success",
-                        status: Some(response.status.as_u16()),
+                        status: Some(status),
                         latency_ms,
+                        reason: None,
+                    },
+                );
+                self.emit_tool_observation(
+                    context,
+                    &tool,
+                    ToolObservationOutcome {
+                        status,
+                        latency_ms,
+                        schema_mismatch: false,
                         reason: None,
                     },
                 );
@@ -423,6 +441,7 @@ impl ToolExecutor {
             }
             Err(source) => {
                 let reason = egress_error_reason(&source);
+                let status = egress_error_observation_status(&source);
                 self.emit_upstream_audit(
                     context,
                     &tool,
@@ -431,6 +450,16 @@ impl ToolExecutor {
                         outcome: "failure",
                         status: None,
                         latency_ms,
+                        reason: Some(reason),
+                    },
+                );
+                self.emit_tool_observation(
+                    context,
+                    &tool,
+                    ToolObservationOutcome {
+                        status,
+                        latency_ms,
+                        schema_mismatch: false,
                         reason: Some(reason),
                     },
                 );
@@ -450,6 +479,16 @@ impl ToolExecutor {
         args: Value,
     ) -> Result<ToolExecutionResult, ToolExecutorError> {
         let Some(server) = self.mcp_upstream_servers.get(&mapping.server_name) else {
+            self.emit_tool_observation(
+                context,
+                tool,
+                ToolObservationOutcome {
+                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                    latency_ms: 0,
+                    schema_mismatch: false,
+                    reason: Some("unknown_mcp_upstream_server"),
+                },
+            );
             return Err(ToolExecutorError::McpUpstream {
                 tool_name: tool.name.clone(),
                 server_name: mapping.server_name,
@@ -481,10 +520,21 @@ impl ToolExecutor {
                         reason: None,
                     },
                 );
+                self.emit_tool_observation(
+                    context,
+                    tool,
+                    ToolObservationOutcome {
+                        status: StatusCode::OK.as_u16(),
+                        latency_ms,
+                        schema_mismatch: false,
+                        reason: None,
+                    },
+                );
                 Ok(ToolExecutionResult::McpCallToolResult(result))
             }
             Err(source) => {
                 let reason = source.reason();
+                let status = mcp_upstream_error_observation_status(&source);
                 self.emit_mcp_upstream_audit(
                     context,
                     tool,
@@ -493,6 +543,16 @@ impl ToolExecutor {
                         outcome: "failure",
                         status: None,
                         latency_ms,
+                        reason: Some(reason),
+                    },
+                );
+                self.emit_tool_observation(
+                    context,
+                    tool,
+                    ToolObservationOutcome {
+                        status,
+                        latency_ms,
+                        schema_mismatch: false,
                         reason: Some(reason),
                     },
                 );
@@ -681,30 +741,53 @@ impl ToolExecutor {
         ));
     }
 
+    fn emit_tool_observation(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        outcome: ToolObservationOutcome,
+    ) {
+        let path = tool_observation_path(&tool.name);
+        let endpoint_template = path.clone();
+        let mut payload = json!({
+                "method": MCP_TOOL_OBSERVATION_METHOD,
+                "path": path,
+                "endpoint_template": endpoint_template,
+                "status": outcome.status,
+                "latency_ms": outcome.latency_ms,
+                "tool_name": tool.name,
+                "schema_mismatch": outcome.schema_mismatch,
+        });
+
+        if let Some(reason) = outcome.reason {
+            payload["reason"] = json!(reason);
+        }
+
+        self.audit.emit(AuditEvent::new(
+            HTTP_REQUEST_OBSERVED,
+            &context.request_id,
+            &context.source_ip,
+            context.actor.clone(),
+            payload,
+        ));
+    }
+
     fn emit_schema_mismatch_observation(
         &self,
         context: &ToolInvocationContext,
         tool: &ToolDefinition,
         latency_ms: u64,
     ) {
-        let path = tool_observation_path(&tool.name);
-        let endpoint_template = path.clone();
-        self.audit.emit(AuditEvent::new(
-            HTTP_REQUEST_OBSERVED,
-            &context.request_id,
-            &context.source_ip,
-            context.actor.clone(),
-            json!({
-                "method": MCP_TOOL_OBSERVATION_METHOD,
-                "path": path,
-                "endpoint_template": endpoint_template,
-                "status": TOOL_INPUT_VALIDATION_STATUS,
-                "latency_ms": latency_ms,
-                "tool_name": tool.name,
-                "schema_mismatch": true,
-                "reason": "input_validation",
-            }),
-        ));
+        self.emit_tool_observation(
+            context,
+            tool,
+            ToolObservationOutcome {
+                status: TOOL_INPUT_VALIDATION_STATUS,
+                latency_ms,
+                schema_mismatch: true,
+                reason: Some("input_validation"),
+            },
+        );
     }
 }
 
@@ -958,6 +1041,18 @@ fn egress_error_reason(error: &EgressError) -> &'static str {
     }
 }
 
+fn egress_error_observation_status(error: &EgressError) -> u16 {
+    if error.is_timeout() {
+        StatusCode::GATEWAY_TIMEOUT.as_u16()
+    } else {
+        StatusCode::BAD_GATEWAY.as_u16()
+    }
+}
+
+fn mcp_upstream_error_observation_status(_error: &mcp_upstream::McpUpstreamCallError) -> u16 {
+    StatusCode::BAD_GATEWAY.as_u16()
+}
+
 fn executor_work_failure_reason(error: &ToolExecutorError) -> &'static str {
     match error {
         ToolExecutorError::UnknownTool { .. } => "unknown_tool",
@@ -1052,10 +1147,11 @@ mod tests {
         assert_eq!(request.header("content-type"), Some("application/json"));
         assert_eq!(request.body, br#"{"message":"hello"}"#);
 
-        let events = audit_events(&capture, 3).await;
+        let events = audit_events(&capture, 4).await;
         assert_eq!(events[0].event_type, audit::event::TOOL_INVOKE_START);
         assert_eq!(events[1].event_type, audit::event::TOOL_UPSTREAM_REQUEST);
-        assert_eq!(events[2].event_type, audit::event::TOOL_INVOKE_SUCCESS);
+        assert_eq!(events[2].event_type, HTTP_REQUEST_OBSERVED);
+        assert_eq!(events[3].event_type, audit::event::TOOL_INVOKE_SUCCESS);
         assert_eq!(events[1].payload["tool_name"], json!("echo"));
         assert_eq!(events[1].payload["method"], json!("POST"));
         assert_eq!(events[1].payload["path_template"], json!("/v1/echo"));
@@ -1064,6 +1160,19 @@ mod tests {
         assert!(
             events[1].payload["latency_ms"].as_u64().is_some(),
             "upstream audit event should include latency_ms"
+        );
+        assert_eq!(events[2].payload["tool_name"], json!("echo"));
+        assert_eq!(events[2].payload["method"], json!("MCP"));
+        assert_eq!(events[2].payload["path"], json!("/mcp/tools/echo"));
+        assert_eq!(
+            events[2].payload["endpoint_template"],
+            json!("/mcp/tools/echo")
+        );
+        assert_eq!(events[2].payload["status"], json!(201));
+        assert_eq!(events[2].payload["schema_mismatch"], json!(false));
+        assert!(
+            events[2].payload["latency_ms"].as_u64().is_some(),
+            "tool observation event should include latency_ms"
         );
         assert_eq!(executor.validator_cache_guard().len(), 1);
     }

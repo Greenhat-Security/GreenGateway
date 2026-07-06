@@ -11561,6 +11561,202 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn successful_mcp_tool_call_appears_as_per_tool_traffic_inventory_row() {
+        let upstream_addr = spawn_echo_json_upstream().await;
+        let harness = mcp_inventory_test_harness(McpInventoryHarnessConfig {
+            upstream_url: Some(format!("http://{upstream_addr}")),
+            tools_document: mcp_tools_document(),
+            mcp_upstream_servers: Vec::new(),
+            egress_allowed_hosts: vec!["127.0.0.1".to_owned()],
+        })
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            30,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "inventory success"
+                }
+            })),
+            "mcp-inventory-success",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], json!(false));
+
+        let row =
+            wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
+                row["call_count"] == json!(1) && status_count(row, 200) == Some(1)
+            })
+            .await;
+        assert_eq!(row["method"], json!("MCP"));
+        assert_eq!(row["endpoint_template"], json!("/mcp/tools/echo"));
+        assert_eq!(row["call_count"], json!(1));
+        assert_eq!(row["schema_mismatch_count"], json!(0));
+        assert_eq!(row["distinct_principal_count"], json!(1));
+        assert_eq!(status_count(&row, 200), Some(1));
+        let open_signal_types = row["open_signals"]["signal_types"]
+            .as_array()
+            .expect("tool inventory row should include open signal types");
+        assert!(
+            open_signal_types
+                .iter()
+                .any(|signal_type| signal_type == "new_endpoint_seen"),
+            "successful tool call should open a new_endpoint_seen signal: {row}"
+        );
+        assert!(row["latency"]["p50_ms"].as_u64().is_some());
+        assert!(row["latency"]["p95_ms"].as_u64().is_some());
+        assert!(row["latency"]["p99_ms"].as_u64().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxied_mcp_tool_call_appears_as_per_tool_traffic_inventory_row() {
+        let upstream = spawn_test_mcp_upstream("remote_echo").await;
+        let harness = mcp_inventory_test_harness(McpInventoryHarnessConfig {
+            upstream_url: None,
+            tools_document: empty_tools_document(),
+            mcp_upstream_servers: vec![config::McpUpstreamServerConfig {
+                name: "alpha".to_owned(),
+                url: upstream.url.clone(),
+                timeout_ms: Some(2_000),
+                response_idle_timeout_ms: Some(2_000),
+                connect_timeout_ms: Some(2_000),
+            }],
+            egress_allowed_hosts: vec!["127.0.0.1".to_owned()],
+        })
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            31,
+            "tools/call",
+            Some(json!({
+                "name": "alpha:remote_echo",
+                "arguments": {
+                    "message": "inventory proxied"
+                }
+            })),
+            "mcp-inventory-proxied",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], json!(false));
+
+        let row = wait_for_mcp_tool_inventory_row(
+            &harness.router,
+            &harness.admin_token,
+            "alpha:remote_echo",
+            |row| row["call_count"] == json!(1) && status_count(row, 200) == Some(1),
+        )
+        .await;
+        assert_eq!(row["method"], json!("MCP"));
+        assert_eq!(
+            row["endpoint_template"],
+            json!("/mcp/tools/alpha:remote_echo")
+        );
+        assert_eq!(row["call_count"], json!(1));
+        assert_eq!(row["schema_mismatch_count"], json!(0));
+        assert_eq!(status_count(&row, 200), Some(1));
+    }
+
+    #[tokio::test]
+    async fn non_schema_mismatch_mcp_tool_failure_appears_as_error_inventory_row() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let upstream_addr = listener
+            .local_addr()
+            .expect("listener address should be available");
+        drop(listener);
+        let harness = mcp_inventory_test_harness(McpInventoryHarnessConfig {
+            upstream_url: Some(format!("http://{upstream_addr}")),
+            tools_document: mcp_tools_document(),
+            mcp_upstream_servers: Vec::new(),
+            egress_allowed_hosts: vec!["127.0.0.1".to_owned()],
+        })
+        .await;
+
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            32,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "inventory failure"
+                }
+            })),
+            "mcp-inventory-failure",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32603));
+
+        let row =
+            wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
+                row["call_count"] == json!(1) && status_count(row, 502) == Some(1)
+            })
+            .await;
+        assert_eq!(row["method"], json!("MCP"));
+        assert_eq!(row["endpoint_template"], json!("/mcp/tools/echo"));
+        assert_eq!(row["call_count"], json!(1));
+        assert_eq!(row["schema_mismatch_count"], json!(0));
+        assert_eq!(status_count(&row, 502), Some(1));
+    }
+
+    #[tokio::test]
+    async fn repeated_mcp_tool_calls_accumulate_into_one_inventory_row() {
+        let upstream_addr = spawn_echo_json_upstream().await;
+        let harness = mcp_inventory_test_harness(McpInventoryHarnessConfig {
+            upstream_url: Some(format!("http://{upstream_addr}")),
+            tools_document: mcp_tools_document(),
+            mcp_upstream_servers: Vec::new(),
+            egress_allowed_hosts: vec!["127.0.0.1".to_owned()],
+        })
+        .await;
+
+        for index in 0..3 {
+            let (status, body) = mcp_rpc(
+                &harness.router,
+                Some(&harness.admin_token),
+                33 + index,
+                "tools/call",
+                Some(json!({
+                    "name": "echo",
+                    "arguments": {
+                        "message": format!("inventory repeat {index}")
+                    }
+                })),
+                &format!("mcp-inventory-repeat-{index}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["result"]["isError"], json!(false));
+        }
+
+        let row =
+            wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
+                row["call_count"] == json!(3) && status_count(row, 200) == Some(3)
+            })
+            .await;
+        assert_eq!(row["endpoint_template"], json!("/mcp/tools/echo"));
+        assert_eq!(row["call_count"], json!(3));
+        assert_eq!(status_count(&row, 200), Some(3));
+        assert_eq!(
+            inventory_rows_for_tool(&harness.router, &harness.admin_token, "echo")
+                .await
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_upstream_tools_are_discovered_and_namespaced_in_tools_list() {
         let upstream = spawn_test_mcp_upstream("remote_echo").await;
@@ -21845,6 +22041,61 @@ paths:
         _token_db: TempDb,
     }
 
+    struct McpInventoryHarnessConfig {
+        upstream_url: Option<String>,
+        tools_document: String,
+        mcp_upstream_servers: Vec<config::McpUpstreamServerConfig>,
+        egress_allowed_hosts: Vec<String>,
+    }
+
+    struct McpInventoryTestHarness {
+        router: Router,
+        admin_token: String,
+        _policy: TempPolicyFile,
+        _tools: TempToolsFile,
+        _token_db: TempDb,
+        _discovery_db: TempDb,
+    }
+
+    async fn mcp_inventory_test_harness(
+        harness_config: McpInventoryHarnessConfig,
+    ) -> McpInventoryTestHarness {
+        let token_db = TempDb::new("mcp-inventory-service-tokens");
+        let discovery_db = TempDb::new("mcp-inventory-discovery");
+        let token_store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        let admin_token = create_service_token(&token_store, &["admin"]);
+        let policy = TempPolicyFile::new(&mcp_inventory_policy_document());
+        let tools = TempToolsFile::new(&harness_config.tools_document);
+
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.tools_file = Some(tools.path.to_string_lossy().into_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        config.service_token_cache_ttl_ms = 20;
+        config.discovery_sqlite_path = Some(discovery_db.path.to_string_lossy().into_owned());
+        config.upstream_url = harness_config.upstream_url;
+        config.mcp_upstream_servers = harness_config.mcp_upstream_servers;
+        config.egress_allowed_hosts = harness_config.egress_allowed_hosts;
+        config.egress_deny_private_ips = false;
+
+        let (sink, audit_event_sender) =
+            audit::sink::build_sink_from_config(&config).expect("audit sink should build");
+        let audit_log = audit::AuditLog::new(sink);
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(config, recorder.handle(), audit_log, audit_event_sender)
+            .expect("MCP inventory test app should build");
+
+        McpInventoryTestHarness {
+            router,
+            admin_token,
+            _policy: policy,
+            _tools: tools,
+            _token_db: token_db,
+            _discovery_db: discovery_db,
+        }
+    }
+
     async fn mcp_upstream_test_harness(
         server_name: &str,
         upstream_url: String,
@@ -22697,6 +22948,58 @@ paths:
             .expect("MCP result should include text content")
     }
 
+    async fn wait_for_mcp_tool_inventory_row(
+        router: &Router,
+        token: &str,
+        tool_name: &str,
+        condition: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let started = Instant::now();
+
+        loop {
+            let rows = inventory_rows_for_tool(router, token, tool_name).await;
+            if let Some(row) = rows.iter().find(|row| condition(row)) {
+                return row.clone();
+            }
+
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "MCP tool inventory row did not match condition: {rows:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn inventory_rows_for_tool(router: &Router, token: &str, tool_name: &str) -> Vec<Value> {
+        let endpoint_template = format!("/mcp/tools/{tool_name}");
+        let uri = format!(
+            "{TRAFFIC_ENDPOINTS_ADMIN_ROUTE}?method=MCP&endpoint_template_prefix={endpoint_template}"
+        );
+        let response = router
+            .clone()
+            .oneshot(bearer_get_request(&uri, token))
+            .await;
+        let response = response.expect("traffic inventory request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+
+        body["endpoints"]
+            .as_array()
+            .expect("traffic response should include endpoints")
+            .iter()
+            .filter(|row| row["endpoint_template"] == json!(endpoint_template))
+            .cloned()
+            .collect()
+    }
+
+    fn status_count(row: &Value, status: u16) -> Option<u64> {
+        row["status_counts"]
+            .as_array()?
+            .iter()
+            .find(|count| count["status"] == json!(status))
+            .and_then(|count| count["count"].as_u64())
+    }
+
     fn mcp_initialize_params() -> Value {
         json!({
             "protocolVersion": "2025-11-25",
@@ -22763,6 +23066,54 @@ paths:
                     }
                 }
             ]
+        })
+        .to_string()
+    }
+
+    fn mcp_inventory_policy_document() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "id": "mcp-inventory-test-policy",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "admin": {
+                    "permissions": [
+                        ADMIN_MCP_USE_PERMISSION,
+                        ADMIN_TRAFFIC_READ_PERMISSION,
+                        ADMIN_SIGNALS_READ_PERMISSION
+                    ]
+                }
+            },
+            "routes": [
+                {
+                    "methods": ["POST"],
+                    "path_prefix": MCP_ROUTE,
+                    "permission": ADMIN_MCP_USE_PERMISSION
+                },
+                {
+                    "methods": ["GET"],
+                    "path_prefix": TRAFFIC_ENDPOINTS_ADMIN_ROUTE,
+                    "permission": ADMIN_TRAFFIC_READ_PERMISSION
+                }
+            ],
+            "tools": {
+                "echo": {
+                    "allowed_roles": ["admin"],
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                },
+                "get_widget": {
+                    "allowed_roles": ["admin"],
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                },
+                "alpha:remote_echo": {
+                    "allowed_roles": ["admin"],
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            }
         })
         .to_string()
     }
