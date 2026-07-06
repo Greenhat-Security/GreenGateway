@@ -42,6 +42,13 @@ impl ProtectedResourceMetadataConfig {
         public_url_with_appended_path(&self.public_url, MCP_RESOURCE_PATH)
     }
 
+    pub(crate) fn mcp_resource_path(&self) -> String {
+        Url::parse(&self.mcp_resource())
+            .expect("MCP resource URL should parse")
+            .path()
+            .to_owned()
+    }
+
     pub(crate) fn metadata_url(&self) -> String {
         public_url_with_path(&self.mcp_resource(), WELL_KNOWN_PATH)
     }
@@ -54,6 +61,16 @@ impl ProtectedResourceMetadataConfig {
             bearer_methods_supported: vec![BEARER_METHOD],
         }
     }
+}
+
+pub(crate) fn mcp_route_paths(config: &Config) -> Vec<String> {
+    let mut paths = vec![MCP_RESOURCE_PATH.to_owned()];
+    if let Some(metadata) = ProtectedResourceMetadataConfig::from_config(config) {
+        paths.push(metadata.mcp_resource_path());
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn authorization_servers(config: &Config) -> Vec<String> {

@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     audit::{AuditEvent, AuditLog},
-    auth::{self, actor_from_principal},
+    auth::{self, actor_from_principal, protected_resource},
     client_ip::{canonical_client_ip, request_id},
     config::Config,
     path_match::path_prefix_matches,
@@ -50,6 +50,7 @@ pub struct RbacState {
     pub exempt_paths: Vec<String>,
     pub trust_proxy_headers: bool,
     pub audit: AuditLog,
+    mcp_route_paths: Vec<String>,
 }
 
 struct RbacPolicyState {
@@ -95,19 +96,37 @@ struct AuditContext {
 
 impl RbacState {
     pub fn from_policy(policy: Policy, config: &Config, audit: AuditLog) -> Self {
-        Self::new(
+        Self::new_with_mcp_route_paths(
             policy,
             config.rbac_exempt_paths.clone(),
             config.trust_proxy_headers,
             audit,
+            protected_resource::mcp_route_paths(config),
         )
     }
 
+    #[cfg(test)]
     pub fn new(
         policy: Policy,
         exempt_paths: Vec<String>,
         trust_proxy_headers: bool,
         audit: AuditLog,
+    ) -> Self {
+        Self::new_with_mcp_route_paths(
+            policy,
+            exempt_paths,
+            trust_proxy_headers,
+            audit,
+            vec![protected_resource::MCP_RESOURCE_PATH.to_owned()],
+        )
+    }
+
+    fn new_with_mcp_route_paths(
+        policy: Policy,
+        exempt_paths: Vec<String>,
+        trust_proxy_headers: bool,
+        audit: AuditLog,
+        mcp_route_paths: Vec<String>,
     ) -> Self {
         Self {
             policy: Arc::new(ArcSwap::from_pointee(RbacPolicyState::from_policy(policy))),
@@ -116,6 +135,7 @@ impl RbacState {
             exempt_paths,
             trust_proxy_headers,
             audit,
+            mcp_route_paths,
         }
     }
 
@@ -146,6 +166,19 @@ impl RbacState {
             .load()
             .engine
             .principal_has_permission(principal, permission)
+    }
+
+    fn policy_path_for_request<'a>(&'a self, path: &'a str) -> &'a str {
+        if path != protected_resource::MCP_RESOURCE_PATH
+            && self
+                .mcp_route_paths
+                .iter()
+                .any(|route_path| path == route_path)
+        {
+            protected_resource::MCP_RESOURCE_PATH
+        } else {
+            path
+        }
     }
 
     pub(crate) fn evaluate_tool_authorization<R>(
@@ -396,6 +429,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
 
     let context = audit_context(&req, state.trust_proxy_headers);
     let principal = req.extensions().get::<auth::Principal>().cloned();
+    let policy_path = state.policy_path_for_request(path);
 
     let policy = state.policy.load();
     // Direct firewall rules are additive alongside route-to-permission rules
@@ -403,10 +437,20 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     // for the full request tuple. If no direct rule matches, route and
     // default-action behavior continues exactly as it did before rules were
     // integrated.
-    if let Some(rule_decision) =
-        policy
-            .rule_matcher
-            .evaluate(req.method().as_str(), path, principal.as_ref())
+    if let Some(rule_decision) = policy
+        .rule_matcher
+        .evaluate(req.method().as_str(), path, principal.as_ref())
+        .or_else(|| {
+            (policy_path != path)
+                .then(|| {
+                    policy.rule_matcher.evaluate(
+                        req.method().as_str(),
+                        policy_path,
+                        principal.as_ref(),
+                    )
+                })
+                .flatten()
+        })
     {
         let matched_rule_id = policy.rule_id(rule_decision.rule_index);
         return match rule_decision.action {
@@ -446,7 +490,10 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         };
     }
 
-    if let Some(rule) = matching_route(&policy.routes, req.method(), path) {
+    let matching_policy_route =
+        matching_route_for_request(&policy.routes, req.method(), path, policy_path);
+
+    if let Some(rule) = matching_policy_route {
         if principal.as_ref().is_some_and(|principal| {
             policy
                 .engine
@@ -549,6 +596,30 @@ fn matching_route<'a>(
     routes.iter().find(|rule| {
         path_prefix_matches(path, &rule.path_prefix) && method_matches(&rule.methods, method)
     })
+}
+
+fn matching_route_for_request<'a>(
+    routes: &'a [RouteRule],
+    method: &Method,
+    path: &str,
+    policy_path: &str,
+) -> Option<&'a RouteRule> {
+    if policy_path != path {
+        matching_exact_route(routes, method, path)
+            .or_else(|| matching_route(routes, method, policy_path))
+    } else {
+        matching_route(routes, method, path)
+    }
+}
+
+fn matching_exact_route<'a>(
+    routes: &'a [RouteRule],
+    method: &Method,
+    path: &str,
+) -> Option<&'a RouteRule> {
+    routes
+        .iter()
+        .find(|rule| rule.path_prefix == path && method_matches(&rule.methods, method))
 }
 
 fn is_unsafe_request_path(path: &str) -> bool {
@@ -886,6 +957,49 @@ mod tests {
         assert_eq!(event.payload["path_prefix"], json!("/data"));
         assert_eq!(event.payload["permission"], json!("data:read"));
         assert!(event.actor.is_some());
+    }
+
+    #[tokio::test]
+    async fn prefixed_mcp_route_does_not_use_broad_public_prefix_permission() {
+        let (state, capture) = test_state_with_mcp_route_paths(
+            test_policy(
+                DefaultAction::Deny,
+                &[
+                    ("base-reader", &["base:read"]),
+                    ("mcp-user", &["admin:mcp:use"]),
+                ],
+                &[
+                    route(&["POST"], "/base", "base:read"),
+                    route(&["POST"], "/mcp", "admin:mcp:use"),
+                ],
+            ),
+            &[],
+            &["/mcp", "/base/mcp"],
+        );
+        let router = test_router(state.clone(), Some(test_principal(&["base-reader"])));
+
+        let response = router
+            .clone()
+            .oneshot(request(Method::POST, "/base/mcp"))
+            .await
+            .expect("prefixed MCP request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let denied = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(denied.payload["path"], json!("/base/mcp"));
+        assert_eq!(denied.payload["path_prefix"], json!("/mcp"));
+        assert_eq!(denied.payload["permission"], json!("admin:mcp:use"));
+
+        let allowed_response = test_router(state, Some(test_principal(&["mcp-user"])))
+            .oneshot(request(Method::POST, "/base/mcp"))
+            .await
+            .expect("prefixed MCP request with MCP permission should complete");
+
+        assert_eq!(allowed_response.status(), StatusCode::OK);
+        let allowed = captured_event(&capture, AUTHZ_ALLOWED).await;
+        assert_eq!(allowed.payload["path"], json!("/base/mcp"));
+        assert_eq!(allowed.payload["path_prefix"], json!("/mcp"));
+        assert_eq!(allowed.payload["permission"], json!("admin:mcp:use"));
     }
 
     #[tokio::test]
@@ -1988,15 +2102,31 @@ mod tests {
     }
 
     fn test_state(policy: Policy, exempt_paths: &[&str]) -> (RbacState, CaptureSink) {
+        test_state_with_mcp_route_paths(
+            policy,
+            exempt_paths,
+            &[protected_resource::MCP_RESOURCE_PATH],
+        )
+    }
+
+    fn test_state_with_mcp_route_paths(
+        policy: Policy,
+        exempt_paths: &[&str],
+        mcp_route_paths: &[&str],
+    ) -> (RbacState, CaptureSink) {
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
 
         (
-            RbacState::new(
+            RbacState::new_with_mcp_route_paths(
                 policy,
                 exempt_paths.iter().map(|path| (*path).to_owned()).collect(),
                 false,
                 audit,
+                mcp_route_paths
+                    .iter()
+                    .map(|path| (*path).to_owned())
+                    .collect(),
             ),
             capture,
         )

@@ -110,6 +110,7 @@ const ADMIN_TRAFFIC_WRITE_PERMISSION: &str = "admin:traffic:write";
 const ADMIN_PRINCIPALS_READ_PERMISSION: &str = "admin:principals:read";
 #[cfg(test)]
 const ADMIN_MCP_USE_PERMISSION: &str = "admin:mcp:use";
+#[cfg(test)]
 const MCP_ROUTE: &str = auth::protected_resource::MCP_RESOURCE_PATH;
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
 const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
@@ -184,6 +185,7 @@ struct GatewayRoutes {
     admin: AdminRoutes,
     exact_owned_paths: Vec<String>,
     prefix_owned_paths: Vec<String>,
+    mcp_route_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -235,10 +237,9 @@ impl GatewayRoutes {
             .iter()
             .map(|path| (*path).to_owned())
             .collect();
+        let mcp_route_paths = auth::protected_resource::mcp_route_paths(config);
         let mut prefix_owned_paths = vec![admin.ui_prefix.clone(), admin.api_prefix.clone()];
-        prefix_owned_paths.sort();
-        prefix_owned_paths.dedup();
-        prefix_owned_paths.push(MCP_ROUTE.to_owned());
+        prefix_owned_paths.extend(mcp_route_paths.iter().cloned());
         prefix_owned_paths.sort();
         prefix_owned_paths.dedup();
 
@@ -246,6 +247,7 @@ impl GatewayRoutes {
             admin,
             exact_owned_paths,
             prefix_owned_paths,
+            mcp_route_paths,
         }
     }
 
@@ -1729,10 +1731,10 @@ fn unified_router(
             auth::protected_resource::WELL_KNOWN_SUFFIX_ROUTE,
             get(oauth_protected_resource_metadata_endpoint),
         )
-        .route(MCP_ROUTE, any(mcp::mcp_endpoint))
         .route(routes.admin.ui_prefix.as_str(), get(admin_ui_index))
         .route(routes.admin.ui_slash_route.as_str(), get(admin_ui_index))
         .route(routes.admin.ui_asset_route.as_str(), get(admin_ui_asset));
+    let router = add_mcp_routes(router, routes);
 
     let router = with_proxy_fallback_if_configured(router, &app_state).with_state(app_state);
     let router = add_admin_api_routes(router, routes, admin_api_states);
@@ -1758,10 +1760,17 @@ fn data_router(app_state: AppState) -> Router {
         .route(
             auth::protected_resource::WELL_KNOWN_SUFFIX_ROUTE,
             get(oauth_protected_resource_metadata_endpoint),
-        )
-        .route(MCP_ROUTE, any(mcp::mcp_endpoint));
+        );
+    let router = add_mcp_routes(router, &app_state.routes);
 
     with_proxy_fallback_if_configured(router, &app_state).with_state(app_state)
+}
+
+fn add_mcp_routes(mut router: Router<AppState>, routes: &GatewayRoutes) -> Router<AppState> {
+    for route_path in &routes.mcp_route_paths {
+        router = router.route(route_path.as_str(), any(mcp::mcp_endpoint));
+    }
+    router
 }
 
 fn admin_router(
@@ -10517,6 +10526,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_path_prefixed_public_url_serves_advertised_resource_route() {
+        let harness = mcp_test_harness_with_public_url(
+            &["admin"],
+            test_audit_log(),
+            "https://gateway.example.test/base",
+        )
+        .await;
+
+        let response = harness
+            .router
+            .clone()
+            .oneshot(mcp_request_to(
+                "/base/mcp",
+                Some(&harness.admin_token),
+                1,
+                "initialize",
+                Some(mcp_initialize_params()),
+                "mcp-prefixed-init-request",
+            ))
+            .await
+            .expect("prefixed MCP request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["jsonrpc"], json!("2.0"));
+        assert_eq!(body["id"], json!(1));
+        assert_eq!(body["result"]["serverInfo"]["name"], json!("greengateway"));
+    }
+
+    #[tokio::test]
     async fn oauth_protected_resource_metadata_returns_mcp_resource_document() {
         let mut config = test_config(Vec::new());
         config.gateway_public_url = Some("https://gateway.example.test/base/".to_owned());
@@ -10632,6 +10671,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_unauthorized_challenge_includes_resource_metadata_for_prefixed_route() {
+        let mut config = test_config(Vec::new());
+        config.gateway_public_url = Some("https://gateway.example.test/base".to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/base/mcp")
+                    .body(Body::empty())
+                    .expect("prefixed MCP request should build"),
+            )
+            .await
+            .expect("prefixed MCP request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::WWW_AUTHENTICATE),
+            Some(&HeaderValue::from_static(
+                "Bearer realm=\"mcp\", resource_metadata=\"https://gateway.example.test/.well-known/oauth-protected-resource/base/mcp\""
+            ))
+        );
+    }
+
+    #[tokio::test]
     async fn mcp_unauthorized_challenge_includes_resource_metadata_only_for_mcp() {
         let mut config = test_config(Vec::new());
         config.gateway_public_url = Some("https://gateway.example.test".to_owned());
@@ -10696,12 +10767,8 @@ mod tests {
         let response = router
             .oneshot(
                 Request::builder()
-                    // A path-prefixed GATEWAY_PUBLIC_URL describes the
-                    // external resource URL. The gateway itself still serves
-                    // bare /mcp; deployments using /base are expected to strip
-                    // that prefix in the reverse proxy before forwarding. The
-                    // assertion below should still advertise the public
-                    // /base/mcp-derived metadata URL.
+                    // Bare /mcp remains a compatibility route even when the
+                    // public resource URL is advertised under /base/mcp.
                     .uri(auth::protected_resource::MCP_RESOURCE_PATH)
                     .body(Body::empty())
                     .expect("MCP request should build"),
@@ -22028,6 +22095,24 @@ paths:
         .await
     }
 
+    async fn mcp_test_harness_with_public_url(
+        echo_allowed_roles: &[&str],
+        audit_log: audit::AuditLog,
+        gateway_public_url: &str,
+    ) -> McpTestHarness {
+        let upstream_addr = spawn_echo_json_upstream().await;
+        mcp_test_harness_from_parts(
+            echo_allowed_roles,
+            audit_log,
+            format!("http://{upstream_addr}"),
+            mcp_tools_document(),
+            vec!["127.0.0.1".to_owned()],
+            Some(gateway_public_url.to_owned()),
+            &["admin", auth::protected_resource::MCP_SCOPE],
+        )
+        .await
+    }
+
     async fn mcp_test_harness_with_upstream_url(
         echo_allowed_roles: &[&str],
         audit_log: audit::AuditLog,
@@ -22035,10 +22120,31 @@ paths:
         tools_document: String,
         egress_allowed_hosts: Vec<String>,
     ) -> McpTestHarness {
+        mcp_test_harness_from_parts(
+            echo_allowed_roles,
+            audit_log,
+            upstream_url,
+            tools_document,
+            egress_allowed_hosts,
+            None,
+            &["admin"],
+        )
+        .await
+    }
+
+    async fn mcp_test_harness_from_parts(
+        echo_allowed_roles: &[&str],
+        audit_log: audit::AuditLog,
+        upstream_url: String,
+        tools_document: String,
+        egress_allowed_hosts: Vec<String>,
+        gateway_public_url: Option<String>,
+        admin_token_roles: &[&str],
+    ) -> McpTestHarness {
         let token_db = TempDb::new("mcp-service-tokens");
         let token_store =
             auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
-        let admin_token = create_service_token(&token_store, &["admin"]);
+        let admin_token = create_service_token(&token_store, admin_token_roles);
         let reader_token = create_service_token(&token_store, &["reader"]);
         let blocked_token = create_service_token(&token_store, &["blocked"]);
         let policy = TempPolicyFile::new(&mcp_policy_document(echo_allowed_roles));
@@ -22052,6 +22158,7 @@ paths:
         config.upstream_url = Some(upstream_url);
         config.egress_allowed_hosts = egress_allowed_hosts;
         config.egress_deny_private_ips = false;
+        config.gateway_public_url = gateway_public_url;
 
         let recorder = PrometheusBuilder::new().build_recorder();
         let router = app(
@@ -22937,6 +23044,17 @@ paths:
         params: Option<Value>,
         request_id: &str,
     ) -> Request<Body> {
+        mcp_request_to(MCP_ROUTE, token, id, method, params, request_id)
+    }
+
+    fn mcp_request_to(
+        uri: &str,
+        token: Option<&str>,
+        id: u64,
+        method: &str,
+        params: Option<Value>,
+        request_id: &str,
+    ) -> Request<Body> {
         let mut body = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -22949,7 +23067,7 @@ paths:
 
         let mut builder = Request::builder()
             .method(Method::POST)
-            .uri(MCP_ROUTE)
+            .uri(uri)
             .header(header::HOST, "localhost")
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "application/json, text/event-stream")
