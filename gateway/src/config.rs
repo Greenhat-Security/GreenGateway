@@ -87,6 +87,7 @@ const EGRESS_MAX_REQUEST_BODY_BYTES: &str = "EGRESS_MAX_REQUEST_BODY_BYTES";
 const EGRESS_MAX_RESPONSE_BYTES: &str = "EGRESS_MAX_RESPONSE_BYTES";
 const EGRESS_RESPONSE_IDLE_TIMEOUT_MS: &str = "EGRESS_RESPONSE_IDLE_TIMEOUT_MS";
 const EGRESS_TIMEOUT_MS: &str = "EGRESS_TIMEOUT_MS";
+const GATEWAY_PUBLIC_URL: &str = "GATEWAY_PUBLIC_URL";
 const JWT_AUDIENCE: &str = "JWT_AUDIENCE";
 const JWT_ISSUER: &str = "JWT_ISSUER";
 const JWT_JWKS_TIMEOUT_MS: &str = "JWT_JWKS_TIMEOUT_MS";
@@ -134,6 +135,7 @@ pub struct Config {
     pub admin_listen_addr: Option<SocketAddr>,
     pub admin_prefix: String,
     pub admin_login_provider: Option<String>,
+    pub gateway_public_url: Option<String>,
     pub audit_log_file: Option<String>,
     pub audit_sqlite_path: Option<String>,
     pub audit_sqlite_retention_days: Option<u32>,
@@ -419,6 +421,11 @@ impl Config {
         let admin_login_provider = parse_optional_string(
             ADMIN_LOGIN_PROVIDER,
             get_var(ADMIN_LOGIN_PROVIDER),
+            &mut problems,
+        );
+        let gateway_public_url = parse_optional_gateway_public_url(
+            GATEWAY_PUBLIC_URL,
+            get_var(GATEWAY_PUBLIC_URL),
             &mut problems,
         );
         let audit_log_file =
@@ -870,6 +877,7 @@ impl Config {
                 admin_listen_addr,
                 admin_prefix,
                 admin_login_provider,
+                gateway_public_url,
                 audit_log_file,
                 audit_sqlite_path,
                 audit_sqlite_retention_days,
@@ -1679,6 +1687,43 @@ fn parse_optional_upstream_url(
     validate_upstream_url(name, value, problems)
 }
 
+fn parse_optional_gateway_public_url(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Option<String> {
+    let value = parse_optional_upstream_url(name, value, problems)?;
+    let parsed = url::Url::parse(&value).expect("gateway public URL should have been validated");
+
+    if parsed.fragment().is_some() {
+        problems.push(format!(
+            "{name} must not include a URL fragment, got '{value}'"
+        ));
+        None
+    } else if parsed.scheme() == "http" && !url_host_is_loopback(&parsed) {
+        problems.push(format!(
+            "{name} must use https unless the host is loopback, got '{value}'"
+        ));
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn url_host_is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped_ip| mapped_ip.is_loopback())
+        }
+        None => false,
+    }
+}
+
 fn parse_upstream_routes(
     name: &str,
     value: Result<String, VarError>,
@@ -2271,6 +2316,7 @@ mod tests {
             )
         );
         assert_eq!(config.admin_prefix, DEFAULT_ADMIN_PREFIX);
+        assert_eq!(config.gateway_public_url, None);
         assert_eq!(config.audit_log_file, None);
         assert_eq!(config.audit_sqlite_path, None);
         assert_eq!(config.audit_sqlite_retention_days, None);
@@ -3260,6 +3306,111 @@ mod tests {
     }
 
     #[test]
+    fn gateway_public_url_parses_optional_https_url() {
+        let config = Config::from_env_vars(|name| match name {
+            "GATEWAY_PUBLIC_URL" => Ok("  https://gateway.example.test/base/  ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        assert_eq!(
+            config.gateway_public_url,
+            Some("https://gateway.example.test/base/".to_owned())
+        );
+    }
+
+    #[test]
+    fn invalid_gateway_public_url_values_are_rejected() {
+        for (value, expected) in [
+            (
+                "not a url",
+                "GATEWAY_PUBLIC_URL must be a valid http or https URL",
+            ),
+            (
+                "mailto:ops@example.test",
+                "GATEWAY_PUBLIC_URL must be a valid http or https URL with a host",
+            ),
+            (
+                "ftp://gateway.example.test",
+                "GATEWAY_PUBLIC_URL must use http or https",
+            ),
+        ] {
+            let error = Config::from_env_vars(|name| match name {
+                "GATEWAY_PUBLIC_URL" => Ok(value.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect_err("config should reject invalid public URL");
+
+            let message = error.to_string();
+            assert!(message.contains(expected), "{message}");
+            assert_eq!(error.problems.len(), 1);
+        }
+    }
+
+    #[test]
+    fn gateway_public_url_rejects_fragment() {
+        let error = Config::from_env_vars(|name| match name {
+            "GATEWAY_PUBLIC_URL" => Ok("https://gateway.example.test/#metadata".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject public URL fragments");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("GATEWAY_PUBLIC_URL must not include a URL fragment"),
+            "{message}"
+        );
+        assert!(message.contains("https://gateway.example.test/#metadata"));
+        assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
+    fn gateway_public_url_allows_http_loopback_for_local_development() {
+        for value in [
+            "http://localhost:8080/base",
+            "http://127.0.0.1:8080/base",
+            "http://[::1]:8080/base",
+        ] {
+            let config = Config::from_env_vars(|name| match name {
+                "GATEWAY_PUBLIC_URL" => Ok(value.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect("loopback HTTP public URL should parse");
+
+            assert_eq!(config.gateway_public_url, Some(value.to_owned()));
+        }
+    }
+
+    #[test]
+    fn gateway_public_url_allows_http_ipv4_mapped_ipv6_loopback_for_local_development() {
+        let value = "http://[::ffff:127.0.0.1]:8080/base";
+        let config = Config::from_env_vars(|name| match name {
+            "GATEWAY_PUBLIC_URL" => Ok(value.to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("IPv4-mapped IPv6 loopback HTTP public URL should parse");
+
+        assert_eq!(config.gateway_public_url, Some(value.to_owned()));
+    }
+
+    #[test]
+    fn gateway_public_url_rejects_http_non_loopback_hosts() {
+        let error = Config::from_env_vars(|name| match name {
+            "GATEWAY_PUBLIC_URL" => Ok("http://gateway.example.test/base".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("non-loopback HTTP public URL should be rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("GATEWAY_PUBLIC_URL must use https unless the host is loopback"),
+            "{message}"
+        );
+        assert!(message.contains("http://gateway.example.test/base"));
+        assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
     fn auth_providers_parse_ordered_jwt_list() {
         let config = Config::from_env_vars(|name| match name {
             "AUTH_PROVIDERS" => Ok(r#"[
@@ -4166,6 +4317,20 @@ mod tests {
         assert_eq!(
             config.upstream_url,
             Some("https://upstream.example.test:8443/base/path".to_owned())
+        );
+    }
+
+    #[test]
+    fn upstream_url_still_accepts_fragment() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_URL" => Ok("https://upstream.example.test/base/path#allowed".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("shared upstream URL validation should still accept fragments");
+
+        assert_eq!(
+            config.upstream_url,
+            Some("https://upstream.example.test/base/path#allowed".to_owned())
         );
     }
 

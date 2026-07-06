@@ -48,6 +48,20 @@ The admin UI login flow uses OAuth2 authorization-code with PKCE. `GET /v1{ADMIN
 
 The pending-login state is intentionally process-local and bounded in memory. It is suitable for a single GreenGateway instance; multi-instance deployments need sticky routing or a future shared state store for the login callback.
 
+### GATEWAY_PUBLIC_URL
+
+Optional public base URL clients use to reach this gateway.
+
+Default: empty, which disables the OAuth protected-resource metadata document. In this mode `GET /.well-known/oauth-protected-resource` and RFC 9728 path-derived children under it return a clear not-configured error, MCP 401 responses keep the same plain bearer challenge as other endpoints, and JWT validation behavior is unchanged.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be a valid `https` URL with a host and no fragment. Plain `http` is accepted only for loopback local-development hosts such as `localhost`, `127.0.0.1`, and `::1`. The configured URL may include a path prefix; GreenGateway appends `/mcp` to compute the MCP protected resource identifier. The metadata document URL advertised to MCP clients follows RFC 9728 by inserting `/.well-known/oauth-protected-resource` between the MCP resource identifier's origin and its path and/or query components. For example, `https://gateway.example.test/base` advertises `https://gateway.example.test/.well-known/oauth-protected-resource/base/mcp`; `https://gateway.example.test` advertises `https://gateway.example.test/.well-known/oauth-protected-resource/mcp`.
+
+Path-prefix deployments must strip the prefix before forwarding to GreenGateway. `GATEWAY_PUBLIC_URL` describes the public URL; it does not remount the gateway's internal routes. With `GATEWAY_PUBLIC_URL=https://gateway.example.test/base`, configure the front reverse proxy so public `GET /base/mcp` reaches GreenGateway as `GET /mcp`. The same proxy should forward OAuth metadata URLs under `/.well-known/oauth-protected-resource` to GreenGateway while preserving the RFC 9728 suffix, so public `GET /.well-known/oauth-protected-resource/base/mcp` reaches GreenGateway at `GET /.well-known/oauth-protected-resource/base/mcp`. GreenGateway itself should not receive `GET /base/mcp`, because the MCP endpoint is mounted at bare `/mcp`.
+
+When set, `GET` at the derived metadata document URL is public and unauthenticated. The response advertises `resource` as `{GATEWAY_PUBLIC_URL}/mcp`, `authorization_servers` from configured JWT/OIDC provider issuers when present, `scopes_supported` as `["mcp:tools"]`, and `bearer_methods_supported` as `["header"]`. MCP authentication failures include a `WWW-Authenticate` challenge with `realm="mcp"` and `resource_metadata` pointing at the derived metadata document URL.
+
+The protected-resource requirement applies to every credential type that can otherwise authenticate to `/mcp`. JWT bearer tokens must include the MCP resource identifier in the `aud` claim, in addition to any existing provider-level static `audience` requirement. GreenGateway `ggw_` service tokens must include the exact `mcp:tools` scope. Cookie-session credentials are not accepted for `/mcp` when protected-resource binding is active; browser admin sessions remain valid for non-MCP routes. Non-MCP endpoints are unchanged by this setting.
+
 ### AUDIT_LOG_FILE
 
 Optional JSON Lines audit log file path.
@@ -732,6 +746,8 @@ Optional SQLite store path for service tokens managed by `POST /v1{ADMIN_PREFIX}
 Default: empty, which disables the service-token admin API storage backend and does not add the service-token validator to the auth chain.
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. When set, GreenGateway creates or opens the SQLite database at startup and initializes the `service_tokens` table if needed.
+
+When `GATEWAY_PUBLIC_URL` is configured, a service token used against `/mcp` must carry the exact `mcp:tools` scope advertised by the OAuth protected-resource metadata document. This scope is a credential-binding requirement for MCP access; route and tool authorization still uses the normal RBAC policy and tool `allowed_roles` checks after authentication.
 
 ### SERVICE_TOKEN_CACHE_TTL_MS
 

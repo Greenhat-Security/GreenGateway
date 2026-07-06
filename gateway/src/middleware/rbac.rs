@@ -378,6 +378,10 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         );
     }
 
+    if auth::protected_resource::is_well_known_path(path) {
+        return next.run(req).await;
+    }
+
     if state
         .exempt_paths
         .iter()

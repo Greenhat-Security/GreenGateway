@@ -24,8 +24,19 @@ impl SessionValidator for ChainValidator {
         &self,
         credential: &SessionCredential,
     ) -> Result<Principal, AuthError> {
+        self.validate_session_for_resource(credential, None).await
+    }
+
+    async fn validate_session_for_resource(
+        &self,
+        credential: &SessionCredential,
+        resource: Option<&str>,
+    ) -> Result<Principal, AuthError> {
         for validator in &self.validators {
-            match validator.validate_session(credential).await {
+            match validator
+                .validate_session_for_resource(credential, resource)
+                .await
+            {
                 Ok(principal) => return Ok(principal),
                 Err(AuthError::InvalidSession(_)) => continue,
                 Err(error @ AuthError::Upstream(_)) => return Err(error),

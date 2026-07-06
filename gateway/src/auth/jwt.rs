@@ -340,6 +340,26 @@ impl JwtValidator {
         })
     }
 
+    fn validate_resource_audience(
+        &self,
+        claims: &JwtClaims,
+        resource: Option<&str>,
+    ) -> Result<(), AuthError> {
+        let Some(resource) = resource else {
+            return Ok(());
+        };
+
+        if claims
+            .aud
+            .as_ref()
+            .is_some_and(|audience| audience.contains(resource))
+        {
+            Ok(())
+        } else {
+            Err(invalid_token())
+        }
+    }
+
     pub(crate) async fn validate_oidc_id_token_nonce(
         &self,
         token: &str,
@@ -359,12 +379,21 @@ impl SessionValidator for JwtValidator {
         &self,
         credential: &SessionCredential,
     ) -> Result<Principal, AuthError> {
+        self.validate_session_for_resource(credential, None).await
+    }
+
+    async fn validate_session_for_resource(
+        &self,
+        credential: &SessionCredential,
+        resource: Option<&str>,
+    ) -> Result<Principal, AuthError> {
         match credential {
             SessionCredential::Cookie(_) => Err(AuthError::InvalidSession(
                 "jwt validator only supports bearer tokens".to_owned(),
             )),
             SessionCredential::Bearer(token) => {
                 let claims = self.decode(token).await?;
+                self.validate_resource_audience(&claims, resource)?;
                 self.validate_claims(claims).await
             }
         }
@@ -406,12 +435,29 @@ pub(crate) struct CachedDecodingKey {
 struct JwtClaims {
     sub: String,
     iss: Option<String>,
+    aud: Option<AudienceClaim>,
     email: Option<String>,
     #[allow(dead_code)] // jsonwebtoken validates `exp`; GreenGateway does not read it directly.
     exp: Option<u64>,
     jti: Option<String>,
     #[serde(flatten)]
     extra: Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AudienceClaim {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl AudienceClaim {
+    fn contains(&self, expected: &str) -> bool {
+        match self {
+            Self::Single(value) => value == expected,
+            Self::Multiple(values) => values.iter().any(|value| value == expected),
+        }
+    }
 }
 
 fn invalid_token() -> AuthError {
@@ -929,6 +975,49 @@ RowSUZV5FSmOGJ7JyROZ80k=
             .validate_session(&SessionCredential::Bearer(token))
             .await
             .expect("missing issuer and audience should be allowed by default");
+
+        assert_eq!(principal.user_id, "user-123");
+    }
+
+    #[tokio::test]
+    async fn resource_audience_is_required_when_validating_for_resource() {
+        let validator = validator(
+            default_cfg(),
+            Arc::new(NoopRevocationStore),
+            TEST_PUBLIC_KEY,
+        );
+        let resource = "https://gateway.example.test/mcp";
+
+        let missing_audience = signed_token(base_claims(), TEST_PRIVATE_KEY);
+        let missing_error = validator
+            .validate_session_for_resource(
+                &SessionCredential::Bearer(missing_audience),
+                Some(resource),
+            )
+            .await
+            .expect_err("missing resource audience should be rejected");
+        assert_invalid_session(missing_error, INVALID_TOKEN);
+
+        let mut wrong_claims = base_claims();
+        wrong_claims["aud"] = json!("https://other-api.example.test");
+        let wrong_error = validator
+            .validate_session_for_resource(
+                &SessionCredential::Bearer(signed_token(wrong_claims, TEST_PRIVATE_KEY)),
+                Some(resource),
+            )
+            .await
+            .expect_err("wrong resource audience should be rejected");
+        assert_invalid_session(wrong_error, INVALID_TOKEN);
+
+        let mut matching_claims = base_claims();
+        matching_claims["aud"] = json!(["https://other-api.example.test", resource]);
+        let principal = validator
+            .validate_session_for_resource(
+                &SessionCredential::Bearer(signed_token(matching_claims, TEST_PRIVATE_KEY)),
+                Some(resource),
+            )
+            .await
+            .expect("matching resource audience should be accepted");
 
         assert_eq!(principal.user_id, "user-123");
     }
@@ -1472,6 +1561,7 @@ RowSUZV5FSmOGJ7JyROZ80k=
             admin_listen_addr: None,
             admin_prefix: "/admin".to_owned(),
             admin_login_provider: None,
+            gateway_public_url: None,
             audit_log_file: None,
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,

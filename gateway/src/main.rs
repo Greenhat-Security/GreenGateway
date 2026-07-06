@@ -110,7 +110,7 @@ const ADMIN_TRAFFIC_WRITE_PERMISSION: &str = "admin:traffic:write";
 const ADMIN_PRINCIPALS_READ_PERMISSION: &str = "admin:principals:read";
 #[cfg(test)]
 const ADMIN_MCP_USE_PERMISSION: &str = "admin:mcp:use";
-const MCP_ROUTE: &str = "/mcp";
+const MCP_ROUTE: &str = auth::protected_resource::MCP_RESOURCE_PATH;
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
 const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
@@ -133,6 +133,7 @@ struct AppState {
     routes: GatewayRoutes,
     admin_login_configured: bool,
     mcp: mcp::McpState,
+    protected_resource_metadata: Option<auth::protected_resource::ProtectedResourceMetadataConfig>,
 }
 
 #[derive(Clone)]
@@ -1311,6 +1312,8 @@ fn gateway_app_with_process_started_at(
         mcp_executor,
         config.trust_proxy_headers,
     );
+    let protected_resource_metadata =
+        auth::protected_resource::ProtectedResourceMetadataConfig::from_config(&config);
     let status_state = StatusAdminState {
         config: config.clone(),
         rbac: rbac_status,
@@ -1382,6 +1385,7 @@ fn gateway_app_with_process_started_at(
         routes: routes.clone(),
         admin_login_configured: admin_auth_state.is_some(),
         mcp: mcp_state,
+        protected_resource_metadata,
     };
     let audit_admin_state = AuditAdminState {
         query_store: audit_query_store,
@@ -1717,6 +1721,14 @@ fn unified_router(
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/metrics", get(metrics_endpoint))
+        .route(
+            auth::protected_resource::WELL_KNOWN_PATH,
+            get(oauth_protected_resource_metadata_endpoint),
+        )
+        .route(
+            auth::protected_resource::WELL_KNOWN_SUFFIX_ROUTE,
+            get(oauth_protected_resource_metadata_endpoint),
+        )
         .route(MCP_ROUTE, any(mcp::mcp_endpoint))
         .route(routes.admin.ui_prefix.as_str(), get(admin_ui_index))
         .route(routes.admin.ui_slash_route.as_str(), get(admin_ui_index))
@@ -1739,6 +1751,14 @@ fn data_router(app_state: AppState) -> Router {
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/metrics", get(metrics_endpoint))
+        .route(
+            auth::protected_resource::WELL_KNOWN_PATH,
+            get(oauth_protected_resource_metadata_endpoint),
+        )
+        .route(
+            auth::protected_resource::WELL_KNOWN_SUFFIX_ROUTE,
+            get(oauth_protected_resource_metadata_endpoint),
+        )
         .route(MCP_ROUTE, any(mcp::mcp_endpoint));
 
     with_proxy_fallback_if_configured(router, &app_state).with_state(app_state)
@@ -2194,6 +2214,16 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
         )],
         state.metrics_handle.render(),
     )
+}
+
+async fn oauth_protected_resource_metadata_endpoint(State(state): State<AppState>) -> Response {
+    let Some(metadata) = state.protected_resource_metadata.as_ref() else {
+        return not_found(
+            "OAuth protected-resource metadata requires GATEWAY_PUBLIC_URL to be configured",
+        );
+    };
+
+    Json(metadata.document()).into_response()
 }
 
 impl ProxyState {
@@ -7414,6 +7444,7 @@ mod tests {
             admin_listen_addr: None,
             admin_prefix: config::DEFAULT_ADMIN_PREFIX.to_owned(),
             admin_login_provider: None,
+            gateway_public_url: None,
             audit_log_file: None,
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,
@@ -10483,6 +10514,391 @@ mod tests {
         assert_eq!(body["id"], json!(1));
         assert_eq!(body["result"]["serverInfo"]["name"], json!("greengateway"));
         assert_eq!(body["result"]["capabilities"]["tools"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn oauth_protected_resource_metadata_returns_mcp_resource_document() {
+        let mut config = test_config(Vec::new());
+        config.gateway_public_url = Some("https://gateway.example.test/base/".to_owned());
+        config.auth_providers = vec![config::AuthProviderConfig {
+            name: "oidc".to_owned(),
+            provider_type: config::AuthProviderType::Jwt,
+            jwks_url: Some("https://auth.example.test/.well-known/jwks.json".to_owned()),
+            issuer: Some("https://auth.example.test/".to_owned()),
+            audience: None,
+            jwks_timeout_ms: config.jwt_jwks_timeout_ms,
+            require_jti: false,
+            roles_claim: "roles".to_owned(),
+            roles_claim_delimiter: None,
+            org_claim: None,
+            introspection_url: None,
+            introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+            cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+            user_id_claim: None,
+            email_claim: None,
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
+        }];
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(auth::protected_resource::WELL_KNOWN_PATH)
+                    .body(Body::empty())
+                    .expect("metadata request should build"),
+            )
+            .await
+            .expect("metadata request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body,
+            json!({
+                "resource": "https://gateway.example.test/base/mcp",
+                "authorization_servers": ["https://auth.example.test"],
+                "scopes_supported": ["mcp:tools"],
+                "bearer_methods_supported": ["header"]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_protected_resource_metadata_serves_rfc9728_path_for_mcp_resource_path() {
+        let mut config = test_config(Vec::new());
+        config.gateway_public_url = Some("https://gateway.example.test/base".to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/oauth-protected-resource/base/mcp")
+                    .body(Body::empty())
+                    .expect("metadata request should build"),
+            )
+            .await
+            .expect("metadata request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["resource"],
+            json!("https://gateway.example.test/base/mcp")
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_protected_resource_metadata_returns_clear_not_configured_error() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            test_config(Vec::new()),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(auth::protected_resource::WELL_KNOWN_PATH)
+                    .body(Body::empty())
+                    .expect("metadata request should build"),
+            )
+            .await
+            .expect("metadata request should complete");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"OAuth protected-resource metadata requires GATEWAY_PUBLIC_URL to be configured"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_unauthorized_challenge_includes_resource_metadata_only_for_mcp() {
+        let mut config = test_config(Vec::new());
+        config.gateway_public_url = Some("https://gateway.example.test".to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let mcp_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(auth::protected_resource::MCP_RESOURCE_PATH)
+                    .body(Body::empty())
+                    .expect("MCP request should build"),
+            )
+            .await
+            .expect("MCP request should complete");
+
+        assert_eq!(mcp_response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            mcp_response.headers().get(header::WWW_AUTHENTICATE),
+            Some(&HeaderValue::from_static(
+                "Bearer realm=\"mcp\", resource_metadata=\"https://gateway.example.test/.well-known/oauth-protected-resource/mcp\""
+            ))
+        );
+
+        let non_mcp_response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .body(Body::empty())
+                    .expect("non-MCP request should build"),
+            )
+            .await
+            .expect("non-MCP request should complete");
+
+        assert_eq!(non_mcp_response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            non_mcp_response.headers().get(header::WWW_AUTHENTICATE),
+            Some(&HeaderValue::from_static("Bearer"))
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_unauthorized_challenge_inserts_metadata_path_before_mcp_resource_path() {
+        let mut config = test_config(Vec::new());
+        config.gateway_public_url = Some("https://gateway.example.test/base".to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    // A path-prefixed GATEWAY_PUBLIC_URL describes the
+                    // external resource URL. The gateway itself still serves
+                    // bare /mcp; deployments using /base are expected to strip
+                    // that prefix in the reverse proxy before forwarding. The
+                    // assertion below should still advertise the public
+                    // /base/mcp-derived metadata URL.
+                    .uri(auth::protected_resource::MCP_RESOURCE_PATH)
+                    .body(Body::empty())
+                    .expect("MCP request should build"),
+            )
+            .await
+            .expect("MCP request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::WWW_AUTHENTICATE),
+            Some(&HeaderValue::from_static(
+                "Bearer realm=\"mcp\", resource_metadata=\"https://gateway.example.test/.well-known/oauth-protected-resource/base/mcp\""
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_jwt_requires_resource_audience_when_public_url_is_configured() {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let mut config = test_config(Vec::new());
+        config.gateway_public_url = Some("https://gateway.example.test".to_owned());
+        configure_test_jwt_provider(&mut config, jwks_addr);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let missing_audience = signed_token("mcp-missing-audience", &["member"]);
+        let (missing_status, _) = mcp_rpc(
+            &router,
+            Some(&missing_audience),
+            91,
+            "initialize",
+            Some(mcp_initialize_params()),
+            "mcp-missing-audience",
+        )
+        .await;
+        assert_eq!(missing_status, StatusCode::UNAUTHORIZED);
+
+        let wrong_audience = signed_token_with_claims(json!({
+            "sub": "mcp-wrong-audience",
+            "email": "mcp-wrong-audience@example.test",
+            "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+            "jti": "mcp-wrong-audience-session",
+            "roles": ["member"],
+            "aud": "https://other-api.example.test"
+        }));
+        let (wrong_status, _) = mcp_rpc(
+            &router,
+            Some(&wrong_audience),
+            92,
+            "initialize",
+            Some(mcp_initialize_params()),
+            "mcp-wrong-audience",
+        )
+        .await;
+        assert_eq!(wrong_status, StatusCode::UNAUTHORIZED);
+
+        let matching_audience = signed_token_with_claims(json!({
+            "sub": "mcp-matching-audience",
+            "email": "mcp-matching-audience@example.test",
+            "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+            "jti": "mcp-matching-audience-session",
+            "roles": ["member"],
+            "aud": ["https://other-api.example.test", "https://gateway.example.test/mcp"]
+        }));
+        let (matching_status, body) = mcp_rpc(
+            &router,
+            Some(&matching_audience),
+            93,
+            "initialize",
+            Some(mcp_initialize_params()),
+            "mcp-matching-audience",
+        )
+        .await;
+
+        assert_eq!(matching_status, StatusCode::OK);
+        assert_eq!(body["result"]["serverInfo"]["name"], json!("greengateway"));
+    }
+
+    #[tokio::test]
+    async fn mcp_service_token_requires_mcp_scope_when_public_url_is_configured() {
+        let token_db = TempDb::new("mcp-resource-service-token");
+        let token_store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        let token_without_mcp_scope = create_service_token(&token_store, &["admin"]);
+        let token_with_mcp_scope = create_service_token(&token_store, &["admin", "mcp:tools"]);
+        let mut config = test_config(Vec::new());
+        config.gateway_public_url = Some("https://gateway.example.test".to_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        config.service_token_cache_ttl_ms = 20;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let (missing_scope_status, missing_scope_body) = mcp_rpc(
+            &router,
+            Some(&token_without_mcp_scope),
+            94,
+            "initialize",
+            Some(mcp_initialize_params()),
+            "mcp-service-token-missing-scope",
+        )
+        .await;
+        assert_eq!(missing_scope_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(missing_scope_body, json!({ "error": "unauthorized" }));
+
+        let non_mcp_response =
+            authenticated_principal_probe(&router, &token_without_mcp_scope).await;
+        assert_eq!(non_mcp_response.status(), StatusCode::OK);
+        let non_mcp_body = json_body(non_mcp_response).await;
+        assert_eq!(non_mcp_body["auth_method"], json!("service_token"));
+        assert_eq!(non_mcp_body["roles"], json!(["admin"]));
+
+        let (matching_scope_status, matching_scope_body) = mcp_rpc(
+            &router,
+            Some(&token_with_mcp_scope),
+            95,
+            "initialize",
+            Some(mcp_initialize_params()),
+            "mcp-service-token-matching-scope",
+        )
+        .await;
+
+        assert_eq!(matching_scope_status, StatusCode::OK);
+        assert_eq!(
+            matching_scope_body["result"]["serverInfo"]["name"],
+            json!("greengateway")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_cookie_session_is_rejected_when_public_url_is_configured() {
+        let (introspection_url, introspection_server) =
+            spawn_blocking_cookie_session_server(Ipv4Addr::LOCALHOST, 1);
+        let mut config = test_config(Vec::new());
+        config.gateway_public_url = Some("https://gateway.example.test".to_owned());
+        configure_test_cookie_session_provider(&mut config, introspection_url);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        let mcp_response = router
+            .clone()
+            .oneshot(mcp_cookie_request(
+                "session=session-secret-123",
+                96,
+                "initialize",
+                Some(mcp_initialize_params()),
+                "mcp-cookie-session",
+            ))
+            .await
+            .expect("MCP cookie request should complete");
+
+        assert_eq!(mcp_response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            json_body(mcp_response).await,
+            json!({ "error": "unauthorized" })
+        );
+
+        let non_mcp_response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/principal")
+                    .header(header::COOKIE, "session=session-secret-123")
+                    .body(Body::empty())
+                    .expect("non-MCP cookie request should build"),
+            )
+            .await
+            .expect("non-MCP cookie request should complete");
+
+        assert_eq!(non_mcp_response.status(), StatusCode::OK);
+        let non_mcp_body = json_body(non_mcp_response).await;
+        assert_eq!(non_mcp_body["user_id"], json!("cookie-user"));
+        assert_eq!(non_mcp_body["auth_method"], json!("session_cookie"));
+        assert_eq!(
+            introspection_server
+                .join()
+                .expect("cookie-session introspection server should finish"),
+            1
+        );
     }
 
     #[tokio::test]
@@ -22259,6 +22675,22 @@ paths:
             .expect("MCP request should build")
     }
 
+    fn mcp_cookie_request(
+        session_cookie: &str,
+        id: u64,
+        method: &str,
+        params: Option<Value>,
+        request_id: &str,
+    ) -> Request<Body> {
+        let mut request = mcp_request(None, id, method, params, request_id);
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{session_cookie}; csrf_token=mcp-test-csrf"))
+                .expect("test cookie header should be valid"),
+        );
+        request
+    }
+
     fn mcp_content_text(body: &Value) -> &str {
         body["result"]["content"][0]["text"]
             .as_str()
@@ -23323,6 +23755,9 @@ O2gecI9QwDJNpm29J9wJB2F8
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 };
+                stream
+                    .set_nonblocking(false)
+                    .expect("OIDC discovery test stream should use blocking reads");
                 let path = read_blocking_http_path(&mut stream);
                 let (status, body) = match path.as_str() {
                     "/.well-known/openid-configuration" => ("200 OK", discovery.as_str()),

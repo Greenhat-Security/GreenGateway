@@ -47,6 +47,20 @@ pub trait SessionValidator: Send + Sync {
         credential: &SessionCredential,
     ) -> Result<Principal, AuthError>;
 
+    async fn validate_session_for_resource(
+        &self,
+        credential: &SessionCredential,
+        resource: Option<&str>,
+    ) -> Result<Principal, AuthError> {
+        if resource.is_some() {
+            return Err(AuthError::InvalidSession(
+                "validator does not support resource-bound sessions".to_owned(),
+            ));
+        }
+
+        self.validate_session(credential).await
+    }
+
     /// Routing hint for whether this validator should receive cookie credentials.
     /// This is not an authorization decision: every offered credential must still pass
     /// `validate_session`, so the default only opts into receiving this channel.
@@ -136,6 +150,27 @@ mod tests {
 
         assert!(validator.supports_cookie());
         assert!(validator.supports_bearer());
+    }
+
+    #[tokio::test]
+    async fn default_resource_validation_fails_closed() {
+        let validator: Arc<dyn SessionValidator> = Arc::new(StaticValidator {
+            response: StaticResponse::Principal(test_principal()),
+        });
+
+        let error = validator
+            .validate_session_for_resource(
+                &SessionCredential::Bearer("token-123".to_owned()),
+                Some("https://gateway.example.test/mcp"),
+            )
+            .await
+            .expect_err("validators must explicitly handle resource-bound sessions");
+
+        assert!(matches!(
+            error,
+            AuthError::InvalidSession(message)
+                if message == "validator does not support resource-bound sessions"
+        ));
     }
 
     #[test]
