@@ -1291,7 +1291,11 @@ fn gateway_app_with_process_started_at(
             tool_registry.clone(),
         )?;
     }
-    let tool_runtime = tools::runtime::ToolRuntime::new(tool_runtime_config, audit_log.clone());
+    let tool_runtime = tools::runtime::ToolRuntime::new_with_rbac_state(
+        tool_runtime_config,
+        audit_log.clone(),
+        rbac_state.clone(),
+    );
     let mcp_executor = mcp::mcp_executor_from_config(
         &config,
         tool_registry.clone(),
@@ -10607,6 +10611,80 @@ mod tests {
             body["result"]["structuredContent"]["body"],
             json!({ "message": "hello from mcp" })
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_name_rules_follow_policy_admin_reload() {
+        let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
+
+        let (before_status, before_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            51,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "before reload"
+                }
+            })),
+            "mcp-call-before-tool-rule-reload",
+        )
+        .await;
+
+        assert_eq!(before_status, StatusCode::OK);
+        assert_eq!(before_body["error"], Value::Null);
+        assert_eq!(before_body["result"]["isError"], json!(false));
+
+        let current_policy = rbac::Policy::from_file(&harness._policy.path)
+            .expect("current MCP policy should parse");
+        let etag = policy_etag(&current_policy).expect("current MCP policy ETag should compute");
+        let mut policy =
+            serde_json::to_value(&current_policy).expect("current MCP policy should serialize");
+        policy["rules"] = json!([
+            {
+                "id": "deny-echo-after-reload",
+                "tool_name": "echo",
+                "principal": {
+                    "roles": ["admin"]
+                },
+                "action": "deny"
+            }
+        ]);
+
+        let put_response = harness
+            .router
+            .clone()
+            .oneshot(authenticated_json_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                &harness.admin_token,
+                Some(policy.to_string()),
+                Some(&etag),
+            ))
+            .await
+            .expect("policy PUT should complete");
+        assert_eq!(put_response.status(), StatusCode::OK);
+
+        let (after_status, after_body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            52,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "after reload"
+                }
+            })),
+            "mcp-call-after-tool-rule-reload",
+        )
+        .await;
+
+        assert_eq!(after_status, StatusCode::OK);
+        assert_eq!(after_body["error"]["code"], json!(-32001));
+        assert_eq!(after_body["error"]["data"]["tool_name"], json!("echo"));
+        assert_eq!(after_body["error"]["data"]["reason"], json!("matched_rule"));
     }
 
     #[tokio::test]
@@ -20660,6 +20738,30 @@ paths:
         (status, body)
     }
 
+    fn authenticated_json_request(
+        method: Method,
+        uri: &str,
+        token: &str,
+        body: Option<String>,
+        if_match: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::COOKIE, "csrf_token=mcp-test-csrf")
+            .header("x-csrf-token", "mcp-test-csrf");
+
+        if let Some(if_match) = if_match {
+            builder = builder.header(header::IF_MATCH, if_match);
+        }
+
+        builder
+            .body(Body::from(body.unwrap_or_default()))
+            .expect("authenticated JSON request should build")
+    }
+
     fn mcp_request(
         token: Option<&str>,
         id: u64,
@@ -20781,7 +20883,11 @@ paths:
             "enforcement_mode": "enforce",
             "roles": {
                 "admin": {
-                    "permissions": [ADMIN_MCP_USE_PERMISSION]
+                    "permissions": [
+                        ADMIN_MCP_USE_PERMISSION,
+                        ADMIN_POLICY_READ_PERMISSION,
+                        ADMIN_POLICY_WRITE_PERMISSION
+                    ]
                 },
                 "reader": {
                     "permissions": [ADMIN_MCP_USE_PERMISSION]
@@ -20795,6 +20901,11 @@ paths:
                     "methods": ["POST"],
                     "path_prefix": MCP_ROUTE,
                     "permission": ADMIN_MCP_USE_PERMISSION
+                },
+                {
+                    "methods": ["PUT"],
+                    "path_prefix": POLICY_ADMIN_ROUTE,
+                    "permission": ADMIN_POLICY_WRITE_PERMISSION
                 }
             ],
             "tools": {

@@ -1377,6 +1377,19 @@ mod tests {
                 }),
                 "rules[0] must set exactly one of path or tool_name",
             ),
+            (
+                "whitespace-only tool_name",
+                json!({
+                    "schema_version": "0.1.0",
+                    "rules": [
+                        {
+                            "tool_name": "   ",
+                            "action": "deny"
+                        }
+                    ]
+                }),
+                "rules[0].tool_name must not be empty",
+            ),
         ];
         let validator = policy_schema_validator();
 

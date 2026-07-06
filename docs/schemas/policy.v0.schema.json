@@ -205,6 +205,7 @@
         "tool_name": {
           "type": "string",
           "minLength": 1,
+          "pattern": "\\S",
           "description": "Exact MCP tool name matched by this rule. Tool-name rules apply only to MCP tool calls and never to HTTP requests. Exactly one of path or tool_name must be set."
         },
         "principal": {

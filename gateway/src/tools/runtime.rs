@@ -14,6 +14,7 @@ use crate::{
         Config, DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS, DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
         DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH, DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
     },
+    middleware::rbac::{RbacState, ToolRuleDecision},
     rbac::{policy, Policy, Rule, RuleAction, RuleMatcher},
 };
 
@@ -212,6 +213,7 @@ struct ToolRuntimeInner {
     queue: Arc<Semaphore>,
     global: Arc<Semaphore>,
     per_tool: HashMap<String, Arc<Semaphore>>,
+    rbac_state: Option<RbacState>,
     rule_matcher: RuleMatcher,
     rule_ids: Vec<String>,
 }
@@ -235,6 +237,15 @@ struct ExecutionPermits {
 impl ToolRuntime {
     #[allow(dead_code)] // Issue #32's tool registry and issue #33's MCP endpoint will invoke this.
     pub fn new(config: ToolRuntimeConfig, audit: AuditLog) -> Self {
+        Self::new_with_rbac_state(config, audit, None)
+    }
+
+    #[allow(dead_code)] // Main runtime wiring uses this once RBAC is configured.
+    pub(crate) fn new_with_rbac_state(
+        config: ToolRuntimeConfig,
+        audit: AuditLog,
+        rbac_state: Option<RbacState>,
+    ) -> Self {
         let per_tool = config
             .tools
             .iter()
@@ -261,6 +272,7 @@ impl ToolRuntime {
                 per_tool,
                 config,
                 audit,
+                rbac_state,
                 rule_matcher,
                 rule_ids,
             }),
@@ -497,12 +509,8 @@ impl ToolRuntime {
         }
 
         let principal = principal_from_tool_context(context);
-        if let Some(rule_decision) = self
-            .inner
-            .rule_matcher
-            .evaluate_tool(tool_name, principal.as_ref())
-        {
-            let matched_rule_id = self.rule_id(rule_decision.rule_index);
+        if let Some(rule_decision) = self.evaluate_tool_rule(tool_name, principal.as_ref()) {
+            let matched_rule_id = rule_decision.matched_rule_id;
             match rule_decision.action {
                 RuleAction::Allow => {
                     self.emit_tool_rule_event(
@@ -585,6 +593,24 @@ impl ToolRuntime {
             config: state.config,
             _permits: permits,
         })
+    }
+
+    fn evaluate_tool_rule(
+        &self,
+        tool_name: &str,
+        principal: Option<&Principal>,
+    ) -> Option<ToolRuleDecision> {
+        if let Some(rbac_state) = &self.inner.rbac_state {
+            return rbac_state.evaluate_tool_rule(tool_name, principal);
+        }
+
+        self.inner
+            .rule_matcher
+            .evaluate_tool(tool_name, principal)
+            .map(|decision| ToolRuleDecision {
+                action: decision.action,
+                matched_rule_id: self.rule_id(decision.rule_index),
+            })
     }
 
     fn rule_id(&self, rule_index: usize) -> String {
@@ -804,6 +830,8 @@ fn tool_observation_path(tool_name: &str) -> String {
 mod tests {
     use std::{
         collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
@@ -958,6 +986,55 @@ mod tests {
             }),
             "tool Deny rule should emit an authz.denied direct-rule event: {events:#?}"
         );
+    }
+
+    #[tokio::test]
+    async fn policy_reload_updates_live_tool_name_rules_for_same_runtime() {
+        let file = TempPolicyFile::new(&tool_policy_document_without_rules());
+        let initial_policy =
+            Policy::from_file(file.path()).expect("initial tool policy should parse");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            initial_policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let runtime_config = ToolRuntimeConfig::from_policy(&initial_policy)
+            .expect("initial tool policy should configure runtime");
+        let runtime =
+            ToolRuntime::new_with_rbac_state(runtime_config, audit, Some(rbac_state.clone()));
+
+        let allowed = runtime
+            .execute_with_context(
+                "echo",
+                context_with_roles(&["admin"]),
+                CancellationToken::new(),
+                || async { "allowed-before-reload" },
+            )
+            .await
+            .expect("tool call should be allowed before rule reload");
+        assert_eq!(allowed, "allowed-before-reload");
+
+        file.write(&tool_policy_document_with_deny_rule());
+        crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .expect("valid tool policy reload should succeed");
+
+        let denied = runtime
+            .execute_with_context(
+                "echo",
+                context_with_roles(&["admin"]),
+                CancellationToken::new(),
+                || async { "should not run after reload" },
+            )
+            .await
+            .expect_err("same runtime should use reloaded tool-name Deny rule");
+
+        assert!(matches!(
+            denied,
+            ToolRuntimeError::Rejected { ref reason, .. } if reason == "matched_rule"
+        ));
     }
 
     #[tokio::test]
@@ -1635,6 +1712,42 @@ mod tests {
         }
     }
 
+    fn tool_policy_document_without_rules() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "echo": {
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn tool_policy_document_with_deny_rule() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "echo": {
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            },
+            "rules": [
+                {
+                    "id": "deny-echo-after-reload",
+                    "tool_name": "echo",
+                    "principal": {
+                        "roles": ["admin"]
+                    },
+                    "action": "deny"
+                }
+            ]
+        })
+        .to_string()
+    }
+
     fn context() -> ToolInvocationContext {
         ToolInvocationContext {
             request_id: "request-test".to_owned(),
@@ -1777,6 +1890,38 @@ mod tests {
             while !self.released.load(Ordering::SeqCst) {
                 self.notify.notified().await;
             }
+        }
+    }
+
+    struct TempPolicyFile {
+        path: PathBuf,
+    }
+
+    impl TempPolicyFile {
+        fn new(contents: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "greengateway-tool-runtime-policy-test-{}.json",
+                uuid::Uuid::new_v4()
+            ));
+            fs::write(&path, contents)
+                .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
+
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn write(&self, contents: &str) {
+            fs::write(&self.path, contents)
+                .unwrap_or_else(|err| panic!("failed to write {}: {err}", self.path.display()));
+        }
+    }
+
+    impl Drop for TempPolicyFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
         }
     }
 }

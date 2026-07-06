@@ -59,6 +59,12 @@ struct RbacPolicyState {
     routes: Vec<RouteRule>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolRuleDecision {
+    pub action: RuleAction,
+    pub matched_rule_id: String,
+}
+
 #[derive(Serialize)]
 struct ForbiddenBody {
     error: &'static str,
@@ -124,6 +130,21 @@ impl RbacState {
             .load()
             .engine
             .principal_has_permission(principal, permission)
+    }
+
+    pub(crate) fn evaluate_tool_rule(
+        &self,
+        tool_name: &str,
+        principal: Option<&auth::Principal>,
+    ) -> Option<ToolRuleDecision> {
+        let policy = self.policy.load();
+        policy
+            .rule_matcher
+            .evaluate_tool(tool_name, principal)
+            .map(|decision| ToolRuleDecision {
+                action: decision.action,
+                matched_rule_id: policy.rule_id(decision.rule_index),
+            })
     }
 }
 
