@@ -11980,6 +11980,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_style_mcp_tool_call_is_rejected_by_gateway_and_records_inventory() {
+        let harness = mcp_inventory_test_harness(McpInventoryHarnessConfig {
+            upstream_url: Some("http://127.0.0.1:1".to_owned()),
+            tools_document: mcp_tools_document(),
+            mcp_upstream_servers: Vec::new(),
+            egress_allowed_hosts: vec!["127.0.0.1".to_owned()],
+        })
+        .await;
+
+        let request_id = "mcp-inventory-task-unsupported";
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            37,
+            "tools/call",
+            Some(json!({
+                "name": "echo",
+                "arguments": {
+                    "message": "task style"
+                },
+                "task": {}
+            })),
+            request_id,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32602));
+        assert_eq!(
+            body["error"]["message"],
+            json!("task-based tool invocation is not supported by GreenGateway")
+        );
+        assert_eq!(body["error"]["data"]["tool_name"], json!("echo"));
+        assert_eq!(body["error"]["data"]["reason"], json!("task_unsupported"));
+
+        assert_eventually(Duration::from_secs(1), || {
+            let events = harness.capture.events();
+            let failure_seen = events.iter().any(|event| {
+                event.event_type == audit::event::TOOL_INVOKE_FAILURE
+                    && event.request_id == request_id
+                    && event.payload["tool_name"] == json!("echo")
+            });
+            let observation_seen = events.iter().any(|event| {
+                event.event_type == "http.request_observed"
+                    && event.request_id == request_id
+                    && event.payload["method"] == json!("MCP")
+                    && event.payload["tool_name"] == json!("echo")
+                    && event.payload["status"] == json!(400)
+                    && event.payload["reason"] == json!("task_unsupported")
+            });
+            failure_seen && observation_seen
+        });
+
+        let row =
+            wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
+                row["call_count"] == json!(1) && status_count(row, 400) == Some(1)
+            })
+            .await;
+        assert_eq!(row["method"], json!("MCP"));
+        assert_eq!(row["endpoint_template"], json!("/mcp/tools/echo"));
+        assert_eq!(row["call_count"], json!(1));
+        assert_eq!(row["schema_mismatch_count"], json!(0));
+        assert_eq!(status_count(&row, 400), Some(1));
+    }
+
+    #[tokio::test]
+    async fn task_style_unknown_mcp_tool_call_uses_unknown_tool_inventory_path() {
+        let harness = mcp_inventory_test_harness(McpInventoryHarnessConfig {
+            upstream_url: Some("http://127.0.0.1:1".to_owned()),
+            tools_document: mcp_tools_document(),
+            mcp_upstream_servers: Vec::new(),
+            egress_allowed_hosts: vec!["127.0.0.1".to_owned()],
+        })
+        .await;
+
+        let request_id = "mcp-inventory-task-unknown-tool";
+        let (status, body) = mcp_rpc(
+            &harness.router,
+            Some(&harness.admin_token),
+            38,
+            "tools/call",
+            Some(json!({
+                "name": "missing_tool",
+                "arguments": {},
+                "task": {}
+            })),
+            request_id,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], json!(-32601));
+        assert_eq!(
+            body["error"]["message"],
+            json!("tool 'missing_tool' is not defined")
+        );
+        assert_eq!(body["error"]["data"]["tool_name"], json!("missing_tool"));
+
+        assert_eventually(Duration::from_secs(1), || {
+            harness.capture.events().iter().any(|event| {
+                event.event_type == "http.request_observed"
+                    && event.request_id == request_id
+                    && event.payload["method"] == json!("MCP")
+                    && event.payload["tool_name"] == json!("missing_tool")
+                    && event.payload["status"] == json!(404)
+                    && event.payload["reason"] == json!("unknown_tool")
+            })
+        });
+
+        let row = wait_for_mcp_tool_inventory_row(
+            &harness.router,
+            &harness.admin_token,
+            "missing_tool",
+            |row| row["call_count"] == json!(1) && status_count(row, 404) == Some(1),
+        )
+        .await;
+        assert_eq!(row["method"], json!("MCP"));
+        assert_eq!(row["endpoint_template"], json!("/mcp/tools/missing_tool"));
+        assert_eq!(row["call_count"], json!(1));
+        assert_eq!(row["schema_mismatch_count"], json!(0));
+        assert_eq!(status_count(&row, 404), Some(1));
+    }
+
+    #[tokio::test]
     async fn repeated_mcp_tool_calls_accumulate_into_one_inventory_row() {
         let upstream_addr = spawn_echo_json_upstream().await;
         let harness = mcp_inventory_test_harness(McpInventoryHarnessConfig {
