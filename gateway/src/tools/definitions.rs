@@ -11,6 +11,7 @@ use std::{
 use arc_swap::ArcSwap;
 use http::Method;
 use notify::{RecursiveMode, Watcher};
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -23,6 +24,7 @@ use crate::{
 const TOOL_REGISTRY_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 const MAX_TOOLS_FILE_BYTES: u64 = 1_048_576;
 const MAX_INPUT_SCHEMA_REFERENCE_DEPTH: usize = 64;
+const MAX_INPUT_SCHEMA_PRECHECK_NODES: usize = 4_096;
 const TOOLS_FILE_SCHEMA_JSON: &str = include_str!("../../../docs/schemas/tools.v0.schema.json");
 const MCP_PROXY_METHOD: &str = "MCP_PROXY";
 
@@ -683,6 +685,7 @@ fn tools_file_schema_problems(value: &Value) -> Vec<String> {
 fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
     let mut problems = Vec::new();
     let mut seen = BTreeMap::new();
+    let mut input_schema_precheck_budget = MAX_INPUT_SCHEMA_PRECHECK_NODES;
 
     for (index, definition) in definitions.iter().enumerate() {
         if let Some(first_index) = seen.insert(definition.name.as_str(), index) {
@@ -714,7 +717,10 @@ fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
             ));
         }
 
-        if let Some(problem) = input_schema_reference_depth_problem(&definition.input_schema) {
+        if let Some(problem) = input_schema_precheck_problem(
+            &definition.input_schema,
+            &mut input_schema_precheck_budget,
+        ) {
             problems.push(format!(
                 "tool '{}' input_json_schema {problem}",
                 definition.name
@@ -733,32 +739,76 @@ fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
     problems
 }
 
-fn input_schema_reference_depth_problem(schema: &Value) -> Option<String> {
-    let mut stack = vec![schema];
+fn input_schema_precheck_problem(schema: &Value, remaining_budget: &mut usize) -> Option<String> {
+    let mut stack = vec![(schema, SchemaPrecheckContext::Schema)];
+    let mut local_references = Vec::new();
+    let mut anchors = BTreeMap::new();
 
-    while let Some(value) = stack.pop() {
-        if let Some(reference) = value.get("$ref").and_then(Value::as_str) {
-            if let Some(problem) = local_reference_chain_depth_problem(schema, reference) {
+    while let Some((value, context)) = stack.pop() {
+        if !consume_input_schema_precheck_node(remaining_budget) {
+            return Some(format!(
+                "precheck node budget exceeds {MAX_INPUT_SCHEMA_PRECHECK_NODES} across tools file"
+            ));
+        }
+
+        if context == SchemaPrecheckContext::Schema {
+            for keyword in ["$ref", "$dynamicRef"] {
+                if let Some(reference) = value.get(keyword).and_then(Value::as_str) {
+                    if reference.starts_with('#') {
+                        local_references.push(reference);
+                    }
+                }
+            }
+            if let Some(problem) = record_schema_anchors(value, &mut anchors) {
                 return Some(problem);
             }
         }
 
         match value {
-            Value::Array(values) => stack.extend(values.iter()),
-            Value::Object(object) => stack.extend(object.values()),
+            Value::Array(values) => stack.extend(values.iter().map(|value| (value, context))),
+            Value::Object(object) => stack.extend(
+                object
+                    .iter()
+                    .map(|(keyword, value)| (value, schema_child_context(context, keyword))),
+            ),
             _ => {}
+        }
+    }
+
+    for reference in local_references {
+        if let Some(problem) =
+            local_reference_chain_problem(schema, &anchors, reference, remaining_budget)
+        {
+            return Some(problem);
         }
     }
 
     None
 }
 
-fn local_reference_chain_depth_problem(root: &Value, first_reference: &str) -> Option<String> {
-    let mut reference = first_reference;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SchemaPrecheckContext {
+    Schema,
+    SchemaMap,
+    Literal,
+}
+
+fn local_reference_chain_problem(
+    root: &Value,
+    anchors: &BTreeMap<String, &Value>,
+    first_reference: &str,
+    remaining_budget: &mut usize,
+) -> Option<String> {
+    let mut reference = first_reference.to_owned();
     let mut seen_references = BTreeSet::new();
     let mut depth = 1;
 
     loop {
+        if !consume_input_schema_precheck_node(remaining_budget) {
+            return Some(format!(
+                "precheck node budget exceeds {MAX_INPUT_SCHEMA_PRECHECK_NODES} across tools file while following local reference {reference}"
+            ));
+        }
         if depth > MAX_INPUT_SCHEMA_REFERENCE_DEPTH {
             return Some(format!(
                 "reference depth exceeds {MAX_INPUT_SCHEMA_REFERENCE_DEPTH} at {reference}"
@@ -768,13 +818,85 @@ fn local_reference_chain_depth_problem(root: &Value, first_reference: &str) -> O
             return Some(format!("contains circular local reference at {reference}"));
         }
 
-        let pointer = reference.strip_prefix('#')?;
-        let target = root.pointer(pointer)?;
-        let next_reference = target.get("$ref").and_then(Value::as_str)?;
+        let target = match resolve_local_reference_target(root, anchors, &reference) {
+            Ok(Some(target)) => target,
+            Ok(None) => return None,
+            Err(problem) => return Some(problem),
+        };
+        let next_reference = local_reference_from_schema(target)?;
 
-        reference = next_reference;
+        reference = next_reference.to_owned();
         depth += 1;
     }
+}
+
+fn resolve_local_reference_target<'a>(
+    root: &'a Value,
+    anchors: &BTreeMap<String, &'a Value>,
+    reference: &str,
+) -> Result<Option<&'a Value>, String> {
+    let Some(fragment) = reference.strip_prefix('#') else {
+        return Ok(None);
+    };
+    let Ok(decoded_fragment) = percent_decode_str(fragment).decode_utf8() else {
+        return Ok(None);
+    };
+    if decoded_fragment.is_empty() {
+        return Ok(Some(root));
+    }
+    if decoded_fragment.starts_with('/') {
+        return Ok(root.pointer(decoded_fragment.as_ref()));
+    }
+
+    Ok(anchors.get(decoded_fragment.as_ref()).copied())
+}
+
+fn local_reference_from_schema(value: &Value) -> Option<&str> {
+    ["$ref", "$dynamicRef"]
+        .into_iter()
+        .filter_map(|keyword| value.get(keyword).and_then(Value::as_str))
+        .find(|reference| reference.starts_with('#'))
+}
+
+fn record_schema_anchors<'a>(
+    value: &'a Value,
+    anchors: &mut BTreeMap<String, &'a Value>,
+) -> Option<String> {
+    for keyword in ["$anchor", "$dynamicAnchor"] {
+        if let Some(anchor) = value.get(keyword).and_then(Value::as_str) {
+            if anchors.insert(anchor.to_owned(), value).is_some() {
+                return Some(format!(
+                    "contains duplicate local schema anchor '{anchor}', which is not supported by the precheck resolver"
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn schema_child_context(
+    parent_context: SchemaPrecheckContext,
+    keyword: &str,
+) -> SchemaPrecheckContext {
+    match parent_context {
+        SchemaPrecheckContext::Literal => SchemaPrecheckContext::Literal,
+        SchemaPrecheckContext::SchemaMap => SchemaPrecheckContext::Schema,
+        SchemaPrecheckContext::Schema => match keyword {
+            "$defs" | "definitions" | "properties" | "patternProperties" | "dependentSchemas" => {
+                SchemaPrecheckContext::SchemaMap
+            }
+            "const" | "default" | "enum" | "examples" => SchemaPrecheckContext::Literal,
+            _ => SchemaPrecheckContext::Schema,
+        },
+    }
+}
+
+fn consume_input_schema_precheck_node(remaining_budget: &mut usize) -> bool {
+    let Some(updated_budget) = remaining_budget.checked_sub(1) else {
+        return false;
+    };
+    *remaining_budget = updated_budget;
+    true
 }
 
 fn is_known_http_method(method: &str) -> bool {
@@ -928,6 +1050,167 @@ mod tests {
             message.contains("tool 'deep_schema' input_json_schema reference depth exceeds"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn deep_input_schema_anchor_reference_chain_is_rejected_before_jsonschema_compile() {
+        let mut tool = echo_tool("deep_anchor_schema", "POST", "/v1/echo");
+        tool["input_json_schema"] = deep_anchor_ref_schema(65);
+
+        let error = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect_err("overly deep anchor input_json_schema references should reject");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("tool 'deep_anchor_schema' input_json_schema reference depth exceeds"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn deep_input_schema_percent_encoded_reference_chain_is_rejected_before_jsonschema_compile() {
+        let mut tool = echo_tool("deep_encoded_schema", "POST", "/v1/echo");
+        tool["input_json_schema"] = deep_percent_encoded_ref_schema(65);
+
+        let error = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect_err("overly deep percent-encoded input_json_schema references should reject");
+
+        let message = error.to_string();
+        assert!(
+            message
+                .contains("tool 'deep_encoded_schema' input_json_schema reference depth exceeds"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn deep_input_schema_dynamic_anchor_reference_chain_is_rejected_before_jsonschema_compile() {
+        let mut tool = echo_tool("deep_dynamic_schema", "POST", "/v1/echo");
+        tool["input_json_schema"] = deep_dynamic_anchor_ref_schema(65);
+
+        let error = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect_err("overly deep dynamic anchor input_json_schema references should reject");
+
+        let message = error.to_string();
+        assert!(
+            message
+                .contains("tool 'deep_dynamic_schema' input_json_schema reference depth exceeds"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn duplicate_input_schema_anchor_names_are_rejected_before_jsonschema_compile() {
+        let mut tool = echo_tool("duplicate_anchor_schema", "POST", "/v1/echo");
+        tool["input_json_schema"] = duplicate_anchor_schema();
+
+        let error = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect_err("duplicate local anchor names should reject");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "tool 'duplicate_anchor_schema' input_json_schema contains duplicate local schema anchor 'S0'"
+            ),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn anchor_like_literal_schema_data_does_not_create_duplicate_anchor_rejection() {
+        let mut tool = echo_tool("literal_anchor_data", "POST", "/v1/echo");
+        tool["input_json_schema"] = literal_anchor_data_schema();
+
+        ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect("literal data containing repeated $anchor keys should not count as schema anchors");
+    }
+
+    #[test]
+    fn schema_named_like_literal_keyword_is_still_traversed() {
+        let mut tool = echo_tool("schema_named_default", "POST", "/v1/echo");
+        tool["input_json_schema"] = schema_named_like_literal_keyword();
+
+        let error = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect_err("subschema named like a literal keyword should still be traversed");
+
+        let message = error.to_string();
+        assert!(
+            message
+                .contains("tool 'schema_named_default' input_json_schema reference depth exceeds"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn aggregate_input_schema_precheck_budget_is_shared_across_tools() {
+        let tools = (0..80)
+            .map(|index| {
+                let mut tool = echo_tool(
+                    &format!("schema_budget_{index}"),
+                    "POST",
+                    &format!("/v1/schema-budget/{index}"),
+                );
+                tool["input_json_schema"] = object_schema_with_properties(64);
+                tool
+            })
+            .collect::<Vec<_>>();
+
+        let error = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": tools
+        }))
+        .expect_err("aggregate input_json_schema precheck budget should reject");
+
+        let ToolRegistryError::Invalid { problems } = error else {
+            panic!("budget exhaustion should return ToolRegistryError::Invalid");
+        };
+        let message = problems.join("; ");
+        assert!(
+            message.contains("input_json_schema")
+                && (message.contains("budget")
+                    || message.contains("reference")
+                    || message.contains("node")),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn reasonable_multi_tool_input_schemas_stay_within_precheck_budget() {
+        let tools = (0..3)
+            .map(|index| {
+                let mut tool = echo_tool(
+                    &format!("reasonable_schema_{index}"),
+                    "POST",
+                    &format!("/v1/reasonable-schema/{index}"),
+                );
+                tool["input_json_schema"] = object_schema_with_properties(8);
+                tool
+            })
+            .collect::<Vec<_>>();
+
+        ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": tools
+        }))
+        .expect("reasonable multi-tool schemas should stay within the shared precheck budget");
     }
 
     #[test]
@@ -1399,6 +1682,146 @@ mod tests {
             "$ref": "#/$defs/S0",
             "properties": {},
             "$defs": defs
+        })
+    }
+
+    fn deep_anchor_ref_schema(depth: usize) -> Value {
+        let mut defs = serde_json::Map::new();
+        for index in 0..depth {
+            defs.insert(
+                format!("S{index}"),
+                json!({
+                    "$anchor": format!("S{index}"),
+                    "$ref": format!("#S{}", index + 1)
+                }),
+            );
+        }
+        defs.insert(
+            format!("S{depth}"),
+            json!({
+                "$anchor": format!("S{depth}"),
+                "type": "string"
+            }),
+        );
+
+        json!({
+            "$ref": "#S0",
+            "properties": {},
+            "$defs": defs
+        })
+    }
+
+    fn deep_dynamic_anchor_ref_schema(depth: usize) -> Value {
+        let mut defs = serde_json::Map::new();
+        for index in 0..depth {
+            defs.insert(
+                format!("S{index}"),
+                json!({
+                    "$dynamicAnchor": format!("S{index}"),
+                    "$dynamicRef": format!("#S{}", index + 1)
+                }),
+            );
+        }
+        defs.insert(
+            format!("S{depth}"),
+            json!({
+                "$dynamicAnchor": format!("S{depth}"),
+                "type": "string"
+            }),
+        );
+
+        json!({
+            "$dynamicRef": "#S0",
+            "properties": {},
+            "$defs": defs
+        })
+    }
+
+    fn deep_percent_encoded_ref_schema(depth: usize) -> Value {
+        let mut defs = serde_json::Map::new();
+        for index in 0..depth {
+            defs.insert(
+                format!("S{index}"),
+                json!({ "$ref": format!("#/%24defs/S{}", index + 1) }),
+            );
+        }
+        defs.insert(format!("S{depth}"), json!({ "type": "string" }));
+
+        json!({
+            "$ref": "#/%24defs/S0",
+            "properties": {},
+            "$defs": defs
+        })
+    }
+
+    fn literal_anchor_data_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "const_value": {
+                    "const": { "$anchor": "literal" }
+                },
+                "default_value": {
+                    "type": "object",
+                    "default": { "$anchor": "literal" }
+                },
+                "example_value": {
+                    "type": "object",
+                    "examples": [{ "$anchor": "literal" }]
+                }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    fn schema_named_like_literal_keyword() -> Value {
+        let mut defs = serde_json::Map::new();
+        for index in 0..65 {
+            defs.insert(
+                format!("S{index}"),
+                json!({ "$ref": format!("#/$defs/S{}", index + 1) }),
+            );
+        }
+        defs.insert("S65".to_owned(), json!({ "type": "string" }));
+
+        json!({
+            "type": "object",
+            "properties": {
+                "default": {
+                    "$ref": "#/$defs/S0"
+                }
+            },
+            "$defs": defs,
+            "additionalProperties": false
+        })
+    }
+
+    fn duplicate_anchor_schema() -> Value {
+        json!({
+            "$ref": "#S0",
+            "properties": {},
+            "$defs": {
+                "first": {
+                    "$anchor": "S0",
+                    "type": "string"
+                },
+                "second": {
+                    "$anchor": "S0",
+                    "$ref": "#/$defs/second"
+                }
+            }
+        })
+    }
+
+    fn object_schema_with_properties(property_count: usize) -> Value {
+        let properties = (0..property_count)
+            .map(|index| (format!("field_{index}"), json!({ "type": "string" })))
+            .collect::<serde_json::Map<_, _>>();
+
+        json!({
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": false
         })
     }
 
