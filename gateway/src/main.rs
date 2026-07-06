@@ -10629,6 +10629,12 @@ mod tests {
         let response = router
             .oneshot(
                 Request::builder()
+                    // A path-prefixed GATEWAY_PUBLIC_URL describes the
+                    // external resource URL. The gateway itself still serves
+                    // bare /mcp; deployments using /base are expected to strip
+                    // that prefix in the reverse proxy before forwarding. The
+                    // assertion below should still advertise the public
+                    // /base/mcp-derived metadata URL.
                     .uri(auth::protected_resource::MCP_RESOURCE_PATH)
                     .body(Body::empty())
                     .expect("MCP request should build"),
