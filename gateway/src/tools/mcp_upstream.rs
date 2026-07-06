@@ -637,6 +637,13 @@ fn limited_mcp_response_stream(
     max_response_bytes: usize,
 ) -> LimitedMcpByteStream {
     let body = Box::pin(response.bytes_stream());
+    limited_mcp_body_stream(body, max_response_bytes)
+}
+
+fn limited_mcp_body_stream(
+    body: Pin<Box<dyn Stream<Item = Result<Bytes, rmcp_reqwest::Error>> + Send>>,
+    max_response_bytes: usize,
+) -> LimitedMcpByteStream {
     Box::pin(stream::unfold(
         (body, 0usize, false),
         move |state| async move {
@@ -974,4 +981,197 @@ fn server_response_idle_timeout(
 
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        task::JoinHandle,
+    };
+
+    const TEST_RESPONSE_LIMIT: usize = 64;
+
+    #[tokio::test]
+    async fn get_stream_rejects_oversized_sse_without_content_length() {
+        let upstream = spawn_raw_sse_upstream().await;
+        let mut stream = oversized_sse_get_stream(&upstream.url).await;
+
+        assert_first_sse_event(&mut stream).await;
+        assert_sse_stream_response_too_large(&mut stream, TEST_RESPONSE_LIMIT).await;
+
+        upstream.join().await;
+    }
+
+    #[tokio::test]
+    async fn sse_streaming_cap_rejects_body_after_understated_content_length_hint() {
+        let first_chunk = "event: message\ndata: under-limit\n\n";
+        assert!(first_chunk.len() < TEST_RESPONSE_LIMIT);
+        let overflow_chunk = format!(": {}\n\n", "x".repeat(TEST_RESPONSE_LIMIT));
+
+        // HTTP/1.1 frames the body at Content-Length, so extra bytes after an
+        // understated header are not delivered through reqwest::Response. This
+        // covers the production fallback that matters once bytes are delivered:
+        // an under-cap length hint cannot bypass the streaming byte counter.
+        let declared_content_length = first_chunk.len();
+        assert!(declared_content_length < TEST_RESPONSE_LIMIT);
+        let body = stream::iter([
+            Ok::<_, rmcp_reqwest::Error>(Bytes::copy_from_slice(first_chunk.as_bytes())),
+            Ok(Bytes::from(overflow_chunk)),
+        ]);
+        let mut stream: BoxStream<'static, Result<Sse, SseError>> =
+            Box::pin(SseStream::from_byte_stream(limited_mcp_body_stream(
+                Box::pin(body),
+                TEST_RESPONSE_LIMIT,
+            )));
+
+        assert_first_sse_event(&mut stream).await;
+        assert_sse_stream_response_too_large(&mut stream, TEST_RESPONSE_LIMIT).await;
+    }
+
+    async fn oversized_sse_get_stream(url: &str) -> BoxStream<'static, Result<Sse, SseError>> {
+        let client = rmcp_reqwest::Client::builder()
+            .build()
+            .expect("test MCP HTTP client should build");
+        let client = LimitedMcpHttpClient::new(client, usize::MAX, TEST_RESPONSE_LIMIT);
+
+        client
+            .get_stream(
+                Arc::from(url.to_owned()),
+                Arc::from("test-session"),
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await
+            .expect("oversized SSE GET response should pass header checks")
+    }
+
+    async fn assert_first_sse_event(stream: &mut BoxStream<'static, Result<Sse, SseError>>) {
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("SSE stream should yield before timing out")
+            .expect("SSE stream should yield an initial event")
+            .expect("initial SSE event should parse");
+
+        assert_eq!(event.event.as_deref(), Some("message"));
+        assert_eq!(event.data.as_deref(), Some("under-limit"));
+    }
+
+    async fn assert_sse_stream_response_too_large(
+        stream: &mut BoxStream<'static, Result<Sse, SseError>>,
+        expected_max: usize,
+    ) {
+        let error = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("SSE stream should yield oversized-body error before timing out")
+            .expect("SSE stream should yield oversized-body error")
+            .expect_err("SSE stream should reject once cumulative bytes exceed the cap");
+
+        assert_eq!(mcp_response_too_large_max(&error), Some(expected_max));
+    }
+
+    struct RawSseUpstream {
+        url: String,
+        handle: JoinHandle<()>,
+    }
+
+    impl RawSseUpstream {
+        async fn join(self) {
+            self.handle
+                .await
+                .expect("raw SSE upstream task should finish cleanly");
+        }
+    }
+
+    async fn spawn_raw_sse_upstream() -> RawSseUpstream {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("raw SSE upstream should bind");
+        let addr = listener
+            .local_addr()
+            .expect("raw SSE upstream address should be available");
+
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("raw SSE upstream should accept one connection");
+            let request = read_raw_http_request_headers(&mut stream).await;
+            assert!(
+                request.starts_with("GET /mcp HTTP/1.1\r\n"),
+                "get_stream should issue an MCP SSE GET request: {request:?}"
+            );
+
+            let first_chunk = "event: message\ndata: under-limit\n\n";
+            assert!(first_chunk.len() < TEST_RESPONSE_LIMIT);
+            let overflow_chunk = format!(": {}\n\n", "x".repeat(TEST_RESPONSE_LIMIT));
+            write_chunked_sse_response(&mut stream, first_chunk, &overflow_chunk).await;
+        });
+
+        RawSseUpstream {
+            url: format!("http://{addr}/mcp"),
+            handle,
+        }
+    }
+
+    async fn read_raw_http_request_headers(stream: &mut tokio::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .expect("raw SSE upstream should read request headers");
+            assert_ne!(read, 0, "client should send HTTP request headers");
+            buffer.extend_from_slice(&chunk[..read]);
+            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                return String::from_utf8(buffer).expect("raw SSE request headers should be UTF-8");
+            }
+            assert!(
+                buffer.len() <= 16 * 1024,
+                "raw SSE request headers should stay bounded"
+            );
+        }
+    }
+
+    async fn write_chunked_sse_response(
+        stream: &mut tokio::net::TcpStream,
+        first_chunk: &str,
+        overflow_chunk: &str,
+    ) {
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("raw SSE upstream should write response headers");
+        write_chunked_body_chunk(stream, first_chunk).await;
+        write_chunked_body_chunk(stream, overflow_chunk).await;
+        stream
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("raw SSE upstream should finish chunked response");
+    }
+
+    async fn write_chunked_body_chunk(stream: &mut tokio::net::TcpStream, chunk: &str) {
+        let prefix = format!("{:x}\r\n", chunk.len());
+        stream
+            .write_all(prefix.as_bytes())
+            .await
+            .expect("raw SSE upstream should write chunk prefix");
+        stream
+            .write_all(chunk.as_bytes())
+            .await
+            .expect("raw SSE upstream should write chunk body");
+        stream
+            .write_all(b"\r\n")
+            .await
+            .expect("raw SSE upstream should write chunk suffix");
+    }
 }
