@@ -192,7 +192,7 @@ function Dashboard({
 
       <section className="panel" aria-labelledby="views-heading">
         <div className="section-heading">
-          <p className="eyebrow">Phase 2</p>
+          <p className="eyebrow">Workspace</p>
           <h2 id="views-heading">Admin views</h2>
         </div>
         <div className="view-links">
@@ -214,7 +214,7 @@ function Dashboard({
           </Link>
           <Link to="/tools/openapi">
             <span>OpenAPI tools</span>
-            <small>Preview and register generated tools</small>
+            <small>Review OpenAPI tools before registration</small>
           </Link>
           <Link to="/identities">
             <span>Identities</span>

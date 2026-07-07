@@ -442,7 +442,7 @@ describe('AdminShell', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByText('Preview and register generated tools')).toBeTruthy();
+    expect(screen.getByText('Review OpenAPI tools before registration')).toBeTruthy();
   });
 
   it('registers the identity directory route and navigation entry', async () => {

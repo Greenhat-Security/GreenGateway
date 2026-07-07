@@ -7,8 +7,6 @@ const RULE_WORKSPACE_LINKS = [
   { label: 'History', to: '/policy/history' },
 ];
 
-const PLANNED_RULE_WORKSPACE_ITEMS = ['Optimize', 'Test', 'Evidence', 'Export'];
-
 export function RuleWorkspaceNav() {
   return (
     <nav className="rule-workspace-nav" aria-label="Rules workspace">
@@ -23,16 +21,6 @@ export function RuleWorkspaceNav() {
         >
           {link.label}
         </NavLink>
-      ))}
-      {PLANNED_RULE_WORKSPACE_ITEMS.map((label) => (
-        <span
-          aria-disabled="true"
-          className="rule-workspace-tab is-planned"
-          key={label}
-          title="Planned in issue #218"
-        >
-          {label}
-        </span>
       ))}
     </nav>
   );

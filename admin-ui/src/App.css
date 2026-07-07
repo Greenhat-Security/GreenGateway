@@ -1102,10 +1102,11 @@ select:focus-visible {
 
 .rule-form-section,
 .rule-preview-panel {
-  border: 1px solid var(--gh-sys-border);
-  border-radius: var(--gh-comp-card-radius);
-  padding: var(--gh-ref-space-4);
-  background: var(--gh-sys-bg-raised);
+  border: 0;
+  border-top: 1px solid var(--gh-sys-border);
+  border-radius: 0;
+  padding: var(--gh-ref-space-4) 0 0;
+  background: transparent;
 }
 
 .rule-summary-box,
@@ -1113,9 +1114,9 @@ select:focus-visible {
   display: grid;
   gap: var(--gh-ref-space-2);
   border: 1px solid var(--gh-sys-border);
-  border-radius: var(--gh-ref-radius-md);
+  border-radius: var(--gh-ref-radius-sm);
   padding: var(--gh-ref-space-3);
-  background: var(--gh-sys-bg-canvas);
+  background: var(--gh-sys-bg-raised);
 }
 
 .rule-summary-box p {
@@ -1708,10 +1709,8 @@ select:focus-visible {
   display: flex;
   flex-wrap: wrap;
   gap: var(--gh-ref-space-2);
-  border: 1px solid var(--gh-sys-border);
-  border-radius: var(--gh-comp-card-radius);
-  padding: var(--gh-ref-space-2);
-  background: var(--gh-sys-bg-raised);
+  border-bottom: 1px solid var(--gh-sys-border);
+  padding: 0 0 var(--gh-ref-space-3);
 }
 
 .rule-workspace-tab {
@@ -1739,14 +1738,16 @@ select:focus-visible {
 }
 
 .rule-workspace-tab.is-active {
-  border-color: color-mix(in srgb, var(--gh-sys-primary) 32%, transparent);
+  border-color: color-mix(in srgb, var(--gh-sys-primary) 38%, transparent);
   color: var(--gh-sys-primary-text);
   background: var(--gh-sys-primary-subtle);
 }
 
-.rule-workspace-tab.is-planned {
-  cursor: not-allowed;
-  opacity: 0.66;
+.rule-order-note {
+  margin: calc(var(--gh-ref-space-2) * -1) 0 0;
+  color: var(--gh-sys-fg-muted);
+  font-size: var(--gh-type-body-sm);
+  line-height: var(--gh-lh-body-sm);
 }
 
 .rule-table {

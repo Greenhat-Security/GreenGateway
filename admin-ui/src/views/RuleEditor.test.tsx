@@ -64,21 +64,21 @@ describe('RuleEditor', () => {
       (screen.getByRole('radio', { name: /Shadow/ }) as HTMLInputElement).checked,
     ).toBe(true);
     expect(
-      screen.getByLabelText('Plain-English rule summary').textContent,
+      screen.getByLabelText('Rule summary').textContent,
     ).toContain(
       'Log-only POST requests to /api/reports/{id} for role support, auth method session cookie, and principal user-123.',
     );
     expect(
-      screen.getByLabelText('Generated expression preview').textContent,
+      screen.getByLabelText('Policy expression').textContent,
     ).toContain('request.method in ["POST"]');
     expect(
-      screen.getByLabelText('Generated expression preview').textContent,
+      screen.getByLabelText('Policy expression').textContent,
     ).toContain('request.path matches "/api/reports/{id}"');
     expect(
-      screen.getByLabelText('Generated expression preview').textContent,
+      screen.getByLabelText('Policy expression').textContent,
     ).toContain('principal.roles contains "support"');
     expect(
-      screen.getByLabelText('Generated expression preview').textContent,
+      screen.getByLabelText('Policy expression').textContent,
     ).toContain('decision = "shadow"');
   });
 

@@ -1017,18 +1017,18 @@ function RuleLogicSummary({ rule }: { rule: PolicyRule }) {
       aria-labelledby="rule-logic-summary-heading"
     >
       <div className="section-heading">
-        <p className="eyebrow">Generated logic</p>
-        <h3 id="rule-logic-summary-heading">Summary and expression</h3>
+        <p className="eyebrow">Policy logic</p>
+        <h3 id="rule-logic-summary-heading">Rule logic</h3>
       </div>
       <div className="rule-summary-box">
-        <span className="stat-label">Plain-English summary</span>
-        <p aria-label="Plain-English rule summary">
+        <span className="stat-label">Rule summary</span>
+        <p aria-label="Rule summary">
           {plainEnglishRuleSummary(rule)}
         </p>
       </div>
       <div className="rule-expression-box">
-        <span className="stat-label">Generated expression preview</span>
-        <pre aria-label="Generated expression preview">
+        <span className="stat-label">Policy expression</span>
+        <pre aria-label="Policy expression">
           <code>{generatedExpression(rule)}</code>
         </pre>
       </div>

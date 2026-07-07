@@ -1,4 +1,11 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import { Buffer } from 'node:buffer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
@@ -57,6 +64,12 @@ describe('RuleTable', () => {
     expect(screen.getByRole('link', { name: 'Rulebase' })).toBeTruthy();
     expect(screen.getByRole('link', { name: 'Builder' })).toBeTruthy();
     expect(screen.getByRole('link', { name: 'Shadow review' })).toBeTruthy();
+    const workspaceNav = screen.getByRole('navigation', { name: 'Rules workspace' });
+    expect(within(workspaceNav).queryByText('Optimize')).toBeNull();
+    expect(within(workspaceNav).queryByText('Test')).toBeNull();
+    expect(within(workspaceNav).queryByText('Evidence')).toBeNull();
+    expect(within(workspaceNav).queryByText('Export')).toBeNull();
+    expect(screen.getByText('Rules are evaluated top to bottom. First match wins.')).toBeTruthy();
     expect(screen.getByRole('columnheader', { name: 'Priority' })).toBeTruthy();
     expect(screen.getByRole('columnheader', { name: 'Rule' })).toBeTruthy();
     expect(screen.getByRole('columnheader', { name: 'Scope' })).toBeTruthy();
@@ -80,6 +93,8 @@ describe('RuleTable', () => {
     expect(screen.getByText('/billing/{id}')).toBeTruthy();
     expect(screen.getByText('12 hits')).toBeTruthy();
     expect(screen.getByText('never matched')).toBeTruthy();
+    expect(screen.queryByText('First match wins')).toBeNull();
+    expect(screen.queryByText('Last matched unavailable')).toBeNull();
     expect(screen.getByRole('switch', { name: 'Disable rule allow-billing' })).toBeTruthy();
     expect(
       screen.getByRole('switch', { name: 'Enable rule shadow-admin' }).getAttribute('aria-checked'),

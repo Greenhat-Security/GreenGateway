@@ -118,7 +118,7 @@ test('captures rule editor empty, filled, and preview states', async ({
 
   await page.goto('/admin/policy/rules/editor');
   await expect(page.getByRole('heading', { name: 'Create policy rule' })).toBeVisible();
-  await expect(page.getByText('Plain-English summary')).toBeVisible();
+  await expect(page.getByText('Rule summary')).toBeVisible();
   await expect(
     page.getByText('Enter a matcher to preview matched traffic.'),
   ).toBeVisible();
@@ -136,7 +136,7 @@ test('captures rule editor empty, filled, and preview states', async ({
   await page.getByRole('textbox', { name: 'Principal IDs' }).fill('user-123');
   await page.getByRole('button', { name: 'Add principal ID' }).click();
   await page.getByRole('radio', { name: /Shadow/ }).check();
-  await expect(page.getByLabel('Plain-English rule summary')).toContainText(
+  await expect(page.getByLabel('Rule summary')).toContainText(
     'Log-only GET requests to /api/users/{id} for role support, auth method bearer token, and principal user-123.',
   );
 

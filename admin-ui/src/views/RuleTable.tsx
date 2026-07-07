@@ -241,6 +241,9 @@ export function RuleTable() {
         <RuleWorkspaceNav />
 
         {policy ? <DefaultActionBanner action={policy.default_action} /> : null}
+        {rows.length > 0 ? (
+          <p className="rule-order-note">Rules are evaluated top to bottom. First match wins.</p>
+        ) : null}
 
         {loadError ? <PolicyErrorMessage error={loadError} /> : null}
         {showWritePermissionNotice ? <PolicyWritePermissionNotice /> : null}
@@ -318,7 +321,6 @@ export function RuleTable() {
                       >
                         {row.id}
                       </Link>
-                      <span className="rule-row-subtext">First match wins</span>
                     </td>
                     <td>
                       <span className="badge neutral">{ruleScope(row.rule)}</span>
@@ -344,7 +346,6 @@ export function RuleTable() {
                       <span className="numeric-cell">
                         {formatRuleHits(hits[row.id] ?? 0)}
                       </span>
-                      <span className="rule-row-subtext">Last matched unavailable</span>
                     </td>
                     <td>
                       <div className="rule-operations">
