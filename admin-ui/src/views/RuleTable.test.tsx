@@ -54,6 +54,27 @@ describe('RuleTable', () => {
     renderRuleTable();
 
     expect(await screen.findByText('Default action: Deny')).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Rulebase' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Builder' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Shadow review' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Priority' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Rule' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Scope' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Source' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Destination' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Condition' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Mode' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Evidence' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Operations' })).toBeTruthy();
+    expect(screen.getByText('#1')).toBeTruthy();
+    expect(
+      screen.getByRole('link', { name: 'Edit rule allow-billing' }),
+    ).toBeTruthy();
+    expect(screen.getAllByText('API')).toHaveLength(2);
+    expect(screen.getByText('Admin')).toBeTruthy();
+    expect(screen.getByText('GET, HEAD requests to /billing/{id}')).toBeTruthy();
+    expect(screen.getAllByText('Enforcing')).toHaveLength(2);
+    expect(screen.getByText('Draft')).toBeTruthy();
     expect(screen.getByText('role: billing-reader')).toBeTruthy();
     expect(screen.getAllByText('any principal')).toHaveLength(2);
     expect(screen.getByText('/billing/{id}')).toBeTruthy();

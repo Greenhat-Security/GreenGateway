@@ -15,6 +15,7 @@ import {
   policyRuleId,
   reorderPolicyRules,
 } from '../lib/policy';
+import { RuleWorkspaceNav } from './RuleWorkspaceNav';
 import { MethodBadge } from './trafficBadges';
 
 type PolicyLoadError = {
@@ -232,10 +233,12 @@ export function RuleTable() {
         <div className="section-heading logs-heading">
           <div>
             <p className="eyebrow">Policy</p>
-            <h2 id="rule-heading">Rule table</h2>
+            <h2 id="rule-heading">Rulebase</h2>
           </div>
           <span className="result-count">{rows.length} rules</span>
         </div>
+
+        <RuleWorkspaceNav />
 
         {policy ? <DefaultActionBanner action={policy.default_action} /> : null}
 
@@ -260,14 +263,16 @@ export function RuleTable() {
             <table className="logs-table rule-table">
               <thead>
                 <tr>
-                  <th aria-label="Reorder" />
-                  <th>Methods</th>
-                  <th>Target</th>
-                  <th>Principal</th>
+                  <th>Priority</th>
+                  <th>Rule</th>
+                  <th>Scope</th>
+                  <th>Source</th>
+                  <th>Destination</th>
+                  <th>Condition</th>
                   <th>Action</th>
-                  <th>Hits</th>
-                  <th>Enabled</th>
-                  <th>Delete</th>
+                  <th>Mode</th>
+                  <th>Evidence</th>
+                  <th>Operations</th>
                 </tr>
               </thead>
               <tbody>
@@ -299,49 +304,69 @@ export function RuleTable() {
                       void dropRule(row.id);
                     }}
                   >
-                    <td className="rule-drag-cell">
-                      <span className="rule-drag-handle" aria-hidden="true">
+                    <td className="rule-priority-cell">
+                      <span className="rule-priority">#{row.index + 1}</span>
+                      <span className="rule-drag-handle" aria-label={`Reorder rule ${row.id}`}>
                         ::
                       </span>
                     </td>
                     <td>
-                      {row.rule.tool_name ? (
-                        <span className="badge neutral">MCP tool</span>
-                      ) : (
-                        <MethodList methods={row.rule.methods ?? []} />
-                      )}
+                      <Link
+                        aria-label={`Edit rule ${row.id}`}
+                        className="rule-name-link"
+                        to={`/policy/rules/editor?rule_id=${encodeURIComponent(row.id)}`}
+                      >
+                        {row.id}
+                      </Link>
+                      <span className="rule-row-subtext">First match wins</span>
                     </td>
+                    <td>
+                      <span className="badge neutral">{ruleScope(row.rule)}</span>
+                    </td>
+                    <td>{formatPrincipal(row.rule.principal)}</td>
                     <td>
                       <code className="endpoint-template rule-path">
                         {ruleTarget(row.rule)}
                       </code>
                     </td>
-                    <td>{formatPrincipal(row.rule.principal)}</td>
+                    <td>
+                      <span className="rule-condition-summary">
+                        {ruleCondition(row.rule)}
+                      </span>
+                    </td>
                     <td>
                       <ActionBadge action={row.rule.action} />
                     </td>
-                    <td className="numeric-cell">{formatRuleHits(hits[row.id] ?? 0)}</td>
                     <td>
-                      <RuleEnabledSwitch
-                        row={row}
-                        canWritePolicy={canWritePolicy}
-                        isMutating={mutatingRuleId === row.id}
-                        onToggle={() => {
-                          void toggleRule(row);
-                        }}
-                      />
+                      <RuleModeBadge rule={row.rule} />
+                    </td>
+                    <td className="rule-evidence-cell">
+                      <span className="numeric-cell">
+                        {formatRuleHits(hits[row.id] ?? 0)}
+                      </span>
+                      <span className="rule-row-subtext">Last matched unavailable</span>
                     </td>
                     <td>
-                      <RuleDeleteControl
-                        row={row}
-                        canWritePolicy={canWritePolicy}
-                        confirmingDeleteId={confirmingDeleteId}
-                        isMutating={mutatingRuleId === row.id}
-                        onConfirmingChange={setConfirmingDeleteId}
-                        onDelete={() => {
-                          void deleteRule(row);
-                        }}
-                      />
+                      <div className="rule-operations">
+                        <RuleEnabledSwitch
+                          row={row}
+                          canWritePolicy={canWritePolicy}
+                          isMutating={mutatingRuleId === row.id}
+                          onToggle={() => {
+                            void toggleRule(row);
+                          }}
+                        />
+                        <RuleDeleteControl
+                          row={row}
+                          canWritePolicy={canWritePolicy}
+                          confirmingDeleteId={confirmingDeleteId}
+                          isMutating={mutatingRuleId === row.id}
+                          onConfirmingChange={setConfirmingDeleteId}
+                          onDelete={() => {
+                            void deleteRule(row);
+                          }}
+                        />
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -390,6 +415,63 @@ export function ruleTarget(rule: PolicyRule): string {
 
 function ActionBadge({ action }: { action: PolicyRule['action'] }) {
   return <span className={`badge ${actionBadgeClass(action)}`}>{actionTitle(action)}</span>;
+}
+
+function RuleModeBadge({ rule }: { rule: PolicyRule }) {
+  const mode = ruleMode(rule);
+
+  return <span className={`badge ${ruleModeBadgeClass(mode)}`}>{mode}</span>;
+}
+
+function ruleScope(rule: PolicyRule): string {
+  if (rule.tool_name) {
+    return 'MCP';
+  }
+
+  if (rule.path?.startsWith('/admin')) {
+    return 'Admin';
+  }
+
+  return 'API';
+}
+
+function ruleCondition(rule: PolicyRule): string {
+  if (rule.tool_name) {
+    return `MCP tool call to ${rule.tool_name}`;
+  }
+
+  return `${formatMethodsForSentence(rule.methods ?? [])} requests to ${rule.path ?? '-'}`;
+}
+
+function formatMethodsForSentence(methods: string[]): string {
+  if (methods.length === 0 || methods.some((method) => method.trim() === '*')) {
+    return 'Any method';
+  }
+
+  return methods.map((method) => method.toUpperCase()).join(', ');
+}
+
+function ruleMode(rule: PolicyRule): 'Draft' | 'Log only' | 'Enforcing' {
+  if (!isPolicyRuleEnabled(rule)) {
+    return 'Draft';
+  }
+
+  if (rule.action === 'shadow') {
+    return 'Log only';
+  }
+
+  return 'Enforcing';
+}
+
+function ruleModeBadgeClass(mode: ReturnType<typeof ruleMode>): string {
+  switch (mode) {
+    case 'Draft':
+      return 'neutral';
+    case 'Log only':
+      return 'warning';
+    case 'Enforcing':
+      return 'success';
+  }
 }
 
 function RuleEnabledSwitch({

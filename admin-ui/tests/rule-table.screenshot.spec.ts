@@ -3,6 +3,8 @@ import path from 'node:path';
 
 const screenshotDir = path.join(process.cwd(), '.screenshots');
 
+test.use({ viewport: { width: 1440, height: 900 } });
+
 test('captures the rule table in light and dark themes', async ({ page }) => {
   await page.route('**/v1/admin/policy', async (route) => {
     await route.fulfill({
@@ -79,10 +81,14 @@ test('captures the rule table in light and dark themes', async ({ page }) => {
   });
 
   await page.goto('/admin/rules');
+  await page.addStyleTag({
+    content: '*, *::before, *::after { transition-duration: 0ms !important; animation-duration: 0ms !important; }',
+  });
   await expect(
-    page.getByRole('heading', { level: 2, name: 'Rule table' }),
+    page.getByRole('heading', { level: 2, name: 'Rulebase' }),
   ).toBeVisible();
   await expect(page.getByText('Default action: Deny')).toBeVisible();
+  await expect(page.getByRole('columnheader', { name: 'Operations' })).toBeInViewport();
 
   await page.screenshot({
     path: path.join(screenshotDir, 'rule-table-light.png'),

@@ -29,6 +29,7 @@ import {
   emptyTrafficFilters,
   fetchTrafficEndpoints,
 } from '../lib/traffic';
+import { RuleWorkspaceNav } from './RuleWorkspaceNav';
 
 export const RULE_PREVIEW_DEBOUNCE_MS = 450;
 
@@ -444,6 +445,8 @@ export function RuleEditor() {
           </span>
         </div>
 
+        <RuleWorkspaceNav />
+
         {loadState.kind === 'loading' ? (
           <div className="loading-state" role="status">
             Loading policy
@@ -675,6 +678,8 @@ export function RuleEditor() {
                   </div>
                 </fieldset>
               </section>
+
+              <RuleLogicSummary rule={candidateRule} />
 
               {saveState.kind === 'error' ? (
                 <EditorAlert
@@ -1003,6 +1008,147 @@ function formFromPrefillParams(
   }
 
   return form;
+}
+
+function RuleLogicSummary({ rule }: { rule: PolicyRule }) {
+  return (
+    <section
+      className="rule-form-section rule-logic-summary"
+      aria-labelledby="rule-logic-summary-heading"
+    >
+      <div className="section-heading">
+        <p className="eyebrow">Generated logic</p>
+        <h3 id="rule-logic-summary-heading">Summary and expression</h3>
+      </div>
+      <div className="rule-summary-box">
+        <span className="stat-label">Plain-English summary</span>
+        <p aria-label="Plain-English rule summary">
+          {plainEnglishRuleSummary(rule)}
+        </p>
+      </div>
+      <div className="rule-expression-box">
+        <span className="stat-label">Generated expression preview</span>
+        <pre aria-label="Generated expression preview">
+          <code>{generatedExpression(rule)}</code>
+        </pre>
+      </div>
+    </section>
+  );
+}
+
+function plainEnglishRuleSummary(rule: PolicyRule): string {
+  const target =
+    rule.tool_name && rule.tool_name.trim().length > 0
+      ? `MCP tool calls to ${rule.tool_name.trim()}`
+      : `${formatMethodsForSummary(rule.methods ?? [])} requests to ${
+          rule.path?.trim() || '(path not set)'
+        }`;
+  const principal = principalSummary(rule.principal);
+
+  return `${actionSummaryVerb(rule.action)} ${target}${principal}.`;
+}
+
+function generatedExpression(rule: PolicyRule): string {
+  const lines: string[] = [];
+
+  if (rule.tool_name && rule.tool_name.trim().length > 0) {
+    lines.push(`mcp.tool == ${JSON.stringify(rule.tool_name.trim())}`);
+  } else {
+    const methods = normalizeMethods(rule.methods ?? []);
+    if (methods.length > 0) {
+      lines.push(`request.method in ${JSON.stringify(methods)}`);
+    } else {
+      lines.push('request.method matches "*"');
+    }
+    lines.push(
+      `request.path matches ${JSON.stringify(rule.path?.trim() || '(path not set)')}`,
+    );
+  }
+
+  for (const role of normalizeStrings(rule.principal?.roles ?? [])) {
+    lines.push(`principal.roles contains ${JSON.stringify(role)}`);
+  }
+  const authMethods = normalizeAuthMethods(rule.principal?.auth_methods ?? []);
+  if (authMethods.length > 0) {
+    lines.push(`principal.auth_method in ${JSON.stringify(authMethods)}`);
+  }
+  const principalIds = normalizeStrings(rule.principal?.principal_ids ?? []);
+  if (principalIds.length > 0) {
+    lines.push(`principal.id in ${JSON.stringify(principalIds)}`);
+  }
+  lines.push(`decision = ${JSON.stringify(rule.action)}`);
+
+  return lines.join('\nAND ');
+}
+
+function actionSummaryVerb(action: PolicyRuleAction): string {
+  switch (action) {
+    case 'allow':
+      return 'Allow';
+    case 'deny':
+      return 'Deny';
+    case 'shadow':
+      return 'Log-only';
+  }
+}
+
+function formatMethodsForSummary(methods: string[]): string {
+  const normalized = normalizeMethods(methods);
+  return normalized.length > 0 ? normalized.join(', ') : 'any method';
+}
+
+function principalSummary(principal: PrincipalMatcher | undefined): string {
+  const parts: string[] = [];
+  const roles = normalizeStrings(principal?.roles ?? []);
+  const authMethods = normalizeAuthMethods(principal?.auth_methods ?? []);
+  const principalIds = normalizeStrings(principal?.principal_ids ?? []);
+
+  if (roles.length > 0) {
+    parts.push(`${roles.length === 1 ? 'role' : 'roles'} ${joinHumanList(roles)}`);
+  }
+  if (authMethods.length > 0) {
+    parts.push(
+      `${authMethods.length === 1 ? 'auth method' : 'auth methods'} ${joinHumanList(
+        authMethods.map(formatAuthMethod),
+      )}`,
+    );
+  }
+  if (principalIds.length > 0) {
+    parts.push(
+      `${principalIds.length === 1 ? 'principal' : 'principals'} ${joinHumanList(
+        principalIds,
+      )}`,
+    );
+  }
+
+  return parts.length > 0 ? ` for ${joinHumanList(parts)}` : ' for any principal';
+}
+
+function joinHumanList(values: string[]): string {
+  if (values.length === 0) {
+    return '';
+  }
+  if (values.length === 1) {
+    return values[0];
+  }
+  if (values.length === 2) {
+    return `${values[0]} and ${values[1]}`;
+  }
+
+  return `${values.slice(0, -1).join(', ')}, and ${values[values.length - 1]}`;
+}
+
+function formatAuthMethod(value: string): string {
+  switch (value) {
+    case 'bearer_token':
+      return 'bearer token';
+    case 'session_cookie':
+      return 'session cookie';
+    case 'service_token':
+      return 'service token';
+    default:
+      return value;
+  }
 }
 
 function formFromRule(rule: PolicyRule): RuleFormState {

@@ -118,12 +118,14 @@ test('captures rule editor empty, filled, and preview states', async ({
 
   await page.goto('/admin/policy/rules/editor');
   await expect(page.getByRole('heading', { name: 'Create policy rule' })).toBeVisible();
+  await expect(page.getByText('Plain-English summary')).toBeVisible();
   await expect(
-    page.getByText('Enter a path pattern to preview matched traffic.'),
+    page.getByText('Enter a matcher to preview matched traffic.'),
   ).toBeVisible();
 
   await page.screenshot({
     path: path.join(screenshotDir, 'rule-editor-empty.png'),
+    fullPage: true,
   });
 
   await page.getByLabel('GET').check();
@@ -134,15 +136,20 @@ test('captures rule editor empty, filled, and preview states', async ({
   await page.getByRole('textbox', { name: 'Principal IDs' }).fill('user-123');
   await page.getByRole('button', { name: 'Add principal ID' }).click();
   await page.getByRole('radio', { name: /Shadow/ }).check();
+  await expect(page.getByLabel('Plain-English rule summary')).toContainText(
+    'Log-only GET requests to /api/users/{id} for role support, auth method bearer token, and principal user-123.',
+  );
 
   await expect(page.getByText('Refreshing preview')).toBeVisible();
   await page.screenshot({
     path: path.join(screenshotDir, 'rule-editor-filled.png'),
+    fullPage: true,
   });
 
   await expect(page.locator('.rule-preview-stat .stat-value')).toHaveText('37');
   await expect(page.getByText('/api/users/123')).toBeVisible();
   await page.screenshot({
     path: path.join(screenshotDir, 'rule-editor-preview-result.png'),
+    fullPage: true,
   });
 });

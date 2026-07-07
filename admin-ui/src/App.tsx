@@ -205,8 +205,8 @@ function Dashboard({
             <small>Discovered endpoints and rule coverage</small>
           </Link>
           <Link to="/rules">
-            <span>Rule table</span>
-            <small>Ordered firewall policy and hit counts</small>
+            <span>Rulebase</span>
+            <small>Ordered zero trust rules, modes, and evidence</small>
           </Link>
           <Link to="/tokens">
             <span>Tokens</span>
@@ -478,7 +478,7 @@ function pageTitleForPath(pathname: string): string {
     return 'Traffic detail';
   }
   if (pathname === '/rules') {
-    return 'Rule table';
+    return 'Rulebase';
   }
   if (pathname === '/tokens') {
     return 'Tokens';
