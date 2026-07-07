@@ -1,4 +1,11 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import { Buffer } from 'node:buffer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
@@ -54,11 +61,40 @@ describe('RuleTable', () => {
     renderRuleTable();
 
     expect(await screen.findByText('Default action: Deny')).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Rulebase' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Builder' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Shadow review' })).toBeTruthy();
+    const workspaceNav = screen.getByRole('navigation', { name: 'Rules workspace' });
+    expect(within(workspaceNav).queryByText('Optimize')).toBeNull();
+    expect(within(workspaceNav).queryByText('Test')).toBeNull();
+    expect(within(workspaceNav).queryByText('Evidence')).toBeNull();
+    expect(within(workspaceNav).queryByText('Export')).toBeNull();
+    expect(screen.getByText('Rules are evaluated top to bottom. First match wins.')).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Priority' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Rule' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Scope' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Source' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Destination' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Condition' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Mode' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Evidence' })).toBeTruthy();
+    expect(screen.getByRole('columnheader', { name: 'Operations' })).toBeTruthy();
+    expect(screen.getByText('#1')).toBeTruthy();
+    expect(
+      screen.getByRole('link', { name: 'Edit rule allow-billing' }),
+    ).toBeTruthy();
+    expect(screen.getAllByText('API')).toHaveLength(2);
+    expect(screen.getByText('Admin')).toBeTruthy();
+    expect(screen.getByText('GET, HEAD requests to /billing/{id}')).toBeTruthy();
+    expect(screen.getAllByText('Enforcing')).toHaveLength(2);
+    expect(screen.getByText('Draft')).toBeTruthy();
     expect(screen.getByText('role: billing-reader')).toBeTruthy();
     expect(screen.getAllByText('any principal')).toHaveLength(2);
     expect(screen.getByText('/billing/{id}')).toBeTruthy();
     expect(screen.getByText('12 hits')).toBeTruthy();
     expect(screen.getByText('never matched')).toBeTruthy();
+    expect(screen.queryByText('First match wins')).toBeNull();
+    expect(screen.queryByText('Last matched unavailable')).toBeNull();
     expect(screen.getByRole('switch', { name: 'Disable rule allow-billing' })).toBeTruthy();
     expect(
       screen.getByRole('switch', { name: 'Enable rule shadow-admin' }).getAttribute('aria-checked'),
@@ -234,6 +270,70 @@ describe('RuleTable', () => {
       expect(fetcher.reorderBodies).toEqual([['third', 'first', 'second']]);
     });
     expect(fetcher.reorderHeaders[0]).toBe('"etag-initial"');
+  });
+
+  it('moves rules with accessible order buttons', async () => {
+    const fetcher = policyFetchMock({
+      policy: policyDocument({
+        rules: [
+          rule({ id: 'first', path: '/first', action: 'allow' }),
+          rule({ id: 'second', path: '/second', action: 'deny' }),
+          rule({ id: 'third', path: '/third', action: 'shadow' }),
+        ],
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderRuleTable();
+
+    expect(await screen.findByText('first')).toBeTruthy();
+    expect(
+      (screen.getByRole('button', { name: 'Move rule first up' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      (
+        screen.getByRole('button', {
+          name: 'Move rule third down',
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Move rule first down' }));
+
+    await waitFor(() => {
+      expect(fetcher.reorderBodies).toEqual([['second', 'first', 'third']]);
+    });
+    expect(fetcher.reorderHeaders[0]).toBe('"etag-initial"');
+  });
+
+  it('marks rule cells with responsive data labels', async () => {
+    const fetcher = policyFetchMock({
+      policy: policyDocument({
+        rules: [rule({ id: 'responsive-rule', path: '/responsive', action: 'allow' })],
+      }),
+      hits: { 'responsive-rule': 3 },
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderRuleTable();
+
+    const row = await screen.findByTestId('rule-row-responsive-rule');
+    expect(within(row).getByText('#1').closest('td')?.getAttribute('data-label')).toBe(
+      'Priority',
+    );
+    expect(
+      within(row)
+        .getByRole('link', { name: 'Edit rule responsive-rule' })
+        .closest('td')
+        ?.getAttribute('data-label'),
+    ).toBe('Rule');
+    expect(within(row).getByText('/responsive').closest('td')?.getAttribute('data-label')).toBe(
+      'Destination',
+    );
+    expect(within(row).getByText('3 hits').closest('td')?.getAttribute('data-label')).toBe(
+      'Evidence',
+    );
   });
 });
 

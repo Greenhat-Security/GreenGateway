@@ -10,6 +10,7 @@ import {
   type PolicyDiffSummary,
   type PolicyVersion,
 } from '../lib/policyHistory';
+import { RuleWorkspaceNav } from './RuleWorkspaceNav';
 
 type HistoryViewError = {
   kind:
@@ -178,6 +179,8 @@ export function PolicyHistoryView() {
           </div>
           <span className="result-count">{resultCount}</span>
         </div>
+
+        <RuleWorkspaceNav />
 
         {loadError ? <HistoryLoadErrorMessage error={loadError} /> : null}
         {showWritePermissionNotice ? <PolicyWritePermissionNotice /> : null}

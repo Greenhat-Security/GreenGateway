@@ -192,7 +192,7 @@ function Dashboard({
 
       <section className="panel" aria-labelledby="views-heading">
         <div className="section-heading">
-          <p className="eyebrow">Phase 2</p>
+          <p className="eyebrow">Workspace</p>
           <h2 id="views-heading">Admin views</h2>
         </div>
         <div className="view-links">
@@ -205,8 +205,8 @@ function Dashboard({
             <small>Discovered endpoints and rule coverage</small>
           </Link>
           <Link to="/rules">
-            <span>Rule table</span>
-            <small>Ordered firewall policy and hit counts</small>
+            <span>Rulebase</span>
+            <small>Ordered zero trust rules, modes, and evidence</small>
           </Link>
           <Link to="/tokens">
             <span>Tokens</span>
@@ -214,7 +214,7 @@ function Dashboard({
           </Link>
           <Link to="/tools/openapi">
             <span>OpenAPI tools</span>
-            <small>Preview and register generated tools</small>
+            <small>Review OpenAPI tools before registration</small>
           </Link>
           <Link to="/identities">
             <span>Identities</span>
@@ -478,7 +478,7 @@ function pageTitleForPath(pathname: string): string {
     return 'Traffic detail';
   }
   if (pathname === '/rules') {
-    return 'Rule table';
+    return 'Rulebase';
   }
   if (pathname === '/tokens') {
     return 'Tokens';

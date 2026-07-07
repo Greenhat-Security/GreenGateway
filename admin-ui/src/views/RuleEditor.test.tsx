@@ -63,6 +63,23 @@ describe('RuleEditor', () => {
     expect(
       (screen.getByRole('radio', { name: /Shadow/ }) as HTMLInputElement).checked,
     ).toBe(true);
+    expect(
+      screen.getByLabelText('Rule summary').textContent,
+    ).toContain(
+      'Log-only POST requests to /api/reports/{id} for role support, auth method session cookie, and principal user-123.',
+    );
+    expect(
+      screen.getByLabelText('Policy expression').textContent,
+    ).toContain('request.method in ["POST"]');
+    expect(
+      screen.getByLabelText('Policy expression').textContent,
+    ).toContain('request.path matches "/api/reports/{id}"');
+    expect(
+      screen.getByLabelText('Policy expression').textContent,
+    ).toContain('principal.roles contains "support"');
+    expect(
+      screen.getByLabelText('Policy expression').textContent,
+    ).toContain('decision = "shadow"');
   });
 
   it('applies a principal deny shortcut to a new rule form', async () => {

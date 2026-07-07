@@ -3,6 +3,8 @@ import path from 'node:path';
 
 const screenshotDir = path.join(process.cwd(), '.screenshots');
 
+test.use({ viewport: { width: 1440, height: 900 } });
+
 test('captures the rule table in light and dark themes', async ({ page }) => {
   await page.route('**/v1/admin/policy', async (route) => {
     await route.fulfill({
@@ -79,15 +81,32 @@ test('captures the rule table in light and dark themes', async ({ page }) => {
   });
 
   await page.goto('/admin/rules');
+  await page.addStyleTag({
+    content: '*, *::before, *::after { transition-duration: 0ms !important; animation-duration: 0ms !important; }',
+  });
   await expect(
-    page.getByRole('heading', { level: 2, name: 'Rule table' }),
+    page.getByRole('heading', { level: 2, name: 'Rulebase' }),
   ).toBeVisible();
   await expect(page.getByText('Default action: Deny')).toBeVisible();
+  await expect(page.getByRole('columnheader', { name: 'Operations' })).toBeInViewport();
 
   await page.screenshot({
     path: path.join(screenshotDir, 'rule-table-light.png'),
     fullPage: true,
   });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/admin/rules');
+  await expect(page.getByText('allow-billing-reader')).toBeVisible();
+  const mobileTableBox = await page.locator('.rule-table').boundingBox();
+  const mobileFrameBox = await page.locator('.table-scroll').boundingBox();
+  expect(mobileTableBox?.width).toBeLessThanOrEqual((mobileFrameBox?.width ?? 0) + 1);
+  await page.screenshot({
+    path: path.join(screenshotDir, 'rule-table-mobile.png'),
+    fullPage: true,
+  });
+
+  await page.setViewportSize({ width: 1440, height: 900 });
 
   await page.getByRole('button', { name: 'Switch to dark theme' }).click();
   await page.screenshot({

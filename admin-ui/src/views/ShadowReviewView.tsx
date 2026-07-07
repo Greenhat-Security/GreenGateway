@@ -11,6 +11,7 @@ import {
   patchPolicyRule,
 } from '../lib/policy';
 import { MethodList, formatPrincipal, ruleTarget } from './RuleTable';
+import { RuleWorkspaceNav } from './RuleWorkspaceNav';
 
 type ShadowReviewError = {
   kind:
@@ -162,6 +163,8 @@ export function ShadowReviewView() {
           </div>
           <span className="result-count">{resultCount}</span>
         </div>
+
+        <RuleWorkspaceNav />
 
         {loadError ? <ShadowReviewErrorMessage error={loadError} /> : null}
         {showWritePermissionNotice ? <PolicyWritePermissionNotice /> : null}

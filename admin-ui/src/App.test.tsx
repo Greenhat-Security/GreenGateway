@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -312,7 +313,7 @@ describe('AdminShell', () => {
     expect(
       await screen.findByRole('heading', {
         level: 2,
-        name: 'Rule table',
+        name: 'Rulebase',
       }),
     ).toBeTruthy();
   });
@@ -441,7 +442,7 @@ describe('AdminShell', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByText('Preview and register generated tools')).toBeTruthy();
+    expect(screen.getByText('Review OpenAPI tools before registration')).toBeTruthy();
   });
 
   it('registers the identity directory route and navigation entry', async () => {
@@ -562,7 +563,12 @@ describe('AdminShell', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByRole('link', { name: 'History' })).toBeTruthy();
+    expect(
+      within(screen.getByRole('navigation', { name: 'Admin sections' })).getByRole(
+        'link',
+        { name: 'History' },
+      ),
+    ).toBeTruthy();
     expect(
       await screen.findByRole('heading', {
         level: 2,
@@ -580,7 +586,12 @@ describe('AdminShell', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByRole('link', { name: 'Shadow review' })).toBeTruthy();
+    expect(
+      within(screen.getByRole('navigation', { name: 'Admin sections' })).getByRole(
+        'link',
+        { name: 'Shadow review' },
+      ),
+    ).toBeTruthy();
     expect(
       screen.getByRole('heading', {
         level: 1,
