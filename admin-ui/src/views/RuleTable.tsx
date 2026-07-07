@@ -50,6 +50,7 @@ export function RuleTable() {
     null,
   );
   const [draggingRuleId, setDraggingRuleId] = useState<string | null>(null);
+  const [orderAnnouncement, setOrderAnnouncement] = useState('');
 
   useEffect(() => {
     let isCurrent = true;
@@ -168,7 +169,30 @@ export function RuleTable() {
       return;
     }
 
-    setMutatingRuleId(draggingRuleId);
+    await saveRuleOrder(nextOrder, draggingRuleId);
+  }
+
+  async function moveRule(row: RuleRow, offset: -1 | 1) {
+    const currentEtag = etag;
+    if (!policy || !canWritePolicy || currentEtag === null) {
+      return;
+    }
+
+    const nextOrder = ruleOrderAfterMove(policy.rules, row.id, offset);
+    if (nextOrder.length === 0 || sameOrder(nextOrder, rows.map((item) => item.id))) {
+      return;
+    }
+
+    await saveRuleOrder(nextOrder, row.id);
+  }
+
+  async function saveRuleOrder(nextOrder: string[], movingRuleId: string) {
+    const currentEtag = etag;
+    if (!policy || !canWritePolicy || currentEtag === null) {
+      return;
+    }
+
+    setMutatingRuleId(movingRuleId);
     setMutationError(null);
 
     try {
@@ -181,6 +205,12 @@ export function RuleTable() {
               rules: reorderRulesById(current.rules, response.value.order),
             }
           : current,
+      );
+      const nextPriority = response.value.order.indexOf(movingRuleId) + 1;
+      setOrderAnnouncement(
+        nextPriority > 0
+          ? `Moved ${movingRuleId} to priority ${nextPriority}.`
+          : `Moved ${movingRuleId}.`,
       );
     } catch (error) {
       handleMutationError(error);
@@ -244,6 +274,9 @@ export function RuleTable() {
         {rows.length > 0 ? (
           <p className="rule-order-note">Rules are evaluated top to bottom. First match wins.</p>
         ) : null}
+        <p className="sr-only" role="status" aria-live="polite">
+          {orderAnnouncement}
+        </p>
 
         {loadError ? <PolicyErrorMessage error={loadError} /> : null}
         {showWritePermissionNotice ? <PolicyWritePermissionNotice /> : null}
@@ -307,13 +340,22 @@ export function RuleTable() {
                       void dropRule(row.id);
                     }}
                   >
-                    <td className="rule-priority-cell">
+                    <td className="rule-priority-cell" data-label="Priority">
                       <span className="rule-priority">#{row.index + 1}</span>
-                      <span className="rule-drag-handle" aria-label={`Reorder rule ${row.id}`}>
-                        ::
-                      </span>
+                      <RuleOrderControls
+                        row={row}
+                        rowCount={rows.length}
+                        canWritePolicy={canWritePolicy}
+                        isMutating={mutatingRuleId === row.id}
+                        onMoveUp={() => {
+                          void moveRule(row, -1);
+                        }}
+                        onMoveDown={() => {
+                          void moveRule(row, 1);
+                        }}
+                      />
                     </td>
-                    <td>
+                    <td data-label="Rule">
                       <Link
                         aria-label={`Edit rule ${row.id}`}
                         className="rule-name-link"
@@ -322,32 +364,32 @@ export function RuleTable() {
                         {row.id}
                       </Link>
                     </td>
-                    <td>
+                    <td data-label="Scope">
                       <span className="badge neutral">{ruleScope(row.rule)}</span>
                     </td>
-                    <td>{formatPrincipal(row.rule.principal)}</td>
-                    <td>
+                    <td data-label="Source">{formatPrincipal(row.rule.principal)}</td>
+                    <td data-label="Destination">
                       <code className="endpoint-template rule-path">
                         {ruleTarget(row.rule)}
                       </code>
                     </td>
-                    <td>
+                    <td data-label="Condition">
                       <span className="rule-condition-summary">
                         {ruleCondition(row.rule)}
                       </span>
                     </td>
-                    <td>
+                    <td data-label="Action">
                       <ActionBadge action={row.rule.action} />
                     </td>
-                    <td>
+                    <td data-label="Mode">
                       <RuleModeBadge rule={row.rule} />
                     </td>
-                    <td className="rule-evidence-cell">
+                    <td className="rule-evidence-cell" data-label="Evidence">
                       <span className="numeric-cell">
                         {formatRuleHits(hits[row.id] ?? 0)}
                       </span>
                     </td>
-                    <td>
+                    <td data-label="Operations">
                       <div className="rule-operations">
                         <RuleEnabledSwitch
                           row={row}
@@ -507,6 +549,55 @@ function RuleEnabledSwitch({
   );
 }
 
+function RuleOrderControls({
+  row,
+  rowCount,
+  canWritePolicy,
+  isMutating,
+  onMoveUp,
+  onMoveDown,
+}: {
+  row: RuleRow;
+  rowCount: number;
+  canWritePolicy: boolean;
+  isMutating: boolean;
+  onMoveUp: () => void;
+  onMoveDown: () => void;
+}) {
+  if (!canWritePolicy) {
+    return null;
+  }
+
+  return (
+    <div className="rule-order-controls" aria-label={`Reorder rule ${row.id}`}>
+      <button
+        type="button"
+        className="rule-order-button"
+        aria-label={`Move rule ${row.id} up`}
+        title={`Move rule ${row.id} up`}
+        disabled={!canWritePolicy || isMutating || row.index === 0}
+        onClick={onMoveUp}
+      >
+        <span className="rule-order-icon" aria-hidden="true">
+          ↑
+        </span>
+      </button>
+      <button
+        type="button"
+        className="rule-order-button"
+        aria-label={`Move rule ${row.id} down`}
+        title={`Move rule ${row.id} down`}
+        disabled={!canWritePolicy || isMutating || row.index >= rowCount - 1}
+        onClick={onMoveDown}
+      >
+        <span className="rule-order-icon" aria-hidden="true">
+          ↓
+        </span>
+      </button>
+    </div>
+  );
+}
+
 function RuleDeleteControl({
   row,
   canWritePolicy,
@@ -649,6 +740,25 @@ export function ruleOrderAfterDrop(
   const targetIndex = withoutDragged.indexOf(targetRuleId);
   withoutDragged.splice(targetIndex, 0, draggedRuleId);
   return withoutDragged;
+}
+
+export function ruleOrderAfterMove(
+  rules: PolicyRule[],
+  ruleId: string,
+  offset: -1 | 1,
+): string[] {
+  const ids = rules.map(policyRuleId);
+  const currentIndex = ids.indexOf(ruleId);
+  const nextIndex = currentIndex + offset;
+
+  if (currentIndex === -1 || nextIndex < 0 || nextIndex >= ids.length) {
+    return [];
+  }
+
+  const nextOrder = [...ids];
+  const [moved] = nextOrder.splice(currentIndex, 1);
+  nextOrder.splice(nextIndex, 0, moved);
+  return nextOrder;
 }
 
 function reorderRulesById(rules: PolicyRule[], order: string[]): PolicyRule[] {

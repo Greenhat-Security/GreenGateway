@@ -95,6 +95,19 @@ test('captures the rule table in light and dark themes', async ({ page }) => {
     fullPage: true,
   });
 
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/admin/rules');
+  await expect(page.getByText('allow-billing-reader')).toBeVisible();
+  const mobileTableBox = await page.locator('.rule-table').boundingBox();
+  const mobileFrameBox = await page.locator('.table-scroll').boundingBox();
+  expect(mobileTableBox?.width).toBeLessThanOrEqual((mobileFrameBox?.width ?? 0) + 1);
+  await page.screenshot({
+    path: path.join(screenshotDir, 'rule-table-mobile.png'),
+    fullPage: true,
+  });
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+
   await page.getByRole('button', { name: 'Switch to dark theme' }).click();
   await page.screenshot({
     path: path.join(screenshotDir, 'rule-table-dark.png'),

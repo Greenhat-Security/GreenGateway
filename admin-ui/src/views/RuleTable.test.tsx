@@ -271,6 +271,70 @@ describe('RuleTable', () => {
     });
     expect(fetcher.reorderHeaders[0]).toBe('"etag-initial"');
   });
+
+  it('moves rules with accessible order buttons', async () => {
+    const fetcher = policyFetchMock({
+      policy: policyDocument({
+        rules: [
+          rule({ id: 'first', path: '/first', action: 'allow' }),
+          rule({ id: 'second', path: '/second', action: 'deny' }),
+          rule({ id: 'third', path: '/third', action: 'shadow' }),
+        ],
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderRuleTable();
+
+    expect(await screen.findByText('first')).toBeTruthy();
+    expect(
+      (screen.getByRole('button', { name: 'Move rule first up' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      (
+        screen.getByRole('button', {
+          name: 'Move rule third down',
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Move rule first down' }));
+
+    await waitFor(() => {
+      expect(fetcher.reorderBodies).toEqual([['second', 'first', 'third']]);
+    });
+    expect(fetcher.reorderHeaders[0]).toBe('"etag-initial"');
+  });
+
+  it('marks rule cells with responsive data labels', async () => {
+    const fetcher = policyFetchMock({
+      policy: policyDocument({
+        rules: [rule({ id: 'responsive-rule', path: '/responsive', action: 'allow' })],
+      }),
+      hits: { 'responsive-rule': 3 },
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderRuleTable();
+
+    const row = await screen.findByTestId('rule-row-responsive-rule');
+    expect(within(row).getByText('#1').closest('td')?.getAttribute('data-label')).toBe(
+      'Priority',
+    );
+    expect(
+      within(row)
+        .getByRole('link', { name: 'Edit rule responsive-rule' })
+        .closest('td')
+        ?.getAttribute('data-label'),
+    ).toBe('Rule');
+    expect(within(row).getByText('/responsive').closest('td')?.getAttribute('data-label')).toBe(
+      'Destination',
+    );
+    expect(within(row).getByText('3 hits').closest('td')?.getAttribute('data-label')).toBe(
+      'Evidence',
+    );
+  });
 });
 
 function renderRuleTable({

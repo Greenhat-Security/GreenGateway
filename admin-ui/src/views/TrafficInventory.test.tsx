@@ -253,6 +253,50 @@ describe('TrafficInventory', () => {
     ).toBeNull();
   });
 
+  it('marks traffic table cells with responsive data labels', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        jsonResponse(200, {
+          endpoints: [
+            trafficEndpoint({
+              method: 'GET',
+              endpoint_template: '/responsive',
+              call_count: 64,
+              distinct_principal_count: 8,
+              status_counts: [
+                { status: 200, count: 60 },
+                { status: 500, count: 4 },
+              ],
+            }),
+          ],
+          next_cursor: null,
+        }),
+      ),
+    );
+
+    renderTrafficInventory();
+
+    const endpointLink = await screen.findByRole('link', {
+      name: 'View detail for GET /responsive',
+    });
+    const row = endpointLink.closest('tr');
+    expect(row).not.toBeNull();
+    expect(endpointLink.closest('td')?.getAttribute('data-label')).toBe('Endpoint');
+    expect(screen.getByText('64').closest('td')?.getAttribute('data-label')).toBe(
+      'Volume',
+    );
+    expect(screen.getByText('6.3%').closest('td')?.getAttribute('data-label')).toBe(
+      'Error rate',
+    );
+    expect(screen.getByText('8').closest('td')?.getAttribute('data-label')).toBe(
+      'Principals',
+    );
+    expect(screen.getByText('Unreviewed').closest('td')?.getAttribute('data-label')).toBe(
+      'Review',
+    );
+  });
+
   it.each([
     {
       status: 401,

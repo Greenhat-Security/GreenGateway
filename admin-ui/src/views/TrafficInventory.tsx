@@ -344,19 +344,19 @@ export function TrafficInventory() {
                         key={key}
                         className={`event-row ${index % 2 === 1 ? 'is-even' : ''}`}
                       >
-                        <td>
+                        <td data-label="Endpoint">
                           <EndpointCell endpoint={endpoint} />
                         </td>
-                        <td className="numeric-cell">
+                        <td className="numeric-cell" data-label="Volume">
                           {formatCount(endpoint.call_count)}
                         </td>
-                        <td className="numeric-cell">
+                        <td className="numeric-cell" data-label="Error rate">
                           {formatErrorRate(endpoint.status_counts)}
                         </td>
-                        <td className="numeric-cell">
+                        <td className="numeric-cell" data-label="Principals">
                           {formatCount(endpoint.distinct_principal_count)}
                         </td>
-                        <td>
+                        <td data-label="Last seen">
                           <time
                             className="timestamp-cell"
                             dateTime={endpoint.last_seen}
@@ -365,7 +365,7 @@ export function TrafficInventory() {
                             {formatRelativeTimestamp(endpoint.last_seen)}
                           </time>
                         </td>
-                        <td>
+                        <td data-label="Review">
                           <div className="review-cell">
                             <ReviewBadge reviewed={endpoint.reviewed} />
                             <button
