@@ -20,6 +20,7 @@ RUN mkdir -p gateway/src \
     && rm -rf gateway/src
 
 COPY admin-ui admin-ui
+COPY docs/schemas docs/schemas
 COPY gateway gateway
 
 RUN cargo build --release -p gateway

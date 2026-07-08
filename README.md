@@ -32,6 +32,7 @@
 - [Quick Start](#quick-start)
   - [Option 1: Cargo](#option-1-cargo-for-development)
   - [Option 2: Docker Compose](#option-2-docker-compose)
+  - [Option 3: One-click Cloudflare deploy](#option-3-one-click-cloudflare-deploy)
 - [Configuration](#configuration)
 - [Contributing](#contributing)
 - [License](#license)
@@ -196,6 +197,14 @@ To exercise the authenticated dev stack, including an end-to-end proxy request t
 ```sh
 node scripts/generate-traffic.mjs --smoke-test
 ```
+
+### Option 3: One-click Cloudflare deploy
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Greenhat-Security/GreenGateway)
+
+This deploys a Cloudflare Worker that routes traffic to GreenGateway running inside a Cloudflare Container built from the existing `Dockerfile`.
+
+Cloudflare Containers require a Workers Paid plan, and the first deploy can take a few minutes while Cloudflare builds and provisions the image. See [docs/deployment/cloudflare.md](docs/deployment/cloudflare.md) for configuration, limitations, and manual deploy commands.
 
 ## Configuration
 
