@@ -14,9 +14,12 @@ build/
 .next/
 .vercel/
 coverage/
+/.wrangler/
+cloudflare-env.d.ts
 
 # Environment
 .env
+.dev.vars
 .env.local
 .env.*.local
 !.env.example
