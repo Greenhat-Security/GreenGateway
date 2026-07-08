@@ -7,20 +7,20 @@
 ### A universal MCP + API gateway you self-host
 
 [![License: Source-available](https://img.shields.io/badge/License-Source--available-blue.svg?style=flat-square)](LICENSE)
-[![Status](https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square)](#project-status)
+[![Status](https://img.shields.io/badge/status-alpha-blue?style=flat-square)](#project-status)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-DEA584?style=flat-square&logo=rust&logoColor=black)](gateway)
 [![Roadmap](https://img.shields.io/badge/roadmap-7%20phases-blueviolet?style=flat-square)](https://github.com/Greenhat-Security/GreenGateway/issues/44)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
 
 **Auth, authorization, audit, and traffic visibility in front of any API or MCP server — without hand-rolling a control plane yourself.**
 
-[What's Real Today](#whats-real-today) · [Planned Scope](#planned-scope) · [Quick Start](#quick-start) · [Architecture](#architecture-sketch) · [Contributing](#contributing)
+[What's Real Today](#whats-real-today) · [Planned Scope](#planned-scope) · [Quick Start](#quick-start) · [Wiki](https://greenhatsec.com/green-gateway/wiki) · [Architecture](#architecture-sketch) · [Contributing](#contributing)
 
 </div>
 
 ---
 
-> **Community project by [Greenhat-Security](https://github.com/Greenhat-Security).** GreenGateway (GG) is pre-alpha, self-hosted, and source-available under the Apache License 2.0 with the Commons Clause. It is not production ready. See [Project Status](#project-status) before evaluating it for anything real.
+> **Community project by [Greenhat-Security](https://github.com/Greenhat-Security).** GreenGateway (GG) is alpha, self-hosted, and source-available under the Apache License 2.0 with the Commons Clause. Core flows are expected to work for evaluation and guided self-hosting, but GG is not production-hardened yet. See [Project Status](#project-status) before evaluating it for anything real.
 
 ## Table of Contents
 
@@ -33,6 +33,7 @@
   - [Option 1: Cargo](#option-1-cargo-for-development)
   - [Option 2: Docker Compose](#option-2-docker-compose)
   - [Option 3: One-click Cloudflare deploy](#option-3-one-click-cloudflare-deploy)
+- [User Guide / Wiki](https://greenhatsec.com/green-gateway/wiki)
 - [Configuration](#configuration)
 - [Contributing](#contributing)
 - [License](#license)
@@ -47,11 +48,11 @@ It is designed to sit between clients and existing HTTP backends or MCP servers,
 
 ## Project Status
 
-**GreenGateway is pre-alpha and under active initial development.** It is not production ready yet.
+**GreenGateway is now alpha.** The core gateway, admin UI, discovery, visual rule builder, native MCP support, identity/auth surface, and one-click Cloudflare deploy path are expected to work for evaluation and guided self-hosting. It is still alpha software and not production-hardened yet.
 
 Development follows a 7-phase roadmap. **Phase 6 (native MCP protocol support) is v1-complete**, and the core gateway/security/discovery/rule-builder/identity surface across the roadmap exists today: a real security middleware stack, authentication, a hot-reloadable RBAC engine (including shadow-enforcement, observe-only auth modes, and data-driven direct firewall rules), an egress firewall with policy-driven overrides, a full audit/observability pipeline, a streaming reverse proxy with multi-upstream routing and per-upstream settings, a complete policy administration API (read/replace/validate, granular rule operations, and rule preview against historical traffic), full traffic discovery — endpoint inventory, a discovery UI, OpenAPI-based and inferred schema conformance checking, and a deterministic anomaly-signal engine with detectors, admin API, SSE surfacing, and UI — a complete visual rule builder — traffic-derived rule suggestions, a visual rule table/editor with live historical preview and one-click create-from-context, versioned policy history with rollback, and a shadow-mode review queue with real would-deny data and one-click promote/disable — native MCP protocol support — a gateway-owned `/mcp` endpoint, dynamic tool registry, JSON Schema validation, upstream MCP proxying, OpenAPI-to-tools generation, client conformance coverage, and MCP tool traffic discovery/rule-builder integration — and full identity/auth integration — pluggable OIDC providers with discovery, a generic cookie-session validator, managed API/service tokens, a directory and UI of every user and bot that has traversed the gateway with a principal drill-down and identity-based rule shortcuts, and operator SSO login (authorization-code + PKCE) into the admin dashboard with role-gated admin actions attributed to the operator's real identity in the audit trail (see [What's Real Today](#whats-real-today)). The remaining open roadmap checkbox is #11 PR3: a feature-flagged Postgres audit sink for multi-instance deployments; the SQLite audit sink and admin query API are already present.
 
-Progress is tracked in the pinned roadmap issue: [Roadmap / project plan (#44)](https://github.com/Greenhat-Security/GreenGateway/issues/44).
+Progress is tracked in the pinned roadmap issue: [Roadmap / project plan (#44)](https://github.com/Greenhat-Security/GreenGateway/issues/44). For setup, zero-trust rollout guidance, use cases, and operator reference docs, read the [GreenGateway wiki](https://greenhatsec.com/green-gateway/wiki).
 
 ## What's Real Today
 
@@ -227,7 +228,7 @@ Provider-specific `AUTH_PROVIDERS` recipes for Keycloak, Auth0, Microsoft Entra 
 
 ## Contributing
 
-GreenGateway is a pre-alpha project — contributions may involve documentation, governance, and architecture work as much as implementation. Full guidelines live in [CONTRIBUTING.md](CONTRIBUTING.md).
+GreenGateway is an alpha project — contributions may involve documentation, deployment hardening, governance, and architecture work as much as implementation. Full guidelines live in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Work is tracked as checklist items on GitHub issues, one issue per feature area, sized so each checklist item maps to one focused pull request. Start with the pinned roadmap to find open work: [Roadmap / project plan (#44)](https://github.com/Greenhat-Security/GreenGateway/issues/44).
 
