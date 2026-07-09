@@ -6,11 +6,11 @@ This is the orientation doc for anyone, human or AI agent, picking up an issue i
 
 ## Project Summary
 
-GreenGateway is a source-available, self-hosted universal MCP and API gateway written in Rust. It is intended to point at any HTTP backend, enforce authentication and authorization on every call, discover traffic, support a visual rule builder, and provide native MCP support.
+GreenGateway is an open-source, self-hosted universal MCP and API gateway written in Rust. It is intended to point at any HTTP backend, enforce authentication and authorization on every call, discover traffic, support a visual rule builder, and provide native MCP support.
 
 ## Current Repo State And Intended Structure
 
-GreenGateway is pre-alpha, and code is landing incrementally according to the project roadmap. This repository may temporarily look sparse while foundational work lands through separate issues and pull requests.
+GreenGateway is alpha software, and code is landing incrementally according to the project roadmap. This repository may temporarily look sparse while foundational work lands through separate issues and pull requests.
 
 The intended structure will look roughly like a Rust Cargo workspace with a gateway binary crate plus focused library crates for concerns such as middleware and hardening, authentication, RBAC and policy enforcement, egress firewalling, and audit. Issues #3 through #9 are the authoritative source for how that structure actually lands, including the initial workspace scaffold, CI, and subsequent porting work.
 

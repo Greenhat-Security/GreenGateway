@@ -4,133 +4,80 @@
 
 # GreenGateway (GG)
 
-### A universal MCP + API gateway you self-host
+### Open-source security gateway for APIs, MCP servers, and AI-agent traffic
 
-[![License: Source-available](https://img.shields.io/badge/License-Source--available-blue.svg?style=flat-square)](LICENSE)
-[![Status](https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square)](#project-status)
-[![Rust](https://img.shields.io/badge/built%20with-Rust-DEA584?style=flat-square&logo=rust&logoColor=black)](gateway)
-[![Roadmap](https://img.shields.io/badge/roadmap-7%20phases-blueviolet?style=flat-square)](https://github.com/Greenhat-Security/GreenGateway/issues/44)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
+[![Status](https://img.shields.io/badge/status-alpha-blue?style=flat-square)](#project-status)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-DEA584?style=flat-square&logo=rust&logoColor=black)](gateway)
+[![MCP](https://img.shields.io/badge/MCP-ready-22c55e?style=flat-square)](#mcp-support)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
 
-**Auth, authorization, audit, and traffic visibility in front of any API or MCP server — without hand-rolling a control plane yourself.**
+**Put authentication, RBAC, audit logs, traffic discovery, visual firewall rules, shadow mode, and egress controls in front of any API or MCP server.**
 
-[What's Real Today](#whats-real-today) · [Planned Scope](#planned-scope) · [Quick Start](#quick-start) · [Architecture](#architecture-sketch) · [Contributing](#contributing)
+[Quick Start](#quick-start) | [Why GreenGateway](#why-greengateway) | [Demo](#demo-shadow-mode-for-api-firewall-rules) | [Use Cases](#use-cases) | [Features](#features) | [MCP Support](#mcp-support) | [Configuration](#configuration) | [Contributing](#contributing)
 
 </div>
 
 ---
 
-> **Community project by [Greenhat-Security](https://github.com/Greenhat-Security).** GreenGateway (GG) is pre-alpha, self-hosted, and source-available under the Apache License 2.0 with the Commons Clause. It is not production ready. See [Project Status](#project-status) before evaluating it for anything real.
+## Why GreenGateway?
 
-## Table of Contents
+AI agents, MCP clients, internal tools, and automation workflows are starting to call real business systems.
 
-- [What GreenGateway Is](#what-greengateway-is)
-- [Project Status](#project-status)
-- [What's Real Today](#whats-real-today)
-- [Planned Scope](#planned-scope)
-- [Architecture Sketch](#architecture-sketch)
-- [Quick Start](#quick-start)
-  - [Option 1: Cargo](#option-1-cargo-for-development)
-  - [Option 2: Docker Compose](#option-2-docker-compose)
-- [Configuration](#configuration)
-- [Contributing](#contributing)
-- [License](#license)
+That creates a new security problem:
 
----
+- Which human, bot, service account, or AI agent called this API?
+- Which MCP tools should each identity be allowed to use?
+- What happens if an agent tries to call an admin endpoint?
+- Can you audit every request, decision, and outcome?
+- Can you test new rules before blocking production traffic?
+- Can you protect existing services without rebuilding every backend?
 
-## What GreenGateway Is
-
-GreenGateway — GG for short — is a source-available, self-hosted universal MCP and API gateway for teams that want authentication, authorization, traffic visibility, and a visual firewall in front of any API or MCP server, without hand-rolling that control plane themselves.
-
-It is designed to sit between clients and existing HTTP backends or MCP servers, learn what is being used, and turn that traffic into enforceable, reviewable rules.
-
-## Project Status
-
-**GreenGateway is pre-alpha and under active initial development.** It is not production ready yet.
-
-Development follows a 7-phase roadmap. **Phase 6 (native MCP protocol support) is v1-complete**, and the core gateway/security/discovery/rule-builder/identity surface across the roadmap exists today: a real security middleware stack, authentication, a hot-reloadable RBAC engine (including shadow-enforcement, observe-only auth modes, and data-driven direct firewall rules), an egress firewall with policy-driven overrides, a full audit/observability pipeline, a streaming reverse proxy with multi-upstream routing and per-upstream settings, a complete policy administration API (read/replace/validate, granular rule operations, and rule preview against historical traffic), full traffic discovery — endpoint inventory, a discovery UI, OpenAPI-based and inferred schema conformance checking, and a deterministic anomaly-signal engine with detectors, admin API, SSE surfacing, and UI — a complete visual rule builder — traffic-derived rule suggestions, a visual rule table/editor with live historical preview and one-click create-from-context, versioned policy history with rollback, and a shadow-mode review queue with real would-deny data and one-click promote/disable — native MCP protocol support — a gateway-owned `/mcp` endpoint, dynamic tool registry, JSON Schema validation, upstream MCP proxying, OpenAPI-to-tools generation, client conformance coverage, and MCP tool traffic discovery/rule-builder integration — and full identity/auth integration — pluggable OIDC providers with discovery, a generic cookie-session validator, managed API/service tokens, a directory and UI of every user and bot that has traversed the gateway with a principal drill-down and identity-based rule shortcuts, and operator SSO login (authorization-code + PKCE) into the admin dashboard with role-gated admin actions attributed to the operator's real identity in the audit trail (see [What's Real Today](#whats-real-today)). The remaining open roadmap checkbox is #11 PR3: a feature-flagged Postgres audit sink for multi-instance deployments; the SQLite audit sink and admin query API are already present.
-
-Progress is tracked in the pinned roadmap issue: [Roadmap / project plan (#44)](https://github.com/Greenhat-Security/GreenGateway/issues/44).
-
-## What's Real Today
-
-This is what's actually built and working today across the roadmap:
-
-| Area | What's implemented |
-| --- | --- |
-| **Gateway server** | Rust/axum binary exposing `GET /health`, `GET /version`, `GET /metrics` (Prometheus), with an optional second listener (`ADMIN_LISTEN_ADDR`) to keep the control plane off the data path |
-| **Security middleware** | Request-ID + tracing, config-driven CORS, security-header hardening, token-bucket rate limiting (global lanes plus policy-driven per-principal/per-endpoint overrides), body-size/content-type validation, double-submit CSRF — in an asserted, fixed order |
-| **Authentication** | A `Principal` model with pluggable, chained session validators: an ordered `AUTH_PROVIDERS` list of JWKS-backed JWT validators (RS256/ES256/EdDSA, direct JWKS URL or OIDC discovery by issuer, per-provider audience enforcement, configurable — including nested-path and delimiter-split — roles/org claim mapping), a generic cookie-session validator (introspection-backed, cache-hygiene hardened), plus hash-at-rest service tokens (API keys) with their own admin-managed lifecycle; fails closed by default, with an `AUTH_MODE=observe` option to authenticate without blocking while rolling out credentials |
-| **Identity directory** | Every authenticated principal (human or bot) that traverses the gateway is persisted asynchronously off the request hot path (subject, issuer, auth method, email/org, first/last seen, request count), queryable via a paginated admin API and an Identity UI directory table plus a per-principal drill-down (endpoints touched, rules hit, anomaly history) with an identity-based "block this principal" shortcut flowing directly into the rule builder |
-| **Admin UI SSO** | Operators sign into the admin dashboard via their configured IdP using a real authorization-code + PKCE flow (RFC 7636 S256, no fallback to `plain`), with the resulting token validated by the same bearer-token pipeline as any other credential; admin actions are gated by the same granular RBAC permission model as every other admin endpoint and attributed to the operator's real identity (subject, email) in the audit trail; the pre-existing manual paste-a-token flow still works as a fallback |
-| **Authorization** | A deny-by-default RBAC policy engine with config-driven route-to-permission rules, data-driven direct firewall rules (fuzz-tested, anchored glob/`{param}` path matching, first-match-wins) with an `action: shadow` per-rule override that logs would-be denials without blocking, and hot reload (file-watch + `SIGHUP`) with validate-before-swap so an invalid edit never takes down the last-known-good policy |
-| **Reverse proxy** | A multi-upstream routing table (longest-prefix and host-based selection, per-upstream timeouts, request header add/strip rules, and custom TLS trust bundles), or a single catch-all `UPSTREAM_URL` for simple deployments — all HTTP verbs, streamed responses and binary bodies, hop-by-hop header stripping, request-id propagation, a 502/504 error taxonomy, per-upstream health reporting, and upstream latency recorded on every observation event. Gateway-owned routes (health/version/metrics, the admin UI and its API) always take precedence over the proxy, and the admin surface's own path is remappable via `ADMIN_PREFIX` |
-| **Native MCP support** | A gateway-owned `/mcp` streamable-HTTP endpoint handles MCP `initialize`, `tools/list`, and `tools/call` flows through the same auth/RBAC middleware; optional OAuth protected-resource metadata advertises MCP resource binding; `TOOLS_FILE` provides a dynamic tool registry with strict JSON Schema validation and a bounded tool runtime; configured upstream MCP servers can be discovered and proxied with namespaced tools; OpenAPI-to-tools preview/register APIs are present, with upstream API-key header injection still a known limitation for generated tools that require it; MCP client conformance coverage exercises the native endpoint; MCP tool observations feed discovery/anomaly inventory and the visual rule-builder create-from-tool workflow; SEP-1319 task-style `tools/call` requests are explicitly rejected in GreenGateway-owned code with audit/inventory coverage until async task execution becomes a post-v1 feature |
-| **Egress firewall** | An SSRF-hardened outbound HTTP client: host allowlisting (including policy-driven wildcard host globs and CIDR-scoped private-IP exceptions), private/special-use IP blocking (including IPv4-mapped-IPv6/NAT64), pinned-IP resolution with a fresh, per-request DNS resolve to close rebinding windows |
-| **Audit pipeline** | A versioned audit-event envelope with SHA-256 redaction, delivered asynchronously off the request hot path |
-| **Queryable audit store** | A SQLite audit sink (batched writes, retention pruning) with an admin API — `GET /v1/admin/audit` — supporting time-range, event-type, actor, path, and status filters with keyset pagination |
-| **Live event feed** | Server-Sent Events at `GET /v1/admin/events/stream`, backed by an in-process broadcast sink with backpressure handling |
-| **Policy administration** | A complete policy CRUD API: whole-policy read/replace/validate (ETag-guarded against concurrent edits), granular per-rule create/update/delete/reorder operations with an audit trail, and rule preview — evaluate a candidate rule against historical traffic before committing it, plus per-rule historical hit counts — all through protected, permission-gated `/v1/admin/policy*` APIs |
-| **Endpoint discovery** | Path templating that normalizes concrete request paths into stable endpoint shapes (`/users/123` → `/users/{id}`) with cardinality-explosion guards, and a background aggregator that rolls per-endpoint call counts, status distribution, latency percentiles, and distinct-principal counts into a queryable SQLite store — entirely off the request hot path |
-| **Traffic endpoint inventory** | Optional SQLite discovery aggregation (`DISCOVERY_SQLITE_PATH`) with admin APIs for listing endpoint templates, viewing per-endpoint principals, time-series counts, recent raw events, review state, "new since" lifecycle flags, and active-policy direct-rule coverage |
-| **Schema awareness** | Optional OpenAPI 3.x ingestion per upstream matched against observed endpoints (undocumented endpoints, unused operations); opt-in, off-by-default, redaction-aware payload-shape sampling (`PAYLOAD_CAPTURE_ENABLED`); request-shape inference from captured samples when no spec is configured; and request-time conformance checking that flags missing required query params/JSON body keys or undocumented calls, rolling up a `schema_mismatch_count` per endpoint |
-| **Anomaly signals** | A deterministic (not ML) signal engine with lifecycle (open/acknowledged/dismissed) and structured evidence, evaluated entirely off the request hot path: `new_endpoint_seen`, `schema_mismatch`, `error_rate_spike`, `principal_new_to_endpoint`, and `volume_outlier`, each with configurable thresholds; an admin API to list/filter/acknowledge/dismiss; and live `signal.opened`/`signal.lifecycle_changed` events on the SSE feed |
-| **Rule suggestions** | A suggestion engine (evaluated off the request hot path) generating baseline `allow` suggestions from the observed role/endpoint matrix and anomaly-derived `deny`/`shadow` suggestions from open discovery signals, deduplicated against existing policy coverage, with an admin API to list/accept/dismiss |
-| **Visual rule builder** | A rule table (drag-reorder, enable/disable, per-rule hit counts, action color coding) and a rule editor (visual matcher builder with a debounced live preview against historical traffic before saving) — full rule lifecycle without touching JSON, plus one-click create-from-context from a traffic endpoint, a live-tail event, or an anomaly signal |
-| **Policy versioning & rollback** | Every policy mutation appends an append-only, actor/timestamp/diff-stamped version to a dedicated store; a version-history timeline UI with human-readable per-action diffs and one-click rollback validated against the current live policy ETag |
-| **Shadow-mode review** | A review queue over the direct-firewall-rule engine's live `action: shadow` enforcement — real would-deny counts, affected principals, and sample requests per shadow rule, aggregated in a single bounded scan, with one-click promote (behind an explicit confirmation) and disable |
-| **Admin UI** | An embedded Vite + React + TypeScript app, built into the binary and served at `/admin` (or `ADMIN_PREFIX`): a log explorer, live tail, a traffic inventory table and per-endpoint drill-down (with schema-mismatch and signal badges), a signals view (filter, evidence, acknowledge/dismiss, live updates), the visual rule builder and policy-history/shadow-review views above, and a status page reporting real running-config values |
-| **Local dev harness** | Checked-in JWKS/RBAC fixtures, a `docker-compose.dev.yml` profile that brings up a fully authenticated gateway with a sample echo upstream in one command, and a traffic-generator smoke test |
-
-None of this requires a real backend to try — the dev harness in [Quick Start](#quick-start) is self-contained.
-
-## Planned Scope
-
-Everything below is roadmap and vision beyond what's listed in [What's Real Today](#whats-real-today). Phase 6 is now v1-complete; the remaining tracked roadmap gap is #11 PR3, and longer-term MCP follow-ups are tracked separately from the v1 MCP endpoint work in the [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44):
-
-| Area | Capability | Status |
-| --- | --- | --- |
-| Audit store follow-up | Feature-flagged Postgres audit sink for multi-instance deployments | Open on #11; SQLite audit durability and the admin query API are complete today |
-| MCP follow-ups | Async SEP-1319 task execution and upstream API-key injection for generated OpenAPI tools | Post-v1: task-style `tools/call` is deliberately rejected today with policy/audit/inventory semantics, and generated-tool API-key injection remains a known limitation |
-
-Do not evaluate GG today assuming any capability not explicitly listed in [What's Real Today](#whats-real-today) already works.
-
-## Architecture Sketch
+GreenGateway sits between clients and your APIs or MCP servers, learns how traffic is being used, and turns that traffic into enforceable, reviewable security controls.
 
 ```text
-client
-  |
-  v
-GreenGateway
-  |-- auth: authenticate the caller
-  |-- authz/policy: evaluate RBAC and rules-as-data
-  |-- proxy/MCP: forward HTTP traffic or handle MCP protocol flows
-  |-- audit: record identity, request, decision, and outcome
-  |
-  v
-your backend API or MCP server
+Client, bot, or AI agent
+        |
+        v
++-------------------------+
+|      GreenGateway       |
+|-------------------------|
+| Auth                    |
+| RBAC                    |
+| Visual firewall rules   |
+| Shadow mode             |
+| Audit logs              |
+| Traffic discovery       |
+| Egress controls         |
+| MCP proxying            |
++-------------------------+
+        |
+        v
+Your API, service, or MCP server
 ```
 
-The HTTP half of the proxy layer above is real today — multi-upstream routing (or a single catch-all `UPSTREAM_URL`) forwards traffic, and rules-as-data (policy-driven RBAC and direct firewall rules, evaluated and hot-reloadable through a full CRUD API, with a visual builder, versioned history, and shadow-mode review on top) governs what's allowed. The MCP-protocol half is also real today through the native `/mcp` endpoint, bounded tool runtime, dynamic registry, upstream MCP proxying, OpenAPI-to-tools generation, conformance coverage, and discovery/rule-builder integration listed in [What's Real Today](#whats-real-today).
+## Demo: Shadow Mode for API Firewall Rules
+
+![Demo 2: Shadow mode for API firewall rules](docs/images/demo-shadow-mode.gif)
+
+GreenGateway can learn observed API traffic, draft a visual firewall rule from that traffic, run it in shadow mode, and preview the exact principals and requests that would be denied before enforcement is promoted.
 
 ## Quick Start
 
-GreenGateway currently includes a gateway server with `GET /health`, `GET /version`, `GET /metrics`, an embedded admin UI at `/admin` (traffic inventory, signals, log explorer, live tail, the visual rule builder, policy history, shadow review, status), a working reverse proxy — either a single catch-all `UPSTREAM_URL` or a full multi-upstream routing table — optional traffic discovery (endpoint inventory, schema awareness, anomaly signals) when `DISCOVERY_SQLITE_PATH` is set, and the native MCP support described in [What's Real Today](#whats-real-today). The remaining capabilities described in [Planned Scope](#planned-scope) are still roadmap work.
+The fastest way to try GreenGateway is the seeded Docker Compose development stack.
 
-For the full list of environment variables, see [docs/configuration.md](docs/configuration.md). As more variables land, that document and [.env.example](.env.example) are kept in sync with the code by an automated test.
+It starts:
 
-### Option 1: Cargo (for development)
-
-Local builds require Rust plus Node.js and npm on `PATH`, because `cargo build --workspace` builds and embeds the admin UI. This scaffold was tested with Node.js `v24.15.0` and npm `11.12.1`.
-
-`.env.example` documents the available environment variables and defaults; to override one today, set it in the real shell/process environment rather than sourcing a `.env` file.
+- GreenGateway
+- Embedded admin UI
+- Local JWKS fixture
+- Seeded RBAC policy
+- Internal echo upstream
+- SQLite-backed audit storage
+- Traffic-generator smoke test
 
 ```sh
-cargo build --workspace
-cargo run
-
-# Or, with a non-default listen address:
-LISTEN_ADDR=127.0.0.1:9090 cargo run
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
 In another terminal:
@@ -145,17 +92,295 @@ Expected response:
 {"status":"ok"}
 ```
 
-The embedded admin UI shell is available at:
+Open the admin UI:
 
-```sh
-curl http://localhost:8080/admin
+```text
+http://localhost:8080/admin
 ```
 
-For frontend development with hot reload, run the backend and Vite dev server side by side:
+Generate sample authenticated traffic:
+
+```sh
+node scripts/generate-traffic.mjs --smoke-test
+```
+
+The dev stack is self-contained. You do not need a real backend to test the gateway, admin UI, audit flow, rule builder, discovery features, or MCP surface.
+
+## What GreenGateway Is
+
+GreenGateway, GG for short, is an open-source, self-hosted security gateway for APIs and MCP servers.
+
+It is designed for teams that want identity-aware controls, traffic visibility, audit logs, and visual policy management before exposing internal systems to humans, bots, service accounts, or AI agents.
+
+GreenGateway can sit in front of:
+
+- HTTP APIs
+- Internal services
+- MCP servers
+- AI-agent tools
+- Automation backends
+- Developer or platform engineering services
+
+It can run as a lightweight local gateway, a Docker Compose deployment, or a containerized self-hosted service.
+
+## Use Cases
+
+### Secure MCP Servers
+
+Put GreenGateway in front of MCP servers so tools are not exposed directly to every client or agent.
+
+Use it to control:
+
+- Who can list tools
+- Who can call specific tools
+- Which tools are available to humans, bots, or agents
+- Which outbound hosts tools are allowed to reach
+- Which tool calls should be allowed, denied, shadowed, or audited
+
+### Protect Internal APIs
+
+Use GreenGateway as a security layer in front of existing HTTP APIs.
+
+It can proxy traffic, observe endpoint usage, build an endpoint inventory, and help convert real traffic into identity-aware access rules.
+
+### Roll Out API Firewall Rules Safely
+
+Start in observe or shadow mode, review what would have been denied, and then promote rules once you are confident.
+
+This helps teams move toward stricter access control without breaking valid traffic on day one.
+
+### Audit AI and Automation Traffic
+
+GreenGateway records who called what, which rule matched, what decision was made, and what happened.
+
+This gives security, engineering, platform, and compliance teams a clearer view of human, bot, service account, and AI-agent activity.
+
+## Features
+
+| Area | What GreenGateway provides |
+| --- | --- |
+| Gateway server | Rust/axum gateway with health, version, metrics, proxy, admin, and MCP surfaces |
+| Reverse proxy | HTTP proxying with upstream routing, header handling, request IDs, streamed responses, and latency tracking |
+| Authentication | JWT/OIDC-style authentication, service tokens, cookie-session validation, and observe mode |
+| Authorization | RBAC policy engine, direct firewall rules, deny-by-default support, hot reload, and shadow enforcement |
+| Admin UI | Embedded React/TypeScript admin dashboard served from the gateway |
+| Visual rule builder | Create, preview, reorder, enable, disable, and roll back rules without hand-editing JSON |
+| Shadow mode | Test deny rules without blocking traffic, then promote them when ready |
+| Audit logs | Queryable audit trail for requests, identities, policy decisions, and outcomes |
+| Traffic discovery | Endpoint inventory, observed principals, traffic history, review state, and active rule coverage |
+| Rule suggestions | Suggested allow, deny, and shadow rules based on observed traffic and anomaly signals |
+| Identity directory | Directory of humans, bots, and service accounts that have traversed the gateway |
+| MCP support | Native `/mcp` endpoint, tool registry, upstream MCP proxying, OpenAPI-to-tools, and MCP audit/discovery |
+| Egress firewall | Outbound host allowlists, private IP protections, and SSRF-focused controls |
+| Anomaly signals | Deterministic signals for new endpoints, schema mismatches, error spikes, new principal activity, and volume outliers |
+| Policy history | Versioned policy changes, rollback, and audit trail |
+| Local dev harness | Checked-in JWKS/RBAC fixtures, Docker Compose stack, and sample traffic generator |
+
+## MCP Support
+
+GreenGateway includes native MCP support through a gateway-owned `/mcp` endpoint.
+
+Current MCP capabilities include:
+
+- MCP `initialize`
+- `tools/list`
+- `tools/call`
+- Dynamic tool registry
+- JSON Schema validation
+- Upstream MCP server proxying
+- OpenAPI-to-tools preview/register APIs
+- MCP client conformance coverage
+- MCP traffic discovery
+- Rule-builder integration for MCP tool calls
+- Audit coverage for MCP activity
+
+This lets you apply the same identity, policy, audit, and traffic-review model to MCP tools that you use for HTTP APIs.
+
+## Visual Rule Builder
+
+GreenGateway includes a visual rule builder so operators do not need to hand-edit JSON policies for every change.
+
+You can:
+
+- View existing rules
+- Create rules from observed traffic
+- Drag and reorder rules
+- Enable or disable rules
+- Preview a rule against historical traffic
+- Review rule hit counts
+- Promote shadow rules into enforced rules
+- Roll back policy versions
+
+This is designed to make API and MCP security policy easier to review before enforcement.
+
+## Shadow Mode
+
+Shadow mode lets you test a rule without blocking traffic.
+
+When a rule is set to shadow mode, GreenGateway records what would have been denied while still allowing the request.
+
+Use shadow mode to:
+
+- Validate new access rules
+- Reduce rollout risk
+- Understand blast radius before enforcement
+- Build confidence before blocking production traffic
+- Show security reviewers what enforcement would do before turning it on
+
+## Audit and Discovery
+
+GreenGateway records security-relevant activity so teams can answer:
+
+- Who called this endpoint?
+- Which identity, service account, bot, or agent was used?
+- Which rule matched?
+- Was the request allowed, denied, or shadowed?
+- Which endpoints are new?
+- Which principals are touching which APIs?
+- Are there schema mismatches or unexpected calls?
+
+The audit and discovery features are designed to support security reviews, incident response, compliance evidence, and day-to-day operations.
+
+## Example Rollout
+
+A typical GreenGateway rollout looks like this:
+
+1. Put GreenGateway in front of an API or MCP server
+2. Start in observe mode while real traffic flows through
+3. Review discovered endpoints, callers, tools, and anomalies
+4. Generate suggested rules from observed behavior
+5. Preview rules against historical traffic
+6. Enable rules in shadow mode
+7. Review would-deny events
+8. Promote safe rules to enforcement
+9. Continue auditing and tuning over time
+
+## GreenGateway vs Traditional API Gateways
+
+Traditional API gateways are broad platforms for routing, load balancing, rate limiting, developer portals, API lifecycle management, plugins, and enterprise API operations.
+
+GreenGateway is narrower by design.
+
+It focuses on security workflows for APIs and MCP servers:
+
+- Identity-aware access rules
+- Traffic discovery before enforcement
+- Visual rule building
+- Shadow-mode rollout
+- Audit trails for human, bot, service account, and agent traffic
+- MCP tool governance
+- Egress controls for tool calls
+
+If you need a full enterprise API management platform, a mature gateway such as Kong may be a better fit.
+
+If you need a focused, self-hosted security control plane for internal APIs, MCP servers, and AI-agent traffic, GreenGateway may be a better starting point.
+
+## When to Use GreenGateway
+
+GreenGateway may be useful if you are:
+
+- Building with MCP servers
+- Giving AI agents access to internal tools
+- Exposing internal APIs to automation
+- Trying to add audit logs in front of existing services
+- Rolling out zero-trust controls for APIs
+- Reviewing which identities can access which endpoints
+- Building a safer control plane for bots, agents, and service accounts
+- Looking for a lightweight self-hosted layer before adopting a broader API platform
+
+## When Not to Use GreenGateway Yet
+
+GreenGateway is alpha software.
+
+Do not use it as your only production security control unless you have reviewed, tested, and hardened it for your own environment.
+
+You should not assume GreenGateway is production-ready for:
+
+- High-scale production traffic
+- Regulated production environments
+- Mission-critical enforcement
+- Multi-instance production deployments
+- Environments requiring formal vendor support
+
+The current project is best suited for evaluation, demos, development environments, guided self-hosting, and early adopters who can review and test the code.
+
+## Project Status
+
+GreenGateway is in alpha.
+
+The core gateway, admin UI, discovery, visual rule builder, native MCP support, and identity/auth surface are implemented for evaluation and guided self-hosting.
+
+The project is not production-hardened yet.
+
+Current status:
+
+| Area | Status |
+| --- | --- |
+| Core gateway | Implemented |
+| HTTP reverse proxy | Implemented |
+| Admin UI | Implemented |
+| JWT/OIDC-style auth | Implemented |
+| Service tokens | Implemented |
+| RBAC and direct firewall rules | Implemented |
+| Visual rule builder | Implemented |
+| Shadow-mode review | Implemented |
+| SQLite audit sink | Implemented |
+| Traffic discovery | Implemented |
+| Native MCP endpoint | Implemented |
+| MCP tool registry and upstream proxying | Implemented |
+| Egress firewall | Implemented |
+| Anomaly signals | Implemented |
+| Postgres audit sink for multi-instance deployments | Planned |
+| Additional MCP follow-ups | Planned |
+
+Progress is tracked in the pinned roadmap issue:
+
+```text
+https://github.com/Greenhat-Security/GreenGateway/issues/44
+```
+
+## Run with Cargo
+
+For local development, build and run the workspace:
+
+```sh
+cargo build --workspace
+cargo run
+```
+
+Check the gateway:
+
+```sh
+curl http://localhost:8080/health
+```
+
+Expected response:
+
+```json
+{"status":"ok"}
+```
+
+Run on a different address:
+
+```sh
+LISTEN_ADDR=127.0.0.1:9090 cargo run
+```
+
+Local builds require Rust plus Node.js and npm on `PATH`, because `cargo build --workspace` builds and embeds the admin UI.
+
+## Frontend Development
+
+The admin UI is a Vite + React + TypeScript app embedded into the gateway binary.
+
+For frontend development with hot reload, run the backend and frontend side by side.
+
+Terminal 1:
 
 ```sh
 cargo run
 ```
+
+Terminal 2:
 
 ```sh
 cd admin-ui
@@ -163,77 +388,171 @@ npm ci
 npm run dev
 ```
 
-Then open `http://127.0.0.1:5173/admin/`. The Vite dev server proxies `/v1/admin` requests to `http://127.0.0.1:8080` by default; set `GREENGATEWAY_BACKEND_URL` before `npm run dev` to target a different backend.
+Then open:
 
-### Option 2: Docker Compose
+```text
+http://127.0.0.1:5173/admin/
+```
+
+The Vite dev server proxies `/v1/admin` requests to `http://127.0.0.1:8080` by default.
+
+To target a different backend:
+
+```sh
+GREENGATEWAY_BACKEND_URL=http://127.0.0.1:9090 npm run dev
+```
+
+## Docker Compose
+
+Basic Docker Compose:
 
 ```sh
 docker compose up --build
 ```
 
-In another terminal:
-
-```sh
-curl http://localhost:8080/health
-```
-
-Expected response:
-
-```json
-{"status":"ok"}
-```
-
-For a seeded local development stack with JWT auth, RBAC, a JWKS sidecar, the embedded admin UI, and queryable SQLite audit storage, run:
+Seeded local development stack:
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
-This dev stack serves the checked-in local JWKS fixture from `dev/jwks/`, starts an internal-only echo upstream behind the gateway, loads `dev/policy.json`, and writes queryable audit events to an ephemeral SQLite database inside the gateway container. The admin UI shell remains available without a token at `http://localhost:8080/admin`; protected admin APIs and the seeded `/__dev-echo` proxy path require a dev JWT signed with `dev/jwks/dev-signing-key.pem`.
-
-To exercise the authenticated dev stack, including an end-to-end proxy request to the echo upstream, run:
-
-```sh
-node scripts/generate-traffic.mjs --smoke-test
-```
+The development stack includes JWT auth, RBAC, a JWKS sidecar, the embedded admin UI, an internal-only echo upstream, and queryable SQLite audit storage.
 
 ## Configuration
 
-GreenGateway reads all configuration from environment variables — no config files are required to run it. Every variable is documented with defaults, format, and validation behavior in [docs/configuration.md](docs/configuration.md), including:
+GreenGateway reads configuration from environment variables.
 
-- Server binding (`LISTEN_ADDR`)
-- Auth (`JWT_JWKS_URL`, `JWT_ISSUER`, `JWT_AUDIENCE`, `ROLES_CLAIM`, `AUTH_MODE`, ...)
-- RBAC (`POLICY_FILE`, `RBAC_EXEMPT_PATHS`)
-- Reverse proxy (`UPSTREAM_URL`, `ADMIN_PREFIX`)
-- MCP and tools (`GATEWAY_PUBLIC_URL`, `TOOLS_FILE`, `MCP_UPSTREAM_SERVERS`, `TOOL_RUNTIME_*`)
-- Rate limiting, CORS, CSRF, and body validation
-- Egress firewall (`EGRESS_ALLOWED_HOSTS`, `EGRESS_DENY_PRIVATE_IPS`, ...)
-- Audit sinks (`AUDIT_LOG_FILE`, `AUDIT_SQLITE_PATH`, `AUDIT_SQLITE_RETENTION_DAYS`)
+Common configuration areas include:
 
-For real deployments that want to enable RBAC without immediately blocking unmatched traffic, start from [docs/examples/policy.starter.json](docs/examples/policy.starter.json) — see [docs/examples/policy.starter.README.md](docs/examples/policy.starter.README.md) for what `default_action: "allow"` does and doesn't protect against.
+| Area | Examples |
+| --- | --- |
+| Server | `LISTEN_ADDR`, `ADMIN_PREFIX`, `ADMIN_LISTEN_ADDR` |
+| Auth | `AUTH_PROVIDERS`, `JWT_JWKS_URL`, `JWT_ISSUER`, `JWT_AUDIENCE`, `AUTH_MODE` |
+| RBAC | `POLICY_FILE`, `RBAC_EXEMPT_PATHS` |
+| Proxy | `UPSTREAM_URL`, upstream routing settings |
+| MCP | `GATEWAY_PUBLIC_URL`, `TOOLS_FILE`, `MCP_UPSTREAM_SERVERS`, `TOOL_RUNTIME_*` |
+| Audit | `AUDIT_LOG_FILE`, `AUDIT_SQLITE_PATH`, `AUDIT_SQLITE_RETENTION_DAYS` |
+| Discovery | `DISCOVERY_SQLITE_PATH`, schema and payload capture settings |
+| Egress | `EGRESS_ALLOWED_HOSTS`, `EGRESS_DENY_PRIVATE_IPS` |
+| Security | CORS, CSRF, rate limits, body validation, security headers |
 
-Provider-specific `AUTH_PROVIDERS` recipes for Keycloak, Auth0, Microsoft Entra ID, and Okta live in [docs/auth/README.md](docs/auth/README.md).
+See the full configuration reference:
 
-`docs/configuration.md` and `.env.example` are kept in sync with the actual code by the `gateway/tests/env_example.rs` drift test, so they should never silently fall out of date.
+```text
+docs/configuration.md
+```
+
+Provider-specific auth recipes for Keycloak, Auth0, Microsoft Entra ID, and Okta live in:
+
+```text
+docs/auth/README.md
+```
+
+For real deployments that want to enable RBAC without immediately blocking unmatched traffic, start from:
+
+```text
+docs/examples/policy.starter.json
+```
+
+And read:
+
+```text
+docs/examples/policy.starter.README.md
+```
+
+The `docs/configuration.md` file and `.env.example` are kept in sync with the code by automated tests.
+
+## Repository Structure
+
+```text
+.
+|-- admin-ui/              # React/TypeScript admin UI
+|-- gateway/               # Rust gateway server
+|-- docs/                  # Configuration, examples, and guides
+|-- dev/                   # Local development fixtures
+|-- scripts/               # Helper scripts and traffic generation
+|-- docker-compose.yml
+|-- docker-compose.dev.yml
+|-- Dockerfile
+|-- Cargo.toml
+`-- README.md
+```
+
+## Roadmap
+
+The project is moving toward a stronger v1 control plane for API and MCP security.
+
+Planned focus areas include:
+
+- Production hardening
+- Multi-instance deployment support
+- Postgres audit sink
+- More MCP deployment patterns
+- More rule templates
+- More identity-provider recipes
+- Better documentation and examples
+- More end-to-end demo environments
+
+See the pinned roadmap issue for active work:
+
+```text
+https://github.com/Greenhat-Security/GreenGateway/issues/44
+```
 
 ## Contributing
 
-GreenGateway is a pre-alpha project — contributions may involve documentation, governance, and architecture work as much as implementation. Full guidelines live in [CONTRIBUTING.md](CONTRIBUTING.md).
+Contributions are welcome.
 
-Work is tracked as checklist items on GitHub issues, one issue per feature area, sized so each checklist item maps to one focused pull request. Start with the pinned roadmap to find open work: [Roadmap / project plan (#44)](https://github.com/Greenhat-Security/GreenGateway/issues/44).
+Good first contribution areas include:
 
-Security-relevant changes — auth, RBAC, egress controls, audit behavior, secrets handling, policy evaluation — receive extra review scrutiny. Please report suspected vulnerabilities per [SECURITY.md](SECURITY.md) rather than opening a public issue.
+- Documentation improvements
+- Example policies
+- Deployment recipes
+- Identity-provider setup guides
+- MCP server examples
+- UI/UX improvements
+- Tests
+- Security hardening
+- Issue triage
+
+Before opening a pull request, read:
+
+```text
+CONTRIBUTING.md
+```
+
+Security-relevant changes involving authentication, authorization, egress controls, audit behavior, secrets handling, policy evaluation, or admin permissions may require extra review.
+
+Please report suspected vulnerabilities through the process described in:
+
+```text
+SECURITY.md
+```
+
+Do not open public GitHub issues for suspected security vulnerabilities.
 
 ## License
 
-This project is source-available under the [Apache License 2.0 with the Commons Clause](LICENSE). You may use, fork, and modify the software for personal or internal business use. You may not sell, resell, host, offer, or provide this software, or a substantially similar derivative, as a paid product, hosted SaaS, support offering, or commercial service without a separate commercial license from the copyright holder.
+GreenGateway is open source under the Apache License 2.0.
 
-Commercial SaaS, resale, paid hosting, managed service, or paid support usage requires a separate written commercial license. See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+You may use, copy, modify, merge, publish, distribute, sublicense, and sell copies of the software under the terms of the Apache License 2.0.
+
+See:
+
+```text
+LICENSE
+```
 
 ---
 
+## Maintained By
+
+GreenGateway is maintained by [Greenhat-Security](https://github.com/Greenhat-Security).
+
+If you are building with AI agents, MCP servers, internal APIs, or automation workflows and want a self-hosted security control plane, try the dev stack and open an issue with feedback.
+
 <div align="center">
 
-Maintained by [Greenhat-Security](https://github.com/Greenhat-Security) · [Issues](https://github.com/Greenhat-Security/GreenGateway/issues) · [Roadmap](https://github.com/Greenhat-Security/GreenGateway/issues/44)
+[Issues](https://github.com/Greenhat-Security/GreenGateway/issues) | [Roadmap](https://github.com/Greenhat-Security/GreenGateway/issues/44) | [Wiki](https://greenhatsec.com/green-gateway/wiki)
 
 </div>
