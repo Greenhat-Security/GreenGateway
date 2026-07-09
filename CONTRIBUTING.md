@@ -1,6 +1,6 @@
 # Contributing to GreenGateway
 
-GreenGateway is a pre-alpha, source-available, self-hosted universal MCP and API gateway. The project is still early, so contributions may involve documentation, governance, repository scaffolding, and architecture work before the main implementation is fully present.
+GreenGateway is an alpha, open-source, self-hosted universal MCP and API gateway. The project is still early, so contributions may involve documentation, governance, repository scaffolding, and architecture work before the main implementation is fully present.
 
 ## Development Setup
 
