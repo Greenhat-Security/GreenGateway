@@ -14,7 +14,7 @@
 
 **Put authentication, RBAC, audit logs, traffic discovery, visual firewall rules, shadow mode, and egress controls in front of any API or MCP server.**
 
-[Quick Start](#quick-start) | [Why GreenGateway](#why-greengateway) | [Demo](#demo-shadow-mode-for-api-firewall-rules) | [Use Cases](#use-cases) | [Features](#features) | [MCP Support](#mcp-support) | [Configuration](#configuration) | [Wiki](https://greenhatsec.com/green-gateway/wiki) | [Contributing](#contributing)
+[Quick Start](#quick-start) | [Why GreenGateway](#why-greengateway) | [Demo](#demo-shadow-mode-for-api-firewall-rules) | [Use Cases](#use-cases) | [Features](#features) | [MCP Support](#mcp-support) | [Configuration](#configuration) | [Cloudflare Deploy](#cloudflare-deploy) | [Wiki](https://greenhatsec.com/green-gateway/wiki) | [Contributing](#contributing)
 
 </div>
 
@@ -64,7 +64,11 @@ GreenGateway can learn observed API traffic, draft a visual firewall rule from t
 
 ## Quick Start
 
-The fastest way to try GreenGateway is the seeded Docker Compose development stack.
+Choose the setup path that matches what you want to test.
+
+### Option 1: Seeded Local Stack
+
+The fastest local path is the seeded Docker Compose development stack.
 
 It starts:
 
@@ -105,6 +109,22 @@ node scripts/generate-traffic.mjs --smoke-test
 ```
 
 The dev stack is self-contained. You do not need a real backend to test the gateway, admin UI, audit flow, rule builder, discovery features, or MCP surface.
+
+### Option 2: One-click Cloudflare Deploy
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Greenhat-Security/GreenGateway)
+
+Use the Cloudflare deploy button when you want a hosted evaluation deployment instead of a local Docker Compose stack.
+
+The one-click path creates a Cloudflare Worker that routes traffic to GreenGateway running inside a Cloudflare Container built from this repository's `Dockerfile`.
+
+Requirements:
+
+- Cloudflare account on a Workers Paid plan with Containers available
+- Public GitHub or GitLab source repository
+- A few minutes for the first container build and provisioning step
+
+For the full deploy flow, runtime variables, and limitations, see [Cloudflare Deploy](#cloudflare-deploy).
 
 ## What GreenGateway Is
 
@@ -426,15 +446,94 @@ The development stack includes JWT auth, RBAC, a JWKS sidecar, the embedded admi
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Greenhat-Security/GreenGateway)
 
-This deploys a Cloudflare Worker that routes traffic to GreenGateway running inside a Cloudflare Container built from the existing `Dockerfile`.
+The one-click deploy button creates a Cloudflare Workers application backed by a Cloudflare Container.
 
-Cloudflare Containers require a Workers Paid plan, and the first deploy can take a few minutes while Cloudflare builds and provisions the image.
+The Worker entrypoint lives in `cloudflare/src/index.ts`. The container image is built from the repository `Dockerfile`.
 
-See:
+### Requirements
+
+- Cloudflare account on a Workers Paid plan with Containers available
+- Public GitHub or GitLab source repository, because Cloudflare Deploy buttons do not support private source repositories
+- Docker or another Docker-compatible engine for manual deploys from your own machine
+
+### What Cloudflare Creates
+
+Wrangler uses `wrangler.jsonc` as the deployment source of truth.
+
+It defines:
+
+- Worker name: `greengateway`
+- Worker entrypoint: `cloudflare/src/index.ts`
+- Container class: `GreenGatewayContainer`
+- Durable Object binding: `GREENGATEWAY_CONTAINER`
+- Container image: `./Dockerfile`
+- Preview URLs enabled for PR and version previews
+
+The Worker sends every request to a singleton GreenGateway container on port `8080`. `LISTEN_ADDR` is forced to `0.0.0.0:8080` so the Cloudflare container supervisor can reach the gateway.
+
+### Runtime Defaults
+
+The default Cloudflare deploy is intentionally conservative.
+
+| Variable | Default |
+| --- | --- |
+| `AUTH_ENABLED` | `true` |
+| `AUTH_MODE` | `required` |
+| `AUTH_EXEMPT_PATHS` | `/health,/version,/metrics,/admin` |
+| `RBAC_EXEMPT_PATHS` | `/health,/version,/metrics,/admin` |
+| `ADMIN_PREFIX` | `/admin` |
+| `EGRESS_DENY_PRIVATE_IPS` | `true` |
+| `UPSTREAM_URL` | blank by default |
+
+Set `UPSTREAM_URL` during deploy, or later in the Cloudflare dashboard, when you want GreenGateway to proxy to an origin API.
+
+After the first deploy, set `GATEWAY_PUBLIC_URL` to the deployed Worker URL if you use MCP OAuth protected-resource metadata.
+
+The Cloudflare wrapper forwards non-empty string Worker variables and secrets whose names match GreenGateway configuration keys from `.env.example`, except:
+
+- `LISTEN_ADDR`, because Cloudflare must reach the container on port `8080`
+- `ADMIN_LISTEN_ADDR`, because this one-click Worker exposes a single container port
+
+Keep secrets such as OIDC client secrets in Worker secrets or inside a secret-backed `AUTH_PROVIDERS` value. Do not commit them to the repository.
+
+### Check the Deployment
+
+After Cloudflare finishes provisioning, check the deployed gateway:
+
+```sh
+curl https://<worker-name>.<your-workers-subdomain>.workers.dev/health
+```
+
+Expected response:
+
+```json
+{"status":"ok"}
+```
+
+The embedded admin UI is available at:
 
 ```text
-docs/deployment/cloudflare.md
+https://<worker-name>.<your-workers-subdomain>.workers.dev/admin
 ```
+
+### Manual Deploy
+
+If you are deploying from your own machine:
+
+```sh
+npm install
+npx wrangler login
+npm run deploy
+```
+
+### Important Limitations
+
+- Cloudflare Containers use an ephemeral container filesystem by default. SQLite-backed evaluation settings can work for demos, but they are not durable storage across container replacement.
+- File-backed settings such as `POLICY_FILE`, `TOOLS_FILE`, and `OPENAPI_SPEC_PATH` must point at files that exist inside the image or are created at runtime.
+- Treat the one-click deploy path as a fast evaluation path for the current alpha, not a production hardening guide.
+- The first container deploy may return Worker errors for several minutes while Cloudflare finishes provisioning container capacity.
+
+Full guide: [docs/deployment/cloudflare.md](docs/deployment/cloudflare.md)
 
 ## Configuration
 
