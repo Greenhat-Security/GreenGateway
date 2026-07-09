@@ -14,7 +14,7 @@
 
 **Put authentication, RBAC, audit logs, traffic discovery, visual firewall rules, shadow mode, and egress controls in front of any API or MCP server.**
 
-[Quick Start](#quick-start) | [Why GreenGateway](#why-greengateway) | [Demo](#demo-shadow-mode-for-api-firewall-rules) | [Use Cases](#use-cases) | [Features](#features) | [MCP Support](#mcp-support) | [Configuration](#configuration) | [Cloudflare Deploy](#cloudflare-deploy) | [Wiki](https://greenhatsec.com/green-gateway/wiki) | [Contributing](#contributing)
+[Quick Start](#quick-start) | [Why GreenGateway](#why-greengateway) | [Demos](#demos) | [Use Cases](#use-cases) | [Features](#features) | [MCP Support](#mcp-support) | [Configuration](#configuration) | [Cloudflare Deploy](#cloudflare-deploy) | [Wiki](https://greenhatsec.com/green-gateway/wiki) | [Contributing](#contributing)
 
 </div>
 
@@ -56,11 +56,25 @@ Client, bot, or AI agent
 Your API, service, or MCP server
 ```
 
-## Demo: Shadow Mode for API Firewall Rules
+## Demos
+
+### Demo 1: Put an MCP Server Behind RBAC in 5 Minutes
+
+![Demo 1: Put an MCP server behind RBAC in 5 minutes](docs/images/demo-mcp-rbac.gif)
+
+GreenGateway can sit in front of MCP clients and servers, learn which tools are being called, and turn observed tool traffic into identity-aware rules. This demo shows Claude, Cursor, and GitHub MCP traffic flowing through the gateway, then blocks one risky tool for the GitHub automation identity while leaving normal MCP usage available.
+
+### Demo 2: Shadow Mode for API Firewall Rules
 
 ![Demo 2: Shadow mode for API firewall rules](docs/images/demo-shadow-mode.gif)
 
 GreenGateway can learn observed API traffic, draft a visual firewall rule from that traffic, run it in shadow mode, and preview the exact principals and requests that would be denied before enforcement is promoted.
+
+### Demo 3: Stop an AI Agent from Calling Dangerous Internal Endpoints
+
+![Demo 3: Stop an AI agent from calling dangerous internal endpoints](docs/images/demo-agent-deny.gif)
+
+GreenGateway can let an AI agent continue using normal business APIs while blocking dangerous internal or admin endpoints. This demo shows an agent attempting to call an admin role-change endpoint, GreenGateway denying it with an enforcing rule, and the live tail plus audit log preserving the actor, endpoint, matched rule, decision, status, and request ID.
 
 ## Quick Start
 
