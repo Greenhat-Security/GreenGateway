@@ -1,0 +1,39 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "greengateway",
+  "main": "cloudflare/src/index.ts",
+  "compatibility_date": "2026-07-07",
+  "workers_dev": true,
+  "preview_urls": true,
+  "containers": [
+    {
+      "class_name": "GreenGatewayContainer",
+      "image": "./Dockerfile",
+      "max_instances": 3
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "GREENGATEWAY_CONTAINER",
+        "class_name": "GreenGatewayContainer"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["GreenGatewayContainer"]
+    }
+  ],
+  "vars": {
+    "ADMIN_PREFIX": "/admin",
+    "AUTH_ENABLED": "true",
+    "AUTH_MODE": "required",
+    "AUTH_EXEMPT_PATHS": "/health,/version,/metrics,/admin",
+    "RBAC_EXEMPT_PATHS": "/health,/version,/metrics,/admin",
+    "EGRESS_DENY_PRIVATE_IPS": "true",
+    "GATEWAY_PUBLIC_URL": "",
+    "UPSTREAM_URL": ""
+  }
+}

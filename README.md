@@ -14,7 +14,7 @@
 
 **Put authentication, RBAC, audit logs, traffic discovery, visual firewall rules, shadow mode, and egress controls in front of any API or MCP server.**
 
-[Quick Start](#quick-start) | [Why GreenGateway](#why-greengateway) | [Demo](#demo-shadow-mode-for-api-firewall-rules) | [Use Cases](#use-cases) | [Features](#features) | [MCP Support](#mcp-support) | [Configuration](#configuration) | [Contributing](#contributing)
+[Quick Start](#quick-start) | [Why GreenGateway](#why-greengateway) | [Demo](#demo-shadow-mode-for-api-firewall-rules) | [Use Cases](#use-cases) | [Features](#features) | [MCP Support](#mcp-support) | [Configuration](#configuration) | [Wiki](https://greenhatsec.com/green-gateway/wiki) | [Contributing](#contributing)
 
 </div>
 
@@ -121,7 +121,7 @@ GreenGateway can sit in front of:
 - Automation backends
 - Developer or platform engineering services
 
-It can run as a lightweight local gateway, a Docker Compose deployment, or a containerized self-hosted service.
+It can run as a lightweight local gateway, a Docker Compose deployment, a containerized self-hosted service, or a Cloudflare Worker plus Container deployment.
 
 ## Use Cases
 
@@ -174,6 +174,7 @@ This gives security, engineering, platform, and compliance teams a clearer view 
 | Egress firewall | Outbound host allowlists, private IP protections, and SSRF-focused controls |
 | Anomaly signals | Deterministic signals for new endpoints, schema mismatches, error spikes, new principal activity, and volume outliers |
 | Policy history | Versioned policy changes, rollback, and audit trail |
+| Cloudflare deployment | Worker plus Container deployment path for guided self-hosting on Cloudflare |
 | Local dev harness | Checked-in JWKS/RBAC fixtures, Docker Compose stack, and sample traffic generator |
 
 ## MCP Support
@@ -308,7 +309,7 @@ The current project is best suited for evaluation, demos, development environmen
 
 GreenGateway is in alpha.
 
-The core gateway, admin UI, discovery, visual rule builder, native MCP support, and identity/auth surface are implemented for evaluation and guided self-hosting.
+The core gateway, admin UI, discovery, visual rule builder, native MCP support, identity/auth surface, and Cloudflare deployment path are implemented for evaluation and guided self-hosting.
 
 The project is not production-hardened yet.
 
@@ -330,6 +331,7 @@ Current status:
 | MCP tool registry and upstream proxying | Implemented |
 | Egress firewall | Implemented |
 | Anomaly signals | Implemented |
+| Cloudflare deploy path | Implemented |
 | Postgres audit sink for multi-instance deployments | Planned |
 | Additional MCP follow-ups | Planned |
 
@@ -338,6 +340,8 @@ Progress is tracked in the pinned roadmap issue:
 ```text
 https://github.com/Greenhat-Security/GreenGateway/issues/44
 ```
+
+For setup, zero-trust rollout guidance, use cases, and operator reference docs, read the [GreenGateway wiki](https://greenhatsec.com/green-gateway/wiki).
 
 ## Run with Cargo
 
@@ -418,6 +422,20 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
 The development stack includes JWT auth, RBAC, a JWKS sidecar, the embedded admin UI, an internal-only echo upstream, and queryable SQLite audit storage.
 
+## Cloudflare Deploy
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Greenhat-Security/GreenGateway)
+
+This deploys a Cloudflare Worker that routes traffic to GreenGateway running inside a Cloudflare Container built from the existing `Dockerfile`.
+
+Cloudflare Containers require a Workers Paid plan, and the first deploy can take a few minutes while Cloudflare builds and provisions the image.
+
+See:
+
+```text
+docs/deployment/cloudflare.md
+```
+
 ## Configuration
 
 GreenGateway reads configuration from environment variables.
@@ -467,8 +485,9 @@ The `docs/configuration.md` file and `.env.example` are kept in sync with the co
 ```text
 .
 |-- admin-ui/              # React/TypeScript admin UI
+|-- cloudflare/            # Cloudflare Worker entrypoint and config helpers
 |-- gateway/               # Rust gateway server
-|-- docs/                  # Configuration, examples, and guides
+|-- docs/                  # Configuration, deployment, examples, and guides
 |-- dev/                   # Local development fixtures
 |-- scripts/               # Helper scripts and traffic generation
 |-- docker-compose.yml

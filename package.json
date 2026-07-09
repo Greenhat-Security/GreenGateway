@@ -1,0 +1,43 @@
+{
+  "name": "greengateway-cloudflare-worker",
+  "private": true,
+  "license": "SEE LICENSE IN LICENSE",
+  "type": "module",
+  "scripts": {
+    "cf:dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run cloudflare/src/config.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260708.1",
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.108.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "UPSTREAM_URL": {
+        "description": "Optional HTTP or HTTPS origin that GreenGateway should proxy when no gateway-owned route matches. Leave blank to deploy only `/health`, `/version`, `/metrics`, `/admin`, and MCP/control-plane routes first."
+      },
+      "GATEWAY_PUBLIC_URL": {
+        "description": "Optional public URL for this deployed gateway, such as `https://greengateway.<your-subdomain>.workers.dev`. Set this after the first deploy if you use MCP OAuth protected-resource metadata."
+      },
+      "AUTH_PROVIDERS": {
+        "description": "Optional GreenGateway auth provider JSON. Use this for OIDC/JWT/cookie-session auth configuration; keep embedded client secrets in Worker secrets rather than public commits."
+      },
+      "JWT_JWKS_URL": {
+        "description": "Optional JWKS URL for the legacy single-provider JWT validator."
+      },
+      "JWT_ISSUER": {
+        "description": "Optional expected JWT issuer for the legacy single-provider JWT validator."
+      },
+      "JWT_AUDIENCE": {
+        "description": "Optional expected JWT audience for the legacy single-provider JWT validator."
+      }
+    }
+  }
+}
