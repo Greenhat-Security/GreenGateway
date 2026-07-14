@@ -5,6 +5,7 @@ import { AdminApiError } from '../lib/api';
 import {
   type PrincipalDetailResponse,
   type PrincipalEndpointTouch,
+  type PrincipalRecord,
   fetchPrincipalDetail,
 } from '../lib/principals';
 import { type DiscoverySignal, displaySignalTarget } from '../lib/signals';
@@ -144,7 +145,7 @@ function PrincipalSummary({ detail }: { detail: PrincipalDetailResponse }) {
         </div>
         <Link
           className="rule-danger-button"
-          to={blockPrincipalRuleEditorPath(principal.subject)}
+          to={blockPrincipalRuleEditorPath(principal)}
         >
           Block this principal
         </Link>
@@ -545,13 +546,37 @@ function ruleEditorPathForRule(ruleId: string): string {
   return `/policy/rules/editor?${params.toString()}`;
 }
 
-function blockPrincipalRuleEditorPath(subject: string): string {
+function blockPrincipalRuleEditorPath(
+  principal: Pick<PrincipalRecord, 'subject' | 'issuer' | 'auth_method'>,
+): string {
   const params = new URLSearchParams();
-  params.set('prefill_principal_id', subject);
+  params.set('prefill_principal_id', principal.subject);
+  if (principal.issuer.trim().length > 0) {
+    params.set('prefill_issuer', principal.issuer.trim());
+  }
+  const authMethod = policyAuthMethod(principal.auth_method);
+  if (authMethod !== null) {
+    params.set('prefill_auth_method', authMethod);
+  }
   params.set('prefill_action', 'deny');
   params.set('prefill_path', '/**');
 
   return `/policy/rules/editor?${params.toString()}`;
+}
+
+function policyAuthMethod(value: string): string | null {
+  switch (value.trim()) {
+    case 'bearer':
+    case 'bearer_token':
+      return 'bearer_token';
+    case 'cookie':
+    case 'session_cookie':
+      return 'session_cookie';
+    case 'service_token':
+      return 'service_token';
+    default:
+      return null;
+  }
 }
 
 function signalStateBadgeClass(state: DiscoverySignal['state']): string {

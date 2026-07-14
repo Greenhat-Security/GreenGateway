@@ -80,6 +80,25 @@
           "items": {
             "type": "string"
           }
+        },
+        "issuers": {
+          "type": "array",
+          "description": "Exact issuer or provider:<name> boundary values allowed to activate this role's permissions. Empty or omitted means any issuer.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "auth_methods": {
+          "type": "array",
+          "description": "Authentication methods allowed to activate this role's permissions. Empty or omitted means any authentication method.",
+          "items": {
+            "enum": [
+              "bearer_token",
+              "session_cookie",
+              "service_token"
+            ]
+          }
         }
       }
     },
@@ -115,13 +134,21 @@
     "principal_matcher": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Optional principal constraints for a rule. Non-empty fields are ANDed together: roles AND auth_methods AND principal_ids must all match when configured. Within each field, any listed value matches. An empty object or omitted principal matcher means any principal, authenticated or not.",
+      "description": "Optional principal constraints for a rule. Non-empty fields are ANDed together: roles AND issuers AND auth_methods AND principal_ids must all match when configured. Within each field, any listed value matches. An empty object or omitted principal matcher means any principal, authenticated or not.",
       "properties": {
         "roles": {
           "type": "array",
           "description": "Role names this rule matches. Empty or omitted means any role set.",
           "items": {
             "type": "string"
+          }
+        },
+        "issuers": {
+          "type": "array",
+          "description": "Exact issuer or provider:<name> boundary values this rule matches. Empty or omitted means any issuer.",
+          "items": {
+            "type": "string",
+            "minLength": 1
           }
         },
         "auth_methods": {
@@ -304,6 +331,27 @@
           "description": "Role names allowed to invoke this tool. Empty or omitted means no role constraint beyond enabled.",
           "items": {
             "type": "string"
+          }
+        },
+        "issuers": {
+          "type": "array",
+          "default": [],
+          "description": "Exact issuer or provider:<name> boundary values allowed to invoke this tool. Empty or omitted means any issuer.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "auth_methods": {
+          "type": "array",
+          "default": [],
+          "description": "Authentication methods allowed to invoke this tool. Empty or omitted means any authentication method.",
+          "items": {
+            "enum": [
+              "bearer_token",
+              "session_cookie",
+              "service_token"
+            ]
           }
         },
         "timeout_ms": {

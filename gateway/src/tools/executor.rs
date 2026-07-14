@@ -2870,6 +2870,8 @@ mod tests {
         ToolRuntimeToolConfig {
             enabled: true,
             allowed_roles: Vec::new(),
+            issuers: Vec::new(),
+            auth_methods: Vec::new(),
             timeout: Duration::from_millis(timeout_ms),
             max_concurrent,
         }
@@ -3440,6 +3442,7 @@ mod tests {
             source_ip: "203.0.113.10".to_owned(),
             actor: Some(Actor {
                 user_id: "user-123".to_owned(),
+                issuer: None,
                 email: None,
                 roles: Some(roles.iter().map(|role| (*role).to_owned()).collect()),
                 auth_mode: "bearer_token".to_owned(),

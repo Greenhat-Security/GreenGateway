@@ -323,6 +323,7 @@ impl RuleSuggestionEngine {
         for observation in matrix.observations {
             let principal = PrincipalMatcher {
                 roles: vec![observation.role.clone()],
+                issuers: Vec::new(),
                 auth_methods: Vec::new(),
                 principal_ids: Vec::new(),
             };
@@ -1176,6 +1177,7 @@ fn principal_key(principal: &PrincipalMatcher) -> Result<String, RuleSuggestionE
 
     let canonical = PrincipalMatcher {
         roles: sorted_unique(&principal.roles),
+        issuers: sorted_unique(&principal.issuers),
         auth_methods: sorted_unique(&principal.auth_methods),
         principal_ids: sorted_unique(&principal.principal_ids),
     };
@@ -1240,6 +1242,7 @@ fn suggestion_target_from_signal(signal: &Signal) -> Option<SignalSuggestionTarg
             .to_owned();
         PrincipalMatcher {
             roles: Vec::new(),
+            issuers: Vec::new(),
             auth_methods: Vec::new(),
             principal_ids: vec![principal],
         }
@@ -1488,6 +1491,7 @@ mod tests {
             tool_name: None,
             principal: PrincipalMatcher {
                 roles: vec!["billing-reader".to_owned()],
+                issuers: Vec::new(),
                 auth_methods: Vec::new(),
                 principal_ids: Vec::new(),
             },
@@ -1721,6 +1725,7 @@ mod tests {
             tool_name: None,
             principal: PrincipalMatcher {
                 roles: Vec::new(),
+                issuers: Vec::new(),
                 auth_methods: Vec::new(),
                 principal_ids: vec!["alice".to_owned()],
             },

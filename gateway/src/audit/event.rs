@@ -36,6 +36,8 @@ pub struct AuditEvent {
 pub struct Actor {
     pub user_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roles: Option<Vec<String>>,
@@ -87,6 +89,7 @@ mod tests {
     fn new_event_populates_envelope_fields() {
         let actor = Actor {
             user_id: "user-123".to_owned(),
+            issuer: None,
             email: Some("user@example.com".to_owned()),
             roles: Some(vec!["admin".to_owned(), "reader".to_owned()]),
             auth_mode: "session".to_owned(),
@@ -129,6 +132,7 @@ mod tests {
                 "203.0.113.10",
                 Some(Actor {
                     user_id: "user-123".to_owned(),
+                    issuer: Some("https://idp.example/".to_owned()),
                     email: Some("user@example.com".to_owned()),
                     roles: Some(vec!["admin".to_owned(), "reader".to_owned()]),
                     auth_mode: "session".to_owned(),
@@ -148,6 +152,10 @@ mod tests {
         assert_eq!(
             event_with_actor["actor"]["email"],
             json!("user@example.com")
+        );
+        assert_eq!(
+            event_with_actor["actor"]["issuer"],
+            json!("https://idp.example/")
         );
         assert_eq!(event_with_actor["user_agent"], json!("test-agent/1.0"));
 
@@ -179,6 +187,7 @@ mod tests {
     fn serialized_actor_omits_missing_roles() {
         let actor = Actor {
             user_id: "user-123".to_owned(),
+            issuer: None,
             email: None,
             roles: None,
             auth_mode: "api_key".to_owned(),

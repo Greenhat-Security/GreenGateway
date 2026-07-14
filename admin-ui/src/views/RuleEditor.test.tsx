@@ -28,12 +28,16 @@ describe('RuleEditor', () => {
       false,
     );
     expect(screen.getByText('Any role')).toBeTruthy();
+    expect(screen.getByText('Any issuer')).toBeTruthy();
     expect(screen.getByText('Any principal ID')).toBeTruthy();
     expect(
       (screen.getByLabelText('Bearer token') as HTMLInputElement).checked,
     ).toBe(false);
     expect(
       (screen.getByLabelText('Session cookie') as HTMLInputElement).checked,
+    ).toBe(false);
+    expect(
+      (screen.getByLabelText('Service token') as HTMLInputElement).checked,
     ).toBe(false);
     expect(
       (screen.getByRole('radio', { name: /Deny/ }) as HTMLInputElement).checked,
@@ -44,7 +48,7 @@ describe('RuleEditor', () => {
     vi.stubGlobal('fetch', policyBackedFetch(policyFixture(), 'W/"policy-1"'));
 
     renderRuleEditor(
-      '/policy/rules/editor?prefill_method=post&prefill_path=%2Fapi%2Freports%2F%7Bid%7D&prefill_role=support&prefill_auth_method=session_cookie&prefill_principal_id=user-123&prefill_action=shadow',
+      '/policy/rules/editor?prefill_method=post&prefill_path=%2Fapi%2Freports%2F%7Bid%7D&prefill_role=support&prefill_issuer=https%3A%2F%2Fidp.example%2F&prefill_auth_method=session_cookie&prefill_principal_id=user-123&prefill_action=shadow',
     );
 
     expect(await screen.findByDisplayValue('/api/reports/{id}')).toBeTruthy();
@@ -54,6 +58,9 @@ describe('RuleEditor', () => {
     expect(
       screen.getByLabelText('Role constraints selected values').textContent,
     ).toContain('support');
+    expect(
+      screen.getByLabelText('Issuers selected values').textContent,
+    ).toContain('https://idp.example/');
     expect(
       (screen.getByLabelText('Session cookie') as HTMLInputElement).checked,
     ).toBe(true);
@@ -66,7 +73,7 @@ describe('RuleEditor', () => {
     expect(
       screen.getByLabelText('Rule summary').textContent,
     ).toContain(
-      'Log-only POST requests to /api/reports/{id} for role support, auth method session cookie, and principal user-123.',
+      'Log-only POST requests to /api/reports/{id} for role support, issuer https://idp.example/, auth method session cookie, and principal user-123.',
     );
     expect(
       screen.getByLabelText('Policy expression').textContent,
@@ -77,6 +84,9 @@ describe('RuleEditor', () => {
     expect(
       screen.getByLabelText('Policy expression').textContent,
     ).toContain('principal.roles contains "support"');
+    expect(
+      screen.getByLabelText('Policy expression').textContent,
+    ).toContain('principal.issuer in ["https://idp.example/"]');
     expect(
       screen.getByLabelText('Policy expression').textContent,
     ).toContain('decision = "shadow"');
@@ -131,6 +141,7 @@ describe('RuleEditor', () => {
       tool_name: 'reports.export',
       principal: {
         roles: ['support'],
+        issuers: [],
         auth_methods: [],
         principal_ids: [],
       },
@@ -164,6 +175,7 @@ describe('RuleEditor', () => {
       path: '/existing/{id}',
       principal: {
         roles: ['support'],
+        issuers: [],
         auth_methods: ['bearer_token'],
         principal_ids: ['existing-user'],
       },
@@ -280,6 +292,7 @@ describe('RuleEditor', () => {
         path: '/api/users/{id}',
         principal: {
           roles: ['support'],
+          issuers: [],
           auth_methods: ['bearer_token'],
           principal_ids: ['user-123'],
         },
@@ -360,6 +373,7 @@ describe('RuleEditor', () => {
       path: '/reports/**',
       principal: {
         roles: [],
+        issuers: [],
         auth_methods: [],
         principal_ids: [],
       },
@@ -391,6 +405,7 @@ describe('RuleEditor', () => {
       path: '/reports/**',
       principal: {
         roles: [],
+        issuers: [],
         auth_methods: [],
         principal_ids: [],
       },
@@ -405,6 +420,7 @@ describe('RuleEditor', () => {
       path: '/api/users/{id}',
       principal: {
         roles: ['support'],
+        issuers: [],
         auth_methods: ['bearer_token'],
         principal_ids: [],
       },
@@ -443,6 +459,7 @@ describe('RuleEditor', () => {
       tool_name: null,
       principal: {
         roles: ['support'],
+        issuers: [],
         auth_methods: ['bearer_token'],
         principal_ids: [],
       },
@@ -457,6 +474,7 @@ describe('RuleEditor', () => {
       path: '/api/users/{id}',
       principal: {
         roles: ['support'],
+        issuers: [],
         auth_methods: ['bearer_token'],
         principal_ids: [],
       },
@@ -500,6 +518,7 @@ describe('RuleEditor', () => {
       tool_name: 'reports.export',
       principal: {
         roles: ['support'],
+        issuers: [],
         auth_methods: ['bearer_token'],
         principal_ids: [],
       },
@@ -685,6 +704,7 @@ function policyBackedFetch(
               path: '/reports/**',
               principal: {
                 roles: [],
+                issuers: [],
                 auth_methods: [],
                 principal_ids: [],
               },
@@ -708,6 +728,7 @@ function policyBackedFetch(
             path: '/api/users/{id}',
             principal: {
               roles: ['support'],
+              issuers: [],
               auth_methods: ['bearer_token'],
               principal_ids: [],
             },

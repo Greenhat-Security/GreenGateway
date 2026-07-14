@@ -27,6 +27,7 @@ use crate::{
 
 use super::{
     claims::{extract_roles, extract_string_claim},
+    principal::provider_issuer,
     AuthError, AuthMethod, Principal, SessionCredential, SessionValidator,
 };
 
@@ -66,18 +67,37 @@ impl CookieSessionAuthConfig {
 
 pub struct CookieSessionValidator {
     cfg: CookieSessionAuthConfig,
+    principal_issuer: Option<String>,
     egress_client: Arc<EgressClient>,
     cache: CookieSessionValidationCache,
 }
 
 impl CookieSessionValidator {
+    #[allow(dead_code)] // Retained for direct callers and unit tests without provider metadata.
     pub fn new(
         cfg: CookieSessionAuthConfig,
+        egress_client: Arc<EgressClient>,
+    ) -> Result<Self, AuthError> {
+        Self::with_principal_issuer(cfg, None, egress_client)
+    }
+
+    pub fn new_for_provider(
+        cfg: CookieSessionAuthConfig,
+        provider_name: &str,
+        egress_client: Arc<EgressClient>,
+    ) -> Result<Self, AuthError> {
+        Self::with_principal_issuer(cfg, Some(provider_issuer(provider_name)), egress_client)
+    }
+
+    fn with_principal_issuer(
+        cfg: CookieSessionAuthConfig,
+        principal_issuer: Option<String>,
         egress_client: Arc<EgressClient>,
     ) -> Result<Self, AuthError> {
         Ok(Self {
             cache: CookieSessionValidationCache::new(cfg.cache_ttl),
             cfg,
+            principal_issuer,
             egress_client,
         })
     }
@@ -192,13 +212,13 @@ impl SessionValidator for CookieSessionValidator {
 
         let cache_key = cache_key_for_cookie(cookie_value);
         if let Some(result) = self.cache.get(&cache_key) {
-            return result.into_principal();
+            return result.into_principal(self.principal_issuer.as_deref());
         }
 
         let session_id = format!("sha256:{cache_key}");
         let result = self.introspect(cookie_value, session_id).await?;
         self.cache.insert(cache_key, result.clone());
-        result.into_principal()
+        result.into_principal(self.principal_issuer.as_deref())
     }
 
     async fn validate_session_for_resource(
@@ -308,11 +328,11 @@ impl CookieSessionValidationCache {
 }
 
 impl CachedSessionValidation {
-    fn into_principal(self) -> Result<Principal, AuthError> {
+    fn into_principal(self, principal_issuer: Option<&str>) -> Result<Principal, AuthError> {
         match self {
             Self::Valid(valid) => Ok(Principal {
                 user_id: valid.user_id,
-                issuer: None,
+                issuer: principal_issuer.map(str::to_owned),
                 email: valid.email,
                 org_id: valid.org_id,
                 roles: valid.roles,
@@ -493,6 +513,35 @@ mod tests {
         assert_eq!(principal.roles, vec!["admin"]);
         assert_eq!(principal.auth_method, AuthMethod::Cookie);
         assert_eq!(server.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_constructor_assigns_stable_issuer_to_cookie_principal() {
+        let (url, _server) = introspection_server(
+            [TestResponse::json(
+                StatusLine::Ok,
+                json!({"user_id": "shared-subject", "roles": ["operator"]}),
+            )],
+            "127.0.0.1",
+        )
+        .await;
+        let validator = CookieSessionValidator::new_for_provider(
+            config(&url),
+            "workforce-cookie",
+            egress_client(),
+        )
+        .expect("validator should build");
+
+        let principal = validator
+            .validate_session(&SessionCredential::Cookie("session-secret".to_owned()))
+            .await
+            .expect("valid cookie should authenticate");
+
+        assert_eq!(principal.user_id, "shared-subject");
+        assert_eq!(
+            principal.issuer.as_deref(),
+            Some("provider:workforce-cookie")
+        );
     }
 
     #[tokio::test]

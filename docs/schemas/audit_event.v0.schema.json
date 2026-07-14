@@ -64,6 +64,9 @@
         "user_id": {
           "type": "string"
         },
+        "issuer": {
+          "type": "string"
+        },
         "email": {
           "type": "string"
         },

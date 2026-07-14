@@ -22,6 +22,7 @@ impl PolicyEngine {
             .roles
             .iter()
             .filter_map(|role| self.policy.roles.get(role))
+            .filter(|entry| entry.matches_principal_identity(principal))
             .flat_map(|entry| entry.permissions.iter())
             .any(|grant| grant == "*" || grant == permission)
     }
@@ -83,6 +84,24 @@ mod tests {
         assert!(!engine.principal_has_permission(&principal, "settings:write"));
     }
 
+    #[test]
+    fn role_permissions_are_bound_to_the_configured_issuer() {
+        let mut policy = test_policy(&[("operator", &["data:write"])]);
+        policy
+            .roles
+            .get_mut("operator")
+            .expect("operator role should exist")
+            .issuers = vec!["https://idp-a.example/".to_owned()];
+        let engine = PolicyEngine::new(policy);
+        let mut provider_a = test_principal(&["operator"]);
+        provider_a.issuer = Some("https://idp-a.example/".to_owned());
+        let mut provider_b = provider_a.clone();
+        provider_b.issuer = Some("https://idp-b.example/".to_owned());
+
+        assert!(engine.principal_has_permission(&provider_a, "data:write"));
+        assert!(!engine.principal_has_permission(&provider_b, "data:write"));
+    }
+
     fn test_policy(entries: &[(&str, &[&str])]) -> Policy {
         let roles = entries
             .iter()
@@ -94,6 +113,8 @@ mod tests {
                             .iter()
                             .map(|permission| (*permission).to_owned())
                             .collect(),
+                        issuers: Vec::new(),
+                        auth_methods: Vec::new(),
                     },
                 )
             })

@@ -1511,15 +1511,17 @@ fn auth_validator_from_config(
                     }
                 };
                 let jwt_config = auth::JwtAuthConfig::from_provider_config(provider, jwks_url);
-                validators.push(Arc::new(auth::JwtValidator::new(
+                validators.push(Arc::new(auth::JwtValidator::new_for_provider(
                     jwt_config,
+                    &provider.name,
                     Arc::clone(&egress_client),
                 )?) as Arc<dyn auth::SessionValidator>);
             }
             config::AuthProviderType::CookieSession => {
                 let cookie_config = auth::CookieSessionAuthConfig::from_provider_config(provider)?;
-                validators.push(Arc::new(auth::CookieSessionValidator::new(
+                validators.push(Arc::new(auth::CookieSessionValidator::new_for_provider(
                     cookie_config,
+                    &provider.name,
                     Arc::clone(&egress_client),
                 )?) as Arc<dyn auth::SessionValidator>);
             }
@@ -4652,7 +4654,12 @@ async fn principal_detail_endpoint(
     };
     let (endpoints_touched, rules_hit) = match state.audit_query_store.as_ref() {
         Some(audit_query_store) => {
-            match principal_audit_summary(audit_query_store, principal_record.subject.as_str()) {
+            match principal_audit_summary(
+                audit_query_store,
+                principal_record.subject.as_str(),
+                principal_record.issuer.as_str(),
+                principal_record.auth_method.as_str(),
+            ) {
                 Ok(summary) => summary,
                 Err(err) => {
                     tracing::error!(error = %err, "failed to query principal audit summary");
@@ -4994,6 +5001,8 @@ impl AuditQueryParams {
             to,
             event_type: self.event_type,
             actor: self.actor,
+            actor_issuer: None,
+            actor_auth_mode: None,
             method: None,
             path: self.path,
             status,
@@ -5846,12 +5855,13 @@ fn principal_from_audit_actor(actor: &audit::Actor) -> Option<auth::Principal> {
     let auth_method = match actor.auth_mode.as_str() {
         rbac::rule::AUTH_METHOD_BEARER_TOKEN => auth::AuthMethod::Bearer,
         rbac::rule::AUTH_METHOD_SESSION_COOKIE => auth::AuthMethod::Cookie,
+        rbac::rule::AUTH_METHOD_SERVICE_TOKEN => auth::AuthMethod::ServiceToken,
         _ => return None,
     };
 
     Some(auth::Principal {
         user_id: actor.user_id.clone(),
-        issuer: None,
+        issuer: actor.issuer.clone(),
         email: actor.email.clone(),
         org_id: None,
         roles: actor.roles.clone().unwrap_or_default(),
@@ -5954,15 +5964,16 @@ fn list_traffic_endpoint_page(
 fn principal_audit_summary(
     audit_query_store: &audit::query::AuditQueryStore,
     subject: &str,
+    issuer: &str,
+    auth_method: &str,
 ) -> Result<(Vec<PrincipalEndpointTouch>, Vec<String>), audit::query::AuditQueryError> {
-    // Audit events currently store only actor_user_id, not issuer/auth_method,
-    // so this convenience view can include same-subject events from another
-    // principal-directory identity key.
     let page = audit_query_store.query(&audit::query::AuditQueryFilters {
         from: None,
         to: None,
         event_type: Some("http.request_observed".to_owned()),
         actor: Some(subject.to_owned()),
+        actor_issuer: Some(issuer.to_owned()),
+        actor_auth_mode: Some(principal_directory_audit_auth_mode(auth_method).to_owned()),
         method: None,
         path: None,
         status: None,
@@ -6024,6 +6035,15 @@ fn principal_audit_summary(
     });
 
     Ok((endpoints, rules.into_iter().collect()))
+}
+
+fn principal_directory_audit_auth_mode(auth_method: &str) -> &str {
+    match auth_method {
+        "bearer" => rbac::rule::AUTH_METHOD_BEARER_TOKEN,
+        "cookie" => rbac::rule::AUTH_METHOD_SESSION_COOKIE,
+        "service_token" => rbac::rule::AUTH_METHOD_SERVICE_TOKEN,
+        other => other,
+    }
 }
 
 fn rfc3339_after(left: &str, right: &str) -> bool {
@@ -6125,7 +6145,7 @@ fn representative_principal_for_rule(rule: &rbac::Rule) -> Option<auth::Principa
             .first()
             .cloned()
             .unwrap_or_else(|| "traffic-coverage-principal".to_owned()),
-        issuer: None,
+        issuer: rule.principal.issuers.first().cloned(),
         email: None,
         org_id: None,
         roles: rule.principal.roles.clone(),
@@ -12788,7 +12808,12 @@ mod tests {
         assert_eventually(Duration::from_secs(1), || {
             principal_directory_row_count(&principal_db.path) == 1
         });
-        let row = principal_directory_row(&principal_db.path, "directory-user", "", "bearer");
+        let row = principal_directory_row(
+            &principal_db.path,
+            "directory-user",
+            "provider:legacy",
+            "bearer",
+        );
         assert_eq!(row.email.as_deref(), Some("directory-user@example.test"));
         assert_eq!(row.request_count, 1);
     }
@@ -13021,8 +13046,7 @@ mod tests {
             principal_directory_row_count(&principal_db.path) == 1
         });
 
-        let detail_uri =
-            "/v1/admin/principal?subject=directory-detail-user&issuer=&auth_method=bearer";
+        let detail_uri = "/v1/admin/principal?subject=directory-detail-user&issuer=provider%3Alegacy&auth_method=bearer";
         let body = wait_for_principal_detail_json(&router, detail_uri, &admin_token, |body| {
             principal_detail_endpoint_paths(body)
                 .contains(&("GET".to_owned(), "/__test/principal".to_owned()))
@@ -16634,6 +16658,7 @@ mod tests {
                 tool_name: None,
                 principal: rbac::PrincipalMatcher {
                     roles: vec!["reader".to_owned()],
+                    issuers: Vec::new(),
                     auth_methods: vec!["bearer_token".to_owned()],
                     principal_ids: Vec::new(),
                 },
@@ -18845,6 +18870,7 @@ paths:
                 "path": "/widgets",
                 "principal": {
                     "roles": ["writer"],
+                    "issuers": [],
                     "auth_methods": [],
                     "principal_ids": []
                 },
@@ -25542,6 +25568,7 @@ O2gecI9QwDJNpm29J9wJB2F8
     ) -> audit::AuditEvent {
         let actor = user_id.map(|user_id| audit::Actor {
             user_id: user_id.to_owned(),
+            issuer: None,
             email: None,
             roles: Some(vec!["reader".to_owned()]),
             auth_mode: "bearer_token".to_owned(),

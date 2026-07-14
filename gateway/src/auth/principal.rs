@@ -17,6 +17,11 @@ impl AuthMethod {
     }
 }
 
+/// Stable identity-boundary label for configured providers without an issuer.
+pub(crate) fn provider_issuer(provider_name: &str) -> String {
+    format!("provider:{provider_name}")
+}
+
 /// Authenticated caller identity used for authorization and audit attribution.
 #[derive(Debug, Clone)]
 pub struct Principal {
@@ -47,6 +52,7 @@ pub struct Principal {
 pub fn actor_from_principal(principal: &Principal) -> crate::audit::Actor {
     crate::audit::Actor {
         user_id: principal.user_id.clone(),
+        issuer: principal.issuer.clone(),
         email: principal.email.clone(),
         roles: if principal.roles.is_empty() {
             None
@@ -63,11 +69,13 @@ mod tests {
 
     #[test]
     fn actor_from_principal_maps_roles_and_cookie_auth_mode() {
-        let principal = test_principal(AuthMethod::Cookie, vec!["admin", "member"]);
+        let mut principal = test_principal(AuthMethod::Cookie, vec!["admin", "member"]);
+        principal.issuer = Some("https://idp.example/".to_owned());
 
         let actor = actor_from_principal(&principal);
 
         assert_eq!(actor.user_id, "user-123");
+        assert_eq!(actor.issuer, Some("https://idp.example/".to_owned()));
         assert_eq!(actor.email, Some("user@example.com".to_owned()));
         assert_eq!(
             actor.roles,
