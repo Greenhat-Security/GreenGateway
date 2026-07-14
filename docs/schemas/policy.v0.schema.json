@@ -98,6 +98,15 @@
             "type": "string"
           }
         },
+        "hosts": {
+          "type": "array",
+          "description": "Exact request hostnames this route rule matches, without ports. Host-qualified upstream routes require an explicit matching host. Empty or omitted matches only upstream routes that are not host-qualified.",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+          }
+        },
         "path_prefix": {
           "type": "string",
           "description": "Path prefix matched with starts_with, such as /admin or /v1/."

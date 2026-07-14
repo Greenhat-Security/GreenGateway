@@ -805,6 +805,11 @@ impl Config {
                 "{UPSTREAM_URL} and {UPSTREAM_ROUTES} are mutually exclusive; set one proxy routing source"
             ));
         }
+        if policy_file.is_none() && upstream_routes.iter().any(|route| route.host.is_some()) {
+            problems.push(format!(
+                "{UPSTREAM_ROUTES} entries with host require {POLICY_FILE} so RBAC can bind authorization to the selected request host"
+            ));
+        }
         let upstream_timeout_ms = parse_optional_var(
             UPSTREAM_TIMEOUT_MS,
             get_var(UPSTREAM_TIMEOUT_MS),
@@ -4337,6 +4342,7 @@ mod tests {
     #[test]
     fn upstream_routes_parse_json_array_and_normalize_matchers() {
         let config = Config::from_env_vars(|name| match name {
+            "POLICY_FILE" => Ok("policy.json".to_owned()),
             "UPSTREAM_ROUTES" => Ok(r#"[
                     {
                         "path_prefix": " /api ",
@@ -4395,6 +4401,22 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn host_qualified_upstream_routes_require_policy_file() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(
+                r#"[{"host":"app.example.test","upstream_url":"https://app.internal.example"}]"#
+                    .to_owned(),
+            ),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("host-qualified routes should require an RBAC policy");
+
+        assert!(error.to_string().contains(
+            "UPSTREAM_ROUTES entries with host require POLICY_FILE so RBAC can bind authorization to the selected request host"
+        ));
     }
 
     #[test]

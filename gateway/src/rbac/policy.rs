@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     ffi::OsString,
     fmt, fs, io,
@@ -117,6 +117,11 @@ pub struct RouteRule {
     /// HTTP methods this rule matches. Empty or ["*"] matches any method.
     #[serde(default)]
     pub methods: Vec<String>,
+    /// Exact request hosts this route rule matches. Empty matches only
+    /// upstream routes that are not host-qualified.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
     /// Absolute path prefix this rule matches. Rules are evaluated in order.
     pub path_prefix: String,
     /// Permission required to access a matching route.
@@ -287,12 +292,33 @@ impl Policy {
             )));
         }
 
+        validate_routes(&self.routes)?;
         validate_rules(&self.rules)?;
         validate_rate_limits(&self.rate_limits)?;
         validate_tools(&self.tools)?;
 
         self.egress.validate()
     }
+}
+
+fn validate_routes(routes: &[RouteRule]) -> Result<(), PolicyError> {
+    for (route_index, route) in routes.iter().enumerate() {
+        let mut seen = HashSet::new();
+        for host in &route.hosts {
+            if host.trim() != host || !is_valid_hostname_without_port(host) {
+                return Err(PolicyError::Invalid(format!(
+                    "routes[{route_index}].hosts must contain hostnames without ports, got '{host}'"
+                )));
+            }
+            if !seen.insert(host.to_ascii_lowercase()) {
+                return Err(PolicyError::Invalid(format!(
+                    "routes[{route_index}].hosts contains duplicate hostname '{host}'"
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_rule_target_properties(value: &Value) -> Result<(), PolicyError> {
@@ -1345,6 +1371,64 @@ mod tests {
     }
 
     #[test]
+    fn route_hosts_parse_round_trip_and_match_published_schema() {
+        let value = json!({
+            "schema_version": "0.1.0",
+            "routes": [
+                {
+                    "methods": ["GET"],
+                    "hosts": ["admin.example.test"],
+                    "path_prefix": "/data",
+                    "permission": "admin:read"
+                }
+            ]
+        });
+
+        assert_schema_accepts(&policy_schema_validator(), &value);
+        let policy = Policy::from_json_value(value, None)
+            .expect("host-bound route policy should parse and validate");
+        assert_eq!(policy.routes[0].hosts, vec!["admin.example.test"]);
+
+        let serialized = serde_json::to_value(&policy).expect("host-bound policy should serialize");
+        let round_tripped: Policy =
+            serde_json::from_value(serialized).expect("serialized host-bound policy should parse");
+        assert_eq!(round_tripped, policy);
+    }
+
+    #[test]
+    fn route_hosts_reject_ports_and_case_insensitive_duplicates() {
+        let validator = policy_schema_validator();
+        let with_port = json!({
+            "schema_version": "0.1.0",
+            "routes": [
+                {
+                    "hosts": ["admin.example.test:443"],
+                    "path_prefix": "/data",
+                    "permission": "admin:read"
+                }
+            ]
+        });
+        assert!(!validator.is_valid(&with_port));
+        let error = Policy::from_json_value(with_port, None)
+            .expect_err("route hosts with ports should fail validation");
+        assert!(error.to_string().contains("hostnames without ports"));
+
+        let duplicate = json!({
+            "schema_version": "0.1.0",
+            "routes": [
+                {
+                    "hosts": ["admin.example.test", "ADMIN.EXAMPLE.TEST"],
+                    "path_prefix": "/data",
+                    "permission": "admin:read"
+                }
+            ]
+        });
+        let error = Policy::from_json_value(duplicate, None)
+            .expect_err("route hosts should be unique ignoring case");
+        assert!(error.to_string().contains("duplicate hostname"));
+    }
+
+    #[test]
     fn malformed_rules_are_rejected_by_parser_and_schema() {
         let cases = [
             (
@@ -2175,6 +2259,7 @@ mod tests {
     fn route(path_prefix: &str, permission: &str) -> RouteRule {
         RouteRule {
             methods: Vec::new(),
+            hosts: Vec::new(),
             path_prefix: path_prefix.to_owned(),
             permission: permission.to_owned(),
             enforcement_mode: None,
@@ -2204,12 +2289,14 @@ mod tests {
             routes: vec![
                 RouteRule {
                     methods: vec!["GET".to_owned(), "HEAD".to_owned()],
+                    hosts: Vec::new(),
                     path_prefix: "/data".to_owned(),
                     permission: "data:read".to_owned(),
                     enforcement_mode: Some(EnforcementMode::Enforce),
                 },
                 RouteRule {
                     methods: Vec::new(),
+                    hosts: Vec::new(),
                     path_prefix: "/reports".to_owned(),
                     permission: "reports:read".to_owned(),
                     enforcement_mode: None,

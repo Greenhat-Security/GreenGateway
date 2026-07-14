@@ -45,6 +45,7 @@ mod middleware;
 mod path_match;
 mod rbac;
 mod tools;
+mod upstream_route;
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -2543,45 +2544,17 @@ fn routing_route_for_request<'a>(
     path: &str,
     headers: &HeaderMap,
 ) -> Option<&'a ProxyRoute> {
-    let request_host = request_host_without_port(headers);
-    let request_host = request_host.as_deref();
-    let mut best = None::<(&ProxyRoute, usize, bool)>;
-
-    for route in routes {
-        if !route.matches(path, request_host) {
-            continue;
-        }
-
-        let prefix_len = route.path_prefix.as_deref().map_or(0, str::len);
-        let host_specific = route.host.is_some();
-        let should_replace = match best {
-            Some((_, best_prefix_len, best_host_specific)) => {
-                prefix_len > best_prefix_len
-                    || (prefix_len == best_prefix_len && host_specific && !best_host_specific)
-            }
-            None => true,
-        };
-
-        if should_replace {
-            best = Some((route, prefix_len, host_specific));
-        }
-    }
-
-    best.map(|(route, _, _)| route)
+    let request_host = upstream_route::request_host_without_port(headers);
+    upstream_route::matching_route(routes, path, request_host.as_deref())
 }
 
-impl ProxyRoute {
-    fn matches(&self, path: &str, request_host: Option<&str>) -> bool {
-        let host_matches = self
-            .host
-            .as_deref()
-            .is_none_or(|host| request_host == Some(host));
-        let path_matches = self
-            .path_prefix
-            .as_deref()
-            .is_none_or(|path_prefix| path_match::path_prefix_matches(path, path_prefix));
+impl upstream_route::RouteMatch for ProxyRoute {
+    fn path_prefix(&self) -> Option<&str> {
+        self.path_prefix.as_deref()
+    }
 
-        host_matches && path_matches
+    fn host(&self) -> Option<&str> {
+        self.host.as_deref()
     }
 }
 
@@ -2611,22 +2584,6 @@ fn upstream_health_targets(
     }
 
     targets
-}
-
-fn request_host_without_port(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(header::HOST)?.to_str().ok()?.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    let host = if let Some(rest) = value.strip_prefix('[') {
-        let end = rest.find(']')?;
-        &rest[..end]
-    } else {
-        value.split_once(':').map_or(value, |(host, _)| host)
-    };
-
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -> Response {
