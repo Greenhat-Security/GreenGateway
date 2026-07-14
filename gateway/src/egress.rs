@@ -839,11 +839,11 @@ fn classify_nat64_address(ip: Ipv6Addr, configured_prefixes: &[IpNet]) -> Nat64A
 
 fn extract_rfc6052_ipv4(ip: Ipv6Addr, prefix_len: u8) -> Option<Ipv4Addr> {
     let bits = u128::from(ip);
+    if !matches!(prefix_len, 32 | 40 | 48 | 56 | 64 | 96) || ip.octets()[8] != 0 {
+        return None;
+    }
     if prefix_len == 96 {
         return Some(Ipv4Addr::from(bits as u32));
-    }
-    if !matches!(prefix_len, 32 | 40 | 48 | 56 | 64) || ip.octets()[8] != 0 {
-        return None;
     }
 
     let leading_bits = 64 - prefix_len;
@@ -1130,6 +1130,21 @@ mod tests {
                 "unexpected extraction for {prefix}"
             );
         }
+    }
+
+    #[test]
+    fn rfc6052_extraction_rejects_nonzero_u_octet_for_96_prefixes() {
+        let prefix = "2001:db8:122:344:100::/96"
+            .parse::<IpNet>()
+            .expect("test prefix should parse");
+        let address = "2001:db8:122:344:100:0:808:808"
+            .parse::<Ipv6Addr>()
+            .expect("test address should parse");
+
+        assert!(prefix.contains(&IpAddr::V6(address)));
+        assert_eq!(address.octets()[8], 1);
+        assert_eq!(extract_rfc6052_ipv4(address, 96), None);
+        assert!(is_non_global_ip(IpAddr::V6(address), &[prefix]));
     }
 
     #[test]

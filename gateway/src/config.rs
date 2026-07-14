@@ -31,6 +31,11 @@ static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
         .parse()
         .expect("default listen address should be valid")
 });
+static WELL_KNOWN_NAT64_PREFIX: LazyLock<IpNet> = LazyLock::new(|| {
+    "64:ff9b::/96"
+        .parse()
+        .expect("well-known NAT64 prefix should be valid")
+});
 const DEFAULT_MAX_BODY_SIZE: usize = 1_048_576;
 const DEFAULT_RATE_LIMIT_READ_RPS: f64 = 50.0;
 const DEFAULT_RATE_LIMIT_READ_BURST: u32 = 100;
@@ -1647,6 +1652,25 @@ fn parse_nat64_prefixes(
                 continue;
             }
         };
+
+        let IpNet::V6(ipv6_prefix) = &prefix else {
+            unreachable!("IPv4 NAT64 prefixes are rejected above");
+        };
+        if ipv6_prefix.network().octets()[8] != 0 {
+            problems.push(format!(
+                "{name} entries must use a zero RFC 6052 u octet, got '{entry}'"
+            ));
+            continue;
+        }
+
+        if WELL_KNOWN_NAT64_PREFIX.contains(&prefix.network())
+            || prefix.contains(&WELL_KNOWN_NAT64_PREFIX.network())
+        {
+            problems.push(format!(
+                "{name} entries must not overlap the built-in well-known NAT64 prefix 64:ff9b::/96, got '{prefix}'"
+            ));
+            continue;
+        }
 
         if let Some(existing) = prefixes.iter().find(|existing| {
             existing.contains(&prefix.network()) || prefix.contains(&existing.network())
@@ -4405,6 +4429,22 @@ mod tests {
         assert!(message.contains("valid IPv6 CIDR prefixes"));
         assert!(message.contains("entries must not overlap"));
         assert_eq!(error.problems.len(), 4);
+    }
+
+    #[test]
+    fn malformed_or_well_known_overlapping_nat64_prefixes_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "EGRESS_NAT64_PREFIXES" => Ok("2001:db8:122:344:100::/96,64:ff9b::/64".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject structurally invalid NAT64 prefixes");
+
+        let message = error.to_string();
+        assert!(message.contains("must use a zero RFC 6052 u octet"));
+        assert!(
+            message.contains("must not overlap the built-in well-known NAT64 prefix 64:ff9b::/96")
+        );
+        assert_eq!(error.problems.len(), 2);
     }
 
     #[test]

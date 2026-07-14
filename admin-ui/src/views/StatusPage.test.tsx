@@ -27,6 +27,8 @@ describe('StatusPage', () => {
     expect(screen.getByText('https://example.test')).toBeTruthy();
     expect(screen.getByText('https://ops.example.test')).toBeTruthy();
     expect(screen.getByText('3')).toBeTruthy();
+    expect(screen.getByText('NAT64 prefixes')).toBeTruthy();
+    expect(screen.getByText('Deny non-global IPs')).toBeTruthy();
 
     expect(fetchMock).toHaveBeenCalledWith(
       '/v1/admin/status',
@@ -107,6 +109,7 @@ function gatewayStatus(overrides: Partial<GatewayStatus> = {}): GatewayStatus {
     csrf_enabled: true,
     egress: {
       allowed_hosts_count: 3,
+      nat64_prefixes_count: 2,
       deny_private_ips: true,
     },
     ...overrides,

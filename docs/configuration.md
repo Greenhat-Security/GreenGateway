@@ -993,7 +993,7 @@ Optional comma-separated RFC 6052 network-specific IPv6 translation prefixes use
 
 Default: empty. GreenGateway always recognizes the globally reachable well-known prefix `64:ff9b::/96` without configuration. The local-use prefix `64:ff9b:1::/48` remains blocked unless it is explicitly configured here.
 
-Format and validation: entries must be IPv6 CIDR prefixes with an RFC 6052 prefix length of `/32`, `/40`, `/48`, `/56`, `/64`, or `/96`. Prefixes must not overlap. GreenGateway extracts the embedded IPv4 address and applies the same non-global-address policy to it, so an alternate IPv6 representation cannot hide a private, loopback, link-local, or other blocked IPv4 destination. Configure only prefixes routed to a trusted NAT64 translator in this deployment.
+Format and validation: entries must be IPv6 CIDR prefixes with an RFC 6052 prefix length of `/32`, `/40`, `/48`, `/56`, `/64`, or `/96`, and the RFC 6052 `u` octet must be zero. Prefixes must not overlap each other or the built-in `64:ff9b::/96` prefix. GreenGateway extracts the embedded IPv4 address and applies the same non-global-address policy to it, so an alternate IPv6 representation cannot hide a private, loopback, link-local, or other blocked IPv4 destination. Configure only prefixes routed to a trusted NAT64 translator in this deployment.
 
 ### EGRESS_DENY_PRIVATE_IPS
 

@@ -1307,7 +1307,8 @@ fn egress_error_reason(error: &EgressError) -> &'static str {
     match error {
         EgressError::HostNotAllowed(_) => "host_not_allowed",
         EgressError::PortNotAllowed(_) => "port_not_allowed",
-        EgressError::NonGlobalIpBlocked(_) => "non_global_ip_blocked",
+        // Keep the original machine reason stable for audit and alert consumers.
+        EgressError::NonGlobalIpBlocked(_) => "private_ip_blocked",
         EgressError::InvalidPolicy(_) => "invalid_egress_policy",
         EgressError::DnsResolutionFailed(_) => "dns_resolution_failed",
         EgressError::InvalidUrl(_) => "invalid_url",
@@ -1514,6 +1515,15 @@ mod tests {
     };
 
     const EXPECTED_STRICT_SCHEMA_INJECTION_MAX_DEPTH: usize = 64;
+
+    #[test]
+    fn non_global_egress_reason_preserves_machine_contract() {
+        let error = EgressError::NonGlobalIpBlocked(
+            "10.0.0.1".parse().expect("test IP address should parse"),
+        );
+
+        assert_eq!(egress_error_reason(&error), "private_ip_blocked");
+    }
 
     #[tokio::test]
     async fn valid_args_are_mapped_to_upstream_request_and_audited() {
