@@ -259,7 +259,8 @@ impl GatewayRoutes {
     }
 
     fn is_gateway_owned_path(&self, path: &str) -> bool {
-        self.exact_owned_paths.iter().any(|owned| path == owned)
+        auth::protected_resource::is_well_known_path(path)
+            || self.exact_owned_paths.iter().any(|owned| path == owned)
             || self
                 .prefix_owned_paths
                 .iter()
@@ -10133,6 +10134,49 @@ mod tests {
         assert_upstream_receives_no_request(
             &mut captured,
             "host-qualified fallback must not replace MCP route authorization",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn host_qualified_fallback_policy_cannot_replace_oauth_metadata_route() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "roles": {},
+                "routes": []
+            }"#,
+        );
+        let mut config = routing_proxy_config(vec![host_path_route(
+            "app.example.test",
+            "/",
+            upstream_addr,
+        )]);
+        config.gateway_public_url = Some("https://gateway.example.test".to_owned());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        let router = proxy_router(config, test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/oauth-protected-resource/mcp")
+                    .header(header::HOST, "app.example.test")
+                    .body(Body::empty())
+                    .expect("metadata request should build"),
+            )
+            .await
+            .expect("metadata request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await["resource"],
+            json!("https://gateway.example.test/mcp")
+        );
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "host-qualified fallback must not replace OAuth metadata",
         )
         .await;
     }

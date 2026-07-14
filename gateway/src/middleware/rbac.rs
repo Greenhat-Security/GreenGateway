@@ -464,6 +464,14 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     } else {
         first_direct_rule.clone()
     };
+    if required_upstream_host.is_some() {
+        if let Some(rule_decision) = first_direct_rule.as_ref() {
+            if rule_decision.action == RuleAction::Shadow {
+                let matched_rule_id = policy.rule_id(rule_decision.rule_index);
+                emit_rule_would_deny(&state, &context, principal.as_ref(), &matched_rule_id);
+            }
+        }
+    }
     if let Some(rule_decision) = direct_rule_decision {
         let matched_rule_id = policy.rule_id(rule_decision.rule_index);
         return match rule_decision.action {
@@ -501,15 +509,6 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 with_policy_decision(response, decision)
             }
         };
-    }
-
-    if required_upstream_host.is_some() {
-        if let Some(rule_decision) = first_direct_rule {
-            if rule_decision.action == RuleAction::Shadow {
-                let matched_rule_id = policy.rule_id(rule_decision.rule_index);
-                emit_rule_would_deny(&state, &context, principal.as_ref(), &matched_rule_id);
-            }
-        }
     }
 
     let matching_policy_route = matching_route_for_request(
@@ -1836,6 +1835,53 @@ mod tests {
         assert_eq!(shadow.payload["matched_rule_id"], json!("shadow-data"));
         let allowed = captured_event(&capture, AUTHZ_ALLOWED).await;
         assert_eq!(allowed.payload["permission"], json!("admin:read"));
+    }
+
+    #[tokio::test]
+    async fn direct_shadow_keeps_telemetry_when_later_deny_blocks_host_route() {
+        let (state, capture) = test_state(
+            test_policy_with_rules(
+                DefaultAction::Deny,
+                &[("admin", &["admin:read"])],
+                &[host_route(
+                    &["GET"],
+                    &["admin.example.test"],
+                    "/data",
+                    "admin:read",
+                )],
+                &[
+                    direct_rule(
+                        Some("shadow-data"),
+                        &["GET"],
+                        "/data/**",
+                        RuleAction::Shadow,
+                    ),
+                    direct_rule(Some("deny-data"), &["GET"], "/data/**", RuleAction::Deny),
+                ],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, Some(test_principal(&["admin"])))
+            .oneshot(proxy_request(
+                Method::GET,
+                "/data/report",
+                "admin.example.test",
+            ))
+            .await
+            .expect("host-qualified shadow request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.outcome, PolicyDecisionOutcome::Denied);
+        assert_eq!(decision.matched_rule_id.as_deref(), Some("deny-data"));
+        let shadow = captured_event(&capture, AUTHZ_WOULD_DENY).await;
+        assert_eq!(shadow.payload["matched_rule_id"], json!("shadow-data"));
+        let denied = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(denied.payload["matched_rule_id"], json!("deny-data"));
     }
 
     #[tokio::test]
