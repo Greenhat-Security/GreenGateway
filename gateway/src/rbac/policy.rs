@@ -304,10 +304,10 @@ impl Policy {
             canonicalize_issuer_list(&mut role.issuers);
         }
         for rule in &mut self.rules {
-            canonicalize_issuer_list(&mut rule.principal.issuers);
+            canonicalize_principal_matcher_issuers(&mut rule.principal);
         }
         for rule in &mut self.rate_limits {
-            canonicalize_issuer_list(&mut rule.principal.issuers);
+            canonicalize_principal_matcher_issuers(&mut rule.principal);
         }
         for tool in self.tools.values_mut() {
             canonicalize_issuer_list(&mut tool.issuers);
@@ -461,6 +461,10 @@ fn canonicalize_issuer_list(issuers: &mut Vec<String>) {
         *issuer = canonical_issuer(issuer).unwrap_or_default();
         seen.insert(issuer.clone())
     });
+}
+
+pub(crate) fn canonicalize_principal_matcher_issuers(principal: &mut PrincipalMatcher) {
+    canonicalize_issuer_list(&mut principal.issuers);
 }
 
 fn validate_roles(roles: &HashMap<String, RoleEntry>) -> Result<(), PolicyError> {

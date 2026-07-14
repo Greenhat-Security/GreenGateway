@@ -810,14 +810,14 @@ impl DiscoveryQueryStore {
     pub fn list_principal_endpoint_signals(
         &self,
         principal: &str,
+        issuer: &str,
+        auth_method: &str,
         limit: usize,
     ) -> Result<Vec<Signal>, DiscoveryQueryError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
 
-        let target_key_suffix = format!(" {principal}");
-        let target_key_pattern = format!("%{}", like_escape(&target_key_suffix));
         let rows = {
             let connection = self.connection_guard();
             let mut statement = connection
@@ -839,8 +839,15 @@ impl DiscoveryQueryStore {
                     FROM discovery_signals
                     WHERE signal_type = ?1
                       AND target_kind = ?2
-                      AND target_key LIKE ?3 ESCAPE '\'
+                      AND CASE
+                            WHEN json_valid(target_identity_json) = 1 THEN
+                                json_extract(target_identity_json, '$.principal') = ?3
+                                AND COALESCE(json_extract(target_identity_json, '$.issuer'), '') = ?4
+                                AND json_extract(target_identity_json, '$.auth_method') = ?5
+                            ELSE 0
+                          END
                     ORDER BY julianday(created_at) DESC, id ASC
+                    LIMIT ?6
                     "#,
                 )
                 .map_err(|source| DiscoveryQueryError::Sqlite {
@@ -852,7 +859,10 @@ impl DiscoveryQueryStore {
                     params![
                         signals::PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_TYPE,
                         signals::PRINCIPAL_ENDPOINT_TARGET_KIND,
-                        target_key_pattern
+                        principal,
+                        issuer,
+                        auth_method,
+                        i64::try_from(limit).unwrap_or(i64::MAX),
                     ],
                     RawSignal::from_row,
                 )
@@ -868,24 +878,7 @@ impl DiscoveryQueryStore {
             rows
         };
 
-        let mut signals = Vec::new();
-        for row in rows {
-            let signal = row.into_signal()?;
-            if signal
-                .target
-                .identity
-                .get("principal")
-                .and_then(Value::as_str)
-                == Some(principal)
-            {
-                signals.push(signal);
-                if signals.len() == limit {
-                    break;
-                }
-            }
-        }
-
-        Ok(signals)
+        rows.into_iter().map(RawSignal::into_signal).collect()
     }
 
     pub fn transition_signal(
@@ -1379,7 +1372,9 @@ struct EndpointCursor {
 struct PrincipalCursor {
     last_seen: String,
     user_id: String,
+    #[serde(default)]
     issuer: String,
+    #[serde(default)]
     auth_method: String,
 }
 
@@ -2249,6 +2244,20 @@ mod tests {
             .expect("inferred schema should query");
 
         assert!(schema.is_none());
+    }
+
+    #[test]
+    fn principal_cursor_decodes_pre_identity_pagination_shape() {
+        let legacy_cursor =
+            hex::encode(br#"{"last_seen":"2024-06-01T12:00:00Z","user_id":"alice"}"#);
+
+        let cursor = decode_cursor::<PrincipalCursor>("principal_cursor", &legacy_cursor)
+            .expect("legacy principal cursor should remain decodable");
+
+        assert_eq!(cursor.last_seen, "2024-06-01T12:00:00Z");
+        assert_eq!(cursor.user_id, "alice");
+        assert_eq!(cursor.issuer, "");
+        assert_eq!(cursor.auth_method, "");
     }
 
     fn seed_endpoint(path: &PathBuf, method: &str, endpoint_template: &str) {

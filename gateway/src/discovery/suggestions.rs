@@ -147,6 +147,14 @@ pub struct RuleSuggestion {
     pub source_signal_id: Option<String>,
 }
 
+impl RuleSuggestion {
+    pub fn is_identity_bound_for_acceptance(&self) -> bool {
+        self.suggestion_type != BASELINE_ALLOW_SUGGESTION_TYPE
+            || (!self.proposed_rule.principal.issuers.is_empty()
+                && !self.proposed_rule.principal.auth_methods.is_empty())
+    }
+}
+
 #[derive(Serialize)]
 pub struct RuleSuggestionListPage {
     pub suggestions: Vec<RuleSuggestion>,
@@ -489,6 +497,9 @@ pub enum RuleSuggestionError {
     InvalidCursor {
         parameter: &'static str,
     },
+    UnsafeBaselineSuggestion {
+        id: String,
+    },
 }
 
 impl fmt::Display for RuleSuggestionError {
@@ -516,6 +527,10 @@ impl fmt::Display for RuleSuggestionError {
             Self::InvalidCursor { parameter } => {
                 write!(formatter, "invalid rule suggestion cursor: {parameter}")
             }
+            Self::UnsafeBaselineSuggestion { id } => write!(
+                formatter,
+                "baseline rule suggestion {id} is missing issuer or authentication-method constraints"
+            ),
         }
     }
 }
@@ -529,6 +544,7 @@ impl Error for RuleSuggestionError {
             Self::Json { source, .. } => Some(source),
             Self::InvalidState { .. } => None,
             Self::InvalidCursor { .. } => None,
+            Self::UnsafeBaselineSuggestion { .. } => None,
         }
     }
 }
@@ -771,6 +787,15 @@ impl RuleSuggestionStore {
     ) -> Result<Option<RuleSuggestion>, RuleSuggestionError> {
         let transitioned_at = utc_timestamp_rfc3339();
         let connection = self.connection_guard();
+        if state == RuleSuggestionLifecycleState::Accepted {
+            let Some(suggestion) = load_suggestion_by_id(&connection, &self.path, suggestion_id)?
+            else {
+                return Ok(None);
+            };
+            if !suggestion.is_identity_bound_for_acceptance() {
+                return Err(RuleSuggestionError::UnsafeBaselineSuggestion { id: suggestion.id });
+            }
+        }
         let updated = connection
             .execute(
                 r#"
@@ -908,7 +933,28 @@ struct RuleSuggestionCursor {
 }
 
 pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
-    connection.execute_batch(CREATE_RULE_SUGGESTION_SCHEMA_SQL)
+    connection.execute_batch(CREATE_RULE_SUGGESTION_SCHEMA_SQL)?;
+
+    let transitioned_at = utc_timestamp_rfc3339();
+    connection.execute(
+        r#"
+        UPDATE discovery_rule_suggestions
+        SET state = 'dismissed',
+            updated_at = ?1,
+            transitioned_at = ?1,
+            transitioned_by = 'system:issuer-bound-migration'
+        WHERE state = 'open'
+          AND suggestion_type = 'baseline_allow'
+          AND CASE
+                WHEN json_valid(proposed_rule_json) = 0 THEN 1
+                ELSE COALESCE(json_array_length(proposed_rule_json, '$.principal.issuers'), 0) = 0
+                  OR COALESCE(json_array_length(proposed_rule_json, '$.principal.auth_methods'), 0) = 0
+              END
+        "#,
+        params![transitioned_at],
+    )?;
+
+    Ok(())
 }
 
 fn load_suggestion_by_id(
@@ -1942,6 +1988,74 @@ mod tests {
             .is_empty());
     }
 
+    #[test]
+    fn configure_connection_dismisses_open_legacy_baselines_only() {
+        let db = TempDb::new("legacy-baseline-migration");
+        let connection = Connection::open(&db.path).expect("suggestion database should open");
+        configure_connection(&connection).expect("suggestion schema should configure");
+        insert_stored_baseline(&connection, "missing-issuer", &[], &["bearer_token"]);
+        insert_stored_baseline(&connection, "missing-auth", &["provider:test"], &[]);
+        insert_stored_baseline(
+            &connection,
+            "identity-bound",
+            &["provider:test"],
+            &["bearer_token"],
+        );
+
+        configure_connection(&connection).expect("legacy suggestion migration should run");
+
+        for id in ["missing-issuer", "missing-auth"] {
+            let (state, transitioned_by) = connection
+                .query_row(
+                    "SELECT state, transitioned_by FROM discovery_rule_suggestions WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("migrated suggestion should query");
+            assert_eq!(state, RULE_SUGGESTION_STATE_DISMISSED);
+            assert_eq!(transitioned_by, "system:issuer-bound-migration");
+        }
+
+        let safe_state = connection
+            .query_row(
+                "SELECT state FROM discovery_rule_suggestions WHERE id = 'identity-bound'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("identity-bound suggestion should query");
+        assert_eq!(safe_state, RULE_SUGGESTION_STATE_OPEN);
+    }
+
+    #[test]
+    fn transition_rejects_unbound_baseline_inserted_after_configuration() {
+        let db = TempDb::new("legacy-baseline-transition");
+        let store = RuleSuggestionStore::open(&db.path).expect("suggestion store should open");
+        let connection = Connection::open(&db.path).expect("suggestion database should open");
+        insert_stored_baseline(&connection, "unsafe-baseline", &[], &[]);
+
+        let error = store
+            .transition_suggestion(
+                "unsafe-baseline",
+                RuleSuggestionLifecycleState::Accepted,
+                Some("reviewer"),
+            )
+            .expect_err("unbound baseline acceptance should fail closed");
+
+        assert!(matches!(
+            error,
+            RuleSuggestionError::UnsafeBaselineSuggestion { ref id }
+                if id == "unsafe-baseline"
+        ));
+        let state = connection
+            .query_row(
+                "SELECT state FROM discovery_rule_suggestions WHERE id = 'unsafe-baseline'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("unsafe suggestion should query");
+        assert_eq!(state, RULE_SUGGESTION_STATE_OPEN);
+    }
+
     fn suggestion_engine(
         discovery_path: &PathBuf,
         audit_path: Option<&PathBuf>,
@@ -1969,6 +2083,49 @@ mod tests {
             rate_limits: Vec::new(),
             tools: Default::default(),
         }
+    }
+
+    fn insert_stored_baseline(
+        connection: &Connection,
+        id: &str,
+        issuers: &[&str],
+        auth_methods: &[&str],
+    ) {
+        let proposed_rule = rule_suggestion_for_endpoint(
+            "GET",
+            &format!("/legacy/{id}"),
+            PrincipalMatcher {
+                roles: vec!["reader".to_owned()],
+                issuers: issuers.iter().map(|issuer| (*issuer).to_owned()).collect(),
+                auth_methods: auth_methods
+                    .iter()
+                    .map(|auth_method| (*auth_method).to_owned())
+                    .collect(),
+                principal_ids: Vec::new(),
+            },
+            RuleAction::Allow,
+        );
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_rule_suggestions (
+                    id, suggestion_type, method, path_pattern, principal_key,
+                    proposed_rule_json, rationale, evidence_json, state,
+                    created_at, updated_at, transitioned_at, transitioned_by,
+                    source_signal_id
+                ) VALUES (?1, 'baseline_allow', 'GET', ?2, ?3, ?4, 'legacy test', '{}',
+                          'open', '2024-06-01T00:00:00Z', '2024-06-01T00:00:00Z',
+                          NULL, NULL, NULL)
+                "#,
+                params![
+                    id,
+                    proposed_rule.path.as_str(),
+                    format!("legacy:{id}"),
+                    serde_json::to_string(&proposed_rule)
+                        .expect("proposed baseline rule should serialize"),
+                ],
+            )
+            .expect("stored baseline should insert");
     }
 
     fn suggestion_for<'a>(

@@ -1220,7 +1220,18 @@ fn validate_auth_providers(
         match provider_type {
             AuthProviderType::Jwt => {
                 jwks_url = normalize_optional_config_string(provider.jwks_url);
-                issuer = provider.issuer.as_deref().and_then(canonical_issuer);
+                issuer = match provider.issuer.as_deref() {
+                    Some(raw_issuer) => match canonical_issuer(raw_issuer) {
+                        Some(canonical_issuer) => Some(canonical_issuer),
+                        None => {
+                            problems.push(format!(
+                                "{provider_name}.issuer must be non-empty after trimming whitespace and trailing slashes"
+                            ));
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 if issuer
                     .as_deref()
                     .is_some_and(|issuer| issuer.starts_with(PROVIDER_ISSUER_PREFIX))
@@ -4015,6 +4026,26 @@ mod tests {
                 redirect_uri: None,
             }]
         );
+    }
+
+    #[test]
+    fn auth_providers_reject_explicit_issuer_that_canonicalizes_to_empty() {
+        let error = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(r#"[{
+                    "name": "invalid-issuer",
+                    "type": "jwt",
+                    "jwks_url": "https://issuer.example.test/.well-known/jwks.json",
+                    "issuer": " / "
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("an explicitly configured empty canonical issuer should fail validation");
+
+        assert!(error.to_string().contains(
+            "AUTH_PROVIDERS[0].issuer must be non-empty after trimming whitespace and trailing slashes"
+        ));
+        assert_eq!(error.problems.len(), 1);
     }
 
     #[test]
