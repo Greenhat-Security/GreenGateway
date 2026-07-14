@@ -165,6 +165,7 @@ mod tests {
             rate_limit_write_rps: 10.0,
             rate_limit_write_burst: 20,
             trust_proxy_headers: false,
+            trusted_proxy_cidrs: Vec::new(),
             rbac_exempt_paths: vec![
                 "/health".to_owned(),
                 "/version".to_owned(),

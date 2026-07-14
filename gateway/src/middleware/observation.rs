@@ -21,7 +21,7 @@ use crate::{
         AuditEvent, AuditLog,
     },
     auth::actor_from_principal,
-    client_ip::{canonical_client_ip, request_id},
+    client_ip::{canonical_client_ip, request_id, ClientIpPolicy},
     config::Config,
     discovery::{
         openapi::{OpenApiRequestShape, SchemaCoverage},
@@ -45,7 +45,7 @@ const INFERRED_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct ObservationState {
     pub audit: AuditLog,
-    pub trust_proxy_headers: bool,
+    pub client_ip_policy: ClientIpPolicy,
     payload_capture: Option<PayloadCaptureConfig>,
     conformance: Option<SchemaConformanceState>,
 }
@@ -54,7 +54,7 @@ impl ObservationState {
     pub fn from_config(config: &Config, audit: AuditLog) -> Self {
         Self {
             audit,
-            trust_proxy_headers: config.trust_proxy_headers,
+            client_ip_policy: ClientIpPolicy::from_config(config),
             payload_capture: PayloadCaptureConfig::from_config(config),
             conformance: None,
         }
@@ -147,7 +147,7 @@ pub async fn observation_middleware(
     let method = req.method().to_string();
     let path = req.uri().path().to_owned();
     let request_id = request_id(req.headers(), req.extensions());
-    let source_ip = canonical_client_ip(req.headers(), req.extensions(), state.trust_proxy_headers);
+    let source_ip = canonical_client_ip(req.headers(), req.extensions(), &state.client_ip_policy);
     let query = req.uri().query().map(str::to_owned);
     let conformance_check = state
         .conformance
@@ -2003,7 +2003,7 @@ paths:
                     exempt_paths: Vec::new(),
                     audit: audit.clone(),
                     principal_directory: crate::auth::PrincipalDirectory::disabled(),
-                    trust_proxy_headers: false,
+                    client_ip_policy: ClientIpPolicy::default(),
                     mcp_route_paths: vec![
                         crate::auth::protected_resource::MCP_RESOURCE_PATH.to_owned()
                     ],
@@ -2015,7 +2015,7 @@ paths:
             .layer(from_fn_with_state(
                 ObservationState {
                     audit,
-                    trust_proxy_headers: false,
+                    client_ip_policy: ClientIpPolicy::default(),
                     payload_capture: None,
                     conformance: None,
                 },
@@ -2028,7 +2028,7 @@ paths:
         (
             ObservationState {
                 audit,
-                trust_proxy_headers: false,
+                client_ip_policy: ClientIpPolicy::default(),
                 payload_capture: None,
                 conformance: None,
             },
@@ -2043,7 +2043,7 @@ paths:
         (
             ObservationState {
                 audit,
-                trust_proxy_headers: false,
+                client_ip_policy: ClientIpPolicy::default(),
                 payload_capture: None,
                 conformance: Some(conformance),
             },

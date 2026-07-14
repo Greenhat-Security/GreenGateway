@@ -48,12 +48,12 @@ impl McpState {
     pub(crate) fn new(
         registry: ToolRegistry,
         executor: Option<ToolExecutor>,
-        trust_proxy_headers: bool,
+        client_ip_policy: client_ip::ClientIpPolicy,
     ) -> Self {
         let server = McpServer {
             registry,
             executor,
-            trust_proxy_headers,
+            client_ip_policy,
         };
         let config = StreamableHttpServerConfig::default()
             .with_stateful_mode(false)
@@ -84,7 +84,7 @@ pub(crate) async fn mcp_endpoint(
 struct McpServer {
     registry: ToolRegistry,
     executor: Option<ToolExecutor>,
-    trust_proxy_headers: bool,
+    client_ip_policy: client_ip::ClientIpPolicy,
 }
 
 impl ServerHandler for McpServer {
@@ -100,8 +100,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let invocation_context =
-            invocation_context_from_request(&context, self.trust_proxy_headers);
+        let invocation_context = invocation_context_from_request(&context, &self.client_ip_policy);
         let tools = self
             .registry
             .list()
@@ -124,8 +123,7 @@ impl ServerHandler for McpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let tool_name = request.name.to_string();
         let lookup_started = Instant::now();
-        let invocation_context =
-            invocation_context_from_request(&context, self.trust_proxy_headers);
+        let invocation_context = invocation_context_from_request(&context, &self.client_ip_policy);
 
         if self.registry.get(&tool_name).is_none() {
             if let Some(executor) = self.executor.as_ref() {
@@ -171,8 +169,7 @@ impl ServerHandler for McpServer {
     ) -> Result<CreateTaskResult, ErrorData> {
         let tool_name = request.name.to_string();
         let lookup_started = Instant::now();
-        let invocation_context =
-            invocation_context_from_request(&context, self.trust_proxy_headers);
+        let invocation_context = invocation_context_from_request(&context, &self.client_ip_policy);
 
         if self.registry.get(&tool_name).is_none() {
             if let Some(executor) = self.executor.as_ref() {
@@ -238,7 +235,7 @@ fn json_object_from_value(value: &Value) -> Option<JsonObject> {
 
 fn invocation_context_from_request(
     context: &RequestContext<RoleServer>,
-    trust_proxy_headers: bool,
+    client_ip_policy: &client_ip::ClientIpPolicy,
 ) -> ToolInvocationContext {
     let Some(parts) = context.extensions.get::<Parts>() else {
         return ToolInvocationContext::default();
@@ -249,7 +246,7 @@ fn invocation_context_from_request(
         source_ip: client_ip::canonical_client_ip(
             &parts.headers,
             &parts.extensions,
-            trust_proxy_headers,
+            client_ip_policy,
         ),
         actor: parts
             .extensions
@@ -670,7 +667,11 @@ mod tests {
 
     #[tokio::test]
     async fn empty_registry_tool_call_returns_unknown_tool_without_executor() {
-        let state = McpState::new(ToolRegistry::disabled(), None, false);
+        let state = McpState::new(
+            ToolRegistry::disabled(),
+            None,
+            client_ip::ClientIpPolicy::default(),
+        );
         let request = AxumRequest::builder()
             .method(http::Method::POST)
             .uri("/mcp")
@@ -765,6 +766,7 @@ mod tests {
             rate_limit_write_rps: 10.0,
             rate_limit_write_burst: 20,
             trust_proxy_headers: false,
+            trusted_proxy_cidrs: Vec::new(),
             rbac_exempt_paths: vec![
                 "/health".to_owned(),
                 "/version".to_owned(),

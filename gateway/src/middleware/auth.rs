@@ -24,7 +24,7 @@ use crate::{
         actor_from_principal, protected_resource, AuthError, Principal, PrincipalDirectory,
         SessionCredential, SessionValidator,
     },
-    client_ip::{canonical_client_ip, request_id},
+    client_ip::{canonical_client_ip, request_id, ClientIpPolicy},
     config::{AuthMode, Config},
     path_match::path_prefix_matches,
 };
@@ -42,7 +42,7 @@ pub struct AuthState {
     pub exempt_paths: Vec<String>,
     pub audit: AuditLog,
     pub principal_directory: PrincipalDirectory,
-    pub trust_proxy_headers: bool,
+    pub client_ip_policy: ClientIpPolicy,
     pub mcp_route_paths: Vec<String>,
     pub mcp_resource: Option<String>,
     pub mcp_resource_metadata_url: Option<String>,
@@ -76,7 +76,7 @@ impl AuthState {
             exempt_paths: config.auth_exempt_paths.clone(),
             audit,
             principal_directory,
-            trust_proxy_headers: config.trust_proxy_headers,
+            client_ip_policy: ClientIpPolicy::from_config(config),
             mcp_route_paths: protected_resource::mcp_route_paths(config),
             mcp_resource: protected_resource_metadata
                 .as_ref()
@@ -125,7 +125,7 @@ pub async fn auth_middleware(
     }
 
     let resource = state.mcp_resource_for_path(&path);
-    let audit = audit_context(&req, path, state.trust_proxy_headers);
+    let audit = audit_context(&req, path, &state.client_ip_policy);
     let Some(credential) = extract_credential(req.headers(), &state.cookie_name) else {
         return auth_failure_response(&state, &audit, "missing_credential", req, next).await;
     };
@@ -172,10 +172,10 @@ pub async fn auth_middleware(
     }
 }
 
-fn audit_context(req: &Request, path: String, trust_proxy_headers: bool) -> AuditContext {
+fn audit_context(req: &Request, path: String, client_ip_policy: &ClientIpPolicy) -> AuditContext {
     AuditContext {
         request_id: request_id(req.headers(), req.extensions()),
-        source_ip: canonical_client_ip(req.headers(), req.extensions(), trust_proxy_headers),
+        source_ip: canonical_client_ip(req.headers(), req.extensions(), client_ip_policy),
         user_agent: header_to_trimmed_string(req.headers().get(USER_AGENT)),
         path,
     }
@@ -447,7 +447,7 @@ mod tests {
                 ],
                 audit,
                 principal_directory: PrincipalDirectory::disabled(),
-                trust_proxy_headers: false,
+                client_ip_policy: ClientIpPolicy::default(),
                 mcp_route_paths: vec![protected_resource::MCP_RESOURCE_PATH.to_owned()],
                 mcp_resource: None,
                 mcp_resource_metadata_url: None,

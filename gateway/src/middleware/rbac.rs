@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use crate::{
     audit::{AuditEvent, AuditLog},
     auth::{self, actor_from_principal, protected_resource},
-    client_ip::{canonical_client_ip, request_id},
+    client_ip::{canonical_client_ip, request_id, ClientIpPolicy},
     config::Config,
     path_match::path_prefix_matches,
     rbac::{
@@ -48,7 +48,7 @@ pub struct RbacState {
     policy_write_lock: Arc<Mutex<()>>,
     rate_limit: Option<RateLimitState>,
     pub exempt_paths: Vec<String>,
-    pub trust_proxy_headers: bool,
+    pub client_ip_policy: ClientIpPolicy,
     pub audit: AuditLog,
     mcp_route_paths: Vec<String>,
 }
@@ -99,7 +99,7 @@ impl RbacState {
         Self::new_with_mcp_route_paths(
             policy,
             config.rbac_exempt_paths.clone(),
-            config.trust_proxy_headers,
+            ClientIpPolicy::from_config(config),
             audit,
             protected_resource::mcp_route_paths(config),
         )
@@ -115,7 +115,13 @@ impl RbacState {
         Self::new_with_mcp_route_paths(
             policy,
             exempt_paths,
-            trust_proxy_headers,
+            {
+                assert!(
+                    !trust_proxy_headers,
+                    "tests that trust proxies must provide an explicit ClientIpPolicy"
+                );
+                ClientIpPolicy::default()
+            },
             audit,
             vec![protected_resource::MCP_RESOURCE_PATH.to_owned()],
         )
@@ -124,7 +130,7 @@ impl RbacState {
     fn new_with_mcp_route_paths(
         policy: Policy,
         exempt_paths: Vec<String>,
-        trust_proxy_headers: bool,
+        client_ip_policy: ClientIpPolicy,
         audit: AuditLog,
         mcp_route_paths: Vec<String>,
     ) -> Self {
@@ -133,7 +139,7 @@ impl RbacState {
             policy_write_lock: Arc::new(Mutex::new(())),
             rate_limit: None,
             exempt_paths,
-            trust_proxy_headers,
+            client_ip_policy,
             audit,
             mcp_route_paths,
         }
@@ -400,7 +406,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     // matching so legitimate percent-encoded upstream paths can be supported.
     // Until then, rejecting unsafe raw paths is the safe default.
     if is_unsafe_request_path(path) {
-        let context = audit_context(&req, state.trust_proxy_headers);
+        let context = audit_context(&req, &state.client_ip_policy);
         let principal = req.extensions().get::<auth::Principal>().cloned();
         emit_denied(&state, &context, principal.as_ref(), "unsafe_path", None);
         return with_policy_decision(
@@ -427,7 +433,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         return next.run(req).await;
     }
 
-    let context = audit_context(&req, state.trust_proxy_headers);
+    let context = audit_context(&req, &state.client_ip_policy);
     let principal = req.extensions().get::<auth::Principal>().cloned();
     let policy_path = state.policy_path_for_request(path);
 
@@ -637,10 +643,10 @@ fn method_matches(methods: &[String], method: &Method) -> bool {
         })
 }
 
-fn audit_context(req: &Request, trust_proxy_headers: bool) -> AuditContext {
+fn audit_context(req: &Request, client_ip_policy: &ClientIpPolicy) -> AuditContext {
     AuditContext {
         request_id: request_id(req.headers(), req.extensions()),
-        source_ip: canonical_client_ip(req.headers(), req.extensions(), trust_proxy_headers),
+        source_ip: canonical_client_ip(req.headers(), req.extensions(), client_ip_policy),
         path: req.uri().path().to_owned(),
         method: req.method().as_str().to_owned(),
     }
@@ -2121,7 +2127,7 @@ mod tests {
             RbacState::new_with_mcp_route_paths(
                 policy,
                 exempt_paths.iter().map(|path| (*path).to_owned()).collect(),
-                false,
+                ClientIpPolicy::default(),
                 audit,
                 mcp_route_paths
                     .iter()

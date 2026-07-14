@@ -333,7 +333,7 @@ struct PolicyAdminState {
     history_store: Option<Arc<rbac::PolicyHistoryStore>>,
     query_store: Option<Arc<audit::query::AuditQueryStore>>,
     audit: audit::AuditLog,
-    trust_proxy_headers: bool,
+    client_ip_policy: client_ip::ClientIpPolicy,
     max_body_size: usize,
 }
 
@@ -343,7 +343,7 @@ struct TokenAdminState {
     validator: Option<Arc<auth::ServiceTokenValidator>>,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
-    trust_proxy_headers: bool,
+    client_ip_policy: client_ip::ClientIpPolicy,
     max_body_size: usize,
 }
 
@@ -354,7 +354,7 @@ struct ToolAdminState {
     mcp_proxy_definitions_provider: Option<tools::definitions::McpProxyDefinitionsProvider>,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
-    trust_proxy_headers: bool,
+    client_ip_policy: client_ip::ClientIpPolicy,
     max_body_size: usize,
     write_lock: Arc<Mutex<()>>,
 }
@@ -378,7 +378,7 @@ struct SignalsAdminState {
     discovery_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
-    trust_proxy_headers: bool,
+    client_ip_policy: client_ip::ClientIpPolicy,
 }
 
 #[derive(Clone)]
@@ -393,7 +393,7 @@ struct TrafficAdminState {
     audit_query_store: Option<Arc<audit::query::AuditQueryStore>>,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
-    trust_proxy_headers: bool,
+    client_ip_policy: client_ip::ClientIpPolicy,
     max_body_size: usize,
 }
 
@@ -1331,10 +1331,11 @@ fn gateway_app_with_process_started_at(
         Arc::clone(&egress_client),
         audit_log.clone(),
     )?;
+    let client_ip_policy = client_ip::ClientIpPolicy::from_config(&config);
     let mcp_state = mcp::McpState::new(
         tool_registry.clone(),
         mcp_executor,
-        config.trust_proxy_headers,
+        client_ip_policy.clone(),
     );
     let protected_resource_metadata =
         auth::protected_resource::ProtectedResourceMetadataConfig::from_config(&config);
@@ -1351,7 +1352,7 @@ fn gateway_app_with_process_started_at(
         history_store: policy_history_store,
         query_store: audit_query_store.clone(),
         audit: audit_log.clone(),
-        trust_proxy_headers: config.trust_proxy_headers,
+        client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
     };
     let token_admin_state = TokenAdminState {
@@ -1359,7 +1360,7 @@ fn gateway_app_with_process_started_at(
         validator: service_token_validator,
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
-        trust_proxy_headers: config.trust_proxy_headers,
+        client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
     };
     let tool_admin_state = ToolAdminState {
@@ -1368,7 +1369,7 @@ fn gateway_app_with_process_started_at(
         mcp_proxy_definitions_provider,
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
-        trust_proxy_headers: config.trust_proxy_headers,
+        client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
         write_lock: Arc::new(Mutex::new(())),
     };
@@ -1421,7 +1422,7 @@ fn gateway_app_with_process_started_at(
         discovery_store: discovery_query_store.clone(),
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
-        trust_proxy_headers: config.trust_proxy_headers,
+        client_ip_policy: client_ip_policy.clone(),
     };
     let suggestions_admin_state = SuggestionsAdminState {
         suggestion_engine: rule_suggestion_engine,
@@ -1438,7 +1439,7 @@ fn gateway_app_with_process_started_at(
         audit_query_store: audit_admin_state.query_store.clone(),
         rbac_state,
         audit: audit_log,
-        trust_proxy_headers: config.trust_proxy_headers,
+        client_ip_policy,
         max_body_size: config.max_body_size,
     };
     let admin_api_states = AdminApiStates {
@@ -6839,11 +6840,8 @@ fn emit_policy_changed_payload(
     payload: Value,
 ) {
     let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
-    let source_ip = client_ip::canonical_client_ip(
-        &parts.headers,
-        &parts.extensions,
-        state.trust_proxy_headers,
-    );
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
     let actor = Some(auth::actor_from_principal(principal));
 
     state.audit.emit(audit::AuditEvent::new(
@@ -6863,11 +6861,8 @@ fn emit_service_token_changed(
     record: &auth::tokens::TokenRecord,
 ) {
     let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
-    let source_ip = client_ip::canonical_client_ip(
-        &parts.headers,
-        &parts.extensions,
-        state.trust_proxy_headers,
-    );
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
     let actor = Some(auth::actor_from_principal(principal));
     let mut payload = json!({
         "action": action,
@@ -6901,11 +6896,8 @@ fn emit_tool_registry_changed(
     tool_count: usize,
 ) {
     let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
-    let source_ip = client_ip::canonical_client_ip(
-        &parts.headers,
-        &parts.extensions,
-        state.trust_proxy_headers,
-    );
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
     let actor = Some(auth::actor_from_principal(principal));
     let payload = json!({
         "action": "openapi_tools_registered",
@@ -6933,11 +6925,8 @@ fn emit_traffic_endpoint_review_changed(
     review: &discovery::query::EndpointReviewState,
 ) {
     let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
-    let source_ip = client_ip::canonical_client_ip(
-        &parts.headers,
-        &parts.extensions,
-        state.trust_proxy_headers,
-    );
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
     let actor = Some(auth::actor_from_principal(principal));
     let payload = json!({
         "method": method,
@@ -6963,11 +6952,8 @@ fn emit_signal_lifecycle_changed(
     signal: &discovery::signals::Signal,
 ) {
     let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
-    let source_ip = client_ip::canonical_client_ip(
-        &parts.headers,
-        &parts.extensions,
-        state.trust_proxy_headers,
-    );
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
     let actor = Some(auth::actor_from_principal(principal));
     let payload = json!({
         "id": &signal.id,
@@ -6997,7 +6983,7 @@ fn emit_suggestion_lifecycle_changed(
     let source_ip = client_ip::canonical_client_ip(
         &parts.headers,
         &parts.extensions,
-        state.policy.trust_proxy_headers,
+        &state.policy.client_ip_policy,
     );
     let actor = Some(auth::actor_from_principal(principal));
     let payload = json!({
@@ -7538,6 +7524,7 @@ mod tests {
             rate_limit_write_rps: 10.0,
             rate_limit_write_burst: 20,
             trust_proxy_headers: false,
+            trusted_proxy_cidrs: Vec::new(),
             rbac_exempt_paths: vec![
                 "/health".to_owned(),
                 "/version".to_owned(),
@@ -13517,6 +13504,9 @@ mod tests {
         rich_config.rate_limit_write_rps = 4.25;
         rich_config.rate_limit_write_burst = 9;
         rich_config.trust_proxy_headers = true;
+        rich_config.trusted_proxy_cidrs = vec!["10.0.0.0/8"
+            .parse()
+            .expect("trusted proxy CIDR should parse")];
         rich_config.auth_enabled = true;
         rich_config
             .auth_exempt_paths

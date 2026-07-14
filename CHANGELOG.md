@@ -12,6 +12,14 @@ major runtime pieces have landed since 0.6.0. See the
 [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44)
 for full phase-by-phase status.
 
+### Security
+
+- Forwarded client IP headers are now accepted only from direct peers in the
+  new `TRUSTED_PROXY_CIDRS` allowlist. `X-Forwarded-For` chains are resolved
+  from the nearest hop backward, and malformed chains fail closed to the
+  socket peer. Deployments using `TRUST_PROXY_HEADERS=true` must now configure
+  at least one bounded proxy CIDR; catch-all CIDRs are rejected.
+
 ### Added — Phase 6 (native MCP support)
 
 - Native MCP streamable-HTTP endpoint at `/mcp`, wired through the gateway's

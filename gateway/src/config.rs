@@ -10,6 +10,7 @@ use std::{
 };
 
 use http::{header, HeaderName, HeaderValue};
+use ipnet::IpNet;
 use serde::Deserialize;
 
 use crate::discovery::{
@@ -119,6 +120,7 @@ const TOOL_RUNTIME_QUEUE_DEPTH: &str = "TOOL_RUNTIME_QUEUE_DEPTH";
 const TOOL_RUNTIME_QUEUE_TIMEOUT_MS: &str = "TOOL_RUNTIME_QUEUE_TIMEOUT_MS";
 const TOOLS_FILE: &str = "TOOLS_FILE";
 const TRUST_PROXY_HEADERS: &str = "TRUST_PROXY_HEADERS";
+const TRUSTED_PROXY_CIDRS: &str = "TRUSTED_PROXY_CIDRS";
 const SESSION_COOKIE_NAME: &str = "SESSION_COOKIE_NAME";
 const UPSTREAM_CONNECT_TIMEOUT_MS: &str = "UPSTREAM_CONNECT_TIMEOUT_MS";
 const UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS: &str = "UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS";
@@ -159,6 +161,7 @@ pub struct Config {
     pub rate_limit_write_rps: f64,
     pub rate_limit_write_burst: u32,
     pub trust_proxy_headers: bool,
+    pub trusted_proxy_cidrs: Vec<IpNet>,
     pub rbac_exempt_paths: Vec<String>,
     pub session_cookie_name: String,
     pub validation_allowed_content_types: Vec<String>,
@@ -599,6 +602,16 @@ impl Config {
             "boolean",
             &mut problems,
         );
+        let trusted_proxy_cidrs = parse_comma_separated_cidrs(
+            TRUSTED_PROXY_CIDRS,
+            get_var(TRUSTED_PROXY_CIDRS),
+            &mut problems,
+        );
+        if trust_proxy_headers && trusted_proxy_cidrs.is_empty() {
+            problems.push(format!(
+                "{TRUSTED_PROXY_CIDRS} must contain at least one CIDR when {TRUST_PROXY_HEADERS}=true"
+            ));
+        }
         let mut rbac_exempt_paths = parse_comma_separated_paths(
             RBAC_EXEMPT_PATHS,
             get_var(RBAC_EXEMPT_PATHS),
@@ -901,6 +914,7 @@ impl Config {
                 rate_limit_write_rps,
                 rate_limit_write_burst,
                 trust_proxy_headers,
+                trusted_proxy_cidrs,
                 rbac_exempt_paths,
                 session_cookie_name,
                 validation_allowed_content_types,
@@ -1591,6 +1605,42 @@ fn parse_comma_separated_hostnames(
     }
 
     values
+}
+
+fn parse_comma_separated_cidrs(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Vec<IpNet> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return Vec::new(),
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return Vec::new();
+        }
+    };
+
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| match entry.parse::<IpNet>() {
+            Ok(cidr) if cidr.prefix_len() == 0 => {
+                problems.push(format!(
+                    "{name} entries must identify bounded proxy networks; catch-all CIDR '{entry}' is not allowed"
+                ));
+                None
+            }
+            Ok(cidr) => Some(cidr),
+            Err(err) => {
+                problems.push(format!(
+                    "{name} entries must be valid CIDRs, got '{entry}': {err}"
+                ));
+                None
+            }
+        })
+        .collect()
 }
 
 fn parse_cookie_name(
@@ -2335,6 +2385,7 @@ mod tests {
             DEFAULT_RATE_LIMIT_WRITE_BURST
         );
         assert!(!config.trust_proxy_headers);
+        assert!(config.trusted_proxy_cidrs.is_empty());
         assert_eq!(
             config.rbac_exempt_paths,
             vec![
@@ -2526,6 +2577,7 @@ mod tests {
             DEFAULT_RATE_LIMIT_WRITE_BURST
         );
         assert!(!config.trust_proxy_headers);
+        assert!(config.trusted_proxy_cidrs.is_empty());
         assert_eq!(
             config.rbac_exempt_paths,
             vec![
@@ -3095,6 +3147,7 @@ mod tests {
             "RATE_LIMIT_WRITE_RPS" => Ok("5.25".to_owned()),
             "RATE_LIMIT_WRITE_BURST" => Ok("10".to_owned()),
             "TRUST_PROXY_HEADERS" => Ok("true".to_owned()),
+            "TRUSTED_PROXY_CIDRS" => Ok("10.0.0.0/8, 2001:db8::/32".to_owned()),
             "SESSION_COOKIE_NAME" => Ok("gateway_session".to_owned()),
             _ => Err(VarError::NotPresent),
         })
@@ -3105,7 +3158,60 @@ mod tests {
         assert_eq!(config.rate_limit_write_rps, 5.25);
         assert_eq!(config.rate_limit_write_burst, 10);
         assert!(config.trust_proxy_headers);
+        assert_eq!(
+            config.trusted_proxy_cidrs,
+            vec![
+                "10.0.0.0/8".parse::<IpNet>().unwrap(),
+                "2001:db8::/32".parse::<IpNet>().unwrap()
+            ]
+        );
         assert_eq!(config.session_cookie_name, "gateway_session");
+    }
+
+    #[test]
+    fn trusted_proxy_headers_require_at_least_one_cidr() {
+        let error = Config::from_env_vars(|name| match name {
+            "TRUST_PROXY_HEADERS" => Ok("true".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("trusted proxy headers without a peer boundary must fail closed");
+
+        assert!(error.to_string().contains(
+            "TRUSTED_PROXY_CIDRS must contain at least one CIDR when TRUST_PROXY_HEADERS=true"
+        ));
+    }
+
+    #[test]
+    fn invalid_trusted_proxy_cidrs_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "TRUST_PROXY_HEADERS" => Ok("true".to_owned()),
+            "TRUSTED_PROXY_CIDRS" => Ok("10.0.0.0/8, 192.0.2.0/99".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("invalid trusted proxy CIDRs must fail startup");
+
+        assert!(error
+            .to_string()
+            .contains("TRUSTED_PROXY_CIDRS entries must be valid CIDRs"));
+    }
+
+    #[test]
+    fn catch_all_trusted_proxy_cidrs_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "TRUST_PROXY_HEADERS" => Ok("true".to_owned()),
+            "TRUSTED_PROXY_CIDRS" => Ok("0.0.0.0/0, ::/0".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("catch-all trusted proxy CIDRs must fail startup");
+
+        assert_eq!(
+            error
+                .problems
+                .iter()
+                .filter(|problem| problem.contains("catch-all CIDR"))
+                .count(),
+            2
+        );
     }
 
     #[test]

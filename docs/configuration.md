@@ -591,11 +591,23 @@ Format and validation: must parse as a `u32`. A fresh write-lane bucket starts f
 
 ### TRUST_PROXY_HEADERS
 
-Whether to trust `X-Forwarded-For` and `X-Real-IP` as canonical client IP inputs.
+Whether direct proxy peers listed in `TRUSTED_PROXY_CIDRS` may supply `X-Forwarded-For` and `X-Real-IP` as canonical client IP inputs.
 
 Default: `false`
 
-Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, forwarded proxy headers are ignored and the connection peer IP is used. Enable this only when GreenGateway is deployed behind a trusted proxy boundary that sanitizes these headers.
+Format and validation: must parse as a Rust boolean, `true` or `false`. Setting this to `true` requires at least one valid `TRUSTED_PROXY_CIDRS` entry. With the default, forwarded proxy headers are ignored and the connection peer IP is used.
+
+Only the direct connection peer is checked against the trusted CIDRs. For a valid `X-Forwarded-For` chain, GreenGateway walks from the nearest hop to the farthest, skips trusted proxy addresses, and selects the first untrusted address. This supports trusted proxies that append to an existing chain without allowing an attacker-prepended address to replace the actual client. A malformed forwarding chain fails closed to the connection peer and does not fall through to `X-Real-IP`.
+
+### TRUSTED_PROXY_CIDRS
+
+Comma-separated IPv4 or IPv6 CIDRs containing the reverse proxies that connect directly to GreenGateway. These are proxy peer ranges, not ranges for end-user clients.
+
+Default: empty list
+
+Format and validation: every non-empty entry must parse as a CIDR, for example `10.20.0.0/16,2001:db8:1234::/48`. The list is ignored while `TRUST_PROXY_HEADERS=false`; startup fails when `TRUST_PROXY_HEADERS=true` and the list is empty or contains no valid entries. Requests from peers outside these ranges always use the socket peer IP, regardless of any forwarding headers.
+
+Security note: keep GreenGateway reachable only through the configured proxies whenever possible. Use the narrowest stable proxy egress ranges available and update this list when proxy infrastructure changes. Catch-all networks `0.0.0.0/0` and `::/0` are rejected because they would restore unconditional trust in caller-supplied headers.
 
 ### SESSION_COOKIE_NAME
 
