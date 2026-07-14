@@ -6131,6 +6131,13 @@ fn representative_principal_for_rule(rule: &rbac::Rule) -> Option<auth::Principa
         .principal
         .auth_methods
         .iter()
+        .any(|method| method == rbac::rule::AUTH_METHOD_SERVICE_TOKEN)
+    {
+        auth::AuthMethod::ServiceToken
+    } else if rule
+        .principal
+        .auth_methods
+        .iter()
         .any(|method| method == rbac::rule::AUTH_METHOD_SESSION_COOKIE)
     {
         auth::AuthMethod::Cookie
@@ -16586,10 +16593,12 @@ mod tests {
             json!([
                 {
                     "user_id": "analyst-2",
+                    "auth_mode": "bearer_token",
                     "roles": ["analyst", "manager"]
                 },
                 {
                     "user_id": "analyst-1",
+                    "auth_mode": "bearer_token",
                     "roles": ["analyst"]
                 }
             ])
@@ -24980,6 +24989,7 @@ O2gecI9QwDJNpm29J9wJB2F8
         let connection = Connection::open(audit_path).expect("test audit database should open");
         let actor_json = json!({
             "user_id": format!("user-{event_id}"),
+            "issuer": "provider:test",
             "roles": [role],
             "auth_mode": "bearer_token"
         })

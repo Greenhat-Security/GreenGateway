@@ -419,6 +419,8 @@ function PrincipalBreakdown({
               <thead>
                 <tr>
                   <th>User ID</th>
+                  <th>Issuer</th>
+                  <th>Auth method</th>
                   <th>First seen</th>
                   <th>Last seen</th>
                 </tr>
@@ -427,9 +429,11 @@ function PrincipalBreakdown({
                 {principals.map((principal, index) => (
                   <tr
                     className={`event-row ${index % 2 === 1 ? 'is-even' : ''}`}
-                    key={`${principal.user_id}\n${principal.first_seen}`}
+                    key={`${principal.user_id}\n${principal.issuer ?? ''}\n${principal.auth_method ?? ''}`}
                   >
                     <td>{principal.user_id}</td>
+                    <td>{principal.issuer ?? 'Legacy / unknown'}</td>
+                    <td>{principal.auth_method || 'Legacy / unknown'}</td>
                     <td>
                       <time dateTime={principal.first_seen}>
                         {principal.first_seen}

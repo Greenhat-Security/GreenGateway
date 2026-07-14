@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-pub const SCHEMA_VERSION: &str = "0.1.0";
+pub const SCHEMA_VERSION: &str = "0.2.0";
 pub const POLICY_CHANGED: &str = "policy.changed";
 pub const SIGNAL_OPENED: &str = "signal.opened";
 pub const SIGNAL_LIFECYCLE_CHANGED: &str = "signal.lifecycle_changed";

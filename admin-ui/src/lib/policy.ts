@@ -66,6 +66,7 @@ export type PolicyRulePreviewSample = {
   path: string;
   actor: {
     user_id?: string;
+    issuer?: string;
     auth_mode?: string;
     roles?: string[];
   } | null;
@@ -90,6 +91,8 @@ export type PolicyRulePreviewResponse = {
 
 export type PolicyRuleShadowReviewPrincipal = {
   user_id: string;
+  issuer?: string;
+  auth_mode: string;
   roles: string[];
 };
 
@@ -100,6 +103,7 @@ export type PolicyRuleShadowReviewSample = {
   path: string;
   actor: {
     user_id: string;
+    issuer?: string;
     auth_mode: string;
     roles?: string[];
   } | null;

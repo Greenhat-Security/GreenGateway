@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     ffi::OsString,
     fmt, fs, io,
@@ -16,7 +16,7 @@ use super::rule::{
     principal_identity_matches, valid_auth_method_name, PrincipalMatcher, Rule,
     AUTH_METHOD_BEARER_TOKEN, AUTH_METHOD_SESSION_COOKIE,
 };
-use crate::{auth::Principal, config::Config};
+use crate::{auth::principal::canonical_issuer, auth::Principal, config::Config};
 
 const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "schema_version",
@@ -287,14 +287,31 @@ impl Policy {
         warn_unknown_top_level_keys(&value);
         validate_rule_target_properties(&value)?;
 
-        let policy: Self = serde_json::from_value(value).map_err(|source| PolicyError::Parse {
-            path: path.map(Path::to_owned),
-            source,
-        })?;
+        let mut policy: Self =
+            serde_json::from_value(value).map_err(|source| PolicyError::Parse {
+                path: path.map(Path::to_owned),
+                source,
+            })?;
+        policy.canonicalize_issuers();
         policy.validate()?;
         warn_unreachable_route_path_prefixes(&policy);
 
         Ok(policy)
+    }
+
+    fn canonicalize_issuers(&mut self) {
+        for role in self.roles.values_mut() {
+            canonicalize_issuer_list(&mut role.issuers);
+        }
+        for rule in &mut self.rules {
+            canonicalize_issuer_list(&mut rule.principal.issuers);
+        }
+        for rule in &mut self.rate_limits {
+            canonicalize_issuer_list(&mut rule.principal.issuers);
+        }
+        for tool in self.tools.values_mut() {
+            canonicalize_issuer_list(&mut tool.issuers);
+        }
     }
 
     fn validate(&self) -> Result<(), PolicyError> {
@@ -436,6 +453,14 @@ fn validate_tools(tools: &HashMap<String, ToolPolicyEntry>) -> Result<(), Policy
     }
 
     Ok(())
+}
+
+fn canonicalize_issuer_list(issuers: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    issuers.retain_mut(|issuer| {
+        *issuer = canonical_issuer(issuer).unwrap_or_default();
+        seen.insert(issuer.clone())
+    });
 }
 
 fn validate_roles(roles: &HashMap<String, RoleEntry>) -> Result<(), PolicyError> {
@@ -1119,11 +1144,11 @@ mod tests {
 
         assert_eq!(
             policy.roles["operator"].issuers,
-            vec!["https://idp-a.example/".to_owned()]
+            vec!["https://idp-a.example".to_owned()]
         );
         assert_eq!(
             policy.rules[0].principal.issuers,
-            vec!["https://idp-a.example/".to_owned()]
+            vec!["https://idp-a.example".to_owned()]
         );
         assert_eq!(
             policy.rate_limits[0].principal.auth_methods,
@@ -1131,7 +1156,7 @@ mod tests {
         );
         assert_eq!(
             policy.tools["reports.export"].issuers,
-            vec!["https://idp-a.example/".to_owned()]
+            vec!["https://idp-a.example".to_owned()]
         );
 
         let round_trip = serde_json::to_value(&policy).expect("policy should serialize");

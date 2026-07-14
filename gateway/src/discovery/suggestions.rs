@@ -13,7 +13,8 @@ use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, Of
 
 use crate::{
     audit::query::{
-        AuditQueryStore, RoleEndpointObservationFilters, MAX_RULE_SUGGESTION_AUDIT_SCAN_ROWS,
+        AuditQueryStore, RoleEndpointObservation, RoleEndpointObservationFilters,
+        MAX_RULE_SUGGESTION_AUDIT_SCAN_ROWS,
     },
     auth::{AuthMethod, Principal},
     discovery::{
@@ -189,6 +190,8 @@ pub struct BaselineSuggestionRun {
     pub skipped_unauthenticated_observations: u64,
     pub skipped_without_roles_observations: u64,
     pub skipped_denied_observations: u64,
+    pub skipped_without_issuer_observations: u64,
+    pub skipped_unsupported_auth_method_observations: u64,
     pub scanned_event_count: u64,
     pub scan_truncated: bool,
 }
@@ -203,6 +206,8 @@ impl Default for BaselineSuggestionRun {
             skipped_unauthenticated_observations: 0,
             skipped_without_roles_observations: 0,
             skipped_denied_observations: 0,
+            skipped_without_issuer_observations: 0,
+            skipped_unsupported_auth_method_observations: 0,
             scanned_event_count: 0,
             scan_truncated: false,
         }
@@ -318,13 +323,16 @@ impl RuleSuggestionEngine {
         run.skipped_unauthenticated_observations = matrix.skipped_unauthenticated_observations;
         run.skipped_without_roles_observations = matrix.skipped_without_roles_observations;
         run.skipped_denied_observations = matrix.skipped_denied_observations;
+        run.skipped_without_issuer_observations = matrix.skipped_without_issuer_observations;
+        run.skipped_unsupported_auth_method_observations =
+            matrix.skipped_unsupported_auth_method_observations;
 
         let mut suggestions = Vec::new();
         for observation in matrix.observations {
             let principal = PrincipalMatcher {
                 roles: vec![observation.role.clone()],
-                issuers: Vec::new(),
-                auth_methods: Vec::new(),
+                issuers: observation.issuer.clone().into_iter().collect(),
+                auth_methods: vec![observation.auth_method.clone()],
                 principal_ids: Vec::new(),
             };
             if policy_has_covering_action(
@@ -344,14 +352,7 @@ impl RuleSuggestionEngine {
                 principal,
                 RuleAction::Allow,
             );
-            let rationale = baseline_rationale(
-                &observation.method,
-                &observation.endpoint_template,
-                &observation.role,
-                observation.observation_count,
-                observation.error_count,
-                self.config.baseline_window_hours,
-            );
+            let rationale = baseline_rationale(&observation, self.config.baseline_window_hours);
             let evidence = json!({
                 "source": "audit_sqlite",
                 "lookback_window_hours": self.config.baseline_window_hours,
@@ -360,6 +361,8 @@ impl RuleSuggestionEngine {
                 "method": observation.method,
                 "endpoint_template": observation.endpoint_template,
                 "role": observation.role,
+                "issuer": observation.issuer,
+                "auth_method": observation.auth_method,
                 "observation_count": observation.observation_count,
                 "error_count": observation.error_count,
                 "first_seen": observation.first_seen,
@@ -371,6 +374,8 @@ impl RuleSuggestionEngine {
                 "skipped_denied_observations": matrix.skipped_denied_observations,
                 "skipped_unauthenticated_observations": matrix.skipped_unauthenticated_observations,
                 "skipped_without_roles_observations": matrix.skipped_without_roles_observations,
+                "skipped_without_issuer_observations": matrix.skipped_without_issuer_observations,
+                "skipped_unsupported_auth_method_observations": matrix.skipped_unsupported_auth_method_observations,
             });
             suggestions.push(NewRuleSuggestion::new(
                 BASELINE_ALLOW_SUGGESTION_TYPE,
@@ -1148,6 +1153,12 @@ fn representative_principal_for_matcher(matcher: &PrincipalMatcher) -> Option<Pr
     let auth_method = if matcher
         .auth_methods
         .iter()
+        .any(|method| method == crate::rbac::rule::AUTH_METHOD_SERVICE_TOKEN)
+    {
+        AuthMethod::ServiceToken
+    } else if matcher
+        .auth_methods
+        .iter()
         .any(|method| method == crate::rbac::rule::AUTH_METHOD_SESSION_COOKIE)
     {
         AuthMethod::Cookie
@@ -1161,7 +1172,7 @@ fn representative_principal_for_matcher(matcher: &PrincipalMatcher) -> Option<Pr
             .first()
             .cloned()
             .unwrap_or_else(|| "rule-suggestion-principal".to_owned()),
-        issuer: None,
+        issuer: matcher.issuers.first().cloned(),
         email: None,
         org_id: None,
         roles: matcher.roles.clone(),
@@ -1196,14 +1207,9 @@ fn sorted_unique(values: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn baseline_rationale(
-    method: &str,
-    endpoint_template: &str,
-    role: &str,
-    observation_count: u64,
-    error_count: u64,
-    window_hours: u64,
-) -> String {
+fn baseline_rationale(observation: &RoleEndpointObservation, window_hours: u64) -> String {
+    let observation_count = observation.observation_count;
+    let error_count = observation.error_count;
     let call_word = if observation_count == 1 {
         "call"
     } else {
@@ -1215,8 +1221,13 @@ fn baseline_rationale(
         format!("with {error_count} 4xx/5xx responses")
     };
 
+    let issuer = observation.issuer.as_deref().unwrap_or("none");
+    let role = &observation.role;
+    let auth_method = &observation.auth_method;
+    let method = &observation.method;
+    let endpoint_template = &observation.endpoint_template;
     format!(
-        "Baseline allow candidate: observed {observation_count} {call_word} from role '{role}' to {method} {endpoint_template} over the last {window_hours}h, {error_clause}."
+        "Baseline allow candidate: observed {observation_count} {call_word} from role '{role}' through issuer '{issuer}' using '{auth_method}' to {method} {endpoint_template} over the last {window_hours}h, {error_clause}."
     )
 }
 
@@ -1240,10 +1251,28 @@ fn suggestion_target_from_signal(signal: &Signal) -> Option<SignalSuggestionTarg
             .get("principal")
             .and_then(Value::as_str)?
             .to_owned();
+        let auth_method = signal
+            .target
+            .identity
+            .get("auth_method")
+            .and_then(Value::as_str)?
+            .to_owned();
+        if !crate::rbac::rule::valid_auth_method_name(&auth_method) {
+            return None;
+        }
+        let issuer = signal
+            .target
+            .identity
+            .get("issuer")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if issuer.is_none() && auth_method != crate::rbac::rule::AUTH_METHOD_SERVICE_TOKEN {
+            return None;
+        }
         PrincipalMatcher {
             roles: Vec::new(),
-            issuers: Vec::new(),
-            auth_methods: Vec::new(),
+            issuers: issuer.into_iter().collect(),
+            auth_methods: vec![auth_method],
             principal_ids: vec![principal],
         }
     } else {
@@ -1397,6 +1426,14 @@ mod tests {
             invoice.proposed_rule.principal.roles,
             vec!["billing-reader".to_owned()]
         );
+        assert_eq!(
+            invoice.proposed_rule.principal.issuers,
+            vec!["provider:test".to_owned()]
+        );
+        assert_eq!(
+            invoice.proposed_rule.principal.auth_methods,
+            vec!["bearer_token".to_owned()]
+        );
         assert!(invoice.rationale.contains("observed 2 calls"));
         assert!(invoice.rationale.contains("zero 4xx/5xx responses"));
         assert_eq!(invoice.evidence["observation_count"], json!(2));
@@ -1406,6 +1443,98 @@ mod tests {
         let refund = suggestion_for(&suggestions, "POST", "/refunds", "billing-writer");
         assert_eq!(refund.proposed_rule.action, RuleAction::Allow);
         assert_eq!(refund.evidence["observation_count"], json!(1));
+    }
+
+    #[test]
+    fn baseline_generation_separates_same_role_by_issuer() {
+        let discovery_db = TempDb::new("baseline-issuer-bound-discovery");
+        let audit_db = TempDb::new("baseline-issuer-bound-audit");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/reports");
+        create_audit_schema(&audit_db.path);
+
+        for (event_id, issuer) in [
+            ("provider-a", "https://idp-a.example"),
+            ("provider-b", "https://idp-b.example"),
+        ] {
+            insert_observation_event(
+                &audit_db.path,
+                SeedObservationEvent {
+                    event_id,
+                    timestamp: "2024-06-01T12:00:00Z",
+                    actor_user_id: "shared-subject",
+                    roles: &["report-reader"],
+                    method: "GET",
+                    request_path: "/reports",
+                    status: 200,
+                    policy_decision: Some("allowed"),
+                },
+            );
+            Connection::open(&audit_db.path)
+                .expect("audit database should open")
+                .execute(
+                    "UPDATE audit_events SET actor_json = json_set(actor_json, '$.issuer', ?1) WHERE event_id = ?2",
+                    params![issuer, event_id],
+                )
+                .expect("issuer should update");
+        }
+
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        let run = engine
+            .generate(&empty_policy())
+            .expect("suggestion generation should succeed");
+        let suggestions = engine.list_suggestions().expect("suggestions should query");
+
+        assert_eq!(run.inserted_count, 2);
+        let issuers = suggestions
+            .iter()
+            .map(|suggestion| suggestion.proposed_rule.principal.issuers[0].clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            issuers,
+            BTreeSet::from([
+                "https://idp-a.example".to_owned(),
+                "https://idp-b.example".to_owned()
+            ])
+        );
+        assert!(suggestions.iter().all(|suggestion| {
+            suggestion.proposed_rule.principal.auth_methods == vec!["bearer_token".to_owned()]
+        }));
+    }
+
+    #[test]
+    fn baseline_generation_skips_legacy_bearer_observation_without_issuer() {
+        let discovery_db = TempDb::new("baseline-missing-issuer-discovery");
+        let audit_db = TempDb::new("baseline-missing-issuer-audit");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/legacy");
+        create_audit_schema(&audit_db.path);
+        insert_observation_event(
+            &audit_db.path,
+            SeedObservationEvent {
+                event_id: "legacy",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: "alice",
+                roles: &["reader"],
+                method: "GET",
+                request_path: "/legacy",
+                status: 200,
+                policy_decision: Some("allowed"),
+            },
+        );
+        Connection::open(&audit_db.path)
+            .expect("audit database should open")
+            .execute(
+                "UPDATE audit_events SET actor_json = json_remove(actor_json, '$.issuer') WHERE event_id = 'legacy'",
+                [],
+            )
+            .expect("legacy actor should update");
+
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        let run = engine
+            .generate(&empty_policy())
+            .expect("suggestion generation should succeed");
+
+        assert_eq!(run.inserted_count, 0);
+        assert_eq!(run.baseline.skipped_without_issuer_observations, 1);
     }
 
     #[test]
@@ -1695,7 +1824,9 @@ mod tests {
                 target_identity: json!({
                     "method": "GET",
                     "endpoint_template": "/invoices/{id}",
-                    "principal": "alice"
+                    "principal": "alice",
+                    "issuer": "provider:test",
+                    "auth_method": "bearer_token"
                 }),
                 evidence: json!({ "prior_distinct_principal_count": 5 }),
                 state: "open",
@@ -1710,7 +1841,9 @@ mod tests {
                 target_identity: json!({
                     "method": "GET",
                     "endpoint_template": "/invoices/{id}",
-                    "principal": "bob"
+                    "principal": "bob",
+                    "issuer": "provider:test",
+                    "auth_method": "bearer_token"
                 }),
                 evidence: json!({ "prior_distinct_principal_count": 5 }),
                 state: "open",
@@ -1944,6 +2077,7 @@ mod tests {
         let connection = Connection::open(path).expect("test audit database should open");
         let actor_json = json!({
             "user_id": event.actor_user_id,
+            "issuer": "provider:test",
             "roles": event.roles,
             "auth_mode": "bearer_token"
         })

@@ -249,6 +249,8 @@ pub struct PrincipalNewToEndpointSignalObservation<'a> {
     pub endpoint_template: &'a str,
     pub observed_at: &'a str,
     pub principal: &'a str,
+    pub issuer: Option<&'a str>,
+    pub auth_method: &'a str,
     pub prior_distinct_principal_count: u64,
 }
 
@@ -519,10 +521,14 @@ impl PrincipalNewToEndpointDetector {
             "method": observation.method,
             "endpoint_template": observation.endpoint_template,
             "principal": observation.principal,
+            "issuer": observation.issuer,
+            "auth_method": observation.auth_method,
         });
         let evidence = json!({
             "observed_at": observation.observed_at,
             "principal": observation.principal,
+            "issuer": observation.issuer,
+            "auth_method": observation.auth_method,
             "prior_distinct_principal_count": observation.prior_distinct_principal_count,
             "threshold": threshold,
         });
@@ -538,10 +544,12 @@ impl PrincipalNewToEndpointDetector {
         Some(NewSignal::new(
             PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_TYPE,
             PRINCIPAL_ENDPOINT_TARGET_KIND,
-            principal_endpoint_target_key(
+            principal_identity_endpoint_target_key(
                 observation.method,
                 observation.endpoint_template,
                 observation.principal,
+                observation.issuer,
+                observation.auth_method,
             ),
             target_identity,
             explanation,
@@ -661,6 +669,21 @@ pub fn principal_endpoint_target_key(
     principal: &str,
 ) -> String {
     format!("{method} {endpoint_template} {principal}")
+}
+
+pub fn principal_identity_endpoint_target_key(
+    method: &str,
+    endpoint_template: &str,
+    principal: &str,
+    issuer: Option<&str>,
+    auth_method: &str,
+) -> String {
+    let identity = json!({
+        "user_id": principal,
+        "issuer": issuer,
+        "auth_method": auth_method,
+    });
+    format!("{method} {endpoint_template} {identity}")
 }
 
 fn endpoint_target_identity(method: &str, endpoint_template: &str) -> Value {

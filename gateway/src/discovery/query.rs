@@ -180,6 +180,9 @@ pub struct PrincipalPage {
 #[derive(Clone, Debug, Serialize)]
 pub struct EndpointPrincipal {
     pub user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    pub auth_method: String,
     pub first_seen: String,
     pub last_seen: String,
 }
@@ -943,8 +946,13 @@ impl DiscoveryQueryStore {
                 .query_map(params_from_iter(params.iter()), |row| {
                     Ok(EndpointPrincipal {
                         user_id: row.get(0)?,
-                        first_seen: row.get(1)?,
-                        last_seen: row.get(2)?,
+                        issuer: {
+                            let issuer = row.get::<_, String>(1)?;
+                            (!issuer.is_empty()).then_some(issuer)
+                        },
+                        auth_method: row.get(2)?,
+                        first_seen: row.get(3)?,
+                        last_seen: row.get(4)?,
                     })
                 })
                 .map_err(|source| DiscoveryQueryError::Sqlite {
@@ -971,6 +979,8 @@ impl DiscoveryQueryStore {
                     encode_cursor(&PrincipalCursor {
                         last_seen: principal.last_seen.clone(),
                         user_id: principal.user_id.clone(),
+                        issuer: principal.issuer.clone().unwrap_or_default(),
+                        auth_method: principal.auth_method.clone(),
                     })
                 })
                 .transpose()?
@@ -1369,6 +1379,8 @@ struct EndpointCursor {
 struct PrincipalCursor {
     last_seen: String,
     user_id: String,
+    issuer: String,
+    auth_method: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1562,7 +1574,7 @@ fn build_principal_query(
 ) -> (String, Vec<SqlValue>) {
     let mut sql = String::from(
         r#"
-        SELECT user_id, first_seen, last_seen
+        SELECT user_id, issuer, auth_method, first_seen, last_seen
         FROM discovery_endpoint_principals
         WHERE method = ? AND endpoint_template = ?
         "#,
@@ -1574,14 +1586,20 @@ fn build_principal_query(
 
     if let Some(cursor) = cursor {
         sql.push_str(
-            " AND (julianday(last_seen) < julianday(?) OR (julianday(last_seen) = julianday(?) AND user_id > ?))",
+            " AND (julianday(last_seen) < julianday(?) OR (julianday(last_seen) = julianday(?) AND (user_id > ? OR (user_id = ? AND (issuer > ? OR (issuer = ? AND auth_method > ?))))))",
         );
         params.push(SqlValue::Text(cursor.last_seen.clone()));
         params.push(SqlValue::Text(cursor.last_seen.clone()));
         params.push(SqlValue::Text(cursor.user_id.clone()));
+        params.push(SqlValue::Text(cursor.user_id.clone()));
+        params.push(SqlValue::Text(cursor.issuer.clone()));
+        params.push(SqlValue::Text(cursor.issuer.clone()));
+        params.push(SqlValue::Text(cursor.auth_method.clone()));
     }
 
-    sql.push_str(" ORDER BY julianday(last_seen) DESC, user_id ASC LIMIT ?");
+    sql.push_str(
+        " ORDER BY julianday(last_seen) DESC, user_id ASC, issuer ASC, auth_method ASC LIMIT ?",
+    );
     params.push(SqlValue::Integer(query_limit(limit)));
 
     (sql, params)
@@ -1903,6 +1921,7 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
         "#,
     )?;
     connection.execute_batch(CREATE_REVIEW_SCHEMA_SQL)?;
+    super::aggregator::ensure_discovery_endpoint_principal_identity_schema(connection)?;
     ensure_discovery_endpoint_aggregate_column(
         connection,
         "schema_mismatch_count",

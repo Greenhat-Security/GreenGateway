@@ -7,14 +7,14 @@
 //!
 //! Aggregates are keyed by `(method, endpoint_template)`. Status counts are
 //! exact per status code. Distinct principal counts are exact by storing one
-//! principal row per observed `actor.user_id`; unauthenticated requests increase
-//! call counts but not distinct principal counts. Latency percentiles are
+//! principal row per observed `(actor.user_id, actor.issuer, actor.auth_mode)`;
+//! unauthenticated requests increase call counts but not distinct principal counts. Latency percentiles are
 //! computed from a bounded deterministic reservoir sample, which keeps memory
 //! bounded while making percentiles approximate once an endpoint has more than
 //! `LATENCY_SAMPLE_LIMIT` observations.
 //!
 //! Known limitation: exact distinct-principal tracking is unbounded. Each
-//! distinct `actor.user_id` observed for a `(method, endpoint_template)` is kept
+//! distinct identity tuple observed for a `(method, endpoint_template)` is kept
 //! in memory for the lifetime of the process and stored in
 //! `discovery_endpoint_principals` for the lifetime of the database.
 
@@ -37,6 +37,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     audit::{event, redact::hash_args, AuditEvent, AuditEventSender, AuditSink},
+    auth::principal::canonical_issuer,
     discovery::{
         path_template::{template_stateless, PathTemplateLearner},
         signals::{
@@ -87,9 +88,11 @@ CREATE TABLE IF NOT EXISTS discovery_endpoint_principals (
     method TEXT NOT NULL,
     endpoint_template TEXT NOT NULL,
     user_id TEXT NOT NULL,
+    issuer TEXT NOT NULL DEFAULT '',
+    auth_method TEXT NOT NULL DEFAULT '',
     first_seen TEXT NOT NULL,
     last_seen TEXT NOT NULL,
-    PRIMARY KEY (method, endpoint_template, user_id)
+    PRIMARY KEY (method, endpoint_template, user_id, issuer, auth_method)
 );
 
 CREATE INDEX IF NOT EXISTS idx_discovery_endpoint_last_seen
@@ -553,12 +556,12 @@ struct EndpointAggregate {
     payload_shape_observation_count: u64,
     payload_shape_samples: Vec<PayloadShapeSample>,
     /// Known limitation: exact principal entries are never capped or evicted.
-    /// This map grows one entry per distinct `actor.user_id` seen for this
+    /// This map grows one entry per distinct identity tuple seen for this
     /// endpoint for the lifetime of the process, and the matching
     /// `discovery_endpoint_principals` rows grow for the lifetime of the
     /// database. Future work should add TTL pruning or a configured
     /// cardinality cap if exactness becomes too costly.
-    principals: HashMap<String, PrincipalSeen>,
+    principals: HashMap<PrincipalIdentity, PrincipalSeen>,
     recent_error_window: RecentErrorWindow,
     volume_window: VolumeWindow,
 }
@@ -607,23 +610,21 @@ impl EndpointAggregate {
         let recent_error_window = self.recent_error_window.observe(error_status);
         let completed_volume_window = self.volume_window.observe(&observation.timestamp);
 
-        if let Some(user_id) = observation.user_id.as_deref() {
-            if !user_id.is_empty() {
-                self.principals
-                    .entry(user_id.to_owned())
-                    .and_modify(|seen| {
-                        if timestamp_before(&observation.timestamp, &seen.first_seen) {
-                            seen.first_seen = observation.timestamp.clone();
-                        }
-                        if timestamp_after(&observation.timestamp, &seen.last_seen) {
-                            seen.last_seen = observation.timestamp.clone();
-                        }
-                    })
-                    .or_insert_with(|| PrincipalSeen {
-                        first_seen: observation.timestamp.clone(),
-                        last_seen: observation.timestamp.clone(),
-                    });
-            }
+        if let Some(principal) = observation.principal.as_ref() {
+            self.principals
+                .entry(principal.clone())
+                .and_modify(|seen| {
+                    if timestamp_before(&observation.timestamp, &seen.first_seen) {
+                        seen.first_seen = observation.timestamp.clone();
+                    }
+                    if timestamp_after(&observation.timestamp, &seen.last_seen) {
+                        seen.last_seen = observation.timestamp.clone();
+                    }
+                })
+                .or_insert_with(|| PrincipalSeen {
+                    first_seen: observation.timestamp.clone(),
+                    last_seen: observation.timestamp.clone(),
+                });
         }
 
         EndpointAggregateObservation {
@@ -654,9 +655,9 @@ impl EndpointAggregate {
             other.payload_shape_samples,
         );
 
-        for (user_id, other_seen) in other.principals {
+        for (principal, other_seen) in other.principals {
             self.principals
-                .entry(user_id)
+                .entry(principal)
                 .and_modify(|seen| seen.merge(other_seen.clone()))
                 .or_insert(other_seen);
         }
@@ -890,6 +891,13 @@ struct PrincipalSeen {
     last_seen: String,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PrincipalIdentity {
+    user_id: String,
+    issuer: String,
+    auth_method: String,
+}
+
 impl PrincipalSeen {
     fn merge(&mut self, other: Self) {
         if timestamp_before(&other.first_seen, &self.first_seen) {
@@ -971,7 +979,11 @@ impl AggregatorState {
                 continue;
             };
             aggregate.principals.insert(
-                row.user_id,
+                PrincipalIdentity {
+                    user_id: row.user_id,
+                    issuer: row.issuer,
+                    auth_method: row.auth_method,
+                },
                 PrincipalSeen {
                     first_seen: row.first_seen,
                     last_seen: row.last_seen,
@@ -1013,10 +1025,7 @@ impl AggregatorState {
             .unwrap_or_else(|| self.endpoint_template(&observation.method, &observation.path));
         let key = EndpointKey::new(observation.method.clone(), endpoint_template);
         let is_new_endpoint = !self.aggregates.contains_key(&key);
-        let principal = observation
-            .user_id
-            .as_deref()
-            .filter(|user_id| !user_id.is_empty());
+        let principal = observation.principal.as_ref();
         let (
             previous_schema_mismatch_count,
             previous_distinct_principal_count,
@@ -1033,7 +1042,7 @@ impl AggregatorState {
             let previous_schema_mismatch_count = aggregate.schema_mismatch_count;
             let previous_distinct_principal_count = aggregate.principals.len() as u64;
             let principal_seen_before =
-                principal.is_some_and(|user_id| aggregate.principals.contains_key(user_id));
+                principal.is_some_and(|principal| aggregate.principals.contains_key(principal));
             let observation_effects = aggregate.observe(&observation);
 
             (
@@ -1049,16 +1058,20 @@ impl AggregatorState {
 
         let mut signals = Vec::new();
         if is_new_endpoint {
-            signals.extend(self.signal_evaluator.evaluate_new_endpoint(
-                EndpointSignalObservation {
-                    method: &key.method,
-                    endpoint_template: &key.endpoint_template,
-                    first_seen: &observation.timestamp,
-                    status: observation.status,
-                    latency_ms: observation.latency_ms,
-                    user_id: observation.user_id.as_deref(),
-                },
-            ));
+            signals.extend(
+                self.signal_evaluator
+                    .evaluate_new_endpoint(EndpointSignalObservation {
+                        method: &key.method,
+                        endpoint_template: &key.endpoint_template,
+                        first_seen: &observation.timestamp,
+                        status: observation.status,
+                        latency_ms: observation.latency_ms,
+                        user_id: observation
+                            .principal
+                            .as_ref()
+                            .map(|principal| principal.user_id.as_str()),
+                    }),
+            );
         }
         signals.extend(self.signal_evaluator.evaluate_schema_mismatch(
             SchemaMismatchSignalObservation {
@@ -1091,7 +1104,9 @@ impl AggregatorState {
                         method: &key.method,
                         endpoint_template: &key.endpoint_template,
                         observed_at: &observation.timestamp,
-                        principal,
+                        principal: &principal.user_id,
+                        issuer: (!principal.issuer.is_empty()).then_some(principal.issuer.as_str()),
+                        auth_method: &principal.auth_method,
                         prior_distinct_principal_count: previous_distinct_principal_count,
                     },
                 ));
@@ -1252,7 +1267,7 @@ struct ObservedRequest {
     status: u16,
     latency_ms: u64,
     timestamp: String,
-    user_id: Option<String>,
+    principal: Option<PrincipalIdentity>,
     endpoint_template: Option<String>,
     payload_shape: Option<Value>,
     schema_mismatch: bool,
@@ -1279,7 +1294,21 @@ impl ObservedRequest {
             status,
             latency_ms,
             timestamp: event.timestamp.clone(),
-            user_id: event.actor.as_ref().map(|actor| actor.user_id.clone()),
+            principal: event.actor.as_ref().and_then(|actor| {
+                let user_id = actor.user_id.trim();
+                if user_id.is_empty() {
+                    return None;
+                }
+                Some(PrincipalIdentity {
+                    user_id: user_id.to_owned(),
+                    issuer: actor
+                        .issuer
+                        .as_deref()
+                        .and_then(canonical_issuer)
+                        .unwrap_or_default(),
+                    auth_method: actor.auth_mode.trim().to_owned(),
+                })
+            }),
             endpoint_template: event
                 .payload
                 .get("endpoint_template")
@@ -1322,6 +1351,8 @@ struct PrincipalRow {
     method: String,
     endpoint_template: String,
     user_id: String,
+    issuer: String,
+    auth_method: String,
     first_seen: String,
     last_seen: String,
 }
@@ -1384,6 +1415,7 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
         "#,
     )?;
     connection.execute_batch(CREATE_SCHEMA_SQL)?;
+    ensure_discovery_endpoint_principal_identity_schema(connection)?;
     ensure_discovery_endpoint_aggregate_column(
         connection,
         "schema_mismatch_count",
@@ -1391,6 +1423,87 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     )?;
     signals::configure_connection(connection)?;
     suggestions::configure_connection(connection)
+}
+
+pub(crate) fn ensure_discovery_endpoint_principal_identity_schema(
+    connection: &Connection,
+) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS discovery_endpoint_principals (
+            method TEXT NOT NULL,
+            endpoint_template TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            issuer TEXT NOT NULL DEFAULT '',
+            auth_method TEXT NOT NULL DEFAULT '',
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            PRIMARY KEY (method, endpoint_template, user_id, issuer, auth_method)
+        );
+        "#,
+    )?;
+    let columns = {
+        let mut statement =
+            connection.prepare("PRAGMA table_info(discovery_endpoint_principals)")?;
+        let columns = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        columns
+    };
+    let expected_primary_key = [
+        ("method", 1_i64),
+        ("endpoint_template", 2),
+        ("user_id", 3),
+        ("issuer", 4),
+        ("auth_method", 5),
+    ];
+    if expected_primary_key
+        .iter()
+        .all(|(expected_name, expected_pk)| {
+            columns
+                .iter()
+                .any(|(name, pk)| name == expected_name && pk == expected_pk)
+        })
+    {
+        return Ok(());
+    }
+
+    let has_issuer = columns.iter().any(|(name, _)| name == "issuer");
+    let has_auth_method = columns.iter().any(|(name, _)| name == "auth_method");
+    let issuer_expression = if has_issuer { "issuer" } else { "''" };
+    let auth_method_expression = if has_auth_method { "auth_method" } else { "''" };
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS discovery_endpoint_principals_v2;
+        CREATE TABLE discovery_endpoint_principals_v2 (
+            method TEXT NOT NULL,
+            endpoint_template TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            issuer TEXT NOT NULL DEFAULT '',
+            auth_method TEXT NOT NULL DEFAULT '',
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            PRIMARY KEY (method, endpoint_template, user_id, issuer, auth_method)
+        );
+        "#,
+    )?;
+    let copy_sql = format!(
+        "INSERT OR IGNORE INTO discovery_endpoint_principals_v2 \
+         (method, endpoint_template, user_id, issuer, auth_method, first_seen, last_seen) \
+         SELECT method, endpoint_template, user_id, {issuer_expression}, \
+         {auth_method_expression}, first_seen, last_seen FROM discovery_endpoint_principals"
+    );
+    transaction.execute(&copy_sql, [])?;
+    transaction.execute_batch(
+        r#"
+        DROP TABLE discovery_endpoint_principals;
+        ALTER TABLE discovery_endpoint_principals_v2 RENAME TO discovery_endpoint_principals;
+        "#,
+    )?;
+    transaction.commit()
 }
 
 fn ensure_discovery_endpoint_aggregate_column(
@@ -1493,7 +1606,7 @@ fn load_principal_rows(
 ) -> Result<Vec<PrincipalRow>, EndpointAggregatorLoadError> {
     let mut statement = connection.prepare(
         r#"
-        SELECT method, endpoint_template, user_id, first_seen, last_seen
+        SELECT method, endpoint_template, user_id, issuer, auth_method, first_seen, last_seen
         FROM discovery_endpoint_principals
         "#,
     )?;
@@ -1504,8 +1617,10 @@ fn load_principal_rows(
                 method: row.get(0)?,
                 endpoint_template: row.get(1)?,
                 user_id: row.get(2)?,
-                first_seen: row.get(3)?,
-                last_seen: row.get(4)?,
+                issuer: row.get(3)?,
+                auth_method: row.get(4)?,
+                first_seen: row.get(5)?,
+                last_seen: row.get(6)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
@@ -1695,17 +1810,19 @@ fn upsert_aggregate(
             aggregate.key.endpoint_template.as_str()
         ],
     )?;
-    for (user_id, seen) in &aggregate.principals {
+    for (principal, seen) in &aggregate.principals {
         connection.execute(
             r#"
             INSERT INTO discovery_endpoint_principals (
-                method, endpoint_template, user_id, first_seen, last_seen
-            ) VALUES (?1, ?2, ?3, ?4, ?5)
+                method, endpoint_template, user_id, issuer, auth_method, first_seen, last_seen
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
             params![
                 aggregate.key.method.as_str(),
                 aggregate.key.endpoint_template.as_str(),
-                user_id,
+                principal.user_id.as_str(),
+                principal.issuer.as_str(),
+                principal.auth_method.as_str(),
                 seen.first_seen.as_str(),
                 seen.last_seen.as_str(),
             ],
@@ -2478,7 +2595,16 @@ mod tests {
         let rows = signal_rows_by_type(&db.path, "principal_new_to_endpoint");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].target_kind, "principal_endpoint");
-        assert_eq!(rows[0].target_key, "POST /principal-pairs/{id} bob");
+        assert_eq!(
+            rows[0].target_key,
+            signals::principal_identity_endpoint_target_key(
+                "POST",
+                "/principal-pairs/{id}",
+                "bob",
+                None,
+                "bearer_token"
+            )
+        );
         assert!(rows[0].explanation.contains("principal bob"));
         let evidence: Value =
             serde_json::from_str(&rows[0].evidence_json).expect("evidence should be JSON");
@@ -2500,6 +2626,80 @@ mod tests {
             1,
             "same principal/endpoint pair should not create duplicate signals"
         );
+    }
+
+    #[test]
+    fn distinct_principals_separate_same_subject_by_issuer() {
+        let db = TempDb::new("issuer-bound-principals");
+        let sink = aggregator_sink(&db.path);
+
+        for issuer in ["https://idp-a.example/", "https://idp-b.example/"] {
+            let mut event = observed_event(
+                "GET",
+                "/shared-subject/123",
+                200,
+                10,
+                Some("shared-subject"),
+                "2024-06-01T12:00:00Z",
+            );
+            event.actor.as_mut().expect("actor should exist").issuer = Some(issuer.to_owned());
+            sink.emit(&event);
+        }
+        sink.flush_for_test();
+
+        let connection = Connection::open(&db.path).expect("database should open");
+        let count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM discovery_endpoint_principals WHERE user_id = 'shared-subject'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("principal count should query");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn legacy_principal_schema_migrates_without_losing_rows() {
+        let db = TempDb::new("legacy-principal-schema");
+        let connection = Connection::open(&db.path).expect("database should open");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE discovery_endpoint_principals (
+                    method TEXT NOT NULL,
+                    endpoint_template TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    PRIMARY KEY (method, endpoint_template, user_id)
+                );
+                INSERT INTO discovery_endpoint_principals (
+                    method, endpoint_template, user_id, first_seen, last_seen
+                ) VALUES (
+                    'GET', '/legacy', 'alice',
+                    '2024-06-01T12:00:00Z', '2024-06-01T12:01:00Z'
+                );
+                "#,
+            )
+            .expect("legacy schema should seed");
+
+        ensure_discovery_endpoint_principal_identity_schema(&connection)
+            .expect("legacy schema should migrate");
+
+        let migrated = connection
+            .query_row(
+                "SELECT user_id, issuer, auth_method FROM discovery_endpoint_principals",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .expect("migrated row should query");
+        assert_eq!(migrated, ("alice".to_owned(), String::new(), String::new()));
     }
 
     #[test]
