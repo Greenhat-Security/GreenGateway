@@ -38,4 +38,16 @@ describe("buildGreenGatewayContainerEnv", () => {
   it("does not allow a split admin listener because the Worker exposes one container port", () => {
     expect(GREEN_GATEWAY_ENV_KEYS).not.toContain("ADMIN_LISTEN_ADDR");
   });
+
+  it("passes the complete trusted proxy boundary into the container", () => {
+    const env = buildGreenGatewayContainerEnv({
+      TRUST_PROXY_HEADERS: "true",
+      TRUSTED_PROXY_CIDRS: "10.0.0.0/8,2001:db8:1234::/48",
+    });
+
+    expect(env).toMatchObject({
+      TRUST_PROXY_HEADERS: "true",
+      TRUSTED_PROXY_CIDRS: "10.0.0.0/8,2001:db8:1234::/48",
+    });
+  });
 });

@@ -66,11 +66,10 @@ pub fn canonical_client_ip(
         Ok(None) => {}
     }
 
-    header_value(headers, &X_REAL_IP)
-        .and_then(|value| value.parse::<IpAddr>().ok())
-        .map(canonical_ip)
-        .unwrap_or(peer_ip)
-        .to_string()
+    match single_ip_header(headers, &X_REAL_IP) {
+        Ok(Some(ip)) => ip.to_string(),
+        Ok(None) | Err(()) => peer_ip.to_string(),
+    }
 }
 
 pub fn request_id(headers: &HeaderMap, extensions: &Extensions) -> String {
@@ -119,12 +118,25 @@ fn forwarded_client_ip(chain: &[IpAddr], policy: &ClientIpPolicy) -> IpAddr {
         .unwrap_or(chain[0])
 }
 
-fn header_value<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&'a str> {
-    headers
-        .get(name)
-        .and_then(header_value_to_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+fn single_ip_header(headers: &HeaderMap, name: &HeaderName) -> Result<Option<IpAddr>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+
+    let value = value.to_str().map_err(|_| ())?.trim();
+    if value.is_empty() {
+        return Err(());
+    }
+
+    value
+        .parse::<IpAddr>()
+        .map(canonical_ip)
+        .map(Some)
+        .map_err(|_| ())
 }
 
 fn header_value_to_str(value: &HeaderValue) -> Option<&str> {
@@ -257,6 +269,19 @@ mod tests {
     fn invalid_real_ip_falls_back_to_peer() {
         let mut headers = HeaderMap::new();
         headers.insert(X_REAL_IP, "198.51.100.11, 192.0.2.1".parse().unwrap());
+        let extensions = extensions_with_peer("10.0.0.6:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "10.0.0.6"
+        );
+    }
+
+    #[test]
+    fn duplicate_real_ip_headers_fall_back_to_peer() {
+        let mut headers = HeaderMap::new();
+        headers.append(X_REAL_IP, "192.0.2.66".parse().unwrap());
+        headers.append(X_REAL_IP, "198.51.100.10".parse().unwrap());
         let extensions = extensions_with_peer("10.0.0.6:12345");
 
         assert_eq!(

@@ -3196,6 +3196,20 @@ mod tests {
     }
 
     #[test]
+    fn dormant_trusted_proxy_cidrs_are_still_validated() {
+        let error = Config::from_env_vars(|name| match name {
+            "TRUST_PROXY_HEADERS" => Ok("false".to_owned()),
+            "TRUSTED_PROXY_CIDRS" => Ok("not-a-cidr".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("dormant trusted proxy CIDRs must still be valid configuration");
+
+        assert!(error
+            .to_string()
+            .contains("TRUSTED_PROXY_CIDRS entries must be valid CIDRs"));
+    }
+
+    #[test]
     fn catch_all_trusted_proxy_cidrs_are_rejected() {
         let error = Config::from_env_vars(|name| match name {
             "TRUST_PROXY_HEADERS" => Ok("true".to_owned()),

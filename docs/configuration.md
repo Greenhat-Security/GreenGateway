@@ -599,13 +599,15 @@ Format and validation: must parse as a Rust boolean, `true` or `false`. Setting 
 
 Only the direct connection peer is checked against the trusted CIDRs. For a valid `X-Forwarded-For` chain, GreenGateway walks from the nearest hop to the farthest, skips trusted proxy addresses, and selects the first untrusted address. This supports trusted proxies that append to an existing chain without allowing an attacker-prepended address to replace the actual client. A malformed forwarding chain fails closed to the connection peer and does not fall through to `X-Real-IP`.
 
+`X-Real-IP` is accepted only when `X-Forwarded-For` is absent and exactly one valid IP value is present. Multiple `X-Real-IP` header lines fail closed to the connection peer. Configure the trusted proxy to remove or overwrite any inbound `X-Real-IP`; append-only proxy chains should use `X-Forwarded-For`.
+
 ### TRUSTED_PROXY_CIDRS
 
 Comma-separated IPv4 or IPv6 CIDRs containing the reverse proxies that connect directly to GreenGateway. These are proxy peer ranges, not ranges for end-user clients.
 
 Default: empty list
 
-Format and validation: every non-empty entry must parse as a CIDR, for example `10.20.0.0/16,2001:db8:1234::/48`. The list is ignored while `TRUST_PROXY_HEADERS=false`; startup fails when `TRUST_PROXY_HEADERS=true` and the list is empty or contains no valid entries. Requests from peers outside these ranges always use the socket peer IP, regardless of any forwarding headers.
+Format and validation: every non-empty entry must parse as a CIDR, for example `10.20.0.0/16,2001:db8:1234::/48`. Entries are always parsed and validated, but the resulting list is inactive while `TRUST_PROXY_HEADERS=false`. Startup fails when `TRUST_PROXY_HEADERS=true` and the list is empty or contains no valid entries. Requests from peers outside these ranges always use the socket peer IP, regardless of any forwarding headers.
 
 Security note: keep GreenGateway reachable only through the configured proxies whenever possible. Use the narrowest stable proxy egress ranges available and update this list when proxy infrastructure changes. Catch-all networks `0.0.0.0/0` and `::/0` are rejected because they would restore unconditional trust in caller-supplied headers.
 
