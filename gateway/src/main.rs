@@ -139,6 +139,12 @@ struct AppState {
 }
 
 #[derive(Clone)]
+struct ProxyDispatchState {
+    proxy: Option<ProxyState>,
+    routes: GatewayRoutes,
+}
+
+#[derive(Clone)]
 struct ProxyState {
     routes: ProxyRoutes,
     upstream_health: Vec<UpstreamHealthTarget>,
@@ -1050,6 +1056,7 @@ struct MiddlewareStack {
     observation_state: middleware::observation::ObservationState,
     rbac_state: Option<middleware::rbac::RbacState>,
     auth_state: Option<middleware::auth::AuthState>,
+    proxy_dispatch_state: ProxyDispatchState,
 }
 
 #[tokio::main]
@@ -1404,6 +1411,10 @@ fn gateway_app_with_process_started_at(
         observation_state,
         rbac_state: rbac_state.clone(),
         auth_state,
+        proxy_dispatch_state: ProxyDispatchState {
+            proxy: proxy_state.clone(),
+            routes: routes.clone(),
+        },
     };
     let app_state = AppState {
         metrics_handle,
@@ -1458,16 +1469,18 @@ fn gateway_app_with_process_started_at(
 
     if split_admin_listener {
         Ok(GatewayApp::Split {
-            data: apply_middleware(data_router(app_state.clone()), &middleware_stack),
+            data: apply_middleware(data_router(app_state.clone()), &middleware_stack, true),
             admin: apply_middleware(
                 admin_router(&routes, app_state, admin_api_states),
                 &middleware_stack,
+                false,
             ),
         })
     } else {
         Ok(GatewayApp::Unified(apply_middleware(
             unified_router(&routes, app_state, admin_api_states),
             &middleware_stack,
+            true,
         )))
     }
 }
@@ -2032,18 +2045,33 @@ fn admin_auth_router(routes: &GatewayRoutes, state: Option<AdminAuthState>) -> R
         .with_state(state)
 }
 
-fn apply_middleware(router: Router, stack: &MiddlewareStack) -> Router {
+fn apply_middleware(
+    router: Router,
+    stack: &MiddlewareStack,
+    proxy_fallback_enabled: bool,
+) -> Router {
     let request_id_header = request_id_header();
 
-    // Later axum layers run earlier at runtime. Attach RBAC before auth, then
-    // auth before CSRF, so requests flow through CSRF, auth, RBAC, then the
-    // route handler. The coarse global rate limiter remains outside auth for
-    // early IP/session DoS protection; policy overrides run inside auth so
-    // principal-aware buckets are based on real authenticated principals.
+    // Later axum layers run earlier at runtime. Requests flow through CSRF,
+    // auth, principal-aware rate limiting, proxy dispatch classification, RBAC,
+    // then the route handler. The coarse global rate limiter remains outside
+    // auth for early IP/session DoS protection.
     let router = if let Some(rbac_state) = stack.rbac_state.clone() {
         router.layer(axum::middleware::from_fn_with_state(
             rbac_state,
             middleware::rbac::rbac_middleware,
+        ))
+    } else {
+        router
+    };
+
+    // This layer runs before RBAC and marks only requests that Axum can dispatch
+    // to proxy fallback. Gateway-owned routes and the split admin listener are
+    // deliberately excluded so upstream policy cannot replace local policy.
+    let router = if proxy_fallback_enabled && stack.proxy_dispatch_state.proxy.is_some() {
+        router.layer(axum::middleware::from_fn_with_state(
+            stack.proxy_dispatch_state.clone(),
+            proxy_dispatch_context_middleware,
         ))
     } else {
         router
@@ -2092,6 +2120,25 @@ fn apply_middleware(router: Router, stack: &MiddlewareStack) -> Router {
     let router = router.layer(axum::middleware::from_fn(audit_extension_probe_middleware));
 
     router.layer(Extension(stack.audit_log.clone()))
+}
+
+async fn proxy_dispatch_context_middleware(
+    State(state): State<ProxyDispatchState>,
+    mut request: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    if !state.routes.is_gateway_owned_path(path) {
+        if let Some(context) = state
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.authorization_context_for_request(path, request.headers()))
+        {
+            request.extensions_mut().insert(context);
+        }
+    }
+
+    next.run(request).await
 }
 
 fn install_metrics_recorder() -> Result<PrometheusHandle, metrics_exporter_prometheus::BuildError> {
@@ -2373,6 +2420,24 @@ impl ProxyState {
                 })
             }
         }
+    }
+
+    fn authorization_context_for_request(
+        &self,
+        path: &str,
+        headers: &HeaderMap,
+    ) -> Option<upstream_route::ProxyRouteAuthorizationContext> {
+        let ProxyRoutes::RoutingTable { routes } = &self.routes else {
+            return None;
+        };
+        let route = routing_route_for_request(routes, path, headers)?;
+        let host = route.host.clone()?;
+
+        Some(upstream_route::ProxyRouteAuthorizationContext::new(
+            host,
+            route.path_prefix.clone(),
+            route.upstream_origin.clone(),
+        ))
     }
 
     async fn upstream_health_response(&self) -> UpstreamHealthResponse {
@@ -10001,6 +10066,121 @@ mod tests {
         assert_upstream_receives_no_request(
             &mut captured,
             "route table must not override gateway-owned paths",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn host_qualified_fallback_policy_cannot_replace_mcp_route_policy() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "deny",
+                "roles": {},
+                "routes": [
+                    {
+                        "methods": ["POST"],
+                        "path_prefix": "/mcp",
+                        "permission": "admin:mcp:use"
+                    },
+                    {
+                        "methods": ["POST"],
+                        "hosts": ["app.example.test"],
+                        "path_prefix": "/",
+                        "permission": "app:proxy"
+                    }
+                ]
+            }"#,
+        );
+        let mut config = routing_proxy_config(vec![host_path_route(
+            "app.example.test",
+            "/",
+            upstream_addr,
+        )]);
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = proxy_router(config, audit_log);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header(header::HOST, "app.example.test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("MCP request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eventually(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == "authz.denied"
+                    && event.payload["permission"] == json!("admin:mcp:use")
+            })
+        });
+        assert!(!capture.events().iter().any(|event| {
+            event.event_type.starts_with("authz.")
+                && event.payload["permission"] == json!("app:proxy")
+        }));
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "host-qualified fallback must not replace MCP route authorization",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn host_qualified_fallback_policy_applies_to_custom_rbac_exemption() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "roles": {},
+                "routes": []
+            }"#,
+        );
+        let mut config = routing_proxy_config(vec![host_path_route(
+            "app.example.test",
+            "/",
+            upstream_addr,
+        )]);
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.rbac_exempt_paths.push("/public".to_owned());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = proxy_router(config, audit_log);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/public/report")
+                    .header(header::HOST, "app.example.test")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("host-qualified exempt request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eventually(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == "authz.denied"
+                    && event.payload["reason"] == json!("host_policy_required")
+            })
+        });
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "custom RBAC exemption must not bypass host-qualified policy",
         )
         .await;
     }

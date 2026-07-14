@@ -8,12 +8,15 @@ pub const AUTH_METHOD_SERVICE_TOKEN: &str = "service_token";
 
 /// Action applied by a first-match-wins firewall rule.
 ///
-/// HTTP path rules run before, and take precedence over, the routes/permission
-/// model: once a path rule matches, it is the sole authority for the HTTP
-/// request and routes are never consulted. MCP tool-name rules are an
-/// additional restriction layered after per-tool `allowed_roles`; an `Allow` or
-/// `Shadow` tool rule does not override a failed role check. `Shadow` records a
-/// would-deny observation event while still permitting the rule layer.
+/// HTTP path rules normally run before, and take precedence over, the
+/// routes/permission model. Host-qualified proxy fallback is the exception:
+/// direct allow and shadow rules cannot authorize a selected virtual upstream,
+/// a matching deny still blocks, and authorization must come from a host-bound
+/// route rule. A first-matching shadow still records policy-authoring telemetry.
+/// MCP tool-name rules are an additional restriction layered after per-tool
+/// `allowed_roles`; an `Allow` or `Shadow` tool rule does not override a failed
+/// role check. `Shadow` records a would-deny observation event while still
+/// permitting the rule layer.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleAction {

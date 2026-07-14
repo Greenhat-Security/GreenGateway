@@ -10,17 +10,37 @@ pub(crate) trait RouteMatch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProxyRouteAuthorizationContext {
+    pub(crate) host: String,
+    pub(crate) path_prefix: Option<String>,
+    pub(crate) upstream_origin: String,
+}
+
+impl ProxyRouteAuthorizationContext {
+    pub(crate) fn new(host: String, path_prefix: Option<String>, upstream_origin: String) -> Self {
+        Self {
+            host,
+            path_prefix,
+            upstream_origin,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AuthorizationRouteMatch {
     path_prefix: Option<String>,
     host: Option<String>,
 }
 
+#[cfg(test)]
 impl AuthorizationRouteMatch {
     pub(crate) fn new(path_prefix: Option<String>, host: Option<String>) -> Self {
         Self { path_prefix, host }
     }
 }
 
+#[cfg(test)]
 impl RouteMatch for AuthorizationRouteMatch {
     fn path_prefix(&self) -> Option<&str> {
         self.path_prefix.as_deref()
