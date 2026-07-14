@@ -504,6 +504,7 @@ struct RateLimitsStatus {
 #[derive(Serialize)]
 struct EgressStatus {
     allowed_hosts_count: usize,
+    nat64_prefixes_count: usize,
     deny_private_ips: bool,
 }
 
@@ -4174,6 +4175,7 @@ impl StatusResponse {
             csrf_enabled: config.csrf_enabled,
             egress: EgressStatus {
                 allowed_hosts_count: state.egress_allowed_hosts_count,
+                nat64_prefixes_count: config.egress_nat64_prefixes.len(),
                 deny_private_ips: config.egress_deny_private_ips,
             },
         }
@@ -7589,6 +7591,7 @@ mod tests {
             egress_connect_timeout_ms: 10_000,
             egress_max_response_bytes: 5_242_880,
             egress_max_request_body_bytes: 1_048_576,
+            egress_nat64_prefixes: Vec::new(),
             egress_deny_private_ips: true,
         }
     }
@@ -13526,6 +13529,9 @@ mod tests {
             "api.example.test".to_owned(),
             "tiles.example.test".to_owned(),
         ];
+        rich_config.egress_nat64_prefixes = vec!["2001:db8:122:344::/64"
+            .parse()
+            .expect("test NAT64 prefix should parse")];
         rich_config.egress_deny_private_ips = false;
 
         let rich = status_json(
@@ -13561,6 +13567,7 @@ mod tests {
         assert_eq!(rich["trust_proxy_headers"], true);
         assert_eq!(rich["csrf_enabled"], false);
         assert_eq!(rich["egress"]["allowed_hosts_count"], 2);
+        assert_eq!(rich["egress"]["nat64_prefixes_count"], 1);
         assert_eq!(rich["egress"]["deny_private_ips"], false);
 
         let minimal_policy = TempPolicyFile::new(
@@ -13608,6 +13615,7 @@ mod tests {
         assert_eq!(minimal["rate_limits"]["write"]["burst"], 12);
         assert_eq!(minimal["cors_allow_origins"], json!([]));
         assert_eq!(minimal["egress"]["allowed_hosts_count"], 0);
+        assert_eq!(minimal["egress"]["nat64_prefixes_count"], 0);
         assert_eq!(minimal["egress"]["deny_private_ips"], true);
     }
 

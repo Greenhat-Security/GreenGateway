@@ -1307,7 +1307,7 @@ fn egress_error_reason(error: &EgressError) -> &'static str {
     match error {
         EgressError::HostNotAllowed(_) => "host_not_allowed",
         EgressError::PortNotAllowed(_) => "port_not_allowed",
-        EgressError::PrivateIpBlocked(_) => "private_ip_blocked",
+        EgressError::NonGlobalIpBlocked(_) => "non_global_ip_blocked",
         EgressError::InvalidPolicy(_) => "invalid_egress_policy",
         EgressError::DnsResolutionFailed(_) => "dns_resolution_failed",
         EgressError::InvalidUrl(_) => "invalid_url",

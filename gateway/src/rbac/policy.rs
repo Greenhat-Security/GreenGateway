@@ -137,7 +137,7 @@ pub struct RouteRule {
 ///
 /// These rules are additive to `EGRESS_ALLOWED_HOSTS` and auto-seeded
 /// infrastructure endpoint hosts. `cidrs` explicitly permit matching private
-/// resolved IPs through `EGRESS_DENY_PRIVATE_IPS=true`; private IPs outside
+/// resolved IPs through `EGRESS_DENY_PRIVATE_IPS=true`; non-global IPs outside
 /// these CIDRs still fail closed. If `ports` is non-empty, the destination port
 /// must be listed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -2326,6 +2326,7 @@ mod tests {
             egress_connect_timeout_ms: 10_000,
             egress_max_response_bytes: 5_242_880,
             egress_max_request_body_bytes: 1_048_576,
+            egress_nat64_prefixes: Vec::new(),
             egress_deny_private_ips: true,
         }
     }
