@@ -149,9 +149,12 @@ pub struct RuleSuggestion {
 
 impl RuleSuggestion {
     pub fn is_identity_bound_for_acceptance(&self) -> bool {
+        let auth_methods = &self.proposed_rule.principal.auth_methods;
+        let service_token_bound = auth_methods.len() == 1
+            && auth_methods[0] == crate::rbac::rule::AUTH_METHOD_SERVICE_TOKEN;
         self.suggestion_type != BASELINE_ALLOW_SUGGESTION_TYPE
-            || (!self.proposed_rule.principal.issuers.is_empty()
-                && !self.proposed_rule.principal.auth_methods.is_empty())
+            || (!auth_methods.is_empty()
+                && (!self.proposed_rule.principal.issuers.is_empty() || service_token_bound))
     }
 }
 
@@ -947,8 +950,14 @@ pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
           AND suggestion_type = 'baseline_allow'
           AND CASE
                 WHEN json_valid(proposed_rule_json) = 0 THEN 1
-                ELSE COALESCE(json_array_length(proposed_rule_json, '$.principal.issuers'), 0) = 0
-                  OR COALESCE(json_array_length(proposed_rule_json, '$.principal.auth_methods'), 0) = 0
+                ELSE COALESCE(json_array_length(proposed_rule_json, '$.principal.auth_methods'), 0) = 0
+                  OR (
+                    COALESCE(json_array_length(proposed_rule_json, '$.principal.issuers'), 0) = 0
+                    AND NOT (
+                        COALESCE(json_array_length(proposed_rule_json, '$.principal.auth_methods'), 0) = 1
+                        AND json_extract(proposed_rule_json, '$.principal.auth_methods[0]') = 'service_token'
+                    )
+                  )
               END
         "#,
         params![transitioned_at],
@@ -1584,6 +1593,69 @@ mod tests {
     }
 
     #[test]
+    fn service_token_baseline_generates_and_accepts_without_issuer() {
+        let discovery_db = TempDb::new("baseline-service-token-discovery");
+        let audit_db = TempDb::new("baseline-service-token-audit");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/service-report");
+        create_audit_schema(&audit_db.path);
+        insert_observation_event(
+            &audit_db.path,
+            SeedObservationEvent {
+                event_id: "service-token-report",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: "service-token:reporter",
+                roles: &["report-reader"],
+                method: "GET",
+                request_path: "/service-report",
+                status: 200,
+                policy_decision: Some("allowed"),
+            },
+        );
+        Connection::open(&audit_db.path)
+            .expect("audit database should open")
+            .execute(
+                r#"
+                UPDATE audit_events
+                SET actor_json = json_remove(
+                    json_set(actor_json, '$.auth_mode', 'service_token'),
+                    '$.issuer'
+                )
+                WHERE event_id = 'service-token-report'
+                "#,
+                [],
+            )
+            .expect("service-token actor should omit issuer");
+
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        let run = engine
+            .generate(&empty_policy())
+            .expect("service-token baseline generation should succeed");
+        assert_eq!(run.inserted_count, 1);
+        let suggestion = engine
+            .list_suggestions()
+            .expect("service-token suggestion should query")
+            .into_iter()
+            .next()
+            .expect("service-token suggestion should exist");
+        assert!(suggestion.proposed_rule.principal.issuers.is_empty());
+        assert_eq!(
+            suggestion.proposed_rule.principal.auth_methods,
+            vec![crate::rbac::rule::AUTH_METHOD_SERVICE_TOKEN.to_owned()]
+        );
+        assert!(suggestion.is_identity_bound_for_acceptance());
+
+        let accepted = engine
+            .transition_suggestion(
+                &suggestion.id,
+                RuleSuggestionLifecycleState::Accepted,
+                Some("reviewer"),
+            )
+            .expect("service-token suggestion acceptance should succeed")
+            .expect("service-token suggestion should still exist");
+        assert_eq!(accepted.state, RuleSuggestionLifecycleState::Accepted);
+    }
+
+    #[test]
     fn baseline_generation_suggests_tool_name_rule_for_mcp_tool_observation() {
         let discovery_db = TempDb::new("baseline-tool-discovery");
         let audit_db = TempDb::new("baseline-tool-audit");
@@ -1997,14 +2069,25 @@ mod tests {
         insert_stored_baseline(&connection, "missing-auth", &["provider:test"], &[]);
         insert_stored_baseline(
             &connection,
+            "mixed-auth-without-issuer",
+            &[],
+            &["service_token", "bearer_token"],
+        );
+        insert_stored_baseline(
+            &connection,
             "identity-bound",
             &["provider:test"],
             &["bearer_token"],
         );
+        insert_stored_baseline(&connection, "service-token-bound", &[], &["service_token"]);
 
         configure_connection(&connection).expect("legacy suggestion migration should run");
 
-        for id in ["missing-issuer", "missing-auth"] {
+        for id in [
+            "missing-issuer",
+            "missing-auth",
+            "mixed-auth-without-issuer",
+        ] {
             let (state, transitioned_by) = connection
                 .query_row(
                     "SELECT state, transitioned_by FROM discovery_rule_suggestions WHERE id = ?1",
@@ -2016,14 +2099,16 @@ mod tests {
             assert_eq!(transitioned_by, "system:issuer-bound-migration");
         }
 
-        let safe_state = connection
-            .query_row(
-                "SELECT state FROM discovery_rule_suggestions WHERE id = 'identity-bound'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("identity-bound suggestion should query");
-        assert_eq!(safe_state, RULE_SUGGESTION_STATE_OPEN);
+        for id in ["identity-bound", "service-token-bound"] {
+            let safe_state = connection
+                .query_row(
+                    "SELECT state FROM discovery_rule_suggestions WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("identity-bound suggestion should query");
+            assert_eq!(safe_state, RULE_SUGGESTION_STATE_OPEN);
+        }
     }
 
     #[test]
