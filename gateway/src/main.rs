@@ -2734,6 +2734,7 @@ async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -
     let (parts, body) = request.into_parts();
     let target_url = proxy_target_url(&upstream.upstream_origin, &parts.uri);
     let mut headers = strip_hop_by_hop_headers(&parts.headers);
+    strip_gateway_credentials(&mut headers);
     if let Some(request_id) = parts.headers.get(REQUEST_ID_HEADER) {
         headers.insert(request_id_header(), request_id.clone());
     }
@@ -2867,6 +2868,11 @@ fn set_upstream_client_ip(headers: &mut HeaderMap, source_ip: &str) {
         .expect("normalized IP address should be a valid header value");
     headers.insert(X_FORWARDED_FOR_HEADER, value.clone());
     headers.insert(X_REAL_IP_HEADER, value);
+}
+
+fn strip_gateway_credentials(headers: &mut HeaderMap) {
+    headers.remove(header::AUTHORIZATION);
+    headers.remove(header::COOKIE);
 }
 
 fn apply_route_request_header_policy(headers: &mut HeaderMap, policy: &RouteRequestHeaderPolicy) {
@@ -9857,26 +9863,34 @@ mod tests {
             } else {
                 Vec::new()
             };
+            let mut request = Request::builder()
+                .method(method.clone())
+                .uri("/api/items/42/?x=1&name=two%20words")
+                .header(header::AUTHORIZATION, "Bearer client-token")
+                .header(header::COOKIE, "session=client")
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::CONNECTION, "keep-alive, x-hop-by-connection")
+                .header("keep-alive", "timeout=5")
+                .header("proxy-authorization", "Basic stripped")
+                .header("te", "trailers")
+                .header("upgrade", "websocket")
+                .header(header::CONTENT_LENGTH, "0")
+                .header("x-hop-by-connection", "strip me")
+                .header("x-end-to-end", "keep me")
+                .body(Body::from(body.clone()))
+                .expect("request should build");
+            request.headers_mut().append(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer second-client-token"),
+            );
+            request.headers_mut().append(
+                header::COOKIE,
+                HeaderValue::from_static("other-client-cookie=value"),
+            );
+
             let response = router
                 .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method.clone())
-                        .uri("/api/items/42/?x=1&name=two%20words")
-                        .header(header::AUTHORIZATION, "Bearer upstream-token")
-                        .header(header::COOKIE, "session=abc")
-                        .header(header::CONTENT_TYPE, "application/octet-stream")
-                        .header(header::CONNECTION, "keep-alive, x-hop-by-connection")
-                        .header("keep-alive", "timeout=5")
-                        .header("proxy-authorization", "Basic stripped")
-                        .header("te", "trailers")
-                        .header("upgrade", "websocket")
-                        .header(header::CONTENT_LENGTH, "0")
-                        .header("x-hop-by-connection", "strip me")
-                        .header("x-end-to-end", "keep me")
-                        .body(Body::from(body.clone()))
-                        .expect("request should build"),
-                )
+                .oneshot(request)
                 .await
                 .expect("proxy request should complete");
 
@@ -9919,14 +9933,6 @@ mod tests {
             );
             assert_eq!(upstream.body, body);
             assert_eq!(
-                upstream.headers.get(header::AUTHORIZATION),
-                Some(&HeaderValue::from_static("Bearer upstream-token"))
-            );
-            assert_eq!(
-                upstream.headers.get(header::COOKIE),
-                Some(&HeaderValue::from_static("session=abc"))
-            );
-            assert_eq!(
                 upstream.headers.get("x-end-to-end"),
                 Some(&HeaderValue::from_static("keep me"))
             );
@@ -9948,6 +9954,8 @@ mod tests {
                 "te",
                 "upgrade",
                 "x-hop-by-connection",
+                header::AUTHORIZATION.as_str(),
+                header::COOKIE.as_str(),
             ] {
                 assert!(
                     !upstream.headers.contains_key(stripped),
@@ -10234,6 +10242,76 @@ mod tests {
             next_proxied_request(&mut captured, "upstream should receive proxied request").await;
         assert!(!upstream.headers.contains_key(X_FORWARDED_FOR_HEADER));
         assert!(!upstream.headers.contains_key(X_REAL_IP_HEADER));
+    }
+
+    #[tokio::test]
+    async fn routing_table_strips_client_credentials_by_default() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let router = proxy_router(
+            routing_proxy_config(vec![path_route("/api", upstream_addr)]),
+            test_audit_log(),
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/headers")
+                    .header(header::AUTHORIZATION, "Bearer client-token")
+                    .header(header::COOKIE, "session=client")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let upstream =
+            next_proxied_request(&mut captured, "upstream should receive proxied request").await;
+        assert!(!upstream.headers.contains_key(header::AUTHORIZATION));
+        assert!(!upstream.headers.contains_key(header::COOKIE));
+    }
+
+    #[tokio::test]
+    async fn routing_table_replaces_client_credentials_with_configured_upstream_credentials() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut route = path_route("/api", upstream_addr);
+        route.add_request_headers = HashMap::from([
+            (
+                header::AUTHORIZATION.as_str().to_owned(),
+                "Bearer configured-upstream-token".to_owned(),
+            ),
+            (
+                header::COOKIE.as_str().to_owned(),
+                "upstream-session=configured".to_owned(),
+            ),
+        ]);
+        let router = proxy_router(routing_proxy_config(vec![route]), test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/headers")
+                    .header(header::AUTHORIZATION, "Bearer client-token")
+                    .header(header::COOKIE, "session=client")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let upstream =
+            next_proxied_request(&mut captured, "upstream should receive proxied request").await;
+        assert_eq!(
+            upstream.headers.get(header::AUTHORIZATION),
+            Some(&HeaderValue::from_static(
+                "Bearer configured-upstream-token"
+            ))
+        );
+        assert_eq!(
+            upstream.headers.get(header::COOKIE),
+            Some(&HeaderValue::from_static("upstream-session=configured"))
+        );
     }
 
     #[tokio::test]
