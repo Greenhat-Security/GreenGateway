@@ -2484,6 +2484,7 @@ mod tests {
             egress_connect_timeout_ms: 10_000,
             egress_max_response_bytes: 5_242_880,
             egress_max_request_body_bytes: 1_048_576,
+            egress_nat64_prefixes: Vec::new(),
             egress_deny_private_ips: true,
         }
     }

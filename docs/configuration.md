@@ -531,7 +531,7 @@ Example:
 ]
 ```
 
-Security note: MCP upstream hosts are not auto-seeded into the egress allowlist. Their URLs are checked at startup and again before each call through the same egress URL, host, port, DNS, and private-IP validation used by normal gateway-originated HTTP requests. Configure `EGRESS_ALLOWED_HOSTS` or policy `egress.hosts` for every allowed MCP upstream host.
+Security note: MCP upstream hosts are not auto-seeded into the egress allowlist. Their URLs are checked at startup and again before each call through the same egress URL, host, port, DNS, and non-global-IP validation used by normal gateway-originated HTTP requests. Configure `EGRESS_ALLOWED_HOSTS` or policy `egress.hosts` for every allowed MCP upstream host.
 
 Startup discovery imports each upstream tool into the same tool registry as `TOOLS_FILE` tools. Namespaced collisions with local tools or other MCP upstream tools fail startup rather than overwriting.
 
@@ -715,7 +715,7 @@ OIDC discovery: when a provider has `issuer` but no `jwks_url`, startup fetches 
 
 JWT algorithms: JWKS keys with `kty` `RSA` validate RS256 tokens, `kty` `EC` with `crv` `P-256` validates ES256 tokens, and `kty` `OKP` with `crv` `Ed25519` validates EdDSA tokens. Unsupported or incomplete keys are skipped during JWKS refresh.
 
-Egress trust: each JWT provider `jwks_url`, each JWT provider `issuer` when it is a URL with a host, each discovered OIDC `jwks_uri` host, the discovered admin-login `token_endpoint` host, and each cookie-session provider `introspection_url` host are automatically trusted for gateway-originated egress. Private-IP, scheme, port, and DNS-pinning checks still apply to every discovery, JWKS, token-exchange, and introspection request.
+Egress trust: each JWT provider `jwks_url`, each JWT provider `issuer` when it is a URL with a host, each discovered OIDC `jwks_uri` host, the discovered admin-login `token_endpoint` host, and each cookie-session provider `introspection_url` host are automatically trusted for gateway-originated egress. Non-global-IP, scheme, port, and DNS-pinning checks still apply to every discovery, JWKS, token-exchange, and introspection request.
 
 ### JWT_JWKS_URL
 
@@ -869,7 +869,7 @@ Optional `http` or `https` upstream origin for the catch-all reverse proxy fallb
 
 Default: empty, which disables proxying and leaves unmatched paths on axum's default `404`.
 
-Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be a valid `http` or `https` URL with a host. The proxy uses only the configured scheme, host, and port; each incoming request's path and query are forwarded unchanged. The upstream host is automatically trusted for gateway-originated egress, so operators do not need to duplicate it in `EGRESS_ALLOWED_HOSTS`. Private resolved IP ranges are still blocked by default unless `EGRESS_DENY_PRIVATE_IPS=false` is explicitly configured.
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be a valid `http` or `https` URL with a host. The proxy uses only the configured scheme, host, and port; each incoming request's path and query are forwarded unchanged. The upstream host is automatically trusted for gateway-originated egress, so operators do not need to duplicate it in `EGRESS_ALLOWED_HOSTS`. Non-global resolved IP ranges are still blocked by default unless `EGRESS_DENY_PRIVATE_IPS=false` is explicitly configured.
 
 The proxy fallback rejects raw request paths containing percent encoding or literal `.` or `..` path segments with `404 Not Found` before upstream route selection. This fail-closed boundary is always active, including when RBAC is not configured, so encoded or traversal-shaped variants cannot bypass gateway-owned admin, API, MCP, or probe namespaces. GreenGateway does not normalize and forward these ambiguous paths.
 
@@ -999,7 +999,7 @@ Comma-separated hostnames the egress HTTP client may call for gateway-originated
 
 Default: empty list, which denies all egress requests.
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, lowercase entries, and require each entry to be an ASCII hostname without a port. Configure only hostnames, not URLs. The egress client still blocks private resolved IP ranges by default even when a hostname is allowlisted.
+Format and validation: split on commas, trim whitespace, ignore empty entries, lowercase entries, and require each entry to be an ASCII hostname without a port. Configure only hostnames, not URLs. The egress client still blocks non-global resolved IP ranges by default even when a hostname is allowlisted.
 
 Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, every `UPSTREAM_ROUTES[].upstream_url`, configured `AUTH_PROVIDERS[].jwks_url` values, URL-shaped `AUTH_PROVIDERS[].issuer` values, OIDC-discovered `jwks_uri` hosts, the discovered admin-login `token_endpoint` host, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to configured upstreams, fetch OIDC discovery documents, validate tokens, or exchange admin-login authorization codes without duplicating those hosts here.
 
@@ -1043,10 +1043,18 @@ Default: `1048576` (1 MiB)
 
 Format and validation: must parse as a non-negative byte count that fits in `usize`. The egress client checks this cap before sending a request.
 
+### EGRESS_NAT64_PREFIXES
+
+Optional comma-separated RFC 6052 network-specific IPv6 translation prefixes used by the deployment's NAT64 infrastructure.
+
+Default: empty. GreenGateway always recognizes the globally reachable well-known prefix `64:ff9b::/96` without configuration. The local-use prefix `64:ff9b:1::/48` remains blocked unless it is explicitly configured here.
+
+Format and validation: entries must be IPv6 CIDR prefixes with an RFC 6052 prefix length of `/32`, `/40`, `/48`, `/56`, `/64`, or `/96`, and the RFC 6052 `u` octet must be zero. Prefixes must not overlap each other or the built-in `64:ff9b::/96` prefix. GreenGateway extracts the embedded IPv4 address and applies the same non-global-address policy to it, so an alternate IPv6 representation cannot hide a private, loopback, link-local, or other blocked IPv4 destination. Configure only prefixes routed to a trusted NAT64 translator in this deployment.
+
 ### EGRESS_DENY_PRIVATE_IPS
 
-Whether the egress client blocks private and special-use resolved IP ranges.
+Whether the egress client blocks non-global and special-use resolved IP ranges. The legacy setting name is retained for compatibility.
 
 Default: `true`
 
-Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, the egress client blocks RFC1918 IPv4 ranges, CGNAT, loopback, link-local, IPv4 `0/8`, IPv6 loopback, IPv6 ULA, and IPv6 link-local addresses even when the hostname is allowlisted. If any resolved address for a hostname is private, the request is denied.
+Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, the egress client blocks the non-global entries in the IANA IPv4 and IPv6 special-purpose registries, including private, shared, loopback, link-local, documentation, benchmarking, deprecated transition, discard, multicast, and reserved ranges. Registry-defined global exceptions remain allowed. IPv4-mapped IPv6 and recognized NAT64 addresses are classified by their embedded IPv4 destination. If any resolved address for a hostname is non-global, the complete request is denied before the selected address is pinned.

@@ -163,7 +163,11 @@ function StatusSummary({ status }: { status: GatewayStatus }) {
             value={String(status.egress.allowed_hosts_count)}
           />
           <StatusItem
-            label="Deny private IPs"
+            label="NAT64 prefixes"
+            value={String(status.egress.nat64_prefixes_count)}
+          />
+          <StatusItem
+            label="Deny non-global IPs"
             value={enabledLabel(status.egress.deny_private_ips)}
           />
         </StatusSection>

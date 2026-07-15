@@ -5,6 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -21,11 +22,77 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
+// Snapshot: IANA IPv4 and IPv6 Special-Purpose Address Registries, 2026-07-14.
+// Explicit global exceptions are checked before their enclosing special-use blocks.
+static IPV4_GLOBAL_EXCEPTIONS: LazyLock<Vec<IpNet>> =
+    LazyLock::new(|| cidr_list(&["192.0.0.9/32", "192.0.0.10/32"]));
+static IPV4_NON_GLOBAL_RANGES: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
+    cidr_list(&[
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.88.99.0/24",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        // Multicast is not a unicast destination and is outside the special registry.
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+    ])
+});
+static IPV6_GLOBAL_EXCEPTIONS: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
+    cidr_list(&[
+        "2001:1::1/128",
+        "2001:1::2/128",
+        "2001:1::3/128",
+        "2001:3::/32",
+        "2001:4:112::/48",
+        "2001:20::/28",
+        "2001:30::/28",
+    ])
+});
+static IPV6_NON_GLOBAL_RANGES: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
+    cidr_list(&[
+        "::/128",
+        "::1/128",
+        "64:ff9b:1::/48",
+        "100::/64",
+        "100:0:0:1::/64",
+        "2001::/23",
+        "2001:db8::/32",
+        // 6to4 is deprecated and has conditional rather than global reachability.
+        "2002::/16",
+        "3fff::/20",
+        "5f00::/16",
+        "fc00::/7",
+        "fe80::/10",
+        // Deprecated site-local and multicast addresses are never valid HTTP origins.
+        "fec0::/10",
+        "ff00::/8",
+    ])
+});
+static IPV6_GLOBAL_UNICAST: LazyLock<IpNet> = LazyLock::new(|| {
+    "2000::/3"
+        .parse()
+        .expect("hard-coded global IPv6 unicast prefix should parse")
+});
+static WELL_KNOWN_NAT64_PREFIX: LazyLock<IpNet> = LazyLock::new(|| {
+    "64:ff9b::/96"
+        .parse()
+        .expect("hard-coded well-known NAT64 prefix should parse")
+});
+
 #[derive(Debug)]
 pub enum EgressError {
     HostNotAllowed(String),
     PortNotAllowed(u16),
-    PrivateIpBlocked(IpAddr),
+    NonGlobalIpBlocked(IpAddr),
     InvalidPolicy(String),
     DnsResolutionFailed(String),
     InvalidUrl(String),
@@ -42,7 +109,9 @@ impl fmt::Display for EgressError {
         match self {
             Self::HostNotAllowed(host) => write!(formatter, "egress host is not allowed: {host}"),
             Self::PortNotAllowed(port) => write!(formatter, "egress port is not allowed: {port}"),
-            Self::PrivateIpBlocked(ip) => write!(formatter, "egress private IP is blocked: {ip}"),
+            Self::NonGlobalIpBlocked(ip) => {
+                write!(formatter, "egress non-global IP is blocked: {ip}")
+            }
             Self::InvalidPolicy(message) => {
                 write!(formatter, "egress policy is invalid: {message}")
             }
@@ -110,9 +179,10 @@ impl EgressError {
 /// policy `egress` section. Host patterns are additive: an outbound request
 /// must match either an exact bootstrap host or a policy host pattern. If
 /// `allowed_ports` is non-empty, the URL's destination port must be listed.
-/// If `deny_private_ips` is true, any private resolved address still blocks
-/// the request unless that private IP is explicitly covered by one of the
-/// policy CIDRs; policy CIDRs do not disable private-IP blocking globally.
+/// If `deny_private_ips` is true, any non-global or special-use resolved
+/// address still blocks the request unless that address is explicitly covered
+/// by one of the policy CIDRs. The legacy field name is retained for config
+/// compatibility; policy CIDRs do not disable non-global blocking globally.
 #[derive(Clone)]
 pub struct EgressConfig {
     pub allowed_hosts: HashSet<String>,
@@ -124,6 +194,7 @@ pub struct EgressConfig {
     pub connect_timeout: Duration,
     pub max_response_bytes: usize,
     pub max_request_body_bytes: usize,
+    pub nat64_prefixes: Vec<IpNet>,
     pub deny_private_ips: bool,
     pub tls_ca_bundle_path: Option<PathBuf>,
     pub tls_root_certificates: Vec<reqwest::Certificate>,
@@ -142,6 +213,7 @@ impl fmt::Debug for EgressConfig {
             .field("connect_timeout", &self.connect_timeout)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("max_request_body_bytes", &self.max_request_body_bytes)
+            .field("nat64_prefixes", &self.nat64_prefixes)
             .field("deny_private_ips", &self.deny_private_ips)
             .field("tls_ca_bundle_path", &self.tls_ca_bundle_path)
             .field(
@@ -163,6 +235,7 @@ impl PartialEq for EgressConfig {
             && self.connect_timeout == other.connect_timeout
             && self.max_response_bytes == other.max_response_bytes
             && self.max_request_body_bytes == other.max_request_body_bytes
+            && self.nat64_prefixes == other.nat64_prefixes
             && self.deny_private_ips == other.deny_private_ips
             && self.tls_ca_bundle_path == other.tls_ca_bundle_path
             && self.tls_root_certificates.len() == other.tls_root_certificates.len()
@@ -183,6 +256,7 @@ impl Default for EgressConfig {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+            nat64_prefixes: Vec::new(),
             deny_private_ips: true,
             tls_ca_bundle_path: None,
             tls_root_certificates: Vec::new(),
@@ -262,6 +336,7 @@ impl EgressConfig {
             connect_timeout: Duration::from_millis(config.egress_connect_timeout_ms),
             max_response_bytes: config.egress_max_response_bytes,
             max_request_body_bytes: config.egress_max_request_body_bytes,
+            nat64_prefixes: config.egress_nat64_prefixes.clone(),
             deny_private_ips: config.egress_deny_private_ips,
             tls_ca_bundle_path: None,
             tls_root_certificates: Vec::new(),
@@ -458,6 +533,7 @@ impl EgressClient {
             &host,
             &resolved,
             self.config.deny_private_ips,
+            &self.config.nat64_prefixes,
             &self.config.private_ip_allow_cidrs,
         )?;
         enforce_request_body_size(
@@ -493,6 +569,7 @@ impl EgressClient {
             &host,
             &resolved,
             self.config.deny_private_ips,
+            &self.config.nat64_prefixes,
             &self.config.private_ip_allow_cidrs,
         )?;
 
@@ -519,6 +596,7 @@ impl EgressClient {
             &host,
             &resolved,
             self.config.deny_private_ips,
+            &self.config.nat64_prefixes,
             &self.config.private_ip_allow_cidrs,
         )?;
         enforce_request_body_size(
@@ -677,48 +755,113 @@ impl EgressClient {
     }
 }
 
-pub fn is_private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let ip = u32::from(ip);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Nat64Address {
+    NotNat64,
+    Embedded(Ipv4Addr),
+    Malformed,
+}
 
-            (ip & 0xff00_0000) == 0x0a00_0000
-                || (ip & 0xff00_0000) == 0x7f00_0000
-                || (ip & 0xfff0_0000) == 0xac10_0000
-                || (ip & 0xffff_0000) == 0xc0a8_0000
-                || (ip & 0xffc0_0000) == 0x6440_0000
-                || (ip & 0xffff_0000) == 0xa9fe_0000
-                || (ip & 0xff00_0000) == 0x0000_0000
-                // 240.0.0.0/4 is reserved and includes 255.255.255.255 broadcast.
-                || (ip & 0xf000_0000) == 0xf000_0000
-        }
+fn cidr_list(values: &[&str]) -> Vec<IpNet> {
+    values
+        .iter()
+        .map(|value| {
+            value
+                .parse()
+                .expect("hard-coded special-purpose CIDR should parse")
+        })
+        .collect()
+}
+
+pub fn is_non_global_ip(ip: IpAddr, nat64_prefixes: &[IpNet]) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_non_global_ipv4(ip),
         IpAddr::V6(ip) => {
             if let Some(v4) = ip.to_ipv4_mapped() {
-                return is_private_ip(IpAddr::V4(v4));
+                return is_non_global_ipv4(v4);
             }
 
-            if let Some(v4) = nat64_embedded_ipv4(ip) {
-                return is_private_ip(IpAddr::V4(v4));
+            match classify_nat64_address(ip, nat64_prefixes) {
+                Nat64Address::Embedded(v4) => return is_non_global_ipv4(v4),
+                Nat64Address::Malformed => return true,
+                Nat64Address::NotNat64 => {}
             }
 
-            ip.is_unspecified()
-                || ip == Ipv6Addr::LOCALHOST
-                || (ip.segments()[0] & 0xfe00) == 0xfc00
-                || (ip.segments()[0] & 0xffc0) == 0xfe80
+            let ip = IpAddr::V6(ip);
+            if IPV6_GLOBAL_EXCEPTIONS
+                .iter()
+                .any(|prefix| prefix.contains(&ip))
+            {
+                return false;
+            }
+
+            IPV6_NON_GLOBAL_RANGES
+                .iter()
+                .any(|prefix| prefix.contains(&ip))
+                || !IPV6_GLOBAL_UNICAST.contains(&ip)
         }
     }
 }
 
-fn nat64_embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
-    let segments = ip.segments();
-
-    if segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
-        Some(Ipv4Addr::from(
-            ((segments[6] as u32) << 16) | segments[7] as u32,
-        ))
-    } else {
-        None
+fn is_non_global_ipv4(ip: Ipv4Addr) -> bool {
+    let ip = IpAddr::V4(ip);
+    if IPV4_GLOBAL_EXCEPTIONS
+        .iter()
+        .any(|prefix| prefix.contains(&ip))
+    {
+        return false;
     }
+
+    IPV4_NON_GLOBAL_RANGES
+        .iter()
+        .any(|prefix| prefix.contains(&ip))
+}
+
+fn classify_nat64_address(ip: Ipv6Addr, configured_prefixes: &[IpNet]) -> Nat64Address {
+    let ip_addr = IpAddr::V6(ip);
+    let prefix = if WELL_KNOWN_NAT64_PREFIX.contains(&ip_addr) {
+        Some(&*WELL_KNOWN_NAT64_PREFIX)
+    } else {
+        configured_prefixes
+            .iter()
+            .find(|prefix| prefix.contains(&ip_addr))
+    };
+
+    let Some(prefix) = prefix else {
+        return Nat64Address::NotNat64;
+    };
+
+    match extract_rfc6052_ipv4(ip, prefix.prefix_len()) {
+        Some(v4) => Nat64Address::Embedded(v4),
+        None => Nat64Address::Malformed,
+    }
+}
+
+fn extract_rfc6052_ipv4(ip: Ipv6Addr, prefix_len: u8) -> Option<Ipv4Addr> {
+    let bits = u128::from(ip);
+    if !matches!(prefix_len, 32 | 40 | 48 | 56 | 64 | 96) || ip.octets()[8] != 0 {
+        return None;
+    }
+    if prefix_len == 96 {
+        return Some(Ipv4Addr::from(bits as u32));
+    }
+
+    let leading_bits = 64 - prefix_len;
+    let trailing_bits = 32 - leading_bits;
+    let leading = if leading_bits == 0 {
+        0
+    } else {
+        ((bits >> 64) & ((1_u128 << leading_bits) - 1)) as u32
+    };
+    let trailing = if trailing_bits == 0 {
+        0
+    } else {
+        let shift = 128 - (72 + trailing_bits);
+        ((bits >> shift) & ((1_u128 << trailing_bits) - 1)) as u32
+    };
+
+    let value = ((leading as u64) << trailing_bits) | trailing as u64;
+    Some(Ipv4Addr::from(value as u32))
 }
 
 fn base_client_builder(config: &EgressConfig) -> reqwest::ClientBuilder {
@@ -804,6 +947,7 @@ fn checked_socket_addr(
     host: &str,
     resolved: &[SocketAddr],
     deny_private_ips: bool,
+    nat64_prefixes: &[IpNet],
     private_ip_allow_cidrs: &[IpNet],
 ) -> Result<SocketAddr, EgressError> {
     if resolved.is_empty() {
@@ -811,17 +955,16 @@ fn checked_socket_addr(
     }
 
     if deny_private_ips {
-        if let Some(blocked) = resolved
-            .iter()
-            .map(SocketAddr::ip)
-            .find(|ip| is_private_ip(*ip) && !ip_matches_policy_cidr(*ip, private_ip_allow_cidrs))
-        {
+        if let Some(blocked) = resolved.iter().map(SocketAddr::ip).find(|ip| {
+            is_non_global_ip(*ip, nat64_prefixes)
+                && !ip_matches_policy_cidr(*ip, private_ip_allow_cidrs)
+        }) {
             tracing::warn!(
                 host,
                 ip = %blocked,
-                "egress blocked private resolved address outside policy CIDRs"
+                "egress blocked non-global resolved address outside policy CIDRs"
             );
-            return Err(EgressError::PrivateIpBlocked(blocked));
+            return Err(EgressError::NonGlobalIpBlocked(blocked));
         }
     }
 
@@ -858,113 +1001,150 @@ mod tests {
     use super::*;
 
     #[test]
-    fn private_ip_detects_ipv4_loopback_range_and_adjacent_public() {
-        assert!(is_private_ip(ip("127.0.0.1")));
-        assert!(is_private_ip(ip("127.255.255.255")));
-        assert!(!is_private_ip(ip("126.255.255.255")));
-        assert!(!is_private_ip(ip("128.0.0.1")));
+    fn non_global_ipv4_matches_registry_snapshot_and_multicast_policy() {
+        for (address, expected_non_global) in [
+            ("0.0.0.0", true),
+            ("0.255.255.255", true),
+            ("1.0.0.0", false),
+            ("10.0.0.0", true),
+            ("10.255.255.255", true),
+            ("100.63.255.255", false),
+            ("100.64.0.0", true),
+            ("100.127.255.255", true),
+            ("100.128.0.0", false),
+            ("127.0.0.0", true),
+            ("127.255.255.255", true),
+            ("169.254.0.0", true),
+            ("169.254.255.255", true),
+            ("172.15.255.255", false),
+            ("172.16.0.0", true),
+            ("172.31.255.255", true),
+            ("172.32.0.0", false),
+            ("192.0.0.8", true),
+            ("192.0.0.9", false),
+            ("192.0.0.10", false),
+            ("192.0.0.11", true),
+            ("192.0.2.1", true),
+            ("192.31.196.1", false),
+            ("192.88.99.1", true),
+            ("192.168.0.0", true),
+            ("192.168.255.255", true),
+            ("192.175.48.1", false),
+            ("198.18.0.0", true),
+            ("198.19.255.255", true),
+            ("198.51.100.1", true),
+            ("203.0.113.1", true),
+            ("223.255.255.255", false),
+            ("224.0.0.0", true),
+            ("239.255.255.255", true),
+            ("240.0.0.0", true),
+            ("255.255.255.255", true),
+            ("8.8.8.8", false),
+        ] {
+            assert_eq!(
+                is_non_global_ip(ip(address), &[]),
+                expected_non_global,
+                "unexpected classification for {address}"
+            );
+        }
     }
 
     #[test]
-    fn private_ip_detects_ipv4_ten_range_and_adjacent_public() {
-        assert!(is_private_ip(ip("10.0.0.1")));
-        assert!(is_private_ip(ip("10.255.255.255")));
-        assert!(!is_private_ip(ip("9.255.255.255")));
-        assert!(!is_private_ip(ip("11.0.0.1")));
+    fn non_global_ipv6_matches_registry_snapshot_and_global_unicast_policy() {
+        for (address, expected_non_global) in [
+            ("::", true),
+            ("::1", true),
+            ("::2", true),
+            ("::ffff:127.0.0.1", true),
+            ("::ffff:8.8.8.8", false),
+            ("100::1", true),
+            ("100:0:0:1::1", true),
+            ("2001::1", true),
+            ("2001:1::1", false),
+            ("2001:1::2", false),
+            ("2001:1::3", false),
+            ("2001:2::1", true),
+            ("2001:3::1", false),
+            ("2001:4:112::1", false),
+            ("2001:10::1", true),
+            ("2001:20::1", false),
+            ("2001:30::1", false),
+            ("2001:db8::1", true),
+            ("2002::1", true),
+            ("2620:4f:8000::1", false),
+            ("3fff::1", true),
+            ("5f00::1", true),
+            ("fc00::1", true),
+            ("fe80::1", true),
+            ("fec0::1", true),
+            ("ff02::1", true),
+            ("2606:4700:4700::1111", false),
+            ("4000::1", true),
+        ] {
+            assert_eq!(
+                is_non_global_ip(ip(address), &[]),
+                expected_non_global,
+                "unexpected classification for {address}"
+            );
+        }
     }
 
     #[test]
-    fn private_ip_detects_ipv4_172_16_range_and_adjacent_public() {
-        assert!(is_private_ip(ip("172.16.0.1")));
-        assert!(is_private_ip(ip("172.31.255.255")));
-        assert!(!is_private_ip(ip("172.15.255.255")));
-        assert!(!is_private_ip(ip("172.32.0.1")));
+    fn nat64_classification_uses_embedded_ipv4_and_requires_configured_local_prefixes() {
+        assert!(is_non_global_ip(ip("64:ff9b::a9fe:a9fe"), &[]));
+        assert!(!is_non_global_ip(ip("64:ff9b::808:808"), &[]));
+
+        let local_use_public = ip("64:ff9b:1:808:8:800::");
+        let local_use_private = ip("64:ff9b:1:a9fe:a9:fe00::");
+        assert!(is_non_global_ip(local_use_public, &[]));
+
+        let configured = vec!["64:ff9b:1::/48"
+            .parse::<IpNet>()
+            .expect("test NAT64 prefix should parse")];
+        assert!(!is_non_global_ip(local_use_public, &configured));
+        assert!(is_non_global_ip(local_use_private, &configured));
+        assert!(is_non_global_ip(ip("64:ff9b:1:808:108:800::"), &configured));
     }
 
     #[test]
-    fn private_ip_detects_ipv4_192_168_range_and_adjacent_public() {
-        assert!(is_private_ip(ip("192.168.0.1")));
-        assert!(is_private_ip(ip("192.168.255.255")));
-        assert!(!is_private_ip(ip("192.167.255.255")));
-        assert!(!is_private_ip(ip("192.169.0.1")));
+    fn rfc6052_extraction_supports_every_standard_prefix_length() {
+        let expected = Ipv4Addr::new(192, 0, 2, 33);
+        for (prefix, address) in [
+            ("2001:db8::/32", "2001:db8:c000:221::"),
+            ("2001:db8:100::/40", "2001:db8:1c0:2:21::"),
+            ("2001:db8:122::/48", "2001:db8:122:c000:2:2100::"),
+            ("2001:db8:122:300::/56", "2001:db8:122:3c0:0:221::"),
+            ("2001:db8:122:344::/64", "2001:db8:122:344:c0:2:2100::"),
+            ("2001:db8:122:344::/96", "2001:db8:122:344::192.0.2.33"),
+        ] {
+            let prefix = prefix
+                .parse::<IpNet>()
+                .expect("RFC 6052 example prefix should parse");
+            let address = address
+                .parse::<Ipv6Addr>()
+                .expect("RFC 6052 example address should parse");
+            assert!(prefix.contains(&IpAddr::V6(address)));
+            assert_eq!(
+                extract_rfc6052_ipv4(address, prefix.prefix_len()),
+                Some(expected),
+                "unexpected extraction for {prefix}"
+            );
+        }
     }
 
     #[test]
-    fn private_ip_detects_ipv4_cgnat_range_and_adjacent_public() {
-        assert!(is_private_ip(ip("100.64.0.1")));
-        assert!(is_private_ip(ip("100.127.255.255")));
-        assert!(!is_private_ip(ip("100.63.255.255")));
-        assert!(!is_private_ip(ip("100.128.0.1")));
-    }
+    fn rfc6052_extraction_rejects_nonzero_u_octet_for_96_prefixes() {
+        let prefix = "2001:db8:122:344:100::/96"
+            .parse::<IpNet>()
+            .expect("test prefix should parse");
+        let address = "2001:db8:122:344:100:0:808:808"
+            .parse::<Ipv6Addr>()
+            .expect("test address should parse");
 
-    #[test]
-    fn private_ip_detects_ipv4_link_local_range_and_adjacent_public() {
-        assert!(is_private_ip(ip("169.254.0.1")));
-        assert!(is_private_ip(ip("169.254.255.255")));
-        assert!(!is_private_ip(ip("169.253.255.255")));
-        assert!(!is_private_ip(ip("169.255.0.1")));
-    }
-
-    #[test]
-    fn private_ip_detects_ipv4_zero_range_and_adjacent_public() {
-        assert!(is_private_ip(ip("0.0.0.0")));
-        assert!(is_private_ip(ip("0.255.255.255")));
-        assert!(!is_private_ip(ip("1.0.0.0")));
-    }
-
-    #[test]
-    fn private_ip_detects_ipv4_reserved_range_and_broadcast() {
-        assert!(is_private_ip(ip("240.0.0.1")));
-        assert!(is_private_ip(ip("255.255.255.255")));
-        assert!(!is_private_ip(ip("239.255.255.255")));
-    }
-
-    #[test]
-    fn private_ip_allows_public_ipv4_examples() {
-        assert!(!is_private_ip(ip("8.8.8.8")));
-        assert!(!is_private_ip(ip("1.1.1.1")));
-    }
-
-    #[test]
-    fn private_ip_detects_ipv4_mapped_ipv6_private_addresses() {
-        assert!(is_private_ip(ip("::ffff:127.0.0.1")));
-        assert!(is_private_ip(ip("::ffff:169.254.169.254")));
-        assert!(is_private_ip(ip("::ffff:10.0.0.1")));
-        assert!(is_private_ip(ip("::ffff:192.168.1.1")));
-        assert!(!is_private_ip(ip("::ffff:8.8.8.8")));
-    }
-
-    #[test]
-    fn private_ip_detects_ipv6_loopback() {
-        assert!(is_private_ip(ip("::1")));
-        assert!(!is_private_ip(ip("::2")));
-    }
-
-    #[test]
-    fn private_ip_detects_ipv6_unspecified() {
-        assert!(is_private_ip(ip("::")));
-    }
-
-    #[test]
-    fn private_ip_detects_ipv6_ula_range_and_adjacent_public() {
-        assert!(is_private_ip(ip("fc00::1")));
-        assert!(is_private_ip(ip("fdff:ffff::1")));
-        assert!(!is_private_ip(ip("fbff:ffff::1")));
-        assert!(!is_private_ip(ip("fe00::1")));
-    }
-
-    #[test]
-    fn private_ip_detects_ipv6_link_local_range_and_adjacent_public() {
-        assert!(is_private_ip(ip("fe80::1")));
-        assert!(is_private_ip(ip("febf:ffff::1")));
-        assert!(!is_private_ip(ip("fe7f:ffff::1")));
-        assert!(!is_private_ip(ip("fec0::1")));
-    }
-
-    #[test]
-    fn private_ip_detects_nat64_embedded_private_addresses() {
-        assert!(is_private_ip(ip("64:ff9b::a9fe:a9fe")));
-        assert!(!is_private_ip(ip("64:ff9b::808:808")));
+        assert!(prefix.contains(&IpAddr::V6(address)));
+        assert_eq!(address.octets()[8], 1);
+        assert_eq!(extract_rfc6052_ipv4(address, 96), None);
+        assert!(is_non_global_ip(IpAddr::V6(address), &[prefix]));
     }
 
     #[test]
@@ -1102,18 +1282,30 @@ mod tests {
     fn policy_cidr_exempts_only_matching_private_resolved_ips() {
         let allowed_cidrs = vec!["10.0.0.0/8".parse().expect("CIDR should parse")];
         let resolved = vec![socket("10.1.2.3:443")];
-        let pinned = checked_socket_addr("internal.example.test", &resolved, true, &allowed_cidrs)
-            .expect("private IP covered by policy CIDR should be allowed");
+        let pinned = checked_socket_addr(
+            "internal.example.test",
+            &resolved,
+            true,
+            &[],
+            &allowed_cidrs,
+        )
+        .expect("private IP covered by policy CIDR should be allowed");
 
         assert_eq!(pinned, socket("10.1.2.3:443"));
 
         let resolved = vec![socket("192.168.1.10:443")];
-        let error = checked_socket_addr("internal.example.test", &resolved, true, &allowed_cidrs)
-            .expect_err("private IP outside policy CIDR should still be blocked");
+        let error = checked_socket_addr(
+            "internal.example.test",
+            &resolved,
+            true,
+            &[],
+            &allowed_cidrs,
+        )
+        .expect_err("private IP outside policy CIDR should still be blocked");
 
         assert!(matches!(
             error,
-            EgressError::PrivateIpBlocked(blocked) if blocked == ip("192.168.1.10")
+            EgressError::NonGlobalIpBlocked(blocked) if blocked == ip("192.168.1.10")
         ));
     }
 
@@ -1121,6 +1313,9 @@ mod tests {
     fn no_policy_egress_section_preserves_env_only_config() {
         let mut config = test_config();
         config.egress_allowed_hosts = vec!["API.EXAMPLE.TEST".to_owned()];
+        config.egress_nat64_prefixes = vec!["64:ff9b:1::/48"
+            .parse()
+            .expect("test NAT64 prefix should parse")];
 
         let env_only = EgressConfig::from_config(&config);
         let no_policy = EgressConfig::from_config_and_policy(&config, None)
@@ -1138,6 +1333,7 @@ mod tests {
         assert!(env_only.allowed_host_globs.is_empty());
         assert!(env_only.private_ip_allow_cidrs.is_empty());
         assert!(env_only.allowed_ports.is_empty());
+        assert_eq!(env_only.nat64_prefixes, config.egress_nat64_prefixes);
     }
 
     #[test]
@@ -1385,7 +1581,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            EgressError::PrivateIpBlocked(blocked) if blocked == ip("127.0.0.1")
+            EgressError::NonGlobalIpBlocked(blocked) if blocked == ip("127.0.0.1")
         ));
     }
 
@@ -1439,25 +1635,45 @@ mod tests {
     }
 
     #[test]
-    fn any_private_resolved_ip_blocks_the_host() {
+    fn any_non_global_resolved_ip_blocks_the_host() {
         let resolved = vec![
             socket("93.184.216.34:443"),
-            socket("10.0.0.1:443"),
+            socket("198.18.0.1:443"),
             socket("1.1.1.1:443"),
         ];
-        let error = checked_socket_addr("api.example.test", &resolved, true, &[])
-            .expect_err("mixed public and private answers should deny");
+        let error = checked_socket_addr("api.example.test", &resolved, true, &[], &[])
+            .expect_err("mixed public and non-global answers should deny");
 
         assert!(matches!(
             error,
-            EgressError::PrivateIpBlocked(blocked) if blocked == ip("10.0.0.1")
+            EgressError::NonGlobalIpBlocked(blocked) if blocked == ip("198.18.0.1")
+        ));
+    }
+
+    #[test]
+    fn configured_nat64_prefix_is_applied_before_address_pinning() {
+        let prefixes = vec!["64:ff9b:1::/48"
+            .parse::<IpNet>()
+            .expect("test NAT64 prefix should parse")];
+        let public = vec![socket("[64:ff9b:1:808:8:800::]:443")];
+        let pinned = checked_socket_addr("api.example.test", &public, true, &prefixes, &[])
+            .expect("public embedded IPv4 should be allowed");
+        assert_eq!(pinned, public[0]);
+
+        let private = vec![socket("[64:ff9b:1:a9fe:a9:fe00::]:443")];
+        let error = checked_socket_addr("api.example.test", &private, true, &prefixes, &[])
+            .expect_err("private embedded IPv4 should be blocked");
+        assert!(matches!(
+            error,
+            EgressError::NonGlobalIpBlocked(blocked)
+                if blocked == ip("64:ff9b:1:a9fe:a9:fe00::")
         ));
     }
 
     #[test]
     fn all_public_resolved_ips_select_exact_pinned_addr() {
         let resolved = vec![socket("93.184.216.34:443"), socket("1.1.1.1:443")];
-        let pinned = checked_socket_addr("api.example.test", &resolved, true, &[])
+        let pinned = checked_socket_addr("api.example.test", &resolved, true, &[], &[])
             .expect("public resolved addresses should be allowed");
 
         assert_eq!(pinned, socket("93.184.216.34:443"));
@@ -1466,7 +1682,7 @@ mod tests {
     #[test]
     fn private_resolved_ip_is_allowed_when_private_deny_is_disabled() {
         let resolved = vec![socket("10.0.0.1:443")];
-        let pinned = checked_socket_addr("internal.example.test", &resolved, false, &[])
+        let pinned = checked_socket_addr("internal.example.test", &resolved, false, &[], &[])
             .expect("private address should be allowed when private deny is disabled");
 
         assert_eq!(pinned, socket("10.0.0.1:443"));
@@ -1474,7 +1690,7 @@ mod tests {
 
     #[test]
     fn empty_resolution_fails_closed() {
-        let error = checked_socket_addr("api.example.test", &[], true, &[])
+        let error = checked_socket_addr("api.example.test", &[], true, &[], &[])
             .expect_err("empty resolution should deny");
 
         assert!(matches!(
@@ -1838,7 +2054,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            EgressError::PrivateIpBlocked(blocked) if blocked == ip("127.0.0.1")
+            EgressError::NonGlobalIpBlocked(blocked) if blocked == ip("127.0.0.1")
         ));
     }
 
@@ -1972,6 +2188,7 @@ mod tests {
             egress_connect_timeout_ms: 10_000,
             egress_max_response_bytes: 5_242_880,
             egress_max_request_body_bytes: 1_048_576,
+            egress_nat64_prefixes: Vec::new(),
             egress_deny_private_ips: true,
         }
     }

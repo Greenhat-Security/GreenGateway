@@ -25,6 +25,7 @@ export type GatewayStatus = {
   csrf_enabled: boolean;
   egress: {
     allowed_hosts_count: number;
+    nat64_prefixes_count: number;
     deny_private_ips: boolean;
   };
 };

@@ -47,7 +47,7 @@
     },
     "egress": {
       "$ref": "#/$defs/egress_policy",
-      "description": "Policy-driven outbound egress rules layered on top of EGRESS_ALLOWED_HOSTS and auto-seeded infrastructure endpoint hosts. Host patterns are additive. CIDRs explicitly allow matching private resolved IPs through EGRESS_DENY_PRIVATE_IPS=true; private IPs outside listed CIDRs remain blocked. If ports is non-empty, the destination port must be listed."
+      "description": "Policy-driven outbound egress rules layered on top of EGRESS_ALLOWED_HOSTS and auto-seeded infrastructure endpoint hosts. Host patterns are additive. CIDRs explicitly allow matching non-global resolved IPs through EGRESS_DENY_PRIVATE_IPS=true; non-global IPs outside listed CIDRs remain blocked. If ports is non-empty, the destination port must be listed."
     },
     "rate_limits": {
       "type": "array",
@@ -338,7 +338,7 @@
         },
         "cidrs": {
           "type": "array",
-          "description": "IPv4 or IPv6 CIDR ranges that explicitly allow matching private resolved destination IPs through the private-IP block. These are exceptions to EGRESS_DENY_PRIVATE_IPS, not a global replacement for it.",
+          "description": "IPv4 or IPv6 CIDR ranges that explicitly allow matching non-global resolved destination IPs through the non-global-IP block. These are exceptions to EGRESS_DENY_PRIVATE_IPS, not a global replacement for it.",
           "items": {
             "type": "string",
             "pattern": "^(?:(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})/(?:[0-9]|[12][0-9]|3[0-2])|(?:[0-9A-Fa-f]*:)+[0-9A-Fa-f:.]*/(?:[0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))$"

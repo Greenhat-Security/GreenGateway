@@ -34,6 +34,11 @@ static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
         .parse()
         .expect("default listen address should be valid")
 });
+static WELL_KNOWN_NAT64_PREFIX: LazyLock<IpNet> = LazyLock::new(|| {
+    "64:ff9b::/96"
+        .parse()
+        .expect("well-known NAT64 prefix should be valid")
+});
 const DEFAULT_MAX_BODY_SIZE: usize = 1_048_576;
 const DEFAULT_RATE_LIMIT_READ_RPS: f64 = 50.0;
 const DEFAULT_RATE_LIMIT_READ_BURST: u32 = 100;
@@ -89,6 +94,7 @@ const EGRESS_CONNECT_TIMEOUT_MS: &str = "EGRESS_CONNECT_TIMEOUT_MS";
 const EGRESS_DENY_PRIVATE_IPS: &str = "EGRESS_DENY_PRIVATE_IPS";
 const EGRESS_MAX_REQUEST_BODY_BYTES: &str = "EGRESS_MAX_REQUEST_BODY_BYTES";
 const EGRESS_MAX_RESPONSE_BYTES: &str = "EGRESS_MAX_RESPONSE_BYTES";
+const EGRESS_NAT64_PREFIXES: &str = "EGRESS_NAT64_PREFIXES";
 const EGRESS_RESPONSE_IDLE_TIMEOUT_MS: &str = "EGRESS_RESPONSE_IDLE_TIMEOUT_MS";
 const EGRESS_TIMEOUT_MS: &str = "EGRESS_TIMEOUT_MS";
 const GATEWAY_PUBLIC_URL: &str = "GATEWAY_PUBLIC_URL";
@@ -202,6 +208,7 @@ pub struct Config {
     pub egress_connect_timeout_ms: u64,
     pub egress_max_response_bytes: usize,
     pub egress_max_request_body_bytes: usize,
+    pub egress_nat64_prefixes: Vec<IpNet>,
     pub egress_deny_private_ips: bool,
 }
 
@@ -884,6 +891,11 @@ impl Config {
             "byte size",
             &mut problems,
         );
+        let egress_nat64_prefixes = parse_nat64_prefixes(
+            EGRESS_NAT64_PREFIXES,
+            get_var(EGRESS_NAT64_PREFIXES),
+            &mut problems,
+        );
         let egress_deny_private_ips = parse_var(
             EGRESS_DENY_PRIVATE_IPS,
             get_var(EGRESS_DENY_PRIVATE_IPS),
@@ -960,6 +972,7 @@ impl Config {
                 egress_connect_timeout_ms,
                 egress_max_response_bytes,
                 egress_max_request_body_bytes,
+                egress_nat64_prefixes,
                 egress_deny_private_ips,
             })
         } else {
@@ -1685,6 +1698,86 @@ fn parse_comma_separated_cidrs(
             }
         })
         .collect()
+}
+
+fn parse_nat64_prefixes(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Vec<IpNet> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return Vec::new(),
+        Err(VarError::NotUnicode(value)) => {
+            problems.push(format!("{name} must be valid Unicode, got {value:?}"));
+            return Vec::new();
+        }
+    };
+
+    let mut prefixes = Vec::<IpNet>::new();
+
+    for entry in value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let prefix = match entry.parse::<IpNet>() {
+            Ok(IpNet::V6(prefix)) if matches!(prefix.prefix_len(), 32 | 40 | 48 | 56 | 64 | 96) => {
+                IpNet::V6(prefix)
+            }
+            Ok(IpNet::V6(prefix)) => {
+                problems.push(format!(
+                    "{name} entries must use an RFC 6052 prefix length of 32, 40, 48, 56, 64, or 96, got '/{}' in '{entry}'",
+                    prefix.prefix_len()
+                ));
+                continue;
+            }
+            Ok(IpNet::V4(_)) => {
+                problems.push(format!(
+                    "{name} entries must be IPv6 CIDR prefixes, got '{entry}'"
+                ));
+                continue;
+            }
+            Err(err) => {
+                problems.push(format!(
+                    "{name} entries must be valid IPv6 CIDR prefixes, got '{entry}': {err}"
+                ));
+                continue;
+            }
+        };
+
+        let IpNet::V6(ipv6_prefix) = &prefix else {
+            unreachable!("IPv4 NAT64 prefixes are rejected above");
+        };
+        if ipv6_prefix.network().octets()[8] != 0 {
+            problems.push(format!(
+                "{name} entries must use a zero RFC 6052 u octet, got '{entry}'"
+            ));
+            continue;
+        }
+
+        if WELL_KNOWN_NAT64_PREFIX.contains(&prefix.network())
+            || prefix.contains(&WELL_KNOWN_NAT64_PREFIX.network())
+        {
+            problems.push(format!(
+                "{name} entries must not overlap the built-in well-known NAT64 prefix 64:ff9b::/96, got '{prefix}'"
+            ));
+            continue;
+        }
+
+        if let Some(existing) = prefixes.iter().find(|existing| {
+            existing.contains(&prefix.network()) || prefix.contains(&existing.network())
+        }) {
+            problems.push(format!(
+                "{name} entries must not overlap, got '{prefix}' and '{existing}'"
+            ));
+            continue;
+        }
+
+        prefixes.push(prefix);
+    }
+
+    prefixes
 }
 
 fn parse_cookie_name(
@@ -2501,6 +2594,7 @@ mod tests {
         assert_eq!(config.upstream_response_idle_timeout_ms, None);
         assert_eq!(config.upstream_connect_timeout_ms, None);
         assert!(config.egress_allowed_hosts.is_empty());
+        assert!(config.egress_nat64_prefixes.is_empty());
         assert_eq!(config.egress_timeout_ms, DEFAULT_EGRESS_TIMEOUT_MS);
         assert_eq!(
             config.egress_response_idle_timeout_ms,
@@ -4512,6 +4606,7 @@ mod tests {
             "EGRESS_CONNECT_TIMEOUT_MS" => Ok("3000".to_owned()),
             "EGRESS_MAX_RESPONSE_BYTES" => Ok("2097152".to_owned()),
             "EGRESS_MAX_REQUEST_BODY_BYTES" => Ok("65536".to_owned()),
+            "EGRESS_NAT64_PREFIXES" => Ok(" 2001:db8:122:344::/64,64:ff9b:1::/48 ".to_owned()),
             "EGRESS_DENY_PRIVATE_IPS" => Ok("false".to_owned()),
             _ => Err(VarError::NotPresent),
         })
@@ -4530,7 +4625,52 @@ mod tests {
         assert_eq!(config.egress_connect_timeout_ms, 3_000);
         assert_eq!(config.egress_max_response_bytes, 2_097_152);
         assert_eq!(config.egress_max_request_body_bytes, 65_536);
+        assert_eq!(
+            config.egress_nat64_prefixes,
+            vec![
+                "2001:db8:122:344::/64"
+                    .parse::<IpNet>()
+                    .expect("test prefix should parse"),
+                "64:ff9b:1::/48"
+                    .parse::<IpNet>()
+                    .expect("test prefix should parse"),
+            ]
+        );
         assert!(!config.egress_deny_private_ips);
+    }
+
+    #[test]
+    fn invalid_nat64_prefixes_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "EGRESS_NAT64_PREFIXES" => Ok(
+                "10.0.0.0/8,2001:db8::/72,not-a-cidr,2001:db8:1::/48,2001:db8:1:1::/64".to_owned(),
+            ),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject invalid NAT64 prefixes");
+
+        let message = error.to_string();
+        assert!(message.contains("EGRESS_NAT64_PREFIXES entries must be IPv6 CIDR prefixes"));
+        assert!(message.contains("RFC 6052 prefix length"));
+        assert!(message.contains("valid IPv6 CIDR prefixes"));
+        assert!(message.contains("entries must not overlap"));
+        assert_eq!(error.problems.len(), 4);
+    }
+
+    #[test]
+    fn malformed_or_well_known_overlapping_nat64_prefixes_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "EGRESS_NAT64_PREFIXES" => Ok("2001:db8:122:344:100::/96,64:ff9b::/64".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject structurally invalid NAT64 prefixes");
+
+        let message = error.to_string();
+        assert!(message.contains("must use a zero RFC 6052 u octet"));
+        assert!(
+            message.contains("must not overlap the built-in well-known NAT64 prefix 64:ff9b::/96")
+        );
+        assert_eq!(error.problems.len(), 2);
     }
 
     #[test]
