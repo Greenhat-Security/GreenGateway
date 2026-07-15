@@ -130,7 +130,6 @@ const TOOL_RUNTIME_QUEUE_TIMEOUT_MS: &str = "TOOL_RUNTIME_QUEUE_TIMEOUT_MS";
 const TOOLS_FILE: &str = "TOOLS_FILE";
 const TRUST_PROXY_HEADERS: &str = "TRUST_PROXY_HEADERS";
 const TRUSTED_PROXY_CIDRS: &str = "TRUSTED_PROXY_CIDRS";
-const SESSION_COOKIE_NAME: &str = "SESSION_COOKIE_NAME";
 const UPSTREAM_CONNECT_TIMEOUT_MS: &str = "UPSTREAM_CONNECT_TIMEOUT_MS";
 const UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS: &str = "UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS";
 const UPSTREAM_ROUTES: &str = "UPSTREAM_ROUTES";
@@ -172,7 +171,6 @@ pub struct Config {
     pub trust_proxy_headers: bool,
     pub trusted_proxy_cidrs: Vec<IpNet>,
     pub rbac_exempt_paths: Vec<String>,
-    pub session_cookie_name: String,
     pub validation_allowed_content_types: Vec<String>,
     pub auth_enabled: bool,
     pub auth_mode: AuthMode,
@@ -633,13 +631,6 @@ impl Config {
             &admin_prefix,
             admin_login_provider.is_some(),
         );
-        let session_cookie_name = parse_var(
-            SESSION_COOKIE_NAME,
-            get_var(SESSION_COOKIE_NAME),
-            String::new(),
-            "string",
-            &mut problems,
-        );
         let validation_allowed_content_types = parse_comma_separated_header_values(
             VALIDATION_ALLOWED_CONTENT_TYPES,
             get_var(VALIDATION_ALLOWED_CONTENT_TYPES),
@@ -936,7 +927,6 @@ impl Config {
                 trust_proxy_headers,
                 trusted_proxy_cidrs,
                 rbac_exempt_paths,
-                session_cookie_name,
                 validation_allowed_content_types,
                 auth_enabled,
                 auth_mode,
@@ -2532,7 +2522,6 @@ mod tests {
                 "/admin".to_owned(),
             ]
         );
-        assert!(config.session_cookie_name.is_empty());
         assert_eq!(
             config.validation_allowed_content_types,
             vec!["application/json".to_owned()]
@@ -2725,7 +2714,6 @@ mod tests {
                 "/admin".to_owned(),
             ]
         );
-        assert!(config.session_cookie_name.is_empty());
         assert_eq!(
             config.validation_allowed_content_types,
             vec!["application/json".to_owned()]
@@ -3286,7 +3274,6 @@ mod tests {
             "RATE_LIMIT_WRITE_BURST" => Ok("10".to_owned()),
             "TRUST_PROXY_HEADERS" => Ok("true".to_owned()),
             "TRUSTED_PROXY_CIDRS" => Ok("10.0.0.0/8, 2001:db8::/32".to_owned()),
-            "SESSION_COOKIE_NAME" => Ok("gateway_session".to_owned()),
             _ => Err(VarError::NotPresent),
         })
         .expect("config should parse");
@@ -3303,7 +3290,6 @@ mod tests {
                 "2001:db8::/32".parse::<IpNet>().unwrap()
             ]
         );
-        assert_eq!(config.session_cookie_name, "gateway_session");
     }
 
     #[test]

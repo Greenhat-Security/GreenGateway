@@ -7879,7 +7879,6 @@ mod tests {
                 "/metrics".to_owned(),
                 "/admin".to_owned(),
             ],
-            session_cookie_name: String::new(),
             validation_allowed_content_types: vec!["application/json".to_owned()],
             auth_enabled: true,
             auth_mode: config::AuthMode::Required,
