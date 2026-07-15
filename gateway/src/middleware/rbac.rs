@@ -67,14 +67,14 @@ struct RbacPolicyState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ToolRuleDecision {
+pub(crate) struct MatchedRuleDecision {
     pub action: RuleAction,
     pub matched_rule_id: String,
 }
 
 pub(crate) struct ToolAuthorizationSnapshot<'a> {
     pub tool: Option<ToolPolicySnapshot<'a>>,
-    pub rule_decision: Option<ToolRuleDecision>,
+    pub rule_decision: Option<MatchedRuleDecision>,
     pub tools: &'a HashMap<String, ToolPolicyEntry>,
 }
 
@@ -209,6 +209,17 @@ impl RbacState {
             tools: &policy.engine.policy().tools,
         })
     }
+
+    pub(crate) fn evaluate_http_rule(
+        &self,
+        method: &str,
+        path: &str,
+        principal: Option<&auth::Principal>,
+    ) -> Option<MatchedRuleDecision> {
+        self.policy
+            .load()
+            .evaluate_http_rule(method, path, principal)
+    }
 }
 
 impl RbacPolicyState {
@@ -260,10 +271,24 @@ impl RbacPolicyState {
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
-    ) -> Option<ToolRuleDecision> {
+    ) -> Option<MatchedRuleDecision> {
         self.rule_matcher
             .evaluate_tool(tool_name, principal)
-            .map(|decision| ToolRuleDecision {
+            .map(|decision| MatchedRuleDecision {
+                action: decision.action,
+                matched_rule_id: self.rule_id(decision.rule_index),
+            })
+    }
+
+    fn evaluate_http_rule(
+        &self,
+        method: &str,
+        path: &str,
+        principal: Option<&auth::Principal>,
+    ) -> Option<MatchedRuleDecision> {
+        self.rule_matcher
+            .evaluate(method, path, principal)
+            .map(|decision| MatchedRuleDecision {
                 action: decision.action,
                 matched_rule_id: self.rule_id(decision.rule_index),
             })

@@ -22,7 +22,7 @@ use crate::{
         DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH, DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
     },
     middleware::rbac::{
-        RbacState, ToolAuthorizationSnapshot, ToolPolicySnapshot, ToolRuleDecision,
+        MatchedRuleDecision, RbacState, ToolAuthorizationSnapshot, ToolPolicySnapshot,
     },
     rbac::{policy, rule::principal_identity_matches, Policy, Rule, RuleAction, RuleMatcher},
 };
@@ -171,6 +171,11 @@ pub enum ToolRuntimeError {
     },
 }
 
+pub(crate) enum ToolWorkErrorDisposition {
+    Failure(Option<String>),
+    Rejected(String),
+}
+
 impl fmt::Display for ToolRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -241,7 +246,14 @@ struct AdmittedInvocation {
 
 struct AuthorizedToolInvocation {
     state: ToolExecutionState,
-    rule_decision: Option<ToolRuleDecision>,
+    rule_decision: Option<MatchedRuleDecision>,
+}
+
+struct HttpRuleAudit<'a> {
+    tool_name: &'a str,
+    method: &'a str,
+    path: &'a str,
+    matched_rule_id: &'a str,
 }
 
 struct ExecutionPermits {
@@ -493,8 +505,10 @@ impl ToolRuntime {
         Fut: Future<Output = Result<T, E>>,
         E: fmt::Display,
     {
-        self.execute_result_with_context_and_reason(tool_name, context, cancel, work, |_| None)
-            .await
+        self.execute_result_with_context_and_reason(tool_name, context, cancel, work, |_| {
+            ToolWorkErrorDisposition::Failure(None)
+        })
+        .await
     }
 
     pub(crate) async fn execute_result_with_context_and_reason<F, Fut, T, E, R>(
@@ -509,7 +523,7 @@ impl ToolRuntime {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
         E: fmt::Display,
-        R: Fn(&E) -> Option<String>,
+        R: Fn(&E) -> ToolWorkErrorDisposition,
     {
         let admitted = self
             .prepare_invocation(tool_name, &context, &cancel)
@@ -549,20 +563,30 @@ impl ToolRuntime {
                         Ok(value)
                     }
                     Ok(Err(err)) => {
-                        let reason = failure_reason(&err);
-                        let message = err.to_string();
-                        self.emit(
-                            audit::event::TOOL_INVOKE_FAILURE,
-                            &context,
-                            tool_name,
-                            "failure",
-                            Some("work_error"),
-                        );
-                        Err(ToolRuntimeError::WorkFailed {
-                            tool_name: tool_name.to_owned(),
-                            message,
-                            reason,
-                        })
+                        match failure_reason(&err) {
+                            ToolWorkErrorDisposition::Failure(reason) => {
+                                let message = err.to_string();
+                                self.emit(
+                                    audit::event::TOOL_INVOKE_FAILURE,
+                                    &context,
+                                    tool_name,
+                                    "failure",
+                                    Some("work_error"),
+                                );
+                                Err(ToolRuntimeError::WorkFailed {
+                                    tool_name: tool_name.to_owned(),
+                                    message,
+                                    reason,
+                                })
+                            }
+                            ToolWorkErrorDisposition::Rejected(reason) => {
+                                self.emit_rejected(&context, tool_name, &reason);
+                                Err(ToolRuntimeError::Rejected {
+                                    tool_name: tool_name.to_owned(),
+                                    reason,
+                                })
+                            }
+                        }
                     }
                     Err(_) => {
                         self.emit(
@@ -719,7 +743,7 @@ impl ToolRuntime {
             .inner
             .rule_matcher
             .evaluate_tool(tool_name, principal.as_ref())
-            .map(|decision| ToolRuleDecision {
+            .map(|decision| MatchedRuleDecision {
                 action: decision.action,
                 matched_rule_id: self.rule_id(decision.rule_index),
             });
@@ -740,6 +764,50 @@ impl ToolRuntime {
             state,
             rule_decision,
         })
+    }
+
+    pub(crate) fn authorize_http_operation(
+        &self,
+        tool_name: &str,
+        method: &str,
+        path: &str,
+        context: &ToolInvocationContext,
+    ) -> bool {
+        let principal = principal_from_tool_context(context);
+        let decision = if let Some(rbac_state) = &self.inner.rbac_state {
+            rbac_state.evaluate_http_rule(method, path, principal.as_ref())
+        } else {
+            self.inner
+                .rule_matcher
+                .evaluate(method, path, principal.as_ref())
+                .map(|decision| MatchedRuleDecision {
+                    action: decision.action,
+                    matched_rule_id: self.rule_id(decision.rule_index),
+                })
+        };
+
+        let Some(decision) = decision else {
+            return true;
+        };
+
+        let event_type = match decision.action {
+            RuleAction::Allow => AUTHZ_ALLOWED,
+            RuleAction::Shadow => AUTHZ_WOULD_DENY,
+            RuleAction::Deny => AUTHZ_DENIED,
+        };
+        self.emit_http_rule_event(
+            event_type,
+            context,
+            principal.as_ref(),
+            HttpRuleAudit {
+                tool_name,
+                method,
+                path,
+                matched_rule_id: &decision.matched_rule_id,
+            },
+        );
+
+        decision.action != RuleAction::Deny
     }
 
     fn rule_id(&self, rule_index: usize) -> String {
@@ -915,6 +983,28 @@ impl ToolRuntime {
                 "method": MCP_TOOL_OBSERVATION_METHOD,
                 "reason": "matched_rule",
                 "matched_rule_id": matched_rule_id,
+            }),
+        ));
+    }
+
+    fn emit_http_rule_event(
+        &self,
+        event_type: &'static str,
+        context: &ToolInvocationContext,
+        principal: Option<&Principal>,
+        observation: HttpRuleAudit<'_>,
+    ) {
+        self.inner.audit.emit(AuditEvent::new(
+            event_type,
+            &context.request_id,
+            &context.source_ip,
+            principal.map(crate::auth::actor_from_principal),
+            json!({
+                "tool_name": observation.tool_name,
+                "path": observation.path,
+                "method": observation.method,
+                "reason": "matched_rule",
+                "matched_rule_id": observation.matched_rule_id,
             }),
         ));
     }
@@ -1392,6 +1482,44 @@ mod tests {
             denied,
             ToolRuntimeError::Rejected { ref reason, .. } if reason == "matched_rule"
         ));
+    }
+
+    #[tokio::test]
+    async fn policy_reload_updates_live_http_rules_for_tool_operations() {
+        let file = TempPolicyFile::new(&tool_policy_document_without_rules());
+        let initial_policy =
+            Policy::from_file(file.path()).expect("initial tool policy should parse");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            initial_policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let runtime_config = ToolRuntimeConfig::from_policy(&initial_policy)
+            .expect("initial tool policy should configure runtime");
+        let runtime =
+            ToolRuntime::new_with_rbac_state(runtime_config, audit, Some(rbac_state.clone()));
+        let context = context_with_roles(&["admin"]);
+
+        assert!(runtime.authorize_http_operation("echo", "POST", "/v1/echo", &context));
+
+        file.write(&tool_policy_document_with_http_deny_rule());
+        crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .expect("valid direct HTTP rule reload should succeed");
+
+        assert!(!runtime.authorize_http_operation("echo", "POST", "/v1/echo", &context));
+
+        let events = audit_events(&capture, 1).await;
+        assert_eq!(events[0].event_type, "authz.denied");
+        assert_eq!(events[0].payload["tool_name"], json!("echo"));
+        assert_eq!(events[0].payload["method"], json!("POST"));
+        assert_eq!(events[0].payload["path"], json!("/v1/echo"));
+        assert_eq!(
+            events[0].payload["matched_rule_id"],
+            json!("deny-echo-http-after-reload")
+        );
     }
 
     #[tokio::test]
@@ -2635,6 +2763,27 @@ mod tests {
                     "principal": {
                         "roles": ["admin"]
                     },
+                    "action": "deny"
+                }
+            ]
+        })
+        .to_string()
+    }
+
+    fn tool_policy_document_with_http_deny_rule() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "echo": {
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            },
+            "rules": [
+                {
+                    "id": "deny-echo-http-after-reload",
+                    "methods": ["POST"],
+                    "path": "/v1/echo",
                     "action": "deny"
                 }
             ]
