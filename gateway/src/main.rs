@@ -135,7 +135,7 @@ struct AppState {
     metrics_handle: PrometheusHandle,
     proxy: Option<ProxyState>,
     routes: GatewayRoutes,
-    trust_proxy_headers: bool,
+    client_ip_policy: client_ip::ClientIpPolicy,
     admin_login_configured: bool,
     max_body_size: usize,
     mcp: mcp::McpState,
@@ -1451,7 +1451,7 @@ fn gateway_app_with_process_started_at(
         metrics_handle,
         proxy: proxy_state,
         routes: routes.clone(),
-        trust_proxy_headers: config.trust_proxy_headers,
+        client_ip_policy: client_ip_policy.clone(),
         admin_login_configured: admin_auth_state.is_some(),
         max_body_size: config.max_body_size,
         mcp: mcp_state,
@@ -2727,7 +2727,7 @@ async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -
     let source_ip = client_ip::canonical_client_ip(
         request.headers(),
         request.extensions(),
-        state.trust_proxy_headers,
+        &state.client_ip_policy,
     );
     let (parts, body) = request.into_parts();
     let target_url = proxy_target_url(&upstream.upstream_origin, &parts.uri);

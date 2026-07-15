@@ -714,11 +714,7 @@ fn matching_direct_rule(
         }
     };
 
-    evaluate(policy_path).or_else(|| {
-        (policy_path != path)
-            .then(|| evaluate(path))
-            .flatten()
-    })
+    evaluate(policy_path).or_else(|| (policy_path != path).then(|| evaluate(path)).flatten())
 }
 
 #[cfg(test)]
