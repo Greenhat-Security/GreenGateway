@@ -1192,6 +1192,11 @@ fn validate_auth_providers(
     providers: Vec<RawAuthProviderConfig>,
     problems: &mut Vec<String>,
 ) -> Vec<AuthProviderConfig> {
+    let jwt_provider_indices = providers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, provider)| (provider.provider_type.trim() == "jwt").then_some(index))
+        .collect::<Vec<_>>();
     let mut validated = Vec::with_capacity(providers.len());
     let mut seen_names = HashMap::<String, usize>::new();
 
@@ -1319,6 +1324,16 @@ fn validate_auth_providers(
             client_secret,
             redirect_uri,
         });
+    }
+
+    if jwt_provider_indices.len() > 1 {
+        for index in jwt_provider_indices {
+            if validated[index].issuer.is_none() {
+                problems.push(format!(
+                    "{name}[{index}].issuer must be explicitly configured when more than one JWT provider is configured"
+                ));
+            }
+        }
     }
 
     let mut seen_effective_issuers = HashMap::<String, usize>::new();
@@ -3673,7 +3688,8 @@ mod tests {
                     {
                         "name": "secondary",
                         "type": "jwt",
-                        "jwks_url": "https://secondary.example.test/.well-known/jwks.json"
+                        "jwks_url": "https://secondary.example.test/.well-known/jwks.json",
+                        "issuer": "https://secondary.example.test/"
                     }
                 ]"#
             .to_owned()),
@@ -3710,7 +3726,7 @@ mod tests {
                     jwks_url: Some(
                         "https://secondary.example.test/.well-known/jwks.json".to_owned(),
                     ),
-                    issuer: None,
+                    issuer: Some("https://secondary.example.test".to_owned()),
                     audience: None,
                     jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
                     require_jti: false,
@@ -3727,6 +3743,111 @@ mod tests {
                     redirect_uri: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn auth_providers_reject_multiple_jwt_providers_with_missing_issuers() {
+        for (providers, missing_issuer_indices) in [
+            (
+                r#"[
+                    {
+                        "name": "primary",
+                        "type": "jwt",
+                        "jwks_url": "https://shared.example.test/jwks.json",
+                        "issuer": "https://primary.example.test/"
+                    },
+                    {
+                        "name": "secondary",
+                        "type": "jwt",
+                        "jwks_url": "https://shared.example.test/jwks.json"
+                    }
+                ]"#,
+                &[1][..],
+            ),
+            (
+                r#"[
+                    {
+                        "name": "primary",
+                        "type": "jwt",
+                        "jwks_url": "https://shared.example.test/jwks.json"
+                    },
+                    {
+                        "name": "secondary",
+                        "type": "jwt",
+                        "jwks_url": "https://shared.example.test/jwks.json"
+                    }
+                ]"#,
+                &[0, 1][..],
+            ),
+        ] {
+            let error = Config::from_env_vars(|name| match name {
+                AUTH_PROVIDERS => Ok(providers.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect_err("multiple JWT providers must each configure an issuer");
+
+            let message = error.to_string();
+            for index in missing_issuer_indices {
+                assert!(message.contains(&format!(
+                    "AUTH_PROVIDERS[{index}].issuer must be explicitly configured when more than one JWT provider is configured"
+                )));
+            }
+            assert_eq!(error.problems.len(), missing_issuer_indices.len());
+        }
+    }
+
+    #[test]
+    fn auth_providers_accept_single_issuerless_jwt_provider() {
+        let config = Config::from_env_vars(|name| match name {
+            AUTH_PROVIDERS => Ok(r#"[{
+                    "name": "legacy",
+                    "type": "jwt",
+                    "jwks_url": "https://legacy.example.test/jwks.json"
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("a single issuerless JWT provider should remain supported");
+
+        assert_eq!(config.auth_providers.len(), 1);
+        assert_eq!(
+            config.auth_providers[0].provider_type,
+            AuthProviderType::Jwt
+        );
+        assert_eq!(config.auth_providers[0].issuer, None);
+    }
+
+    #[test]
+    fn auth_providers_accept_issuerless_jwt_with_cookie_session_provider() {
+        let config = Config::from_env_vars(|name| match name {
+            AUTH_PROVIDERS => Ok(r#"[
+                    {
+                        "name": "legacy",
+                        "type": "jwt",
+                        "jwks_url": "https://legacy.example.test/jwks.json"
+                    },
+                    {
+                        "name": "app-session",
+                        "type": "cookie_session",
+                        "introspection_url": "https://app.example.test/session/introspect",
+                        "user_id_claim": "sub"
+                    }
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("cookie-session providers should not trigger the multi-JWT issuer requirement");
+
+        assert_eq!(config.auth_providers.len(), 2);
+        assert_eq!(
+            config.auth_providers[0].provider_type,
+            AuthProviderType::Jwt
+        );
+        assert_eq!(config.auth_providers[0].issuer, None);
+        assert_eq!(
+            config.auth_providers[1].provider_type,
+            AuthProviderType::CookieSession
         );
     }
 
@@ -4276,8 +4397,9 @@ mod tests {
             "AUTH_PROVIDERS" => Ok(r#"[
                     {
                         "name": "fallback",
-                        "type": "jwt",
-                        "jwks_url": "https://fallback.example.test/jwks.json"
+                        "type": "cookie_session",
+                        "introspection_url": "https://fallback.example.test/introspect",
+                        "user_id_claim": "sub"
                     },
                     {
                         "name": "reserved",
@@ -4333,12 +4455,14 @@ mod tests {
                     {
                         "name": "primary",
                         "type": "jwt",
-                        "jwks_url": "https://primary.example.test/.well-known/jwks.json"
+                        "jwks_url": "https://primary.example.test/.well-known/jwks.json",
+                        "issuer": "https://primary.example.test/"
                     },
                     {
                         "name": " primary ",
                         "type": "jwt",
-                        "jwks_url": "https://secondary.example.test/.well-known/jwks.json"
+                        "jwks_url": "https://secondary.example.test/.well-known/jwks.json",
+                        "issuer": "https://secondary.example.test/"
                     }
                 ]"#
             .to_owned()),
