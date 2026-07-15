@@ -10846,6 +10846,7 @@ mod tests {
             "/v1%2Fadmin%2Faudit",
             "/mcp%2Ftools/call",
             "/public/../admin",
+            "/public/..\\admin",
         ] {
             let response = router
                 .clone()

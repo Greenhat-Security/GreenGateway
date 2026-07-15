@@ -2277,7 +2277,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsafe_paths_fail_closed_with_unsafe_path_reason() {
-        for path in ["/data/../admin", "/%61dmin", "/a/./b"] {
+        for path in ["/data/../admin", "/data/..\\admin", "/%61dmin", "/a/./b"] {
             let (state, capture) = test_state(
                 test_policy(
                     DefaultAction::Allow,

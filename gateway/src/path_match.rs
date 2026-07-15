@@ -19,6 +19,7 @@ pub fn path_prefix_matches(path: &str, path_prefix: &str) -> bool {
 
 pub fn is_unsafe_request_path(path: &str) -> bool {
     path.contains('%')
+        || path.contains('\\')
         || path
             .split('/')
             .any(|segment| segment == "." || segment == "..")
@@ -57,8 +58,15 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_paths_include_percent_encoding_and_dot_segments() {
-        for path in ["/%61dmin", "/admin%2Fassets", "/a/./b", "/a/../b"] {
+    fn unsafe_paths_include_encoding_dot_segments_and_backslashes() {
+        for path in [
+            "/%61dmin",
+            "/admin%2Fassets",
+            "/a/./b",
+            "/a/../b",
+            "/public/..\\admin",
+            "/admin\\assets",
+        ] {
             assert!(is_unsafe_request_path(path), "{path}");
         }
 
