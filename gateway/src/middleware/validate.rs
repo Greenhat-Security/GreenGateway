@@ -30,8 +30,8 @@ struct UnsupportedMediaTypeBody {
 }
 
 pub async fn validate_request(State(config): State<Config>, req: Request, next: Next) -> Response {
-    // This is a header-based guard only; chunked bodies without Content-Length
-    // are not enforced by this check.
+    // This early guard rejects declared oversize bodies before downstream
+    // handlers apply their streaming byte limits.
     if let Some(content_length) = content_length(req.headers()) {
         if content_length > config.max_body_size {
             return payload_too_large(config.max_body_size);
