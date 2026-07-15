@@ -274,7 +274,6 @@ impl Policy {
             source,
         })?;
         policy.validate()?;
-        warn_unreachable_route_path_prefixes(&policy);
 
         Ok(policy)
     }
@@ -287,12 +286,25 @@ impl Policy {
             )));
         }
 
+        validate_routes(&self.routes)?;
         validate_rules(&self.rules)?;
         validate_rate_limits(&self.rate_limits)?;
         validate_tools(&self.tools)?;
 
         self.egress.validate()
     }
+}
+
+fn validate_routes(routes: &[RouteRule]) -> Result<(), PolicyError> {
+    for (route_index, route) in routes.iter().enumerate() {
+        if !route.path_prefix.starts_with('/') {
+            return Err(PolicyError::Invalid(format!(
+                "routes[{route_index}].path_prefix must start with '/'"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_rule_target_properties(value: &Value) -> Result<(), PolicyError> {
@@ -703,25 +715,6 @@ fn unknown_top_level_keys(value: &Value) -> Vec<String> {
         .keys()
         .filter(|key| !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()))
         .cloned()
-        .collect()
-}
-
-fn warn_unreachable_route_path_prefixes(policy: &Policy) {
-    let path_prefixes = unreachable_route_path_prefixes(&policy.routes);
-
-    if !path_prefixes.is_empty() {
-        tracing::warn!(
-            path_prefixes = ?path_prefixes,
-            "policy contains route path_prefix values that do not start with '/' and cannot match request paths"
-        );
-    }
-}
-
-fn unreachable_route_path_prefixes(routes: &[RouteRule]) -> Vec<String> {
-    routes
-        .iter()
-        .filter(|route| !route.path_prefix.starts_with('/'))
-        .map(|route| route.path_prefix.clone())
         .collect()
 }
 
@@ -1692,18 +1685,34 @@ mod tests {
     }
 
     #[test]
-    fn unreachable_route_path_prefix_detection_names_non_absolute_prefixes() {
-        let routes = vec![
-            route("/data", "data:read"),
-            route("admin", "admin:read"),
-            route("", "empty:read"),
-            route("/reports", "reports:read"),
-        ];
+    fn non_absolute_route_path_prefix_is_rejected_by_parser_and_schema() {
+        for path_prefix in ["admin", ""] {
+            let value = json!({
+                "schema_version": "0.1.0",
+                "routes": [
+                    {
+                        "path_prefix": path_prefix,
+                        "permission": "admin:read"
+                    }
+                ]
+            });
+            let validator = policy_schema_validator();
 
-        assert_eq!(
-            unreachable_route_path_prefixes(&routes),
-            vec!["admin".to_owned(), String::new()]
-        );
+            assert!(
+                !validator.is_valid(&value),
+                "published schema should reject route prefix {path_prefix:?}"
+            );
+
+            let error = Policy::validate_json_value(value)
+                .expect_err("non-absolute route path_prefix should fail policy validation");
+            assert!(matches!(error, PolicyError::Invalid(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("routes[0].path_prefix must start with '/'"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
@@ -2169,15 +2178,6 @@ mod tests {
     fn assert_schema_accepts(validator: &Validator, policy: &Value) {
         if let Err(error) = validator.validate(policy) {
             panic!("published schema should accept policy document: {error}");
-        }
-    }
-
-    fn route(path_prefix: &str, permission: &str) -> RouteRule {
-        RouteRule {
-            methods: Vec::new(),
-            path_prefix: path_prefix.to_owned(),
-            permission: permission.to_owned(),
-            enforcement_mode: None,
         }
     }
 
