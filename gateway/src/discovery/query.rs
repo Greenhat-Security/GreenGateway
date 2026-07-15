@@ -42,6 +42,35 @@ CREATE TABLE IF NOT EXISTS discovery_endpoint_reviews (
 );
 "#;
 
+const CREATE_ROUTING_CONTEXT_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS discovery_endpoint_routing_contexts (
+    method TEXT NOT NULL,
+    endpoint_template TEXT NOT NULL,
+    route_host TEXT NOT NULL,
+    route_path_prefix TEXT NOT NULL,
+    upstream_origin TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    call_count INTEGER NOT NULL,
+    distinct_principal_count INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (
+        method,
+        endpoint_template,
+        route_host,
+        route_path_prefix,
+        upstream_origin
+    )
+);
+
+CREATE TABLE IF NOT EXISTS discovery_endpoint_routing_classifications (
+    method TEXT NOT NULL,
+    endpoint_template TEXT NOT NULL,
+    first_classified_at TEXT NOT NULL,
+    PRIMARY KEY (method, endpoint_template)
+);
+"#;
+
 #[derive(Clone)]
 pub struct DiscoveryQueryStore {
     path: PathBuf,
@@ -108,6 +137,10 @@ pub struct EndpointSummary {
     pub reviewed_at: Option<String>,
     pub reviewed_by: Option<String>,
     pub covered_by_rule: bool,
+    pub coverage_scope: EndpointCoverageScope,
+    pub routing_context_known: bool,
+    pub routing_context_known_since: Option<String>,
+    pub routing_contexts: Vec<EndpointRoutingContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_signals: Option<OpenSignalSummary>,
     pub latency: EndpointLatencySummary,
@@ -128,6 +161,10 @@ pub struct EndpointAggregateDetail {
     pub reviewed_at: Option<String>,
     pub reviewed_by: Option<String>,
     pub covered_by_rule: bool,
+    pub coverage_scope: EndpointCoverageScope,
+    pub routing_context_known: bool,
+    pub routing_context_known_since: Option<String>,
+    pub routing_contexts: Vec<EndpointRoutingContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_signals: Option<OpenSignalSummary>,
     pub latency: EndpointLatencyDetail,
@@ -140,6 +177,32 @@ pub struct EndpointReviewState {
     pub reviewed: bool,
     pub reviewed_at: Option<String>,
     pub reviewed_by: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointCoverageScope {
+    #[default]
+    None,
+    Unknown,
+    Principal,
+    Endpoint,
+    Mixed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct EndpointRoutingContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_path_prefix: Option<String>,
+    pub upstream_origin: Option<String>,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub call_count: u64,
+    pub distinct_principal_count: u64,
+    pub covered_by_rule: bool,
+    pub coverage_scope: EndpointCoverageScope,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -252,6 +315,14 @@ impl Error for DiscoveryQueryError {
 pub struct ObservedEndpoint {
     pub method: String,
     pub endpoint_template: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_path_prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_context_known_since: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -324,9 +395,34 @@ impl DiscoveryQueryStore {
         let connection = self.connection_guard();
         let mut statement = match connection.prepare(
             r#"
-            SELECT method, endpoint_template
-            FROM discovery_endpoint_aggregates
-            ORDER BY method, endpoint_template
+            SELECT
+                a.method,
+                a.endpoint_template,
+                NULL AS route_host,
+                NULL AS route_path_prefix,
+                NULL AS upstream_origin,
+                k.first_classified_at
+            FROM discovery_endpoint_aggregates a
+            LEFT JOIN discovery_endpoint_routing_classifications k
+                USING (method, endpoint_template)
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM discovery_endpoint_routing_contexts c
+                WHERE c.method = a.method
+                  AND c.endpoint_template = a.endpoint_template
+            )
+            UNION ALL
+            SELECT
+                c.method,
+                c.endpoint_template,
+                NULLIF(c.route_host, ''),
+                NULLIF(c.route_path_prefix, ''),
+                NULLIF(c.upstream_origin, ''),
+                k.first_classified_at
+            FROM discovery_endpoint_routing_contexts c
+            LEFT JOIN discovery_endpoint_routing_classifications k
+                USING (method, endpoint_template)
+            ORDER BY method, endpoint_template, route_host, route_path_prefix, upstream_origin
             "#,
         ) {
             Ok(statement) => statement,
@@ -344,6 +440,10 @@ impl DiscoveryQueryStore {
                 Ok(ObservedEndpoint {
                     method: row.get(0)?,
                     endpoint_template: row.get(1)?,
+                    route_host: row.get(2)?,
+                    route_path_prefix: row.get(3)?,
+                    upstream_origin: row.get(4)?,
+                    routing_context_known_since: row.get(5)?,
                 })
             })
             .map_err(|source| DiscoveryQueryError::Sqlite {
@@ -449,7 +549,25 @@ impl DiscoveryQueryStore {
                 } else {
                     None
                 };
-                Ok(row.into_summary(status_counts, open_signals, &new_since_cutoff))
+                let routing_contexts = load_routing_contexts(
+                    &connection,
+                    &self.path,
+                    &row.method,
+                    &row.endpoint_template,
+                )?;
+                let routing_context_known_since = load_routing_context_known_since(
+                    &connection,
+                    &self.path,
+                    &row.method,
+                    &row.endpoint_template,
+                )?;
+                Ok(row.into_summary(
+                    status_counts,
+                    open_signals,
+                    routing_contexts,
+                    routing_context_known_since,
+                    &new_since_cutoff,
+                ))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -528,6 +646,14 @@ impl DiscoveryQueryStore {
 
         let status_counts =
             load_status_counts(&connection, &self.path, &row.method, &row.endpoint_template)?;
+        let routing_contexts =
+            load_routing_contexts(&connection, &self.path, &row.method, &row.endpoint_template)?;
+        let routing_context_known_since = load_routing_context_known_since(
+            &connection,
+            &self.path,
+            &row.method,
+            &row.endpoint_template,
+        )?;
         let open_signals = if include_open_signals {
             let summaries = self.open_signal_summaries_for_keys(
                 &connection,
@@ -545,6 +671,8 @@ impl DiscoveryQueryStore {
         Ok(Some(row.into_detail(
             status_counts,
             open_signals,
+            routing_contexts,
+            routing_context_known_since,
             &new_since_cutoff,
         )?))
     }
@@ -1283,11 +1411,17 @@ impl RawEndpointAggregate {
         self,
         status_counts: Vec<StatusCount>,
         open_signals: Option<OpenSignalSummary>,
+        routing_contexts: Vec<EndpointRoutingContext>,
+        routing_context_known_since: Option<String>,
         new_since_cutoff: &str,
     ) -> EndpointSummary {
         let latency = self.latency_summary();
         let is_new = is_new_since(&self.first_seen, new_since_cutoff);
-        let review = self.review_state();
+        let review = self.review_state(&routing_contexts);
+        let routing_context_known = routing_context_covers_full_history(
+            &self.first_seen,
+            routing_context_known_since.as_deref(),
+        );
 
         EndpointSummary {
             method: self.method,
@@ -1302,6 +1436,10 @@ impl RawEndpointAggregate {
             reviewed_at: review.reviewed_at,
             reviewed_by: review.reviewed_by,
             covered_by_rule: false,
+            coverage_scope: EndpointCoverageScope::None,
+            routing_context_known,
+            routing_context_known_since,
+            routing_contexts,
             open_signals,
             latency,
             status_counts,
@@ -1312,6 +1450,8 @@ impl RawEndpointAggregate {
         self,
         status_counts: Vec<StatusCount>,
         open_signals: Option<OpenSignalSummary>,
+        routing_contexts: Vec<EndpointRoutingContext>,
+        routing_context_known_since: Option<String>,
         new_since_cutoff: &str,
     ) -> Result<EndpointAggregateDetail, DiscoveryQueryError> {
         let samples =
@@ -1322,7 +1462,11 @@ impl RawEndpointAggregate {
                 }
             })?;
         let is_new = is_new_since(&self.first_seen, new_since_cutoff);
-        let review = self.review_state();
+        let review = self.review_state(&routing_contexts);
+        let routing_context_known = routing_context_covers_full_history(
+            &self.first_seen,
+            routing_context_known_since.as_deref(),
+        );
         let latency = EndpointLatencyDetail {
             count: non_negative_i64_to_u64(self.latency_count),
             p50_ms: non_negative_i64_to_u64(self.latency_p50_ms),
@@ -1344,6 +1488,10 @@ impl RawEndpointAggregate {
             reviewed_at: review.reviewed_at,
             reviewed_by: review.reviewed_by,
             covered_by_rule: false,
+            coverage_scope: EndpointCoverageScope::None,
+            routing_context_known,
+            routing_context_known_since,
+            routing_contexts,
             open_signals,
             latency,
             status_counts,
@@ -1351,11 +1499,16 @@ impl RawEndpointAggregate {
         })
     }
 
-    fn review_state(&self) -> EndpointReviewState {
+    fn review_state(&self, routing_contexts: &[EndpointRoutingContext]) -> EndpointReviewState {
+        let reviewed_at = self.reviewed_at.clone().filter(|reviewed_at| {
+            routing_contexts
+                .iter()
+                .all(|context| !timestamp_after(&context.first_seen, reviewed_at))
+        });
         EndpointReviewState {
-            reviewed: self.reviewed_at.is_some(),
-            reviewed_at: self.reviewed_at.clone(),
-            reviewed_by: self.reviewed_by.clone(),
+            reviewed: reviewed_at.is_some(),
+            reviewed_at: reviewed_at.clone(),
+            reviewed_by: reviewed_at.and(self.reviewed_by.clone()),
         }
     }
 }
@@ -1509,9 +1662,29 @@ fn build_endpoint_list_query(
     }
     if let Some(reviewed) = filters.reviewed {
         if reviewed {
-            clauses.push("r.reviewed_at IS NOT NULL");
+            clauses.push(
+                r#"r.reviewed_at IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM discovery_endpoint_routing_contexts c
+                    WHERE c.method = a.method
+                      AND c.endpoint_template = a.endpoint_template
+                      AND julianday(c.first_seen) > julianday(r.reviewed_at)
+                )"#,
+            );
         } else {
-            clauses.push("r.reviewed_at IS NULL");
+            clauses.push(
+                r#"(
+                    r.reviewed_at IS NULL
+                    OR EXISTS (
+                        SELECT 1
+                        FROM discovery_endpoint_routing_contexts c
+                        WHERE c.method = a.method
+                          AND c.endpoint_template = a.endpoint_template
+                          AND julianday(c.first_seen) > julianday(r.reviewed_at)
+                    )
+                )"#,
+            );
         }
     }
     if let Some(cursor) = cursor {
@@ -1833,6 +2006,82 @@ fn load_status_counts(
     Ok(rows)
 }
 
+fn load_routing_contexts(
+    connection: &Connection,
+    path: &Path,
+    method: &str,
+    endpoint_template: &str,
+) -> Result<Vec<EndpointRoutingContext>, DiscoveryQueryError> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT
+                NULLIF(route_host, ''),
+                NULLIF(route_path_prefix, ''),
+                NULLIF(upstream_origin, ''),
+                first_seen,
+                last_seen,
+                call_count,
+                distinct_principal_count
+            FROM discovery_endpoint_routing_contexts
+            WHERE method = ?1 AND endpoint_template = ?2
+            ORDER BY route_host, route_path_prefix, upstream_origin
+            "#,
+        )
+        .map_err(|source| DiscoveryQueryError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    let rows = statement
+        .query_map(params![method, endpoint_template], |row| {
+            Ok(EndpointRoutingContext {
+                route_host: row.get(0)?,
+                route_path_prefix: row.get(1)?,
+                upstream_origin: row.get(2)?,
+                first_seen: row.get(3)?,
+                last_seen: row.get(4)?,
+                call_count: non_negative_i64_to_u64(row.get(5)?),
+                distinct_principal_count: non_negative_i64_to_u64(row.get(6)?),
+                covered_by_rule: false,
+                coverage_scope: EndpointCoverageScope::None,
+            })
+        })
+        .map_err(|source| DiscoveryQueryError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| DiscoveryQueryError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(rows)
+}
+
+fn load_routing_context_known_since(
+    connection: &Connection,
+    path: &Path,
+    method: &str,
+    endpoint_template: &str,
+) -> Result<Option<String>, DiscoveryQueryError> {
+    connection
+        .query_row(
+            r#"
+            SELECT first_classified_at
+            FROM discovery_endpoint_routing_classifications
+            WHERE method = ?1 AND endpoint_template = ?2
+            "#,
+            params![method, endpoint_template],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| DiscoveryQueryError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
 fn load_open_signal_summaries(
     connection: &Connection,
     path: &Path,
@@ -1917,6 +2166,7 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     )?;
     connection.execute_batch(CREATE_REVIEW_SCHEMA_SQL)?;
     super::aggregator::ensure_discovery_endpoint_principal_identity_schema(connection)?;
+    connection.execute_batch(CREATE_ROUTING_CONTEXT_SCHEMA_SQL)?;
     ensure_discovery_endpoint_aggregate_column(
         connection,
         "schema_mismatch_count",
@@ -1966,6 +2216,23 @@ fn is_new_since(first_seen: &str, new_since_cutoff: &str) -> bool {
     };
 
     first_seen >= new_since_cutoff
+}
+
+fn timestamp_after(left: &str, right: &str) -> bool {
+    match (
+        OffsetDateTime::parse(left, &Rfc3339),
+        OffsetDateTime::parse(right, &Rfc3339),
+    ) {
+        (Ok(left), Ok(right)) => left > right,
+        _ => left > right,
+    }
+}
+
+fn routing_context_covers_full_history(
+    first_seen: &str,
+    routing_context_known_since: Option<&str>,
+) -> bool {
+    routing_context_known_since.is_some_and(|known_since| !timestamp_after(known_since, first_seen))
 }
 
 fn utc_timestamp_rfc3339() -> String {
@@ -2057,10 +2324,74 @@ mod tests {
                 ObservedEndpoint {
                     method: "GET".to_owned(),
                     endpoint_template: "/users/{id}".to_owned(),
+                    route_host: None,
+                    route_path_prefix: None,
+                    upstream_origin: None,
+                    routing_context_known_since: None,
                 },
                 ObservedEndpoint {
                     method: "POST".to_owned(),
                     endpoint_template: "/users".to_owned(),
+                    route_host: None,
+                    route_path_prefix: None,
+                    upstream_origin: None,
+                    routing_context_known_since: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn observed_endpoints_preserve_routing_context_identity() {
+        let db = TempDb::new("query-observed-routing");
+        seed_endpoint(&db.path, "GET", "/users/{id}");
+        let store = DiscoveryQueryStore::open(&db.path).expect("discovery query store should open");
+        let connection = Connection::open(&db.path).expect("database should open");
+        for (host, origin) in [
+            ("api.example.test", "https://api.internal"),
+            ("admin.example.test", "https://admin.internal"),
+        ] {
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO discovery_endpoint_routing_contexts (
+                        method,
+                        endpoint_template,
+                        route_host,
+                        route_path_prefix,
+                        upstream_origin,
+                        first_seen,
+                        last_seen,
+                        call_count,
+                        distinct_principal_count,
+                        updated_at
+                    ) VALUES ('GET', '/users/{id}', ?1, '/users', ?2, ?3, ?3, 1, 1, ?3)
+                    "#,
+                    params![host, origin, "2024-06-01T12:00:00Z"],
+                )
+                .expect("routing context should insert");
+        }
+
+        assert_eq!(
+            store
+                .observed_endpoints()
+                .expect("observed endpoints should query"),
+            vec![
+                ObservedEndpoint {
+                    method: "GET".to_owned(),
+                    endpoint_template: "/users/{id}".to_owned(),
+                    route_host: Some("admin.example.test".to_owned()),
+                    route_path_prefix: Some("/users".to_owned()),
+                    upstream_origin: Some("https://admin.internal".to_owned()),
+                    routing_context_known_since: None,
+                },
+                ObservedEndpoint {
+                    method: "GET".to_owned(),
+                    endpoint_template: "/users/{id}".to_owned(),
+                    route_host: Some("api.example.test".to_owned()),
+                    route_path_prefix: Some("/users".to_owned()),
+                    upstream_origin: Some("https://api.internal".to_owned()),
+                    routing_context_known_since: None,
                 },
             ]
         );

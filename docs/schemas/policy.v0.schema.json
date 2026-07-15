@@ -188,6 +188,60 @@
         "shadow"
       ]
     },
+    "rule_dispatch_matcher": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "description": "Optional immutable proxy-dispatch provenance for an HTTP path rule. contextless matches classified requests without proxy dispatch. legacy matches only the configured fallback upstream and excludes host/path routes, even at the same origin. Omitting dispatch preserves globally scoped matching.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "contextless",
+            "legacy"
+          ]
+        },
+        "upstream_origin": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://[^/?#@]+$",
+          "description": "HTTP(S) fallback origin selected before RBAC, including a non-default port when configured. Host spelling and default ports are normalized for matching. Paths, queries, fragments, and credentials are not allowed."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "contextless"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "upstream_origin"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "legacy"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "upstream_origin"
+            ]
+          }
+        }
+      ]
+    },
     "rule": {
       "type": "object",
       "additionalProperties": false,
@@ -215,8 +269,17 @@
             }
           },
           "not": {
-            "required": [
-              "path"
+            "anyOf": [
+              {
+                "required": [
+                  "path"
+                ]
+              },
+              {
+                "required": [
+                  "dispatch"
+                ]
+              }
             ]
           }
         }
@@ -248,6 +311,9 @@
           "minLength": 1,
           "pattern": "\\S",
           "description": "Exact MCP tool name matched by this rule. Tool-name rules apply only to MCP tool calls and never to HTTP requests. Exactly one of path or tool_name must be set."
+        },
+        "dispatch": {
+          "$ref": "#/$defs/rule_dispatch_matcher"
         },
         "principal": {
           "$ref": "#/$defs/principal_matcher"

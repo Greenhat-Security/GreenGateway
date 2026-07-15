@@ -247,6 +247,24 @@ impl SchemaCoverage {
 
     pub fn compare(&self, observed: &[ObservedEndpoint]) -> SchemaCoverageReport {
         let operation_shapes = self.operation_shapes();
+        let observed = observed
+            .iter()
+            .map(|endpoint| {
+                (
+                    (endpoint.method.clone(), endpoint.endpoint_template.clone()),
+                    ObservedEndpoint {
+                        method: endpoint.method.clone(),
+                        endpoint_template: endpoint.endpoint_template.clone(),
+                        route_host: None,
+                        route_path_prefix: None,
+                        upstream_origin: None,
+                        routing_context_known_since: None,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect::<Vec<_>>();
         let undocumented_endpoints = observed
             .iter()
             .filter(|endpoint| {
@@ -873,6 +891,10 @@ paths:
         ObservedEndpoint {
             method: method.to_owned(),
             endpoint_template: endpoint_template.to_owned(),
+            route_host: None,
+            route_path_prefix: None,
+            upstream_origin: None,
+            routing_context_known_since: None,
         }
     }
 }

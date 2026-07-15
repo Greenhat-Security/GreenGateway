@@ -28,9 +28,12 @@ use crate::{
     path_match::path_prefix_matches,
     rbac::{
         policy::ToolPolicyEntry, DefaultAction, EnforcementMode, Policy, PolicyEngine, RouteRule,
-        RuleAction, RuleDecision, RuleMatcher,
+        RuleAction, RuleDecision, RuleDispatchContext, RuleMatcher,
     },
-    upstream_route::{self, ProxyRouteAuthorizationContext},
+    upstream_route::{
+        self, ProxyRouteAuthorizationContext, ProxyRouteClassificationCompleted,
+        ProxyRouteObservationContext,
+    },
 };
 
 use super::{
@@ -442,6 +445,21 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     let policy_path = state.policy_path_for_request(path);
     let request_host = upstream_route::request_host_without_port(req.headers());
     let required_upstream_host = proxy_context.as_ref().map(|context| context.host.as_str());
+    let dispatch_context = if req
+        .extensions()
+        .get::<ProxyRouteClassificationCompleted>()
+        .is_none()
+    {
+        RuleDispatchContext::unknown()
+    } else if let Some(context) = req.extensions().get::<ProxyRouteObservationContext>() {
+        RuleDispatchContext::classified(
+            context.route_host.as_deref(),
+            context.route_path_prefix.as_deref(),
+            Some(context.upstream_origin.as_str()),
+        )
+    } else {
+        RuleDispatchContext::contextless()
+    };
 
     let policy = state.policy.load();
     // Direct firewall rules run before route-to-permission rules. A direct deny
@@ -454,6 +472,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         path,
         policy_path,
         principal.as_ref(),
+        dispatch_context,
         false,
     );
     let direct_rule_decision = if required_upstream_host.is_some() {
@@ -463,6 +482,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
             path,
             policy_path,
             principal.as_ref(),
+            dispatch_context,
             true,
         )
     } else {
@@ -646,13 +666,19 @@ fn matching_direct_rule(
     path: &str,
     policy_path: &str,
     principal: Option<&auth::Principal>,
+    dispatch_context: RuleDispatchContext<'_>,
     denies_only: bool,
 ) -> Option<RuleDecision> {
     let evaluate = |candidate_path: &str| {
         if denies_only {
-            matcher.evaluate_denies(method, candidate_path, principal)
+            matcher.evaluate_denies_with_dispatch(
+                method,
+                candidate_path,
+                principal,
+                dispatch_context,
+            )
         } else {
-            matcher.evaluate(method, candidate_path, principal)
+            matcher.evaluate_with_dispatch(method, candidate_path, principal, dispatch_context)
         }
     };
 
@@ -2713,6 +2739,7 @@ mod tests {
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
             path: path.to_owned(),
             tool_name: None,
+            dispatch: None,
             principal: PrincipalMatcher::default(),
             action,
         }

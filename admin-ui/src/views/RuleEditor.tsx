@@ -14,6 +14,7 @@ import {
   PolicyDocument,
   PolicyRule,
   PolicyRuleAction,
+  PolicyRuleDispatchMatcher,
   PolicyRulePreviewResponse,
   PolicyRulePreviewSample,
   PrincipalMatcher,
@@ -87,6 +88,7 @@ type RuleFormState = {
   principalIds: string[];
   principalIdDraft: string;
   action: PolicyRuleAction;
+  dispatch?: PolicyRuleDispatchMatcher;
 };
 
 type FormErrors = {
@@ -222,6 +224,7 @@ export function RuleEditor() {
       form.principalIds,
       form.roles,
       form.toolName,
+      form.dispatch,
     ],
   );
   const candidateKey = useMemo(
@@ -315,7 +318,11 @@ export function RuleEditor() {
   }
 
   function updateMatcherType(matcherType: RuleFormState['matcherType']) {
-    setForm((current) => ({ ...current, matcherType }));
+    setForm((current) =>
+      matcherType === 'tool' && current.dispatch
+        ? current
+        : { ...current, matcherType },
+    );
     setErrors({});
     setSaveState({ kind: 'idle' });
   }
@@ -517,6 +524,7 @@ export function RuleEditor() {
                         className="rule-radio"
                         name="rule-matcher-type"
                         checked={form.matcherType === 'tool'}
+                        disabled={Boolean(form.dispatch)}
                         onChange={() => updateMatcherType('tool')}
                       />
                       MCP tool
@@ -1029,6 +1037,22 @@ function formFromPrefillParams(
     form.toolName = toolName;
   }
 
+  if (toolName === null) {
+    const dispatchKind = trimmedSearchParam(
+      searchParams,
+      'prefill_dispatch_kind',
+    );
+    const upstreamOrigin = trimmedSearchParam(
+      searchParams,
+      'prefill_upstream_origin',
+    );
+    if (dispatchKind === 'contextless') {
+      form.dispatch = { kind: 'contextless' };
+    } else if (dispatchKind === 'legacy' && upstreamOrigin !== null) {
+      form.dispatch = { kind: 'legacy', upstream_origin: upstreamOrigin };
+    }
+  }
+
   const role = trimmedSearchParam(searchParams, 'prefill_role');
   if (role !== null) {
     form.roles = [role];
@@ -1091,8 +1115,9 @@ function plainEnglishRuleSummary(rule: PolicyRule): string {
           rule.path?.trim() || '(path not set)'
         }`;
   const principal = principalSummary(rule.principal);
+  const dispatch = dispatchSummary(rule.dispatch);
 
-  return `${actionSummaryVerb(rule.action)} ${target}${principal}.`;
+  return `${actionSummaryVerb(rule.action)} ${target}${principal}${dispatch}.`;
 }
 
 function generatedExpression(rule: PolicyRule): string {
@@ -1110,6 +1135,14 @@ function generatedExpression(rule: PolicyRule): string {
     lines.push(
       `request.path matches ${JSON.stringify(rule.path?.trim() || '(path not set)')}`,
     );
+    if (rule.dispatch) {
+      lines.push(`proxy.dispatch_kind == ${JSON.stringify(rule.dispatch.kind)}`);
+      if (rule.dispatch.kind === 'legacy' && rule.dispatch.upstream_origin) {
+        lines.push(
+          `proxy.upstream_origin == ${JSON.stringify(rule.dispatch.upstream_origin)}`,
+        );
+      }
+    }
   }
 
   for (const role of normalizeStrings(rule.principal?.roles ?? [])) {
@@ -1141,6 +1174,15 @@ function actionSummaryVerb(action: PolicyRuleAction): string {
     case 'shadow':
       return 'Log-only';
   }
+}
+
+function dispatchSummary(dispatch: PolicyRuleDispatchMatcher | undefined): string {
+  if (!dispatch) {
+    return '';
+  }
+  return dispatch.kind === 'legacy' && dispatch.upstream_origin
+    ? ` via legacy upstream ${dispatch.upstream_origin}`
+    : ' without proxy dispatch';
 }
 
 function formatMethodsForSummary(methods: string[]): string {
@@ -1223,6 +1265,7 @@ function formFromRule(rule: PolicyRule): RuleFormState {
     principalIds: normalizeStrings(rule.principal?.principal_ids ?? []),
     principalIdDraft: '',
     action: rule.action,
+    dispatch: rule.dispatch,
   };
 }
 
@@ -1233,6 +1276,7 @@ function ruleFromForm(form: RuleFormState): PolicyRule {
       tool_name: form.toolName.trim(),
       principal: principalFromForm(form),
       action: form.action,
+      dispatch: undefined,
     };
   }
 
@@ -1241,6 +1285,7 @@ function ruleFromForm(form: RuleFormState): PolicyRule {
     path: form.path.trim(),
     principal: principalFromForm(form),
     action: form.action,
+    dispatch: form.dispatch,
   };
 }
 

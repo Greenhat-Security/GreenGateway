@@ -2,7 +2,11 @@ import { FormEvent, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
-import { currentTokenCanWritePolicy, fetchPolicy } from '../lib/policy';
+import {
+  currentTokenCanWritePolicy,
+  fetchPolicy,
+  type PolicyRuleDispatchMatcher,
+} from '../lib/policy';
 import {
   TrafficEndpoint,
   TrafficFilters,
@@ -40,10 +44,6 @@ const METHOD_OPTIONS = [
   'OPTIONS',
 ];
 
-// Renders a flat, sortable/filterable list rather than grouping by upstream:
-// discovery_endpoint_aggregates is keyed only by (method, endpoint_template),
-// with no record of which upstream route produced an observation, so there is
-// no data to group by yet. Revisit once that gap is closed upstream.
 export function TrafficInventory() {
   const navigate = useNavigate();
   const [filters, setFilters] = useState<TrafficFilters>(() =>
@@ -339,6 +339,8 @@ export function TrafficInventory() {
                   {endpoints.map((endpoint, index) => {
                     const key = endpointKey(endpoint);
                     const isUpdating = updatingReviewKey === key;
+                    const ruleCreationBlockReason =
+                      directRuleCreationBlockReason(endpoint);
                     return (
                       <tr
                         key={key}
@@ -373,11 +375,16 @@ export function TrafficInventory() {
                               className="secondary-button row-action-button"
                               aria-label={`Create rule for ${ruleTargetLabel(endpoint)}`}
                               title={
-                                canCreateRules
+                                ruleCreationBlockReason ??
+                                (canCreateRules
                                   ? undefined
-                                  : 'Requires admin:policy:write'
+                                  : 'Requires admin:policy:write')
                               }
-                              disabled={!canCreateRules || isUpdating}
+                              disabled={
+                                !canCreateRules ||
+                                ruleCreationBlockReason !== null ||
+                                isUpdating
+                              }
                               onClick={() => createRuleFromEndpoint(endpoint)}
                             >
                               Create rule
@@ -471,6 +478,7 @@ function EndpointCell({ endpoint }: { endpoint: TrafficEndpoint }) {
         </div>
         <EndpointLifecycleBadges endpoint={endpoint} />
         <EndpointSignalBadge endpoint={endpoint} />
+        <RoutingContextSummary endpoint={endpoint} />
       </div>
     );
   }
@@ -489,6 +497,29 @@ function EndpointCell({ endpoint }: { endpoint: TrafficEndpoint }) {
       </div>
       <EndpointLifecycleBadges endpoint={endpoint} />
       <EndpointSignalBadge endpoint={endpoint} />
+      <RoutingContextSummary endpoint={endpoint} />
+    </div>
+  );
+}
+
+function RoutingContextSummary({ endpoint }: { endpoint: TrafficEndpoint }) {
+  const routingContexts = endpoint.routing_contexts ?? [];
+  if (routingContexts.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="routing-context-summary">
+      {routingContexts.map((context) => (
+        <span
+          className="routing-context-line"
+          key={`${context.route_host ?? ''}\n${context.route_path_prefix ?? ''}\n${context.upstream_origin ?? ''}`}
+          title={context.upstream_origin ?? undefined}
+        >
+          {context.route_host ?? context.upstream_origin ?? 'No proxy dispatch'}
+          {context.route_path_prefix ?? ''}
+        </span>
+      ))}
     </div>
   );
 }
@@ -511,8 +542,61 @@ function ruleEditorPathForTrafficEndpoint(endpoint: TrafficEndpoint): string {
 
   params.set('prefill_method', endpoint.method);
   params.set('prefill_path', endpoint.endpoint_template);
+  const dispatch = dispatchForTrafficEndpoint(endpoint);
+  if (dispatch !== null) {
+    params.set('prefill_dispatch_kind', dispatch.kind);
+    if (dispatch.kind === 'legacy' && dispatch.upstream_origin) {
+      params.set('prefill_upstream_origin', dispatch.upstream_origin);
+    }
+  }
 
   return `/policy/rules/editor?${params.toString()}`;
+}
+
+function directRuleCreationBlockReason(endpoint: TrafficEndpoint): string | null {
+  if (endpoint.routing_context_known !== true) {
+    return 'Observe classified traffic before creating a direct rule';
+  }
+  if (mcpToolName(endpoint) !== null) {
+    return null;
+  }
+
+  const contexts = endpoint.routing_contexts ?? [];
+  if (contexts.some((context) => context.route_host !== undefined)) {
+    return 'Use a host-bound route policy for this endpoint';
+  }
+  if (contexts.some((context) => context.route_path_prefix !== undefined)) {
+    return 'Path-routed traffic cannot create a direct rule';
+  }
+  if (contexts.length !== 1) {
+    return 'Review a single trusted routing context before creating a direct rule';
+  }
+  if (dispatchForTrafficEndpoint(endpoint) === null) {
+    return 'Routing context is missing a valid upstream origin';
+  }
+
+  return null;
+}
+
+function dispatchForTrafficEndpoint(
+  endpoint: TrafficEndpoint,
+): PolicyRuleDispatchMatcher | null {
+  if (mcpToolName(endpoint) !== null) {
+    return null;
+  }
+  const contexts = endpoint.routing_contexts ?? [];
+  if (contexts.length !== 1) {
+    return null;
+  }
+
+  const origin = contexts[0].upstream_origin;
+  if (origin === null) {
+    return { kind: 'contextless' };
+  }
+  if (typeof origin !== 'string' || origin.trim() === '') {
+    return null;
+  }
+  return { kind: 'legacy', upstream_origin: origin };
 }
 
 function ruleTargetLabel(endpoint: TrafficEndpoint): string {

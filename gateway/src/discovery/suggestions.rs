@@ -22,7 +22,10 @@ use crate::{
         signals::{self, Signal, SignalLifecycleState, SignalListFilters},
     },
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
-    rbac::{Policy, PrincipalMatcher, Rule, RuleAction, RuleMatcher},
+    rbac::{
+        Policy, PrincipalMatcher, Rule, RuleAction, RuleDispatchContext, RuleDispatchMatcher,
+        RuleMatcher,
+    },
 };
 
 pub const BASELINE_ALLOW_SUGGESTION_TYPE: &str = "baseline_allow";
@@ -198,11 +201,15 @@ pub struct BaselineSuggestionRun {
     pub omitted_reason: Option<String>,
     pub observed_role_endpoint_count: usize,
     pub skipped_policy_covered: usize,
+    pub skipped_host_routed_observations: usize,
+    pub skipped_path_routed_observations: usize,
+    pub skipped_ambiguous_routing_observations: usize,
     pub skipped_unauthenticated_observations: u64,
     pub skipped_without_roles_observations: u64,
     pub skipped_denied_observations: u64,
     pub skipped_without_issuer_observations: u64,
     pub skipped_unsupported_auth_method_observations: u64,
+    pub skipped_unknown_routing_context_observations: u64,
     pub scanned_event_count: u64,
     pub scan_truncated: bool,
 }
@@ -214,11 +221,15 @@ impl Default for BaselineSuggestionRun {
             omitted_reason: None,
             observed_role_endpoint_count: 0,
             skipped_policy_covered: 0,
+            skipped_host_routed_observations: 0,
+            skipped_path_routed_observations: 0,
+            skipped_ambiguous_routing_observations: 0,
             skipped_unauthenticated_observations: 0,
             skipped_without_roles_observations: 0,
             skipped_denied_observations: 0,
             skipped_without_issuer_observations: 0,
             skipped_unsupported_auth_method_observations: 0,
+            skipped_unknown_routing_context_observations: 0,
             scanned_event_count: 0,
             scan_truncated: false,
         }
@@ -230,6 +241,40 @@ pub struct AnomalySuggestionRun {
     pub open_signal_count: usize,
     pub skipped_policy_covered: usize,
     pub skipped_unusable_target: usize,
+    pub skipped_host_routed: usize,
+    pub skipped_path_routed: usize,
+    pub skipped_ambiguous_routing: usize,
+    pub skipped_unknown_routing_context: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DirectRuleSuggestionSafety {
+    Safe(RuleDispatchMatcher),
+    HostRouted,
+    PathRouted,
+    AmbiguousRouting,
+    UnknownRoutingContext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConfiguredProxyRoute {
+    route_host: Option<String>,
+    route_path_prefix: Option<String>,
+    upstream_origin: String,
+}
+
+impl ConfiguredProxyRoute {
+    pub(crate) fn new(
+        route_host: Option<String>,
+        route_path_prefix: Option<String>,
+        upstream_origin: String,
+    ) -> Self {
+        Self {
+            route_host,
+            route_path_prefix,
+            upstream_origin,
+        }
+    }
 }
 
 pub struct RuleSuggestionEngine {
@@ -237,6 +282,7 @@ pub struct RuleSuggestionEngine {
     audit_store: Option<AuditQueryStore>,
     suggestion_store: RuleSuggestionStore,
     config: RuleSuggestionConfig,
+    configured_proxy_routes: Vec<ConfiguredProxyRoute>,
 }
 
 impl RuleSuggestionEngine {
@@ -261,7 +307,16 @@ impl RuleSuggestionEngine {
             audit_store,
             suggestion_store,
             config,
+            configured_proxy_routes: Vec::new(),
         })
+    }
+
+    pub(crate) fn with_configured_proxy_routes(
+        mut self,
+        configured_proxy_routes: Vec<ConfiguredProxyRoute>,
+    ) -> Self {
+        self.configured_proxy_routes = configured_proxy_routes;
+        self
     }
 
     pub fn generate(&self, policy: &Policy) -> Result<RuleSuggestionRun, RuleSuggestionError> {
@@ -303,6 +358,17 @@ impl RuleSuggestionEngine {
             .transition_suggestion(suggestion_id, state, transitioned_by)
     }
 
+    pub fn direct_rule_suggestion_safety(
+        &self,
+        suggestion: &RuleSuggestion,
+    ) -> Result<DirectRuleSuggestionSafety, RuleSuggestionError> {
+        self.direct_rule_safety_for_target(
+            &suggestion.method,
+            &suggestion.path_pattern,
+            &suggestion.created_at,
+        )
+    }
+
     fn baseline_suggestions(
         &self,
         policy: &Policy,
@@ -337,6 +403,8 @@ impl RuleSuggestionEngine {
         run.skipped_without_issuer_observations = matrix.skipped_without_issuer_observations;
         run.skipped_unsupported_auth_method_observations =
             matrix.skipped_unsupported_auth_method_observations;
+        run.skipped_unknown_routing_context_observations =
+            matrix.skipped_unknown_routing_context_observations;
 
         let mut suggestions = Vec::new();
         for observation in matrix.observations {
@@ -352,16 +420,51 @@ impl RuleSuggestionEngine {
                 &observation.endpoint_template,
                 &principal,
                 &[RuleAction::Allow, RuleAction::Shadow],
+                observation.route_host.as_deref(),
+                RuleDispatchContext::classified(
+                    observation.route_host.as_deref(),
+                    observation.route_path_prefix.as_deref(),
+                    observation.upstream_origin.as_deref(),
+                ),
             ) {
                 run.skipped_policy_covered = run.skipped_policy_covered.saturating_add(1);
                 continue;
             }
+            let dispatch = match self.direct_rule_safety_for_target(
+                &observation.method,
+                &observation.endpoint_template,
+                created_at,
+            )? {
+                DirectRuleSuggestionSafety::Safe(dispatch) => dispatch,
+                DirectRuleSuggestionSafety::HostRouted => {
+                    run.skipped_host_routed_observations =
+                        run.skipped_host_routed_observations.saturating_add(1);
+                    continue;
+                }
+                DirectRuleSuggestionSafety::PathRouted => {
+                    run.skipped_path_routed_observations =
+                        run.skipped_path_routed_observations.saturating_add(1);
+                    continue;
+                }
+                DirectRuleSuggestionSafety::AmbiguousRouting => {
+                    run.skipped_ambiguous_routing_observations =
+                        run.skipped_ambiguous_routing_observations.saturating_add(1);
+                    continue;
+                }
+                DirectRuleSuggestionSafety::UnknownRoutingContext => {
+                    run.skipped_unknown_routing_context_observations = run
+                        .skipped_unknown_routing_context_observations
+                        .saturating_add(observation.observation_count);
+                    continue;
+                }
+            };
 
             let proposed_rule = rule_suggestion_for_endpoint(
                 &observation.method,
                 &observation.endpoint_template,
                 principal,
                 RuleAction::Allow,
+                dispatch,
             );
             let rationale = baseline_rationale(&observation, self.config.baseline_window_hours);
             let evidence = json!({
@@ -371,6 +474,9 @@ impl RuleSuggestionEngine {
                 "to": created_at,
                 "method": observation.method,
                 "endpoint_template": observation.endpoint_template,
+                "upstream_route_host": observation.route_host,
+                "upstream_route_path_prefix": observation.route_path_prefix,
+                "upstream_origin": observation.upstream_origin,
                 "role": observation.role,
                 "issuer": observation.issuer,
                 "auth_method": observation.auth_method,
@@ -387,6 +493,7 @@ impl RuleSuggestionEngine {
                 "skipped_without_roles_observations": matrix.skipped_without_roles_observations,
                 "skipped_without_issuer_observations": matrix.skipped_without_issuer_observations,
                 "skipped_unsupported_auth_method_observations": matrix.skipped_unsupported_auth_method_observations,
+                "skipped_unknown_routing_context_observations": matrix.skipped_unknown_routing_context_observations,
             });
             suggestions.push(NewRuleSuggestion::new(
                 BASELINE_ALLOW_SUGGESTION_TYPE,
@@ -416,12 +523,38 @@ impl RuleSuggestionEngine {
                 run.skipped_unusable_target = run.skipped_unusable_target.saturating_add(1);
                 continue;
             };
+            let dispatch = match self.direct_rule_safety_for_target(
+                &target.method,
+                &target.path_pattern,
+                &signal.created_at,
+            )? {
+                DirectRuleSuggestionSafety::Safe(dispatch) => dispatch,
+                DirectRuleSuggestionSafety::HostRouted => {
+                    run.skipped_host_routed = run.skipped_host_routed.saturating_add(1);
+                    continue;
+                }
+                DirectRuleSuggestionSafety::PathRouted => {
+                    run.skipped_path_routed = run.skipped_path_routed.saturating_add(1);
+                    continue;
+                }
+                DirectRuleSuggestionSafety::AmbiguousRouting => {
+                    run.skipped_ambiguous_routing = run.skipped_ambiguous_routing.saturating_add(1);
+                    continue;
+                }
+                DirectRuleSuggestionSafety::UnknownRoutingContext => {
+                    run.skipped_unknown_routing_context =
+                        run.skipped_unknown_routing_context.saturating_add(1);
+                    continue;
+                }
+            };
             if policy_has_covering_action(
                 policy,
                 &target.method,
                 &target.path_pattern,
                 &target.principal,
                 &[RuleAction::Deny, RuleAction::Shadow],
+                None,
+                RuleDispatchContext::classified(None, None, dispatch.upstream_origin.as_deref()),
             ) {
                 run.skipped_policy_covered = run.skipped_policy_covered.saturating_add(1);
                 continue;
@@ -432,6 +565,7 @@ impl RuleSuggestionEngine {
                 &target.path_pattern,
                 target.principal,
                 RuleAction::Shadow,
+                dispatch,
             );
             let suggestion_type = signal_shadow_suggestion_type(&signal.signal_type);
             let rationale = anomaly_rationale(&signal, &target.method, &target.path_pattern);
@@ -458,6 +592,111 @@ impl RuleSuggestionEngine {
         Ok(suggestions)
     }
 
+    fn direct_rule_safety_for_target(
+        &self,
+        method: &str,
+        endpoint_template: &str,
+        evidence_created_at: &str,
+    ) -> Result<DirectRuleSuggestionSafety, RuleSuggestionError> {
+        let mcp_tool_target = tool_name_from_mcp_endpoint(method, endpoint_template).is_some();
+        let mut matched = false;
+        let mut unknown_routing_context = false;
+        let mut host_routed = false;
+        let mut path_routed = false;
+        let mut observed_dispatch_identities = BTreeSet::new();
+        for endpoint in self
+            .discovery_store
+            .observed_endpoints()?
+            .into_iter()
+            .filter(|endpoint| {
+                endpoint.method == method && endpoint.endpoint_template == endpoint_template
+            })
+        {
+            matched = true;
+            host_routed |= endpoint.route_host.is_some();
+            path_routed |= endpoint.route_path_prefix.is_some();
+            unknown_routing_context |=
+                endpoint
+                    .routing_context_known_since
+                    .as_deref()
+                    .is_none_or(|known_since| {
+                        timestamp_before_or_unparseable(evidence_created_at, known_since)
+                    });
+            observed_dispatch_identities.insert((
+                endpoint.route_path_prefix.clone(),
+                endpoint.upstream_origin.clone(),
+            ));
+        }
+
+        if !matched {
+            return Ok(DirectRuleSuggestionSafety::UnknownRoutingContext);
+        }
+        if unknown_routing_context {
+            return Ok(DirectRuleSuggestionSafety::UnknownRoutingContext);
+        }
+        if mcp_tool_target {
+            if host_routed {
+                return Ok(DirectRuleSuggestionSafety::HostRouted);
+            }
+            if path_routed {
+                return Ok(DirectRuleSuggestionSafety::PathRouted);
+            }
+            let contextless = observed_dispatch_identities.len() == 1
+                && observed_dispatch_identities.contains(&(None, None));
+            return Ok(if contextless {
+                DirectRuleSuggestionSafety::Safe(RuleDispatchMatcher::contextless())
+            } else {
+                DirectRuleSuggestionSafety::AmbiguousRouting
+            });
+        }
+
+        let mut configured_dispatch_identities = BTreeSet::new();
+        for route in self.configured_proxy_routes.iter().filter(|route| {
+            route_path_prefix_overlaps_pattern(
+                route.route_path_prefix.as_deref(),
+                endpoint_template,
+            )
+        }) {
+            host_routed |= route.route_host.is_some();
+            path_routed |= route.route_path_prefix.is_some();
+            configured_dispatch_identities.insert((
+                route.route_path_prefix.clone(),
+                Some(route.upstream_origin.clone()),
+            ));
+        }
+
+        if host_routed {
+            return Ok(DirectRuleSuggestionSafety::HostRouted);
+        }
+        if path_routed {
+            return Ok(DirectRuleSuggestionSafety::PathRouted);
+        }
+
+        let observed_identity = observed_dispatch_identities.iter().next();
+        let configured_identity = configured_dispatch_identities.iter().next();
+        let safe_dispatch = if observed_dispatch_identities.len() == 1 {
+            match configured_dispatch_identities.len() {
+                0 => observed_identity.and_then(|(path_prefix, upstream_origin)| {
+                    (path_prefix.is_none() && upstream_origin.is_none())
+                        .then_some(RuleDispatchMatcher::contextless())
+                }),
+                1 if observed_identity == configured_identity => {
+                    observed_identity.and_then(|(_, upstream_origin)| {
+                        upstream_origin.clone().map(RuleDispatchMatcher::legacy)
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        Ok(safe_dispatch.map_or(
+            DirectRuleSuggestionSafety::AmbiguousRouting,
+            DirectRuleSuggestionSafety::Safe,
+        ))
+    }
+
     fn open_signals(&self) -> Result<Vec<Signal>, RuleSuggestionError> {
         let mut cursor = None;
         let mut signals = Vec::new();
@@ -480,6 +719,56 @@ impl RuleSuggestionEngine {
 
         Ok(signals)
     }
+}
+
+fn timestamp_before_or_unparseable(candidate: &str, threshold: &str) -> bool {
+    match (
+        OffsetDateTime::parse(candidate, &Rfc3339),
+        OffsetDateTime::parse(threshold, &Rfc3339),
+    ) {
+        (Ok(candidate), Ok(threshold)) => candidate < threshold,
+        _ => true,
+    }
+}
+
+fn route_path_prefix_overlaps_pattern(path_prefix: Option<&str>, pattern: &str) -> bool {
+    let Some(path_prefix) = path_prefix else {
+        return true;
+    };
+    let prefix = path_prefix.trim_end_matches('/');
+    let prefix_segments = split_path_segments(prefix);
+    let pattern_segments = split_path_segments(pattern);
+
+    for (index, prefix_segment) in prefix_segments.iter().enumerate() {
+        let Some(pattern_segment) = pattern_segments.get(index) else {
+            return false;
+        };
+        if *pattern_segment == "**" {
+            return true;
+        }
+        if *pattern_segment == "*" || is_capture_segment(pattern_segment) {
+            continue;
+        }
+        if pattern_segment != prefix_segment {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn split_path_segments(path: &str) -> Vec<&str> {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    let path = path.strip_prefix('/').unwrap_or(path);
+    if path.is_empty() {
+        Vec::new()
+    } else {
+        path.split('/').collect()
+    }
+}
+
+fn is_capture_segment(segment: &str) -> bool {
+    segment.len() > 2 && segment.starts_with('{') && segment.ends_with('}')
 }
 
 #[derive(Debug)]
@@ -1076,7 +1365,15 @@ fn policy_has_covering_action(
     path_pattern: &str,
     principal: &PrincipalMatcher,
     covering_actions: &[RuleAction],
+    route_host: Option<&str>,
+    dispatch_context: RuleDispatchContext<'_>,
 ) -> bool {
+    if let Some(route_host) = route_host {
+        return covering_actions
+            .iter()
+            .any(|action| matches!(action, RuleAction::Allow | RuleAction::Shadow))
+            && host_route_covers_principal(policy, method, path_pattern, route_host, principal);
+    }
     if policy.rules.is_empty() {
         return false;
     }
@@ -1091,9 +1388,38 @@ fn policy_has_covering_action(
     } else {
         let path = representative_path_from_endpoint_template(path_pattern);
         matcher
-            .evaluate(method, &path, principal.as_ref())
+            .evaluate_with_dispatch(method, &path, principal.as_ref(), dispatch_context)
             .is_some_and(|decision| covering_actions.contains(&decision.action))
     }
+}
+
+fn host_route_covers_principal(
+    policy: &Policy,
+    method: &str,
+    path_pattern: &str,
+    route_host: &str,
+    principal: &PrincipalMatcher,
+) -> bool {
+    let path = representative_path_from_endpoint_template(path_pattern);
+    let Some(route) = policy.routes.iter().find(|route| {
+        crate::rbac::matcher::method_matches(&route.methods, method)
+            && crate::path_match::path_prefix_matches(&path, &route.path_prefix)
+            && route
+                .hosts
+                .iter()
+                .any(|host| host.eq_ignore_ascii_case(route_host))
+    }) else {
+        return false;
+    };
+
+    principal.roles.iter().any(|role| {
+        policy.roles.get(role).is_some_and(|entry| {
+            entry
+                .permissions
+                .iter()
+                .any(|permission| permission == "*" || permission == &route.permission)
+        })
+    })
 }
 
 fn rule_suggestion_for_endpoint(
@@ -1101,6 +1427,7 @@ fn rule_suggestion_for_endpoint(
     endpoint_template: &str,
     principal: PrincipalMatcher,
     action: RuleAction,
+    dispatch: RuleDispatchMatcher,
 ) -> Rule {
     if let Some(tool_name) = tool_name_from_mcp_endpoint(method, endpoint_template) {
         Rule {
@@ -1109,6 +1436,7 @@ fn rule_suggestion_for_endpoint(
             methods: Vec::new(),
             path: String::new(),
             tool_name: Some(tool_name.to_owned()),
+            dispatch: None,
             principal,
             action,
         }
@@ -1119,6 +1447,7 @@ fn rule_suggestion_for_endpoint(
             methods: vec![method.to_owned()],
             path: endpoint_template.to_owned(),
             tool_name: None,
+            dispatch: Some(dispatch),
             principal,
             action,
         }
@@ -1478,6 +1807,10 @@ mod tests {
         assert_eq!(invoice.proposed_rule.methods, vec!["GET".to_owned()]);
         assert_eq!(invoice.proposed_rule.path, "/invoices/{id}");
         assert_eq!(
+            invoice.proposed_rule.dispatch,
+            Some(RuleDispatchMatcher::contextless())
+        );
+        assert_eq!(
             invoice.proposed_rule.principal.roles,
             vec!["billing-reader".to_owned()]
         );
@@ -1656,6 +1989,449 @@ mod tests {
     }
 
     #[test]
+    fn baseline_generation_never_emits_host_blind_rule_for_host_routed_traffic() {
+        let discovery_db = TempDb::new("baseline-host-routing-discovery");
+        let audit_db = TempDb::new("baseline-host-routing-audit");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/invoices/{id}");
+        seed_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/invoices/{id}",
+            "api.example.test",
+            "/invoices",
+            "https://billing.internal",
+        );
+        create_audit_schema(&audit_db.path);
+        insert_observation_event(
+            &audit_db.path,
+            SeedObservationEvent {
+                event_id: "host-routed-reader",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: "alice",
+                roles: &["billing-reader"],
+                method: "GET",
+                request_path: "/invoices/123",
+                status: 200,
+                policy_decision: Some("allowed"),
+            },
+        );
+        set_observation_routing_context(
+            &audit_db.path,
+            "host-routed-reader",
+            "api.example.test",
+            "/invoices",
+            "https://billing.internal",
+        );
+
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        let run = engine
+            .generate(&empty_policy())
+            .expect("suggestion generation should succeed");
+
+        assert_eq!(run.inserted_count, 0);
+        assert_eq!(run.baseline.skipped_host_routed_observations, 1);
+        assert!(engine
+            .list_suggestions()
+            .expect("suggestions should query")
+            .is_empty());
+
+        let mut covered_policy = empty_policy();
+        covered_policy.roles.insert(
+            "billing-reader".to_owned(),
+            crate::rbac::policy::RoleEntry {
+                permissions: vec!["billing:read".to_owned()],
+                issuers: Vec::new(),
+                auth_methods: Vec::new(),
+            },
+        );
+        covered_policy.routes.push(crate::rbac::RouteRule {
+            methods: vec!["GET".to_owned()],
+            hosts: vec!["api.example.test".to_owned()],
+            path_prefix: "/invoices".to_owned(),
+            permission: "billing:read".to_owned(),
+            enforcement_mode: None,
+        });
+        let covered_run = engine
+            .generate(&covered_policy)
+            .expect("covered suggestion generation should succeed");
+        assert_eq!(covered_run.inserted_count, 0);
+        assert_eq!(covered_run.baseline.skipped_policy_covered, 1);
+        assert_eq!(covered_run.baseline.skipped_host_routed_observations, 0);
+    }
+
+    #[test]
+    fn baseline_generation_rejects_hostless_fallback_for_mixed_host_routing() {
+        let discovery_db = TempDb::new("baseline-mixed-host-routing-discovery");
+        let audit_db = TempDb::new("baseline-mixed-host-routing-audit");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/invoices/{id}");
+        seed_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/invoices/{id}",
+            "",
+            "/invoices",
+            "https://fallback.internal",
+        );
+        seed_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/invoices/{id}",
+            "api.example.test",
+            "/invoices",
+            "https://billing.internal",
+        );
+        create_audit_schema(&audit_db.path);
+        insert_observation_event(
+            &audit_db.path,
+            SeedObservationEvent {
+                event_id: "fallback-reader",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: "alice",
+                roles: &["billing-reader"],
+                method: "GET",
+                request_path: "/invoices/123",
+                status: 200,
+                policy_decision: Some("allowed"),
+            },
+        );
+        set_observation_routing_context(
+            &audit_db.path,
+            "fallback-reader",
+            "",
+            "/invoices",
+            "https://fallback.internal",
+        );
+
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        let run = engine
+            .generate(&empty_policy())
+            .expect("suggestion generation should succeed");
+
+        assert_eq!(run.baseline.observed_role_endpoint_count, 1);
+        assert_eq!(run.baseline.skipped_host_routed_observations, 1);
+        assert_eq!(run.inserted_count, 0);
+        assert!(engine
+            .list_suggestions()
+            .expect("suggestions should query")
+            .is_empty());
+    }
+
+    #[test]
+    fn baseline_generation_rejects_multiple_observed_path_only_dispatches() {
+        let discovery_db = TempDb::new("baseline-observed-path-routing-discovery");
+        let audit_db = TempDb::new("baseline-observed-path-routing-audit");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/tenants/{id}/records");
+        for (tenant, origin) in [
+            ("1", "https://tenant-one.internal"),
+            ("2", "https://tenant-two.internal"),
+        ] {
+            seed_discovery_routing_context(
+                &discovery_db.path,
+                "GET",
+                "/tenants/{id}/records",
+                "",
+                &format!("/tenants/{tenant}"),
+                origin,
+            );
+        }
+        create_audit_schema(&audit_db.path);
+        insert_observation_event(
+            &audit_db.path,
+            SeedObservationEvent {
+                event_id: "tenant-one-reader",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: "alice",
+                roles: &["tenant-reader"],
+                method: "GET",
+                request_path: "/tenants/1/records",
+                status: 200,
+                policy_decision: Some("allowed"),
+            },
+        );
+        set_observation_routing_context(
+            &audit_db.path,
+            "tenant-one-reader",
+            "",
+            "/tenants/1",
+            "https://tenant-one.internal",
+        );
+
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        let run = engine
+            .generate(&empty_policy())
+            .expect("suggestion generation should succeed");
+
+        assert_eq!(run.baseline.observed_role_endpoint_count, 1);
+        assert_eq!(run.baseline.skipped_path_routed_observations, 1);
+        assert_eq!(run.inserted_count, 0);
+        assert!(engine
+            .list_suggestions()
+            .expect("suggestions should query")
+            .is_empty());
+    }
+
+    #[test]
+    fn baseline_generation_rejects_one_path_only_dispatch_identity() {
+        let discovery_db = TempDb::new("baseline-single-path-routing-discovery");
+        let audit_db = TempDb::new("baseline-single-path-routing-audit");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/tenants/{id}/records");
+        seed_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/tenants/{id}/records",
+            "",
+            "/tenants/1",
+            "https://tenant-one.internal",
+        );
+        create_audit_schema(&audit_db.path);
+        insert_observation_event(
+            &audit_db.path,
+            SeedObservationEvent {
+                event_id: "single-tenant-reader",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: "alice",
+                roles: &["tenant-reader"],
+                method: "GET",
+                request_path: "/tenants/1/records",
+                status: 200,
+                policy_decision: Some("allowed"),
+            },
+        );
+        set_observation_routing_context(
+            &audit_db.path,
+            "single-tenant-reader",
+            "",
+            "/tenants/1",
+            "https://tenant-one.internal",
+        );
+
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path))
+            .with_configured_proxy_routes(vec![ConfiguredProxyRoute::new(
+                None,
+                Some("/tenants/1".to_owned()),
+                "https://tenant-one.internal".to_owned(),
+            )]);
+        let run = engine
+            .generate(&empty_policy())
+            .expect("suggestion generation should succeed");
+
+        assert_eq!(run.baseline.observed_role_endpoint_count, 1);
+        assert_eq!(run.baseline.skipped_path_routed_observations, 1);
+        assert_eq!(run.inserted_count, 0);
+        assert!(engine
+            .list_suggestions()
+            .expect("suggestions should query")
+            .is_empty());
+    }
+
+    #[test]
+    fn baseline_generation_rejects_configured_unseen_path_only_dispatch() {
+        let discovery_db = TempDb::new("baseline-unseen-path-routing-discovery");
+        let audit_db = TempDb::new("baseline-unseen-path-routing-audit");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/tenants/{id}/records");
+        seed_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/tenants/{id}/records",
+            "",
+            "",
+            "https://legacy.internal",
+        );
+        create_audit_schema(&audit_db.path);
+        insert_observation_event(
+            &audit_db.path,
+            SeedObservationEvent {
+                event_id: "configured-tenant-one-reader",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: "alice",
+                roles: &["tenant-reader"],
+                method: "GET",
+                request_path: "/tenants/1/records",
+                status: 200,
+                policy_decision: Some("allowed"),
+            },
+        );
+        set_observation_routing_context(
+            &audit_db.path,
+            "configured-tenant-one-reader",
+            "",
+            "",
+            "https://legacy.internal",
+        );
+
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path))
+            .with_configured_proxy_routes(vec![ConfiguredProxyRoute::new(
+                None,
+                Some("/tenants/2".to_owned()),
+                "https://tenant-two.internal".to_owned(),
+            )]);
+        let run = engine
+            .generate(&empty_policy())
+            .expect("suggestion generation should succeed");
+
+        assert_eq!(run.baseline.observed_role_endpoint_count, 1);
+        assert_eq!(run.baseline.skipped_path_routed_observations, 1);
+        assert_eq!(run.inserted_count, 0);
+        assert!(engine
+            .list_suggestions()
+            .expect("suggestions should query")
+            .is_empty());
+    }
+
+    #[test]
+    fn baseline_generation_rejects_changed_legacy_upstream() {
+        let discovery_db = TempDb::new("baseline-changed-legacy-discovery");
+        let audit_db = TempDb::new("baseline-changed-legacy-audit");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/reports/{id}");
+        seed_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/reports/{id}",
+            "",
+            "",
+            "https://legacy-one.internal",
+        );
+        create_audit_schema(&audit_db.path);
+        insert_observation_event(
+            &audit_db.path,
+            SeedObservationEvent {
+                event_id: "legacy-one-reader",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: "alice",
+                roles: &["report-reader"],
+                method: "GET",
+                request_path: "/reports/1",
+                status: 200,
+                policy_decision: Some("allowed"),
+            },
+        );
+        set_observation_routing_context(
+            &audit_db.path,
+            "legacy-one-reader",
+            "",
+            "",
+            "https://legacy-one.internal",
+        );
+
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path))
+            .with_configured_proxy_routes(vec![ConfiguredProxyRoute::new(
+                None,
+                None,
+                "https://legacy-two.internal".to_owned(),
+            )]);
+        let run = engine
+            .generate(&empty_policy())
+            .expect("suggestion generation should succeed");
+
+        assert_eq!(run.baseline.observed_role_endpoint_count, 1);
+        assert_eq!(run.baseline.skipped_ambiguous_routing_observations, 1);
+        assert_eq!(run.inserted_count, 0);
+        assert!(engine
+            .list_suggestions()
+            .expect("suggestions should query")
+            .is_empty());
+    }
+
+    #[test]
+    fn direct_rule_safety_rejects_inactive_legacy_evidence() {
+        let discovery_db = TempDb::new("inactive-legacy-safety");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/reports/{id}");
+        seed_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/reports/{id}",
+            "",
+            "",
+            "https://inactive-legacy.internal",
+        );
+
+        let engine = suggestion_engine(&discovery_db.path, None);
+        assert_eq!(
+            engine
+                .direct_rule_safety_for_target("GET", "/reports/{id}", "2024-06-02T00:00:00Z",)
+                .expect("routing safety should evaluate"),
+            DirectRuleSuggestionSafety::AmbiguousRouting
+        );
+    }
+
+    #[test]
+    fn direct_rule_safety_returns_active_legacy_origin_binding() {
+        let discovery_db = TempDb::new("active-legacy-safety");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/reports/{id}");
+        seed_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/reports/{id}",
+            "",
+            "",
+            "https://legacy.internal",
+        );
+
+        let engine =
+            suggestion_engine(&discovery_db.path, None).with_configured_proxy_routes(vec![
+                ConfiguredProxyRoute::new(None, None, "https://legacy.internal".to_owned()),
+            ]);
+        assert_eq!(
+            engine
+                .direct_rule_safety_for_target("GET", "/reports/{id}", "2024-06-02T00:00:00Z",)
+                .expect("routing safety should evaluate"),
+            DirectRuleSuggestionSafety::Safe(RuleDispatchMatcher::legacy(
+                "https://legacy.internal".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn migrated_pre_context_data_never_generates_direct_rule_suggestions() {
+        let discovery_db = TempDb::new("migrated-context-discovery");
+        let audit_db = TempDb::new("migrated-context-audit");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/legacy/{id}");
+        clear_discovery_routing_classification(&discovery_db.path, "GET", "/legacy/{id}");
+        seed_signal(
+            &discovery_db.path,
+            SeedSignal {
+                id: "legacy-signal",
+                signal_type: "schema_mismatch",
+                target_kind: "endpoint",
+                target_identity: json!({
+                    "method": "GET",
+                    "endpoint_template": "/legacy/{id}"
+                }),
+                evidence: json!({ "schema_mismatch_count": 4 }),
+                state: "open",
+            },
+        );
+        create_audit_schema(&audit_db.path);
+        insert_observation_event(
+            &audit_db.path,
+            SeedObservationEvent {
+                event_id: "legacy-reader",
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: "alice",
+                roles: &["legacy-reader"],
+                method: "GET",
+                request_path: "/legacy/123",
+                status: 200,
+                policy_decision: Some("allowed"),
+            },
+        );
+        clear_observation_routing_classification(&audit_db.path, "legacy-reader");
+
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        let run = engine
+            .generate(&empty_policy())
+            .expect("migration-safe suggestion generation should succeed");
+
+        assert_eq!(run.inserted_count, 0);
+        assert_eq!(run.baseline.skipped_unknown_routing_context_observations, 1);
+        assert_eq!(run.anomaly.skipped_unknown_routing_context, 1);
+        assert!(engine
+            .list_suggestions()
+            .expect("suggestions should query")
+            .is_empty());
+    }
+
+    #[test]
     fn baseline_generation_suggests_tool_name_rule_for_mcp_tool_observation() {
         let discovery_db = TempDb::new("baseline-tool-discovery");
         let audit_db = TempDb::new("baseline-tool-audit");
@@ -1736,6 +2512,7 @@ mod tests {
             methods: vec!["GET".to_owned()],
             path: "/invoices/{id}".to_owned(),
             tool_name: None,
+            dispatch: None,
             principal: PrincipalMatcher {
                 roles: vec!["billing-reader".to_owned()],
                 issuers: Vec::new(),
@@ -1827,6 +2604,7 @@ mod tests {
     #[test]
     fn anomaly_generation_suggests_tool_name_rule_for_mcp_tool_signal() {
         let discovery_db = TempDb::new("anomaly-tool-discovery");
+        seed_discovery_endpoint(&discovery_db.path, "MCP", "/mcp/tools/echo");
         seed_signal(
             &discovery_db.path,
             SeedSignal {
@@ -1844,7 +2622,10 @@ mod tests {
             },
         );
 
-        let engine = suggestion_engine(&discovery_db.path, None);
+        let engine =
+            suggestion_engine(&discovery_db.path, None).with_configured_proxy_routes(vec![
+                ConfiguredProxyRoute::new(None, None, "https://http-fallback.internal".to_owned()),
+            ]);
         let run = engine
             .generate(&empty_policy())
             .expect("suggestion generation should succeed");
@@ -1868,6 +2649,12 @@ mod tests {
             proposed_rule.get("path").is_none(),
             "tool-name anomaly suggestions must not serialize an HTTP path matcher: {proposed_rule}"
         );
+        assert_eq!(
+            engine
+                .direct_rule_suggestion_safety(suggestion)
+                .expect("tool suggestion safety should evaluate"),
+            DirectRuleSuggestionSafety::Safe(RuleDispatchMatcher::contextless())
+        );
     }
 
     #[test]
@@ -1881,6 +2668,7 @@ mod tests {
 
         let (run, suggestions) = tracing::subscriber::with_default(subscriber, || {
             let discovery_db = TempDb::new("anomaly-tool-slash-discovery");
+            seed_discovery_endpoint(&discovery_db.path, "MCP", "/mcp/tools/foo/bar");
             seed_signal(
                 &discovery_db.path,
                 SeedSignal {
@@ -1974,6 +2762,7 @@ mod tests {
             methods: vec!["GET".to_owned()],
             path: "/invoices/{id}".to_owned(),
             tool_name: None,
+            dispatch: None,
             principal: PrincipalMatcher {
                 roles: Vec::new(),
                 issuers: Vec::new(),
@@ -2189,6 +2978,7 @@ mod tests {
                 principal_ids: Vec::new(),
             },
             RuleAction::Allow,
+            RuleDispatchMatcher::contextless(),
         );
         connection
             .execute(
@@ -2250,6 +3040,12 @@ mod tests {
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (method, endpoint_template)
                 );
+                CREATE TABLE IF NOT EXISTS discovery_endpoint_routing_classifications (
+                    method TEXT NOT NULL,
+                    endpoint_template TEXT NOT NULL,
+                    first_classified_at TEXT NOT NULL,
+                    PRIMARY KEY (method, endpoint_template)
+                );
                 "#,
             )
             .expect("discovery schema should create");
@@ -2275,6 +3071,71 @@ mod tests {
                 params![method, endpoint_template],
             )
             .expect("endpoint aggregate should insert");
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_endpoint_routing_classifications (
+                    method, endpoint_template, first_classified_at
+                ) VALUES (?1, ?2, '2024-06-01T11:00:00Z')
+                "#,
+                params![method, endpoint_template],
+            )
+            .expect("routing classification should insert");
+    }
+
+    fn seed_discovery_routing_context(
+        path: &PathBuf,
+        method: &str,
+        endpoint_template: &str,
+        route_host: &str,
+        route_path_prefix: &str,
+        upstream_origin: &str,
+    ) {
+        DiscoveryQueryStore::open(path).expect("query store should create routing schema");
+        let connection = Connection::open(path).expect("test discovery database should open");
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_endpoint_routing_contexts (
+                    method,
+                    endpoint_template,
+                    route_host,
+                    route_path_prefix,
+                    upstream_origin,
+                    first_seen,
+                    last_seen,
+                    call_count,
+                    distinct_principal_count,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1, 1, ?6)
+                "#,
+                params![
+                    method,
+                    endpoint_template,
+                    route_host,
+                    route_path_prefix,
+                    upstream_origin,
+                    "2024-06-01T12:00:00Z",
+                ],
+            )
+            .expect("routing context should insert");
+    }
+
+    fn clear_discovery_routing_classification(
+        path: &PathBuf,
+        method: &str,
+        endpoint_template: &str,
+    ) {
+        let connection = Connection::open(path).expect("test discovery database should open");
+        connection
+            .execute(
+                r#"
+                DELETE FROM discovery_endpoint_routing_classifications
+                WHERE method = ?1 AND endpoint_template = ?2
+                "#,
+                params![method, endpoint_template],
+            )
+            .expect("routing classification should clear");
     }
 
     fn create_audit_schema(path: &PathBuf) {
@@ -2327,7 +3188,8 @@ mod tests {
         let mut payload = json!({
             "method": event.method,
             "path": event.request_path,
-            "status": event.status
+            "status": event.status,
+            "routing_context_known": true
         });
         if let Some(policy_decision) = event.policy_decision {
             payload["policy_decision"] = json!(policy_decision);
@@ -2365,6 +3227,57 @@ mod tests {
                 ],
             )
             .expect("observation event should insert");
+    }
+
+    fn set_observation_routing_context(
+        path: &PathBuf,
+        event_id: &str,
+        route_host: &str,
+        route_path_prefix: &str,
+        upstream_origin: &str,
+    ) {
+        let connection = Connection::open(path).expect("test audit database should open");
+        let payload_json: String = connection
+            .query_row(
+                "SELECT payload_json FROM audit_events WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .expect("observation payload should query");
+        let mut payload: Value =
+            serde_json::from_str(&payload_json).expect("observation payload should parse");
+        payload["upstream_route_host"] = json!(route_host);
+        payload["upstream_route_path_prefix"] = json!(route_path_prefix);
+        payload["upstream_origin"] = json!(upstream_origin);
+        connection
+            .execute(
+                "UPDATE audit_events SET payload_json = ?2 WHERE event_id = ?1",
+                params![event_id, payload.to_string()],
+            )
+            .expect("observation routing context should update");
+    }
+
+    fn clear_observation_routing_classification(path: &PathBuf, event_id: &str) {
+        let connection = Connection::open(path).expect("test audit database should open");
+        let payload_json: String = connection
+            .query_row(
+                "SELECT payload_json FROM audit_events WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .expect("observation payload should query");
+        let mut payload: Value =
+            serde_json::from_str(&payload_json).expect("observation payload should parse");
+        payload
+            .as_object_mut()
+            .expect("observation payload should be an object")
+            .remove("routing_context_known");
+        connection
+            .execute(
+                "UPDATE audit_events SET payload_json = ?2 WHERE event_id = ?1",
+                params![event_id, payload.to_string()],
+            )
+            .expect("observation routing classification should clear");
     }
 
     struct SeedSignal {

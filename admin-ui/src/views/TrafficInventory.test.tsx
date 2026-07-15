@@ -102,7 +102,196 @@ describe('TrafficInventory', () => {
 
     expect(await screen.findByTestId('location')).toBeTruthy();
     expect(screen.getByTestId('location').textContent).toBe(
-      '/policy/rules/editor?prefill_method=POST&prefill_path=%2Freports%2F%7Bid%7D',
+      '/policy/rules/editor?prefill_method=POST&prefill_path=%2Freports%2F%7Bid%7D&prefill_dispatch_kind=contextless',
+    );
+  });
+
+  it('preserves a legacy fallback binding in rule-editor prefill', async () => {
+    const fetcher = trafficInventoryFetchMock({
+      endpoints: [
+        trafficEndpoint({
+          method: 'GET',
+          endpoint_template: '/legacy/{id}',
+          routing_contexts: [
+            {
+              upstream_origin: 'https://legacy.internal',
+              first_seen: '2026-07-04T09:00:00Z',
+              last_seen: '2026-07-04T10:00:00Z',
+              call_count: 8,
+              distinct_principal_count: 2,
+              covered_by_rule: false,
+              coverage_scope: 'none',
+            },
+          ],
+        }),
+      ],
+      policy: policyDocument({
+        roles: {
+          writer: { permissions: ['admin:policy:write'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderTrafficInventory({ token: jwtWithRoles(['writer']) });
+    const createRuleButton = (await screen.findByRole('button', {
+      name: 'Create rule for GET /legacy/{id}',
+    })) as HTMLButtonElement;
+    await waitFor(() => expect(createRuleButton.disabled).toBe(false));
+    fireEvent.click(createRuleButton);
+
+    expect(screen.getByTestId('location').textContent).toBe(
+      '/policy/rules/editor?prefill_method=GET&prefill_path=%2Flegacy%2F%7Bid%7D&prefill_dispatch_kind=legacy&prefill_upstream_origin=https%3A%2F%2Flegacy.internal',
+    );
+  });
+
+  it('shows host-routed context and blocks host-blind direct-rule creation', async () => {
+    const fetcher = trafficInventoryFetchMock({
+      endpoints: [
+        trafficEndpoint({
+          method: 'GET',
+          endpoint_template: '/api/{id}',
+          covered_by_rule: false,
+          coverage_scope: 'principal',
+          routing_contexts: [
+            {
+              route_host: 'api.example.test',
+              route_path_prefix: '/api',
+              upstream_origin: 'https://api.internal',
+              first_seen: '2026-07-04T09:00:00Z',
+              last_seen: '2026-07-04T10:00:00Z',
+              call_count: 12,
+              distinct_principal_count: 2,
+              covered_by_rule: false,
+              coverage_scope: 'principal',
+            },
+          ],
+        }),
+      ],
+      policy: policyDocument({
+        roles: {
+          writer: { permissions: ['admin:policy:write'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderTrafficInventory({ token: jwtWithRoles(['writer']) });
+
+    expect(await screen.findByText('PRINCIPAL-SCOPED')).toBeTruthy();
+    expect(screen.getByText('api.example.test/api')).toBeTruthy();
+    const createRuleButton = screen.getByRole('button', {
+      name: 'Create rule for GET /api/{id}',
+    }) as HTMLButtonElement;
+    expect(createRuleButton.disabled).toBe(true);
+    expect(createRuleButton.title).toBe(
+      'Use a host-bound route policy for this endpoint',
+    );
+  });
+
+  it('blocks direct-rule creation when routing context is unknown', async () => {
+    const fetcher = trafficInventoryFetchMock({
+      endpoints: [
+        trafficEndpoint({
+          method: 'GET',
+          endpoint_template: '/legacy/{id}',
+          covered_by_rule: false,
+          coverage_scope: 'unknown',
+          routing_context_known: false,
+          routing_context_known_since: null,
+        }),
+      ],
+      policy: policyDocument({
+        roles: {
+          writer: { permissions: ['admin:policy:write'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderTrafficInventory({ token: jwtWithRoles(['writer']) });
+
+    expect(await screen.findByText('UNKNOWN CONTEXT')).toBeTruthy();
+    const createRuleButton = screen.getByRole('button', {
+      name: 'Create rule for GET /legacy/{id}',
+    }) as HTMLButtonElement;
+    expect(createRuleButton.disabled).toBe(true);
+    expect(createRuleButton.title).toBe(
+      'Observe classified traffic before creating a direct rule',
+    );
+  });
+
+  it('blocks direct-rule creation for path-routed traffic', async () => {
+    const fetcher = trafficInventoryFetchMock({
+      endpoints: [
+        trafficEndpoint({
+          method: 'GET',
+          endpoint_template: '/reports/{id}',
+          routing_contexts: [
+            {
+              route_path_prefix: '/reports',
+              upstream_origin: 'https://reports.internal',
+              first_seen: '2026-07-04T09:00:00Z',
+              last_seen: '2026-07-04T10:00:00Z',
+              call_count: 12,
+              distinct_principal_count: 2,
+              covered_by_rule: false,
+              coverage_scope: 'none',
+            },
+          ],
+        }),
+      ],
+      policy: policyDocument({
+        roles: {
+          writer: { permissions: ['admin:policy:write'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderTrafficInventory({ token: jwtWithRoles(['writer']) });
+    const createRuleButton = (await screen.findByRole('button', {
+      name: 'Create rule for GET /reports/{id}',
+    })) as HTMLButtonElement;
+    expect(createRuleButton.disabled).toBe(true);
+    expect(createRuleButton.title).toBe(
+      'Path-routed traffic cannot create a direct rule',
+    );
+  });
+
+  it('blocks direct-rule creation when upstream origin is missing', async () => {
+    const malformedContext = {
+      first_seen: '2026-07-04T09:00:00Z',
+      last_seen: '2026-07-04T10:00:00Z',
+      call_count: 12,
+      distinct_principal_count: 2,
+      covered_by_rule: false,
+      coverage_scope: 'none',
+    } as unknown as TrafficEndpoint['routing_contexts'][number];
+    const fetcher = trafficInventoryFetchMock({
+      endpoints: [
+        trafficEndpoint({
+          method: 'GET',
+          endpoint_template: '/malformed/{id}',
+          routing_contexts: [malformedContext],
+        }),
+      ],
+      policy: policyDocument({
+        roles: {
+          writer: { permissions: ['admin:policy:write'] },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderTrafficInventory({ token: jwtWithRoles(['writer']) });
+    const createRuleButton = (await screen.findByRole('button', {
+      name: 'Create rule for GET /malformed/{id}',
+    })) as HTMLButtonElement;
+
+    expect(createRuleButton.disabled).toBe(true);
+    expect(createRuleButton.title).toBe(
+      'Routing context is missing a valid upstream origin',
     );
   });
 
@@ -659,7 +848,7 @@ function policyDocument(
 function trafficEndpoint(
   overrides: Partial<TrafficEndpoint> = {},
 ): TrafficEndpoint {
-  return {
+  const endpoint: TrafficEndpoint = {
     method: 'GET',
     endpoint_template: '/health',
     first_seen: '2026-07-04T09:00:00Z',
@@ -671,6 +860,20 @@ function trafficEndpoint(
     reviewed_at: null,
     reviewed_by: null,
     covered_by_rule: true,
+    coverage_scope: 'endpoint',
+    routing_context_known: true,
+    routing_context_known_since: '2026-07-04T09:00:00Z',
+    routing_contexts: [
+      {
+        upstream_origin: null,
+        first_seen: '2026-07-04T09:00:00Z',
+        last_seen: '2026-07-04T10:00:00Z',
+        call_count: 1,
+        distinct_principal_count: 0,
+        covered_by_rule: true,
+        coverage_scope: 'endpoint',
+      },
+    ],
     open_signals: {
       count: 0,
       signal_types: [],
@@ -684,6 +887,10 @@ function trafficEndpoint(
     status_counts: [{ status: 200, count: 1 }],
     ...overrides,
   };
+  endpoint.coverage_scope =
+    overrides.coverage_scope ??
+    (endpoint.covered_by_rule ? 'endpoint' : 'none');
+  return endpoint;
 }
 
 function jwtWithRoles(roles: string[]): string {

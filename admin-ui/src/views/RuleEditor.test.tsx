@@ -92,6 +92,55 @@ describe('RuleEditor', () => {
     ).toContain('decision = "shadow"');
   });
 
+  it('saves a contextless dispatch binding from traffic prefill', async () => {
+    const fetchMock = policyBackedFetch(policyFixture(), 'W/"policy-1"');
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderRuleEditor(
+      '/policy/rules/editor?prefill_method=GET&prefill_path=%2Flocal%2F%7Bid%7D&prefill_dispatch_kind=contextless',
+    );
+
+    expect(await screen.findByDisplayValue('/local/{id}')).toBeTruthy();
+    expect(screen.getByLabelText('Policy expression').textContent).toContain(
+      'proxy.dispatch_kind == "contextless"',
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Save rule' }));
+    expect(await screen.findByText('Rule saved.')).toBeTruthy();
+
+    const createCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        String(input).endsWith('/policy/rules') && init?.method === 'POST',
+    );
+    expect(JSON.parse(String(createCall?.[1]?.body)).dispatch).toEqual({
+      kind: 'contextless',
+    });
+  });
+
+  it('saves a legacy dispatch binding from traffic prefill', async () => {
+    const fetchMock = policyBackedFetch(policyFixture(), 'W/"policy-1"');
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderRuleEditor(
+      '/policy/rules/editor?prefill_method=GET&prefill_path=%2Flegacy%2F%7Bid%7D&prefill_dispatch_kind=legacy&prefill_upstream_origin=https%3A%2F%2Flegacy.internal',
+    );
+
+    expect(await screen.findByDisplayValue('/legacy/{id}')).toBeTruthy();
+    expect(screen.getByLabelText('Policy expression').textContent).toContain(
+      'proxy.upstream_origin == "https://legacy.internal"',
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Save rule' }));
+    expect(await screen.findByText('Rule saved.')).toBeTruthy();
+
+    const createCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        String(input).endsWith('/policy/rules') && init?.method === 'POST',
+    );
+    expect(JSON.parse(String(createCall?.[1]?.body)).dispatch).toEqual({
+      kind: 'legacy',
+      upstream_origin: 'https://legacy.internal',
+    });
+  });
+
   it('applies a principal deny shortcut to a new rule form', async () => {
     vi.stubGlobal('fetch', policyBackedFetch(policyFixture(), 'W/"policy-1"'));
 
@@ -173,6 +222,10 @@ describe('RuleEditor', () => {
       id: 'support-read',
       methods: ['GET'],
       path: '/existing/{id}',
+      dispatch: {
+        kind: 'legacy',
+        upstream_origin: 'https://api.example.test',
+      },
       principal: {
         roles: ['support'],
         issuers: [],
@@ -212,6 +265,13 @@ describe('RuleEditor', () => {
     expect(
       (screen.getByRole('radio', { name: /Allow/ }) as HTMLInputElement).checked,
     ).toBe(true);
+    expect(
+      (screen.getByRole('radio', { name: 'MCP tool' }) as HTMLInputElement)
+        .disabled,
+    ).toBe(true);
+    expect(screen.getByLabelText('Policy expression').textContent).toContain(
+      'proxy.upstream_origin == "https://api.example.test"',
+    );
   });
 
   it('validates path patterns before submitting', async () => {

@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::auth::{AuthMethod, Principal};
 
@@ -51,6 +51,47 @@ pub struct PrincipalMatcher {
     /// principal id.
     #[serde(default)]
     pub principal_ids: Vec<String>,
+}
+
+/// Dispatch class captured when a traffic-derived HTTP rule is authored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleDispatchKind {
+    Contextless,
+    Legacy,
+}
+
+/// Optional proxy-dispatch provenance for an HTTP firewall rule.
+///
+/// Presence binds a rule either to classified traffic with no selected proxy
+/// dispatch, or to the legacy fallback upstream at the configured origin.
+/// Omitting `dispatch` preserves the historical globally scoped behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleDispatchMatcher {
+    pub kind: RuleDispatchKind,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub upstream_origin: Option<String>,
+}
+
+impl RuleDispatchMatcher {
+    pub fn contextless() -> Self {
+        Self {
+            kind: RuleDispatchKind::Contextless,
+            upstream_origin: None,
+        }
+    }
+
+    pub fn legacy(upstream_origin: String) -> Self {
+        Self {
+            kind: RuleDispatchKind::Legacy,
+            upstream_origin: Some(upstream_origin),
+        }
+    }
 }
 
 impl PrincipalMatcher {
@@ -124,11 +165,29 @@ pub struct Rule {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Optional dispatch provenance. `kind: "contextless"` restricts the rule
+    /// to classified requests without proxy dispatch; `kind: "legacy"` also
+    /// requires the configured fallback origin and excludes routed upstreams.
+    /// Omitted means any dispatch context for backward compatibility.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dispatch: Option<RuleDispatchMatcher>,
     /// Optional principal constraints. Empty or omitted means any principal,
     /// authenticated or not.
     #[serde(default)]
     pub principal: PrincipalMatcher,
     pub action: RuleAction,
+}
+
+fn deserialize_present_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 impl Rule {
@@ -287,6 +346,7 @@ mod tests {
             methods: vec!["GET".to_owned(), "HEAD".to_owned()],
             path: "/data".to_owned(),
             tool_name: None,
+            dispatch: None,
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
@@ -301,6 +361,7 @@ mod tests {
             methods: vec!["*".to_owned()],
             path: "/data".to_owned(),
             tool_name: None,
+            dispatch: None,
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
@@ -316,6 +377,7 @@ mod tests {
             methods: Vec::new(),
             path: "/api/users/{id}".to_owned(),
             tool_name: None,
+            dispatch: None,
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
@@ -325,6 +387,7 @@ mod tests {
             methods: Vec::new(),
             path: "/assets/*".to_owned(),
             tool_name: None,
+            dispatch: None,
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
@@ -334,6 +397,7 @@ mod tests {
             methods: Vec::new(),
             path: "/admin/**".to_owned(),
             tool_name: None,
+            dispatch: None,
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };
@@ -354,6 +418,7 @@ mod tests {
             methods: Vec::new(),
             path: "/api/users/{id}".to_owned(),
             tool_name: None,
+            dispatch: None,
             principal: PrincipalMatcher::default(),
             action: RuleAction::Allow,
         };

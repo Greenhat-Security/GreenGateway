@@ -872,6 +872,24 @@ select:focus-visible {
   gap: var(--gh-ref-space-2);
 }
 
+.routing-context-summary {
+  display: grid;
+  gap: var(--gh-ref-space-1);
+}
+
+.routing-context-line,
+.routing-origin {
+  min-width: 0;
+  color: var(--gh-sys-fg-muted);
+  font-family: var(--gh-ref-font-mono);
+  font-size: var(--gh-type-caption);
+  overflow-wrap: anywhere;
+}
+
+.routing-context-table {
+  table-layout: fixed;
+}
+
 .endpoint-template {
   min-width: 0;
   font-family: var(--gh-ref-font-mono);

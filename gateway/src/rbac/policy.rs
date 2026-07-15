@@ -11,9 +11,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use url::Url;
 
 use super::rule::{
-    principal_identity_matches, valid_auth_method_name, PrincipalMatcher, Rule,
+    principal_identity_matches, valid_auth_method_name, PrincipalMatcher, Rule, RuleDispatchKind,
     AUTH_METHOD_BEARER_TOKEN, AUTH_METHOD_SESSION_COOKIE,
 };
 use crate::{auth::principal::canonical_issuer, auth::Principal, config::Config};
@@ -440,6 +441,32 @@ fn validate_rules(rules: &[Rule]) -> Result<(), PolicyError> {
                     "rules[{rule_index}].methods must be empty when tool_name is set"
                 )));
             }
+
+            if rule.dispatch.is_some() {
+                return Err(PolicyError::Invalid(format!(
+                    "rules[{rule_index}].dispatch is only valid for HTTP path rules"
+                )));
+            }
+        }
+
+        if let Some(dispatch) = rule.dispatch.as_ref() {
+            match dispatch.kind {
+                RuleDispatchKind::Contextless => {
+                    if dispatch.upstream_origin.is_some() {
+                        return Err(PolicyError::Invalid(format!(
+                            "rules[{rule_index}].dispatch.upstream_origin must be omitted for a contextless dispatch"
+                        )));
+                    }
+                }
+                RuleDispatchKind::Legacy => {
+                    let upstream_origin = dispatch.upstream_origin.as_deref().ok_or_else(|| {
+                        PolicyError::Invalid(format!(
+                            "rules[{rule_index}].dispatch.upstream_origin is required for a legacy dispatch"
+                        ))
+                    })?;
+                    validate_rule_dispatch_origin(upstream_origin, rule_index)?;
+                }
+            }
         }
 
         if has_path && !rule.path.starts_with('/') {
@@ -459,6 +486,38 @@ fn validate_rules(rules: &[Rule]) -> Result<(), PolicyError> {
             }
         }
         validate_principal_matcher(&rule.principal, &format!("rules[{rule_index}].principal"))?;
+    }
+
+    Ok(())
+}
+
+fn validate_rule_dispatch_origin(
+    upstream_origin: &str,
+    rule_index: usize,
+) -> Result<(), PolicyError> {
+    upstream_origin
+        .strip_prefix("http://")
+        .or_else(|| upstream_origin.strip_prefix("https://"))
+        .filter(|authority| {
+            !authority.is_empty()
+                && !authority
+                    .chars()
+                    .any(|character| matches!(character, '/' | '?' | '#' | '@'))
+        })
+        .ok_or_else(|| {
+            PolicyError::Invalid(format!(
+                "rules[{rule_index}].dispatch.upstream_origin must be an HTTP(S) origin without credentials, path, query, or fragment"
+            ))
+        })?;
+    let parsed = Url::parse(upstream_origin).map_err(|_| {
+        PolicyError::Invalid(format!(
+            "rules[{rule_index}].dispatch.upstream_origin must be a valid HTTP(S) origin"
+        ))
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(PolicyError::Invalid(format!(
+            "rules[{rule_index}].dispatch.upstream_origin must be a valid HTTP(S) origin"
+        )));
     }
 
     Ok(())
@@ -1763,6 +1822,95 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_binding_requires_a_valid_kind_and_origin_only_http_url() {
+        for invalid_origin in [
+            "https://example.test/path",
+            "https://user@example.test",
+            "https://example.test?query=yes",
+            "https://example.test#fragment",
+            "ftp://example.test",
+            "HTTPS://EXAMPLE.TEST",
+        ] {
+            let error = Policy::validate_json_value(json!({
+                "schema_version": "0.1.0",
+                "rules": [{
+                    "path": "/reports/{id}",
+                    "dispatch": {
+                        "kind": "legacy",
+                        "upstream_origin": invalid_origin
+                    },
+                    "action": "allow"
+                }]
+            }))
+            .expect_err("invalid dispatch origin should be rejected");
+            assert!(
+                error.to_string().contains("HTTP(S) origin"),
+                "unexpected error for {invalid_origin}: {error}"
+            );
+        }
+
+        for invalid_dispatch in [
+            json!(null),
+            json!({
+                "kind": "contextless",
+                "upstream_origin": "https://example.test"
+            }),
+            json!({
+                "kind": "contextless",
+                "upstream_origin": null
+            }),
+            json!({ "kind": "legacy" }),
+            json!({
+                "kind": "legacy",
+                "upstream_origin": null
+            }),
+        ] {
+            Policy::validate_json_value(json!({
+                "schema_version": "0.1.0",
+                "rules": [{
+                    "path": "/reports/{id}",
+                    "dispatch": invalid_dispatch,
+                    "action": "allow"
+                }]
+            }))
+            .expect_err("dispatch kind and origin must agree");
+        }
+
+        let error = Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "rules": [{
+                "tool_name": "reports.export",
+                "dispatch": { "kind": "contextless" },
+                "action": "deny"
+            }]
+        }))
+        .expect_err("tool rules must not have HTTP dispatch provenance");
+        assert!(error
+            .to_string()
+            .contains("dispatch is only valid for HTTP path rules"));
+
+        Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "rules": [
+                {
+                    "path": "/local/{id}",
+                    "dispatch": { "kind": "contextless" },
+                    "action": "allow"
+                },
+                {
+                    "path": "/reports/{id}",
+                    "dispatch": {
+                        "kind": "legacy",
+                        "upstream_origin": "https://EXAMPLE.TEST:443"
+                    },
+                    "action": "allow"
+                }
+            ]
+        }))
+        .expect("contextless and origin-only legacy dispatch bindings should be valid");
+    }
+
+    #[test]
     fn malformed_path_capture_segment_is_rejected() {
         let cases = [
             (
@@ -2195,6 +2343,10 @@ mod tests {
                     "enabled": false,
                     "methods": ["GET", "HEAD"],
                     "path": "/api/users/{id}",
+                    "dispatch": {
+                        "kind": "legacy",
+                        "upstream_origin": "https://api.example.test"
+                    },
                     "principal": {
                         "roles": ["admin", "support"],
                         "auth_methods": ["bearer_token"],
@@ -2228,6 +2380,57 @@ mod tests {
         });
 
         assert_schema_accepts(&validator, &policy);
+    }
+
+    #[test]
+    fn published_schema_rejects_dispatch_on_tool_rule() {
+        let validator = policy_schema_validator();
+        let policy = json!({
+            "schema_version": "0.1.0",
+            "rules": [{
+                "tool_name": "reports.export",
+                "dispatch": { "kind": "contextless" },
+                "action": "deny"
+            }]
+        });
+
+        assert!(!validator.is_valid(&policy));
+    }
+
+    #[test]
+    fn published_schema_enforces_dispatch_kind_and_origin_shape() {
+        let validator = policy_schema_validator();
+        for dispatch in [
+            json!(null),
+            json!({ "upstream_origin": "https://api.example.test" }),
+            json!({ "kind": "legacy" }),
+            json!({
+                "kind": "contextless",
+                "upstream_origin": "https://api.example.test"
+            }),
+            json!({
+                "kind": "contextless",
+                "upstream_origin": null
+            }),
+            json!({
+                "kind": "legacy",
+                "upstream_origin": "https://api.example.test/path"
+            }),
+            json!({
+                "kind": "legacy",
+                "upstream_origin": "https://user@api.example.test"
+            }),
+        ] {
+            let policy = json!({
+                "schema_version": "0.1.0",
+                "rules": [{
+                    "path": "/api/{id}",
+                    "dispatch": dispatch,
+                    "action": "allow"
+                }]
+            });
+            assert!(!validator.is_valid(&policy), "schema accepted {policy}");
+        }
     }
 
     #[test]

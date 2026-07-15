@@ -1209,6 +1209,30 @@ fn gateway_app_with_process_started_at(
         .map(discovery::query::DiscoveryQueryStore::open)
         .transpose()?
         .map(Arc::new);
+    let mut configured_suggestion_routes = config
+        .upstream_url
+        .as_deref()
+        .map(|upstream_url| {
+            discovery::suggestions::ConfiguredProxyRoute::new(
+                None,
+                None,
+                upstream_origin_from_url(upstream_url, "UPSTREAM_URL"),
+            )
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    configured_suggestion_routes.extend(config.upstream_routes.iter().enumerate().map(
+        |(index, route)| {
+            discovery::suggestions::ConfiguredProxyRoute::new(
+                route.host.clone(),
+                route.path_prefix.clone(),
+                upstream_origin_from_url(
+                    &route.upstream_url,
+                    &format!("UPSTREAM_ROUTES[{index}].upstream_url"),
+                ),
+            )
+        },
+    ));
     let rule_suggestion_engine = config
         .discovery_sqlite_path
         .as_deref()
@@ -1218,6 +1242,7 @@ fn gateway_app_with_process_started_at(
                 config.audit_sqlite_path.as_deref(),
                 config.rule_suggestion_config(),
             )
+            .map(|engine| engine.with_configured_proxy_routes(configured_suggestion_routes))
         })
         .transpose()?
         .map(Arc::new);
@@ -2055,26 +2080,13 @@ fn apply_middleware(
 ) -> Router {
     let request_id_header = request_id_header();
 
-    // Later axum layers run earlier at runtime. Requests flow through CSRF,
-    // auth, principal-aware rate limiting, proxy dispatch classification, RBAC,
-    // then the route handler. The coarse global rate limiter remains outside
-    // auth for early IP/session DoS protection.
+    // Later axum layers run earlier at runtime. Observation wraps proxy dispatch
+    // classification, which must complete before any validation, rate limiting,
+    // auth, or RBAC layer can short-circuit the request.
     let router = if let Some(rbac_state) = stack.rbac_state.clone() {
         router.layer(axum::middleware::from_fn_with_state(
             rbac_state,
             middleware::rbac::rbac_middleware,
-        ))
-    } else {
-        router
-    };
-
-    // This layer runs before RBAC and marks only requests that Axum can dispatch
-    // to proxy fallback. Gateway-owned routes and the split admin listener are
-    // deliberately excluded so upstream policy cannot replace local policy.
-    let router = if proxy_fallback_enabled && stack.proxy_dispatch_state.proxy.is_some() {
-        router.layer(axum::middleware::from_fn_with_state(
-            stack.proxy_dispatch_state.clone(),
-            proxy_dispatch_context_middleware,
         ))
     } else {
         router
@@ -2106,7 +2118,23 @@ fn apply_middleware(
         .layer(axum::middleware::from_fn_with_state(
             stack.rate_limit_state.clone(),
             middleware::rate_limit::rate_limit_request,
-        ))
+        ));
+
+    // Classification runs immediately inside observation and stamps every
+    // observed request, including gateway-owned and contextless requests. This
+    // keeps early auth/rate-limit/validation rejections route-aware while still
+    // preventing proxy policy from replacing local route policy.
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        ProxyDispatchState {
+            routes: stack.proxy_dispatch_state.routes.clone(),
+            proxy: proxy_fallback_enabled
+                .then(|| stack.proxy_dispatch_state.proxy.clone())
+                .flatten(),
+        },
+        proxy_dispatch_context_middleware,
+    ));
+
+    let router = router
         .layer(axum::middleware::from_fn_with_state(
             stack.observation_state.clone(),
             middleware::observation::observation_middleware,
@@ -2130,18 +2158,33 @@ async fn proxy_dispatch_context_middleware(
     mut request: Request<Body>,
     next: axum::middleware::Next,
 ) -> Response {
+    request
+        .extensions_mut()
+        .insert(upstream_route::ProxyRouteClassificationCompleted);
     let path = request.uri().path();
-    if !state.routes.is_gateway_owned_path(path) {
-        if let Some(context) = state
+    let observation_context = if !state.routes.is_gateway_owned_path(path) {
+        state
             .proxy
             .as_ref()
-            .and_then(|proxy| proxy.authorization_context_for_request(path, request.headers()))
-        {
-            request.extensions_mut().insert(context);
+            .and_then(|proxy| proxy.observation_context_for_request(path, request.headers()))
+    } else {
+        None
+    };
+    if let Some(context) = observation_context.as_ref() {
+        request.extensions_mut().insert(context.clone());
+        if let Some(authorization_context) = context.authorization_context() {
+            request.extensions_mut().insert(authorization_context);
         }
     }
 
-    next.run(request).await
+    let mut response = next.run(request).await;
+    response
+        .extensions_mut()
+        .insert(upstream_route::ProxyRouteClassificationCompleted);
+    if let Some(context) = observation_context {
+        response.extensions_mut().insert(context);
+    }
+    response
 }
 
 fn install_metrics_recorder() -> Result<PrometheusHandle, metrics_exporter_prometheus::BuildError> {
@@ -2425,22 +2468,28 @@ impl ProxyState {
         }
     }
 
-    fn authorization_context_for_request(
+    fn observation_context_for_request(
         &self,
         path: &str,
         headers: &HeaderMap,
-    ) -> Option<upstream_route::ProxyRouteAuthorizationContext> {
-        let ProxyRoutes::RoutingTable { routes } = &self.routes else {
-            return None;
-        };
-        let route = routing_route_for_request(routes, path, headers)?;
-        let host = route.host.clone()?;
-
-        Some(upstream_route::ProxyRouteAuthorizationContext::new(
-            host,
-            route.path_prefix.clone(),
-            route.upstream_origin.clone(),
-        ))
+    ) -> Option<upstream_route::ProxyRouteObservationContext> {
+        match &self.routes {
+            ProxyRoutes::Legacy { upstream_origin } => {
+                Some(upstream_route::ProxyRouteObservationContext::new(
+                    None,
+                    None,
+                    upstream_origin.clone(),
+                ))
+            }
+            ProxyRoutes::RoutingTable { routes } => {
+                let route = routing_route_for_request(routes, path, headers)?;
+                Some(upstream_route::ProxyRouteObservationContext::new(
+                    route.host.clone(),
+                    route.path_prefix.clone(),
+                    route.upstream_origin.clone(),
+                ))
+            }
+        }
     }
 
     async fn upstream_health_response(&self) -> UpstreamHealthResponse {
@@ -4468,13 +4517,48 @@ async fn rule_suggestion_accept_endpoint(
         );
     }
 
+    let dispatch = match suggestion_engine.direct_rule_suggestion_safety(&suggestion) {
+        Ok(discovery::suggestions::DirectRuleSuggestionSafety::Safe(dispatch)) => dispatch,
+        Ok(discovery::suggestions::DirectRuleSuggestionSafety::HostRouted) => {
+            return conflict(
+                "suggestion targets host-routed traffic and cannot be accepted as a direct rule",
+            );
+        }
+        Ok(discovery::suggestions::DirectRuleSuggestionSafety::PathRouted) => {
+            return conflict(
+                "suggestion targets path-routed traffic and cannot be accepted as a direct rule",
+            );
+        }
+        Ok(discovery::suggestions::DirectRuleSuggestionSafety::AmbiguousRouting) => {
+            return conflict(
+                "suggestion spans multiple upstream routing contexts and cannot be accepted as a direct rule",
+            );
+        }
+        Ok(discovery::suggestions::DirectRuleSuggestionSafety::UnknownRoutingContext) => {
+            return conflict(
+                "suggestion predates trusted routing context and cannot be accepted; dismiss it and review newly classified traffic",
+            );
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to revalidate rule suggestion routing context");
+            return internal_server_error("suggestion routing-context validation failed");
+        }
+    };
+
+    let mut proposed_rule = suggestion.proposed_rule.clone();
+    if proposed_rule.tool_name.is_none() {
+        // Recompute this binding from current trusted routing state instead of
+        // trusting the copy persisted with the advisory suggestion.
+        proposed_rule.dispatch = Some(dispatch);
+    }
+
     let created = match create_policy_rule(
         &state.policy,
         &parts,
         &principal,
         rbac_state,
         policy_file,
-        suggestion.proposed_rule.clone(),
+        proposed_rule,
     ) {
         Ok(result) => result,
         Err(response) => return *response,
@@ -4808,11 +4892,7 @@ async fn traffic_endpoint_detail_endpoint(
             return internal_server_error("traffic endpoint detail query failed");
         }
     };
-    endpoint.covered_by_rule = endpoint_covered_by_active_direct_rule(
-        Some(rbac_state),
-        &params.method,
-        &params.endpoint_template,
-    );
+    apply_endpoint_detail_rule_coverage(&mut endpoint, Some(rbac_state));
     let principals = match discovery_store.list_principals(
         &params.method,
         &params.endpoint_template,
@@ -5805,9 +5885,36 @@ fn preview_rule(
                 .actor
                 .as_ref()
                 .and_then(principal_from_audit_actor);
+            let payload = serde_json::from_str::<Value>(&observation.payload_json).ok();
+            let payload_string = |key: &str| {
+                payload
+                    .as_ref()
+                    .and_then(|payload| payload.get(key))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+            };
+            let dispatch_context = if payload
+                .as_ref()
+                .and_then(|payload| payload.get("routing_context_known"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                rbac::RuleDispatchContext::classified(
+                    payload_string("upstream_route_host"),
+                    payload_string("upstream_route_path_prefix"),
+                    payload_string("upstream_origin"),
+                )
+            } else {
+                rbac::RuleDispatchContext::unknown()
+            };
 
             if matcher
-                .evaluate(&observation.method, &observation.path, principal.as_ref())
+                .evaluate_with_dispatch(
+                    &observation.method,
+                    &observation.path,
+                    principal.as_ref(),
+                    dispatch_context,
+                )
                 .is_some()
             {
                 match_count = match_count.saturating_add(1);
@@ -5945,11 +6052,7 @@ fn enrich_endpoint_summaries_with_rule_coverage(
     let policy = rbac_state.current_policy();
 
     for endpoint in endpoints {
-        endpoint.covered_by_rule = endpoint_covered_by_policy_direct_rules(
-            &policy,
-            &endpoint.method,
-            &endpoint.endpoint_template,
-        );
+        apply_endpoint_summary_rule_coverage(endpoint, &policy);
     }
 }
 
@@ -6096,40 +6199,183 @@ fn rfc3339_after(left: &str, right: &str) -> bool {
     }
 }
 
-fn endpoint_covered_by_active_direct_rule(
+fn apply_endpoint_detail_rule_coverage(
+    endpoint: &mut discovery::query::EndpointAggregateDetail,
     rbac_state: Option<&middleware::rbac::RbacState>,
-    method: &str,
-    endpoint_template: &str,
-) -> bool {
+) {
     let Some(rbac_state) = rbac_state else {
-        return false;
+        return;
     };
+    if !endpoint.routing_context_known {
+        endpoint.coverage_scope = discovery::query::EndpointCoverageScope::Unknown;
+        endpoint.covered_by_rule = false;
+        return;
+    }
     let policy = rbac_state.current_policy();
-
-    endpoint_covered_by_policy_direct_rules(&policy, method, endpoint_template)
+    let method = endpoint.method.clone();
+    let endpoint_template = endpoint.endpoint_template.clone();
+    apply_routing_context_coverage(
+        &mut endpoint.routing_contexts,
+        &policy,
+        &method,
+        &endpoint_template,
+    );
+    endpoint.coverage_scope = aggregate_coverage_scope(
+        &policy,
+        &method,
+        &endpoint_template,
+        &endpoint.routing_contexts,
+    );
+    endpoint.covered_by_rule =
+        endpoint.coverage_scope == discovery::query::EndpointCoverageScope::Endpoint;
 }
 
-fn endpoint_covered_by_policy_direct_rules(
+fn apply_endpoint_summary_rule_coverage(
+    endpoint: &mut discovery::query::EndpointSummary,
+    policy: &rbac::Policy,
+) {
+    if !endpoint.routing_context_known {
+        endpoint.coverage_scope = discovery::query::EndpointCoverageScope::Unknown;
+        endpoint.covered_by_rule = false;
+        return;
+    }
+    let method = endpoint.method.clone();
+    let endpoint_template = endpoint.endpoint_template.clone();
+    apply_routing_context_coverage(
+        &mut endpoint.routing_contexts,
+        policy,
+        &method,
+        &endpoint_template,
+    );
+    endpoint.coverage_scope = aggregate_coverage_scope(
+        policy,
+        &method,
+        &endpoint_template,
+        &endpoint.routing_contexts,
+    );
+    endpoint.covered_by_rule =
+        endpoint.coverage_scope == discovery::query::EndpointCoverageScope::Endpoint;
+}
+
+fn apply_routing_context_coverage(
+    contexts: &mut [discovery::query::EndpointRoutingContext],
     policy: &rbac::Policy,
     method: &str,
     endpoint_template: &str,
-) -> bool {
+) {
+    for context in contexts {
+        context.coverage_scope =
+            endpoint_coverage_scope(policy, method, endpoint_template, Some(context));
+        context.covered_by_rule =
+            context.coverage_scope == discovery::query::EndpointCoverageScope::Endpoint;
+    }
+}
+
+fn aggregate_coverage_scope(
+    policy: &rbac::Policy,
+    method: &str,
+    endpoint_template: &str,
+    contexts: &[discovery::query::EndpointRoutingContext],
+) -> discovery::query::EndpointCoverageScope {
+    if contexts.is_empty() {
+        return endpoint_coverage_scope(policy, method, endpoint_template, None);
+    }
+
+    let first = contexts[0].coverage_scope;
+    if contexts
+        .iter()
+        .all(|context| context.coverage_scope == first)
+    {
+        first
+    } else {
+        discovery::query::EndpointCoverageScope::Mixed
+    }
+}
+
+fn endpoint_coverage_scope(
+    policy: &rbac::Policy,
+    method: &str,
+    endpoint_template: &str,
+    context: Option<&discovery::query::EndpointRoutingContext>,
+) -> discovery::query::EndpointCoverageScope {
     if policy.rules.is_empty() {
-        return false;
+        return host_route_coverage_scope(policy, method, endpoint_template, context);
     }
 
     let path = representative_path_from_endpoint_template(endpoint_template);
     let matcher = rbac::RuleMatcher::new(&policy.rules);
-    if matcher.evaluate(method, &path, None).is_some() {
-        return true;
+    let host_qualified = context.and_then(|context| context.route_host.as_deref());
+    let dispatch_context = context.map_or_else(rbac::RuleDispatchContext::unknown, |context| {
+        rbac::RuleDispatchContext::classified(
+            context.route_host.as_deref(),
+            context.route_path_prefix.as_deref(),
+            context.upstream_origin.as_deref(),
+        )
+    });
+    let endpoint_wide = if host_qualified.is_some() {
+        matcher
+            .evaluate_denies_with_dispatch(method, &path, None, dispatch_context)
+            .is_some()
+    } else {
+        matcher
+            .evaluate_with_dispatch(method, &path, None, dispatch_context)
+            .is_some()
+    };
+    if endpoint_wide {
+        return discovery::query::EndpointCoverageScope::Endpoint;
     }
 
-    policy.rules.iter().any(|rule| {
+    let principal_scoped = policy.rules.iter().any(|rule| {
         let Some(principal) = representative_principal_for_rule(rule) else {
             return false;
         };
-        matcher.evaluate(method, &path, Some(&principal)).is_some()
-    })
+        if host_qualified.is_some() {
+            matcher
+                .evaluate_denies_with_dispatch(method, &path, Some(&principal), dispatch_context)
+                .is_some()
+        } else {
+            matcher
+                .evaluate_with_dispatch(method, &path, Some(&principal), dispatch_context)
+                .is_some()
+        }
+    });
+    if principal_scoped {
+        return discovery::query::EndpointCoverageScope::Principal;
+    }
+
+    host_route_coverage_scope(policy, method, endpoint_template, context)
+}
+
+fn host_route_coverage_scope(
+    policy: &rbac::Policy,
+    method: &str,
+    endpoint_template: &str,
+    context: Option<&discovery::query::EndpointRoutingContext>,
+) -> discovery::query::EndpointCoverageScope {
+    let Some(host) = context.and_then(|context| context.route_host.as_deref()) else {
+        return discovery::query::EndpointCoverageScope::None;
+    };
+    let path = representative_path_from_endpoint_template(endpoint_template);
+    let Some(route) = policy.routes.iter().find(|route| {
+        rbac::matcher::method_matches(&route.methods, method)
+            && path_match::path_prefix_matches(&path, &route.path_prefix)
+            && route
+                .hosts
+                .iter()
+                .any(|route_host| route_host.eq_ignore_ascii_case(host))
+    }) else {
+        return discovery::query::EndpointCoverageScope::None;
+    };
+    let permission_granted = policy.roles.values().any(|role| {
+        role.permissions
+            .iter()
+            .any(|permission| permission == "*" || permission == &route.permission)
+    });
+    if permission_granted {
+        discovery::query::EndpointCoverageScope::Principal
+    } else {
+        discovery::query::EndpointCoverageScope::None
+    }
 }
 
 fn representative_path_from_endpoint_template(endpoint_template: &str) -> String {
@@ -13624,6 +13870,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_rejection_preserves_configured_proxy_routing_context() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut config = routing_proxy_config(vec![host_path_route(
+            "api.example.test",
+            "/private",
+            upstream_addr,
+        )]);
+        config.auth_enabled = true;
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
+        let router = proxy_router(config, audit_log);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/private/report")
+                    .header(header::HOST, "api.example.test")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("auth-rejected request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eventually(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == "http.request_observed"
+                    && event.payload["path"] == json!("/private/report")
+            })
+        });
+        let observed = capture
+            .events()
+            .into_iter()
+            .find(|event| {
+                event.event_type == "http.request_observed"
+                    && event.payload["path"] == json!("/private/report")
+            })
+            .expect("auth rejection observation should exist");
+        assert_eq!(observed.payload["routing_context_known"], json!(true));
+        assert_eq!(
+            observed.payload["upstream_route_host"],
+            json!("api.example.test")
+        );
+        assert_eq!(
+            observed.payload["upstream_route_path_prefix"],
+            json!("/private")
+        );
+        assert!(observed.payload["upstream_origin"]
+            .as_str()
+            .is_some_and(|origin| origin.contains(&upstream_addr.port().to_string())));
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "auth rejection must not reach the selected upstream",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn global_rate_limit_rejection_preserves_configured_proxy_routing_context() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut config = routing_proxy_config(vec![host_path_route(
+            "api.example.test",
+            "/limited",
+            upstream_addr,
+        )]);
+        config.rate_limit_read_rps = 0.001;
+        config.rate_limit_read_burst = 1;
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
+        let router = proxy_router(config, audit_log);
+        let request = || {
+            Request::builder()
+                .uri("/limited/report")
+                .header(header::HOST, "api.example.test")
+                .body(Body::empty())
+                .expect("request should build")
+        };
+
+        let first = router
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("first request should complete");
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let second = router
+            .oneshot(request())
+            .await
+            .expect("rate-limited request should complete");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        assert_eventually(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == "http.request_observed"
+                    && event.payload["path"] == json!("/limited/report")
+                    && event.payload["status"] == json!(429)
+            })
+        });
+        let observed = capture
+            .events()
+            .into_iter()
+            .find(|event| {
+                event.event_type == "http.request_observed"
+                    && event.payload["path"] == json!("/limited/report")
+                    && event.payload["status"] == json!(429)
+            })
+            .expect("rate-limit rejection observation should exist");
+        assert_eq!(observed.payload["routing_context_known"], json!(true));
+        assert_eq!(
+            observed.payload["upstream_route_host"],
+            json!("api.example.test")
+        );
+        assert_eq!(
+            observed.payload["upstream_route_path_prefix"],
+            json!("/limited")
+        );
+        assert!(observed.payload["upstream_origin"]
+            .as_str()
+            .is_some_and(|origin| origin.contains(&upstream_addr.port().to_string())));
+
+        let proxied = next_proxied_request(
+            &mut captured,
+            "only the first rate-limit request should reach upstream",
+        )
+        .await;
+        assert_eq!(proxied.path_and_query, "/limited/report");
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "the rejected rate-limit request must not reach upstream",
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn audit_query_without_principal_returns_unauthorized() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let response = app(
@@ -14997,6 +15376,10 @@ mod tests {
                 "id": "managed-rule",
                 "methods": ["GET"],
                 "path": "/patch",
+                "dispatch": {
+                    "kind": "legacy",
+                    "upstream_origin": "https://api.example.test"
+                },
                 "principal": { "roles": ["admin"] },
                 "action": "allow"
             }]),
@@ -15027,6 +15410,11 @@ mod tests {
         assert_eq!(patched_rule["id"], json!("managed-rule"));
         assert_eq!(patched_rule["methods"], json!(["GET"]));
         assert_eq!(patched_rule["path"], json!("/patch"));
+        assert_eq!(
+            patched_rule["dispatch"]["upstream_origin"],
+            json!("https://api.example.test")
+        );
+        assert_eq!(patched_rule["dispatch"]["kind"], json!("legacy"));
         assert_eq!(patched_rule["principal"]["roles"], json!(["admin"]));
         assert_eq!(patched_rule["action"], json!("deny"));
 
@@ -16625,6 +17013,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_rule_preview_contextless_binding_excludes_unclassified_history() {
+        let db = TempDb::new("rule-preview-contextless");
+        create_audit_schema(&db.path);
+        seed_rule_preview_events(&db.path);
+        let connection = Connection::open(&db.path).expect("audit database should open");
+        connection
+            .execute(
+                "UPDATE audit_events SET payload_json = json_remove(payload_json, '$.routing_context_known')",
+                [],
+            )
+            .expect("legacy preview events should become unclassified");
+        connection
+            .execute(
+                "UPDATE audit_events SET payload_json = ?1 WHERE event_id = 'match-new'",
+                params![json!({
+                    "method": "GET",
+                    "path": "/api/items/4",
+                    "status": 200,
+                    "policy_decision": "allowed",
+                    "matched_rule_id": "existing-rule",
+                    "routing_context_known": true
+                })
+                .to_string()],
+            )
+            .expect("classified preview event should update");
+        drop(connection);
+
+        let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+        let router =
+            policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+        let response = router
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_RULE_PREVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(
+                    json!({
+                        "rule": {
+                            "methods": ["GET"],
+                            "path": "/api/items/{id}",
+                            "dispatch": { "kind": "contextless" },
+                            "principal": { "roles": ["reader"] },
+                            "action": "deny"
+                        }
+                    })
+                    .to_string(),
+                ),
+                None,
+            ))
+            .await
+            .expect("contextless preview should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["match_count"], json!(1));
+        assert_eq!(body["samples"][0]["event_id"], json!("match-new"));
+    }
+
+    #[tokio::test]
     async fn policy_rule_preview_requires_audit_sqlite_path() {
         let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
         let router = policy_admin_router(Some(&policy), test_audit_log());
@@ -16909,6 +17356,7 @@ mod tests {
                 methods: vec!["GET".to_owned()],
                 path: "/load/{id}".to_owned(),
                 tool_name: None,
+                dispatch: None,
                 principal: rbac::PrincipalMatcher {
                     roles: vec!["reader".to_owned()],
                     issuers: Vec::new(),
@@ -17032,10 +17480,26 @@ mod tests {
     #[tokio::test]
     async fn schema_coverage_reports_undocumented_endpoints_and_unused_operations() {
         let discovery_db = TempDb::new("schema-coverage");
+        create_discovery_schema(&discovery_db.path);
         seed_discovery_endpoint(&discovery_db.path, "GET", "/users/{id}");
         seed_discovery_endpoint(&discovery_db.path, "POST", "/users");
         seed_discovery_endpoint(&discovery_db.path, "GET", "/internal/health");
         seed_discovery_endpoint(&discovery_db.path, "GET", "/reports/{id}/summary/details");
+        for (host, origin) in [
+            ("api.example.test", "https://api.internal"),
+            ("admin.example.test", "https://admin.internal"),
+        ] {
+            insert_discovery_routing_context(
+                &discovery_db.path,
+                "GET",
+                "/internal/health",
+                host,
+                "/internal",
+                origin,
+                1,
+                0,
+            );
+        }
         let spec = TempSpecFile::new(
             "coverage",
             r#"
@@ -18436,6 +18900,125 @@ paths:
     }
 
     #[tokio::test]
+    async fn migrated_traffic_endpoint_reports_unknown_context_and_no_rule_coverage() {
+        let discovery_db = TempDb::new("traffic-migrated-unknown-context");
+        create_discovery_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/legacy/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 4,
+                latency_count: 4,
+                latency_p50_ms: 10,
+                latency_p95_ms: 20,
+                latency_p99_ms: 20,
+                distinct_principal_count: 1,
+                status_counts: &[(200, 4)],
+            },
+        );
+        clear_discovery_routing_classification(&discovery_db.path, "GET", "/legacy/{id}");
+
+        let (router, _policy) = traffic_admin_router(Some(&discovery_db.path), None);
+        let body = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?method=GET",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        let endpoint = &body["endpoints"][0];
+
+        assert_eq!(endpoint["routing_context_known"], json!(false));
+        assert_eq!(endpoint["routing_context_known_since"], Value::Null);
+        assert_eq!(endpoint["coverage_scope"], json!("unknown"));
+        assert_eq!(endpoint["covered_by_rule"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn mixed_legacy_and_classified_history_remains_unknown_and_uncovered() {
+        let discovery_db = TempDb::new("traffic-mixed-unknown-context");
+        create_discovery_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/mixed/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T02:00:00Z",
+                call_count: 5,
+                latency_count: 5,
+                latency_p50_ms: 10,
+                latency_p95_ms: 20,
+                latency_p99_ms: 20,
+                distinct_principal_count: 1,
+                status_counts: &[(200, 5)],
+            },
+        );
+        insert_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/mixed/{id}",
+            "",
+            "",
+            "https://legacy.internal",
+            1,
+            1,
+        );
+        let connection =
+            Connection::open(&discovery_db.path).expect("test discovery database should open");
+        connection
+            .execute(
+                r#"
+                UPDATE discovery_endpoint_routing_classifications
+                SET first_classified_at = '2024-06-01T01:00:00Z'
+                WHERE method = 'GET' AND endpoint_template = '/mixed/{id}'
+                "#,
+                [],
+            )
+            .expect("classification timestamp should update");
+        connection
+            .execute(
+                r#"
+                UPDATE discovery_endpoint_routing_contexts
+                SET first_seen = '2024-06-01T01:00:00Z'
+                WHERE method = 'GET' AND endpoint_template = '/mixed/{id}'
+                "#,
+                [],
+            )
+            .expect("routing context timestamp should update");
+        drop(connection);
+
+        let policy = TempPolicyFile::new(&traffic_policy_document_with_rules(json!([{
+            "methods": ["GET"],
+            "path": "/mixed/{id}",
+            "dispatch": {
+                "kind": "legacy",
+                "upstream_origin": "https://legacy.internal"
+            },
+            "action": "allow"
+        }])));
+        let router = traffic_admin_router_with_policy(Some(&discovery_db.path), None, &policy);
+        let body = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?method=GET",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        let endpoint = &body["endpoints"][0];
+
+        assert_eq!(endpoint["routing_context_known"], json!(false));
+        assert_eq!(
+            endpoint["routing_context_known_since"],
+            json!("2024-06-01T01:00:00Z")
+        );
+        assert_eq!(endpoint["routing_contexts"].as_array().unwrap().len(), 1);
+        assert_eq!(endpoint["coverage_scope"], json!("unknown"));
+        assert_eq!(endpoint["covered_by_rule"], json!(false));
+    }
+
+    #[tokio::test]
     async fn traffic_endpoint_lifecycle_flags_rule_coverage_and_hot_reload() {
         let discovery_db = TempDb::new("traffic-lifecycle-coverage");
         create_discovery_schema(&discovery_db.path);
@@ -18537,14 +19120,122 @@ paths:
         ])));
 
         let reloaded = wait_for_traffic_json(&router, "/v1/admin/traffic/endpoints", |body| {
-            endpoint_coverage(body).get("/open/{id}") == Some(&true)
+            endpoint_coverage_scopes(body).get("/open/{id}") == Some(&"principal".to_owned())
         })
         .await;
         assert_eq!(
             endpoint_coverage(&reloaded),
             HashMap::from([
                 ("/covered/{id}".to_owned(), true),
-                ("/open/{id}".to_owned(), true)
+                ("/open/{id}".to_owned(), false)
+            ])
+        );
+        assert_eq!(
+            endpoint_coverage_scopes(&reloaded),
+            HashMap::from([
+                ("/covered/{id}".to_owned(), "endpoint".to_owned()),
+                ("/open/{id}".to_owned(), "principal".to_owned())
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_inventory_reports_route_variants_and_mixed_principal_coverage() {
+        let discovery_db = TempDb::new("traffic-routing-coverage");
+        create_discovery_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/data/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 4,
+                latency_count: 4,
+                latency_p50_ms: 10,
+                latency_p95_ms: 20,
+                latency_p99_ms: 30,
+                distinct_principal_count: 2,
+                status_counts: &[(200, 4)],
+            },
+        );
+        insert_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/data/{id}",
+            "api.example.test",
+            "/data",
+            "https://api.internal",
+            3,
+            2,
+        );
+        insert_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/data/{id}",
+            "admin.example.test",
+            "/data",
+            "https://admin.internal",
+            1,
+            1,
+        );
+        let policy = TempPolicyFile::new(
+            &serde_json::to_string_pretty(&json!({
+                "schema_version": "0.1.0",
+                "default_action": "deny",
+                "roles": {
+                    "traffic-reader": {
+                        "permissions": [ADMIN_TRAFFIC_READ_PERMISSION]
+                    },
+                    "api-reader": {
+                        "permissions": ["api:read"]
+                    }
+                },
+                "routes": [{
+                    "methods": ["GET"],
+                    "hosts": ["api.example.test"],
+                    "path_prefix": "/data",
+                    "permission": "api:read"
+                }]
+            }))
+            .expect("traffic routing policy should serialize"),
+        );
+        let router = traffic_admin_router_with_policy(Some(&discovery_db.path), None, &policy);
+
+        let body = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        let endpoint = &body["endpoints"][0];
+        assert_eq!(endpoint["coverage_scope"], json!("mixed"));
+        assert_eq!(endpoint["covered_by_rule"], json!(false));
+        assert_eq!(
+            endpoint["routing_contexts"],
+            json!([
+                {
+                    "route_host": "admin.example.test",
+                    "route_path_prefix": "/data",
+                    "upstream_origin": "https://admin.internal",
+                    "first_seen": "2024-06-01T00:00:00Z",
+                    "last_seen": "2024-06-01T01:00:00Z",
+                    "call_count": 1,
+                    "distinct_principal_count": 1,
+                    "covered_by_rule": false,
+                    "coverage_scope": "none"
+                },
+                {
+                    "route_host": "api.example.test",
+                    "route_path_prefix": "/data",
+                    "upstream_origin": "https://api.internal",
+                    "first_seen": "2024-06-01T00:00:00Z",
+                    "last_seen": "2024-06-01T01:00:00Z",
+                    "call_count": 3,
+                    "distinct_principal_count": 2,
+                    "covered_by_rule": false,
+                    "coverage_scope": "principal"
+                }
             ])
         );
     }
@@ -18782,6 +19473,91 @@ paths:
             endpoint_templates(&unreviewed_list),
             vec!["/reviewed/{id}".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn traffic_review_filter_tracks_routing_context_invalidation() {
+        let discovery_db = TempDb::new("traffic-review-routing-invalidation");
+        create_discovery_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/review-invalidated/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 10,
+                latency_p95_ms: 10,
+                latency_p99_ms: 10,
+                distinct_principal_count: 0,
+                status_counts: &[(200, 1)],
+            },
+        );
+        let (router, _policy) = traffic_admin_router(Some(&discovery_db.path), None);
+        let marked = router
+            .clone()
+            .oneshot(traffic_admin_json_request(
+                Method::POST,
+                TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["traffic-writer"])),
+                Some(
+                    json!({
+                        "method": "GET",
+                        "endpoint_template": "/review-invalidated/{id}",
+                        "reviewed": true
+                    })
+                    .to_string(),
+                ),
+            ))
+            .await
+            .expect("traffic review request should complete");
+        assert_eq!(marked.status(), StatusCode::OK);
+
+        insert_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/review-invalidated/{id}",
+            "api.example.test",
+            "/review-invalidated",
+            "https://api.internal",
+            1,
+            0,
+        );
+        Connection::open(&discovery_db.path)
+            .expect("test discovery database should open")
+            .execute(
+                r#"
+                UPDATE discovery_endpoint_routing_contexts
+                SET first_seen = '2099-01-01T00:00:00Z',
+                    last_seen = '2099-01-01T00:00:00Z'
+                WHERE method = 'GET'
+                  AND endpoint_template = '/review-invalidated/{id}'
+                "#,
+                [],
+            )
+            .expect("routing context timestamp should update");
+
+        let reviewed = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?reviewed=true",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert!(endpoint_templates(&reviewed).is_empty());
+
+        let unreviewed = traffic_json(
+            &router,
+            "/v1/admin/traffic/endpoints?reviewed=false",
+            Some(test_principal(&["traffic-reader"])),
+        )
+        .await;
+        assert_eq!(
+            endpoint_templates(&unreviewed),
+            vec!["/review-invalidated/{id}".to_owned()]
+        );
+        assert_eq!(unreviewed["endpoints"][0]["reviewed"], json!(false));
     }
 
     #[tokio::test]
@@ -19349,6 +20125,10 @@ paths:
         assert_eq!(accepted_body["rule"]["path"], json!("/accepted/{id}"));
         assert_eq!(accepted_body["rule"]["action"], json!("allow"));
         assert_eq!(
+            accepted_body["rule"]["dispatch"],
+            json!({ "kind": "contextless" })
+        );
+        assert_eq!(
             accepted_body["rule"]["principal"]["roles"],
             json!(["accepted-reader"])
         );
@@ -19486,6 +20266,535 @@ paths:
         assert_eq!(
             dismissed["suggestions"][0]["transitioned_by"],
             json!("system:issuer-bound-migration")
+        );
+    }
+
+    #[tokio::test]
+    async fn suggestions_admin_accepts_mcp_tool_rule_with_http_fallback_configured() {
+        let discovery_db = TempDb::new("suggestions-tool-accept-http-fallback");
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-tool-http-fallback",
+                suggestion_type: "signal_shadow_schema_mismatch",
+                method: "MCP",
+                path_pattern: "/mcp/tools/echo",
+                role: None,
+                action: "shadow",
+                rationale: "Observed schema mismatches for the echo tool.",
+                evidence: json!({ "schema_mismatch_count": 4 }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: None,
+            },
+        );
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let mut config = suggestions_admin_config(Some(&discovery_db.path), None, &policy);
+        config.upstream_url = Some("https://http-fallback.internal".to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+        let etag = suggestions_policy_etag(&router).await;
+
+        let accepted = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-tool-http-fallback/accept",
+                Some(test_principal(&["suggestions-policy-writer"])),
+                None,
+                Some(&etag),
+            ))
+            .await
+            .expect("tool suggestion accept should complete");
+
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        let body = json_body(accepted).await;
+        assert_eq!(body["suggestion"]["state"], json!("accepted"));
+        assert_eq!(body["rule"]["tool_name"], json!("echo"));
+        assert!(body["rule"].get("dispatch").is_none());
+        assert!(body["rule"].get("path").is_none());
+    }
+
+    #[tokio::test]
+    async fn accepted_contextless_suggestion_does_not_authorize_new_path_upstream_after_restart() {
+        let discovery_db = TempDb::new("suggestions-contextless-restart");
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-contextless-restart",
+                suggestion_type: "baseline_allow",
+                method: "GET",
+                path_pattern: "/reports/{id}",
+                role: Some("reader"),
+                action: "allow",
+                rationale: "Observed contextless report traffic.",
+                evidence: json!({ "observation_count": 4 }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: None,
+            },
+        );
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let accepting_router = suggestions_admin_router_with_policy(
+            Some(&discovery_db.path),
+            None,
+            &policy,
+            test_audit_log(),
+        );
+        let etag = suggestions_policy_etag(&accepting_router).await;
+
+        let accepted = accepting_router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-contextless-restart/accept",
+                Some(test_principal(&["suggestions-policy-writer"])),
+                None,
+                Some(&etag),
+            ))
+            .await
+            .expect("contextless suggestion accept should complete");
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        let accepted_body = json_body(accepted).await;
+        assert_eq!(
+            accepted_body["rule"]["dispatch"],
+            json!({ "kind": "contextless" })
+        );
+        drop(accepting_router);
+
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut restarted_config =
+            suggestions_admin_config(Some(&discovery_db.path), None, &policy);
+        restarted_config.upstream_routes = vec![path_route("/reports", upstream_addr)];
+        restarted_config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let restarted_router = app(
+            restarted_config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("gateway should restart with the new path dispatch");
+
+        let response = restarted_router
+            .oneshot(suggestions_admin_request(
+                Method::GET,
+                "/reports/123",
+                Some(test_principal(&["reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("path-routed request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "a contextless suggestion rule must not authorize a newly routed upstream",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn accepted_legacy_suggestion_does_not_authorize_same_origin_path_route_after_restart() {
+        let discovery_db = TempDb::new("suggestions-legacy-same-origin-restart");
+        create_discovery_schema(&discovery_db.path);
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/reports/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 10,
+                latency_p95_ms: 10,
+                latency_p99_ms: 10,
+                distinct_principal_count: 1,
+                status_counts: &[(200, 1)],
+            },
+        );
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let upstream_origin = format!("http://{upstream_addr}");
+        insert_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/reports/{id}",
+            "",
+            "",
+            &upstream_origin,
+            1,
+            1,
+        );
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-legacy-same-origin-restart",
+                suggestion_type: "baseline_allow",
+                method: "GET",
+                path_pattern: "/reports/{id}",
+                role: Some("reader"),
+                action: "allow",
+                rationale: "Observed report traffic through the legacy fallback.",
+                evidence: json!({ "observation_count": 1 }),
+                state: "open",
+                created_at: "2024-06-02T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: None,
+            },
+        );
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let mut accepting_config =
+            suggestions_admin_config(Some(&discovery_db.path), None, &policy);
+        accepting_config.upstream_url = Some(upstream_origin.clone());
+        accepting_config.egress_deny_private_ips = false;
+        let accepting_recorder = PrometheusBuilder::new().build_recorder();
+        let accepting_router = app(
+            accepting_config,
+            accepting_recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("gateway should start with the legacy fallback");
+        let etag = suggestions_policy_etag(&accepting_router).await;
+
+        let accepted = accepting_router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-legacy-same-origin-restart/accept",
+                Some(test_principal(&["suggestions-policy-writer"])),
+                None,
+                Some(&etag),
+            ))
+            .await
+            .expect("legacy suggestion accept should complete");
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        let accepted_body = json_body(accepted).await;
+        assert_eq!(
+            accepted_body["rule"]["dispatch"],
+            json!({
+                "kind": "legacy",
+                "upstream_origin": upstream_origin
+            })
+        );
+        drop(accepting_router);
+
+        let mut restarted_config =
+            suggestions_admin_config(Some(&discovery_db.path), None, &policy);
+        restarted_config.upstream_routes = vec![path_route("/reports", upstream_addr)];
+        restarted_config.egress_deny_private_ips = false;
+        let restarted_recorder = PrometheusBuilder::new().build_recorder();
+        let restarted_router = app(
+            restarted_config,
+            restarted_recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("gateway should restart with a same-origin path route");
+
+        let response = restarted_router
+            .oneshot(suggestions_admin_request(
+                Method::GET,
+                "/reports/123",
+                Some(test_principal(&["reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("same-origin path-routed request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "a legacy suggestion rule must not authorize a path route at the same origin",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn suggestions_admin_rejects_pre_context_open_suggestion_without_policy_mutation() {
+        let discovery_db = TempDb::new("suggestions-pre-context-accept");
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-pre-context",
+                suggestion_type: "baseline_allow",
+                method: "GET",
+                path_pattern: "/legacy/{id}",
+                role: Some("legacy-reader"),
+                action: "allow",
+                rationale: "Legacy observation without routing classification.",
+                evidence: json!({ "observation_count": 4 }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: None,
+            },
+        );
+        clear_discovery_routing_classification(&discovery_db.path, "GET", "/legacy/{id}");
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let before = fs::read_to_string(&policy.path).expect("policy should read");
+        let router = suggestions_admin_router_with_policy(
+            Some(&discovery_db.path),
+            None,
+            &policy,
+            test_audit_log(),
+        );
+        let etag = suggestions_policy_etag(&router).await;
+
+        let response = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-pre-context/accept",
+                Some(test_principal(&["suggestions-policy-writer"])),
+                None,
+                Some(&etag),
+            ))
+            .await
+            .expect("pre-context accept request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(response).await,
+            json!({
+                "error": "suggestion predates trusted routing context and cannot be accepted; dismiss it and review newly classified traffic"
+            })
+        );
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy should read"),
+            before
+        );
+        let open_page = suggestions_json(
+            &router,
+            "/v1/admin/suggestions?state=open",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(
+            suggestion_ids(&open_page),
+            vec!["sug-pre-context".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn suggestions_admin_rejects_path_dispatch_without_policy_mutation() {
+        let discovery_db = TempDb::new("suggestions-path-dispatch-accept");
+        create_discovery_schema(&discovery_db.path);
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/tenants/{id}/records",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 10,
+                latency_p95_ms: 10,
+                latency_p99_ms: 10,
+                distinct_principal_count: 1,
+                status_counts: &[(200, 1)],
+            },
+        );
+        insert_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/tenants/{id}/records",
+            "",
+            "/tenants/1",
+            "http://127.0.0.1:41001",
+            1,
+            1,
+        );
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-path-dispatch",
+                suggestion_type: "baseline_allow",
+                method: "GET",
+                path_pattern: "/tenants/{id}/records",
+                role: Some("tenant-reader"),
+                action: "allow",
+                rationale: "Observed tenant reader traffic.",
+                evidence: json!({ "observation_count": 1 }),
+                state: "open",
+                created_at: "2024-06-02T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: None,
+            },
+        );
+
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let before = fs::read_to_string(&policy.path).expect("policy should read");
+        let mut config = suggestions_admin_config(Some(&discovery_db.path), None, &policy);
+        config.upstream_routes = vec![path_route(
+            "/tenants/1",
+            "127.0.0.1:41001"
+                .parse()
+                .expect("route address should parse"),
+        )];
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+        let etag = suggestions_policy_etag(&router).await;
+
+        let response = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-path-dispatch/accept",
+                Some(test_principal(&["suggestions-policy-writer"])),
+                None,
+                Some(&etag),
+            ))
+            .await
+            .expect("path-dispatch accept request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(response).await,
+            json!({
+                "error": "suggestion targets path-routed traffic and cannot be accepted as a direct rule"
+            })
+        );
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy should read"),
+            before
+        );
+        let open_page = suggestions_json(
+            &router,
+            "/v1/admin/suggestions?state=open",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(
+            suggestion_ids(&open_page),
+            vec!["sug-path-dispatch".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn suggestions_admin_rejects_changed_legacy_upstream_without_policy_mutation() {
+        let discovery_db = TempDb::new("suggestions-changed-legacy-accept");
+        create_discovery_schema(&discovery_db.path);
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_discovery_endpoint(
+            &discovery_db.path,
+            SeedEndpoint {
+                method: "GET",
+                endpoint_template: "/reports/{id}",
+                first_seen: "2024-06-01T00:00:00Z",
+                last_seen: "2024-06-01T01:00:00Z",
+                call_count: 1,
+                latency_count: 1,
+                latency_p50_ms: 10,
+                latency_p95_ms: 10,
+                latency_p99_ms: 10,
+                distinct_principal_count: 1,
+                status_counts: &[(200, 1)],
+            },
+        );
+        insert_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            "/reports/{id}",
+            "",
+            "",
+            "http://127.0.0.1:41001",
+            1,
+            1,
+        );
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-changed-legacy",
+                suggestion_type: "baseline_allow",
+                method: "GET",
+                path_pattern: "/reports/{id}",
+                role: Some("report-reader"),
+                action: "allow",
+                rationale: "Observed report reader traffic on the prior upstream.",
+                evidence: json!({ "observation_count": 1 }),
+                state: "open",
+                created_at: "2024-06-02T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: None,
+            },
+        );
+
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let before = fs::read_to_string(&policy.path).expect("policy should read");
+        let mut config = suggestions_admin_config(Some(&discovery_db.path), None, &policy);
+        config.upstream_url = Some("http://127.0.0.1:41002".to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build after legacy upstream change");
+        let etag = suggestions_policy_etag(&router).await;
+
+        let response = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-changed-legacy/accept",
+                Some(test_principal(&["suggestions-policy-writer"])),
+                None,
+                Some(&etag),
+            ))
+            .await
+            .expect("changed-legacy accept request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(response).await,
+            json!({
+                "error": "suggestion spans multiple upstream routing contexts and cannot be accepted as a direct rule"
+            })
+        );
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy should read"),
+            before
+        );
+        let open_page = suggestions_json(
+            &router,
+            "/v1/admin/suggestions?state=open",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(
+            suggestion_ids(&open_page),
+            vec!["sug-changed-legacy".to_owned()]
         );
     }
 
@@ -19741,12 +21050,17 @@ paths:
     }
 
     #[test]
-    fn endpoint_rule_coverage_without_rbac_is_false() {
-        assert!(!endpoint_covered_by_active_direct_rule(
-            None,
-            "GET",
-            "/anything/{id}"
-        ));
+    fn endpoint_rule_coverage_without_rules_is_none() {
+        let policy: rbac::Policy = serde_json::from_value(json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "roles": {}
+        }))
+        .expect("policy should parse");
+        assert_eq!(
+            endpoint_coverage_scope(&policy, "GET", "/anything/{id}", None),
+            discovery::query::EndpointCoverageScope::None
+        );
     }
 
     #[tokio::test]
@@ -24505,6 +25819,26 @@ paths:
             .collect()
     }
 
+    fn endpoint_coverage_scopes(body: &Value) -> HashMap<String, String> {
+        body["endpoints"]
+            .as_array()
+            .expect("endpoints should be an array")
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint["endpoint_template"]
+                        .as_str()
+                        .expect("endpoint_template should be a string")
+                        .to_owned(),
+                    endpoint["coverage_scope"]
+                        .as_str()
+                        .expect("coverage_scope should be a string")
+                        .to_owned(),
+                )
+            })
+            .collect()
+    }
+
     fn endpoint_new_flags(body: &Value) -> HashMap<String, bool> {
         body["endpoints"]
             .as_array()
@@ -25226,7 +26560,48 @@ O2gecI9QwDJNpm29J9wJB2F8
         suggestion: RuleSuggestionSeed<'_>,
         identity_bound: bool,
     ) {
+        create_discovery_schema(path);
         let connection = Connection::open(path).expect("test discovery database should open");
+        connection
+            .execute(
+                r#"
+                INSERT OR IGNORE INTO discovery_endpoint_aggregates (
+                    method,
+                    endpoint_template,
+                    first_seen,
+                    last_seen,
+                    call_count,
+                    schema_mismatch_count,
+                    latency_count,
+                    latency_p50_ms,
+                    latency_p95_ms,
+                    latency_p99_ms,
+                    latency_samples_json,
+                    distinct_principal_count,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?3, 1, 0, 1, 1, 1, 1, '[]', 0, ?3)
+                "#,
+                params![
+                    suggestion.method,
+                    suggestion.path_pattern,
+                    suggestion.created_at,
+                ],
+            )
+            .expect("suggestion endpoint should insert");
+        connection
+            .execute(
+                r#"
+                INSERT OR IGNORE INTO discovery_endpoint_routing_classifications (
+                    method, endpoint_template, first_classified_at
+                ) VALUES (?1, ?2, ?3)
+                "#,
+                params![
+                    suggestion.method,
+                    suggestion.path_pattern,
+                    suggestion.created_at,
+                ],
+            )
+            .expect("suggestion endpoint classification should insert");
         let roles = suggestion.role.into_iter().collect::<Vec<_>>();
         let principal = if identity_bound {
             json!({
@@ -25243,12 +26618,26 @@ O2gecI9QwDJNpm29J9wJB2F8
                 "principal_ids": []
             })
         };
-        let proposed_rule_json = json!({
-            "methods": [suggestion.method],
-            "path": suggestion.path_pattern,
-            "principal": principal,
-            "action": suggestion.action
-        })
+        let tool_name = suggestion
+            .method
+            .eq_ignore_ascii_case("MCP")
+            .then(|| suggestion.path_pattern.strip_prefix("/mcp/tools/"))
+            .flatten()
+            .filter(|tool_name| !tool_name.is_empty() && !tool_name.contains('/'));
+        let proposed_rule_json = if let Some(tool_name) = tool_name {
+            json!({
+                "tool_name": tool_name,
+                "principal": principal,
+                "action": suggestion.action
+            })
+        } else {
+            json!({
+                "methods": [suggestion.method],
+                "path": suggestion.path_pattern,
+                "principal": principal,
+                "action": suggestion.action
+            })
+        }
         .to_string();
         let principal_key = suggestion
             .role
@@ -25335,7 +26724,8 @@ O2gecI9QwDJNpm29J9wJB2F8
             "method": method,
             "path": concrete_path_for_template(endpoint_template),
             "status": 200,
-            "policy_decision": "allowed"
+            "policy_decision": "allowed",
+            "routing_context_known": true
         })
         .to_string();
 
@@ -25557,6 +26947,21 @@ O2gecI9QwDJNpm29J9wJB2F8
             )
             .expect("endpoint aggregate should insert");
 
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_endpoint_routing_classifications (
+                    method, endpoint_template, first_classified_at
+                ) VALUES (?1, ?2, ?3)
+                "#,
+                params![
+                    endpoint.method,
+                    endpoint.endpoint_template,
+                    endpoint.first_seen,
+                ],
+            )
+            .expect("endpoint routing classification should insert");
+
         for (status, count) in endpoint.status_counts {
             connection
                 .execute(
@@ -25569,6 +26974,66 @@ O2gecI9QwDJNpm29J9wJB2F8
                 )
                 .expect("endpoint status count should insert");
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_discovery_routing_context(
+        path: &PathBuf,
+        method: &str,
+        endpoint_template: &str,
+        route_host: &str,
+        route_path_prefix: &str,
+        upstream_origin: &str,
+        call_count: i64,
+        distinct_principal_count: i64,
+    ) {
+        let connection = Connection::open(path).expect("test discovery database should open");
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_endpoint_routing_contexts (
+                    method,
+                    endpoint_template,
+                    route_host,
+                    route_path_prefix,
+                    upstream_origin,
+                    first_seen,
+                    last_seen,
+                    call_count,
+                    distinct_principal_count,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?7)
+                "#,
+                params![
+                    method,
+                    endpoint_template,
+                    route_host,
+                    route_path_prefix,
+                    upstream_origin,
+                    "2024-06-01T00:00:00Z",
+                    "2024-06-01T01:00:00Z",
+                    call_count,
+                    distinct_principal_count,
+                ],
+            )
+            .expect("routing context should insert");
+    }
+
+    fn clear_discovery_routing_classification(
+        path: &PathBuf,
+        method: &str,
+        endpoint_template: &str,
+    ) {
+        let connection = Connection::open(path).expect("test discovery database should open");
+        connection
+            .execute(
+                r#"
+                DELETE FROM discovery_endpoint_routing_classifications
+                WHERE method = ?1 AND endpoint_template = ?2
+                "#,
+                params![method, endpoint_template],
+            )
+            .expect("routing classification should clear");
     }
 
     fn set_schema_mismatch_count(
@@ -26161,7 +27626,8 @@ O2gecI9QwDJNpm29J9wJB2F8
             "path": event.request_path,
             "status": event.status,
             "policy_decision": event.policy_decision,
-            "policy_reason": "matched_rule"
+            "policy_reason": "matched_rule",
+            "routing_context_known": true
         });
         if let Some(matched_rule_id) = event.matched_rule_id {
             payload["matched_rule_id"] = json!(matched_rule_id);
