@@ -497,7 +497,8 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     // remains global, but host-qualified upstreams require an explicit host-bound
     // route permission. Direct allow cannot authorize them, while first-match
     // shadow telemetry is retained before route evaluation. MCP aliases evaluate
-    // their canonical policy path before falling back to the raw public path.
+    // their raw and canonical policy identities together so a deny or shadow on
+    // either identity cannot be suppressed by an allow on the other.
     let first_direct_rule = matching_direct_rule(
         &policy.rule_matcher,
         req.method().as_str(),
@@ -701,20 +702,21 @@ fn matching_direct_rule(
     dispatch_context: RuleDispatchContext<'_>,
     denies_only: bool,
 ) -> Option<RuleDecision> {
-    let evaluate = |candidate_path: &str| {
-        if denies_only {
-            matcher.evaluate_denies_with_dispatch(
-                method,
-                candidate_path,
-                principal,
-                dispatch_context,
-            )
-        } else {
-            matcher.evaluate_with_dispatch(method, candidate_path, principal, dispatch_context)
-        }
-    };
+    if policy_path != path {
+        return matcher.evaluate_equivalent_paths_with_dispatch(
+            method,
+            &[policy_path, path],
+            principal,
+            dispatch_context,
+            denies_only,
+        );
+    }
 
-    evaluate(policy_path).or_else(|| (policy_path != path).then(|| evaluate(path)).flatten())
+    if denies_only {
+        matcher.evaluate_denies_with_dispatch(method, path, principal, dispatch_context)
+    } else {
+        matcher.evaluate_with_dispatch(method, path, principal, dispatch_context)
+    }
 }
 
 #[cfg(test)]
@@ -1299,6 +1301,107 @@ mod tests {
             .events()
             .iter()
             .any(|event| event.payload["matched_rule_id"] == json!("allow-public-prefix")));
+    }
+
+    #[tokio::test]
+    async fn prefixed_mcp_route_raw_direct_deny_precedes_canonical_allow() {
+        let (state, capture) = test_state_with_mcp_route_paths(
+            test_policy_with_rules(
+                DefaultAction::Deny,
+                &[],
+                &[],
+                &[
+                    direct_rule(
+                        Some("allow-canonical-mcp"),
+                        &["POST"],
+                        "/mcp",
+                        RuleAction::Allow,
+                    ),
+                    direct_rule(
+                        Some("deny-public-alias"),
+                        &["POST"],
+                        "/base/**",
+                        RuleAction::Deny,
+                    ),
+                ],
+            ),
+            &[],
+            &["/mcp", "/base/mcp"],
+        );
+
+        let response = test_router(state, None)
+            .oneshot(request(Method::POST, "/base/mcp"))
+            .await
+            .expect("prefixed MCP request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.outcome, PolicyDecisionOutcome::Denied);
+        assert_eq!(
+            decision.matched_rule_id.as_deref(),
+            Some("deny-public-alias")
+        );
+
+        let denied = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(denied.payload["path"], json!("/base/mcp"));
+        assert_eq!(
+            denied.payload["matched_rule_id"],
+            json!("deny-public-alias")
+        );
+    }
+
+    #[tokio::test]
+    async fn prefixed_mcp_route_raw_direct_deny_precedes_canonical_shadow() {
+        let (state, capture) = test_state_with_mcp_route_paths(
+            test_policy_with_rules(
+                DefaultAction::Deny,
+                &[],
+                &[],
+                &[
+                    direct_rule(
+                        Some("shadow-canonical-mcp"),
+                        &["POST"],
+                        "/mcp",
+                        RuleAction::Shadow,
+                    ),
+                    direct_rule(
+                        Some("deny-exact-alias"),
+                        &["POST"],
+                        "/base/mcp",
+                        RuleAction::Deny,
+                    ),
+                ],
+            ),
+            &[],
+            &["/mcp", "/base/mcp"],
+        );
+
+        let response = test_router(state, None)
+            .oneshot(request(Method::POST, "/base/mcp"))
+            .await
+            .expect("prefixed MCP request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.outcome, PolicyDecisionOutcome::Denied);
+        assert_eq!(
+            decision.matched_rule_id.as_deref(),
+            Some("deny-exact-alias")
+        );
+
+        let denied = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(denied.payload["path"], json!("/base/mcp"));
+        assert_eq!(denied.payload["matched_rule_id"], json!("deny-exact-alias"));
+        assert!(!capture
+            .events()
+            .iter()
+            .any(|event| event.payload["matched_rule_id"] == json!("shadow-canonical-mcp")));
     }
 
     #[tokio::test]
