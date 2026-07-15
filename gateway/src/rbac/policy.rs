@@ -2651,16 +2651,6 @@ mod tests {
         }
     }
 
-    fn route(path_prefix: &str, permission: &str) -> RouteRule {
-        RouteRule {
-            methods: Vec::new(),
-            hosts: Vec::new(),
-            path_prefix: path_prefix.to_owned(),
-            permission: permission.to_owned(),
-            enforcement_mode: None,
-        }
-    }
-
     fn rich_policy() -> Policy {
         Policy {
             schema_version: "0.1.0".to_owned(),
