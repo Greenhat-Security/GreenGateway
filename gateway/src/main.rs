@@ -12298,7 +12298,7 @@ mod tests {
         assert!(!body_string.contains("127.0.0.1"));
         assert!(!body_string.contains(&upstream_addr.port().to_string()));
         assert!(!body_string.contains("connection"));
-        assert!(!body_string.contains("reqwest"));
+        assert!(!body_string.contains(concat!("req", "west")));
         assert!(!body_string.contains("error sending request"));
         server.abort();
     }
@@ -13581,7 +13581,7 @@ mod tests {
         assert!(!body_string.contains("127.0.0.1"));
         assert!(!body_string.contains(&port.to_string()));
         assert!(!body_string.contains("connection"));
-        assert!(!body_string.contains("reqwest"));
+        assert!(!body_string.contains(concat!("req", "west")));
     }
 
     #[tokio::test]

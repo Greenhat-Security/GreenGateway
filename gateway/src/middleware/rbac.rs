@@ -1954,6 +1954,15 @@ mod tests {
             captured_event(&capture, AUTHZ_DENIED).await.payload["permission"],
             json!("admin:read")
         );
+        assert_eventually(Duration::from_secs(1), || {
+            let events = capture.events();
+            ["admin:read", "data:read"].iter().all(|permission| {
+                events.iter().any(|event| {
+                    event.event_type == AUTHZ_ALLOWED
+                        && event.payload["permission"] == json!(permission)
+                })
+            })
+        });
         let events = capture.events();
         assert!(events.iter().any(|event| {
             event.event_type == AUTHZ_ALLOWED && event.payload["permission"] == json!("admin:read")

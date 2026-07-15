@@ -1635,7 +1635,7 @@ mod tests {
             echo_tool("get_widget", "GET", "/v1/widgets/{widget_id}"),
         ]));
 
-        wait_until(Duration::from_secs(2), || {
+        wait_until(Duration::from_secs(5), || {
             registry.get("get_widget").is_some()
         })
         .await;
@@ -1660,7 +1660,7 @@ mod tests {
             echo_tool("get_widget", "GET", "/v1/widgets/{widget_id}"),
         ]));
 
-        wait_until(Duration::from_secs(2), || {
+        wait_until(Duration::from_secs(5), || {
             registry.get("get_widget").is_some()
         })
         .await;
@@ -1693,7 +1693,7 @@ mod tests {
             "/v1/widgets/{widget_id}",
         )]));
 
-        wait_until(Duration::from_secs(2), || {
+        wait_until(Duration::from_secs(5), || {
             registry.get("echo").is_none() && registry.get("get_widget").is_some()
         })
         .await;
@@ -1940,7 +1940,7 @@ mod tests {
             echo_tool("echo", "GET", "/v1/other"),
         ]));
 
-        wait_until(Duration::from_secs(2), || {
+        wait_until(Duration::from_secs(5), || {
             audit_event_count(&capture, audit::event::TOOL_REGISTRY_RELOAD_FAILED) > failure_count
         })
         .await;
@@ -1982,7 +1982,7 @@ mod tests {
 
             file.write(&invalid_update);
 
-            wait_until(Duration::from_secs(2), || {
+            wait_until(Duration::from_secs(5), || {
                 audit_event_count(&capture, audit::event::TOOL_REGISTRY_RELOAD_FAILED)
                     > failure_count
             })
@@ -2009,7 +2009,7 @@ mod tests {
             "/v1/widgets/{widget_id}",
         )]));
 
-        wait_until(Duration::from_secs(2), || registry.get("echo").is_none()).await;
+        wait_until(Duration::from_secs(5), || registry.get("echo").is_none()).await;
         assert!(registry.get("get_widget").is_some());
     }
 

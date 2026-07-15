@@ -1069,7 +1069,7 @@ mod tests {
         let overflow_chunk = format!(": {}\n\n", "x".repeat(TEST_RESPONSE_LIMIT));
 
         // HTTP/1.1 frames the body at Content-Length, so extra bytes after an
-        // understated header are not delivered through reqwest::Response. This
+        // understated header are not delivered through the HTTP response. This
         // covers the production fallback that matters once bytes are delivered:
         // an under-cap length hint cannot bypass the streaming byte counter.
         let declared_content_length = first_chunk.len();

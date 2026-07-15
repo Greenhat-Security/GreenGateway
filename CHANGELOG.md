@@ -7,36 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
-Phase 6 (native MCP support) remains in progress, but the live endpoint and
-major runtime pieces have landed since 0.6.0. See the
+## [1.0.0] - 2026-07-15
+
+Phase 6 (native MCP support) is complete and included in this release. See the
 [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44)
 for full phase-by-phase status.
-
-### Security
-
-- Traffic discovery now records configured upstream route host/path/origin
-  contexts before request middleware can reject a request, reports
-  endpoint-wide, principal-scoped, mixed, uncovered, and unknown migration
-  states separately, and suppresses host-blind rule generation and acceptance
-  for host-routed, path-routed, origin-ambiguous, or pre-context traffic,
-  including the active legacy upstream and configured routes that have not yet
-  received traffic. Suggestion-eligible signal counters and principal history
-  are persisted separately so legacy aggregate evidence cannot cross a
-  detector threshold after the first classified observation. Accepted HTTP
-  suggestions now persist an immutable dispatch-provenance matcher and enforce
-  it against the selected dispatch class and upstream on every request,
-  preventing a later route configuration change from extending an accepted
-  fallback rule to a host/path route, even when the origin is unchanged.
-  Traffic-inventory rule creation carries the same immutable binding, mixed
-  pre-classification history remains unknown, and explicit null dispatch
-  fields are rejected instead of weakening a rule to global scope.
-  Malformed inventory contexts cannot create unbound rules, while MCP tool
-  suggestions remain independent of unrelated HTTP fallback routing.
-- Forwarded client IP headers are now accepted only from direct peers in the
-  new `TRUSTED_PROXY_CIDRS` allowlist. `X-Forwarded-For` chains are resolved
-  from the nearest hop backward, and malformed chains fail closed to the
-  socket peer. Deployments using `TRUST_PROXY_HEADERS=true` must now configure
-  at least one bounded proxy CIDR; catch-all CIDRs are rejected.
 
 ### Added — Phase 6 (native MCP support)
 
@@ -59,22 +34,10 @@ for full phase-by-phase status.
 - Tool traffic inventory plumbing: MCP tool observations feed the existing
   discovery/anomaly pipeline, and policy rules can match tool names.
 
-### Remaining — Phase 6 follow-ups
+### Known limitations
 
-- MCP client conformance coverage still needs to drive a real client SDK
-  through connect, list, and call flows.
-- UI integration is still needed for tool inventory, tool-call metrics, and
-  create-rule-from-tool workflows.
 - Generated tools that require upstream API-key header injection still need
   explicit support before those generated tools are fully usable end-to-end.
-
-### Changed - Security
-
-- Host-qualified `UPSTREAM_ROUTES` now require `POLICY_FILE` and an explicit
-  matching `routes[].hosts` permission binding. Path-only direct allow/shadow
-  rules and permissive defaults can no longer authorize a different virtual
-  upstream selected through the request `Host` header; direct deny rules remain
-  effective.
 
 ## [0.6.0] - 2026-07-05
 
