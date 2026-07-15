@@ -122,16 +122,69 @@ impl RuleMatcher {
         principal: Option<&Principal>,
         dispatch_context: RuleDispatchContext<'_>,
     ) -> Option<RuleDecision> {
-        self.rules
-            .iter()
-            .find(|rule| {
-                rule.action == RuleAction::Deny
-                    && rule.matches(method, path, principal, dispatch_context)
-            })
-            .map(|rule| RuleDecision {
-                rule_index: rule.rule_index,
-                action: RuleAction::Deny,
-            })
+        self.evaluate_matching_paths_by_action(
+            method,
+            &[path],
+            principal,
+            dispatch_context,
+            &[RuleAction::Deny],
+        )
+    }
+
+    /// Evaluates one request against equivalent path identities, preferring the
+    /// most restrictive matching action across the full rulebase. This is used
+    /// for MCP aliases where both the raw public path and canonical `/mcp`
+    /// identity must participate without allowing either path's allow rule to
+    /// suppress a deny or shadow on the other identity.
+    pub fn evaluate_equivalent_paths_with_dispatch(
+        &self,
+        method: &str,
+        paths: &[&str],
+        principal: Option<&Principal>,
+        dispatch_context: RuleDispatchContext<'_>,
+        denies_only: bool,
+    ) -> Option<RuleDecision> {
+        if denies_only {
+            self.evaluate_matching_paths_by_action(
+                method,
+                paths,
+                principal,
+                dispatch_context,
+                &[RuleAction::Deny],
+            )
+        } else {
+            self.evaluate_matching_paths_by_action(
+                method,
+                paths,
+                principal,
+                dispatch_context,
+                &[RuleAction::Deny, RuleAction::Shadow, RuleAction::Allow],
+            )
+        }
+    }
+
+    fn evaluate_matching_paths_by_action(
+        &self,
+        method: &str,
+        paths: &[&str],
+        principal: Option<&Principal>,
+        dispatch_context: RuleDispatchContext<'_>,
+        actions: &[RuleAction],
+    ) -> Option<RuleDecision> {
+        actions.iter().find_map(|action| {
+            self.rules
+                .iter()
+                .find(|rule| {
+                    &rule.action == action
+                        && paths
+                            .iter()
+                            .any(|path| rule.matches(method, path, principal, dispatch_context))
+                })
+                .map(|rule| RuleDecision {
+                    rule_index: rule.rule_index,
+                    action: rule.action.clone(),
+                })
+        })
     }
 
     #[allow(dead_code)]
