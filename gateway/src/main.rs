@@ -133,6 +133,7 @@ struct AppState {
     proxy: Option<ProxyState>,
     routes: GatewayRoutes,
     admin_login_configured: bool,
+    max_body_size: usize,
     mcp: mcp::McpState,
     protected_resource_metadata: Option<auth::protected_resource::ProtectedResourceMetadataConfig>,
 }
@@ -1409,6 +1410,7 @@ fn gateway_app_with_process_started_at(
         proxy: proxy_state,
         routes: routes.clone(),
         admin_login_configured: admin_auth_state.is_some(),
+        max_body_size: config.max_body_size,
         mcp: mcp_state,
         protected_resource_metadata,
     };
@@ -5617,7 +5619,7 @@ async fn read_request_body(body: Body, max_body_size: usize) -> Result<Bytes, Re
     axum::body::to_bytes(body, max_body_size)
         .await
         .map_err(|err| {
-            tracing::warn!(error = %err, "policy request body could not be read");
+            tracing::warn!(error = %err, "request body exceeded the configured limit or could not be read");
             payload_too_large(max_body_size)
         })
 }
@@ -20923,6 +20925,103 @@ paths:
 
         // This proves ordering because CSRF is enabled and the path is not exempt.
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn mcp_streaming_body_limit_rejects_missing_or_underdeclared_content_length() {
+        const MAX_BODY_SIZE: usize = 32;
+
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.csrf_enabled = false;
+        config.max_body_size = MAX_BODY_SIZE;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+
+        for declared_length in [None, Some("1")] {
+            let chunks = stream::iter(vec![
+                Ok::<Bytes, Infallible>(Bytes::from(vec![b'a'; MAX_BODY_SIZE])),
+                Ok::<Bytes, Infallible>(Bytes::from_static(b"b")),
+            ]);
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri(MCP_ROUTE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream");
+            if let Some(declared_length) = declared_length {
+                builder = builder.header(header::CONTENT_LENGTH, declared_length);
+            }
+            let request = builder
+                .body(Body::from_stream(chunks))
+                .expect("streaming MCP request should build");
+
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("streaming MCP request should complete");
+
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(
+                json_body(response).await,
+                json!({
+                    "error": "payload too large",
+                    "max_body_size": MAX_BODY_SIZE
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_streaming_body_limit_allows_body_at_exact_limit() {
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "body-limit-test",
+                    "version": "1.0.0"
+                }
+            }
+        })
+        .to_string();
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.csrf_enabled = false;
+        config.max_body_size = request_body.len();
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+        let chunks = stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(request_body))]);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(MCP_ROUTE)
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .body(Body::from_stream(chunks))
+            .expect("streaming MCP request should build");
+
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("MCP request at exact limit should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

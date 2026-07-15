@@ -551,11 +551,11 @@ Format and validation: split on commas, trim whitespace, ignore empty entries, a
 
 ### MAX_BODY_SIZE
 
-Maximum request body size accepted from the `Content-Length` header, in bytes.
+Maximum native MCP and control-plane request body size, and the early rejection threshold for declared request sizes, in bytes.
 
 Default: `1048576` (1 MiB)
 
-Format and validation: must parse as a non-negative byte count that fits in `usize`. Requests with a `Content-Length` larger than this value are rejected with `413 Payload Too Large`.
+Format and validation: must parse as a non-negative byte count that fits in `usize`. Requests with a `Content-Length` larger than this value are rejected early with `413 Payload Too Large`. Native MCP and control-plane handlers also count actual streamed bytes before parsing, so chunked, no-Length, and under-declared bodies cannot bypass the cap. Reverse-proxy and outbound tool payload limits use the separate egress body-size settings documented below.
 
 ### RATE_LIMIT_READ_RPS
 
