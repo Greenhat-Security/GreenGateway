@@ -422,7 +422,7 @@ Direct firewall rules in `rules` are also evaluated in document order with first
 
 Rate-limit overrides in a policy's `rate_limits` array are also evaluated in document order, and the first matching entry wins. Each entry may constrain `principal` with the same `roles`, `auth_methods`, and `principal_ids` matcher used by direct firewall rules; omit it or use `{}` to match authenticated and unauthenticated callers. Each entry may also constrain `methods` and an absolute `path` pattern using the same whole-path anchored glob syntax as `rules[].path`: literal segments, `*`, `**`, and `{name}` captures. Matching entries must set positive `requests_per_second` and positive `burst` values.
 
-Rate limiting runs in two independent stages, not a fallback chain: a coarse, IP/session-keyed global lane (`RATE_LIMIT_READ_*`/`RATE_LIMIT_WRITE_*` below) runs early, before authentication, and always applies to every request regardless of the policy. A second, principal-keyed check runs after authentication and applies ONLY when the request has a validated `Principal` AND a `rate_limits` entry matches it — in that case the request must pass BOTH the global lane and the matching policy lane's bucket. A `rate_limits` override can therefore only add an additional constraint on top of the global lane for authenticated, matched requests; it can never loosen or replace the global lane, and it has no effect at all on unauthenticated requests or authenticated requests with no matching entry (those are governed by the global lane alone).
+Rate limiting runs in two independent stages, not a fallback chain: a coarse, canonical-client-IP-keyed global lane (`RATE_LIMIT_READ_*`/`RATE_LIMIT_WRITE_*` below) runs early, before authentication, and always applies to every request regardless of the policy. It never keys on raw cookies or other caller-rotatable identifiers. A second, principal-keyed check runs after authentication and applies ONLY when the request has a validated `Principal` AND a `rate_limits` entry matches it — in that case the request must pass BOTH the global lane and the matching policy lane's bucket. A `rate_limits` override can therefore only add an additional constraint on top of the global lane for authenticated, matched requests; it can never loosen or replace the global lane, and it has no effect at all on unauthenticated requests or authenticated requests with no matching entry (those are governed by the global lane alone).
 
 Policy administration APIs are available only when `POLICY_FILE` is configured. When it is unset, `GET /v1{ADMIN_PREFIX}/policy`, `PUT /v1{ADMIN_PREFIX}/policy`, `GET /v1{ADMIN_PREFIX}/policy/history`, `POST /v1{ADMIN_PREFIX}/policy/rollback/{version}`, `POST /v1{ADMIN_PREFIX}/policy/validate`, the rule-management endpoints under `/v1{ADMIN_PREFIX}/policy/rules`, `POST /v1{ADMIN_PREFIX}/policy/rules/preview`, and `GET /v1{ADMIN_PREFIX}/policy/rules/hits` return `404 Not Found` with `{"error":"policy API requires POLICY_FILE to be configured"}` after the caller is authenticated. `GET /v1{ADMIN_PREFIX}/policy` returns the current in-memory live policy, not a fresh file read, and includes a strong ETag header. The ETag is `"sha256:<hex>"`, where `<hex>` is the SHA-256 digest of the policy serialized as canonical JSON with object keys sorted recursively.
 
@@ -596,16 +596,6 @@ Whether to trust `X-Forwarded-For` and `X-Real-IP` as canonical client IP inputs
 Default: `false`
 
 Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, forwarded proxy headers are ignored and the connection peer IP is used. Enable this only when GreenGateway is deployed behind a trusted proxy boundary that sanitizes these headers.
-
-### SESSION_COOKIE_NAME
-
-Optional cookie name used for session-based keying by the global, pre-authentication rate-limit lane (see above) when the request has no matching cookie.
-
-Default: empty string
-
-Format and validation: any valid Unicode string is accepted. The global lane runs before authentication and always keys on this cookie (when set and present on the request, via a non-cryptographic hash) or otherwise the canonical client IP — it never sees a validated `Principal`, since authentication has not run yet at that point in the middleware stack. The SEPARATE, post-authentication policy `rate_limits` lane (see above) always keys on the validated principal's stable `user_id` when one is present, regardless of this setting.
-
-Security note: leave this unset (the default) unless a trusted upstream layer validates the session cookie before the global rate-limit lane sees the request. A client-controlled, unvalidated cookie can be rotated to evade the global lane's keying; canonical client IP keying remains the safe default when no cookie is configured. This does not affect the policy `rate_limits` lane, which only ever keys on a cryptographically-validated `Principal`.
 
 ### VALIDATION_ALLOWED_CONTENT_TYPES
 

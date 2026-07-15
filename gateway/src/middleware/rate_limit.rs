@@ -1,8 +1,7 @@
 //! Token-bucket rate limiting middleware.
 
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
-    hash::{Hash, Hasher},
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -14,10 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use http::{
-    header::{HeaderValue, COOKIE},
-    Extensions, HeaderMap, Method, StatusCode,
-};
+use http::{Method, StatusCode};
 use serde::Serialize;
 
 use crate::{
@@ -37,7 +33,6 @@ pub struct RateLimitState {
     write: RateLimiter,
     policy: Arc<ArcSwap<RateLimitPolicyState>>,
     trust_proxy_headers: bool,
-    session_cookie_name: String,
 }
 
 #[derive(Clone)]
@@ -85,7 +80,6 @@ impl RateLimitState {
                 policy,
             ))),
             trust_proxy_headers: config.trust_proxy_headers,
-            session_cookie_name: config.session_cookie_name.clone(),
         }
     }
 
@@ -210,7 +204,7 @@ pub async fn rate_limit_request(
     let lane = lane_for(req.method());
     let path = req.uri().path().to_owned();
     let client_ip = canonical_client_ip(req.headers(), req.extensions(), state.trust_proxy_headers);
-    let key = unauthenticated_rate_limit_key(req.headers(), &state.session_cookie_name, &client_ip);
+    let key = format!("ip:{client_ip}");
     let limiter = state.global_limiter(lane);
 
     check_rate_limit(limiter, &key, &client_ip, lane, &path, req, next).await
@@ -225,19 +219,13 @@ pub async fn policy_rate_limit_request(
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let client_ip = canonical_client_ip(req.headers(), req.extensions(), state.trust_proxy_headers);
-    let key = rate_limit_key(
-        req.extensions(),
-        req.headers(),
-        &state.session_cookie_name,
-        &client_ip,
-    );
-    let Some(limiter) = req
-        .extensions()
-        .get::<auth::Principal>()
-        .and_then(|principal| state.policy_limiter(&method, &path, Some(principal)))
-    else {
+    let Some(principal) = req.extensions().get::<auth::Principal>() else {
         return next.run(req).await;
     };
+    let Some(limiter) = state.policy_limiter(&method, &path, Some(principal)) else {
+        return next.run(req).await;
+    };
+    let key = format!("principal:{}", principal.user_id);
 
     check_rate_limit(limiter, &key, &client_ip, lane, &path, req, next).await
 }
@@ -262,64 +250,6 @@ async fn check_rate_limit(
     }
 
     next.run(req).await
-}
-
-fn unauthenticated_rate_limit_key(
-    headers: &HeaderMap,
-    session_cookie_name: &str,
-    client_ip: &str,
-) -> String {
-    if let Some(session) = session_cookie(headers, session_cookie_name) {
-        // DefaultHasher is sufficient for a non-cryptographic rate-limit fingerprint.
-        return format!("session:{:016x}", hash_str(session));
-    }
-
-    format!("ip:{client_ip}")
-}
-
-fn rate_limit_key(
-    extensions: &Extensions,
-    headers: &HeaderMap,
-    session_cookie_name: &str,
-    client_ip: &str,
-) -> String {
-    if let Some(principal) = extensions.get::<auth::Principal>() {
-        return format!("principal:{}", principal.user_id);
-    }
-
-    if let Some(session) = session_cookie(headers, session_cookie_name) {
-        // DefaultHasher is sufficient for a non-cryptographic rate-limit fingerprint.
-        return format!("session:{:016x}", hash_str(session));
-    }
-
-    format!("ip:{client_ip}")
-}
-
-fn session_cookie<'a>(headers: &'a HeaderMap, session_cookie_name: &str) -> Option<&'a str> {
-    if session_cookie_name.is_empty() {
-        return None;
-    }
-
-    headers
-        .get_all(COOKIE)
-        .iter()
-        .filter_map(header_value_to_str)
-        .flat_map(|value| value.split(';'))
-        .filter_map(|cookie| cookie.trim().split_once('='))
-        .find_map(|(name, value)| {
-            let value = value.trim();
-            (name.trim() == session_cookie_name && !value.is_empty()).then_some(value)
-        })
-}
-
-fn header_value_to_str(value: &HeaderValue) -> Option<&str> {
-    value.to_str().ok()
-}
-
-fn hash_str(value: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
 }
 
 fn lane_for(method: &Method) -> Lane {
@@ -367,6 +297,7 @@ mod tests {
         routing::any,
         Router,
     };
+    use http::header::COOKIE;
     use serde_json::Value;
     use tower::ServiceExt;
 
@@ -400,19 +331,6 @@ mod tests {
                     .collect(),
             })),
             trust_proxy_headers: false,
-            session_cookie_name: String::new(),
-        }
-    }
-
-    fn test_state_with_session_cookie(session_cookie_name: &str) -> RateLimitState {
-        RateLimitState {
-            read: RateLimiter::new(0.0, 1),
-            write: RateLimiter::new(0.0, 1),
-            policy: Arc::new(ArcSwap::from_pointee(RateLimitPolicyState {
-                overrides: Vec::new(),
-            })),
-            trust_proxy_headers: false,
-            session_cookie_name: session_cookie_name.to_owned(),
         }
     }
 
@@ -743,8 +661,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthenticated_session_cookie_keying_still_uses_configured_cookie() {
-        let router = test_router(test_state_with_session_cookie("gateway_session"));
+    async fn rotating_unauthenticated_cookies_does_not_reset_global_ip_bucket() {
+        let router = test_router(test_state(1, 1));
 
         assert_eq!(
             request_status(
@@ -763,21 +681,10 @@ mod tests {
                 Method::GET,
                 "/session",
                 None,
-                Some("gateway_session=one"),
-            )
-            .await,
-            StatusCode::TOO_MANY_REQUESTS
-        );
-        assert_eq!(
-            request_status(
-                &router,
-                Method::GET,
-                "/session",
-                None,
                 Some("gateway_session=two"),
             )
             .await,
-            StatusCode::OK
+            StatusCode::TOO_MANY_REQUESTS
         );
     }
 
@@ -904,51 +811,6 @@ mod tests {
         }
 
         reload_task.await.expect("reload task should join");
-    }
-
-    #[test]
-    fn session_cookie_key_uses_configured_cookie_name() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            COOKIE,
-            "other=ignored; gateway_session=secret; later=value"
-                .parse()
-                .unwrap(),
-        );
-
-        assert_eq!(
-            rate_limit_key(
-                &Extensions::new(),
-                &headers,
-                "gateway_session",
-                "203.0.113.20"
-            ),
-            format!("session:{:016x}", hash_str("secret"))
-        );
-    }
-
-    #[test]
-    fn principal_key_takes_precedence_over_session_cookie() {
-        let mut headers = HeaderMap::new();
-        headers.insert(COOKIE, "gateway_session=secret".parse().unwrap());
-        let mut extensions = Extensions::new();
-        extensions.insert(test_principal("user-123"));
-
-        assert_eq!(
-            rate_limit_key(&extensions, &headers, "gateway_session", "203.0.113.20"),
-            "principal:user-123"
-        );
-    }
-
-    #[test]
-    fn empty_session_cookie_config_falls_back_to_ip() {
-        let mut headers = HeaderMap::new();
-        headers.insert(COOKIE, "gateway_session=secret".parse().unwrap());
-
-        assert_eq!(
-            rate_limit_key(&Extensions::new(), &headers, "", "203.0.113.20"),
-            "ip:203.0.113.20"
-        );
     }
 
     async fn request_status(

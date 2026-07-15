@@ -1595,7 +1595,6 @@ RowSUZV5FSmOGJ7JyROZ80k=
                 "/version".to_owned(),
                 "/metrics".to_owned(),
             ],
-            session_cookie_name: String::new(),
             validation_allowed_content_types: vec!["application/json".to_owned()],
             auth_enabled: true,
             auth_mode: crate::config::AuthMode::Required,

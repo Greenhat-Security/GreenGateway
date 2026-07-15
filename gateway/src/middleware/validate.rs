@@ -170,7 +170,6 @@ mod tests {
                 "/version".to_owned(),
                 "/metrics".to_owned(),
             ],
-            session_cookie_name: String::new(),
             validation_allowed_content_types: validation_allowed_content_types
                 .into_iter()
                 .map(str::to_owned)
