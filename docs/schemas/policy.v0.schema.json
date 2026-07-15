@@ -40,7 +40,7 @@
     },
     "rules": {
       "type": "array",
-      "description": "Ordered direct firewall rules for HTTP paths or exact MCP tool names. Rules are evaluated in array order within their target type, and the first matching rule wins. HTTP path rules are additive alongside routes and do not replace route-to-permission rules. MCP tool-name rules are an additional restriction layer alongside policy.tools.*.allowed_roles.",
+      "description": "Ordered direct firewall rules for HTTP paths or exact MCP tool names. Rules are evaluated in array order within their target type, and the first matching rule wins. HTTP path rules apply to inbound requests and to fully rendered local/OpenAPI tool HTTP operations before upstream egress; they are additive alongside routes and tool policy. Remote MCP proxy tools have no local HTTP path and remain governed by tool-name policy. MCP tool-name rules are an additional restriction layer alongside policy.tools.*.allowed_roles.",
       "items": {
         "$ref": "#/$defs/rule"
       }
@@ -205,7 +205,7 @@
         "path": {
           "type": "string",
           "pattern": "^/",
-          "description": "Absolute HTTP path pattern matched against the whole request path. Exactly one of path or tool_name must be set. Syntax is segment-based and anchored, never substring-based. Literal segments match exactly and case-sensitively. * matches exactly one non-empty path segment. ** matches zero or more complete path segments. {name} matches exactly one non-empty segment and names the capture for future rule-preview/discovery UI; capture names use ASCII letters, digits, and _, and must start with a letter or _."
+          "description": "Absolute HTTP path pattern matched against the whole inbound request path and fully rendered local/OpenAPI tool HTTP operations before upstream egress. Exactly one of path or tool_name must be set. Syntax is segment-based and anchored, never substring-based. Literal segments match exactly and case-sensitively. * matches exactly one non-empty path segment. ** matches zero or more complete path segments. {name} matches exactly one non-empty segment and names the capture for future rule-preview/discovery UI; capture names use ASCII letters, digits, and _, and must start with a letter or _."
         },
         "tool_name": {
           "type": "string",

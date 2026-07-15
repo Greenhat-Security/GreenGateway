@@ -24,7 +24,7 @@ use crate::{
     tools::{
         definitions::{BodyMappingMode, McpProxyMapping, ToolDefinition, ToolRegistry},
         mcp_upstream::{self, McpUpstreamRuntimeConfig},
-        runtime::{ToolInvocationContext, ToolRuntime, ToolRuntimeError},
+        runtime::{ToolInvocationContext, ToolRuntime, ToolRuntimeError, ToolWorkErrorDisposition},
     },
 };
 
@@ -153,6 +153,9 @@ pub enum ToolExecutorError {
         server_name: String,
         reason: &'static str,
     },
+    HttpRuleDenied {
+        tool_name: String,
+    },
 }
 
 #[derive(Debug)]
@@ -241,6 +244,9 @@ impl fmt::Display for ToolExecutorError {
                 formatter,
                 "tool '{tool_name}' upstream MCP server '{server_name}' request failed: {reason}"
             ),
+            Self::HttpRuleDenied { tool_name } => {
+                write!(formatter, "tool '{tool_name}' HTTP operation is denied by policy")
+            }
         }
     }
 }
@@ -257,6 +263,7 @@ impl Error for ToolExecutorError {
 #[derive(Debug)]
 struct ToolUpstreamRequest {
     method: Method,
+    path: String,
     url: String,
     headers: HeaderMap,
     body: Option<Vec<u8>>,
@@ -401,7 +408,7 @@ impl ToolExecutor {
                         .execute_inner(&work_tool_name, args, &work_context)
                         .await
                 },
-                |error| Some(executor_work_failure_reason(error).to_owned()),
+                executor_work_error_disposition,
             )
             .await;
 
@@ -444,7 +451,9 @@ impl ToolExecutor {
                 context.clone(),
                 CancellationToken::new(),
                 || async { Err(UnsupportedTaskInvocation) },
-                |_| Some(TOOL_TASK_UNSUPPORTED_REASON.to_owned()),
+                |_| {
+                    ToolWorkErrorDisposition::Failure(Some(TOOL_TASK_UNSUPPORTED_REASON.to_owned()))
+                },
             )
             .await;
 
@@ -541,6 +550,16 @@ impl ToolExecutor {
                 return Err(error);
             }
         };
+        if !self.runtime.authorize_http_operation(
+            &tool.name,
+            request.method.as_str(),
+            &request.path,
+            context,
+        ) {
+            return Err(ToolExecutorError::HttpRuleDenied {
+                tool_name: tool.name.clone(),
+            });
+        }
         let started = Instant::now();
         let result = self
             .egress_client
@@ -811,6 +830,7 @@ impl ToolExecutor {
 
         Ok(ToolUpstreamRequest {
             method,
+            path: url.path().to_owned(),
             url: url.to_string(),
             headers,
             body,
@@ -1365,6 +1385,12 @@ fn executor_failure_observation_outcome(
             schema_mismatch: false,
             reason: Some(reason),
         },
+        ToolExecutorError::HttpRuleDenied { .. } => ToolObservationOutcome {
+            status: StatusCode::FORBIDDEN.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_MATCHED_RULE_REASON),
+        },
         ToolExecutorError::MissingUpstreamUrl
         | ToolExecutorError::InvalidUpstreamUrl { .. }
         | ToolExecutorError::SchemaCacheKey { .. }
@@ -1448,24 +1474,32 @@ fn runtime_admission_failure_observation_outcome(
     }
 }
 
-fn executor_work_failure_reason(error: &ToolExecutorError) -> &'static str {
-    match error {
-        ToolExecutorError::UnknownTool { .. } => TOOL_UNKNOWN_TOOL_REASON,
-        ToolExecutorError::InputValidation { .. }
-        | ToolExecutorError::MissingArgument { .. }
-        | ToolExecutorError::UnsupportedArgumentValue { .. }
-        | ToolExecutorError::PathSegmentIsDotSegment { .. } => TOOL_INVALID_PARAMS_REASON,
-        ToolExecutorError::Egress { source, .. } => egress_error_reason(source),
-        ToolExecutorError::McpUpstream { reason, .. } => reason,
-        ToolExecutorError::MissingUpstreamUrl
-        | ToolExecutorError::InvalidUpstreamUrl { .. }
-        | ToolExecutorError::SchemaCacheKey { .. }
-        | ToolExecutorError::SchemaCompile { .. }
-        | ToolExecutorError::InvalidMapping { .. }
-        | ToolExecutorError::InvalidMethod { .. }
-        | ToolExecutorError::BodySerialize { .. }
-        | ToolExecutorError::UrlBuild { .. } => TOOL_EXECUTOR_CONFIGURATION_ERROR_REASON,
+fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDisposition {
+    if matches!(error, ToolExecutorError::HttpRuleDenied { .. }) {
+        return ToolWorkErrorDisposition::Rejected(TOOL_MATCHED_RULE_REASON.to_owned());
     }
+
+    ToolWorkErrorDisposition::Failure(Some(
+        match error {
+            ToolExecutorError::UnknownTool { .. } => TOOL_UNKNOWN_TOOL_REASON,
+            ToolExecutorError::InputValidation { .. }
+            | ToolExecutorError::MissingArgument { .. }
+            | ToolExecutorError::UnsupportedArgumentValue { .. }
+            | ToolExecutorError::PathSegmentIsDotSegment { .. } => TOOL_INVALID_PARAMS_REASON,
+            ToolExecutorError::Egress { source, .. } => egress_error_reason(source),
+            ToolExecutorError::McpUpstream { reason, .. } => reason,
+            ToolExecutorError::MissingUpstreamUrl
+            | ToolExecutorError::InvalidUpstreamUrl { .. }
+            | ToolExecutorError::SchemaCacheKey { .. }
+            | ToolExecutorError::SchemaCompile { .. }
+            | ToolExecutorError::InvalidMapping { .. }
+            | ToolExecutorError::InvalidMethod { .. }
+            | ToolExecutorError::BodySerialize { .. }
+            | ToolExecutorError::UrlBuild { .. } => TOOL_EXECUTOR_CONFIGURATION_ERROR_REASON,
+            ToolExecutorError::HttpRuleDenied { .. } => unreachable!("handled above"),
+        }
+        .to_owned(),
+    ))
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -2252,6 +2286,141 @@ mod tests {
 
         assert!(matches!(error, ToolRuntimeError::RoleDenied { .. }));
         assert_inventory_observation(&capture, &db.path, "echo", 403, "role_not_allowed").await;
+    }
+
+    #[tokio::test]
+    async fn direct_http_deny_rule_blocks_rendered_tool_path_before_egress() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"should-not-run").await;
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = live_policy_runtime(
+            json!({
+                "schema_version": "0.1.0",
+                "tools": {
+                    "get_widget": {
+                        "timeout_ms": 500,
+                        "max_concurrent": 1
+                    }
+                },
+                "rules": [
+                    {
+                        "id": "deny-widget-http-path",
+                        "methods": ["GET"],
+                        "path": "/v1/widgets/{widget_id}",
+                        "action": "deny"
+                    }
+                ]
+            }),
+            audit.clone(),
+            runtime_config([("get_widget", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let executor =
+            executor_for_tools_with_runtime(addr, [widget_tool(false, true)], runtime, audit);
+
+        let error = executor
+            .execute(
+                "get_widget",
+                json!({ "widget_id": "private/record" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("matching direct HTTP Deny rule should reject the tool invocation");
+
+        assert!(matches!(
+            error,
+            ToolRuntimeError::Rejected { ref reason, .. } if reason == TOOL_MATCHED_RULE_REASON
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "direct HTTP Deny rule must stop the rendered request before egress"
+        );
+
+        let events = audit_events(&capture, 4).await;
+        let denied = events
+            .iter()
+            .find(|event| event.event_type == "authz.denied")
+            .expect("direct HTTP Deny rule should emit authz.denied");
+        assert_eq!(denied.payload["tool_name"], json!("get_widget"));
+        assert_eq!(denied.payload["method"], json!("GET"));
+        assert_eq!(
+            denied.payload["path"],
+            json!("/v1/widgets/private%2Frecord")
+        );
+        assert_eq!(
+            denied.payload["matched_rule_id"],
+            json!("deny-widget-http-path")
+        );
+        assert!(events.iter().any(|event| {
+            event.event_type == audit::event::TOOL_INVOKE_REJECTED
+                && event.payload["reason"] == json!(TOOL_MATCHED_RULE_REASON)
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == HTTP_REQUEST_OBSERVED
+                && event.payload["status"] == json!(StatusCode::FORBIDDEN.as_u16())
+                && event.payload["reason"] == json!(TOOL_MATCHED_RULE_REASON)
+        }));
+    }
+
+    #[tokio::test]
+    async fn direct_http_shadow_rule_audits_rendered_tool_path_and_allows_egress() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"ok").await;
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = live_policy_runtime(
+            json!({
+                "schema_version": "0.1.0",
+                "tools": {
+                    "get_widget": {
+                        "timeout_ms": 500,
+                        "max_concurrent": 1
+                    }
+                },
+                "rules": [
+                    {
+                        "id": "shadow-widget-http-path",
+                        "methods": ["GET"],
+                        "path": "/v1/widgets/{widget_id}",
+                        "action": "shadow"
+                    }
+                ]
+            }),
+            audit.clone(),
+            runtime_config([("get_widget", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let executor =
+            executor_for_tools_with_runtime(addr, [widget_tool(false, true)], runtime, audit);
+
+        let response = http_response(
+            executor
+                .execute(
+                    "get_widget",
+                    json!({ "widget_id": "public" }),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("Shadow rule should preserve tool execution"),
+        );
+
+        assert_eq!(response.status, StatusCode::OK);
+        let request = server.await.expect("server task should join");
+        assert_eq!(request.target, "/v1/widgets/public?");
+
+        let events = audit_events(&capture, 5).await;
+        let shadow = events
+            .iter()
+            .find(|event| event.event_type == "authz.would_deny")
+            .expect("direct HTTP Shadow rule should emit authz.would_deny");
+        assert_eq!(shadow.payload["tool_name"], json!("get_widget"));
+        assert_eq!(shadow.payload["method"], json!("GET"));
+        assert_eq!(shadow.payload["path"], json!("/v1/widgets/public"));
+        assert_eq!(
+            shadow.payload["matched_rule_id"],
+            json!("shadow-widget-http-path")
+        );
     }
 
     #[tokio::test]

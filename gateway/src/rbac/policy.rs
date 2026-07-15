@@ -85,7 +85,8 @@ pub struct Policy {
     /// Ordered route-to-permission rules. First matching rule wins.
     #[serde(default)]
     pub routes: Vec<RouteRule>,
-    /// Ordered direct firewall rules. First matching rule wins.
+    /// Ordered direct firewall rules for inbound requests and rendered local
+    /// tool HTTP operations. First matching rule wins per target type.
     #[serde(default)]
     pub rules: Vec<Rule>,
     /// Policy-driven outbound egress rules layered on top of env-var defaults.

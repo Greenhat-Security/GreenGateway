@@ -99,7 +99,8 @@ pub struct Rule {
     /// HTTP methods this rule matches. Empty or ["*"] matches any method.
     #[serde(default)]
     pub methods: Vec<String>,
-    /// Absolute HTTP path pattern matched against the whole request path.
+    /// Absolute HTTP path pattern matched against the whole request path and
+    /// fully rendered local tool HTTP operations before upstream egress.
     ///
     /// Syntax is segment-based and anchored, never substring-based. Literal
     /// segments match exactly and case-sensitively. `*` matches exactly one
