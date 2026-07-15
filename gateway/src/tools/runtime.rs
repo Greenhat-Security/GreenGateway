@@ -24,7 +24,10 @@ use crate::{
     middleware::rbac::{
         MatchedRuleDecision, RbacState, ToolAuthorizationSnapshot, ToolPolicySnapshot,
     },
-    rbac::{policy, rule::principal_identity_matches, Policy, Rule, RuleAction, RuleMatcher},
+    rbac::{
+        policy, rule::principal_identity_matches, Policy, Rule, RuleAction, RuleDispatchContext,
+        RuleMatcher,
+    },
 };
 
 const AUTHZ_ALLOWED: &str = "authz.allowed";
@@ -775,11 +778,16 @@ impl ToolRuntime {
     ) -> bool {
         let principal = principal_from_tool_context(context);
         let decision = if let Some(rbac_state) = &self.inner.rbac_state {
-            rbac_state.evaluate_http_rule(method, path, principal.as_ref())
+            rbac_state.evaluate_tool_http_rule(method, path, principal.as_ref())
         } else {
             self.inner
                 .rule_matcher
-                .evaluate(method, path, principal.as_ref())
+                .evaluate_with_dispatch(
+                    method,
+                    path,
+                    principal.as_ref(),
+                    RuleDispatchContext::unknown(),
+                )
                 .map(|decision| MatchedRuleDecision {
                     action: decision.action,
                     matched_rule_id: self.rule_id(decision.rule_index),
@@ -1520,6 +1528,44 @@ mod tests {
             events[0].payload["matched_rule_id"],
             json!("deny-echo-http-after-reload")
         );
+    }
+
+    #[tokio::test]
+    async fn tool_http_operation_skips_dispatch_bound_allow_with_live_rbac_state() {
+        let policy = tool_policy_with_contextless_allow_before_unbound_deny();
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let runtime_config =
+            ToolRuntimeConfig::from_policy(&policy).expect("tool policy should configure runtime");
+        let runtime = ToolRuntime::new_with_rbac_state(runtime_config, audit, Some(rbac_state));
+
+        assert!(!runtime.authorize_http_operation("echo", "POST", "/v1/echo", &context()));
+
+        let events = audit_events(&capture, 1).await;
+        assert_eq!(events[0].event_type, AUTHZ_DENIED);
+        assert_eq!(events[0].payload["matched_rule_id"], json!("deny-global"));
+    }
+
+    #[tokio::test]
+    async fn tool_http_operation_fallback_skips_dispatch_bound_allow() {
+        let policy = tool_policy_with_contextless_allow_before_unbound_deny();
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime_config =
+            ToolRuntimeConfig::from_policy(&policy).expect("tool policy should configure runtime");
+        let runtime = ToolRuntime::new(runtime_config, audit);
+
+        assert!(!runtime.authorize_http_operation("echo", "POST", "/v1/echo", &context()));
+
+        let events = audit_events(&capture, 1).await;
+        assert_eq!(events[0].event_type, AUTHZ_DENIED);
+        assert_eq!(events[0].payload["matched_rule_id"], json!("deny-global"));
     }
 
     #[tokio::test]
@@ -2789,6 +2835,39 @@ mod tests {
             ]
         })
         .to_string()
+    }
+
+    fn tool_policy_with_contextless_allow_before_unbound_deny() -> Policy {
+        Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "echo": {}
+            },
+            "rules": [
+                {
+                    "id": "allow-contextless",
+                    "methods": ["POST"],
+                    "path": "/v1/echo",
+                    "dispatch": {
+                        "kind": "contextless"
+                    },
+                    "action": "allow"
+                },
+                {
+                    "id": "deny-global",
+                    "methods": ["POST"],
+                    "path": "/v1/echo",
+                    "action": "deny"
+                },
+                {
+                    "id": "allow-global-later",
+                    "methods": ["POST"],
+                    "path": "/v1/echo",
+                    "action": "allow"
+                }
+            ]
+        }))
+        .expect("tool HTTP policy should parse")
     }
 
     fn context() -> ToolInvocationContext {

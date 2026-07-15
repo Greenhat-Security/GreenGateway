@@ -210,7 +210,7 @@ impl RbacState {
         })
     }
 
-    pub(crate) fn evaluate_http_rule(
+    pub(crate) fn evaluate_tool_http_rule(
         &self,
         method: &str,
         path: &str,
@@ -218,7 +218,7 @@ impl RbacState {
     ) -> Option<MatchedRuleDecision> {
         self.policy
             .load()
-            .evaluate_http_rule(method, path, principal)
+            .evaluate_tool_http_rule(method, path, principal)
     }
 }
 
@@ -280,14 +280,14 @@ impl RbacPolicyState {
             })
     }
 
-    fn evaluate_http_rule(
+    fn evaluate_tool_http_rule(
         &self,
         method: &str,
         path: &str,
         principal: Option<&auth::Principal>,
     ) -> Option<MatchedRuleDecision> {
         self.rule_matcher
-            .evaluate(method, path, principal)
+            .evaluate_with_dispatch(method, path, principal, RuleDispatchContext::unknown())
             .map(|decision| MatchedRuleDecision {
                 action: decision.action,
                 matched_rule_id: self.rule_id(decision.rule_index),
