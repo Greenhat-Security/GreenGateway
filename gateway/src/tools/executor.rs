@@ -924,6 +924,7 @@ impl ToolExecutor {
                 "latency_ms": outcome.latency_ms,
                 "tool_name": tool_name,
                 "schema_mismatch": outcome.schema_mismatch,
+                "routing_context_known": true,
         });
 
         if let Some(reason) = outcome.reason {
@@ -1568,6 +1569,7 @@ mod tests {
         );
         assert_eq!(events[2].payload["status"], json!(201));
         assert_eq!(events[2].payload["schema_mismatch"], json!(false));
+        assert_eq!(events[2].payload["routing_context_known"], json!(true));
         assert!(
             events[2].payload["latency_ms"].as_u64().is_some(),
             "tool observation event should include latency_ms"
@@ -3550,6 +3552,7 @@ mod tests {
         );
         assert_eq!(observation.payload["status"], json!(status));
         assert_eq!(observation.payload["schema_mismatch"], json!(false));
+        assert_eq!(observation.payload["routing_context_known"], json!(true));
         assert_eq!(observation.payload["reason"], json!(reason));
         assert!(
             observation.payload["latency_ms"].as_u64().is_some(),

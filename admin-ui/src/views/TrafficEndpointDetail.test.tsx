@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import type { TrafficEndpointDetail as TrafficEndpointDetailData } from '../lib/traffic';
 import { TrafficEndpointDetail } from './TrafficEndpointDetail';
 
 afterEach(() => {
@@ -24,6 +25,29 @@ describe('TrafficEndpointDetail', () => {
             reviewed_at: '2026-07-04T10:30:00Z',
             reviewed_by: 'admin-user',
             covered_by_rule: false,
+            coverage_scope: 'principal',
+            routing_contexts: [
+              {
+                route_host: 'api.example.test',
+                route_path_prefix: '/users',
+                upstream_origin: 'https://api.internal',
+                first_seen: '2026-07-04T08:00:00Z',
+                last_seen: '2026-07-04T10:00:00Z',
+                call_count: 1234,
+                distinct_principal_count: 2,
+                covered_by_rule: false,
+                coverage_scope: 'principal',
+              },
+              {
+                upstream_origin: null,
+                first_seen: '2026-07-04T08:30:00Z',
+                last_seen: '2026-07-04T09:30:00Z',
+                call_count: 4,
+                distinct_principal_count: 1,
+                covered_by_rule: false,
+                coverage_scope: 'none',
+              },
+            ],
             open_signals: {
               count: 3,
               signal_types: [
@@ -57,13 +81,22 @@ describe('TrafficEndpointDetail', () => {
         name: 'GET /users/{id}',
       }),
     ).toBeTruthy();
-    expect(screen.getByText('1,234')).toBeTruthy();
-    expect(screen.getByText('2')).toBeTruthy();
+    expect(screen.getAllByText('1,234').length).toBeGreaterThan(0);
+    expect(screen.getByText('Upstream contexts')).toBeTruthy();
+    expect(screen.getByText('api.example.test')).toBeTruthy();
+    expect(screen.getByText('https://api.internal')).toBeTruthy();
+    expect(screen.getByText('No proxy dispatch')).toBeTruthy();
+    expect(screen.getAllByText('PRINCIPAL-SCOPED').length).toBeGreaterThan(0);
+    const principalsStat = screen
+      .getAllByText('Principals')
+      .find((element) => element.classList.contains('stat-label'));
+    expect(
+      principalsStat?.parentElement?.querySelector('.stat-value')?.textContent,
+    ).toBe('2');
     expect(screen.getAllByText('12 ms').length).toBeGreaterThan(0);
     expect(screen.getAllByText('45 ms').length).toBeGreaterThan(0);
     expect(screen.getAllByText('90 ms').length).toBeGreaterThan(0);
     expect(screen.getByText('NEW')).toBeTruthy();
-    expect(screen.getByText('UNCOVERED')).toBeTruthy();
     expect(screen.getByText('3 open signals')).toBeTruthy();
     expect(screen.getByText('Reviewed')).toBeTruthy();
     expect(screen.getAllByText('200').length).toBeGreaterThan(0);
@@ -324,7 +357,7 @@ function trafficDetailResponse(overrides: Partial<DetailResponseShape> = {}) {
   };
 }
 
-function trafficEndpoint() {
+function trafficEndpoint(): TrafficEndpointDetailData {
   return {
     method: 'GET',
     endpoint_template: '/users/{id}',
@@ -337,6 +370,10 @@ function trafficEndpoint() {
     reviewed_at: null as string | null,
     reviewed_by: null as string | null,
     covered_by_rule: true,
+    coverage_scope: 'endpoint',
+    routing_context_known: true,
+    routing_context_known_since: '2026-07-04T08:00:00Z',
+    routing_contexts: [],
     open_signals: {
       count: 0,
       signal_types: [] as string[],

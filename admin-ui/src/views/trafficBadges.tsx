@@ -5,7 +5,11 @@ import { signalsPathForEndpoint } from '../lib/signals';
 
 type TrafficEndpointBadgeState = Pick<
   TrafficEndpoint,
-  'covered_by_rule' | 'is_new' | 'reviewed'
+  | 'coverage_scope'
+  | 'covered_by_rule'
+  | 'is_new'
+  | 'reviewed'
+  | 'routing_context_known'
 >;
 
 type TrafficEndpointSignalBadgeState = Pick<
@@ -22,18 +26,42 @@ export function EndpointLifecycleBadges({
 }: {
   endpoint: TrafficEndpointBadgeState;
 }) {
-  if (!endpoint.is_new && endpoint.covered_by_rule) {
+  const coverageScope =
+    endpoint.routing_context_known !== true
+      ? 'unknown'
+      : (endpoint.coverage_scope ??
+        (endpoint.covered_by_rule ? 'endpoint' : 'none'));
+
+  if (!endpoint.is_new && coverageScope === 'endpoint') {
     return null;
   }
 
   return (
     <div className="endpoint-badges" aria-label="Endpoint lifecycle">
       {endpoint.is_new ? <span className="badge success">NEW</span> : null}
-      {!endpoint.covered_by_rule ? (
-        <span className="badge warning">UNCOVERED</span>
-      ) : null}
+      <CoverageBadge scope={coverageScope} />
     </div>
   );
+}
+
+export function CoverageBadge({
+  scope,
+}: {
+  scope: TrafficEndpoint['coverage_scope'];
+}) {
+  if (scope === 'endpoint') {
+    return null;
+  }
+  if (scope === 'principal') {
+    return <span className="badge warning">PRINCIPAL-SCOPED</span>;
+  }
+  if (scope === 'mixed') {
+    return <span className="badge warning">MIXED COVERAGE</span>;
+  }
+  if (scope === 'unknown') {
+    return <span className="badge warning">UNKNOWN CONTEXT</span>;
+  }
+  return <span className="badge warning">UNCOVERED</span>;
 }
 
 export function ReviewBadge({ reviewed }: { reviewed: boolean }) {

@@ -16,6 +16,38 @@ pub(crate) struct ProxyRouteAuthorizationContext {
     pub(crate) upstream_origin: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProxyRouteObservationContext {
+    pub(crate) route_host: Option<String>,
+    pub(crate) route_path_prefix: Option<String>,
+    pub(crate) upstream_origin: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProxyRouteClassificationCompleted;
+
+impl ProxyRouteObservationContext {
+    pub(crate) fn new(
+        route_host: Option<String>,
+        route_path_prefix: Option<String>,
+        upstream_origin: String,
+    ) -> Self {
+        Self {
+            route_host,
+            route_path_prefix,
+            upstream_origin,
+        }
+    }
+
+    pub(crate) fn authorization_context(&self) -> Option<ProxyRouteAuthorizationContext> {
+        Some(ProxyRouteAuthorizationContext::new(
+            self.route_host.clone()?,
+            self.route_path_prefix.clone(),
+            self.upstream_origin.clone(),
+        ))
+    }
+}
+
 impl ProxyRouteAuthorizationContext {
     pub(crate) fn new(host: String, path_prefix: Option<String>, upstream_origin: String) -> Self {
         Self {

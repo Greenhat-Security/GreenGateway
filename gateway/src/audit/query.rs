@@ -79,6 +79,9 @@ pub struct RoleEndpointObservationFilters {
 pub struct RoleEndpointObservation {
     pub method: String,
     pub endpoint_template: String,
+    pub route_host: Option<String>,
+    pub route_path_prefix: Option<String>,
+    pub upstream_origin: Option<String>,
     pub role: String,
     pub observation_count: u64,
     pub error_count: u64,
@@ -94,6 +97,7 @@ pub struct RoleEndpointObservationMatrix {
     pub skipped_unauthenticated_observations: u64,
     pub skipped_without_roles_observations: u64,
     pub skipped_denied_observations: u64,
+    pub skipped_unknown_routing_context_observations: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -427,9 +431,27 @@ impl AuditQueryStore {
         let endpoint_keys = filters
             .endpoints
             .iter()
-            .map(|endpoint| (endpoint.method.clone(), endpoint.endpoint_template.clone()))
+            .map(|endpoint| {
+                (
+                    endpoint.method.clone(),
+                    endpoint.endpoint_template.clone(),
+                    endpoint.route_host.clone(),
+                    endpoint.route_path_prefix.clone(),
+                    endpoint.upstream_origin.clone(),
+                )
+            })
             .collect::<BTreeSet<_>>();
-        let mut aggregates = BTreeMap::<(String, String, String), RoleEndpointObservation>::new();
+        let mut aggregates = BTreeMap::<
+            (
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                String,
+            ),
+            RoleEndpointObservation,
+        >::new();
         let mut result = RoleEndpointObservationMatrix::default();
 
         self.scan_request_observations(
@@ -451,8 +473,22 @@ impl AuditQueryStore {
                 result.scanned_event_count = result.scanned_event_count.saturating_add(1);
 
                 let endpoint_template = template_stateless(&observation.path);
-                let endpoint_key = (observation.method.clone(), endpoint_template.clone());
+                let (route_host, route_path_prefix, upstream_origin) =
+                    observation_routing_context(&observation.payload_json);
+                let endpoint_key = (
+                    observation.method.clone(),
+                    endpoint_template.clone(),
+                    route_host.clone(),
+                    route_path_prefix.clone(),
+                    upstream_origin.clone(),
+                );
                 if !endpoint_keys.contains(&endpoint_key) {
+                    return true;
+                }
+                if !observation_routing_context_known(&observation.payload_json) {
+                    result.skipped_unknown_routing_context_observations = result
+                        .skipped_unknown_routing_context_observations
+                        .saturating_add(1);
                     return true;
                 }
 
@@ -485,6 +521,9 @@ impl AuditQueryStore {
                     let key = (
                         observation.method.clone(),
                         endpoint_template.clone(),
+                        route_host.clone(),
+                        route_path_prefix.clone(),
+                        upstream_origin.clone(),
                         role.clone(),
                     );
                     let entry = aggregates
@@ -492,6 +531,9 @@ impl AuditQueryStore {
                         .or_insert_with(|| RoleEndpointObservation {
                             method: observation.method.clone(),
                             endpoint_template: endpoint_template.clone(),
+                            route_host: route_host.clone(),
+                            route_path_prefix: route_path_prefix.clone(),
+                            upstream_origin: upstream_origin.clone(),
                             role: role.clone(),
                             observation_count: 0,
                             error_count: 0,
@@ -1210,6 +1252,38 @@ fn baseline_policy_decision(payload_json: &str) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
+}
+
+fn observation_routing_context(
+    payload_json: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let Ok(payload) = serde_json::from_str::<Value>(payload_json) else {
+        return (None, None, None);
+    };
+    (
+        nonempty_json_string(&payload, "upstream_route_host"),
+        nonempty_json_string(&payload, "upstream_route_path_prefix"),
+        nonempty_json_string(&payload, "upstream_origin"),
+    )
+}
+
+fn observation_routing_context_known(payload_json: &str) -> bool {
+    let Ok(payload) = serde_json::from_str::<Value>(payload_json) else {
+        return false;
+    };
+    payload
+        .get("routing_context_known")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn nonempty_json_string(payload: &Value, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn is_error_status(status: i64) -> bool {

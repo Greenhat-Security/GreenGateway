@@ -12,12 +12,18 @@ export type PrincipalMatcher = {
   principal_ids?: string[];
 };
 
+export type PolicyRuleDispatchMatcher = {
+  kind: 'contextless' | 'legacy';
+  upstream_origin?: string;
+};
+
 export type PolicyRule = {
   id?: string | null;
   enabled?: boolean;
   methods?: string[];
   path?: string;
   tool_name?: string;
+  dispatch?: PolicyRuleDispatchMatcher;
   principal?: PrincipalMatcher;
   action: PolicyRuleAction;
 };

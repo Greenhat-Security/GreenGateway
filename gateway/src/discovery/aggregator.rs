@@ -5,12 +5,15 @@
 //! writer thread, keeps an in-memory working set, and periodically flushes
 //! endpoint inventory to SQLite.
 //!
-//! Aggregates are keyed by `(method, endpoint_template)`. Status counts are
-//! exact per status code. Distinct principal counts are exact by storing one
-//! principal row per observed `actor.user_id`; unauthenticated requests increase
-//! call counts but not distinct principal counts. Latency percentiles are
-//! computed from a bounded deterministic reservoir sample, which keeps memory
-//! bounded while making percentiles approximate once an endpoint has more than
+//! Endpoint aggregates are keyed by `(method, endpoint_template)`. Proxy routing
+//! variants are retained separately by configured route host/path and upstream
+//! origin, avoiding attacker-controlled Host cardinality while preserving every
+//! policy-relevant dispatch dimension. Status counts are exact per status code.
+//! Distinct principal counts are exact by storing one principal row per observed
+//! `actor.user_id`; unauthenticated requests increase call counts but not
+//! distinct principal counts. Latency percentiles are computed from a bounded
+//! deterministic reservoir sample, which keeps memory bounded while making
+//! percentiles approximate once an endpoint has more than
 //! `LATENCY_SAMPLE_LIMIT` observations.
 //!
 //! Known limitation: exact distinct-principal tracking is unbounded. Each
@@ -97,6 +100,69 @@ ON discovery_endpoint_aggregates(last_seen);
 
 CREATE INDEX IF NOT EXISTS idx_discovery_endpoint_template
 ON discovery_endpoint_aggregates(endpoint_template);
+
+CREATE TABLE IF NOT EXISTS discovery_endpoint_routing_contexts (
+    method TEXT NOT NULL,
+    endpoint_template TEXT NOT NULL,
+    route_host TEXT NOT NULL,
+    route_path_prefix TEXT NOT NULL,
+    upstream_origin TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    call_count INTEGER NOT NULL,
+    distinct_principal_count INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (
+        method,
+        endpoint_template,
+        route_host,
+        route_path_prefix,
+        upstream_origin
+    )
+);
+
+CREATE TABLE IF NOT EXISTS discovery_endpoint_routing_principals (
+    method TEXT NOT NULL,
+    endpoint_template TEXT NOT NULL,
+    route_host TEXT NOT NULL,
+    route_path_prefix TEXT NOT NULL,
+    upstream_origin TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    PRIMARY KEY (
+        method,
+        endpoint_template,
+        route_host,
+        route_path_prefix,
+        upstream_origin,
+        user_id
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_discovery_endpoint_routing_origin
+ON discovery_endpoint_routing_contexts(upstream_origin);
+
+CREATE TABLE IF NOT EXISTS discovery_endpoint_routing_classifications (
+    method TEXT NOT NULL,
+    endpoint_template TEXT NOT NULL,
+    first_classified_at TEXT NOT NULL,
+    PRIMARY KEY (method, endpoint_template)
+);
+
+CREATE TABLE IF NOT EXISTS discovery_endpoint_classified_signal_stats (
+    method TEXT NOT NULL,
+    endpoint_template TEXT NOT NULL,
+    call_count INTEGER NOT NULL,
+    schema_mismatch_count INTEGER NOT NULL,
+    error_count INTEGER NOT NULL,
+    PRIMARY KEY (method, endpoint_template)
+);
+
+CREATE TABLE IF NOT EXISTS discovery_endpoint_classified_signal_principals (
+    method TEXT NOT NULL,
+    endpoint_template TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    PRIMARY KEY (method, endpoint_template, user_id)
+);
 "#;
 
 const CREATE_PAYLOAD_CAPTURE_SCHEMA_SQL: &str = r#"
@@ -559,8 +625,9 @@ struct EndpointAggregate {
     /// database. Future work should add TTL pruning or a configured
     /// cardinality cap if exactness becomes too costly.
     principals: HashMap<String, PrincipalSeen>,
-    recent_error_window: RecentErrorWindow,
-    volume_window: VolumeWindow,
+    routing_contexts: HashMap<RoutingContextKey, RoutingContextAggregate>,
+    routing_context_known_since: Option<String>,
+    classified_signal_state: ClassifiedSignalState,
 }
 
 impl EndpointAggregate {
@@ -578,8 +645,9 @@ impl EndpointAggregate {
             payload_shape_observation_count: 0,
             payload_shape_samples: Vec::new(),
             principals: HashMap::new(),
-            recent_error_window: RecentErrorWindow::default(),
-            volume_window: VolumeWindow::default(),
+            routing_contexts: HashMap::new(),
+            routing_context_known_since: None,
+            classified_signal_state: ClassifiedSignalState::default(),
         }
     }
 
@@ -604,9 +672,6 @@ impl EndpointAggregate {
         if let Some(payload_shape) = observation.payload_shape.as_ref() {
             self.record_payload_shape(&observation.timestamp, payload_shape.clone());
         }
-        let recent_error_window = self.recent_error_window.observe(error_status);
-        let completed_volume_window = self.volume_window.observe(&observation.timestamp);
-
         if let Some(user_id) = observation.user_id.as_deref() {
             if !user_id.is_empty() {
                 self.principals
@@ -626,9 +691,23 @@ impl EndpointAggregate {
             }
         }
 
+        if observation.routing_context_known {
+            if let Some(key) = observation.routing_context_key() {
+                self.routing_contexts
+                    .entry(key.clone())
+                    .or_insert_with(|| RoutingContextAggregate::new(key, &observation.timestamp))
+                    .observe(&observation.timestamp, observation.user_id.as_deref());
+            }
+            update_earliest_timestamp(
+                &mut self.routing_context_known_since,
+                &observation.timestamp,
+            );
+        }
+
         EndpointAggregateObservation {
-            recent_error_window,
-            completed_volume_window,
+            classified_signal: observation
+                .routing_context_known
+                .then(|| self.classified_signal_state.observe(observation)),
         }
     }
 
@@ -660,6 +739,18 @@ impl EndpointAggregate {
                 .and_modify(|seen| seen.merge(other_seen.clone()))
                 .or_insert(other_seen);
         }
+
+        for (key, other_context) in other.routing_contexts {
+            self.routing_contexts
+                .entry(key.clone())
+                .and_modify(|context| context.merge(other_context.clone()))
+                .or_insert(other_context);
+        }
+        if let Some(known_since) = other.routing_context_known_since {
+            update_earliest_timestamp(&mut self.routing_context_known_since, &known_since);
+        }
+        self.classified_signal_state
+            .merge(other.classified_signal_state);
 
         self.reset_transient_signal_windows();
     }
@@ -736,13 +827,154 @@ impl EndpointAggregate {
     }
 
     fn reset_transient_signal_windows(&mut self) {
+        self.classified_signal_state.reset_transient_windows();
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RoutingContextKey {
+    route_host: String,
+    route_path_prefix: String,
+    upstream_origin: String,
+}
+
+impl RoutingContextKey {
+    fn new(
+        route_host: Option<String>,
+        route_path_prefix: Option<String>,
+        upstream_origin: String,
+    ) -> Self {
+        Self {
+            route_host: route_host.unwrap_or_default(),
+            route_path_prefix: route_path_prefix.unwrap_or_default(),
+            upstream_origin,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RoutingContextAggregate {
+    key: RoutingContextKey,
+    first_seen: String,
+    last_seen: String,
+    call_count: u64,
+    principals: HashSet<String>,
+}
+
+impl RoutingContextAggregate {
+    fn new(key: RoutingContextKey, timestamp: &str) -> Self {
+        Self {
+            key,
+            first_seen: timestamp.to_owned(),
+            last_seen: timestamp.to_owned(),
+            call_count: 0,
+            principals: HashSet::new(),
+        }
+    }
+
+    fn observe(&mut self, timestamp: &str, user_id: Option<&str>) {
+        if timestamp_before(timestamp, &self.first_seen) {
+            self.first_seen = timestamp.to_owned();
+        }
+        if timestamp_after(timestamp, &self.last_seen) {
+            self.last_seen = timestamp.to_owned();
+        }
+        self.call_count = self.call_count.saturating_add(1);
+        if let Some(user_id) = user_id.filter(|user_id| !user_id.is_empty()) {
+            self.principals.insert(user_id.to_owned());
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        if timestamp_before(&other.first_seen, &self.first_seen) {
+            self.first_seen = other.first_seen;
+        }
+        if timestamp_after(&other.last_seen, &self.last_seen) {
+            self.last_seen = other.last_seen;
+        }
+        self.call_count = self.call_count.saturating_add(other.call_count);
+        self.principals.extend(other.principals);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct EndpointAggregateObservation {
+    classified_signal: Option<ClassifiedSignalObservation>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ClassifiedSignalState {
+    call_count: u64,
+    schema_mismatch_count: u64,
+    error_count: u64,
+    principals: HashSet<String>,
+    recent_error_window: RecentErrorWindow,
+    volume_window: VolumeWindow,
+}
+
+impl ClassifiedSignalState {
+    fn observe(&mut self, observation: &ObservedRequest) -> ClassifiedSignalObservation {
+        let previous_schema_mismatch_count = self.schema_mismatch_count;
+        let previous_distinct_principal_count = self.principals.len() as u64;
+        let principal_seen_before = observation
+            .user_id
+            .as_deref()
+            .filter(|user_id| !user_id.is_empty())
+            .is_some_and(|user_id| self.principals.contains(user_id));
+
+        self.call_count = self.call_count.saturating_add(1);
+        if observation.schema_mismatch {
+            self.schema_mismatch_count = self.schema_mismatch_count.saturating_add(1);
+        }
+        let error_status = is_error_status(observation.status);
+        if error_status {
+            self.error_count = self.error_count.saturating_add(1);
+        }
+        let recent_error_window = self.recent_error_window.observe(error_status);
+        let completed_volume_window = self.volume_window.observe(&observation.timestamp);
+        if let Some(user_id) = observation
+            .user_id
+            .as_deref()
+            .filter(|user_id| !user_id.is_empty())
+        {
+            self.principals.insert(user_id.to_owned());
+        }
+
+        ClassifiedSignalObservation {
+            previous_schema_mismatch_count,
+            previous_distinct_principal_count,
+            principal_seen_before,
+            call_count: self.call_count,
+            schema_mismatch_count: self.schema_mismatch_count,
+            error_count: self.error_count,
+            recent_error_window,
+            completed_volume_window,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.call_count = self.call_count.saturating_add(other.call_count);
+        self.schema_mismatch_count = self
+            .schema_mismatch_count
+            .saturating_add(other.schema_mismatch_count);
+        self.error_count = self.error_count.saturating_add(other.error_count);
+        self.principals.extend(other.principals);
+    }
+
+    fn reset_transient_windows(&mut self) {
         self.recent_error_window = RecentErrorWindow::default();
         self.volume_window = VolumeWindow::default();
     }
 }
 
 #[derive(Clone, Debug)]
-struct EndpointAggregateObservation {
+struct ClassifiedSignalObservation {
+    previous_schema_mismatch_count: u64,
+    previous_distinct_principal_count: u64,
+    principal_seen_before: bool,
+    call_count: u64,
+    schema_mismatch_count: u64,
+    error_count: u64,
     recent_error_window: ErrorRateWindowSnapshot,
     completed_volume_window: Option<CompletedVolumeWindow>,
 }
@@ -944,8 +1176,9 @@ impl AggregatorState {
                     payload_shape_observation_count: 0,
                     payload_shape_samples: Vec::new(),
                     principals: HashMap::new(),
-                    recent_error_window: RecentErrorWindow::default(),
-                    volume_window: VolumeWindow::default(),
+                    routing_contexts: HashMap::new(),
+                    routing_context_known_since: None,
+                    classified_signal_state: ClassifiedSignalState::default(),
                 },
             );
         }
@@ -977,6 +1210,77 @@ impl AggregatorState {
                     last_seen: row.last_seen,
                 },
             );
+        }
+
+        for row in load_routing_context_rows(connection)? {
+            let key = EndpointKey::new(row.method, row.endpoint_template);
+            let Some(aggregate) = state.aggregates.get_mut(&key) else {
+                continue;
+            };
+            let context_key = RoutingContextKey::new(
+                empty_string_as_none(row.route_host),
+                empty_string_as_none(row.route_path_prefix),
+                row.upstream_origin,
+            );
+            aggregate.routing_contexts.insert(
+                context_key.clone(),
+                RoutingContextAggregate {
+                    key: context_key,
+                    first_seen: row.first_seen,
+                    last_seen: row.last_seen,
+                    call_count: non_negative_i64_to_u64(row.call_count),
+                    principals: HashSet::new(),
+                },
+            );
+        }
+
+        for row in load_routing_classification_rows(connection)? {
+            let key = EndpointKey::new(row.method, row.endpoint_template);
+            let Some(aggregate) = state.aggregates.get_mut(&key) else {
+                continue;
+            };
+            update_earliest_timestamp(
+                &mut aggregate.routing_context_known_since,
+                &row.first_classified_at,
+            );
+        }
+
+        for row in load_routing_principal_rows(connection)? {
+            let key = EndpointKey::new(row.method, row.endpoint_template);
+            let Some(aggregate) = state.aggregates.get_mut(&key) else {
+                continue;
+            };
+            let context_key = RoutingContextKey::new(
+                empty_string_as_none(row.route_host),
+                empty_string_as_none(row.route_path_prefix),
+                row.upstream_origin,
+            );
+            if let Some(context) = aggregate.routing_contexts.get_mut(&context_key) {
+                context.principals.insert(row.user_id);
+            }
+        }
+
+        for row in load_classified_signal_stat_rows(connection)? {
+            let key = EndpointKey::new(row.method, row.endpoint_template);
+            let Some(aggregate) = state.aggregates.get_mut(&key) else {
+                continue;
+            };
+            aggregate.classified_signal_state.call_count = non_negative_i64_to_u64(row.call_count);
+            aggregate.classified_signal_state.schema_mismatch_count =
+                non_negative_i64_to_u64(row.schema_mismatch_count);
+            aggregate.classified_signal_state.error_count =
+                non_negative_i64_to_u64(row.error_count);
+        }
+
+        for row in load_classified_signal_principal_rows(connection)? {
+            let key = EndpointKey::new(row.method, row.endpoint_template);
+            let Some(aggregate) = state.aggregates.get_mut(&key) else {
+                continue;
+            };
+            aggregate
+                .classified_signal_state
+                .principals
+                .insert(row.user_id);
         }
 
         if payload_capture_enabled {
@@ -1017,100 +1321,82 @@ impl AggregatorState {
             .user_id
             .as_deref()
             .filter(|user_id| !user_id.is_empty());
-        let (
-            previous_schema_mismatch_count,
-            previous_distinct_principal_count,
-            principal_seen_before,
-            aggregate_call_count,
-            aggregate_schema_mismatch_count,
-            aggregate_error_count,
-            observation_effects,
-        ) = {
+        let observation_effects = {
             let aggregate = self
                 .aggregates
                 .entry(key.clone())
                 .or_insert_with(|| EndpointAggregate::new(key.clone(), &observation.timestamp));
-            let previous_schema_mismatch_count = aggregate.schema_mismatch_count;
-            let previous_distinct_principal_count = aggregate.principals.len() as u64;
-            let principal_seen_before =
-                principal.is_some_and(|user_id| aggregate.principals.contains_key(user_id));
-            let observation_effects = aggregate.observe(&observation);
-
-            (
-                previous_schema_mismatch_count,
-                previous_distinct_principal_count,
-                principal_seen_before,
-                aggregate.call_count,
-                aggregate.schema_mismatch_count,
-                aggregate.error_count,
-                observation_effects,
-            )
+            aggregate.observe(&observation)
         };
 
         let mut signals = Vec::new();
-        if is_new_endpoint {
-            signals.extend(self.signal_evaluator.evaluate_new_endpoint(
-                EndpointSignalObservation {
-                    method: &key.method,
-                    endpoint_template: &key.endpoint_template,
-                    first_seen: &observation.timestamp,
-                    status: observation.status,
-                    latency_ms: observation.latency_ms,
-                    user_id: observation.user_id.as_deref(),
-                },
-            ));
-        }
-        signals.extend(self.signal_evaluator.evaluate_schema_mismatch(
-            SchemaMismatchSignalObservation {
-                method: &key.method,
-                endpoint_template: &key.endpoint_template,
-                observed_at: &observation.timestamp,
-                call_count: aggregate_call_count,
-                previous_schema_mismatch_count,
-                schema_mismatch_count: aggregate_schema_mismatch_count,
-            },
-        ));
-
-        let recent = observation_effects.recent_error_window;
-        signals.extend(self.signal_evaluator.evaluate_error_rate_spike(
-            ErrorRateSpikeSignalObservation {
-                method: &key.method,
-                endpoint_template: &key.endpoint_template,
-                observed_at: &observation.timestamp,
-                recent_sample_count: recent.sample_count,
-                recent_error_count: recent.error_count,
-                baseline_sample_count: aggregate_call_count.saturating_sub(recent.sample_count),
-                baseline_error_count: aggregate_error_count.saturating_sub(recent.error_count),
-            },
-        ));
-
-        if let Some(principal) = principal {
-            if !is_new_endpoint && !principal_seen_before {
-                signals.extend(self.signal_evaluator.evaluate_principal_new_to_endpoint(
-                    PrincipalNewToEndpointSignalObservation {
+        if let Some(classified) = observation_effects.classified_signal {
+            if is_new_endpoint {
+                signals.extend(self.signal_evaluator.evaluate_new_endpoint(
+                    EndpointSignalObservation {
                         method: &key.method,
                         endpoint_template: &key.endpoint_template,
-                        observed_at: &observation.timestamp,
-                        principal,
-                        prior_distinct_principal_count: previous_distinct_principal_count,
+                        first_seen: &observation.timestamp,
+                        status: observation.status,
+                        latency_ms: observation.latency_ms,
+                        user_id: observation.user_id.as_deref(),
                     },
                 ));
             }
-        }
-
-        if let Some(completed) = observation_effects.completed_volume_window {
-            signals.extend(self.signal_evaluator.evaluate_volume_outlier(
-                VolumeOutlierSignalObservation {
+            signals.extend(self.signal_evaluator.evaluate_schema_mismatch(
+                SchemaMismatchSignalObservation {
                     method: &key.method,
                     endpoint_template: &key.endpoint_template,
                     observed_at: &observation.timestamp,
-                    window_call_count: completed.call_count,
-                    window_duration_secs: completed.duration_secs,
-                    current_rate_per_second: completed.rate_per_second,
-                    baseline_window_count: completed.baseline_window_count,
-                    baseline_rate_per_second: completed.baseline_rate_per_second,
+                    call_count: classified.call_count,
+                    previous_schema_mismatch_count: classified.previous_schema_mismatch_count,
+                    schema_mismatch_count: classified.schema_mismatch_count,
                 },
             ));
+
+            let recent = classified.recent_error_window;
+            signals.extend(self.signal_evaluator.evaluate_error_rate_spike(
+                ErrorRateSpikeSignalObservation {
+                    method: &key.method,
+                    endpoint_template: &key.endpoint_template,
+                    observed_at: &observation.timestamp,
+                    recent_sample_count: recent.sample_count,
+                    recent_error_count: recent.error_count,
+                    baseline_sample_count:
+                        classified.call_count.saturating_sub(recent.sample_count),
+                    baseline_error_count: classified.error_count.saturating_sub(recent.error_count),
+                },
+            ));
+
+            if let Some(principal) = principal {
+                if !is_new_endpoint && !classified.principal_seen_before {
+                    signals.extend(self.signal_evaluator.evaluate_principal_new_to_endpoint(
+                        PrincipalNewToEndpointSignalObservation {
+                            method: &key.method,
+                            endpoint_template: &key.endpoint_template,
+                            observed_at: &observation.timestamp,
+                            principal,
+                            prior_distinct_principal_count:
+                                classified.previous_distinct_principal_count,
+                        },
+                    ));
+                }
+            }
+
+            if let Some(completed) = classified.completed_volume_window {
+                signals.extend(self.signal_evaluator.evaluate_volume_outlier(
+                    VolumeOutlierSignalObservation {
+                        method: &key.method,
+                        endpoint_template: &key.endpoint_template,
+                        observed_at: &observation.timestamp,
+                        window_call_count: completed.call_count,
+                        window_duration_secs: completed.duration_secs,
+                        current_rate_per_second: completed.rate_per_second,
+                        baseline_window_count: completed.baseline_window_count,
+                        baseline_rate_per_second: completed.baseline_rate_per_second,
+                    },
+                ));
+            }
         }
 
         self.queue_signals(signals);
@@ -1256,6 +1542,10 @@ struct ObservedRequest {
     endpoint_template: Option<String>,
     payload_shape: Option<Value>,
     schema_mismatch: bool,
+    route_host: Option<String>,
+    route_path_prefix: Option<String>,
+    upstream_origin: Option<String>,
+    routing_context_known: bool,
 }
 
 impl ObservedRequest {
@@ -1293,7 +1583,35 @@ impl ObservedRequest {
                 .get("schema_mismatch")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            route_host: optional_nonempty_payload_string(event, "upstream_route_host"),
+            route_path_prefix: optional_nonempty_payload_string(
+                event,
+                "upstream_route_path_prefix",
+            ),
+            upstream_origin: optional_nonempty_payload_string(event, "upstream_origin"),
+            routing_context_known: event
+                .payload
+                .get("routing_context_known")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
+    }
+
+    fn routing_context_key(&self) -> Option<RoutingContextKey> {
+        Some(RoutingContextKey::new(
+            self.route_host.clone(),
+            self.route_path_prefix.clone(),
+            self.upstream_origin.clone().unwrap_or_default(),
+        ))
+    }
+}
+
+fn update_earliest_timestamp(target: &mut Option<String>, candidate: &str) {
+    if target
+        .as_deref()
+        .is_none_or(|current| timestamp_before(candidate, current))
+    {
+        *target = Some(candidate.to_owned());
     }
 }
 
@@ -1324,6 +1642,51 @@ struct PrincipalRow {
     user_id: String,
     first_seen: String,
     last_seen: String,
+}
+
+#[derive(Debug)]
+struct RoutingContextRow {
+    method: String,
+    endpoint_template: String,
+    route_host: String,
+    route_path_prefix: String,
+    upstream_origin: String,
+    first_seen: String,
+    last_seen: String,
+    call_count: i64,
+}
+
+#[derive(Debug)]
+struct RoutingPrincipalRow {
+    method: String,
+    endpoint_template: String,
+    route_host: String,
+    route_path_prefix: String,
+    upstream_origin: String,
+    user_id: String,
+}
+
+#[derive(Debug)]
+struct RoutingClassificationRow {
+    method: String,
+    endpoint_template: String,
+    first_classified_at: String,
+}
+
+#[derive(Debug)]
+struct ClassifiedSignalStatRow {
+    method: String,
+    endpoint_template: String,
+    call_count: i64,
+    schema_mismatch_count: i64,
+    error_count: i64,
+}
+
+#[derive(Debug)]
+struct ClassifiedSignalPrincipalRow {
+    method: String,
+    endpoint_template: String,
+    user_id: String,
 }
 
 #[derive(Debug)]
@@ -1513,6 +1876,145 @@ fn load_principal_rows(
     Ok(rows)
 }
 
+fn load_routing_context_rows(
+    connection: &Connection,
+) -> Result<Vec<RoutingContextRow>, EndpointAggregatorLoadError> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+            method,
+            endpoint_template,
+            route_host,
+            route_path_prefix,
+            upstream_origin,
+            first_seen,
+            last_seen,
+            call_count
+        FROM discovery_endpoint_routing_contexts
+        "#,
+    )?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(RoutingContextRow {
+                method: row.get(0)?,
+                endpoint_template: row.get(1)?,
+                route_host: row.get(2)?,
+                route_path_prefix: row.get(3)?,
+                upstream_origin: row.get(4)?,
+                first_seen: row.get(5)?,
+                last_seen: row.get(6)?,
+                call_count: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(EndpointAggregatorLoadError::from)?;
+    Ok(rows)
+}
+
+fn load_routing_principal_rows(
+    connection: &Connection,
+) -> Result<Vec<RoutingPrincipalRow>, EndpointAggregatorLoadError> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+            method,
+            endpoint_template,
+            route_host,
+            route_path_prefix,
+            upstream_origin,
+            user_id
+        FROM discovery_endpoint_routing_principals
+        "#,
+    )?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(RoutingPrincipalRow {
+                method: row.get(0)?,
+                endpoint_template: row.get(1)?,
+                route_host: row.get(2)?,
+                route_path_prefix: row.get(3)?,
+                upstream_origin: row.get(4)?,
+                user_id: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(EndpointAggregatorLoadError::from)?;
+    Ok(rows)
+}
+
+fn load_routing_classification_rows(
+    connection: &Connection,
+) -> Result<Vec<RoutingClassificationRow>, EndpointAggregatorLoadError> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT method, endpoint_template, first_classified_at
+        FROM discovery_endpoint_routing_classifications
+        "#,
+    )?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(RoutingClassificationRow {
+                method: row.get(0)?,
+                endpoint_template: row.get(1)?,
+                first_classified_at: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(EndpointAggregatorLoadError::from)?;
+    Ok(rows)
+}
+
+fn load_classified_signal_stat_rows(
+    connection: &Connection,
+) -> Result<Vec<ClassifiedSignalStatRow>, EndpointAggregatorLoadError> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT method, endpoint_template, call_count, schema_mismatch_count, error_count
+        FROM discovery_endpoint_classified_signal_stats
+        "#,
+    )?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ClassifiedSignalStatRow {
+                method: row.get(0)?,
+                endpoint_template: row.get(1)?,
+                call_count: row.get(2)?,
+                schema_mismatch_count: row.get(3)?,
+                error_count: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(EndpointAggregatorLoadError::from)?;
+    Ok(rows)
+}
+
+fn load_classified_signal_principal_rows(
+    connection: &Connection,
+) -> Result<Vec<ClassifiedSignalPrincipalRow>, EndpointAggregatorLoadError> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT method, endpoint_template, user_id
+        FROM discovery_endpoint_classified_signal_principals
+        "#,
+    )?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ClassifiedSignalPrincipalRow {
+                method: row.get(0)?,
+                endpoint_template: row.get(1)?,
+                user_id: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(EndpointAggregatorLoadError::from)?;
+    Ok(rows)
+}
+
 fn load_payload_shape_stat_rows(
     connection: &Connection,
 ) -> Result<Vec<PayloadShapeStatRow>, EndpointAggregatorLoadError> {
@@ -1609,6 +2111,42 @@ fn delete_key(
 
     connection.execute(
         r#"
+        DELETE FROM discovery_endpoint_classified_signal_principals
+        WHERE method = ?1 AND endpoint_template = ?2
+        "#,
+        params![key.method.as_str(), key.endpoint_template.as_str()],
+    )?;
+    connection.execute(
+        r#"
+        DELETE FROM discovery_endpoint_classified_signal_stats
+        WHERE method = ?1 AND endpoint_template = ?2
+        "#,
+        params![key.method.as_str(), key.endpoint_template.as_str()],
+    )?;
+    connection.execute(
+        r#"
+        DELETE FROM discovery_endpoint_routing_classifications
+        WHERE method = ?1 AND endpoint_template = ?2
+        "#,
+        params![key.method.as_str(), key.endpoint_template.as_str()],
+    )?;
+    connection.execute(
+        r#"
+        DELETE FROM discovery_endpoint_routing_principals
+        WHERE method = ?1 AND endpoint_template = ?2
+        "#,
+        params![key.method.as_str(), key.endpoint_template.as_str()],
+    )?;
+    connection.execute(
+        r#"
+        DELETE FROM discovery_endpoint_routing_contexts
+        WHERE method = ?1 AND endpoint_template = ?2
+        "#,
+        params![key.method.as_str(), key.endpoint_template.as_str()],
+    )?;
+
+    connection.execute(
+        r#"
         DELETE FROM discovery_endpoint_status_counts
         WHERE method = ?1 AND endpoint_template = ?2
         "#,
@@ -1658,6 +2196,150 @@ fn upsert_aggregate(
             utc_timestamp_rfc3339(),
         ],
     )?;
+
+    if let Some(first_classified_at) = aggregate.routing_context_known_since.as_deref() {
+        connection.execute(
+            r#"
+            INSERT INTO discovery_endpoint_routing_classifications (
+                method,
+                endpoint_template,
+                first_classified_at
+            ) VALUES (?1, ?2, ?3)
+            ON CONFLICT(method, endpoint_template) DO UPDATE SET
+                first_classified_at = CASE
+                    WHEN julianday(excluded.first_classified_at)
+                       < julianday(discovery_endpoint_routing_classifications.first_classified_at)
+                    THEN excluded.first_classified_at
+                    ELSE discovery_endpoint_routing_classifications.first_classified_at
+                END
+            "#,
+            params![
+                aggregate.key.method.as_str(),
+                aggregate.key.endpoint_template.as_str(),
+                first_classified_at,
+            ],
+        )?;
+    }
+
+    connection.execute(
+        r#"
+        INSERT INTO discovery_endpoint_classified_signal_stats (
+            method,
+            endpoint_template,
+            call_count,
+            schema_mismatch_count,
+            error_count
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(method, endpoint_template) DO UPDATE SET
+            call_count = excluded.call_count,
+            schema_mismatch_count = excluded.schema_mismatch_count,
+            error_count = excluded.error_count
+        "#,
+        params![
+            aggregate.key.method.as_str(),
+            aggregate.key.endpoint_template.as_str(),
+            i64_from_u64(aggregate.classified_signal_state.call_count),
+            i64_from_u64(aggregate.classified_signal_state.schema_mismatch_count),
+            i64_from_u64(aggregate.classified_signal_state.error_count),
+        ],
+    )?;
+    connection.execute(
+        r#"
+        DELETE FROM discovery_endpoint_classified_signal_principals
+        WHERE method = ?1 AND endpoint_template = ?2
+        "#,
+        params![
+            aggregate.key.method.as_str(),
+            aggregate.key.endpoint_template.as_str()
+        ],
+    )?;
+    for user_id in &aggregate.classified_signal_state.principals {
+        connection.execute(
+            r#"
+            INSERT INTO discovery_endpoint_classified_signal_principals (
+                method, endpoint_template, user_id
+            ) VALUES (?1, ?2, ?3)
+            "#,
+            params![
+                aggregate.key.method.as_str(),
+                aggregate.key.endpoint_template.as_str(),
+                user_id,
+            ],
+        )?;
+    }
+
+    connection.execute(
+        r#"
+        DELETE FROM discovery_endpoint_routing_principals
+        WHERE method = ?1 AND endpoint_template = ?2
+        "#,
+        params![
+            aggregate.key.method.as_str(),
+            aggregate.key.endpoint_template.as_str()
+        ],
+    )?;
+    connection.execute(
+        r#"
+        DELETE FROM discovery_endpoint_routing_contexts
+        WHERE method = ?1 AND endpoint_template = ?2
+        "#,
+        params![
+            aggregate.key.method.as_str(),
+            aggregate.key.endpoint_template.as_str()
+        ],
+    )?;
+    for context in aggregate.routing_contexts.values() {
+        connection.execute(
+            r#"
+            INSERT INTO discovery_endpoint_routing_contexts (
+                method,
+                endpoint_template,
+                route_host,
+                route_path_prefix,
+                upstream_origin,
+                first_seen,
+                last_seen,
+                call_count,
+                distinct_principal_count,
+                updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                aggregate.key.method.as_str(),
+                aggregate.key.endpoint_template.as_str(),
+                context.key.route_host.as_str(),
+                context.key.route_path_prefix.as_str(),
+                context.key.upstream_origin.as_str(),
+                context.first_seen.as_str(),
+                context.last_seen.as_str(),
+                i64_from_u64(context.call_count),
+                i64_from_usize(context.principals.len()),
+                utc_timestamp_rfc3339(),
+            ],
+        )?;
+        for user_id in &context.principals {
+            connection.execute(
+                r#"
+                INSERT INTO discovery_endpoint_routing_principals (
+                    method,
+                    endpoint_template,
+                    route_host,
+                    route_path_prefix,
+                    upstream_origin,
+                    user_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    aggregate.key.method.as_str(),
+                    aggregate.key.endpoint_template.as_str(),
+                    context.key.route_host.as_str(),
+                    context.key.route_path_prefix.as_str(),
+                    context.key.upstream_origin.as_str(),
+                    user_id,
+                ],
+            )?;
+        }
+    }
 
     connection.execute(
         r#"
@@ -1851,6 +2533,20 @@ fn parse_u64(value: &Value) -> Option<u64> {
                 None
             }
         })
+}
+
+fn optional_nonempty_payload_string(event: &AuditEvent, field: &str) -> Option<String> {
+    event
+        .payload
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn empty_string_as_none(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
 }
 
 fn is_error_status(status: u16) -> bool {
@@ -2078,6 +2774,184 @@ mod tests {
                 ("GET".to_owned(), "/v1/widgets/{id}".to_owned(), 2),
                 ("GET".to_owned(), "/v1/widgets/{param}".to_owned(), 4),
             ]
+        );
+    }
+
+    #[test]
+    fn routing_contexts_preserve_host_and_upstream_variants() {
+        let db = TempDb::new("routing-contexts");
+        let sink = aggregator_sink(&db.path);
+
+        for (host, origin, user_id) in [
+            ("api.example.test", "https://api.internal", "user-1"),
+            ("admin.example.test", "https://admin.internal", "user-2"),
+        ] {
+            let mut event = observed_event(
+                "GET",
+                "/users/123",
+                200,
+                10,
+                Some(user_id),
+                "2024-06-01T12:00:00Z",
+            );
+            event.payload["upstream_route_host"] = json!(host);
+            event.payload["upstream_route_path_prefix"] = json!("/users");
+            event.payload["upstream_origin"] = json!(origin);
+            sink.emit(&event);
+        }
+        sink.flush_for_test();
+
+        let connection = Connection::open(&db.path).expect("database should open");
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT
+                    route_host,
+                    route_path_prefix,
+                    upstream_origin,
+                    call_count,
+                    distinct_principal_count
+                FROM discovery_endpoint_routing_contexts
+                WHERE method = 'GET' AND endpoint_template = '/users/{id}'
+                ORDER BY route_host
+                "#,
+            )
+            .expect("routing contexts should query");
+        let contexts = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .expect("routing contexts should map")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("routing contexts should collect");
+
+        assert_eq!(
+            contexts,
+            vec![
+                (
+                    "admin.example.test".to_owned(),
+                    "/users".to_owned(),
+                    "https://admin.internal".to_owned(),
+                    1,
+                    1,
+                ),
+                (
+                    "api.example.test".to_owned(),
+                    "/users".to_owned(),
+                    "https://api.internal".to_owned(),
+                    1,
+                    1,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn routing_contexts_preserve_contextless_and_routed_variants_together() {
+        let db = TempDb::new("mixed-routing-contexts");
+        let sink = aggregator_sink(&db.path);
+
+        sink.emit(&observed_event(
+            "GET",
+            "/reports/123",
+            200,
+            10,
+            Some("user-1"),
+            "2024-06-01T12:00:00Z",
+        ));
+        let mut routed = observed_event(
+            "GET",
+            "/reports/456",
+            200,
+            12,
+            Some("user-2"),
+            "2024-06-01T12:01:00Z",
+        );
+        routed.payload["upstream_route_path_prefix"] = json!("/reports");
+        routed.payload["upstream_origin"] = json!("https://reports.internal");
+        sink.emit(&routed);
+        sink.flush_for_test();
+
+        let store = crate::discovery::query::DiscoveryQueryStore::open(&db.path)
+            .expect("discovery query store should open");
+        let endpoints = store
+            .observed_endpoints()
+            .expect("routing variants should query");
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0].route_path_prefix, None);
+        assert_eq!(endpoints[0].upstream_origin, None);
+        assert_eq!(endpoints[1].route_path_prefix.as_deref(), Some("/reports"));
+        assert_eq!(
+            endpoints[1].upstream_origin.as_deref(),
+            Some("https://reports.internal")
+        );
+        let detail = store
+            .get_endpoint("GET", "/reports/{id}", 24)
+            .expect("endpoint detail should query")
+            .expect("endpoint detail should exist");
+        assert_eq!(detail.routing_contexts.len(), 2);
+        assert_eq!(detail.routing_contexts[0].upstream_origin, None);
+        assert_eq!(
+            detail.routing_contexts[1].upstream_origin.as_deref(),
+            Some("https://reports.internal")
+        );
+    }
+
+    #[test]
+    fn routing_classification_timestamp_survives_aggregator_restart() {
+        let db = TempDb::new("routing-classification-restart");
+        {
+            let sink = aggregator_sink(&db.path);
+            let mut event = observed_event(
+                "GET",
+                "/local/123",
+                200,
+                10,
+                Some("user-1"),
+                "2024-06-01T12:00:00Z",
+            );
+            event.payload["routing_context_known"] = json!(true);
+            sink.emit(&event);
+            sink.flush_for_test();
+        }
+
+        {
+            let sink = aggregator_sink(&db.path);
+            let mut event = observed_event(
+                "GET",
+                "/local/456",
+                200,
+                10,
+                Some("user-2"),
+                "2024-06-01T13:00:00Z",
+            );
+            event.payload["routing_context_known"] = json!(true);
+            sink.emit(&event);
+            sink.flush_for_test();
+        }
+
+        let connection = Connection::open(&db.path).expect("database should open");
+        let first_classified_at: String = connection
+            .query_row(
+                r#"
+                SELECT first_classified_at
+                FROM discovery_endpoint_routing_classifications
+                WHERE method = 'GET' AND endpoint_template = '/local/{id}'
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .expect("routing classification should query");
+        assert_eq!(first_classified_at, "2024-06-01T12:00:00Z");
+        assert_eq!(
+            aggregate_snapshot(&db.path, "GET", "/local/{id}").call_count,
+            2
         );
     }
 
@@ -2370,6 +3244,102 @@ mod tests {
     }
 
     #[test]
+    fn legacy_schema_mismatches_do_not_cross_classified_signal_threshold() {
+        let db = TempDb::new("legacy-schema-mismatch-signal");
+        let signal_config = SignalDetectorConfig {
+            schema_mismatch_threshold: 2,
+            ..SignalDetectorConfig::default()
+        };
+        {
+            let sink = aggregator_sink_with_signal_config(&db.path, signal_config);
+            let mut legacy = legacy_observed_event(
+                "GET",
+                "/legacy-schemas/123",
+                200,
+                10,
+                Some("alice"),
+                "2024-06-01T12:00:00Z",
+            );
+            legacy.payload["schema_mismatch"] = json!(true);
+            legacy.payload["upstream_origin"] = json!("https://legacy.internal");
+            sink.emit(&legacy);
+            sink.emit(&observed_event_with_schema_mismatch(
+                "GET",
+                "/legacy-schemas/456",
+                200,
+                10,
+                Some("alice"),
+                "2024-06-01T12:00:01Z",
+                true,
+            ));
+            sink.flush_for_test();
+        }
+
+        assert!(
+            signal_rows_by_type(&db.path, "schema_mismatch").is_empty(),
+            "the first classified mismatch must not combine with legacy mismatch history"
+        );
+
+        {
+            let sink = aggregator_sink_with_signal_config(&db.path, signal_config);
+            sink.emit(&observed_event_with_schema_mismatch(
+                "GET",
+                "/legacy-schemas/789",
+                200,
+                10,
+                Some("alice"),
+                "2024-06-01T12:00:02Z",
+                true,
+            ));
+            sink.flush_for_test();
+        }
+
+        let rows = signal_rows_by_type(&db.path, "schema_mismatch");
+        assert_eq!(rows.len(), 1);
+        let evidence: Value =
+            serde_json::from_str(&rows[0].evidence_json).expect("evidence should be JSON");
+        assert_eq!(evidence["call_count"], json!(2));
+        assert_eq!(evidence["schema_mismatch_count"], json!(2));
+        let connection = Connection::open(&db.path).expect("database should open");
+        let first_classified_at: String = connection
+            .query_row(
+                r#"
+                SELECT first_classified_at
+                FROM discovery_endpoint_routing_classifications
+                WHERE method = 'GET' AND endpoint_template = '/legacy-schemas/{id}'
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .expect("routing classification should query");
+        assert_eq!(first_classified_at, "2024-06-01T12:00:01Z");
+        let context_count: i64 = connection
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM discovery_endpoint_routing_contexts
+                WHERE method = 'GET' AND endpoint_template = '/legacy-schemas/{id}'
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .expect("routing context count should query");
+        assert_eq!(context_count, 1);
+        let classified_origin: String = connection
+            .query_row(
+                r#"
+                SELECT upstream_origin
+                FROM discovery_endpoint_routing_contexts
+                WHERE method = 'GET' AND endpoint_template = '/legacy-schemas/{id}'
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .expect("classified context should query");
+        assert_eq!(classified_origin, "");
+    }
+
+    #[test]
     fn error_rate_spike_signal_waits_for_sample_floor_then_fires_once() {
         let db = TempDb::new("error-rate-spike-signal");
         let sink = aggregator_sink_with_signal_config(
@@ -2447,6 +3417,45 @@ mod tests {
     }
 
     #[test]
+    fn legacy_success_baseline_cannot_trigger_classified_error_rate_signal() {
+        let db = TempDb::new("legacy-error-rate-signal");
+        let sink = aggregator_sink_with_signal_config(
+            &db.path,
+            SignalDetectorConfig {
+                error_rate_spike_threshold: 0.40,
+                ..SignalDetectorConfig::default()
+            },
+        );
+
+        for index in 0..20 {
+            sink.emit(&legacy_observed_event(
+                "GET",
+                "/legacy-errors/steady",
+                200,
+                10,
+                Some("alice"),
+                timestamp_at(index),
+            ));
+        }
+        for index in 20..40 {
+            sink.emit(&observed_event(
+                "GET",
+                "/legacy-errors/steady",
+                500,
+                10,
+                Some("alice"),
+                timestamp_at(index),
+            ));
+        }
+        sink.flush_for_test();
+
+        assert!(
+            signal_rows_by_type(&db.path, "error_rate_spike").is_empty(),
+            "classified errors must not use legacy successes as their baseline"
+        );
+    }
+
+    #[test]
     fn principal_new_to_endpoint_signal_uses_existing_principal_history() {
         let db = TempDb::new("principal-new-signal");
         let sink = aggregator_sink(&db.path);
@@ -2500,6 +3509,56 @@ mod tests {
             1,
             "same principal/endpoint pair should not create duplicate signals"
         );
+    }
+
+    #[test]
+    fn legacy_principals_do_not_count_as_classified_principal_history() {
+        let db = TempDb::new("legacy-principal-new-signal");
+        {
+            let sink = aggregator_sink(&db.path);
+            sink.emit(&legacy_observed_event(
+                "POST",
+                "/legacy-principals/123",
+                200,
+                10,
+                Some("alice"),
+                "2024-06-01T12:00:00Z",
+            ));
+            sink.emit(&observed_event(
+                "POST",
+                "/legacy-principals/456",
+                200,
+                10,
+                Some("bob"),
+                "2024-06-01T12:00:01Z",
+            ));
+            sink.flush_for_test();
+        }
+
+        assert!(
+            signal_rows_by_type(&db.path, "principal_new_to_endpoint").is_empty(),
+            "the first classified principal must not be compared with legacy principals"
+        );
+
+        {
+            let sink = aggregator_sink(&db.path);
+            sink.emit(&observed_event(
+                "POST",
+                "/legacy-principals/789",
+                200,
+                10,
+                Some("charlie"),
+                "2024-06-01T12:00:02Z",
+            ));
+            sink.flush_for_test();
+        }
+
+        let rows = signal_rows_by_type(&db.path, "principal_new_to_endpoint");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target_key, "POST /legacy-principals/{id} charlie");
+        let evidence: Value =
+            serde_json::from_str(&rows[0].evidence_json).expect("evidence should be JSON");
+        assert_eq!(evidence["prior_distinct_principal_count"], json!(1));
     }
 
     #[test]
@@ -2959,10 +4018,28 @@ mod tests {
                 "method": method,
                 "path": path,
                 "status": status,
-                "latency_ms": latency_ms
+                "latency_ms": latency_ms,
+                "routing_context_known": true
             }),
         );
         event.timestamp = timestamp.into();
+        event
+    }
+
+    fn legacy_observed_event(
+        method: &str,
+        path: &str,
+        status: u16,
+        latency_ms: u64,
+        user_id: Option<&str>,
+        timestamp: impl Into<String>,
+    ) -> AuditEvent {
+        let mut event = observed_event(method, path, status, latency_ms, user_id, timestamp);
+        event
+            .payload
+            .as_object_mut()
+            .expect("observation payload should be an object")
+            .remove("routing_context_known");
         event
     }
 

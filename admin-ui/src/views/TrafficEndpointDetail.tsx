@@ -7,11 +7,13 @@ import {
   TrafficEndpointDetailResponse,
   TrafficEndpointPrincipal,
   TrafficEndpointRecentEvent,
+  TrafficRoutingContext,
   TrafficEndpointTimeSeriesPoint,
   TrafficStatusCount,
   fetchTrafficEndpointDetail,
 } from '../lib/traffic';
 import {
+  CoverageBadge,
   EndpointSignalBadge,
   EndpointLifecycleBadges,
   MethodBadge,
@@ -169,6 +171,7 @@ export function TrafficEndpointDetail() {
         {!isLoading && detail !== null ? (
           <>
             <EndpointSummary response={detail} />
+            <RoutingContexts contexts={detail.endpoint.routing_contexts ?? []} />
             <section
               className="traffic-detail-section"
               aria-labelledby="traffic-charts-heading"
@@ -206,6 +209,11 @@ function EndpointSummary({
   response: TrafficEndpointDetailResponse;
 }) {
   const endpoint = response.endpoint;
+  const coverageScope =
+    endpoint.routing_context_known !== true
+      ? 'unknown'
+      : (endpoint.coverage_scope ??
+        (endpoint.covered_by_rule ? 'endpoint' : 'none'));
 
   return (
     <section
@@ -255,11 +263,8 @@ function EndpointSummary({
         <div className="alert info">
           <h3>Rule coverage</h3>
           <p>
-            Current active-rule coverage:{' '}
-            <strong>
-              {endpoint.covered_by_rule ? 'covered' : 'not covered'}
-            </strong>
-            .
+            Current active-policy scope:{' '}
+            <strong>{coverageScopeLabel(coverageScope)}</strong>.
           </p>
           {/* The backend detail API exposes current coverage only. It does not
               return historical per-endpoint matched-rule records. */}
@@ -271,6 +276,85 @@ function EndpointSummary({
       </div>
     </section>
   );
+}
+
+function RoutingContexts({ contexts }: { contexts: TrafficRoutingContext[] }) {
+  if (contexts.length === 0) {
+    return null;
+  }
+
+  return (
+    <section
+      className="traffic-detail-section"
+      aria-labelledby="routing-context-heading"
+    >
+      <div className="section-heading logs-heading">
+        <div>
+          <p className="eyebrow">Routing</p>
+          <h3 id="routing-context-heading">Upstream contexts</h3>
+        </div>
+        <span className="result-count">{contexts.length} contexts</span>
+      </div>
+      <div className="table-scroll">
+        <table className="logs-table traffic-detail-table routing-context-table">
+          <thead>
+            <tr>
+              <th>Host</th>
+              <th>Path prefix</th>
+              <th>Upstream</th>
+              <th>Calls</th>
+              <th>Principals</th>
+              <th>Coverage</th>
+            </tr>
+          </thead>
+          <tbody>
+            {contexts.map((context, index) => (
+              <tr
+                className={`event-row ${index % 2 === 1 ? 'is-even' : ''}`}
+                key={`${context.route_host ?? ''}\n${context.route_path_prefix ?? ''}\n${context.upstream_origin ?? ''}`}
+              >
+                <td>{context.route_host ?? '-'}</td>
+                <td>{context.route_path_prefix ?? '-'}</td>
+                <td
+                  className="routing-origin"
+                  title={context.upstream_origin ?? undefined}
+                >
+                  {context.upstream_origin ?? 'No proxy dispatch'}
+                </td>
+                <td>{formatCount(context.call_count)}</td>
+                <td>{formatCount(context.distinct_principal_count)}</td>
+                <td>
+                  {context.coverage_scope === 'endpoint' ? (
+                    <span className="badge success">ENDPOINT</span>
+                  ) : (
+                    <CoverageBadge scope={context.coverage_scope} />
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function coverageScopeLabel(
+  scope: TrafficEndpointDetailResponse['endpoint']['coverage_scope'],
+): string {
+  if (scope === 'endpoint') {
+    return 'endpoint-wide';
+  }
+  if (scope === 'principal') {
+    return 'principal-scoped';
+  }
+  if (scope === 'mixed') {
+    return 'mixed across upstream contexts';
+  }
+  if (scope === 'unknown') {
+    return 'unknown until newly classified traffic is observed';
+  }
+  return 'uncovered';
 }
 
 function StatCard({ label, value }: { label: string; value: string }) {

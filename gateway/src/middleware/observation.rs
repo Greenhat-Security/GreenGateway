@@ -30,6 +30,9 @@ use crate::{
             ObservedEndpoint,
         },
     },
+    upstream_route::{
+        request_host_without_port, ProxyRouteClassificationCompleted, ProxyRouteObservationContext,
+    },
 };
 
 use super::decision::{AuthOutcome, PolicyDecision, PolicyDecisionOutcome, UpstreamOutcome};
@@ -146,6 +149,7 @@ pub async fn observation_middleware(
     let start = Instant::now();
     let method = req.method().to_string();
     let path = req.uri().path().to_owned();
+    let request_host = request_host_without_port(req.headers());
     let request_id = request_id(req.headers(), req.extensions());
     let source_ip = canonical_client_ip(req.headers(), req.extensions(), state.trust_proxy_headers);
     let query = req.uri().query().map(str::to_owned);
@@ -172,6 +176,11 @@ pub async fn observation_middleware(
     let auth_outcome = response.extensions().get::<AuthOutcome>();
     let policy_decision = response.extensions().get::<PolicyDecision>();
     let upstream_outcome = response.extensions().get::<UpstreamOutcome>();
+    let routing_context_known = response
+        .extensions()
+        .get::<ProxyRouteClassificationCompleted>()
+        .is_some();
+    let upstream_route = response.extensions().get::<ProxyRouteObservationContext>();
     let actor = auth_outcome
         .and_then(|outcome| outcome.principal.as_ref())
         .map(actor_from_principal);
@@ -200,6 +209,9 @@ pub async fn observation_middleware(
             auth_outcome,
             policy_decision,
             upstream_outcome,
+            routing_context_known,
+            request_host: request_host.as_deref(),
+            upstream_route,
             payload_shape: payload_shape.as_ref(),
             schema_mismatch,
         }),
@@ -216,6 +228,9 @@ struct ObservationPayloadInput<'a> {
     auth_outcome: Option<&'a AuthOutcome>,
     policy_decision: Option<&'a PolicyDecision>,
     upstream_outcome: Option<&'a UpstreamOutcome>,
+    routing_context_known: bool,
+    request_host: Option<&'a str>,
+    upstream_route: Option<&'a ProxyRouteObservationContext>,
     payload_shape: Option<&'a CapturedPayloadShape>,
     schema_mismatch: Option<bool>,
 }
@@ -243,6 +258,24 @@ fn observation_payload(input: ObservationPayloadInput<'_>) -> Value {
         "policy_decision".to_owned(),
         json!(policy_decision_label(input.policy_decision)),
     );
+    payload.insert(
+        "routing_context_known".to_owned(),
+        json!(input.routing_context_known),
+    );
+
+    if let Some(request_host) = input.request_host {
+        payload.insert("request_host".to_owned(), json!(request_host));
+    }
+
+    if let Some(route) = input.upstream_route {
+        payload.insert("upstream_origin".to_owned(), json!(route.upstream_origin));
+        if let Some(host) = route.route_host.as_deref() {
+            payload.insert("upstream_route_host".to_owned(), json!(host));
+        }
+        if let Some(path_prefix) = route.route_path_prefix.as_deref() {
+            payload.insert("upstream_route_path_prefix".to_owned(), json!(path_prefix));
+        }
+    }
 
     if let Some(decision) = input.policy_decision {
         payload.insert("policy_reason".to_owned(), json!(decision.reason));
@@ -1190,7 +1223,15 @@ mod tests {
         let response = base_router()
             .layer(from_fn(fake_upstream_layer))
             .layer(from_fn_with_state(state, observation_middleware))
-            .oneshot(request(Method::GET, "/", "request-upstream"))
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/")
+                    .header("host", "API.EXAMPLE.TEST:8443")
+                    .header("x-request-id", "request-upstream")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
             .await
             .expect("request should complete");
 
@@ -1198,6 +1239,16 @@ mod tests {
         let event = one_observation_event(&capture).await;
         assert_eq!(event.payload["upstream_latency_ms"], json!(42));
         assert_eq!(event.payload["upstream_status"], json!(201));
+        assert_eq!(event.payload["request_host"], json!("api.example.test"));
+        assert_eq!(
+            event.payload["upstream_route_host"],
+            json!("api.example.test")
+        );
+        assert_eq!(event.payload["upstream_route_path_prefix"], json!("/api"));
+        assert_eq!(
+            event.payload["upstream_origin"],
+            json!("https://upstream.example.test")
+        );
     }
 
     #[tokio::test]
@@ -1978,6 +2029,13 @@ paths:
                 status: Some(201),
             });
         response
+            .extensions_mut()
+            .insert(crate::upstream_route::ProxyRouteObservationContext::new(
+                Some("api.example.test".to_owned()),
+                Some("/api".to_owned()),
+                "https://upstream.example.test".to_owned(),
+            ));
+        response
     }
 
     fn auth_rbac_observation_router(
@@ -2130,6 +2188,7 @@ paths:
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
             path: path.to_owned(),
             tool_name: None,
+            dispatch: None,
             principal: PrincipalMatcher::default(),
             action,
         }

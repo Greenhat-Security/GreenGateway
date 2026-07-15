@@ -29,6 +29,25 @@ export type TrafficOpenSignalSummary = {
   signal_types: string[];
 };
 
+export type TrafficCoverageScope =
+  | 'none'
+  | 'unknown'
+  | 'principal'
+  | 'endpoint'
+  | 'mixed';
+
+export type TrafficRoutingContext = {
+  route_host?: string;
+  route_path_prefix?: string;
+  upstream_origin: string | null;
+  first_seen: string;
+  last_seen: string;
+  call_count: number;
+  distinct_principal_count: number;
+  covered_by_rule: boolean;
+  coverage_scope: TrafficCoverageScope;
+};
+
 export type TrafficEndpoint = {
   method: string;
   endpoint_template: string;
@@ -41,6 +60,10 @@ export type TrafficEndpoint = {
   reviewed_at: string | null;
   reviewed_by: string | null;
   covered_by_rule: boolean;
+  coverage_scope: TrafficCoverageScope;
+  routing_context_known: boolean;
+  routing_context_known_since: string | null;
+  routing_contexts: TrafficRoutingContext[];
   open_signals?: TrafficOpenSignalSummary;
   latency: TrafficEndpointLatency;
   status_counts: TrafficStatusCount[];

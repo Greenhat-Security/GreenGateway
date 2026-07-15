@@ -1,6 +1,7 @@
 use crate::auth::Principal;
 
-use super::rule::{PrincipalMatcher, Rule, RuleAction};
+use super::rule::{PrincipalMatcher, Rule, RuleAction, RuleDispatchKind, RuleDispatchMatcher};
+use url::Url;
 
 /// Precompiled first-match-wins evaluator for direct firewall rules.
 #[derive(Debug, Clone)]
@@ -13,6 +14,48 @@ pub struct RuleMatcher {
 pub struct RuleDecision {
     pub rule_index: usize,
     pub action: RuleAction,
+}
+
+/// Trusted request dispatch identity established before RBAC evaluation.
+#[derive(Clone, Copy, Debug)]
+pub struct RuleDispatchContext<'a> {
+    routing_context_known: bool,
+    route_host: Option<&'a str>,
+    route_path_prefix: Option<&'a str>,
+    upstream_origin: Option<&'a str>,
+}
+
+impl<'a> RuleDispatchContext<'a> {
+    pub fn unknown() -> Self {
+        Self {
+            routing_context_known: false,
+            route_host: None,
+            route_path_prefix: None,
+            upstream_origin: None,
+        }
+    }
+
+    pub fn contextless() -> Self {
+        Self {
+            routing_context_known: true,
+            route_host: None,
+            route_path_prefix: None,
+            upstream_origin: None,
+        }
+    }
+
+    pub fn classified(
+        route_host: Option<&'a str>,
+        route_path_prefix: Option<&'a str>,
+        upstream_origin: Option<&'a str>,
+    ) -> Self {
+        Self {
+            routing_context_known: true,
+            route_host,
+            route_path_prefix,
+            upstream_origin,
+        }
+    }
 }
 
 impl RuleMatcher {
@@ -34,9 +77,20 @@ impl RuleMatcher {
         path: &str,
         principal: Option<&Principal>,
     ) -> Option<RuleDecision> {
+        self.evaluate_with_dispatch(method, path, principal, RuleDispatchContext::contextless())
+    }
+
+    /// Evaluates an HTTP rule against the proxy origin selected before RBAC.
+    pub fn evaluate_with_dispatch(
+        &self,
+        method: &str,
+        path: &str,
+        principal: Option<&Principal>,
+        dispatch_context: RuleDispatchContext<'_>,
+    ) -> Option<RuleDecision> {
         self.rules
             .iter()
-            .find(|rule| rule.matches(method, path, principal))
+            .find(|rule| rule.matches(method, path, principal, dispatch_context))
             .map(|rule| RuleDecision {
                 rule_index: rule.rule_index,
                 action: rule.action.clone(),
@@ -45,15 +99,35 @@ impl RuleMatcher {
 
     /// Returns the first matching deny while ignoring allow and shadow rules.
     /// Host-qualified upstream authorization uses this as an additional guard.
+    #[allow(dead_code)]
     pub fn evaluate_denies(
         &self,
         method: &str,
         path: &str,
         principal: Option<&Principal>,
     ) -> Option<RuleDecision> {
+        self.evaluate_denies_with_dispatch(
+            method,
+            path,
+            principal,
+            RuleDispatchContext::contextless(),
+        )
+    }
+
+    /// Returns the first dispatch-compatible deny while ignoring other rules.
+    pub fn evaluate_denies_with_dispatch(
+        &self,
+        method: &str,
+        path: &str,
+        principal: Option<&Principal>,
+        dispatch_context: RuleDispatchContext<'_>,
+    ) -> Option<RuleDecision> {
         self.rules
             .iter()
-            .find(|rule| rule.action == RuleAction::Deny && rule.matches(method, path, principal))
+            .find(|rule| {
+                rule.action == RuleAction::Deny
+                    && rule.matches(method, path, principal, dispatch_context)
+            })
             .map(|rule| RuleDecision {
                 rule_index: rule.rule_index,
                 action: RuleAction::Deny,
@@ -82,7 +156,7 @@ pub(super) fn rule_matches(
     path: &str,
     principal: Option<&Principal>,
 ) -> bool {
-    CompiledRule::new(0, rule).matches(method, path, principal)
+    CompiledRule::new(0, rule).matches(method, path, principal, RuleDispatchContext::contextless())
 }
 
 /// Standalone method matcher reusing the hardened, anchored implementation
@@ -125,6 +199,7 @@ struct CompiledRule {
     enabled: bool,
     target: RuleTarget,
     principal: PrincipalMatcher,
+    dispatch: Option<CompiledDispatchMatcher>,
     action: RuleAction,
 }
 
@@ -137,6 +212,52 @@ enum RuleTarget {
     Tool {
         tool_name: String,
     },
+}
+
+#[derive(Debug, Clone)]
+struct CompiledDispatchMatcher {
+    kind: RuleDispatchKind,
+    upstream_origin: Option<String>,
+    valid: bool,
+}
+
+impl CompiledDispatchMatcher {
+    fn new(matcher: &RuleDispatchMatcher) -> Self {
+        let upstream_origin = matcher
+            .upstream_origin
+            .as_deref()
+            .and_then(|origin| Url::parse(origin).ok())
+            .map(|origin| origin.origin().ascii_serialization());
+        let valid = match matcher.kind {
+            RuleDispatchKind::Contextless => matcher.upstream_origin.is_none(),
+            RuleDispatchKind::Legacy => upstream_origin.is_some(),
+        };
+
+        Self {
+            kind: matcher.kind,
+            upstream_origin,
+            valid,
+        }
+    }
+
+    fn matches(&self, context: RuleDispatchContext<'_>) -> bool {
+        if !self.valid || !context.routing_context_known {
+            return false;
+        }
+
+        match self.kind {
+            RuleDispatchKind::Contextless => {
+                context.route_host.is_none()
+                    && context.route_path_prefix.is_none()
+                    && context.upstream_origin.is_none()
+            }
+            RuleDispatchKind::Legacy => {
+                context.route_host.is_none()
+                    && context.route_path_prefix.is_none()
+                    && self.upstream_origin.as_deref() == context.upstream_origin
+            }
+        }
+    }
 }
 
 impl CompiledRule {
@@ -156,11 +277,18 @@ impl CompiledRule {
             enabled: rule.enabled,
             target,
             principal: rule.principal.clone(),
+            dispatch: rule.dispatch.as_ref().map(CompiledDispatchMatcher::new),
             action: rule.action.clone(),
         }
     }
 
-    fn matches(&self, method: &str, path: &str, principal: Option<&Principal>) -> bool {
+    fn matches(
+        &self,
+        method: &str,
+        path: &str,
+        principal: Option<&Principal>,
+        dispatch_context: RuleDispatchContext<'_>,
+    ) -> bool {
         let RuleTarget::Http {
             methods,
             path: rule_path,
@@ -172,6 +300,10 @@ impl CompiledRule {
         self.enabled
             && methods.matches(method)
             && rule_path.matches(path)
+            && self
+                .dispatch
+                .as_ref()
+                .is_none_or(|dispatch| dispatch.matches(dispatch_context))
             && self.principal.matches(principal)
     }
 
@@ -358,6 +490,7 @@ mod tests {
             methods: vec!["GET".to_owned()],
             path: "/api/users/*".to_owned(),
             tool_name: None,
+            dispatch: None,
             principal: PrincipalMatcher {
                 roles: vec!["support".to_owned()],
                 auth_methods: Vec::new(),
@@ -383,6 +516,103 @@ mod tests {
             None
         );
         assert_eq!(matcher.evaluate("GET", "/api/users/42", None), None);
+    }
+
+    #[test]
+    fn dispatch_bound_rules_match_only_the_authored_proxy_origin() {
+        let mut legacy_bound = rule(&["GET"], "/reports/{id}", RuleAction::Allow);
+        legacy_bound.dispatch = Some(RuleDispatchMatcher::legacy(
+            "http://127.0.0.1:41001".to_owned(),
+        ));
+        let matcher = RuleMatcher::new(&[legacy_bound]);
+
+        assert!(matcher
+            .evaluate_with_dispatch(
+                "GET",
+                "/reports/123",
+                None,
+                RuleDispatchContext::classified(None, None, Some("http://127.0.0.1:41001")),
+            )
+            .is_some());
+        assert_eq!(
+            matcher.evaluate_with_dispatch(
+                "GET",
+                "/reports/123",
+                None,
+                RuleDispatchContext::classified(None, None, Some("http://127.0.0.1:41002")),
+            ),
+            None
+        );
+        assert_eq!(
+            matcher.evaluate_with_dispatch(
+                "GET",
+                "/reports/123",
+                None,
+                RuleDispatchContext::classified(
+                    None,
+                    Some("/reports"),
+                    Some("http://127.0.0.1:41001"),
+                ),
+            ),
+            None
+        );
+        assert_eq!(
+            matcher.evaluate_with_dispatch(
+                "GET",
+                "/reports/123",
+                None,
+                RuleDispatchContext::unknown(),
+            ),
+            None
+        );
+        assert_eq!(matcher.evaluate("GET", "/reports/123", None), None);
+
+        let mut normalized = rule(&["GET"], "/normalized/{id}", RuleAction::Allow);
+        normalized.dispatch = Some(RuleDispatchMatcher::legacy(
+            "https://EXAMPLE.TEST:443".to_owned(),
+        ));
+        let matcher = RuleMatcher::new(&[normalized]);
+        assert!(matcher
+            .evaluate_with_dispatch(
+                "GET",
+                "/normalized/123",
+                None,
+                RuleDispatchContext::classified(None, None, Some("https://example.test")),
+            )
+            .is_some());
+
+        let mut contextless = rule(&["GET"], "/local/{id}", RuleAction::Allow);
+        contextless.dispatch = Some(RuleDispatchMatcher::contextless());
+        let matcher = RuleMatcher::new(&[contextless]);
+        assert!(matcher.evaluate("GET", "/local/123", None).is_some());
+        assert_eq!(
+            matcher.evaluate_with_dispatch(
+                "GET",
+                "/local/123",
+                None,
+                RuleDispatchContext::classified(None, None, Some("http://127.0.0.1:41002")),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rules_without_dispatch_binding_remain_global() {
+        let matcher = RuleMatcher::new(&[rule(&["GET"], "/reports/{id}", RuleAction::Deny)]);
+
+        assert!(matcher.evaluate("GET", "/reports/123", None).is_some());
+        assert!(matcher
+            .evaluate_with_dispatch(
+                "GET",
+                "/reports/123",
+                None,
+                RuleDispatchContext::classified(
+                    None,
+                    Some("/reports"),
+                    Some("http://127.0.0.1:41002"),
+                ),
+            )
+            .is_some());
     }
 
     #[test]
@@ -832,6 +1062,7 @@ mod tests {
                 methods,
                 path,
                 tool_name: None,
+                dispatch: None,
                 principal,
                 action,
             })
@@ -947,6 +1178,7 @@ mod tests {
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
             path: path.to_owned(),
             tool_name: None,
+            dispatch: None,
             principal: PrincipalMatcher::default(),
             action,
         }
@@ -959,6 +1191,7 @@ mod tests {
             methods: Vec::new(),
             path: String::new(),
             tool_name: Some(tool_name.to_owned()),
+            dispatch: None,
             principal: PrincipalMatcher {
                 roles: roles.iter().map(|role| (*role).to_owned()).collect(),
                 auth_methods: Vec::new(),

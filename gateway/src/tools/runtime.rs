@@ -2426,6 +2426,7 @@ mod tests {
             methods: Vec::new(),
             path: String::new(),
             tool_name: Some(tool_name.to_owned()),
+            dispatch: None,
             principal: PrincipalMatcher {
                 roles: roles.iter().map(|role| (*role).to_owned()).collect(),
                 auth_methods: Vec::new(),

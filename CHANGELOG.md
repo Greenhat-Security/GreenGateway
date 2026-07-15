@@ -12,6 +12,27 @@ major runtime pieces have landed since 0.6.0. See the
 [pinned roadmap issue](https://github.com/Greenhat-Security/GreenGateway/issues/44)
 for full phase-by-phase status.
 
+### Security
+
+- Traffic discovery now records configured upstream route host/path/origin
+  contexts before request middleware can reject a request, reports
+  endpoint-wide, principal-scoped, mixed, uncovered, and unknown migration
+  states separately, and suppresses host-blind rule generation and acceptance
+  for host-routed, path-routed, origin-ambiguous, or pre-context traffic,
+  including the active legacy upstream and configured routes that have not yet
+  received traffic. Suggestion-eligible signal counters and principal history
+  are persisted separately so legacy aggregate evidence cannot cross a
+  detector threshold after the first classified observation. Accepted HTTP
+  suggestions now persist an immutable dispatch-provenance matcher and enforce
+  it against the selected dispatch class and upstream on every request,
+  preventing a later route configuration change from extending an accepted
+  fallback rule to a host/path route, even when the origin is unchanged.
+  Traffic-inventory rule creation carries the same immutable binding, mixed
+  pre-classification history remains unknown, and explicit null dispatch
+  fields are rejected instead of weakening a rule to global scope.
+  Malformed inventory contexts cannot create unbound rules, while MCP tool
+  suggestions remain independent of unrelated HTTP fallback routing.
+
 ### Added — Phase 6 (native MCP support)
 
 - Native MCP streamable-HTTP endpoint at `/mcp`, wired through the gateway's
