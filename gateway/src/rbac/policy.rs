@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     ffi::OsString,
     fmt, fs, io,
@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::rule::{
-    valid_auth_method_name, PrincipalMatcher, Rule, AUTH_METHOD_BEARER_TOKEN,
-    AUTH_METHOD_SESSION_COOKIE,
+    principal_identity_matches, valid_auth_method_name, PrincipalMatcher, Rule,
+    AUTH_METHOD_BEARER_TOKEN, AUTH_METHOD_SESSION_COOKIE,
 };
-use crate::config::Config;
+use crate::{auth::principal::canonical_issuer, auth::Principal, config::Config};
 
 const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "schema_version",
@@ -108,6 +108,18 @@ pub struct Policy {
 pub struct RoleEntry {
     #[serde(default)]
     pub permissions: Vec<String>,
+    /// Issuers allowed to activate this role's permissions. Empty means any issuer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issuers: Vec<String>,
+    /// Authentication methods allowed to activate this role's permissions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auth_methods: Vec<String>,
+}
+
+impl RoleEntry {
+    pub(crate) fn matches_principal_identity(&self, principal: &Principal) -> bool {
+        principal_identity_matches(&self.issuers, &self.auth_methods, principal)
+    }
 }
 
 /// Permission required for requests matching a path prefix and optional method set.
@@ -188,6 +200,12 @@ pub struct ToolPolicyEntry {
     /// Role names allowed to invoke this tool. Empty means no role constraint.
     #[serde(default)]
     pub allowed_roles: Vec<String>,
+    /// Issuers allowed to invoke this tool. Empty means any issuer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issuers: Vec<String>,
+    /// Authentication methods allowed to invoke this tool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auth_methods: Vec<String>,
     /// Execution timeout for a single invocation, in milliseconds.
     #[serde(default = "default_tool_policy_timeout_ms")]
     pub timeout_ms: u64,
@@ -269,14 +287,31 @@ impl Policy {
         warn_unknown_top_level_keys(&value);
         validate_rule_target_properties(&value)?;
 
-        let policy: Self = serde_json::from_value(value).map_err(|source| PolicyError::Parse {
-            path: path.map(Path::to_owned),
-            source,
-        })?;
+        let mut policy: Self =
+            serde_json::from_value(value).map_err(|source| PolicyError::Parse {
+                path: path.map(Path::to_owned),
+                source,
+            })?;
+        policy.canonicalize_issuers();
         policy.validate()?;
         warn_unreachable_route_path_prefixes(&policy);
 
         Ok(policy)
+    }
+
+    fn canonicalize_issuers(&mut self) {
+        for role in self.roles.values_mut() {
+            canonicalize_issuer_list(&mut role.issuers);
+        }
+        for rule in &mut self.rules {
+            canonicalize_principal_matcher_issuers(&mut rule.principal);
+        }
+        for rule in &mut self.rate_limits {
+            canonicalize_principal_matcher_issuers(&mut rule.principal);
+        }
+        for tool in self.tools.values_mut() {
+            canonicalize_issuer_list(&mut tool.issuers);
+        }
     }
 
     fn validate(&self) -> Result<(), PolicyError> {
@@ -289,6 +324,7 @@ impl Policy {
 
         validate_rules(&self.rules)?;
         validate_rate_limits(&self.rate_limits)?;
+        validate_roles(&self.roles)?;
         validate_tools(&self.tools)?;
 
         self.egress.validate()
@@ -409,6 +445,35 @@ fn validate_tools(tools: &HashMap<String, ToolPolicyEntry>) -> Result<(), Policy
                 "tools.{tool_name}.timeout_ms must be positive"
             )));
         }
+        validate_identity_constraints(
+            &entry.issuers,
+            &entry.auth_methods,
+            &format!("tools.{tool_name}"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn canonicalize_issuer_list(issuers: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    issuers.retain_mut(|issuer| {
+        *issuer = canonical_issuer(issuer).unwrap_or_default();
+        seen.insert(issuer.clone())
+    });
+}
+
+pub(crate) fn canonicalize_principal_matcher_issuers(principal: &mut PrincipalMatcher) {
+    canonicalize_issuer_list(&mut principal.issuers);
+}
+
+fn validate_roles(roles: &HashMap<String, RoleEntry>) -> Result<(), PolicyError> {
+    for (role_name, entry) in roles {
+        validate_identity_constraints(
+            &entry.issuers,
+            &entry.auth_methods,
+            &format!("roles.{role_name}"),
+        )?;
     }
 
     Ok(())
@@ -469,7 +534,21 @@ fn validate_principal_matcher(
     principal: &PrincipalMatcher,
     field_path: &str,
 ) -> Result<(), PolicyError> {
-    for auth_method in &principal.auth_methods {
+    validate_identity_constraints(&principal.issuers, &principal.auth_methods, field_path)
+}
+
+fn validate_identity_constraints(
+    issuers: &[String],
+    auth_methods: &[String],
+    field_path: &str,
+) -> Result<(), PolicyError> {
+    if issuers.iter().any(|issuer| issuer.trim().is_empty()) {
+        return Err(PolicyError::Invalid(format!(
+            "{field_path}.issuers must not contain empty values"
+        )));
+    }
+
+    for auth_method in auth_methods {
         if !valid_auth_method_name(auth_method) {
             return Err(PolicyError::Invalid(format!(
                 "{field_path}.auth_methods contains unknown auth method '{auth_method}', expected \
@@ -1026,6 +1105,111 @@ mod tests {
     }
 
     #[test]
+    fn issuer_bound_identity_constraints_parse_validate_and_round_trip() {
+        let value = json!({
+            "schema_version": "0.1.0",
+            "roles": {
+                "operator": {
+                    "permissions": ["data:write"],
+                    "issuers": ["https://idp-a.example/"],
+                    "auth_methods": ["bearer_token"]
+                }
+            },
+            "rules": [{
+                "path": "/data/**",
+                "principal": {
+                    "roles": ["operator"],
+                    "issuers": ["https://idp-a.example/"],
+                    "auth_methods": ["bearer_token"],
+                    "principal_ids": ["shared-subject"]
+                },
+                "action": "allow"
+            }],
+            "rate_limits": [{
+                "principal": {
+                    "issuers": ["https://idp-a.example/"],
+                    "auth_methods": ["bearer_token"]
+                },
+                "requests_per_second": 5.0,
+                "burst": 10
+            }],
+            "tools": {
+                "reports.export": {
+                    "allowed_roles": ["operator"],
+                    "issuers": ["https://idp-a.example/"],
+                    "auth_methods": ["bearer_token"]
+                }
+            }
+        });
+        assert_schema_accepts(&policy_schema_validator(), &value);
+
+        let policy = Policy::from_json_value(value, None)
+            .expect("issuer-bound identity constraints should parse");
+
+        assert_eq!(
+            policy.roles["operator"].issuers,
+            vec!["https://idp-a.example".to_owned()]
+        );
+        assert_eq!(
+            policy.rules[0].principal.issuers,
+            vec!["https://idp-a.example".to_owned()]
+        );
+        assert_eq!(
+            policy.rate_limits[0].principal.auth_methods,
+            vec!["bearer_token".to_owned()]
+        );
+        assert_eq!(
+            policy.tools["reports.export"].issuers,
+            vec!["https://idp-a.example".to_owned()]
+        );
+
+        let round_trip = serde_json::to_value(&policy).expect("policy should serialize");
+        let reparsed = Policy::from_json_value(round_trip, None)
+            .expect("serialized issuer-bound policy should parse");
+        assert_eq!(reparsed, policy);
+    }
+
+    #[test]
+    fn invalid_role_and_tool_identity_constraints_are_rejected() {
+        let cases = [
+            (
+                json!({
+                    "schema_version": "0.1.0",
+                    "roles": {
+                        "operator": {
+                            "permissions": ["data:write"],
+                            "issuers": [""]
+                        }
+                    }
+                }),
+                "roles.operator.issuers must not contain empty values",
+            ),
+            (
+                json!({
+                    "schema_version": "0.1.0",
+                    "tools": {
+                        "reports.export": {
+                            "auth_methods": ["api_key"]
+                        }
+                    }
+                }),
+                "tools.reports.export.auth_methods contains unknown auth method",
+            ),
+        ];
+        let validator = policy_schema_validator();
+
+        for (value, expected_error) in cases {
+            assert!(!validator.is_valid(&value));
+            let error = Policy::from_json_value(value, None)
+                .expect_err("invalid identity constraint should fail");
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn rules_section_parses_and_round_trips_as_ordered_first_match_rules() {
         let file = TempPolicyFile::new(
             r#"{
@@ -1080,6 +1264,7 @@ mod tests {
             policy.rules[0].principal,
             PrincipalMatcher {
                 roles: vec!["admin".to_owned(), "support".to_owned()],
+                issuers: Vec::new(),
                 auth_methods: vec!["bearer_token".to_owned()],
                 principal_ids: vec!["user-123".to_owned()],
             }
@@ -1142,6 +1327,7 @@ mod tests {
             policy.rate_limits[0].principal,
             PrincipalMatcher {
                 roles: vec!["admin".to_owned(), "support".to_owned()],
+                issuers: Vec::new(),
                 auth_methods: vec!["bearer_token".to_owned()],
                 principal_ids: vec!["user-123".to_owned()],
             }
@@ -1185,6 +1371,8 @@ mod tests {
             ToolPolicyEntry {
                 enabled: true,
                 allowed_roles: Vec::new(),
+                issuers: Vec::new(),
+                auth_methods: Vec::new(),
                 timeout_ms: DEFAULT_TOOL_POLICY_TIMEOUT_MS,
                 max_concurrent: DEFAULT_TOOL_POLICY_MAX_CONCURRENT,
             }
@@ -1194,6 +1382,8 @@ mod tests {
             ToolPolicyEntry {
                 enabled: false,
                 allowed_roles: vec!["operator".to_owned(), "support".to_owned()],
+                issuers: Vec::new(),
+                auth_methods: Vec::new(),
                 timeout_ms: 1500,
                 max_concurrent: 3,
             }
@@ -2192,12 +2382,16 @@ mod tests {
                     "admin".to_owned(),
                     RoleEntry {
                         permissions: vec!["*".to_owned()],
+                        issuers: Vec::new(),
+                        auth_methods: Vec::new(),
                     },
                 ),
                 (
                     "reader".to_owned(),
                     RoleEntry {
                         permissions: vec!["data:read".to_owned(), "reports:read".to_owned()],
+                        issuers: Vec::new(),
+                        auth_methods: Vec::new(),
                     },
                 ),
             ]),
@@ -2220,6 +2414,7 @@ mod tests {
             rate_limits: vec![RateLimitRule {
                 principal: PrincipalMatcher {
                     roles: vec!["admin".to_owned()],
+                    issuers: Vec::new(),
                     auth_methods: vec!["bearer_token".to_owned()],
                     principal_ids: Vec::new(),
                 },
@@ -2233,6 +2428,8 @@ mod tests {
                 ToolPolicyEntry {
                     enabled: true,
                     allowed_roles: Vec::new(),
+                    issuers: Vec::new(),
+                    auth_methods: Vec::new(),
                     timeout_ms: DEFAULT_TOOL_POLICY_TIMEOUT_MS,
                     max_concurrent: DEFAULT_TOOL_POLICY_MAX_CONCURRENT,
                 },

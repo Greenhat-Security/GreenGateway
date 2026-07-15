@@ -70,6 +70,8 @@ describe('TrafficEndpointDetail', () => {
     expect(screen.getAllByText('500').length).toBeGreaterThan(0);
     expect(screen.getAllByText('reader-1').length).toBeGreaterThan(0);
     expect(screen.getByText('reader-2')).toBeTruthy();
+    expect(screen.getByText('https://idp-a.example')).toBeTruthy();
+    expect(screen.getByText('bearer_token')).toBeTruthy();
     expect(screen.getByText('2026-07-04T09:00:00Z')).toBeTruthy();
     expect(screen.getByText('/users/123')).toBeTruthy();
     expect(screen.getByText('event-2')).toBeTruthy();
@@ -308,6 +310,8 @@ function trafficDetailResponse(overrides: Partial<DetailResponseShape> = {}) {
       principals: [
         {
           user_id: 'reader-1',
+          issuer: 'https://idp-a.example',
+          auth_method: 'bearer_token',
           first_seen: '2026-07-04T08:00:00Z',
           last_seen: '2026-07-04T10:00:00Z',
         },

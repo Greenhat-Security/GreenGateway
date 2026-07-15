@@ -12,15 +12,18 @@ use std::{
 use http::{header, HeaderName, HeaderValue};
 use serde::Deserialize;
 
-use crate::discovery::{
-    signals::{
-        SignalDetectorConfig, DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
-        DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
-        DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD, DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
-    },
-    suggestions::{
-        RuleSuggestionConfig, DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
-        MAX_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
+use crate::{
+    auth::principal::{canonical_issuer, provider_issuer, PROVIDER_ISSUER_PREFIX},
+    discovery::{
+        signals::{
+            SignalDetectorConfig, DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
+            DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
+            DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD, DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+        },
+        suggestions::{
+            RuleSuggestionConfig, DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
+            MAX_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
+        },
     },
 };
 
@@ -1217,7 +1220,26 @@ fn validate_auth_providers(
         match provider_type {
             AuthProviderType::Jwt => {
                 jwks_url = normalize_optional_config_string(provider.jwks_url);
-                issuer = normalize_optional_config_string(provider.issuer);
+                issuer = match provider.issuer.as_deref() {
+                    Some(raw_issuer) => match canonical_issuer(raw_issuer) {
+                        Some(canonical_issuer) => Some(canonical_issuer),
+                        None => {
+                            problems.push(format!(
+                                "{provider_name}.issuer must be non-empty after trimming whitespace and trailing slashes"
+                            ));
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                if issuer
+                    .as_deref()
+                    .is_some_and(|issuer| issuer.starts_with(PROVIDER_ISSUER_PREFIX))
+                {
+                    problems.push(format!(
+                        "{provider_name}.issuer must not use reserved prefix '{PROVIDER_ISSUER_PREFIX}'"
+                    ));
+                }
                 audience = normalize_optional_config_string(provider.audience);
                 jwks_timeout_ms = provider
                     .jwks_timeout_ms
@@ -1275,6 +1297,23 @@ fn validate_auth_providers(
             client_secret,
             redirect_uri,
         });
+    }
+
+    let mut seen_effective_issuers = HashMap::<String, usize>::new();
+    for (index, provider) in validated.iter().enumerate() {
+        let effective_issuer = provider
+            .issuer
+            .clone()
+            .unwrap_or_else(|| provider_issuer(&provider.name));
+        if let Some(previous_index) = seen_effective_issuers.insert(effective_issuer.clone(), index)
+        {
+            if validated[previous_index].name == provider.name {
+                continue;
+            }
+            problems.push(format!(
+                "{name}[{index}] effective issuer '{effective_issuer}' duplicates {name}[{previous_index}]"
+            ));
+        }
     }
 
     validated
@@ -3444,7 +3483,7 @@ mod tests {
                     name: "primary".to_owned(),
                     provider_type: AuthProviderType::Jwt,
                     jwks_url: Some("https://primary.example.test/.well-known/jwks.json".to_owned(),),
-                    issuer: Some("https://primary.example.test/".to_owned()),
+                    issuer: Some("https://primary.example.test".to_owned()),
                     audience: Some("greengateway".to_owned()),
                     jwks_timeout_ms: 7000,
                     require_jti: true,
@@ -3932,7 +3971,7 @@ mod tests {
             name: name.to_owned(),
             provider_type: AuthProviderType::Jwt,
             jwks_url: None,
-            issuer: Some(issuer.to_owned()),
+            issuer: canonical_issuer(issuer),
             audience: audience.map(str::to_owned),
             jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
             require_jti: false,
@@ -3970,7 +4009,7 @@ mod tests {
                 name: "oidc".to_owned(),
                 provider_type: AuthProviderType::Jwt,
                 jwks_url: None,
-                issuer: Some("https://issuer.example.test/".to_owned()),
+                issuer: Some("https://issuer.example.test".to_owned()),
                 audience: Some("greengateway".to_owned()),
                 jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
                 require_jti: false,
@@ -3990,6 +4029,26 @@ mod tests {
     }
 
     #[test]
+    fn auth_providers_reject_explicit_issuer_that_canonicalizes_to_empty() {
+        let error = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(r#"[{
+                    "name": "invalid-issuer",
+                    "type": "jwt",
+                    "jwks_url": "https://issuer.example.test/.well-known/jwks.json",
+                    "issuer": " / "
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("an explicitly configured empty canonical issuer should fail validation");
+
+        assert!(error.to_string().contains(
+            "AUTH_PROVIDERS[0].issuer must be non-empty after trimming whitespace and trailing slashes"
+        ));
+        assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
     fn auth_providers_reject_jwt_provider_without_jwks_url_or_issuer() {
         let error = Config::from_env_vars(|name| match name {
             "AUTH_PROVIDERS" => Ok(r#"[{
@@ -4004,6 +4063,49 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("AUTH_PROVIDERS[0] must set jwks_url or issuer"));
         assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
+    fn auth_providers_reject_reserved_and_duplicate_effective_issuers() {
+        let error = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(r#"[
+                    {
+                        "name": "fallback",
+                        "type": "jwt",
+                        "jwks_url": "https://fallback.example.test/jwks.json"
+                    },
+                    {
+                        "name": "reserved",
+                        "type": "jwt",
+                        "issuer": "provider:fallback"
+                    },
+                    {
+                        "name": "issuer-a",
+                        "type": "jwt",
+                        "issuer": "https://issuer.example.test/"
+                    },
+                    {
+                        "name": "issuer-b",
+                        "type": "jwt",
+                        "issuer": "https://issuer.example.test"
+                    }
+                ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject colliding effective issuer boundaries");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("AUTH_PROVIDERS[1].issuer must not use reserved prefix 'provider:'")
+        );
+        assert!(message.contains(
+            "AUTH_PROVIDERS[1] effective issuer 'provider:fallback' duplicates AUTH_PROVIDERS[0]"
+        ));
+        assert!(message.contains(
+            "AUTH_PROVIDERS[3] effective issuer 'https://issuer.example.test' duplicates AUTH_PROVIDERS[2]"
+        ));
+        assert_eq!(error.problems.len(), 3);
     }
 
     #[test]
@@ -4134,7 +4236,7 @@ mod tests {
                 name: "declared".to_owned(),
                 provider_type: AuthProviderType::Jwt,
                 jwks_url: Some("https://declared.example.test/.well-known/jwks.json".to_owned()),
-                issuer: Some("https://declared.example.test/".to_owned()),
+                issuer: Some("https://declared.example.test".to_owned()),
                 audience: Some("declared-audience".to_owned()),
                 jwks_timeout_ms: 8000,
                 require_jti: false,

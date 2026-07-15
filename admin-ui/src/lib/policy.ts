@@ -4,10 +4,14 @@ import { adminApiUrl } from './config';
 
 export type PolicyDefaultAction = 'allow' | 'deny';
 export type PolicyRuleAction = 'allow' | 'deny' | 'shadow';
-export type AuthMethodName = 'bearer_token' | 'session_cookie';
+export type AuthMethodName =
+  | 'bearer_token'
+  | 'session_cookie'
+  | 'service_token';
 
 export type PrincipalMatcher = {
   roles?: string[];
+  issuers?: string[];
   auth_methods?: string[];
   principal_ids?: string[];
 };
@@ -62,6 +66,7 @@ export type PolicyRulePreviewSample = {
   path: string;
   actor: {
     user_id?: string;
+    issuer?: string;
     auth_mode?: string;
     roles?: string[];
   } | null;
@@ -86,6 +91,8 @@ export type PolicyRulePreviewResponse = {
 
 export type PolicyRuleShadowReviewPrincipal = {
   user_id: string;
+  issuer?: string;
+  auth_mode: string;
   roles: string[];
 };
 
@@ -96,6 +103,7 @@ export type PolicyRuleShadowReviewSample = {
   path: string;
   actor: {
     user_id: string;
+    issuer?: string;
     auth_mode: string;
     roles?: string[];
   } | null;
@@ -265,7 +273,11 @@ export function currentTokenCanWritePolicy(policy: PolicyDocument): boolean {
 }
 
 export function isAuthMethodName(value: string): value is AuthMethodName {
-  return value === 'bearer_token' || value === 'session_cookie';
+  return (
+    value === 'bearer_token' ||
+    value === 'session_cookie' ||
+    value === 'service_token'
+  );
 }
 
 export function isPolicyRuleAction(value: string): value is PolicyRuleAction {

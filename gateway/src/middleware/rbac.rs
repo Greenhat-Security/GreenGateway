@@ -78,6 +78,8 @@ pub(crate) struct ToolAuthorizationSnapshot<'a> {
 pub(crate) struct ToolPolicySnapshot<'a> {
     pub enabled: bool,
     pub allowed_roles: &'a [String],
+    pub issuers: &'a [String],
+    pub auth_methods: &'a [String],
     pub timeout_ms: u64,
     pub max_concurrent: u32,
 }
@@ -237,6 +239,8 @@ impl RbacPolicyState {
             .map(|entry| ToolPolicySnapshot {
                 enabled: entry.enabled,
                 allowed_roles: entry.allowed_roles.as_slice(),
+                issuers: entry.issuers.as_slice(),
+                auth_methods: entry.auth_methods.as_slice(),
                 timeout_ms: entry.timeout_ms,
                 max_concurrent: entry.max_concurrent,
             })
@@ -2193,6 +2197,8 @@ mod tests {
                                 .iter()
                                 .map(|permission| (*permission).to_owned())
                                 .collect(),
+                            issuers: Vec::new(),
+                            auth_methods: Vec::new(),
                         },
                     )
                 })

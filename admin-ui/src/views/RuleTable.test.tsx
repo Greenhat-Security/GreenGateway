@@ -30,7 +30,10 @@ describe('RuleTable', () => {
             id: 'allow-billing',
             methods: ['GET', 'HEAD'],
             path: '/billing/{id}',
-            principal: { roles: ['billing-reader'] },
+            principal: {
+              roles: ['billing-reader'],
+              issuers: ['https://idp.example/'],
+            },
             action: 'allow',
           }),
           rule({
@@ -88,7 +91,11 @@ describe('RuleTable', () => {
     expect(screen.getByText('GET, HEAD requests to /billing/{id}')).toBeTruthy();
     expect(screen.getAllByText('Enforcing')).toHaveLength(2);
     expect(screen.getByText('Draft')).toBeTruthy();
-    expect(screen.getByText('role: billing-reader')).toBeTruthy();
+    expect(
+      screen.getByText(
+        'role: billing-reader + issuer: https://idp.example/',
+      ),
+    ).toBeTruthy();
     expect(screen.getAllByText('any principal')).toHaveLength(2);
     expect(screen.getByText('/billing/{id}')).toBeTruthy();
     expect(screen.getByText('12 hits')).toBeTruthy();

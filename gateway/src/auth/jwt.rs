@@ -21,7 +21,9 @@ use crate::{
 
 use super::{
     claims::{extract_roles, extract_string_claim},
-    oidc, AuthError, AuthMethod, Principal, SessionCredential, SessionValidator,
+    oidc,
+    principal::provider_issuer,
+    AuthError, AuthMethod, Principal, SessionCredential, SessionValidator,
 };
 
 const INVALID_TOKEN: &str = "invalid or expired token";
@@ -101,6 +103,7 @@ impl RevocationStore for NoopRevocationStore {
 /// JWT bearer-token validator backed by a kid-indexed JWKS key cache.
 pub struct JwtValidator {
     cfg: JwtAuthConfig,
+    principal_issuer: Option<String>,
     egress_client: Arc<EgressClient>,
     keys: Arc<RwLock<HashMap<String, CachedDecodingKey>>>,
     last_jwks_refresh: Arc<Mutex<Option<Instant>>>,
@@ -126,6 +129,21 @@ impl JwtValidator {
     pub fn new(cfg: JwtAuthConfig, egress_client: Arc<EgressClient>) -> Result<Self, AuthError> {
         Self::with_keys(
             cfg,
+            None,
+            egress_client,
+            Arc::new(NoopRevocationStore),
+            HashMap::new(),
+        )
+    }
+
+    pub fn new_for_provider(
+        cfg: JwtAuthConfig,
+        provider_name: &str,
+        egress_client: Arc<EgressClient>,
+    ) -> Result<Self, AuthError> {
+        Self::with_keys(
+            cfg,
+            Some(provider_issuer(provider_name)),
             egress_client,
             Arc::new(NoopRevocationStore),
             HashMap::new(),
@@ -138,7 +156,7 @@ impl JwtValidator {
         egress_client: Arc<EgressClient>,
         revocation: Arc<dyn RevocationStore>,
     ) -> Result<Self, AuthError> {
-        Self::with_keys(cfg, egress_client, revocation, HashMap::new())
+        Self::with_keys(cfg, None, egress_client, revocation, HashMap::new())
     }
 
     #[allow(dead_code)] // Startup now builds JwtValidator instances from Config.auth_providers.
@@ -158,11 +176,12 @@ impl JwtValidator {
         revocation: Arc<dyn RevocationStore>,
         initial_keys: HashMap<String, CachedDecodingKey>,
     ) -> Result<Self, AuthError> {
-        Self::with_keys(cfg, egress_client, revocation, initial_keys)
+        Self::with_keys(cfg, None, egress_client, revocation, initial_keys)
     }
 
     fn with_keys(
         mut cfg: JwtAuthConfig,
+        fallback_principal_issuer: Option<String>,
         egress_client: Arc<EgressClient>,
         revocation: Arc<dyn RevocationStore>,
         initial_keys: HashMap<String, CachedDecodingKey>,
@@ -172,8 +191,10 @@ impl JwtValidator {
             .as_deref()
             .map(normalize_configured_issuer)
             .transpose()?;
+        let principal_issuer = cfg.issuer.clone().or(fallback_principal_issuer);
         Ok(Self {
             cfg,
+            principal_issuer,
             egress_client,
             keys: Arc::new(RwLock::new(initial_keys)),
             last_jwks_refresh: Arc::new(Mutex::new(None)),
@@ -331,7 +352,7 @@ impl JwtValidator {
 
         Ok(Principal {
             user_id: user_id.to_owned(),
-            issuer: self.cfg.issuer.clone(),
+            issuer: self.principal_issuer.clone(),
             email,
             org_id,
             roles,
@@ -1399,6 +1420,26 @@ RowSUZV5FSmOGJ7JyROZ80k=
             .expect("validator construction should not fail");
 
         assert!(validator.is_some());
+    }
+
+    #[test]
+    fn provider_constructor_uses_configured_issuer_or_provider_fallback() {
+        let fallback =
+            JwtValidator::new_for_provider(default_cfg(), "workforce", test_egress_client())
+                .expect("validator should build");
+        assert_eq!(
+            fallback.principal_issuer.as_deref(),
+            Some("provider:workforce")
+        );
+
+        let mut cfg = default_cfg();
+        cfg.issuer = Some("https://idp.example/".to_owned());
+        let configured = JwtValidator::new_for_provider(cfg, "workforce", test_egress_client())
+            .expect("validator should build");
+        assert_eq!(
+            configured.principal_issuer.as_deref(),
+            Some("https://idp.example")
+        );
     }
 
     fn validator(

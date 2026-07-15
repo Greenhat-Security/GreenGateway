@@ -279,11 +279,16 @@ function ShadowReviewEntry({
           {summary.affected_principals.length > 0 ? (
             <div className="shadow-review-chip-list" aria-label="Affected principals">
               {summary.affected_principals.map((principal) => (
-                <span className="badge neutral" key={principal.user_id}>
+                <span
+                  className="badge neutral"
+                  key={`${principal.user_id}:${principal.issuer ?? ''}:${principal.auth_mode}`}
+                >
                   {principal.user_id}
-                  {principal.roles.length > 0 ? (
-                    <small>{principal.roles.join(', ')}</small>
-                  ) : null}
+                  <small>
+                    {[principal.issuer ?? 'no issuer', principal.auth_mode]
+                      .concat(principal.roles)
+                      .join(' / ')}
+                  </small>
                 </span>
               ))}
             </div>

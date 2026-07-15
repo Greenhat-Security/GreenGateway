@@ -24,7 +24,7 @@ use crate::{
     middleware::rbac::{
         RbacState, ToolAuthorizationSnapshot, ToolPolicySnapshot, ToolRuleDecision,
     },
-    rbac::{policy, Policy, Rule, RuleAction, RuleMatcher},
+    rbac::{policy, rule::principal_identity_matches, Policy, Rule, RuleAction, RuleMatcher},
 };
 
 const AUTHZ_ALLOWED: &str = "authz.allowed";
@@ -37,6 +37,8 @@ const MCP_TOOL_OBSERVATION_METHOD: &str = "MCP";
 pub struct ToolRuntimeToolConfig {
     pub enabled: bool,
     pub allowed_roles: Vec<String>,
+    pub issuers: Vec<String>,
+    pub auth_methods: Vec<String>,
     pub timeout: Duration,
     pub max_concurrent: usize,
 }
@@ -722,7 +724,12 @@ impl ToolRuntime {
                 matched_rule_id: self.rule_id(decision.rule_index),
             });
 
-        if !allowed_roles_match(&state.config.allowed_roles, context) {
+        if !tool_principal_matches(
+            &state.config.allowed_roles,
+            &state.config.issuers,
+            &state.config.auth_methods,
+            context,
+        ) {
             return Err(ToolRuntimeError::RoleDenied {
                 tool_name: tool_name.to_owned(),
                 allowed_roles: state.config.allowed_roles.clone(),
@@ -775,7 +782,12 @@ impl ToolRuntime {
             return false;
         }
 
-        allowed_roles_match(&state.config.allowed_roles, context)
+        tool_principal_matches(
+            &state.config.allowed_roles,
+            &state.config.issuers,
+            &state.config.auth_methods,
+            context,
+        )
     }
 
     async fn acquire_execution_permits(
@@ -820,6 +832,8 @@ impl ToolRuntime {
                 config: ToolRuntimeToolConfig {
                     enabled: true,
                     allowed_roles: Vec::new(),
+                    issuers: Vec::new(),
+                    auth_methods: Vec::new(),
                     timeout: self.inner.config.default_timeout,
                     max_concurrent: self.inner.config.max_concurrent_global,
                 },
@@ -927,6 +941,8 @@ fn tool_config_from_policy(entry: &policy::ToolPolicyEntry) -> ToolRuntimeToolCo
     ToolRuntimeToolConfig {
         enabled: entry.enabled,
         allowed_roles: entry.allowed_roles.clone(),
+        issuers: entry.issuers.clone(),
+        auth_methods: entry.auth_methods.clone(),
         timeout: Duration::from_millis(entry.timeout_ms),
         max_concurrent: entry.max_concurrent as usize,
     }
@@ -936,6 +952,8 @@ fn tool_config_from_policy_snapshot(tool: ToolPolicySnapshot<'_>) -> ToolRuntime
     ToolRuntimeToolConfig {
         enabled: tool.enabled,
         allowed_roles: tool.allowed_roles.to_vec(),
+        issuers: tool.issuers.to_vec(),
+        auth_methods: tool.auth_methods.to_vec(),
         timeout: Duration::from_millis(tool.timeout_ms),
         max_concurrent: tool.max_concurrent as usize,
     }
@@ -958,7 +976,7 @@ fn authorize_tool_snapshot(
         });
     }
 
-    if !allowed_roles_match(tool.allowed_roles, context) {
+    if !tool_principal_matches(tool.allowed_roles, tool.issuers, tool.auth_methods, context) {
         return Err(ToolRuntimeError::RoleDenied {
             tool_name: tool_name.to_owned(),
             allowed_roles: tool.allowed_roles.to_vec(),
@@ -972,35 +990,40 @@ fn tool_visible_for_snapshot(
     context: &ToolInvocationContext,
     authorization: &ToolAuthorizationSnapshot<'_>,
 ) -> bool {
-    authorization
-        .tool
-        .is_some_and(|tool| tool.enabled && allowed_roles_match(tool.allowed_roles, context))
-        && tool_rule_allows_visibility(
-            authorization
-                .rule_decision
-                .as_ref()
-                .map(|decision| &decision.action),
-        )
+    authorization.tool.is_some_and(|tool| {
+        tool.enabled
+            && tool_principal_matches(tool.allowed_roles, tool.issuers, tool.auth_methods, context)
+    }) && tool_rule_allows_visibility(
+        authorization
+            .rule_decision
+            .as_ref()
+            .map(|decision| &decision.action),
+    )
 }
 
 fn tool_rule_allows_visibility(rule_action: Option<&RuleAction>) -> bool {
     !matches!(rule_action, Some(RuleAction::Deny))
 }
 
-fn allowed_roles_match(allowed_roles: &[String], context: &ToolInvocationContext) -> bool {
-    if allowed_roles.is_empty() {
+fn tool_principal_matches(
+    allowed_roles: &[String],
+    issuers: &[String],
+    auth_methods: &[String],
+    context: &ToolInvocationContext,
+) -> bool {
+    if allowed_roles.is_empty() && issuers.is_empty() && auth_methods.is_empty() {
         return true;
     }
 
-    context
-        .actor
-        .as_ref()
-        .and_then(|actor| actor.roles.as_ref())
-        .is_some_and(|actor_roles| {
-            allowed_roles
+    let Some(principal) = principal_from_tool_context(context) else {
+        return false;
+    };
+
+    principal_identity_matches(issuers, auth_methods, &principal)
+        && (allowed_roles.is_empty()
+            || allowed_roles
                 .iter()
-                .any(|allowed_role| actor_roles.iter().any(|role| role == allowed_role))
-        })
+                .any(|allowed_role| principal.roles.iter().any(|role| role == allowed_role)))
 }
 
 fn principal_from_tool_context(context: &ToolInvocationContext) -> Option<Principal> {
@@ -1009,7 +1032,7 @@ fn principal_from_tool_context(context: &ToolInvocationContext) -> Option<Princi
 
     Some(Principal {
         user_id: actor.user_id.clone(),
-        issuer: None,
+        issuer: actor.issuer.clone(),
         email: actor.email.clone(),
         org_id: None,
         roles: actor.roles.clone().unwrap_or_default(),
@@ -1136,6 +1159,45 @@ mod tests {
             )
             .await
             .expect("any overlapping role should allow invocation");
+
+        assert_eq!(allowed, "allowed");
+    }
+
+    #[tokio::test]
+    async fn tool_policy_separates_colliding_roles_by_issuer_and_auth_method() {
+        let mut tool = role_restricted_tool(100, 1, &["operator"]);
+        tool.issuers = vec!["https://idp-a.example/".to_owned()];
+        tool.auth_methods = vec!["bearer_token".to_owned()];
+        let (runtime, _capture) = runtime_with_tools([("tool", tool)], 2, 1, 100);
+
+        let denied = runtime
+            .execute_with_context(
+                "tool",
+                context_with_identity(
+                    &["operator"],
+                    Some("https://idp-b.example/"),
+                    "bearer_token",
+                ),
+                CancellationToken::new(),
+                || async { "should not run" },
+            )
+            .await
+            .expect_err("same role from another issuer must not invoke the tool");
+        assert!(matches!(denied, ToolRuntimeError::RoleDenied { .. }));
+
+        let allowed = runtime
+            .execute_with_context(
+                "tool",
+                context_with_identity(
+                    &["operator"],
+                    Some("https://idp-a.example/"),
+                    "bearer_token",
+                ),
+                CancellationToken::new(),
+                || async { "allowed" },
+            )
+            .await
+            .expect("matching issuer and auth method should allow invocation");
 
         assert_eq!(allowed, "allowed");
     }
@@ -2254,6 +2316,7 @@ mod tests {
                     source_ip: "203.0.113.24".to_owned(),
                     actor: Some(Actor {
                         user_id: "user-123".to_owned(),
+                        issuer: None,
                         email: None,
                         roles: Some(vec!["operator".to_owned()]),
                         auth_mode: "bearer_token".to_owned(),
@@ -2315,6 +2378,8 @@ mod tests {
             ToolRuntimeToolConfig {
                 enabled: true,
                 allowed_roles: Vec::new(),
+                issuers: Vec::new(),
+                auth_methods: Vec::new(),
                 timeout: Duration::from_millis(30_000),
                 max_concurrent: 8,
             }
@@ -2324,6 +2389,8 @@ mod tests {
             ToolRuntimeToolConfig {
                 enabled: false,
                 allowed_roles: vec!["operator".to_owned()],
+                issuers: Vec::new(),
+                auth_methods: Vec::new(),
                 timeout: Duration::from_millis(1500),
                 max_concurrent: 3,
             }
@@ -2377,6 +2444,8 @@ mod tests {
         ToolRuntimeToolConfig {
             enabled: true,
             allowed_roles: Vec::new(),
+            issuers: Vec::new(),
+            auth_methods: Vec::new(),
             timeout: Duration::from_millis(timeout_ms),
             max_concurrent,
         }
@@ -2386,6 +2455,8 @@ mod tests {
         ToolRuntimeToolConfig {
             enabled: false,
             allowed_roles: Vec::new(),
+            issuers: Vec::new(),
+            auth_methods: Vec::new(),
             timeout: Duration::from_millis(timeout_ms),
             max_concurrent,
         }
@@ -2402,6 +2473,8 @@ mod tests {
                 .iter()
                 .map(|role| (*role).to_owned())
                 .collect(),
+            issuers: Vec::new(),
+            auth_methods: Vec::new(),
             timeout: Duration::from_millis(timeout_ms),
             max_concurrent,
         }
@@ -2428,6 +2501,7 @@ mod tests {
             tool_name: Some(tool_name.to_owned()),
             principal: PrincipalMatcher {
                 roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+                issuers: Vec::new(),
                 auth_methods: Vec::new(),
                 principal_ids: Vec::new(),
             },
@@ -2576,14 +2650,23 @@ mod tests {
     }
 
     fn context_with_roles(roles: &[&str]) -> ToolInvocationContext {
+        context_with_identity(roles, None, "bearer_token")
+    }
+
+    fn context_with_identity(
+        roles: &[&str],
+        issuer: Option<&str>,
+        auth_mode: &str,
+    ) -> ToolInvocationContext {
         ToolInvocationContext {
             request_id: "request-test".to_owned(),
             source_ip: "127.0.0.1".to_owned(),
             actor: Some(Actor {
                 user_id: "user-123".to_owned(),
+                issuer: issuer.map(str::to_owned),
                 email: None,
                 roles: Some(roles.iter().map(|role| (*role).to_owned()).collect()),
-                auth_mode: "bearer_token".to_owned(),
+                auth_mode: auth_mode.to_owned(),
             }),
         }
     }

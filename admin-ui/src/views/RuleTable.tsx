@@ -775,12 +775,16 @@ function sameOrder(left: string[], right: string[]): boolean {
 
 export function formatPrincipal(principal: PolicyRule['principal']): string {
   const roles = principal?.roles ?? [];
+  const issuers = principal?.issuers ?? [];
   const authMethods = principal?.auth_methods ?? [];
   const principalIds = principal?.principal_ids ?? [];
   const parts: string[] = [];
 
   if (roles.length > 0) {
     parts.push(`${roles.length === 1 ? 'role' : 'roles'}: ${roles.join(', ')}`);
+  }
+  if (issuers.length > 0) {
+    parts.push(`${issuers.length === 1 ? 'issuer' : 'issuers'}: ${issuers.join(', ')}`);
   }
   if (authMethods.length > 0) {
     parts.push(`auth: ${authMethods.map(formatAuthMethod).join(', ')}`);
@@ -800,6 +804,8 @@ function formatAuthMethod(value: string): string {
       return 'bearer token';
     case 'session_cookie':
       return 'session cookie';
+    case 'service_token':
+      return 'service token';
     default:
       return value;
   }

@@ -6,7 +6,7 @@ use tokio::time::timeout;
 
 use crate::egress::EgressClient;
 
-use super::AuthError;
+use super::{principal::canonical_issuer, AuthError};
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct DiscoveryDocument {
@@ -144,12 +144,7 @@ fn normalize_discovery_endpoint(value: Option<&str>) -> Option<String> {
 }
 
 pub(crate) fn normalize_issuer(issuer: &str) -> Option<String> {
-    let issuer = issuer.trim().trim_end_matches('/');
-    if issuer.is_empty() {
-        return None;
-    }
-
-    Some(issuer.to_owned())
+    canonical_issuer(issuer)
 }
 
 pub(crate) fn normalize_required_issuer(issuer: &str) -> Result<String, AuthError> {

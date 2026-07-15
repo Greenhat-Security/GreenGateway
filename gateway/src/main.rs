@@ -1511,15 +1511,17 @@ fn auth_validator_from_config(
                     }
                 };
                 let jwt_config = auth::JwtAuthConfig::from_provider_config(provider, jwks_url);
-                validators.push(Arc::new(auth::JwtValidator::new(
+                validators.push(Arc::new(auth::JwtValidator::new_for_provider(
                     jwt_config,
+                    &provider.name,
                     Arc::clone(&egress_client),
                 )?) as Arc<dyn auth::SessionValidator>);
             }
             config::AuthProviderType::CookieSession => {
                 let cookie_config = auth::CookieSessionAuthConfig::from_provider_config(provider)?;
-                validators.push(Arc::new(auth::CookieSessionValidator::new(
+                validators.push(Arc::new(auth::CookieSessionValidator::new_for_provider(
                     cookie_config,
+                    &provider.name,
                     Arc::clone(&egress_client),
                 )?) as Arc<dyn auth::SessionValidator>);
             }
@@ -4437,6 +4439,11 @@ async fn rule_suggestion_accept_endpoint(
     if suggestion.state != discovery::suggestions::RuleSuggestionLifecycleState::Open {
         return conflict("suggestion is not open");
     }
+    if !suggestion.is_identity_bound_for_acceptance() {
+        return conflict(
+            "baseline suggestion is missing issuer or authentication-method constraints",
+        );
+    }
 
     let created = match create_policy_rule(
         &state.policy,
@@ -4652,7 +4659,12 @@ async fn principal_detail_endpoint(
     };
     let (endpoints_touched, rules_hit) = match state.audit_query_store.as_ref() {
         Some(audit_query_store) => {
-            match principal_audit_summary(audit_query_store, principal_record.subject.as_str()) {
+            match principal_audit_summary(
+                audit_query_store,
+                principal_record.subject.as_str(),
+                principal_record.issuer.as_str(),
+                principal_record.auth_method.as_str(),
+            ) {
                 Ok(summary) => summary,
                 Err(err) => {
                     tracing::error!(error = %err, "failed to query principal audit summary");
@@ -4665,6 +4677,8 @@ async fn principal_detail_endpoint(
     let anomaly_history = match state.discovery_store.as_ref() {
         Some(discovery_store) => match discovery_store.list_principal_endpoint_signals(
             principal_record.subject.as_str(),
+            principal_record.issuer.as_str(),
+            principal_directory_audit_auth_mode(principal_record.auth_method.as_str()),
             DEFAULT_PRINCIPAL_ANOMALY_HISTORY_LIMIT,
         ) {
             Ok(signals) => signals,
@@ -4994,6 +5008,8 @@ impl AuditQueryParams {
             to,
             event_type: self.event_type,
             actor: self.actor,
+            actor_issuer: None,
+            actor_auth_mode: None,
             method: None,
             path: self.path,
             status,
@@ -5684,8 +5700,9 @@ fn parse_rule_order_body(body: &Bytes) -> Result<Vec<String>, Vec<String>> {
 }
 
 fn parse_rule_preview_body(body: &Bytes) -> Result<PolicyRulePreviewRequest, Vec<String>> {
-    let request = serde_json::from_slice::<PolicyRulePreviewRequest>(body)
+    let mut request = serde_json::from_slice::<PolicyRulePreviewRequest>(body)
         .map_err(|err| vec![format!("invalid JSON: {err}")])?;
+    rbac::policy::canonicalize_principal_matcher_issuers(&mut request.rule.principal);
     validate_rule_preview_request(&request)?;
     Ok(request)
 }
@@ -5712,6 +5729,15 @@ fn validate_rule_preview_request(request: &PolicyRulePreviewRequest) -> Result<(
             "rule.path must start with '/', got '{}'",
             request.rule.path
         ));
+    }
+    if request
+        .rule
+        .principal
+        .issuers
+        .iter()
+        .any(|issuer| issuer.is_empty())
+    {
+        errors.push("rule.principal.issuers must not contain empty values".to_owned());
     }
     for auth_method in &request.rule.principal.auth_methods {
         if !rbac::rule::valid_auth_method_name(auth_method) {
@@ -5846,12 +5872,13 @@ fn principal_from_audit_actor(actor: &audit::Actor) -> Option<auth::Principal> {
     let auth_method = match actor.auth_mode.as_str() {
         rbac::rule::AUTH_METHOD_BEARER_TOKEN => auth::AuthMethod::Bearer,
         rbac::rule::AUTH_METHOD_SESSION_COOKIE => auth::AuthMethod::Cookie,
+        rbac::rule::AUTH_METHOD_SERVICE_TOKEN => auth::AuthMethod::ServiceToken,
         _ => return None,
     };
 
     Some(auth::Principal {
         user_id: actor.user_id.clone(),
-        issuer: None,
+        issuer: actor.issuer.clone(),
         email: actor.email.clone(),
         org_id: None,
         roles: actor.roles.clone().unwrap_or_default(),
@@ -5954,15 +5981,16 @@ fn list_traffic_endpoint_page(
 fn principal_audit_summary(
     audit_query_store: &audit::query::AuditQueryStore,
     subject: &str,
+    issuer: &str,
+    auth_method: &str,
 ) -> Result<(Vec<PrincipalEndpointTouch>, Vec<String>), audit::query::AuditQueryError> {
-    // Audit events currently store only actor_user_id, not issuer/auth_method,
-    // so this convenience view can include same-subject events from another
-    // principal-directory identity key.
     let page = audit_query_store.query(&audit::query::AuditQueryFilters {
         from: None,
         to: None,
         event_type: Some("http.request_observed".to_owned()),
         actor: Some(subject.to_owned()),
+        actor_issuer: Some(issuer.to_owned()),
+        actor_auth_mode: Some(principal_directory_audit_auth_mode(auth_method).to_owned()),
         method: None,
         path: None,
         status: None,
@@ -6024,6 +6052,15 @@ fn principal_audit_summary(
     });
 
     Ok((endpoints, rules.into_iter().collect()))
+}
+
+fn principal_directory_audit_auth_mode(auth_method: &str) -> &str {
+    match auth_method {
+        "bearer" => rbac::rule::AUTH_METHOD_BEARER_TOKEN,
+        "cookie" => rbac::rule::AUTH_METHOD_SESSION_COOKIE,
+        "service_token" => rbac::rule::AUTH_METHOD_SERVICE_TOKEN,
+        other => other,
+    }
 }
 
 fn rfc3339_after(left: &str, right: &str) -> bool {
@@ -6111,6 +6148,13 @@ fn representative_principal_for_rule(rule: &rbac::Rule) -> Option<auth::Principa
         .principal
         .auth_methods
         .iter()
+        .any(|method| method == rbac::rule::AUTH_METHOD_SERVICE_TOKEN)
+    {
+        auth::AuthMethod::ServiceToken
+    } else if rule
+        .principal
+        .auth_methods
+        .iter()
         .any(|method| method == rbac::rule::AUTH_METHOD_SESSION_COOKIE)
     {
         auth::AuthMethod::Cookie
@@ -6125,7 +6169,7 @@ fn representative_principal_for_rule(rule: &rbac::Rule) -> Option<auth::Principa
             .first()
             .cloned()
             .unwrap_or_else(|| "traffic-coverage-principal".to_owned()),
-        issuer: None,
+        issuer: rule.principal.issuers.first().cloned(),
         email: None,
         org_id: None,
         roles: rule.principal.roles.clone(),
@@ -12788,7 +12832,12 @@ mod tests {
         assert_eventually(Duration::from_secs(1), || {
             principal_directory_row_count(&principal_db.path) == 1
         });
-        let row = principal_directory_row(&principal_db.path, "directory-user", "", "bearer");
+        let row = principal_directory_row(
+            &principal_db.path,
+            "directory-user",
+            "provider:legacy",
+            "bearer",
+        );
         assert_eq!(row.email.as_deref(), Some("directory-user@example.test"));
         assert_eq!(row.request_count, 1);
     }
@@ -13021,8 +13070,7 @@ mod tests {
             principal_directory_row_count(&principal_db.path) == 1
         });
 
-        let detail_uri =
-            "/v1/admin/principal?subject=directory-detail-user&issuer=&auth_method=bearer";
+        let detail_uri = "/v1/admin/principal?subject=directory-detail-user&issuer=provider%3Alegacy&auth_method=bearer";
         let body = wait_for_principal_detail_json(&router, detail_uri, &admin_token, |body| {
             principal_detail_endpoint_paths(body)
                 .contains(&("GET".to_owned(), "/__test/principal".to_owned()))
@@ -13041,13 +13089,19 @@ mod tests {
         let discovery_db = TempDb::new("principal-directory-signals-discovery");
         create_principal_schema(&principal_db.path);
         create_discovery_schema(&discovery_db.path);
-        for subject in ["bob", "alice bob", "charlie"] {
+        for (subject, issuer, auth_method) in [
+            ("bob", "https://issuer-a.example", "bearer"),
+            ("bob", "https://issuer-b.example", "bearer"),
+            ("bob", "https://issuer-a.example", "cookie"),
+            ("alice bob", "https://issuer-a.example", "bearer"),
+            ("charlie", "https://issuer-a.example", "bearer"),
+        ] {
             insert_principal_directory_row(
                 &principal_db.path,
                 PrincipalDirectorySeed {
                     subject,
-                    issuer: "",
-                    auth_method: "bearer",
+                    issuer,
+                    auth_method,
                     email: None,
                     org_id: None,
                     first_seen: "2026-01-01T00:00:00Z",
@@ -13058,26 +13112,58 @@ mod tests {
         }
         insert_principal_endpoint_signal(
             &discovery_db.path,
-            "sig-bob",
-            "POST",
-            "/principal-pairs/{id}",
-            "bob",
-            "2026-01-02T00:00:00Z",
+            PrincipalEndpointSignalSeed {
+                id: "sig-bob",
+                method: "POST",
+                endpoint_template: "/principal-pairs/{id}",
+                principal: "bob",
+                issuer: Some("https://issuer-a.example"),
+                auth_method: "bearer_token",
+                created_at: "2026-01-02T00:00:00Z",
+            },
         );
         insert_principal_endpoint_signal(
             &discovery_db.path,
-            "sig-alice-bob",
-            "POST",
-            "/principal-pairs/{id}",
-            "alice bob",
-            "2026-01-03T00:00:00Z",
+            PrincipalEndpointSignalSeed {
+                id: "sig-bob-other-issuer",
+                method: "POST",
+                endpoint_template: "/principal-pairs/{id}",
+                principal: "bob",
+                issuer: Some("https://issuer-b.example"),
+                auth_method: "bearer_token",
+                created_at: "2026-01-03T00:00:00Z",
+            },
+        );
+        insert_principal_endpoint_signal(
+            &discovery_db.path,
+            PrincipalEndpointSignalSeed {
+                id: "sig-bob-other-auth",
+                method: "POST",
+                endpoint_template: "/principal-pairs/{id}",
+                principal: "bob",
+                issuer: Some("https://issuer-a.example"),
+                auth_method: "session_cookie",
+                created_at: "2026-01-04T00:00:00Z",
+            },
+        );
+        insert_principal_endpoint_signal(
+            &discovery_db.path,
+            PrincipalEndpointSignalSeed {
+                id: "sig-alice-bob",
+                method: "POST",
+                endpoint_template: "/principal-pairs/{id}",
+                principal: "alice bob",
+                issuer: Some("https://issuer-a.example"),
+                auth_method: "bearer_token",
+                created_at: "2026-01-05T00:00:00Z",
+            },
         );
         let (router, _policy) =
             principal_admin_router(Some(&principal_db.path), None, Some(&discovery_db.path));
 
         let bob = principal_json(
             &router,
-            "/v1/admin/principal?subject=bob&issuer=&auth_method=bearer",
+            "/v1/admin/principal?subject=bob&issuer=https%3A%2F%2Fissuer-a.example&auth_method=bearer",
             Some(test_principal(&["principal-reader"])),
         )
         .await;
@@ -13088,7 +13174,7 @@ mod tests {
 
         let charlie = principal_json(
             &router,
-            "/v1/admin/principal?subject=charlie&issuer=&auth_method=bearer",
+            "/v1/admin/principal?subject=charlie&issuer=https%3A%2F%2Fissuer-a.example&auth_method=bearer",
             Some(test_principal(&["principal-reader"])),
         )
         .await;
@@ -16229,6 +16315,13 @@ mod tests {
         let db = TempDb::new("rule-preview");
         create_audit_schema(&db.path);
         seed_rule_preview_events(&db.path);
+        Connection::open(&db.path)
+            .expect("audit database should open")
+            .execute(
+                "UPDATE audit_events SET actor_json = json_set(actor_json, '$.issuer', 'https://issuer.example')",
+                [],
+            )
+            .expect("preview actor issuers should update");
         let initial_policy = policy_document_string("initial-policy", "test:old");
         let policy = TempPolicyFile::new(&initial_policy);
         let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
@@ -16256,6 +16349,7 @@ mod tests {
                 "path": "/api/items/{id}",
                 "principal": {
                     "roles": ["reader"],
+                    "issuers": ["https://issuer.example/"],
                     "auth_methods": ["bearer_token"]
                 },
                 "action": "deny"
@@ -16562,10 +16656,12 @@ mod tests {
             json!([
                 {
                     "user_id": "analyst-2",
+                    "auth_mode": "bearer_token",
                     "roles": ["analyst", "manager"]
                 },
                 {
                     "user_id": "analyst-1",
+                    "auth_mode": "bearer_token",
                     "roles": ["analyst"]
                 }
             ])
@@ -16634,6 +16730,7 @@ mod tests {
                 tool_name: None,
                 principal: rbac::PrincipalMatcher {
                     roles: vec!["reader".to_owned()],
+                    issuers: Vec::new(),
                     auth_methods: vec!["bearer_token".to_owned()],
                     principal_ids: Vec::new(),
                 },
@@ -18845,7 +18942,8 @@ paths:
                 "path": "/widgets",
                 "principal": {
                     "roles": ["writer"],
-                    "auth_methods": [],
+                    "issuers": ["provider:test"],
+                    "auth_methods": ["bearer_token"],
                     "principal_ids": []
                 },
                 "action": "allow"
@@ -19073,6 +19171,14 @@ paths:
             accepted_body["rule"]["principal"]["roles"],
             json!(["accepted-reader"])
         );
+        assert_eq!(
+            accepted_body["rule"]["principal"]["issuers"],
+            json!(["provider:test"])
+        );
+        assert_eq!(
+            accepted_body["rule"]["principal"]["auth_methods"],
+            json!(["bearer_token"])
+        );
         assert!(accepted_body["rule"]["id"].as_str().is_some());
 
         let policy_response = router
@@ -19131,6 +19237,75 @@ paths:
             .expect("suggestion lifecycle event should be emitted");
         assert_eq!(suggestion_event.payload["id"], json!("sug-accept"));
         assert_eq!(suggestion_event.payload["state"], json!("accepted"));
+    }
+
+    #[tokio::test]
+    async fn suggestions_admin_dismisses_legacy_unbound_baseline_before_acceptance() {
+        let discovery_db = TempDb::new("suggestions-legacy-unbound");
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_legacy_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-legacy-unbound",
+                suggestion_type: "baseline_allow",
+                method: "GET",
+                path_pattern: "/legacy/{id}",
+                role: Some("legacy-reader"),
+                action: "allow",
+                rationale: "Legacy role-only baseline suggestion.",
+                evidence: json!({ "observation_count": 3 }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: None,
+            },
+        );
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let before_contents = fs::read_to_string(&policy.path).expect("policy should read");
+        let router = suggestions_admin_router_with_policy(
+            Some(&discovery_db.path),
+            None,
+            &policy,
+            test_audit_log(),
+        );
+        let current_etag = suggestions_policy_etag(&router).await;
+
+        let response = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-legacy-unbound/accept",
+                Some(test_principal(&["suggestions-policy-writer"])),
+                None,
+                Some(&current_etag),
+            ))
+            .await
+            .expect("legacy suggestion accept request should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(response).await,
+            json!({ "error": "suggestion is not open" })
+        );
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy should read"),
+            before_contents
+        );
+        let dismissed = suggestions_json(
+            &router,
+            "/v1/admin/suggestions?state=dismissed",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(
+            suggestion_ids(&dismissed),
+            vec!["sug-legacy-unbound".to_owned()]
+        );
+        assert_eq!(
+            dismissed["suggestions"][0]["transitioned_by"],
+            json!("system:issuer-bound-migration")
+        );
     }
 
     #[tokio::test]
@@ -24858,18 +25033,34 @@ O2gecI9QwDJNpm29J9wJB2F8
     }
 
     fn insert_rule_suggestion(path: &PathBuf, suggestion: RuleSuggestionSeed<'_>) {
+        insert_rule_suggestion_with_identity_binding(path, suggestion, true);
+    }
+
+    fn insert_legacy_rule_suggestion(path: &PathBuf, suggestion: RuleSuggestionSeed<'_>) {
+        insert_rule_suggestion_with_identity_binding(path, suggestion, false);
+    }
+
+    fn insert_rule_suggestion_with_identity_binding(
+        path: &PathBuf,
+        suggestion: RuleSuggestionSeed<'_>,
+        identity_bound: bool,
+    ) {
         let connection = Connection::open(path).expect("test discovery database should open");
-        let principal = match suggestion.role {
-            Some(role) => json!({
-                "roles": [role],
+        let roles = suggestion.role.into_iter().collect::<Vec<_>>();
+        let principal = if identity_bound {
+            json!({
+                "roles": roles,
+                "issuers": ["provider:test"],
+                "auth_methods": ["bearer_token"],
+                "principal_ids": []
+            })
+        } else {
+            json!({
+                "roles": roles,
+                "issuers": [],
                 "auth_methods": [],
                 "principal_ids": []
-            }),
-            None => json!({
-                "roles": [],
-                "auth_methods": [],
-                "principal_ids": []
-            }),
+            })
         };
         let proposed_rule_json = json!({
             "methods": [suggestion.method],
@@ -24954,6 +25145,7 @@ O2gecI9QwDJNpm29J9wJB2F8
         let connection = Connection::open(audit_path).expect("test audit database should open");
         let actor_json = json!({
             "user_id": format!("user-{event_id}"),
+            "issuer": "provider:test",
             "roles": [role],
             "auth_mode": "bearer_token"
         })
@@ -25385,30 +25577,40 @@ O2gecI9QwDJNpm29J9wJB2F8
             .expect("anonymous observation count should query")
     }
 
-    fn insert_principal_endpoint_signal(
-        path: &PathBuf,
-        id: &str,
-        method: &str,
-        endpoint_template: &str,
-        principal: &str,
-        created_at: &str,
-    ) {
+    struct PrincipalEndpointSignalSeed<'a> {
+        id: &'a str,
+        method: &'a str,
+        endpoint_template: &'a str,
+        principal: &'a str,
+        issuer: Option<&'a str>,
+        auth_method: &'a str,
+        created_at: &'a str,
+    }
+
+    fn insert_principal_endpoint_signal(path: &PathBuf, signal: PrincipalEndpointSignalSeed<'_>) {
         let connection = Connection::open(path).expect("test discovery database should open");
         let target_identity_json = serde_json::to_string(&json!({
-            "method": method,
-            "endpoint_template": endpoint_template,
-            "principal": principal,
+            "method": signal.method,
+            "endpoint_template": signal.endpoint_template,
+            "principal": signal.principal,
+            "issuer": signal.issuer,
+            "auth_method": signal.auth_method,
         }))
         .expect("target identity should serialize");
         let evidence_json = serde_json::to_string(&json!({
-            "observed_at": created_at,
-            "principal": principal,
+            "observed_at": signal.created_at,
+            "principal": signal.principal,
             "prior_distinct_principal_count": 1,
             "threshold": 1
         }))
         .expect("evidence should serialize");
-        let target_key =
-            discovery::signals::principal_endpoint_target_key(method, endpoint_template, principal);
+        let target_key = discovery::signals::principal_identity_endpoint_target_key(
+            signal.method,
+            signal.endpoint_template,
+            signal.principal,
+            signal.issuer,
+            signal.auth_method,
+        );
 
         connection
             .execute(
@@ -25429,14 +25631,14 @@ O2gecI9QwDJNpm29J9wJB2F8
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?8, NULL, NULL)
                 "#,
                 params![
-                    id,
+                    signal.id,
                     discovery::signals::PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_TYPE,
                     discovery::signals::PRINCIPAL_ENDPOINT_TARGET_KIND,
                     target_key,
                     target_identity_json,
-                    format!("Principal new to endpoint: {principal}"),
+                    format!("Principal new to endpoint: {}", signal.principal),
                     evidence_json,
-                    created_at,
+                    signal.created_at,
                 ],
             )
             .expect("principal endpoint signal should insert");
@@ -25542,6 +25744,7 @@ O2gecI9QwDJNpm29J9wJB2F8
     ) -> audit::AuditEvent {
         let actor = user_id.map(|user_id| audit::Actor {
             user_id: user_id.to_owned(),
+            issuer: None,
             email: None,
             roles: Some(vec!["reader".to_owned()]),
             auth_mode: "bearer_token".to_owned(),

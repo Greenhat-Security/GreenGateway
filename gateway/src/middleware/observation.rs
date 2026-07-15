@@ -2101,6 +2101,8 @@ paths:
                                 .iter()
                                 .map(|permission| (*permission).to_owned())
                                 .collect(),
+                            issuers: Vec::new(),
+                            auth_methods: Vec::new(),
                         },
                     )
                 })

@@ -50,6 +50,7 @@ const AUTH_METHOD_OPTIONS: Array<{
 }> = [
   { value: 'bearer_token', label: 'Bearer token' },
   { value: 'session_cookie', label: 'Session cookie' },
+  { value: 'service_token', label: 'Service token' },
 ];
 const ACTION_OPTIONS: Array<{
   value: PolicyRuleAction;
@@ -80,6 +81,8 @@ type RuleFormState = {
   toolName: string;
   roles: string[];
   roleDraft: string;
+  issuers: string[];
+  issuerDraft: string;
   authMethods: AuthMethodName[];
   principalIds: string[];
   principalIdDraft: string;
@@ -212,6 +215,7 @@ export function RuleEditor() {
     [
       form.action,
       form.authMethods,
+      form.issuers,
       form.matcherType,
       form.methods,
       form.path,
@@ -365,6 +369,27 @@ export function RuleEditor() {
     setForm((current) => ({
       ...current,
       roles: current.roles.filter((item) => item !== role),
+    }));
+    setSaveState({ kind: 'idle' });
+  }
+
+  function addIssuer() {
+    const value = form.issuerDraft.trim();
+    if (value.length === 0) {
+      return;
+    }
+    setForm((current) => ({
+      ...current,
+      issuers: addUnique(current.issuers, value),
+      issuerDraft: '',
+    }));
+    setSaveState({ kind: 'idle' });
+  }
+
+  function removeIssuer(issuer: string) {
+    setForm((current) => ({
+      ...current,
+      issuers: current.issuers.filter((item) => item !== issuer),
     }));
     setSaveState({ kind: 'idle' });
   }
@@ -604,6 +629,21 @@ export function RuleEditor() {
                   }
                   onAdd={addRole}
                   onRemove={removeRole}
+                />
+
+                <TokenListField
+                  label="Issuers"
+                  inputId="rule-issuer"
+                  value={form.issuerDraft}
+                  values={form.issuers}
+                  placeholder="https://idp.example/"
+                  addButtonLabel="Add issuer"
+                  emptyText="Any issuer"
+                  onChange={(value) =>
+                    setForm((current) => ({ ...current, issuerDraft: value }))
+                  }
+                  onAdd={addIssuer}
+                  onRemove={removeIssuer}
                 />
 
                 <fieldset className="rule-fieldset">
@@ -957,6 +997,8 @@ function emptyRuleForm(): RuleFormState {
     toolName: '',
     roles: [],
     roleDraft: '',
+    issuers: [],
+    issuerDraft: '',
     authMethods: [],
     principalIds: [],
     principalIdDraft: '',
@@ -990,6 +1032,11 @@ function formFromPrefillParams(
   const role = trimmedSearchParam(searchParams, 'prefill_role');
   if (role !== null) {
     form.roles = [role];
+  }
+
+  const issuer = trimmedSearchParam(searchParams, 'prefill_issuer');
+  if (issuer !== null) {
+    form.issuers = [issuer];
   }
 
   const authMethod = trimmedSearchParam(searchParams, 'prefill_auth_method');
@@ -1068,6 +1115,10 @@ function generatedExpression(rule: PolicyRule): string {
   for (const role of normalizeStrings(rule.principal?.roles ?? [])) {
     lines.push(`principal.roles contains ${JSON.stringify(role)}`);
   }
+  const issuers = normalizeStrings(rule.principal?.issuers ?? []);
+  if (issuers.length > 0) {
+    lines.push(`principal.issuer in ${JSON.stringify(issuers)}`);
+  }
   const authMethods = normalizeAuthMethods(rule.principal?.auth_methods ?? []);
   if (authMethods.length > 0) {
     lines.push(`principal.auth_method in ${JSON.stringify(authMethods)}`);
@@ -1100,11 +1151,17 @@ function formatMethodsForSummary(methods: string[]): string {
 function principalSummary(principal: PrincipalMatcher | undefined): string {
   const parts: string[] = [];
   const roles = normalizeStrings(principal?.roles ?? []);
+  const issuers = normalizeStrings(principal?.issuers ?? []);
   const authMethods = normalizeAuthMethods(principal?.auth_methods ?? []);
   const principalIds = normalizeStrings(principal?.principal_ids ?? []);
 
   if (roles.length > 0) {
     parts.push(`${roles.length === 1 ? 'role' : 'roles'} ${joinHumanList(roles)}`);
+  }
+  if (issuers.length > 0) {
+    parts.push(
+      `${issuers.length === 1 ? 'issuer' : 'issuers'} ${joinHumanList(issuers)}`,
+    );
   }
   if (authMethods.length > 0) {
     parts.push(
@@ -1160,6 +1217,8 @@ function formFromRule(rule: PolicyRule): RuleFormState {
     toolName,
     roles: normalizeStrings(rule.principal?.roles ?? []),
     roleDraft: '',
+    issuers: normalizeStrings(rule.principal?.issuers ?? []),
+    issuerDraft: '',
     authMethods: normalizeAuthMethods(rule.principal?.auth_methods ?? []),
     principalIds: normalizeStrings(rule.principal?.principal_ids ?? []),
     principalIdDraft: '',
@@ -1200,6 +1259,7 @@ function rulePatchFromRule(rule: PolicyRule) {
 function principalFromForm(form: RuleFormState): PrincipalMatcher {
   return {
     roles: normalizeStrings(form.roles),
+    issuers: normalizeStrings(form.issuers),
     auth_methods: normalizeAuthMethods(form.authMethods),
     principal_ids: normalizeStrings(form.principalIds),
   };

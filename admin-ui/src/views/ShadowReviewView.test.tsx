@@ -25,8 +25,18 @@ describe('ShadowReviewView', () => {
               rule_id: 'shadow-reports',
               would_deny_count: 2,
               affected_principals: [
-                { user_id: 'analyst-1', roles: ['analyst'] },
-                { user_id: 'manager-1', roles: ['manager', 'analyst'] },
+                {
+                  user_id: 'analyst-1',
+                  issuer: 'https://idp-a.example',
+                  auth_mode: 'bearer_token',
+                  roles: ['analyst'],
+                },
+                {
+                  user_id: 'manager-1',
+                  issuer: 'https://idp-b.example',
+                  auth_mode: 'session_cookie',
+                  roles: ['manager', 'analyst'],
+                },
               ],
               samples: [
                 sample({
@@ -55,6 +65,14 @@ describe('ShadowReviewView', () => {
     expect(screen.getByText('2 would-deny events')).toBeTruthy();
     expect(screen.getAllByText('analyst-1').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('manager-1')).toBeTruthy();
+    expect(
+      screen.getByText('https://idp-a.example / bearer_token / analyst'),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        'https://idp-b.example / session_cookie / manager / analyst',
+      ),
+    ).toBeTruthy();
     expect(screen.getByText('DELETE /reports/42')).toBeTruthy();
     expect(screen.getByText('Jul 4, 2026, 4:10 PM UTC')).toBeTruthy();
   });
@@ -295,6 +313,8 @@ type ShadowReviewSummaryFixture = {
   would_deny_count: number;
   affected_principals: Array<{
     user_id: string;
+    issuer?: string;
+    auth_mode: string;
     roles: string[];
   }>;
   samples: ShadowReviewSampleFixture[];
@@ -338,7 +358,14 @@ function shadowSummary(
       principal: { roles: ['analyst'] },
     }),
     would_deny_count: 1,
-    affected_principals: [{ user_id: 'analyst-1', roles: ['analyst'] }],
+    affected_principals: [
+      {
+        user_id: 'analyst-1',
+        issuer: 'provider:test',
+        auth_mode: 'bearer_token',
+        roles: ['analyst'],
+      },
+    ],
     samples: [sample()],
     ...overrides,
   };

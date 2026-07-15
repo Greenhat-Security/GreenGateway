@@ -79,6 +79,7 @@ describe('PrincipalDetail', () => {
           principalDetailResponse({
             principal: principalRecord({
               subject: 'alice/prod@example.test',
+              issuer: 'https://idp.example/',
               auth_method: 'service_token',
             }),
           }),
@@ -87,14 +88,14 @@ describe('PrincipalDetail', () => {
     );
 
     renderPrincipalDetail(
-      '/identities/detail?subject=alice%2Fprod%40example.test&issuer=&auth_method=service_token',
+      '/identities/detail?subject=alice%2Fprod%40example.test&issuer=https%3A%2F%2Fidp.example%2F&auth_method=service_token',
     );
 
     const blockLink = await screen.findByRole('link', {
       name: 'Block this principal',
     });
     expect(blockLink.getAttribute('href')).toBe(
-      '/policy/rules/editor?prefill_principal_id=alice%2Fprod%40example.test&prefill_action=deny&prefill_path=%2F**',
+      '/policy/rules/editor?prefill_principal_id=alice%2Fprod%40example.test&prefill_issuer=https%3A%2F%2Fidp.example%2F&prefill_auth_method=service_token&prefill_action=deny&prefill_path=%2F**',
     );
   });
 

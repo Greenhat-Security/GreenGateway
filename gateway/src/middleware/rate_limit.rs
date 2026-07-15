@@ -284,7 +284,13 @@ fn rate_limit_key(
     client_ip: &str,
 ) -> String {
     if let Some(principal) = extensions.get::<auth::Principal>() {
-        return format!("principal:{}", principal.user_id);
+        let issuer = principal.issuer.as_deref().unwrap_or("");
+        let auth_method = crate::rbac::rule::auth_method_policy_value(&principal.auth_method);
+        return format!(
+            "principal:{}:{issuer}:{auth_method}:{}",
+            issuer.len(),
+            principal.user_id
+        );
     }
 
     if let Some(session) = session_cookie(headers, session_cookie_name) {
@@ -936,8 +942,28 @@ mod tests {
 
         assert_eq!(
             rate_limit_key(&extensions, &headers, "gateway_session", "203.0.113.20"),
-            "principal:user-123"
+            "principal:0::bearer_token:user-123"
         );
+    }
+
+    #[test]
+    fn principal_key_separates_colliding_subjects_by_issuer_and_auth_method() {
+        let headers = HeaderMap::new();
+        let mut first = test_principal("shared-subject");
+        first.issuer = Some("https://idp-a.example.test/".to_owned());
+        let mut second = test_principal("shared-subject");
+        second.issuer = Some("https://idp-b.example.test/".to_owned());
+        let mut cookie = first.clone();
+        cookie.auth_method = auth::AuthMethod::Cookie;
+
+        let key = |principal| {
+            let mut extensions = Extensions::new();
+            extensions.insert(principal);
+            rate_limit_key(&extensions, &headers, "", "203.0.113.20")
+        };
+
+        assert_ne!(key(first.clone()), key(second));
+        assert_ne!(key(first), key(cookie));
     }
 
     #[test]

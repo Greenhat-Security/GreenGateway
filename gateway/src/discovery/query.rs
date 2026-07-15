@@ -180,6 +180,9 @@ pub struct PrincipalPage {
 #[derive(Clone, Debug, Serialize)]
 pub struct EndpointPrincipal {
     pub user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    pub auth_method: String,
     pub first_seen: String,
     pub last_seen: String,
 }
@@ -807,14 +810,14 @@ impl DiscoveryQueryStore {
     pub fn list_principal_endpoint_signals(
         &self,
         principal: &str,
+        issuer: &str,
+        auth_method: &str,
         limit: usize,
     ) -> Result<Vec<Signal>, DiscoveryQueryError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
 
-        let target_key_suffix = format!(" {principal}");
-        let target_key_pattern = format!("%{}", like_escape(&target_key_suffix));
         let rows = {
             let connection = self.connection_guard();
             let mut statement = connection
@@ -836,8 +839,15 @@ impl DiscoveryQueryStore {
                     FROM discovery_signals
                     WHERE signal_type = ?1
                       AND target_kind = ?2
-                      AND target_key LIKE ?3 ESCAPE '\'
+                      AND CASE
+                            WHEN json_valid(target_identity_json) = 1 THEN
+                                json_extract(target_identity_json, '$.principal') = ?3
+                                AND COALESCE(json_extract(target_identity_json, '$.issuer'), '') = ?4
+                                AND json_extract(target_identity_json, '$.auth_method') = ?5
+                            ELSE 0
+                          END
                     ORDER BY julianday(created_at) DESC, id ASC
+                    LIMIT ?6
                     "#,
                 )
                 .map_err(|source| DiscoveryQueryError::Sqlite {
@@ -849,7 +859,10 @@ impl DiscoveryQueryStore {
                     params![
                         signals::PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_TYPE,
                         signals::PRINCIPAL_ENDPOINT_TARGET_KIND,
-                        target_key_pattern
+                        principal,
+                        issuer,
+                        auth_method,
+                        i64::try_from(limit).unwrap_or(i64::MAX),
                     ],
                     RawSignal::from_row,
                 )
@@ -865,24 +878,7 @@ impl DiscoveryQueryStore {
             rows
         };
 
-        let mut signals = Vec::new();
-        for row in rows {
-            let signal = row.into_signal()?;
-            if signal
-                .target
-                .identity
-                .get("principal")
-                .and_then(Value::as_str)
-                == Some(principal)
-            {
-                signals.push(signal);
-                if signals.len() == limit {
-                    break;
-                }
-            }
-        }
-
-        Ok(signals)
+        rows.into_iter().map(RawSignal::into_signal).collect()
     }
 
     pub fn transition_signal(
@@ -943,8 +939,13 @@ impl DiscoveryQueryStore {
                 .query_map(params_from_iter(params.iter()), |row| {
                     Ok(EndpointPrincipal {
                         user_id: row.get(0)?,
-                        first_seen: row.get(1)?,
-                        last_seen: row.get(2)?,
+                        issuer: {
+                            let issuer = row.get::<_, String>(1)?;
+                            (!issuer.is_empty()).then_some(issuer)
+                        },
+                        auth_method: row.get(2)?,
+                        first_seen: row.get(3)?,
+                        last_seen: row.get(4)?,
                     })
                 })
                 .map_err(|source| DiscoveryQueryError::Sqlite {
@@ -971,6 +972,8 @@ impl DiscoveryQueryStore {
                     encode_cursor(&PrincipalCursor {
                         last_seen: principal.last_seen.clone(),
                         user_id: principal.user_id.clone(),
+                        issuer: principal.issuer.clone().unwrap_or_default(),
+                        auth_method: principal.auth_method.clone(),
                     })
                 })
                 .transpose()?
@@ -1369,6 +1372,10 @@ struct EndpointCursor {
 struct PrincipalCursor {
     last_seen: String,
     user_id: String,
+    #[serde(default)]
+    issuer: String,
+    #[serde(default)]
+    auth_method: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1562,7 +1569,7 @@ fn build_principal_query(
 ) -> (String, Vec<SqlValue>) {
     let mut sql = String::from(
         r#"
-        SELECT user_id, first_seen, last_seen
+        SELECT user_id, issuer, auth_method, first_seen, last_seen
         FROM discovery_endpoint_principals
         WHERE method = ? AND endpoint_template = ?
         "#,
@@ -1574,14 +1581,20 @@ fn build_principal_query(
 
     if let Some(cursor) = cursor {
         sql.push_str(
-            " AND (julianday(last_seen) < julianday(?) OR (julianday(last_seen) = julianday(?) AND user_id > ?))",
+            " AND (julianday(last_seen) < julianday(?) OR (julianday(last_seen) = julianday(?) AND (user_id > ? OR (user_id = ? AND (issuer > ? OR (issuer = ? AND auth_method > ?))))))",
         );
         params.push(SqlValue::Text(cursor.last_seen.clone()));
         params.push(SqlValue::Text(cursor.last_seen.clone()));
         params.push(SqlValue::Text(cursor.user_id.clone()));
+        params.push(SqlValue::Text(cursor.user_id.clone()));
+        params.push(SqlValue::Text(cursor.issuer.clone()));
+        params.push(SqlValue::Text(cursor.issuer.clone()));
+        params.push(SqlValue::Text(cursor.auth_method.clone()));
     }
 
-    sql.push_str(" ORDER BY julianday(last_seen) DESC, user_id ASC LIMIT ?");
+    sql.push_str(
+        " ORDER BY julianday(last_seen) DESC, user_id ASC, issuer ASC, auth_method ASC LIMIT ?",
+    );
     params.push(SqlValue::Integer(query_limit(limit)));
 
     (sql, params)
@@ -1903,6 +1916,7 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
         "#,
     )?;
     connection.execute_batch(CREATE_REVIEW_SCHEMA_SQL)?;
+    super::aggregator::ensure_discovery_endpoint_principal_identity_schema(connection)?;
     ensure_discovery_endpoint_aggregate_column(
         connection,
         "schema_mismatch_count",
@@ -2230,6 +2244,20 @@ mod tests {
             .expect("inferred schema should query");
 
         assert!(schema.is_none());
+    }
+
+    #[test]
+    fn principal_cursor_decodes_pre_identity_pagination_shape() {
+        let legacy_cursor =
+            hex::encode(br#"{"last_seen":"2024-06-01T12:00:00Z","user_id":"alice"}"#);
+
+        let cursor = decode_cursor::<PrincipalCursor>("principal_cursor", &legacy_cursor)
+            .expect("legacy principal cursor should remain decodable");
+
+        assert_eq!(cursor.last_seen, "2024-06-01T12:00:00Z");
+        assert_eq!(cursor.user_id, "alice");
+        assert_eq!(cursor.issuer, "");
+        assert_eq!(cursor.auth_method, "");
     }
 
     fn seed_endpoint(path: &PathBuf, method: &str, endpoint_template: &str) {

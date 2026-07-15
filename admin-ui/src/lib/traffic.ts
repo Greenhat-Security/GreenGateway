@@ -53,6 +53,8 @@ export type TrafficEndpointDetail = Omit<TrafficEndpoint, 'latency'> & {
 
 export type TrafficEndpointPrincipal = {
   user_id: string;
+  issuer?: string;
+  auth_method?: string;
   first_seen: string;
   last_seen: string;
 };

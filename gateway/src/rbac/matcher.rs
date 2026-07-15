@@ -343,6 +343,7 @@ mod tests {
             tool_name: None,
             principal: PrincipalMatcher {
                 roles: vec!["support".to_owned()],
+                issuers: Vec::new(),
                 auth_methods: Vec::new(),
                 principal_ids: Vec::new(),
             },
@@ -835,6 +836,7 @@ mod tests {
         )
             .prop_map(|(roles, auth_methods, principal_ids)| PrincipalMatcher {
                 roles,
+                issuers: Vec::new(),
                 auth_methods,
                 principal_ids,
             })
@@ -927,6 +929,7 @@ mod tests {
             tool_name: Some(tool_name.to_owned()),
             principal: PrincipalMatcher {
                 roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+                issuers: Vec::new(),
                 auth_methods: Vec::new(),
                 principal_ids: Vec::new(),
             },

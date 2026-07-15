@@ -13,8 +13,10 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     audit::{Actor, AuditEvent},
+    auth::principal::canonical_issuer,
     discovery::{path_template::template_stateless, query::ObservedEndpoint},
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
+    rbac::rule::{AUTH_METHOD_BEARER_TOKEN, AUTH_METHOD_SERVICE_TOKEN, AUTH_METHOD_SESSION_COOKIE},
 };
 
 pub const MAX_ENDPOINT_AUDIT_SCAN_ROWS: usize = 100_000;
@@ -36,6 +38,8 @@ pub struct AuditQueryFilters {
     pub to: Option<String>,
     pub event_type: Option<String>,
     pub actor: Option<String>,
+    pub actor_issuer: Option<String>,
+    pub actor_auth_mode: Option<String>,
     pub method: Option<String>,
     pub path: Option<String>,
     pub status: Option<i64>,
@@ -79,6 +83,8 @@ pub struct RoleEndpointObservationFilters {
 pub struct RoleEndpointObservation {
     pub method: String,
     pub endpoint_template: String,
+    pub issuer: Option<String>,
+    pub auth_method: String,
     pub role: String,
     pub observation_count: u64,
     pub error_count: u64,
@@ -94,6 +100,8 @@ pub struct RoleEndpointObservationMatrix {
     pub skipped_unauthenticated_observations: u64,
     pub skipped_without_roles_observations: u64,
     pub skipped_denied_observations: u64,
+    pub skipped_without_issuer_observations: u64,
+    pub skipped_unsupported_auth_method_observations: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -113,6 +121,9 @@ pub struct ShadowRuleWouldDenySummary {
 #[derive(Clone, Debug, Serialize)]
 pub struct ShadowRuleAffectedPrincipal {
     pub user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    pub auth_mode: String,
     pub roles: Vec<String>,
 }
 
@@ -429,7 +440,10 @@ impl AuditQueryStore {
             .iter()
             .map(|endpoint| (endpoint.method.clone(), endpoint.endpoint_template.clone()))
             .collect::<BTreeSet<_>>();
-        let mut aggregates = BTreeMap::<(String, String, String), RoleEndpointObservation>::new();
+        let mut aggregates = BTreeMap::<
+            (String, String, Option<String>, String, String),
+            RoleEndpointObservation,
+        >::new();
         let mut result = RoleEndpointObservationMatrix::default();
 
         self.scan_request_observations(
@@ -469,6 +483,24 @@ impl AuditQueryStore {
                         .saturating_add(1);
                     return true;
                 };
+                let auth_method = actor.auth_mode.trim().to_owned();
+                if !matches!(
+                    auth_method.as_str(),
+                    AUTH_METHOD_BEARER_TOKEN
+                        | AUTH_METHOD_SESSION_COOKIE
+                        | AUTH_METHOD_SERVICE_TOKEN
+                ) {
+                    result.skipped_unsupported_auth_method_observations = result
+                        .skipped_unsupported_auth_method_observations
+                        .saturating_add(1);
+                    return true;
+                }
+                let issuer = actor.issuer.as_deref().and_then(canonical_issuer);
+                if issuer.is_none() && auth_method != AUTH_METHOD_SERVICE_TOKEN {
+                    result.skipped_without_issuer_observations =
+                        result.skipped_without_issuer_observations.saturating_add(1);
+                    return true;
+                }
                 let roles = actor
                     .roles
                     .unwrap_or_default()
@@ -485,6 +517,8 @@ impl AuditQueryStore {
                     let key = (
                         observation.method.clone(),
                         endpoint_template.clone(),
+                        issuer.clone(),
+                        auth_method.clone(),
                         role.clone(),
                     );
                     let entry = aggregates
@@ -492,6 +526,8 @@ impl AuditQueryStore {
                         .or_insert_with(|| RoleEndpointObservation {
                             method: observation.method.clone(),
                             endpoint_template: endpoint_template.clone(),
+                            issuer: issuer.clone(),
+                            auth_method: auth_method.clone(),
                             role: role.clone(),
                             observation_count: 0,
                             error_count: 0,
@@ -740,6 +776,14 @@ fn build_query(filters: &AuditQueryFilters) -> (String, Vec<SqlValue>) {
         clauses.push("actor_user_id = ?");
         params.push(SqlValue::Text(actor.clone()));
     }
+    if let Some(actor_issuer) = &filters.actor_issuer {
+        clauses.push("COALESCE(json_extract(actor_json, '$.issuer'), '') = ?");
+        params.push(SqlValue::Text(actor_issuer.clone()));
+    }
+    if let Some(actor_auth_mode) = &filters.actor_auth_mode {
+        clauses.push("json_extract(actor_json, '$.auth_mode') = ?");
+        params.push(SqlValue::Text(actor_auth_mode.clone()));
+    }
     if let Some(method) = &filters.method {
         clauses.push("payload_method = ?");
         params.push(SqlValue::Text(method.clone()));
@@ -918,7 +962,7 @@ struct RawShadowWouldDenyRow {
 struct ShadowRuleWouldDenyAccumulator {
     would_deny_count: u64,
     affected_principals: Vec<ShadowRuleAffectedPrincipal>,
-    seen_principal_keys: BTreeSet<(String, Vec<String>)>,
+    seen_principal_keys: BTreeSet<(String, Option<String>, String, Vec<String>)>,
     samples: Vec<ShadowRuleWouldDenySample>,
 }
 
@@ -1006,13 +1050,20 @@ impl ShadowRuleWouldDenyAccumulator {
         }
 
         let roles = sorted_actor_roles(actor);
-        let key = (actor.user_id.clone(), roles.clone());
+        let key = (
+            actor.user_id.clone(),
+            actor.issuer.clone(),
+            actor.auth_mode.clone(),
+            roles.clone(),
+        );
         if !self.seen_principal_keys.insert(key) {
             return;
         }
 
         self.affected_principals.push(ShadowRuleAffectedPrincipal {
             user_id: actor.user_id.clone(),
+            issuer: actor.issuer.clone(),
+            auth_mode: actor.auth_mode.clone(),
             roles,
         });
     }
@@ -1328,6 +1379,8 @@ mod tests {
                 to: None,
                 event_type: None,
                 actor: None,
+                actor_issuer: None,
+                actor_auth_mode: None,
                 method: None,
                 path: None,
                 status: None,
@@ -1344,6 +1397,87 @@ mod tests {
                 "fractionally-newer-event".to_owned(),
                 "cutoff-event".to_owned()
             ]
+        );
+    }
+
+    #[test]
+    fn actor_filters_separate_colliding_subjects_by_issuer_and_auth_mode() {
+        let db = TempDb::new("query-actor-identity");
+        create_schema(&db.path);
+        for (event_id, issuer, auth_mode) in [
+            ("provider-a", "https://idp-a.example/", "bearer_token"),
+            ("provider-b", "https://idp-b.example/", "bearer_token"),
+            (
+                "provider-a-cookie",
+                "https://idp-a.example/",
+                "session_cookie",
+            ),
+        ] {
+            insert_event(
+                &db.path,
+                SeedEvent {
+                    event_id,
+                    event_type: "http.request_observed",
+                    timestamp: "2024-06-01T12:00:00Z",
+                    actor_user_id: "shared-subject",
+                    path: "/items/1",
+                    status: 200,
+                },
+            );
+            let actor_json = json!({
+                "user_id": "shared-subject",
+                "issuer": issuer,
+                "roles": ["operator"],
+                "auth_mode": auth_mode
+            })
+            .to_string();
+            Connection::open(&db.path)
+                .expect("test database should open")
+                .execute(
+                    "UPDATE audit_events SET actor_json = ?1 WHERE event_id = ?2",
+                    params![actor_json, event_id],
+                )
+                .expect("actor identity should update");
+        }
+
+        let page = AuditQueryStore::open(&db.path)
+            .expect("query store should open")
+            .query(&AuditQueryFilters {
+                from: None,
+                to: None,
+                event_type: Some("http.request_observed".to_owned()),
+                actor: Some("shared-subject".to_owned()),
+                actor_issuer: Some("https://idp-a.example/".to_owned()),
+                actor_auth_mode: Some("bearer_token".to_owned()),
+                method: None,
+                path: None,
+                status: None,
+                matched_rule_id: None,
+                limit: 10,
+                before_id: None,
+            })
+            .expect("identity-bound actor query should succeed");
+
+        assert_eq!(event_ids(&page.events), vec!["provider-a".to_owned()]);
+    }
+
+    #[test]
+    fn shadow_review_separates_colliding_subjects_by_identity_boundary() {
+        let mut accumulator = ShadowRuleWouldDenyAccumulator::default();
+        for issuer in ["https://idp-a.example", "https://idp-b.example"] {
+            accumulator.add_affected_principal(&Actor {
+                user_id: "shared-subject".to_owned(),
+                issuer: Some(issuer.to_owned()),
+                email: None,
+                roles: Some(vec!["operator".to_owned()]),
+                auth_mode: "bearer_token".to_owned(),
+            });
+        }
+
+        assert_eq!(accumulator.affected_principals.len(), 2);
+        assert_ne!(
+            accumulator.affected_principals[0].issuer,
+            accumulator.affected_principals[1].issuer
         );
     }
 
@@ -1794,6 +1928,8 @@ mod tests {
                 to: Some("2026-01-06T21:40:00Z".to_owned()),
                 event_type: Some("audit.benchmark.42".to_owned()),
                 actor: None,
+                actor_issuer: None,
+                actor_auth_mode: None,
                 method: None,
                 path: None,
                 status: None,
@@ -1811,6 +1947,8 @@ mod tests {
                 to: None,
                 event_type: None,
                 actor: Some("actor-123".to_owned()),
+                actor_issuer: None,
+                actor_auth_mode: None,
                 method: None,
                 path: Some("/benchmark/123".to_owned()),
                 status: None,
@@ -1828,6 +1966,8 @@ mod tests {
                 to: None,
                 event_type: None,
                 actor: None,
+                actor_issuer: None,
+                actor_auth_mode: None,
                 method: None,
                 path: None,
                 status: Some(204),
@@ -1845,6 +1985,8 @@ mod tests {
                 to: None,
                 event_type: None,
                 actor: None,
+                actor_issuer: None,
+                actor_auth_mode: None,
                 method: None,
                 path: None,
                 status: None,
@@ -1905,6 +2047,7 @@ mod tests {
         let connection = Connection::open(path).expect("test database should open");
         let actor_json = json!({
             "user_id": event.actor_user_id,
+            "issuer": "provider:test",
             "roles": ["reader"],
             "auth_mode": "bearer_token"
         })
@@ -1966,6 +2109,7 @@ mod tests {
         let connection = Connection::open(path).expect("test database should open");
         let actor_json = json!({
             "user_id": event.actor_user_id,
+            "issuer": "provider:test",
             "roles": ["reader"],
             "auth_mode": "bearer_token"
         })

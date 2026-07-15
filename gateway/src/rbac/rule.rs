@@ -25,7 +25,7 @@ pub enum RuleAction {
 /// Principal constraints for a firewall rule.
 ///
 /// Non-empty fields are ANDed together: a principal must satisfy the role
-/// constraint, the authentication-method constraint, and the principal-id
+/// constraint, the issuer constraint, the authentication-method constraint, and the principal-id
 /// constraint when each is configured. Within one field, any listed value
 /// matches. Empty fields are unconstrained, and a completely empty matcher
 /// matches any caller, including unauthenticated requests.
@@ -35,6 +35,10 @@ pub struct PrincipalMatcher {
     /// Role names this rule matches. Empty means any role set.
     #[serde(default)]
     pub roles: Vec<String>,
+    /// Exact authenticated issuer or configured provider-boundary values this
+    /// rule matches. Empty means any issuer.
+    #[serde(default)]
+    pub issuers: Vec<String>,
     /// Authentication methods this rule matches: "bearer_token",
     /// "session_cookie", or "service_token". Empty means any authentication
     /// method.
@@ -49,7 +53,10 @@ pub struct PrincipalMatcher {
 impl PrincipalMatcher {
     #[allow(dead_code)]
     pub fn is_unconstrained(&self) -> bool {
-        self.roles.is_empty() && self.auth_methods.is_empty() && self.principal_ids.is_empty()
+        self.roles.is_empty()
+            && self.issuers.is_empty()
+            && self.auth_methods.is_empty()
+            && self.principal_ids.is_empty()
     }
 
     /// Returns true when the optional principal satisfies every configured
@@ -70,11 +77,10 @@ impl PrincipalMatcher {
                 .roles
                 .iter()
                 .any(|principal_role| principal_role == role)
-        }) && constraint_matches(&self.auth_methods, |auth_method| {
-            auth_method == auth_method_policy_value(&principal.auth_method)
-        }) && constraint_matches(&self.principal_ids, |principal_id| {
-            principal.user_id == principal_id
-        })
+        }) && principal_identity_matches(&self.issuers, &self.auth_methods, principal)
+            && constraint_matches(&self.principal_ids, |principal_id| {
+                principal.user_id == principal_id
+            })
     }
 }
 
@@ -148,7 +154,19 @@ pub fn valid_auth_method_name(value: &str) -> bool {
     )
 }
 
-fn auth_method_policy_value(auth_method: &AuthMethod) -> &'static str {
+pub(crate) fn principal_identity_matches(
+    issuers: &[String],
+    auth_methods: &[String],
+    principal: &Principal,
+) -> bool {
+    constraint_matches(issuers, |issuer| {
+        principal.issuer.as_deref() == Some(issuer)
+    }) && constraint_matches(auth_methods, |auth_method| {
+        auth_method == auth_method_policy_value(&principal.auth_method)
+    })
+}
+
+pub(crate) fn auth_method_policy_value(auth_method: &AuthMethod) -> &'static str {
     match auth_method {
         AuthMethod::Bearer => AUTH_METHOD_BEARER_TOKEN,
         AuthMethod::Cookie => AUTH_METHOD_SESSION_COOKIE,
@@ -192,6 +210,7 @@ mod tests {
     fn principal_matcher_ands_non_empty_constraints() {
         let matcher = PrincipalMatcher {
             roles: vec!["admin".to_owned(), "support".to_owned()],
+            issuers: Vec::new(),
             auth_methods: vec![AUTH_METHOD_BEARER_TOKEN.to_owned()],
             principal_ids: vec!["user-123".to_owned()],
         };
@@ -223,6 +242,7 @@ mod tests {
     fn principal_matcher_can_match_service_token_auth_method() {
         let matcher = PrincipalMatcher {
             roles: Vec::new(),
+            issuers: Vec::new(),
             auth_methods: vec![AUTH_METHOD_SERVICE_TOKEN.to_owned()],
             principal_ids: Vec::new(),
         };
@@ -237,6 +257,23 @@ mod tests {
             &["admin:tokens:read"],
             AuthMethod::Bearer
         ))));
+    }
+
+    #[test]
+    fn principal_matcher_separates_colliding_subjects_and_roles_by_issuer() {
+        let matcher = PrincipalMatcher {
+            roles: vec!["operator".to_owned()],
+            issuers: vec!["https://idp-a.example/".to_owned()],
+            auth_methods: vec![AUTH_METHOD_BEARER_TOKEN.to_owned()],
+            principal_ids: vec!["shared-subject".to_owned()],
+        };
+        let mut provider_a = test_principal("shared-subject", &["operator"], AuthMethod::Bearer);
+        provider_a.issuer = Some("https://idp-a.example/".to_owned());
+        let mut provider_b = provider_a.clone();
+        provider_b.issuer = Some("https://idp-b.example/".to_owned());
+
+        assert!(matcher.matches(Some(&provider_a)));
+        assert!(!matcher.matches(Some(&provider_b)));
     }
 
     #[test]
