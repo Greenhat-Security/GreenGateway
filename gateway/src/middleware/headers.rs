@@ -17,7 +17,9 @@ use axum::{extract::Request, middleware::Next, response::Response};
 ///
 /// Note: `x-forwarded-for` and `x-real-ip` are intentionally preserved because
 /// canonical client-IP extraction accepts them only when the direct connection
-/// peer belongs to an explicitly configured trusted proxy CIDR.
+/// peer belongs to an explicitly configured trusted proxy CIDR. The
+/// reverse-proxy fallback removes both before upstream egress and emits
+/// gateway-controlled values instead.
 ///
 /// `x-forwarded-host` and `x-forwarded-proto` are stripped because spoofed
 /// values can poison URL generation, auth redirects, and cookie domains.
