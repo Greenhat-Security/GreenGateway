@@ -15150,6 +15150,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_put_rejects_relative_route_prefix_without_persisting_or_swapping() {
+        let initial_policy = policy_document_string("initial-policy", "test:old");
+        let policy = TempPolicyFile::new(&initial_policy);
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+        let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+
+        let get_response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete");
+        let current_etag = policy_etag_header(&get_response);
+        let mut invalid_policy = policy_document("relative-route", "test:new");
+        invalid_policy["routes"][5]["path_prefix"] = json!("__test");
+
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(invalid_policy.to_string()),
+                Some(&current_etag),
+            ))
+            .await
+            .expect("relative route prefix PUT should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["valid"], json!(false));
+        assert!(
+            body["errors"][0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("routes[5].path_prefix must start with '/'"),
+            "unexpected validation body: {body}"
+        );
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy file should read"),
+            before_contents
+        );
+
+        let after_get = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET after invalid PUT should complete");
+        assert_eq!(policy_etag_header(&after_get), current_etag);
+        assert_eq!(json_body(after_get).await["id"], json!("initial-policy"));
+    }
+
+    #[tokio::test]
     async fn policy_put_missing_if_match_is_rejected_without_changes() {
         let initial_policy = policy_document_string("initial-policy", "test:old");
         let policy = TempPolicyFile::new(&initial_policy);
@@ -16867,6 +16930,55 @@ mod tests {
             fs::read_to_string(&policy.path).expect("policy file should read"),
             before_contents
         );
+    }
+
+    #[tokio::test]
+    async fn policy_validate_rejects_relative_route_prefix_without_changes() {
+        let initial_policy = policy_document_string("initial-policy", "test:old");
+        let policy = TempPolicyFile::new(&initial_policy);
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+        let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+        let mut invalid_policy = policy_document("relative-route", "test:new");
+        invalid_policy["routes"][5]["path_prefix"] = json!("__test");
+
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(invalid_policy.to_string()),
+                None,
+            ))
+            .await
+            .expect("relative route prefix validation should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["valid"], json!(false));
+        assert!(
+            body["errors"][0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("routes[5].path_prefix must start with '/'"),
+            "unexpected validation body: {body}"
+        );
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy file should read"),
+            before_contents
+        );
+
+        let after_get = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET after invalid validation should complete");
+        assert_eq!(json_body(after_get).await["id"], json!("initial-policy"));
     }
 
     #[tokio::test]
