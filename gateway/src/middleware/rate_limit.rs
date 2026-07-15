@@ -22,7 +22,7 @@ use serde::Serialize;
 
 use crate::{
     auth,
-    client_ip::canonical_client_ip,
+    client_ip::{canonical_client_ip, ClientIpPolicy},
     config::Config,
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
     rbac::{
@@ -36,7 +36,7 @@ pub struct RateLimitState {
     read: RateLimiter,
     write: RateLimiter,
     policy: Arc<ArcSwap<RateLimitPolicyState>>,
-    trust_proxy_headers: bool,
+    client_ip_policy: ClientIpPolicy,
     session_cookie_name: String,
 }
 
@@ -84,7 +84,7 @@ impl RateLimitState {
             policy: Arc::new(ArcSwap::from_pointee(RateLimitPolicyState::from_policy(
                 policy,
             ))),
-            trust_proxy_headers: config.trust_proxy_headers,
+            client_ip_policy: ClientIpPolicy::from_config(config),
             session_cookie_name: config.session_cookie_name.clone(),
         }
     }
@@ -209,7 +209,7 @@ pub async fn rate_limit_request(
 ) -> Response {
     let lane = lane_for(req.method());
     let path = req.uri().path().to_owned();
-    let client_ip = canonical_client_ip(req.headers(), req.extensions(), state.trust_proxy_headers);
+    let client_ip = canonical_client_ip(req.headers(), req.extensions(), &state.client_ip_policy);
     let key = unauthenticated_rate_limit_key(req.headers(), &state.session_cookie_name, &client_ip);
     let limiter = state.global_limiter(lane);
 
@@ -224,7 +224,7 @@ pub async fn policy_rate_limit_request(
     let lane = lane_for(req.method());
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
-    let client_ip = canonical_client_ip(req.headers(), req.extensions(), state.trust_proxy_headers);
+    let client_ip = canonical_client_ip(req.headers(), req.extensions(), &state.client_ip_policy);
     let key = rate_limit_key(
         req.extensions(),
         req.headers(),
@@ -369,6 +369,7 @@ mod tests {
     use super::*;
     use axum::{
         body::Body,
+        extract::ConnectInfo,
         middleware::{from_fn, from_fn_with_state},
         routing::any,
         Router,
@@ -405,7 +406,7 @@ mod tests {
                     .map(RateLimitOverride::new)
                     .collect(),
             })),
-            trust_proxy_headers: false,
+            client_ip_policy: ClientIpPolicy::default(),
             session_cookie_name: String::new(),
         }
     }
@@ -417,7 +418,7 @@ mod tests {
             policy: Arc::new(ArcSwap::from_pointee(RateLimitPolicyState {
                 overrides: Vec::new(),
             })),
-            trust_proxy_headers: false,
+            client_ip_policy: ClientIpPolicy::default(),
             session_cookie_name: session_cookie_name.to_owned(),
         }
     }
@@ -569,6 +570,43 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).expect("body should be JSON");
 
         assert_eq!(json, serde_json::json!({ "error": "too many requests" }));
+    }
+
+    #[tokio::test]
+    async fn attacker_prepended_forwarded_ips_cannot_rotate_pre_auth_limit_key() {
+        let mut state = test_state(1, 1);
+        state.client_ip_policy = ClientIpPolicy::from_trusted_proxy_cidrs(vec!["10.0.0.0/8"
+            .parse()
+            .expect("test CIDR should parse")]);
+        let router = test_router(state);
+
+        let request = |spoofed_ip: &str| {
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("/")
+                .header("x-forwarded-for", format!("{spoofed_ip}, 198.51.100.10"))
+                .body(Body::empty())
+                .expect("request should build");
+            request.extensions_mut().insert(ConnectInfo(
+                "10.0.0.6:12345"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("test peer should parse"),
+            ));
+            request
+        };
+
+        let first = router
+            .clone()
+            .oneshot(request("192.0.2.1"))
+            .await
+            .expect("first request should complete");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = router
+            .oneshot(request("192.0.2.2"))
+            .await
+            .expect("second request should complete");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

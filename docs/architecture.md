@@ -19,7 +19,7 @@ Every inbound request is expected to pass through the gateway in this order:
 | 3 | CORS | #4 | Enforce config-driven allowed origins with a neutral default. |
 | 4 | Security headers | #4 | Strip spoofable identity headers on ingress and add hardening headers on responses. |
 | 5 | Observation | #10 | Emit one `http.request_observed` audit event per request with method, path, status, latency, and the auth/authz outcome from any inner layer that reached a decision for end-to-end request observability. |
-| 6 | Rate limiting | #4 | Apply token-bucket limits with separate read and write lanes, keyed by principal, then session, then client IP, using the trusted-proxy setting to determine the canonical client IP. |
+| 6 | Rate limiting | #4 | Apply token-bucket limits with separate read and write lanes, keyed by principal, then session, then client IP. Forwarded client IPs are accepted only from direct peers in explicitly configured trusted proxy CIDRs. |
 | 7 | Request validation | #4 | Enforce body size caps and content-type requirements before handlers consume request bodies. |
 | 8 | CSRF | #4 | Enforce a double-submit cookie on the gateway's own control-plane endpoints, with bearer-token requests bypassing CSRF checks. |
 | 9 | Authentication | #5 | Run pluggable validators, starting with JWT/JWKS, with cookie sessions and additional identity providers deferred to Phase 7; fail closed with `401` on any non-exempt route. |

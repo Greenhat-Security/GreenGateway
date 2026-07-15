@@ -32,6 +32,11 @@ for full phase-by-phase status.
   fields are rejected instead of weakening a rule to global scope.
   Malformed inventory contexts cannot create unbound rules, while MCP tool
   suggestions remain independent of unrelated HTTP fallback routing.
+- Forwarded client IP headers are now accepted only from direct peers in the
+  new `TRUSTED_PROXY_CIDRS` allowlist. `X-Forwarded-For` chains are resolved
+  from the nearest hop backward, and malformed chains fail closed to the
+  socket peer. Deployments using `TRUST_PROXY_HEADERS=true` must now configure
+  at least one bounded proxy CIDR; catch-all CIDRs are rejected.
 
 ### Added — Phase 6 (native MCP support)
 
