@@ -42,6 +42,14 @@ for full phase-by-phase status.
 - Generated tools that require upstream API-key header injection still need
   explicit support before those generated tools are fully usable end-to-end.
 
+### Changed - Security
+
+- Host-qualified `UPSTREAM_ROUTES` now require `POLICY_FILE` and an explicit
+  matching `routes[].hosts` permission binding. Path-only direct allow/shadow
+  rules and permissive defaults can no longer authorize a different virtual
+  upstream selected through the request `Host` header; direct deny rules remain
+  effective.
+
 ## [0.6.0] - 2026-07-05
 
 Phase 7 (identity & auth integrations) is complete. Phase 6 (native MCP

@@ -416,9 +416,11 @@ A copyable starter policy for real deployments is available at `docs/examples/po
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. The policy loader reads the file as JSON, validates that `schema_version` starts with `0.`, warns on unknown top-level keys, and rejects invalid policy documents.
 
-Route rules in a policy's `routes` array are evaluated in document order. The first rule whose `path_prefix` matches the request path and whose `methods` match the request method determines the required permission.
+Route rules in a policy's `routes` array are evaluated in document order. The first rule whose `path_prefix` matches the request path, whose `methods` match the request method, and whose optional `hosts` list matches the request host determines the required permission. `hosts` entries are exact hostnames without ports and match case-insensitively; ports in the request `Host` header are ignored. Duplicate hosts in one rule are rejected case-insensitively.
 
-Direct firewall rules in `rules` are also evaluated in document order with first-match-wins semantics. Each rule may set `enabled` to `true` or `false`; omitted `enabled` values default to `true` so existing policy files remain active without edits. A rule with `enabled:false` is skipped entirely during live request evaluation, as if it were not present in the rulebase, so the request falls through to the next rule and then to the policy default action if no enabled rule matches.
+When proxy fallback selects a host-qualified `UPSTREAM_ROUTES` entry, authorization requires a matching policy route with a non-empty `hosts` list. Gateway-owned handlers such as `/mcp`, probes, and admin routes are not proxy fallbacks and keep their normal path policy even when their host and path would match an upstream entry. A route rule with omitted or empty `hosts` cannot authorize the fallback request. Direct firewall `deny` rules still apply, but direct `allow` and `shadow` rules and `default_action: "allow"` cannot bypass this binding. A first-matching direct shadow still emits `authz.would_deny` before host-route evaluation. If no matching host-bound route exists, the gateway returns `403 Forbidden` and audits `reason: "host_policy_required"` together with the selected upstream host, path prefix, and origin.
+
+Direct firewall rules in `rules` are also evaluated in document order with first-match-wins semantics. For a host-qualified proxy fallback, the binding guard prevents direct `allow` and `shadow` rules from authorizing the upstream, preserves the first matching shadow's audit signal, and applies the first matching `deny`; authorization must still come from a host-bound route rule. Each rule may set `enabled` to `true` or `false`; omitted `enabled` values default to `true` so existing policy files remain active without edits. A rule with `enabled:false` is skipped entirely during live request evaluation, as if it were not present in the rulebase, so the request falls through to the next rule and then to the policy default action if no enabled rule matches.
 
 Identity constraints are issuer-aware. A direct rule's `principal` matcher may contain `roles`, `issuers`, `auth_methods`, and `principal_ids`. Non-empty dimensions are combined with AND semantics, while multiple values inside one dimension use OR semantics. For example, `{"roles":["operator"],"issuers":["https://idp.example/"],"auth_methods":["bearer_token"],"principal_ids":["user-123"]}` matches only a bearer-authenticated `user-123` carrying the `operator` role from that issuer. Valid auth methods are `bearer_token`, `session_cookie`, and `service_token`. Empty or omitted dimensions are unconstrained.
 
@@ -855,7 +857,7 @@ Optional ordered routing table for the reverse proxy fallback, encoded as a JSON
 
 Default: empty, which disables route-table proxying. `UPSTREAM_URL` continues to provide the legacy catch-all proxy when this value is unset or an empty array.
 
-Format and validation: unset, empty, or whitespace-only values become an empty route table. Non-empty values must be a JSON array of objects. Each object has optional `path_prefix`, optional `host`, and required `upstream_url` fields. Unknown fields are rejected. `upstream_url` uses the same validation as `UPSTREAM_URL`: it must be a valid `http` or `https` URL with a host. `path_prefix`, when present, must be a URI path starting with `/`. `host`, when present, must be a hostname without a port and is normalized to lowercase. Each entry must set at least one of `path_prefix` or `host`; an entry with only `path_prefix: "/"` is rejected because it would be an unconditional catch-all. Use `UPSTREAM_URL` for the legacy catch-all behavior or add a host to make the root prefix host-specific.
+Format and validation: unset, empty, or whitespace-only values become an empty route table. Non-empty values must be a JSON array of objects. Each object has optional `path_prefix`, optional `host`, and required `upstream_url` fields. Unknown fields are rejected. `upstream_url` uses the same validation as `UPSTREAM_URL`: it must be a valid `http` or `https` URL with a host. `path_prefix`, when present, must be a URI path starting with `/`. `host`, when present, must be a hostname without a port and is normalized to lowercase. Each entry must set at least one of `path_prefix` or `host`; an entry with only `path_prefix: "/"` is rejected because it would be an unconditional catch-all. Use `UPSTREAM_URL` for the legacy catch-all behavior or add a host to make the root prefix host-specific. Any entry with `host` also requires `POLICY_FILE`; startup fails without a policy because host-qualified upstream authorization must be bound explicitly.
 
 Route entries may also set these optional per-upstream fields:
 
@@ -874,6 +876,8 @@ Per-route header validation rejects invalid header names or values, rejects addi
 `openapi_spec_path` uses the same parser and startup validation as `OPENAPI_SPEC_PATH`. For route-table specs, coverage is scoped by `path_prefix` when a route has one. The current discovery aggregate table stores only `(method, endpoint_template)` and not the matched upstream route or request host, so host-only routes cannot yet be separated from the global observed inventory. If a route has a `path_prefix`, schema paths may be written either as gateway paths such as `/api/users/{userId}` or as upstream-local paths such as `/users/{userId}`; the coverage matcher considers both the raw spec path and the path prefixed with the route's `path_prefix`.
 
 Matching semantics: a route with both `host` and `path_prefix` requires both to match. Host matching is exact against the request `Host` header after lowercasing and ignoring any port. Path matching uses the gateway's segment-boundary-aware prefix matcher, so `/api` matches `/api` and `/api/users` but not `/apiary`. Among matching routes, the longest `path_prefix` wins. For equal prefix lengths, a host-qualified route wins over a path-only route. Remaining exact ties use declaration order, with the first route winning; exact duplicate `host` plus `path_prefix` matcher keys are rejected at startup.
+
+The proxy and RBAC middleware use the same route-selection implementation. For a selected host-qualified entry, the policy must contain a `routes` rule with the same request host in `hosts`. This prevents a permission granted for a shared path from being reused to reach a different virtual upstream selected by `Host`.
 
 Every distinct routing-table upstream origin is health-checked and auto-seeded into the egress allowlist. Duplicate route entries pointing at the same upstream origin share one health-check loop.
 
@@ -900,6 +904,28 @@ Example:
     "upstream_url": "https://app.internal.example"
   }
 ]
+```
+
+The host-qualified `app.example.test` entry above needs a policy route such as:
+
+```json
+{
+  "schema_version": "0.1.0",
+  "default_action": "deny",
+  "roles": {
+    "app-user": {
+      "permissions": ["app:proxy"]
+    }
+  },
+  "routes": [
+    {
+      "methods": ["*"],
+      "hosts": ["app.example.test"],
+      "path_prefix": "/",
+      "permission": "app:proxy"
+    }
+  ]
+}
 ```
 
 ### UPSTREAM_TIMEOUT_MS

@@ -43,6 +43,23 @@ impl RuleMatcher {
             })
     }
 
+    /// Returns the first matching deny while ignoring allow and shadow rules.
+    /// Host-qualified upstream authorization uses this as an additional guard.
+    pub fn evaluate_denies(
+        &self,
+        method: &str,
+        path: &str,
+        principal: Option<&Principal>,
+    ) -> Option<RuleDecision> {
+        self.rules
+            .iter()
+            .find(|rule| rule.action == RuleAction::Deny && rule.matches(method, path, principal))
+            .map(|rule| RuleDecision {
+                rule_index: rule.rule_index,
+                action: RuleAction::Deny,
+            })
+    }
+
     #[allow(dead_code)]
     pub fn evaluate_tool(
         &self,
@@ -455,6 +472,23 @@ mod tests {
             matcher.evaluate("GET", "/admin/settings", None),
             Some(RuleDecision {
                 rule_index: 0,
+                action: RuleAction::Deny,
+            })
+        );
+    }
+
+    #[test]
+    fn deny_only_evaluation_skips_earlier_allow_and_shadow_rules() {
+        let matcher = RuleMatcher::new(&[
+            rule(&["GET"], "/admin/**", RuleAction::Allow),
+            rule(&["GET"], "/admin/**", RuleAction::Shadow),
+            rule(&["GET"], "/admin/settings", RuleAction::Deny),
+        ]);
+
+        assert_eq!(
+            matcher.evaluate_denies("GET", "/admin/settings", None),
+            Some(RuleDecision {
+                rule_index: 2,
                 action: RuleAction::Deny,
             })
         );

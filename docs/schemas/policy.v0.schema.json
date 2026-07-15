@@ -117,6 +117,15 @@
             "type": "string"
           }
         },
+        "hosts": {
+          "type": "array",
+          "description": "Exact request hostnames this route rule matches, without ports. Host-qualified upstream routes require an explicit matching host. Empty or omitted matches only upstream routes that are not host-qualified.",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+          }
+        },
         "path_prefix": {
           "type": "string",
           "description": "Path prefix matched with starts_with, such as /admin or /v1/."
@@ -172,7 +181,7 @@
       }
     },
     "rule_action": {
-      "description": "For HTTP path rules, direct rules run before, and take precedence over, the routes/permission model: the first matching path rule is the sole authority for the request, and routes are never consulted once a path rule matches. For MCP tool-name rules, direct rules are an additional restriction layered after per-tool allowed_roles; 'allow' and 'shadow' do not override a failed allowed_roles check. 'deny' blocks, while 'shadow' permits the rule layer but records a would-deny observation event for policy-authoring dry runs.",
+      "description": "For HTTP path rules, direct rules normally run before, and take precedence over, the routes/permission model: the first matching path rule is the sole authority for the request. Host-qualified proxy fallback is the exception: direct allow and shadow rules cannot authorize a selected virtual upstream, the first matching deny still blocks, a first-matching shadow still records policy-authoring telemetry, and authorization must come from a matching host-bound route rule. For MCP tool-name rules, direct rules are an additional restriction layered after per-tool allowed_roles; allow and shadow do not override a failed allowed_roles check. Deny blocks, while shadow permits the rule layer but records a would-deny observation event for policy-authoring dry runs.",
       "enum": [
         "allow",
         "deny",

@@ -28,8 +28,9 @@ use crate::{
     path_match::path_prefix_matches,
     rbac::{
         policy::ToolPolicyEntry, DefaultAction, EnforcementMode, Policy, PolicyEngine, RouteRule,
-        RuleAction, RuleMatcher,
+        RuleAction, RuleDecision, RuleMatcher,
     },
+    upstream_route::{self, ProxyRouteAuthorizationContext},
 };
 
 use super::{
@@ -397,6 +398,10 @@ fn spawn_sighup_reload_task(_policy_file: PathBuf, _state: RbacState) {}
 
 pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next: Next) -> Response {
     let path = req.uri().path();
+    let proxy_context = req
+        .extensions()
+        .get::<ProxyRouteAuthorizationContext>()
+        .cloned();
 
     // Conservative fail-closed guard for the current local-handler stage. When
     // the Phase 3 reverse proxy lands, upgrade this to proper path
@@ -419,14 +424,15 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         );
     }
 
-    if auth::protected_resource::is_well_known_path(path) {
+    if proxy_context.is_none() && auth::protected_resource::is_well_known_path(path) {
         return next.run(req).await;
     }
 
-    if state
-        .exempt_paths
-        .iter()
-        .any(|exempt_path| path_prefix_matches(path, exempt_path))
+    if proxy_context.is_none()
+        && state
+            .exempt_paths
+            .iter()
+            .any(|exempt_path| path_prefix_matches(path, exempt_path))
     {
         return next.run(req).await;
     }
@@ -434,28 +440,43 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     let context = audit_context(&req, state.trust_proxy_headers);
     let principal = req.extensions().get::<auth::Principal>().cloned();
     let policy_path = state.policy_path_for_request(path);
+    let request_host = upstream_route::request_host_without_port(req.headers());
+    let required_upstream_host = proxy_context.as_ref().map(|context| context.host.as_str());
 
     let policy = state.policy.load();
-    // Direct firewall rules are additive alongside route-to-permission rules
-    // and run first because they make an explicit allow/deny/shadow decision
-    // for the full request tuple. If no direct rule matches, route and
-    // default-action behavior continues exactly as it did before rules were
-    // integrated.
-    if let Some(rule_decision) = policy
-        .rule_matcher
-        .evaluate(req.method().as_str(), path, principal.as_ref())
-        .or_else(|| {
-            (policy_path != path)
-                .then(|| {
-                    policy.rule_matcher.evaluate(
-                        req.method().as_str(),
-                        policy_path,
-                        principal.as_ref(),
-                    )
-                })
-                .flatten()
-        })
-    {
+    // Direct firewall rules run before route-to-permission rules. A direct deny
+    // remains global, but host-qualified upstreams require an explicit host-bound
+    // route permission. Direct allow cannot authorize them, while first-match
+    // shadow telemetry is retained before route evaluation.
+    let first_direct_rule = matching_direct_rule(
+        &policy.rule_matcher,
+        req.method().as_str(),
+        path,
+        policy_path,
+        principal.as_ref(),
+        false,
+    );
+    let direct_rule_decision = if required_upstream_host.is_some() {
+        matching_direct_rule(
+            &policy.rule_matcher,
+            req.method().as_str(),
+            path,
+            policy_path,
+            principal.as_ref(),
+            true,
+        )
+    } else {
+        first_direct_rule.clone()
+    };
+    if required_upstream_host.is_some() {
+        if let Some(rule_decision) = first_direct_rule.as_ref() {
+            if rule_decision.action == RuleAction::Shadow {
+                let matched_rule_id = policy.rule_id(rule_decision.rule_index);
+                emit_rule_would_deny(&state, &context, principal.as_ref(), &matched_rule_id);
+            }
+        }
+    }
+    if let Some(rule_decision) = direct_rule_decision {
         let matched_rule_id = policy.rule_id(rule_decision.rule_index);
         return match rule_decision.action {
             RuleAction::Allow => {
@@ -494,8 +515,14 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         };
     }
 
-    let matching_policy_route =
-        matching_route_for_request(&policy.routes, req.method(), path, policy_path);
+    let matching_policy_route = matching_route_for_request(
+        &policy.routes,
+        req.method(),
+        path,
+        policy_path,
+        required_upstream_host.or(request_host.as_deref()),
+        required_upstream_host.is_some(),
+    );
 
     if let Some(rule) = matching_policy_route {
         if principal.as_ref().is_some_and(|principal| {
@@ -531,6 +558,27 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 with_policy_decision(response, decision)
             }
         };
+    }
+
+    if required_upstream_host.is_some() {
+        emit_host_policy_required(
+            &state,
+            &context,
+            principal.as_ref(),
+            proxy_context
+                .as_ref()
+                .expect("host binding requires proxy dispatch context"),
+        );
+        return with_policy_decision(
+            forbidden(),
+            PolicyDecision {
+                outcome: PolicyDecisionOutcome::Denied,
+                reason: "host_policy_required",
+                permission: None,
+                path_prefix: None,
+                matched_rule_id: None,
+            },
+        );
     }
 
     let default_action = policy.default_action.clone();
@@ -592,13 +640,49 @@ fn effective_enforcement_mode(policy: &RbacPolicyState, rule: &RouteRule) -> Enf
     rule.enforcement_mode.unwrap_or(policy.enforcement_mode)
 }
 
+fn matching_direct_rule(
+    matcher: &RuleMatcher,
+    method: &str,
+    path: &str,
+    policy_path: &str,
+    principal: Option<&auth::Principal>,
+    denies_only: bool,
+) -> Option<RuleDecision> {
+    let evaluate = |candidate_path: &str| {
+        if denies_only {
+            matcher.evaluate_denies(method, candidate_path, principal)
+        } else {
+            matcher.evaluate(method, candidate_path, principal)
+        }
+    };
+
+    evaluate(path).or_else(|| {
+        (policy_path != path)
+            .then(|| evaluate(policy_path))
+            .flatten()
+    })
+}
+
+#[cfg(test)]
 fn matching_route<'a>(
     routes: &'a [RouteRule],
     method: &Method,
     path: &str,
 ) -> Option<&'a RouteRule> {
+    matching_route_with_host(routes, method, path, None, false)
+}
+
+fn matching_route_with_host<'a>(
+    routes: &'a [RouteRule],
+    method: &Method,
+    path: &str,
+    request_host: Option<&str>,
+    host_binding_required: bool,
+) -> Option<&'a RouteRule> {
     routes.iter().find(|rule| {
-        path_prefix_matches(path, &rule.path_prefix) && method_matches(&rule.methods, method)
+        path_prefix_matches(path, &rule.path_prefix)
+            && method_matches(&rule.methods, method)
+            && route_host_matches(rule, request_host, host_binding_required)
     })
 }
 
@@ -607,12 +691,23 @@ fn matching_route_for_request<'a>(
     method: &Method,
     path: &str,
     policy_path: &str,
+    request_host: Option<&str>,
+    host_binding_required: bool,
 ) -> Option<&'a RouteRule> {
     if policy_path != path {
-        matching_exact_route(routes, method, path)
-            .or_else(|| matching_route(routes, method, policy_path))
+        matching_exact_route(routes, method, path, request_host, host_binding_required).or_else(
+            || {
+                matching_route_with_host(
+                    routes,
+                    method,
+                    policy_path,
+                    request_host,
+                    host_binding_required,
+                )
+            },
+        )
     } else {
-        matching_route(routes, method, path)
+        matching_route_with_host(routes, method, path, request_host, host_binding_required)
     }
 }
 
@@ -620,10 +715,30 @@ fn matching_exact_route<'a>(
     routes: &'a [RouteRule],
     method: &Method,
     path: &str,
+    request_host: Option<&str>,
+    host_binding_required: bool,
 ) -> Option<&'a RouteRule> {
-    routes
-        .iter()
-        .find(|rule| rule.path_prefix == path && method_matches(&rule.methods, method))
+    routes.iter().find(|rule| {
+        rule.path_prefix == path
+            && method_matches(&rule.methods, method)
+            && route_host_matches(rule, request_host, host_binding_required)
+    })
+}
+
+fn route_host_matches(
+    rule: &RouteRule,
+    request_host: Option<&str>,
+    host_binding_required: bool,
+) -> bool {
+    if rule.hosts.is_empty() {
+        return !host_binding_required;
+    }
+
+    request_host.is_some_and(|request_host| {
+        rule.hosts
+            .iter()
+            .any(|host| host.eq_ignore_ascii_case(request_host))
+    })
 }
 
 fn is_unsafe_request_path(path: &str) -> bool {
@@ -801,6 +916,31 @@ fn emit_denial_event(
 
     state.audit.emit(AuditEvent::new(
         event_type,
+        &context.request_id,
+        &context.source_ip,
+        actor,
+        payload,
+    ));
+}
+
+fn emit_host_policy_required(
+    state: &RbacState,
+    context: &AuditContext,
+    principal: Option<&auth::Principal>,
+    proxy_context: &ProxyRouteAuthorizationContext,
+) {
+    let actor = principal.map(actor_from_principal);
+    let payload = json!({
+        "path": &context.path,
+        "method": &context.method,
+        "reason": "host_policy_required",
+        "upstream_host": &proxy_context.host,
+        "upstream_path_prefix": &proxy_context.path_prefix,
+        "upstream_origin": &proxy_context.upstream_origin,
+    });
+
+    state.audit.emit(AuditEvent::new(
+        AUTHZ_DENIED,
         &context.request_id,
         &context.source_ip,
         actor,
@@ -1554,6 +1694,346 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_path_on_different_upstream_hosts_uses_host_bound_permissions() {
+        let (state, capture) = test_state(
+            test_policy(
+                DefaultAction::Deny,
+                &[("reader", &["data:read"]), ("admin", &["admin:read"])],
+                &[
+                    host_route(&["GET"], &["admin.example.test"], "/data", "admin:read"),
+                    route(&["GET"], "/data", "data:read"),
+                ],
+            ),
+            &[],
+        );
+        let denied = test_router(state.clone(), Some(test_principal(&["reader"])))
+            .oneshot(proxy_request(
+                Method::GET,
+                "/data/report",
+                "admin.example.test:443",
+            ))
+            .await
+            .expect("host-qualified request should complete");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let denied_decision = denied
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(denied_decision.reason, "missing_permission");
+        assert_eq!(denied_decision.permission.as_deref(), Some("admin:read"));
+
+        let host_allowed = test_router(state.clone(), Some(test_principal(&["admin"])))
+            .oneshot(proxy_request(
+                Method::GET,
+                "/data/report",
+                "ADMIN.EXAMPLE.TEST",
+            ))
+            .await
+            .expect("authorized host-qualified request should complete");
+        assert_eq!(host_allowed.status(), StatusCode::OK);
+        assert_eq!(
+            host_allowed
+                .extensions()
+                .get::<PolicyDecision>()
+                .expect("policy decision should be attached")
+                .permission
+                .as_deref(),
+            Some("admin:read")
+        );
+
+        let allowed = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request_with_host(
+                Method::GET,
+                "/data/report",
+                "public.example.test",
+            ))
+            .await
+            .expect("path-only upstream request should complete");
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let allowed_decision = allowed
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(allowed_decision.permission.as_deref(), Some("data:read"));
+
+        assert_eq!(
+            captured_event(&capture, AUTHZ_DENIED).await.payload["permission"],
+            json!("admin:read")
+        );
+        let events = capture.events();
+        assert!(events.iter().any(|event| {
+            event.event_type == AUTHZ_ALLOWED && event.payload["permission"] == json!("admin:read")
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == AUTHZ_ALLOWED && event.payload["permission"] == json!("data:read")
+        }));
+    }
+
+    #[tokio::test]
+    async fn host_qualified_proxy_binding_applies_on_rbac_exempt_path() {
+        let (state, capture) = test_state(test_policy(DefaultAction::Allow, &[], &[]), &["/data"]);
+
+        let response = test_router(state, None)
+            .oneshot(proxy_request(
+                Method::GET,
+                "/data/report",
+                "admin.example.test",
+            ))
+            .await
+            .expect("host-qualified exempt request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.reason, "host_policy_required");
+        let event = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(event.payload["reason"], json!("host_policy_required"));
+        assert_eq!(event.payload["upstream_host"], json!("admin.example.test"));
+        assert_eq!(
+            event.payload["upstream_origin"],
+            json!("https://upstream.example.test")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_shadow_keeps_telemetry_before_host_bound_route_allows() {
+        let (state, capture) = test_state(
+            test_policy_with_rules(
+                DefaultAction::Deny,
+                &[("admin", &["admin:read"])],
+                &[host_route(
+                    &["GET"],
+                    &["admin.example.test"],
+                    "/data",
+                    "admin:read",
+                )],
+                &[direct_rule(
+                    Some("shadow-data"),
+                    &["GET"],
+                    "/data/**",
+                    RuleAction::Shadow,
+                )],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, Some(test_principal(&["admin"])))
+            .oneshot(proxy_request(
+                Method::GET,
+                "/data/report",
+                "admin.example.test",
+            ))
+            .await
+            .expect("host-qualified shadow request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.outcome, PolicyDecisionOutcome::Allowed);
+        assert_eq!(decision.permission.as_deref(), Some("admin:read"));
+        let shadow = captured_event(&capture, AUTHZ_WOULD_DENY).await;
+        assert_eq!(shadow.payload["matched_rule_id"], json!("shadow-data"));
+        let allowed = captured_event(&capture, AUTHZ_ALLOWED).await;
+        assert_eq!(allowed.payload["permission"], json!("admin:read"));
+    }
+
+    #[tokio::test]
+    async fn direct_shadow_keeps_telemetry_when_later_deny_blocks_host_route() {
+        let (state, capture) = test_state(
+            test_policy_with_rules(
+                DefaultAction::Deny,
+                &[("admin", &["admin:read"])],
+                &[host_route(
+                    &["GET"],
+                    &["admin.example.test"],
+                    "/data",
+                    "admin:read",
+                )],
+                &[
+                    direct_rule(
+                        Some("shadow-data"),
+                        &["GET"],
+                        "/data/**",
+                        RuleAction::Shadow,
+                    ),
+                    direct_rule(Some("deny-data"), &["GET"], "/data/**", RuleAction::Deny),
+                ],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, Some(test_principal(&["admin"])))
+            .oneshot(proxy_request(
+                Method::GET,
+                "/data/report",
+                "admin.example.test",
+            ))
+            .await
+            .expect("host-qualified shadow request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.outcome, PolicyDecisionOutcome::Denied);
+        assert_eq!(decision.matched_rule_id.as_deref(), Some("deny-data"));
+        let shadow = captured_event(&capture, AUTHZ_WOULD_DENY).await;
+        assert_eq!(shadow.payload["matched_rule_id"], json!("shadow-data"));
+        let denied = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(denied.payload["matched_rule_id"], json!("deny-data"));
+    }
+
+    #[tokio::test]
+    async fn policy_reload_adds_and_removes_live_host_bindings() {
+        let host_policy = test_policy(
+            DefaultAction::Deny,
+            &[("admin", &["admin:read"])],
+            &[host_route(
+                &["GET"],
+                &["admin.example.test"],
+                "/data",
+                "admin:read",
+            )],
+        );
+        let policy_file = TempPolicyFile::new(
+            &serde_json::to_string(&host_policy).expect("host policy should serialize"),
+        );
+        let (state, _capture) = test_state(host_policy.clone(), &[]);
+        let router = test_router(state.clone(), Some(test_principal(&["admin"])));
+
+        let allowed = router
+            .clone()
+            .oneshot(proxy_request(
+                Method::GET,
+                "/data/report",
+                "admin.example.test",
+            ))
+            .await
+            .expect("initial host-bound request should complete");
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        let unbound_policy = test_policy(
+            DefaultAction::Allow,
+            &[("admin", &["admin:read"])],
+            &[route(&["GET"], "/data", "admin:read")],
+        );
+        policy_file.write(
+            &serde_json::to_string(&unbound_policy).expect("unbound policy should serialize"),
+        );
+        reload_policy_from_file(&state, policy_file.path())
+            .expect("removing the host binding should reload");
+        let denied = router
+            .clone()
+            .oneshot(proxy_request(
+                Method::GET,
+                "/data/report",
+                "admin.example.test",
+            ))
+            .await
+            .expect("request after removing host binding should complete");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            denied
+                .extensions()
+                .get::<PolicyDecision>()
+                .expect("policy decision should be attached")
+                .reason,
+            "host_policy_required"
+        );
+
+        policy_file
+            .write(&serde_json::to_string(&host_policy).expect("host policy should serialize"));
+        reload_policy_from_file(&state, policy_file.path())
+            .expect("restoring the host binding should reload");
+        let restored = router
+            .oneshot(proxy_request(
+                Method::GET,
+                "/data/report",
+                "admin.example.test",
+            ))
+            .await
+            .expect("request after restoring host binding should complete");
+        assert_eq!(restored.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn broad_allow_and_default_allow_cannot_authorize_host_qualified_upstream() {
+        for action in [RuleAction::Allow, RuleAction::Shadow] {
+            let (state, capture) = test_state(
+                test_policy_with_rules(
+                    DefaultAction::Allow,
+                    &[],
+                    &[],
+                    &[direct_rule(Some("broad-rule"), &["GET"], "/**", action)],
+                ),
+                &[],
+            );
+            let response = test_router(state, None)
+                .oneshot(proxy_request(
+                    Method::GET,
+                    "/data/report",
+                    "admin.example.test",
+                ))
+                .await
+                .expect("host-qualified request should complete");
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let decision = response
+                .extensions()
+                .get::<PolicyDecision>()
+                .expect("policy decision should be attached");
+            assert_eq!(decision.reason, "host_policy_required");
+            assert!(decision.matched_rule_id.is_none());
+            let event = captured_event(&capture, AUTHZ_DENIED).await;
+            assert_eq!(event.payload["reason"], json!("host_policy_required"));
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_deny_still_applies_to_host_qualified_upstream() {
+        let (state, capture) = test_state(
+            test_policy_with_rules(
+                DefaultAction::Allow,
+                &[],
+                &[],
+                &[
+                    direct_rule(Some("broad-allow"), &["GET"], "/**", RuleAction::Allow),
+                    direct_rule(
+                        Some("deny-admin-host"),
+                        &["GET"],
+                        "/data/**",
+                        RuleAction::Deny,
+                    ),
+                ],
+            ),
+            &[],
+        );
+        let response = test_router(state, None)
+            .oneshot(proxy_request(
+                Method::GET,
+                "/data/report",
+                "admin.example.test",
+            ))
+            .await
+            .expect("host-qualified request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let decision = response
+            .extensions()
+            .get::<PolicyDecision>()
+            .expect("policy decision should be attached");
+        assert_eq!(decision.reason, "matched_rule");
+        assert_eq!(decision.matched_rule_id.as_deref(), Some("deny-admin-host"));
+        let event = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(event.payload["matched_rule_id"], json!("deny-admin-host"));
+    }
+
+    #[tokio::test]
     async fn absent_and_empty_rules_lists_have_identical_route_behavior() {
         let absent_file = TempPolicyFile::new(&route_policy_document_without_rules());
         let empty_file = TempPolicyFile::new(&route_policy_document_with_empty_rules());
@@ -2215,6 +2695,17 @@ mod tests {
         route_with_enforcement(methods, path_prefix, permission, None)
     }
 
+    fn host_route(
+        methods: &[&str],
+        hosts: &[&str],
+        path_prefix: &str,
+        permission: &str,
+    ) -> RouteRule {
+        let mut rule = route(methods, path_prefix, permission);
+        rule.hosts = hosts.iter().map(|host| (*host).to_owned()).collect();
+        rule
+    }
+
     fn direct_rule(id: Option<&str>, methods: &[&str], path: &str, action: RuleAction) -> Rule {
         Rule {
             id: id.map(str::to_owned),
@@ -2235,6 +2726,7 @@ mod tests {
     ) -> RouteRule {
         RouteRule {
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
+            hosts: Vec::new(),
             path_prefix: path_prefix.to_owned(),
             permission: permission.to_owned(),
             enforcement_mode,
@@ -2259,6 +2751,31 @@ mod tests {
             .uri(uri)
             .body(Body::empty())
             .expect("request should build")
+    }
+
+    fn request_with_host(method: Method, uri: &str, host: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", host)
+            .body(Body::empty())
+            .expect("request should build")
+    }
+
+    fn proxy_request(method: Method, uri: &str, host: &str) -> Request<Body> {
+        let normalized_host = host
+            .split_once(':')
+            .map_or(host, |(hostname, _)| hostname)
+            .to_ascii_lowercase();
+        let mut request = request_with_host(method, uri, host);
+        request
+            .extensions_mut()
+            .insert(ProxyRouteAuthorizationContext::new(
+                normalized_host,
+                Some("/data".to_owned()),
+                "https://upstream.example.test".to_owned(),
+            ));
+        request
     }
 
     fn default_policy_document(default_action: &str) -> String {

@@ -2118,6 +2118,7 @@ paths:
     fn route(methods: &[&str], path_prefix: &str, permission: &str) -> RouteRule {
         RouteRule {
             methods: methods.iter().map(|method| (*method).to_owned()).collect(),
+            hosts: Vec::new(),
             path_prefix: path_prefix.to_owned(),
             permission: permission.to_owned(),
             enforcement_mode: None,
