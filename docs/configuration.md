@@ -841,6 +841,8 @@ Default: empty, which disables proxying and leaves unmatched paths on axum's def
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be a valid `http` or `https` URL with a host. The proxy uses only the configured scheme, host, and port; each incoming request's path and query are forwarded unchanged. The upstream host is automatically trusted for gateway-originated egress, so operators do not need to duplicate it in `EGRESS_ALLOWED_HOSTS`. Private resolved IP ranges are still blocked by default unless `EGRESS_DENY_PRIVATE_IPS=false` is explicitly configured.
 
+The proxy fallback rejects raw request paths containing percent encoding or literal `.` or `..` path segments with `404 Not Found` before upstream route selection. This fail-closed boundary is always active, including when RBAC is not configured, so encoded or traversal-shaped variants cannot bypass gateway-owned admin, API, MCP, or probe namespaces. GreenGateway does not normalize and forward these ambiguous paths.
+
 `UPSTREAM_URL` and `UPSTREAM_ROUTES` are mutually exclusive when `UPSTREAM_ROUTES` contains at least one entry. This keeps proxy startup deterministic and avoids an implicit precedence rule between the legacy catch-all upstream and the routing table.
 
 ### UPSTREAM_ROUTES

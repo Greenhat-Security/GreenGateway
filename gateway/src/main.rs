@@ -2632,7 +2632,8 @@ fn request_host_without_port(headers: &HeaderMap) -> Option<String> {
 async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -> Response {
     record_request(PROXY_FALLBACK_ROUTE);
 
-    if state.routes.is_gateway_owned_path(request.uri().path()) {
+    let path = request.uri().path();
+    if path_match::is_unsafe_request_path(path) || state.routes.is_gateway_owned_path(path) {
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -2640,7 +2641,7 @@ async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let Some(upstream) = proxy.upstream_for_request(request.uri().path(), request.headers()) else {
+    let Some(upstream) = proxy.upstream_for_request(path, request.headers()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let (parts, body) = request.into_parts();
@@ -10046,6 +10047,39 @@ mod tests {
             "route table must not override gateway-owned paths",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_unsafe_gateway_namespace_paths_without_rbac() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let config = proxy_config(upstream_addr);
+        assert!(config.policy_file.is_none());
+        let router = proxy_router(config, test_audit_log());
+
+        for path in [
+            "/admin%2Fassets/app.js",
+            "/v1%2Fadmin%2Faudit",
+            "/mcp%2Ftools/call",
+            "/public/../admin",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("unsafe path request should build"),
+                )
+                .await
+                .expect("unsafe path request should complete");
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_upstream_receives_no_request(
+                &mut captured,
+                "unsafe path must not reach proxy upstream without RBAC",
+            )
+            .await;
+        }
     }
 
     #[tokio::test]

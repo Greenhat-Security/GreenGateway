@@ -25,7 +25,7 @@ use crate::{
     auth::{self, actor_from_principal, protected_resource},
     client_ip::{canonical_client_ip, request_id},
     config::Config,
-    path_match::path_prefix_matches,
+    path_match::{is_unsafe_request_path, path_prefix_matches},
     rbac::{
         policy::ToolPolicyEntry, DefaultAction, EnforcementMode, Policy, PolicyEngine, RouteRule,
         RuleAction, RuleMatcher,
@@ -620,13 +620,6 @@ fn matching_exact_route<'a>(
     routes
         .iter()
         .find(|rule| rule.path_prefix == path && method_matches(&rule.methods, method))
-}
-
-fn is_unsafe_request_path(path: &str) -> bool {
-    path.contains('%')
-        || path
-            .split('/')
-            .any(|segment| segment == "." || segment == "..")
 }
 
 fn method_matches(methods: &[String], method: &Method) -> bool {
