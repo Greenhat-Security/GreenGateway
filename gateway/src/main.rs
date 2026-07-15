@@ -51,6 +51,23 @@ const REQUEST_COUNTER: &str = "gateway_http_requests";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const X_FORWARDED_FOR_HEADER: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_REAL_IP_HEADER: HeaderName = HeaderName::from_static("x-real-ip");
+const COMMON_CLIENT_IP_FORWARDING_HEADERS: &[&str] = &[
+    "cf-connecting-ip",
+    "client-ip",
+    "fastly-client-ip",
+    "fly-client-ip",
+    "forwarded",
+    "forwarded-for",
+    "forwarded-for-ip",
+    "true-client-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "x-envoy-external-address",
+    "x-forwarded",
+    "x-original-forwarded-for",
+    "x-proxyuser-ip",
+    "x-real-ip",
+];
 const ADMIN_UI_ROUTE: &str = "/admin";
 const ADMIN_UI_INDEX: &str = "index.html";
 const ADMIN_UI_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
@@ -2857,8 +2874,14 @@ fn strip_hop_by_hop_headers(headers: &HeaderMap) -> HeaderMap {
 }
 
 fn set_upstream_client_ip(headers: &mut HeaderMap, source_ip: &str) {
-    headers.remove(X_FORWARDED_FOR_HEADER);
-    headers.remove(X_REAL_IP_HEADER);
+    let forwarding_headers = headers
+        .keys()
+        .filter(|name| is_client_forwarding_header(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in forwarding_headers {
+        headers.remove(name);
+    }
 
     let Ok(source_ip) = source_ip.parse::<IpAddr>() else {
         return;
@@ -2868,6 +2891,11 @@ fn set_upstream_client_ip(headers: &mut HeaderMap, source_ip: &str) {
         .expect("normalized IP address should be a valid header value");
     headers.insert(X_FORWARDED_FOR_HEADER, value.clone());
     headers.insert(X_REAL_IP_HEADER, value);
+}
+
+fn is_client_forwarding_header(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    name.starts_with("x-forwarded-") || COMMON_CLIENT_IP_FORWARDING_HEADERS.contains(&name)
 }
 
 fn strip_gateway_credentials(headers: &mut HeaderMap) {
@@ -9965,13 +9993,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_replaces_client_forwarding_headers_with_canonical_peer_ip() {
+    async fn proxy_strips_inbound_forwarding_metadata_and_sets_canonical_peer_ip() {
         let (upstream_addr, mut captured) = spawn_capture_upstream().await;
         let router = proxy_router(proxy_config(upstream_addr), test_audit_log());
         let mut request = Request::builder()
             .uri("/api/forwarded")
+            .header("forwarded", "for=198.51.100.12;proto=https")
             .header("x-forwarded-for", "198.51.100.10, 10.0.0.5")
             .header("x-real-ip", "198.51.100.11")
+            .header("x-forwarded-host", "attacker.example")
+            .header("x-forwarded-proto", "https")
+            .header("x-forwarded-port", "8443")
+            .header("x-forwarded-prefix", "/attacker")
+            .header("x-forwarded-server", "attacker-proxy")
+            .header("cf-connecting-ip", "198.51.100.13")
+            .header("true-client-ip", "198.51.100.14")
+            .header("x-client-ip", "198.51.100.15")
+            .header("x-original-forwarded-for", "198.51.100.16")
             .body(Body::empty())
             .expect("proxy request should build");
         request.extensions_mut().insert(axum::extract::ConnectInfo(
@@ -10003,6 +10041,23 @@ mod tests {
             1
         );
         assert_eq!(upstream.headers.get_all(X_REAL_IP_HEADER).iter().count(), 1);
+        for stripped in [
+            "forwarded",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "x-forwarded-server",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "x-client-ip",
+            "x-original-forwarded-for",
+        ] {
+            assert!(
+                !upstream.headers.contains_key(stripped),
+                "upstream request should strip inbound {stripped}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -10183,12 +10238,24 @@ mod tests {
         let (upstream_addr, mut captured) = spawn_capture_upstream().await;
         let mut route = path_route("/api", upstream_addr);
         route.add_request_headers = HashMap::from([
+            ("forwarded".to_owned(), "for=192.0.2.39".to_owned()),
             ("x-forwarded-for".to_owned(), "192.0.2.40".to_owned()),
             ("x-real-ip".to_owned(), "192.0.2.41".to_owned()),
+            ("x-forwarded-host".to_owned(), "gateway.example".to_owned()),
+            ("x-forwarded-proto".to_owned(), "https".to_owned()),
+            ("x-forwarded-port".to_owned(), "443".to_owned()),
+            ("x-forwarded-prefix".to_owned(), "/api".to_owned()),
+            ("true-client-ip".to_owned(), "192.0.2.42".to_owned()),
         ]);
         let router = proxy_router(routing_proxy_config(vec![route]), test_audit_log());
         let mut request = Request::builder()
             .uri("/api/headers")
+            .header("forwarded", "for=198.51.100.10")
+            .header("x-forwarded-host", "attacker.example")
+            .header("x-forwarded-proto", "http")
+            .header("x-forwarded-port", "8080")
+            .header("x-forwarded-prefix", "/attacker")
+            .header("true-client-ip", "198.51.100.11")
             .body(Body::empty())
             .expect("request should build");
         request.extensions_mut().insert(axum::extract::ConnectInfo(
@@ -10212,6 +10279,30 @@ mod tests {
         assert_eq!(
             upstream.headers.get(X_REAL_IP_HEADER),
             Some(&HeaderValue::from_static("192.0.2.41"))
+        );
+        assert_eq!(
+            upstream.headers.get("forwarded"),
+            Some(&HeaderValue::from_static("for=192.0.2.39"))
+        );
+        assert_eq!(
+            upstream.headers.get("x-forwarded-host"),
+            Some(&HeaderValue::from_static("gateway.example"))
+        );
+        assert_eq!(
+            upstream.headers.get("x-forwarded-proto"),
+            Some(&HeaderValue::from_static("https"))
+        );
+        assert_eq!(
+            upstream.headers.get("x-forwarded-port"),
+            Some(&HeaderValue::from_static("443"))
+        );
+        assert_eq!(
+            upstream.headers.get("x-forwarded-prefix"),
+            Some(&HeaderValue::from_static("/api"))
+        );
+        assert_eq!(
+            upstream.headers.get("true-client-ip"),
+            Some(&HeaderValue::from_static("192.0.2.42"))
         );
     }
 
