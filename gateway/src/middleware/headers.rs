@@ -16,8 +16,9 @@ use axum::{extract::Request, middleware::Next, response::Response};
 /// metadata.
 ///
 /// Note: `x-forwarded-for` and `x-real-ip` are intentionally preserved because
-/// they are common reverse proxy inputs. Callers should still treat them as
-/// advisory unless the proxy boundary is trusted.
+/// they are inputs to canonical client-IP resolution. The reverse-proxy
+/// fallback removes both before upstream egress and emits gateway-controlled
+/// values instead.
 ///
 /// `x-forwarded-host` and `x-forwarded-proto` are stripped because spoofed
 /// values can poison URL generation, auth redirects, and cookie domains.

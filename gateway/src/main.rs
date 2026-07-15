@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
     fs,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -48,6 +48,8 @@ mod tools;
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
 const REQUEST_ID_HEADER: &str = "x-request-id";
+const X_FORWARDED_FOR_HEADER: HeaderName = HeaderName::from_static("x-forwarded-for");
+const X_REAL_IP_HEADER: HeaderName = HeaderName::from_static("x-real-ip");
 const ADMIN_UI_ROUTE: &str = "/admin";
 const ADMIN_UI_INDEX: &str = "index.html";
 const ADMIN_UI_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
@@ -132,6 +134,7 @@ struct AppState {
     metrics_handle: PrometheusHandle,
     proxy: Option<ProxyState>,
     routes: GatewayRoutes,
+    trust_proxy_headers: bool,
     admin_login_configured: bool,
     mcp: mcp::McpState,
     protected_resource_metadata: Option<auth::protected_resource::ProtectedResourceMetadataConfig>,
@@ -1408,6 +1411,7 @@ fn gateway_app_with_process_started_at(
         metrics_handle,
         proxy: proxy_state,
         routes: routes.clone(),
+        trust_proxy_headers: config.trust_proxy_headers,
         admin_login_configured: admin_auth_state.is_some(),
         mcp: mcp_state,
         protected_resource_metadata,
@@ -2643,12 +2647,18 @@ async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -
     let Some(upstream) = proxy.upstream_for_request(request.uri().path(), request.headers()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let source_ip = client_ip::canonical_client_ip(
+        request.headers(),
+        request.extensions(),
+        state.trust_proxy_headers,
+    );
     let (parts, body) = request.into_parts();
     let target_url = proxy_target_url(&upstream.upstream_origin, &parts.uri);
     let mut headers = strip_hop_by_hop_headers(&parts.headers);
     if let Some(request_id) = parts.headers.get(REQUEST_ID_HEADER) {
         headers.insert(request_id_header(), request_id.clone());
     }
+    set_upstream_client_ip(&mut headers, &source_ip);
     apply_route_request_header_policy(&mut headers, &upstream.request_header_policy);
     let request_id = parts.headers.get(REQUEST_ID_HEADER).cloned();
     let payload_capture = parts
@@ -2764,6 +2774,20 @@ fn strip_hop_by_hop_headers(headers: &HeaderMap) -> HeaderMap {
     }
 
     forwarded
+}
+
+fn set_upstream_client_ip(headers: &mut HeaderMap, source_ip: &str) {
+    headers.remove(X_FORWARDED_FOR_HEADER);
+    headers.remove(X_REAL_IP_HEADER);
+
+    let Ok(source_ip) = source_ip.parse::<IpAddr>() else {
+        return;
+    };
+    let source_ip = source_ip.to_string();
+    let value = HeaderValue::from_bytes(source_ip.as_bytes())
+        .expect("normalized IP address should be a valid header value");
+    headers.insert(X_FORWARDED_FOR_HEADER, value.clone());
+    headers.insert(X_REAL_IP_HEADER, value);
 }
 
 fn apply_route_request_header_policy(headers: &mut HeaderMap, policy: &RouteRequestHeaderPolicy) {
@@ -9628,6 +9652,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_replaces_client_forwarding_headers_with_canonical_peer_ip() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let router = proxy_router(proxy_config(upstream_addr), test_audit_log());
+        let mut request = Request::builder()
+            .uri("/api/forwarded")
+            .header("x-forwarded-for", "198.51.100.10, 10.0.0.5")
+            .header("x-real-ip", "198.51.100.11")
+            .body(Body::empty())
+            .expect("proxy request should build");
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            "203.0.113.20:12345"
+                .parse::<SocketAddr>()
+                .expect("test peer address should parse"),
+        ));
+
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let upstream =
+            next_proxied_request(&mut captured, "upstream should receive proxied request").await;
+        let expected = HeaderValue::from_static("203.0.113.20");
+        assert_eq!(
+            upstream.headers.get(X_FORWARDED_FOR_HEADER),
+            Some(&expected)
+        );
+        assert_eq!(upstream.headers.get(X_REAL_IP_HEADER), Some(&expected));
+        assert_eq!(
+            upstream
+                .headers
+                .get_all(X_FORWARDED_FOR_HEADER)
+                .iter()
+                .count(),
+            1
+        );
+        assert_eq!(upstream.headers.get_all(X_REAL_IP_HEADER).iter().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_omits_client_forwarding_headers_without_a_valid_canonical_ip() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let router = proxy_router(proxy_config(upstream_addr), test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/forwarded")
+                    .header("x-forwarded-for", "198.51.100.10")
+                    .header("x-real-ip", "198.51.100.11")
+                    .body(Body::empty())
+                    .expect("proxy request should build"),
+            )
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let upstream =
+            next_proxied_request(&mut captured, "upstream should receive proxied request").await;
+        assert!(!upstream.headers.contains_key(X_FORWARDED_FOR_HEADER));
+        assert!(!upstream.headers.contains_key(X_REAL_IP_HEADER));
+    }
+
+    #[tokio::test]
     async fn proxy_path_ending_in_openapi_preview_does_not_get_preview_content_type_exception() {
         let (upstream_addr, mut captured) = spawn_capture_upstream().await;
         let mut config = proxy_config(upstream_addr);
@@ -9774,6 +9863,71 @@ mod tests {
             upstream.headers.get("x-route-added"),
             Some(&HeaderValue::from_static("route-added-value"))
         );
+    }
+
+    #[tokio::test]
+    async fn routing_table_can_replace_gateway_forwarding_headers() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut route = path_route("/api", upstream_addr);
+        route.add_request_headers = HashMap::from([
+            ("x-forwarded-for".to_owned(), "192.0.2.40".to_owned()),
+            ("x-real-ip".to_owned(), "192.0.2.41".to_owned()),
+        ]);
+        let router = proxy_router(routing_proxy_config(vec![route]), test_audit_log());
+        let mut request = Request::builder()
+            .uri("/api/headers")
+            .body(Body::empty())
+            .expect("request should build");
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            "203.0.113.20:12345"
+                .parse::<SocketAddr>()
+                .expect("test peer address should parse"),
+        ));
+
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let upstream =
+            next_proxied_request(&mut captured, "upstream should receive proxied request").await;
+        assert_eq!(
+            upstream.headers.get(X_FORWARDED_FOR_HEADER),
+            Some(&HeaderValue::from_static("192.0.2.40"))
+        );
+        assert_eq!(
+            upstream.headers.get(X_REAL_IP_HEADER),
+            Some(&HeaderValue::from_static("192.0.2.41"))
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_table_can_strip_gateway_forwarding_headers() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut route = path_route("/api", upstream_addr);
+        route.strip_request_headers = vec!["x-forwarded-for".to_owned(), "x-real-ip".to_owned()];
+        let router = proxy_router(routing_proxy_config(vec![route]), test_audit_log());
+        let mut request = Request::builder()
+            .uri("/api/headers")
+            .body(Body::empty())
+            .expect("request should build");
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            "203.0.113.20:12345"
+                .parse::<SocketAddr>()
+                .expect("test peer address should parse"),
+        ));
+
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let upstream =
+            next_proxied_request(&mut captured, "upstream should receive proxied request").await;
+        assert!(!upstream.headers.contains_key(X_FORWARDED_FOR_HEADER));
+        assert!(!upstream.headers.contains_key(X_REAL_IP_HEADER));
     }
 
     #[tokio::test]

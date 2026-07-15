@@ -597,6 +597,8 @@ Default: `false`
 
 Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, forwarded proxy headers are ignored and the connection peer IP is used. Enable this only when GreenGateway is deployed behind a trusted proxy boundary that sanitizes these headers.
 
+For reverse-proxy fallback requests, GreenGateway never passes inbound `X-Forwarded-For` or `X-Real-IP` values through unchanged. Before upstream egress it removes both headers and, when the canonical client IP is a valid IPv4 or IPv6 address, sets each to that single normalized gateway-controlled value. If no valid canonical IP is available, both headers are omitted. A matching `UPSTREAM_ROUTES` entry applies `strip_request_headers` and `add_request_headers` afterward, so an operator can explicitly remove or replace these values for a particular upstream.
+
 ### SESSION_COOKIE_NAME
 
 Optional cookie name used for session-based keying by the global, pre-authentication rate-limit lane (see above) when the request has no matching cookie.
@@ -856,8 +858,8 @@ Route entries may also set these optional per-upstream fields:
 - `timeout_ms`: total timeout for this route's upstream requests, in milliseconds. When unset, the route inherits `UPSTREAM_TIMEOUT_MS` if configured, otherwise `EGRESS_TIMEOUT_MS`.
 - `response_idle_timeout_ms`: maximum idle time between streamed response chunks for this route, in milliseconds. When unset, the route inherits `UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS` if configured, otherwise `EGRESS_RESPONSE_IDLE_TIMEOUT_MS`.
 - `connect_timeout_ms`: TCP/TLS connection timeout for this route, in milliseconds. When unset, the route inherits `UPSTREAM_CONNECT_TIMEOUT_MS` if configured, otherwise `EGRESS_CONNECT_TIMEOUT_MS`.
-- `add_request_headers`: object mapping header names to values added to requests sent to this route's upstream after the gateway strips hop-by-hop headers and propagates `x-request-id`.
-- `strip_request_headers`: array of request header names removed before sending to this route's upstream after the gateway strips hop-by-hop headers and propagates `x-request-id`.
+- `add_request_headers`: object mapping header names to values added to requests sent to this route's upstream after the gateway strips hop-by-hop headers, propagates `x-request-id`, and sets gateway-controlled client-IP forwarding headers.
+- `strip_request_headers`: array of request header names removed before sending to this route's upstream after the gateway strips hop-by-hop headers, propagates `x-request-id`, and sets gateway-controlled client-IP forwarding headers.
 - `tls_ca_bundle_path`: filesystem path to a PEM CA bundle whose certificates are added to this route's TLS trust store.
 - `openapi_spec_path`: filesystem path to a local OpenAPI 3.x JSON or YAML document for this upstream route's schema coverage.
 
