@@ -17,6 +17,13 @@ pub fn path_prefix_matches(path: &str, path_prefix: &str) -> bool {
         .is_some_and(|remaining| remaining.starts_with('/'))
 }
 
+pub fn is_unsafe_request_path(path: &str) -> bool {
+    path.contains('%')
+        || path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,5 +54,16 @@ mod tests {
     fn non_absolute_prefixes_do_not_match() {
         assert!(!path_prefix_matches("/admin", "admin"));
         assert!(!path_prefix_matches("/admin", ""));
+    }
+
+    #[test]
+    fn unsafe_paths_include_percent_encoding_and_dot_segments() {
+        for path in ["/%61dmin", "/admin%2Fassets", "/a/./b", "/a/../b"] {
+            assert!(is_unsafe_request_path(path), "{path}");
+        }
+
+        for path in ["/admin", "/files/report.json", "/files/v1.2/report"] {
+            assert!(!is_unsafe_request_path(path), "{path}");
+        }
     }
 }
