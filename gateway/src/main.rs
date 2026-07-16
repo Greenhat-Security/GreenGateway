@@ -3202,6 +3202,10 @@ async fn policy_put_endpoint(
         Err(error) => return if_match_error_response(error),
     }
 
+    if candidate.egress != before_policy.egress {
+        return egress_reload_unsupported();
+    }
+
     if let Err(err) = candidate.persist_to_file(policy_file) {
         tracing::error!(policy_file = %policy_file.display(), error = %err, "failed to persist policy");
         return internal_server_error("policy persist failed");
@@ -6954,6 +6958,10 @@ fn persist_policy_mutation(
     candidate: &rbac::Policy,
     diff_summary: Value,
 ) -> ResponseResult<PolicyMutationCommitResult> {
+    if candidate.egress != before_policy.egress {
+        return Err(Box::new(egress_reload_unsupported()));
+    }
+
     if let Err(err) = candidate.persist_to_file(context.policy_file) {
         tracing::error!(policy_file = %context.policy_file.display(), error = %err, "failed to persist policy");
         return Err(Box::new(internal_server_error("policy persist failed")));
@@ -7845,6 +7853,12 @@ fn conflict(error: &str) -> Response {
         }),
     )
         .into_response()
+}
+
+fn egress_reload_unsupported() -> Response {
+    conflict(
+        "egress allowlist changes cannot be applied via the policy API; edit POLICY_FILE and restart the gateway to change egress rules",
+    )
 }
 
 fn service_unavailable(error: &str) -> Response {
@@ -14983,6 +14997,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_put_rejects_egress_change_without_persisting_or_swapping() {
+        let initial_policy = policy_document_string("initial-policy", "test:old");
+        let policy = TempPolicyFile::new(&initial_policy);
+        let router = policy_admin_router(Some(&policy), test_audit_log());
+        let disk_before = fs::read_to_string(&policy.path).expect("policy file should read");
+        let (etag_before, live_before) = current_policy(&router).await;
+
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(policy_document_with_egress_string(
+                    "replacement-policy",
+                    "test:new",
+                    "replacement.example.test",
+                )),
+                Some(&etag_before),
+            ))
+            .await
+            .expect("egress-changing policy PUT should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert!(body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("restart")));
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy file should still read"),
+            disk_before
+        );
+
+        let (etag_after, live_after) = current_policy(&router).await;
+        assert_eq!(etag_after, etag_before);
+        assert_eq!(live_after, live_before);
+        assert!(live_after["egress"].is_null());
+    }
+
+    #[tokio::test]
     async fn policy_history_records_every_policy_mutation_path_once() {
         let initial_policy = policy_document_with_rules_string(
             "initial-policy",
@@ -15434,6 +15488,80 @@ mod tests {
         assert_eq!(entries_after_rollback[0]["policy"], target_snapshot);
         assert_eq!(entries_after_rollback[1], entries_before_rollback[0]);
         assert_eq!(entries_after_rollback[2], entries_before_rollback[1]);
+    }
+
+    #[tokio::test]
+    async fn policy_rollback_rejects_egress_change_without_persisting_or_swapping() {
+        let policy = TempPolicyFile::new(&policy_document_with_egress_string(
+            "initial-policy",
+            "test:old",
+            "initial.example.test",
+        ));
+        let history_db = TempDb::new("policy-history-egress-rollback");
+        let router = policy_admin_router_with_history(Some(&policy), &history_db);
+
+        let (etag, _) = current_policy(&router).await;
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(policy_document_with_egress_string(
+                    "target-policy",
+                    "test:new",
+                    "initial.example.test",
+                )),
+                Some(&etag),
+            ))
+            .await
+            .expect("same-egress policy PUT should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(policy_history_entries(&router, None).await.len(), 1);
+        drop(router);
+
+        policy.write(&policy_document_with_egress_string(
+            "restarted-policy",
+            "test:new",
+            "restarted.example.test",
+        ));
+        let restarted_router = policy_admin_router_with_history(Some(&policy), &history_db);
+        let disk_before = fs::read_to_string(&policy.path).expect("policy file should read");
+        let (etag_before, live_before) = current_policy(&restarted_router).await;
+        assert_eq!(
+            live_before["egress"]["hosts"],
+            json!(["restarted.example.test"])
+        );
+
+        let response = restarted_router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                "/v1/admin/policy/rollback/1",
+                Some(test_principal(&["admin"])),
+                None,
+                Some(&etag_before),
+            ))
+            .await
+            .expect("egress-changing rollback should complete");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert!(body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("restart")));
+        assert_eq!(
+            fs::read_to_string(&policy.path).expect("policy file should still read"),
+            disk_before
+        );
+
+        let (etag_after, live_after) = current_policy(&restarted_router).await;
+        assert_eq!(etag_after, etag_before);
+        assert_eq!(live_after, live_before);
+        assert_eq!(
+            policy_history_entries(&restarted_router, None).await.len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -24670,6 +24798,12 @@ paths:
     fn policy_document_string(id: &str, test_permission: &str) -> String {
         serde_json::to_string_pretty(&policy_document(id, test_permission))
             .expect("test policy should serialize")
+    }
+
+    fn policy_document_with_egress_string(id: &str, test_permission: &str, host: &str) -> String {
+        let mut policy = policy_document(id, test_permission);
+        policy["egress"] = json!({ "hosts": [host] });
+        serde_json::to_string_pretty(&policy).expect("test policy should serialize")
     }
 
     fn policy_document_with_rules_string(id: &str, rules: Value) -> String {
