@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-07-16
+
 ### Security
 
 - Service-token creation now rejects scopes that exceed the creator's current
