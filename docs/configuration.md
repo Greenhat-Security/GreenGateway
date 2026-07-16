@@ -76,7 +76,7 @@ Optional SQLite audit event store path for queryable local audit history.
 
 Default: empty, which disables the SQLite sink.
 
-Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. When set, the gateway opens or creates the database at startup, creates the audit event schema and indexes if needed, and fans audit events out to SQLite in addition to stdout and any JSONL file sink. Startup also migrates older audit databases in place by adding any missing promoted payload columns used for indexed queries, including `payload_matched_rule_id` for rule hit counts.
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. When set, the gateway opens or creates the database at startup, creates the audit event schema and indexes if needed, and fans audit events out to SQLite in addition to stdout and any JSONL file sink. Startup also migrates older audit databases in place by adding any missing promoted payload columns used for indexed queries, including `payload_matched_rule_id` for rule hit counts. It also adds and backfills an indexed `timestamp_epoch_us` column used by retention pruning; the original timestamp column and index remain available for audit queries and compatibility.
 
 ### AUDIT_SQLITE_RETENTION_DAYS
 
@@ -84,7 +84,7 @@ Optional SQLite audit event retention window, in days.
 
 Default: empty, which disables SQLite pruning.
 
-Format and validation: must parse as a `u32` day count when set. This value is only applied when `AUDIT_SQLITE_PATH` is also set; if the path is unset, the parsed retention value is accepted but has no effect.
+Format and validation: must parse as a `u32` day count when set. This value is only applied when `AUDIT_SQLITE_PATH` is also set; if the path is unset, the parsed retention value is accepted but has no effect. Retention pruning uses the indexed epoch column and runs at most once per minute, independently of the more frequent audit flush cadence. Rows with malformed external timestamps retain a `NULL` epoch and are not deleted automatically.
 
 ### DISCOVERY_SQLITE_PATH
 

@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex, MutexGuard,
     },
     thread::{self, JoinHandle},
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant},
 };
 
 use rusqlite::{params, Connection};
@@ -21,6 +21,7 @@ use crate::{
 
 const SQLITE_BATCH_SIZE: usize = 200;
 const SQLITE_FLUSH_INTERVAL: StdDuration = StdDuration::from_millis(250);
+const SQLITE_PRUNE_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
 const CREATE_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -28,6 +29,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
     event_id TEXT NOT NULL UNIQUE,
     event_type TEXT NOT NULL,
     timestamp TEXT NOT NULL,
+    timestamp_epoch_us INTEGER,
     schema_version TEXT NOT NULL,
     request_id TEXT NOT NULL,
     source_ip TEXT NOT NULL,
@@ -44,6 +46,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 const CREATE_INDEXES_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp ON audit_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp_epoch_us
+    ON audit_events(timestamp_epoch_us);
 CREATE INDEX IF NOT EXISTS idx_audit_events_event_type ON audit_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_audit_events_actor_user_id ON audit_events(actor_user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_events_payload_method ON audit_events(payload_method);
@@ -57,6 +61,7 @@ INSERT INTO audit_events (
     event_id,
     event_type,
     timestamp,
+    timestamp_epoch_us,
     schema_version,
     request_id,
     source_ip,
@@ -68,12 +73,20 @@ INSERT INTO audit_events (
     payload_status,
     payload_matched_rule_id,
     payload_json
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
 "#;
 
 const DELETE_RETAINED_EVENTS_SQL: &str = r#"
 DELETE FROM audit_events
-WHERE julianday(timestamp) < julianday(?1)
+WHERE timestamp_epoch_us < ?1
+"#;
+
+const BACKFILL_TIMESTAMP_EPOCH_US_SQL: &str = r#"
+UPDATE audit_events
+SET timestamp_epoch_us =
+    CAST(ROUND((julianday(timestamp) - 2440587.5) * 86400000000.0) AS INTEGER)
+WHERE timestamp_epoch_us IS NULL
+  AND julianday(timestamp) IS NOT NULL
 "#;
 
 #[derive(Debug, Clone)]
@@ -138,12 +151,13 @@ impl Error for SqliteSinkError {
 
 impl SqliteSink {
     pub fn new(config: SqliteSinkConfig) -> Result<Self, SqliteSinkError> {
-        Self::new_with_flush_interval(config, SQLITE_FLUSH_INTERVAL)
+        Self::new_with_intervals(config, SQLITE_FLUSH_INTERVAL, SQLITE_PRUNE_INTERVAL)
     }
 
-    fn new_with_flush_interval(
+    fn new_with_intervals(
         config: SqliteSinkConfig,
         flush_interval: StdDuration,
+        prune_interval: StdDuration,
     ) -> Result<Self, SqliteSinkError> {
         let connection =
             Connection::open(&config.path).map_err(|source| SqliteSinkError::Open {
@@ -165,7 +179,9 @@ impl SqliteSink {
         let flusher_shared = Arc::clone(&shared);
         let flusher = thread::Builder::new()
             .name("audit-sqlite-flusher".to_owned())
-            .spawn(move || flusher_loop(flusher_shared, shutdown_rx, flush_interval))
+            .spawn(move || {
+                flusher_loop(flusher_shared, shutdown_rx, flush_interval, prune_interval)
+            })
             .map_err(|source| SqliteSinkError::ThreadSpawn { source })?;
 
         Ok(Self {
@@ -253,10 +269,10 @@ impl SqliteSinkShared {
             return;
         };
 
-        let cutoff = retention_cutoff(retention_days);
+        let cutoff_epoch_us = retention_cutoff_epoch_us(retention_days);
         let result = {
             let connection = self.connection_guard();
-            prune_retained_events(&connection, &cutoff)
+            prune_retained_events(&connection, cutoff_epoch_us)
         };
 
         if let Err(err) = result {
@@ -293,11 +309,13 @@ impl SqliteSinkShared {
                 let payload_matched_rule_id =
                     event.payload.get("matched_rule_id").and_then(Value::as_str);
                 let payload_json = serde_json::to_string(&event.payload)?;
+                let timestamp_epoch_us = epoch_micros(event.timestamp.as_str());
 
                 statement.execute(params![
                     event.event_id.as_str(),
                     event.event_type.as_str(),
                     event.timestamp.as_str(),
+                    timestamp_epoch_us,
                     event.schema_version.as_str(),
                     event.request_id.as_str(),
                     event.source_ip.as_str(),
@@ -396,7 +414,9 @@ fn flusher_loop(
     shared: Arc<SqliteSinkShared>,
     shutdown_rx: mpsc::Receiver<()>,
     flush_interval: StdDuration,
+    prune_interval: StdDuration,
 ) {
+    let mut last_prune = Instant::now();
     loop {
         match shutdown_rx.recv_timeout(flush_interval) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => {
@@ -405,7 +425,10 @@ fn flusher_loop(
             }
             Err(RecvTimeoutError::Timeout) => {
                 shared.flush_buffer();
-                shared.prune_old_events();
+                if last_prune.elapsed() >= prune_interval {
+                    shared.prune_old_events();
+                    last_prune = Instant::now();
+                }
             }
         }
     }
@@ -424,8 +447,10 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(CREATE_TABLE_SQL)?;
     ensure_audit_events_column(connection, "payload_method", "TEXT")?;
     ensure_audit_events_column(connection, "payload_matched_rule_id", "TEXT")?;
+    ensure_audit_events_column(connection, "timestamp_epoch_us", "INTEGER")?;
     backfill_payload_text_column(connection, "payload_method", "method")?;
     backfill_payload_text_column(connection, "payload_matched_rule_id", "matched_rule_id")?;
+    backfill_timestamp_epoch_us(connection)?;
     connection.execute_batch(CREATE_INDEXES_SQL)
 }
 
@@ -479,18 +504,27 @@ fn backfill_payload_text_column(
     Ok(())
 }
 
-fn retention_cutoff(retention_days: u32) -> String {
-    let cutoff = OffsetDateTime::now_utc() - TimeDuration::days(i64::from(retention_days));
-    cutoff
-        .format(&Rfc3339)
-        .expect("UTC retention cutoff should format as RFC 3339")
+fn backfill_timestamp_epoch_us(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute(BACKFILL_TIMESTAMP_EPOCH_US_SQL, [])?;
+    Ok(())
 }
 
-fn prune_retained_events(connection: &Connection, cutoff: &str) -> rusqlite::Result<usize> {
-    // Audit timestamps and retention cutoffs are written by this codebase's
-    // RFC3339 formatter. SQLite returns NULL for malformed timestamps, so rows
-    // this sink did not write are not silently matched by the retention delete.
-    connection.execute(DELETE_RETAINED_EVENTS_SQL, params![cutoff])
+fn epoch_micros(timestamp: &str) -> Option<i64> {
+    OffsetDateTime::parse(timestamp, &Rfc3339)
+        .ok()
+        .and_then(|datetime| i64::try_from(datetime.unix_timestamp_nanos() / 1_000).ok())
+}
+
+fn retention_cutoff_epoch_us(retention_days: u32) -> i64 {
+    let cutoff = OffsetDateTime::now_utc() - TimeDuration::days(i64::from(retention_days));
+    // `OffsetDateTime`'s supported range fits comfortably in epoch microseconds.
+    (cutoff.unix_timestamp_nanos() / 1_000) as i64
+}
+
+fn prune_retained_events(connection: &Connection, cutoff_epoch_us: i64) -> rusqlite::Result<usize> {
+    // NULL epochs belong to malformed or externally inserted timestamps. They
+    // do not match the range predicate and retain the previous prune semantics.
+    connection.execute(DELETE_RETAINED_EVENTS_SQL, params![cutoff_epoch_us])
 }
 
 fn payload_status(payload: &Value) -> Option<i64> {
@@ -591,6 +625,21 @@ mod tests {
     }
 
     #[test]
+    fn fresh_schema_includes_timestamp_epoch_index() {
+        let db = TempDb::new("schema-timestamp-epoch");
+
+        drop(sqlite_sink(&db.path, None));
+
+        let connection = Connection::open(&db.path).expect("test database should open");
+        assert!(column_exists(&connection, "timestamp_epoch_us"));
+        assert!(index_exists(
+            &connection,
+            "idx_audit_events_timestamp_epoch_us"
+        ));
+        assert!(index_exists(&connection, "idx_audit_events_timestamp"));
+    }
+
+    #[test]
     fn old_schema_migrates_promoted_rule_columns_without_losing_rows() {
         let db = TempDb::new("schema-migration-rule-columns");
         create_old_schema(&db.path);
@@ -601,9 +650,14 @@ mod tests {
         assert_eq!(row_count(&db.path), 1);
         assert!(column_exists(&connection, "payload_method"));
         assert!(column_exists(&connection, "payload_matched_rule_id"));
+        assert!(column_exists(&connection, "timestamp_epoch_us"));
         assert!(index_exists(
             &connection,
             "idx_audit_events_payload_matched_rule_id"
+        ));
+        assert!(index_exists(
+            &connection,
+            "idx_audit_events_timestamp_epoch_us"
         ));
 
         let promoted = connection
@@ -629,6 +683,74 @@ mod tests {
         assert_eq!(promoted.1.as_deref(), Some("GET"));
         assert_eq!(promoted.2.as_deref(), Some("allow-data"));
         assert!(promoted.3.contains(r#""matched_rule_id":"allow-data""#));
+        assert!(event_epoch(&connection, "old-event").is_some());
+    }
+
+    #[test]
+    fn timestamp_epoch_migration_and_exact_inserts_are_ordered_and_idempotent() {
+        let db = TempDb::new("schema-migration-timestamp-epoch");
+        create_old_schema(&db.path);
+
+        {
+            let sink = sqlite_sink(&db.path, None);
+            let mut event = test_event("audit.new-epoch", json!({ "test": true }));
+            event.event_id = "new-event".to_owned();
+            event.timestamp = "2026-01-01T00:00:00.5Z".to_owned();
+            sink.emit(&event);
+            sink.flush_for_test();
+        }
+
+        let before_reopen = {
+            let connection = Connection::open(&db.path).expect("test database should open");
+            let old_epoch = event_epoch(&connection, "old-event")
+                .expect("legacy timestamp should be backfilled");
+            let new_epoch = event_epoch(&connection, "new-event")
+                .expect("new timestamp should be stored at insert time");
+            assert_eq!(
+                new_epoch,
+                epoch_micros("2026-01-01T00:00:00.5Z").expect("new timestamp should parse")
+            );
+            assert!(old_epoch < new_epoch);
+            (old_epoch, new_epoch)
+        };
+
+        drop(sqlite_sink(&db.path, None));
+
+        let connection = Connection::open(&db.path).expect("test database should open");
+        assert_eq!(
+            (
+                event_epoch(&connection, "old-event").expect("legacy epoch should survive reopen"),
+                event_epoch(&connection, "new-event").expect("new epoch should survive reopen"),
+            ),
+            before_reopen
+        );
+    }
+
+    #[test]
+    fn retention_prune_uses_timestamp_epoch_index() {
+        let db = TempDb::new("retention-index-plan");
+        drop(sqlite_sink(&db.path, None));
+
+        let connection = Connection::open(&db.path).expect("test database should open");
+        let explain_sql = format!("EXPLAIN QUERY PLAN {DELETE_RETAINED_EVENTS_SQL}");
+        let mut statement = connection
+            .prepare(&explain_sql)
+            .expect("retention query plan should prepare");
+        let plan = statement
+            .query_map(params![0_i64], |row| row.get::<_, String>(3))
+            .expect("retention query plan should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("retention query plan should read");
+        let plan = plan.join("\n");
+
+        assert!(
+            plan.contains("USING INDEX idx_audit_events_timestamp_epoch_us"),
+            "unexpected retention query plan: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN audit_events"),
+            "retention query unexpectedly scans the table: {plan}"
+        );
     }
 
     #[test]
@@ -649,7 +771,12 @@ mod tests {
     #[test]
     fn retention_pruning_deletes_old_rows_and_keeps_new_rows() {
         let db = TempDb::new("retention");
-        let _sink = sqlite_sink_with_interval(&db.path, Some(1), StdDuration::from_millis(20));
+        let _sink = sqlite_sink_with_intervals(
+            &db.path,
+            Some(1),
+            StdDuration::from_millis(20),
+            StdDuration::from_millis(20),
+        );
         insert_raw_event(&db.path, "old-event", "2000-01-01T00:00:00Z");
         insert_raw_event(&db.path, "new-event", "2999-01-01T00:00:00Z");
 
@@ -673,7 +800,8 @@ mod tests {
         insert_raw_event(&db.path, "later-event", "2024-06-01T12:00:01Z");
 
         let connection = Connection::open(&db.path).expect("test database should open");
-        let deleted = prune_retained_events(&connection, "2024-06-01T12:00:00Z")
+        let cutoff_epoch_us = epoch_micros("2024-06-01T12:00:00Z").expect("cutoff should parse");
+        let deleted = prune_retained_events(&connection, cutoff_epoch_us)
             .expect("retention prune should run");
 
         assert_eq!(deleted, 1);
@@ -688,34 +816,59 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_julianday_parses_audit_timestamp_variants() {
-        let connection = Connection::open_in_memory().expect("in-memory database should open");
-        let cutoff = julianday(&connection, "2024-06-01T12:00:00Z");
-
-        for timestamp in [
+    fn epoch_micros_orders_audit_timestamp_variants() {
+        let epochs = [
             "2024-06-01T12:00:00Z",
-            "2024-06-01T12:00:00.5Z",
             "2024-06-01T12:00:00.123Z",
-            "2024-06-01T12:00:00.4438138Z",
             "2024-06-01T12:00:00.123456789Z",
-        ] {
-            assert!(
-                julianday(&connection, timestamp).is_finite(),
-                "{timestamp} should parse as a SQLite julianday"
-            );
-        }
+            "2024-06-01T12:00:00.4438138Z",
+            "2024-06-01T12:00:00.5Z",
+        ]
+        .map(|timestamp| epoch_micros(timestamp).expect("timestamp should parse"));
 
-        for timestamp in [
-            "2024-06-01T12:00:00.5Z",
-            "2024-06-01T12:00:00.123Z",
-            "2024-06-01T12:00:00.4438138Z",
-            "2024-06-01T12:00:00.123456789Z",
-        ] {
-            assert!(
-                julianday(&connection, timestamp) > cutoff,
-                "{timestamp} should compare newer than the whole-second cutoff"
-            );
+        for pair in epochs.windows(2) {
+            assert!(pair[0] < pair[1], "epoch microseconds should be ordered");
         }
+    }
+
+    #[test]
+    fn malformed_timestamp_epoch_stays_null_and_is_not_pruned() {
+        let db = TempDb::new("retention-malformed-timestamp");
+        drop(sqlite_sink(&db.path, None));
+        insert_raw_event(&db.path, "malformed-event", "not-a-timestamp");
+
+        let connection = Connection::open(&db.path).expect("test database should open");
+        assert_eq!(event_epoch(&connection, "malformed-event"), None);
+        assert_eq!(
+            prune_retained_events(&connection, i64::MAX)
+                .expect("retention prune should preserve NULL epochs"),
+            0
+        );
+        assert_eq!(event_ids(&db.path), vec!["malformed-event".to_owned()]);
+    }
+
+    #[test]
+    fn prune_waits_for_prune_interval_even_when_flush_ticks_fire() {
+        let db = TempDb::new("retention-cadence");
+        let sink = sqlite_sink_with_intervals(
+            &db.path,
+            Some(1),
+            StdDuration::from_millis(10),
+            StdDuration::from_secs(5),
+        );
+        insert_raw_event(&db.path, "old-event", "2000-01-01T00:00:00Z");
+
+        std::thread::sleep(StdDuration::from_millis(100));
+        assert_eq!(event_ids(&db.path), vec!["old-event".to_owned()]);
+        drop(sink);
+
+        let _fast_prune = sqlite_sink_with_intervals(
+            &db.path,
+            Some(1),
+            StdDuration::from_millis(10),
+            StdDuration::from_millis(10),
+        );
+        assert_eventually(StdDuration::from_secs(1), || event_ids(&db.path).is_empty());
     }
 
     #[test]
@@ -791,12 +944,22 @@ mod tests {
         retention_days: Option<u32>,
         flush_interval: StdDuration,
     ) -> SqliteSink {
-        SqliteSink::new_with_flush_interval(
+        sqlite_sink_with_intervals(path, retention_days, flush_interval, SQLITE_PRUNE_INTERVAL)
+    }
+
+    fn sqlite_sink_with_intervals(
+        path: &Path,
+        retention_days: Option<u32>,
+        flush_interval: StdDuration,
+        prune_interval: StdDuration,
+    ) -> SqliteSink {
+        SqliteSink::new_with_intervals(
             SqliteSinkConfig {
                 path: path.to_owned(),
                 retention_days,
             },
             flush_interval,
+            prune_interval,
         )
         .expect("SQLite sink should build")
     }
@@ -833,11 +996,21 @@ mod tests {
                     event_id,
                     event_type,
                     timestamp,
+                    timestamp_epoch_us,
                     schema_version,
                     request_id,
                     source_ip,
                     payload_json
-                ) VALUES (?1, 'audit.raw', ?2, '0.1.0', 'request-raw', 'internal', '{}')
+                ) VALUES (
+                    ?1,
+                    'audit.raw',
+                    ?2,
+                    CAST(ROUND((julianday(?2) - 2440587.5) * 86400000000.0) AS INTEGER),
+                    '0.1.0',
+                    'request-raw',
+                    'internal',
+                    '{}'
+                )
                 "#,
                 params![event_id, timestamp],
             )
@@ -913,13 +1086,14 @@ mod tests {
             .expect("event_id rows should read")
     }
 
-    fn julianday(connection: &Connection, timestamp: &str) -> f64 {
+    fn event_epoch(connection: &Connection, event_id: &str) -> Option<i64> {
         connection
-            .query_row("SELECT julianday(?1)", params![timestamp], |row| {
-                row.get::<_, Option<f64>>(0)
-            })
-            .expect("julianday query should run")
-            .expect("timestamp should parse as a SQLite julianday")
+            .query_row(
+                "SELECT timestamp_epoch_us FROM audit_events WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .expect("timestamp epoch should query")
     }
 
     fn query_payload_columns(
