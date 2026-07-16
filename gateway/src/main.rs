@@ -289,6 +289,39 @@ impl GatewayRoutes {
     }
 }
 
+fn warn_on_mcp_exempt_prefix_overlaps(routes: &GatewayRoutes, config: &config::Config) {
+    for mcp_path in &routes.mcp_route_paths {
+        for (exempt_list, exempt_paths) in [
+            ("AUTH_EXEMPT_PATHS", &config.auth_exempt_paths),
+            ("RBAC_EXEMPT_PATHS", &config.rbac_exempt_paths),
+        ] {
+            if let Some(exempt_prefix) = mcp_route_covering_exempt_prefix(mcp_path, exempt_paths) {
+                tracing::warn!(
+                    mcp_route = %mcp_path,
+                    exempt_prefix = %exempt_prefix,
+                    exempt_list,
+                    "MCP route falls under an exempt prefix; authentication and authorization are \
+                     still enforced on the MCP route, but the overlapping configuration is likely \
+                     unintended"
+                );
+            }
+        }
+    }
+}
+
+fn mcp_route_covering_exempt_prefix<'a>(
+    mcp_path: &str,
+    exempt_paths: &'a [String],
+) -> Option<&'a str> {
+    exempt_paths
+        .iter()
+        .find(|exempt_path| {
+            exempt_path.as_str() != mcp_path
+                && path_match::path_prefix_matches(mcp_path, exempt_path)
+        })
+        .map(String::as_str)
+}
+
 impl AdminRoutes {
     fn from_prefix(admin_prefix: &str) -> Self {
         let api_prefix = format!("/v1{admin_prefix}");
@@ -1319,6 +1352,7 @@ fn gateway_app_with_process_started_at(
         proxy.spawn_upstream_health_checks();
     }
     let routes = GatewayRoutes::from_config(&config);
+    warn_on_mcp_exempt_prefix_overlaps(&routes, &config);
     let service_token_store = config
         .service_token_sqlite_path
         .as_deref()
@@ -11483,6 +11517,73 @@ mod tests {
         assert_eq!(body["id"], json!(1));
         assert_eq!(body["result"]["serverInfo"]["name"], json!("greengateway"));
         assert_eq!(body["result"]["capabilities"]["tools"], json!({}));
+    }
+
+    #[test]
+    fn mcp_exempt_overlap_detection_is_segment_aware_and_ignores_exact_entries() {
+        let covering = vec!["/admin".to_owned(), "/other".to_owned()];
+        assert_eq!(
+            mcp_route_covering_exempt_prefix("/admin/mcp", &covering),
+            Some("/admin")
+        );
+
+        let exact = vec!["/admin/mcp".to_owned()];
+        assert_eq!(mcp_route_covering_exempt_prefix("/admin/mcp", &exact), None);
+
+        let lookalike = vec!["/admin-mcp".to_owned(), "/administrator".to_owned()];
+        assert_eq!(
+            mcp_route_covering_exempt_prefix("/admin/mcp", &lookalike),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_alias_under_admin_exempt_prefix_rejects_junk_bearer() {
+        let harness = mcp_test_harness_with_public_url(
+            &["admin"],
+            test_audit_log(),
+            "https://gateway.example.test/admin",
+        )
+        .await;
+
+        let rejected = harness
+            .router
+            .clone()
+            .oneshot(mcp_request_to(
+                "/admin/mcp",
+                Some("junk"),
+                1,
+                "initialize",
+                Some(mcp_initialize_params()),
+                "mcp-admin-alias-junk-bearer",
+            ))
+            .await
+            .expect("MCP alias request should complete");
+
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            json_body(rejected).await,
+            json!({ "error": "unauthorized" })
+        );
+
+        let allowed = harness
+            .router
+            .oneshot(mcp_request_to(
+                "/admin/mcp",
+                Some(&harness.admin_token),
+                2,
+                "initialize",
+                Some(mcp_initialize_params()),
+                "mcp-admin-alias-valid-bearer",
+            ))
+            .await
+            .expect("authenticated MCP alias request should complete");
+
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(allowed).await["result"]["serverInfo"]["name"],
+            json!("greengateway")
+        );
     }
 
     #[tokio::test]

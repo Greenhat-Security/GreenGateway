@@ -20,7 +20,7 @@ use http::{
 };
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::{auth::protected_resource, config::Config};
 
 use super::bearer::bearer_token;
 
@@ -31,6 +31,7 @@ pub struct CsrfConfig {
     pub cookie_domain: Option<String>,
     pub header_name: String,
     pub exempt_paths: Vec<String>,
+    pub mcp_route_paths: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -46,6 +47,7 @@ impl CsrfConfig {
             cookie_domain: config.csrf_cookie_domain.clone(),
             header_name: config.csrf_header_name.clone(),
             exempt_paths: config.csrf_exempt_paths.clone(),
+            mcp_route_paths: protected_resource::mcp_route_paths(config),
         }
     }
 }
@@ -60,10 +62,15 @@ pub async fn csrf_middleware(
     }
 
     let path = request.uri().path();
-    if config
-        .exempt_paths
+    let is_mcp_route = config
+        .mcp_route_paths
         .iter()
-        .any(|exempt_path| exempt_path == path)
+        .any(|route_path| route_path == path);
+    if !is_mcp_route
+        && config
+            .exempt_paths
+            .iter()
+            .any(|exempt_path| exempt_path == path)
     {
         return next.run(request).await;
     }
@@ -201,6 +208,7 @@ mod tests {
             cookie_domain: None,
             header_name: "x-csrf-token".to_owned(),
             exempt_paths: vec!["/exempt".to_owned()],
+            mcp_route_paths: vec![protected_resource::MCP_RESOURCE_PATH.to_owned()],
         }
     }
 
@@ -212,6 +220,7 @@ mod tests {
         Router::new()
             .route("/", get(ok).post(ok))
             .route("/exempt", get(ok).post(ok))
+            .route("/mcp", get(ok).post(ok))
             .layer(from_fn_with_state(config, csrf_middleware))
     }
 
@@ -379,5 +388,26 @@ mod tests {
             .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mcp_route_is_not_csrf_exempt_even_if_listed() {
+        let mut config = test_config(true);
+        config
+            .exempt_paths
+            .push(protected_resource::MCP_RESOURCE_PATH.to_owned());
+
+        let response = test_router(config)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(protected_resource::MCP_RESOURCE_PATH)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("MCP request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

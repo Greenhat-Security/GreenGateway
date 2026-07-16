@@ -200,13 +200,14 @@ impl RbacState {
             .collect()
     }
 
+    fn is_mcp_route_path(&self, path: &str) -> bool {
+        self.mcp_route_paths
+            .iter()
+            .any(|route_path| path == route_path)
+    }
+
     fn policy_path_for_request<'a>(&'a self, path: &'a str) -> &'a str {
-        if path != protected_resource::MCP_RESOURCE_PATH
-            && self
-                .mcp_route_paths
-                .iter()
-                .any(|route_path| path == route_path)
-        {
+        if path != protected_resource::MCP_RESOURCE_PATH && self.is_mcp_route_path(path) {
             protected_resource::MCP_RESOURCE_PATH
         } else {
             path
@@ -483,6 +484,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     }
 
     if proxy_context.is_none()
+        && !state.is_mcp_route_path(path)
         && state
             .exempt_paths
             .iter()
@@ -1147,6 +1149,59 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_alias_under_exempt_prefix_is_not_exempt_from_rbac() {
+        let (state, capture) = test_state_with_mcp_route_paths(
+            test_policy(
+                DefaultAction::Deny,
+                &[("mcp-user", &["admin:mcp:use"])],
+                &[route(&["POST"], "/mcp", "admin:mcp:use")],
+            ),
+            &["/admin"],
+            &["/mcp", "/admin/mcp"],
+        );
+
+        let denied_response = test_router(state.clone(), None)
+            .oneshot(request(Method::POST, "/admin/mcp"))
+            .await
+            .expect("unauthenticated MCP alias request should complete");
+
+        assert_eq!(denied_response.status(), StatusCode::FORBIDDEN);
+        let denied = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(denied.payload["reason"], json!("missing_principal"));
+        assert_eq!(denied.payload["path"], json!("/admin/mcp"));
+        assert_eq!(denied.payload["path_prefix"], json!("/mcp"));
+        assert_eq!(denied.payload["permission"], json!("admin:mcp:use"));
+
+        let allowed_response = test_router(state, Some(test_principal(&["mcp-user"])))
+            .oneshot(request(Method::POST, "/admin/mcp"))
+            .await
+            .expect("authorized MCP alias request should complete");
+
+        assert_eq!(allowed_response.status(), StatusCode::OK);
+        let allowed = captured_event(&capture, AUTHZ_ALLOWED).await;
+        assert_eq!(allowed.payload["path"], json!("/admin/mcp"));
+        assert_eq!(allowed.payload["path_prefix"], json!("/mcp"));
+        assert_eq!(allowed.payload["permission"], json!("admin:mcp:use"));
+    }
+
+    #[tokio::test]
+    async fn mcp_alias_subpath_under_exempt_prefix_remains_exempt() {
+        let (state, capture) = test_state_with_mcp_route_paths(
+            test_policy(DefaultAction::Deny, &[], &[]),
+            &["/admin"],
+            &["/mcp", "/admin/mcp"],
+        );
+
+        let response = test_router(state, None)
+            .oneshot(request(Method::GET, "/admin/mcp/assets"))
+            .await
+            .expect("non-MCP subpath request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(capture.events().is_empty());
     }
 
     #[tokio::test]
