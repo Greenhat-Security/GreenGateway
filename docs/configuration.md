@@ -34,6 +34,8 @@ When `ADMIN_LOGIN_PROVIDER` is set, the admin OIDC login routes are also registe
 
 The default `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` include the effective `ADMIN_PREFIX` so the static admin UI shell can load before an operator pastes a token. When `ADMIN_LOGIN_PROVIDER` is set, they also include `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` so an unauthenticated browser can complete the login flow. Other admin APIs remain protected by authentication and endpoint-specific authorization checks.
 
+Leave `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` unset to keep these defaults synchronized with `ADMIN_PREFIX`. Setting either variable replaces its entire dynamic default; when changing `ADMIN_PREFIX`, update every explicit exempt list at the same time so a stale former admin prefix is not forwarded upstream without the corresponding security check.
+
 ### ADMIN_LOGIN_PROVIDER
 
 Optional name of the `AUTH_PROVIDERS` entry used for admin UI OIDC login.
@@ -549,9 +551,9 @@ This is deliberately separate from `DISCOVERY_SQLITE_PATH` and `AUDIT_SQLITE_PAT
 
 Comma-separated paths that bypass RBAC authorization.
 
-Default: `/health,/version,/metrics,/admin`
+Default: `/health,/version,/metrics` plus the effective `ADMIN_PREFIX` (for example, `/admin` with the default prefix).
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without RBAC permission checks and do not emit authz audit events.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without RBAC permission checks and do not emit authz audit events. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without RBAC; this warning is non-fatal because exempting an upstream path may be intentional.
 
 ### CORS_ALLOW_ORIGINS
 
@@ -661,9 +663,9 @@ Format and validation: must be a non-empty RFC 6265 cookie name. The cookie valu
 
 Comma-separated paths that bypass authentication.
 
-Default: `/health,/version,/metrics,/admin`
+Default: `/health,/version,/metrics` plus the effective `ADMIN_PREFIX` (for example, `/admin` with the default prefix).
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without credential extraction and do not emit auth audit events.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without credential extraction and do not emit auth audit events. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without authentication; this warning is non-fatal because exempting an upstream path may be intentional.
 
 ### AUTH_PROVIDERS
 

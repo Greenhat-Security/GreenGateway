@@ -493,8 +493,8 @@ The default Cloudflare deploy is intentionally conservative.
 | --- | --- |
 | `AUTH_ENABLED` | `true` |
 | `AUTH_MODE` | `required` |
-| `AUTH_EXEMPT_PATHS` | `/health,/version,/metrics,/admin` |
-| `RBAC_EXEMPT_PATHS` | `/health,/version,/metrics,/admin` |
+| `AUTH_EXEMPT_PATHS` | unset; defaults to probe paths plus the effective `ADMIN_PREFIX` |
+| `RBAC_EXEMPT_PATHS` | unset; defaults to probe paths plus the effective `ADMIN_PREFIX` |
 | `ADMIN_PREFIX` | `/admin` |
 | `EGRESS_DENY_PRIVATE_IPS` | `true` |
 | `UPSTREAM_URL` | blank by default |

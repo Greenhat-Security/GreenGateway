@@ -30,8 +30,6 @@
     "ADMIN_PREFIX": "/admin",
     "AUTH_ENABLED": "true",
     "AUTH_MODE": "required",
-    "AUTH_EXEMPT_PATHS": "/health,/version,/metrics,/admin",
-    "RBAC_EXEMPT_PATHS": "/health,/version,/metrics,/admin",
     "EGRESS_DENY_PRIVATE_IPS": "true",
     "GATEWAY_PUBLIC_URL": "",
     "UPSTREAM_URL": ""

@@ -28,6 +28,41 @@ fn env_example_matches_gateway_env_reads() {
 }
 
 #[test]
+fn env_example_exempt_paths_are_not_hardcoded() {
+    let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = gateway_root
+        .parent()
+        .expect("gateway crate should live directly under the repo root");
+    let path = repo_root.join(".env.example");
+    let contents = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+
+    for key in ["AUTH_EXEMPT_PATHS", "RBAC_EXEMPT_PATHS"] {
+        let assignment_prefix = format!("{key}=");
+        let active = contents
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(&assignment_prefix));
+        assert!(
+            active.is_none(),
+            "{key} must remain unset in .env.example so its dynamic ADMIN_PREFIX-aware default applies; found {active:?}"
+        );
+
+        let documented = contents.lines().map(str::trim).find_map(|line| {
+            line.strip_prefix('#')
+                .map(str::trim_start)
+                .filter(|line| line.starts_with(&assignment_prefix))
+        });
+        let documented =
+            documented.unwrap_or_else(|| panic!("{key} should retain a commented shape example"));
+        assert!(
+            !documented.split(',').any(|entry| entry.trim() == "/admin"),
+            "{key} shape example must not hardcode /admin: {documented}"
+        );
+    }
+}
+
+#[test]
 fn configuration_doc_matches_gateway_env_reads() {
     let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo_root = gateway_root
@@ -59,9 +94,13 @@ fn documented_env_vars(path: &Path) -> BTreeSet<String> {
         .filter_map(|line| {
             let line = line.trim();
 
-            if line.is_empty() || line.starts_with('#') {
+            if line.is_empty() {
                 return None;
             }
+
+            // A commented `#KEY=value` assignment still documents a supported
+            // variable while keeping it unset so runtime defaults apply.
+            let line = line.strip_prefix('#').unwrap_or(line).trim_start();
 
             let (key, _) = line.split_once('=')?;
             let key = key.trim();

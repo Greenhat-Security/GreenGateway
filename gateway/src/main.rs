@@ -287,6 +287,16 @@ impl GatewayRoutes {
                 .iter()
                 .any(|owned| path_match::path_prefix_matches(path, owned))
     }
+
+    /// Returns exempt-list entries that do not fall under a gateway-owned
+    /// path. These entries bypass auth/RBAC before reaching proxy fallback.
+    fn unowned_exempt_paths<'a>(&self, exempt_paths: &'a [String]) -> Vec<&'a str> {
+        exempt_paths
+            .iter()
+            .filter(|path| !self.is_gateway_owned_path(path))
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 impl AdminRoutes {
@@ -1314,6 +1324,20 @@ fn gateway_app_with_process_started_at(
         proxy.spawn_upstream_health_checks();
     }
     let routes = GatewayRoutes::from_config(&config);
+    for (var, paths) in [
+        ("AUTH_EXEMPT_PATHS", config.auth_exempt_paths.as_slice()),
+        ("RBAC_EXEMPT_PATHS", config.rbac_exempt_paths.as_slice()),
+    ] {
+        let unowned = routes.unowned_exempt_paths(paths);
+        if !unowned.is_empty() {
+            tracing::warn!(
+                var,
+                admin_prefix = %config.admin_prefix,
+                paths = ?unowned,
+                "exempt paths are not gateway-owned; these paths bypass auth/RBAC and can be forwarded upstream; confirm this is intended or align them with ADMIN_PREFIX"
+            );
+        }
+    }
     let service_token_store = config
         .service_token_sqlite_path
         .as_deref()
@@ -14082,6 +14106,46 @@ mod tests {
                 .join()
                 .expect("cookie-session introspection server should finish"),
             1
+        );
+    }
+
+    #[test]
+    fn unowned_exempt_paths_flags_stale_admin_prefix() {
+        let mut config = test_config(Vec::new());
+        config.admin_prefix = "/ops".to_owned();
+        let routes = GatewayRoutes::from_config(&config);
+        let exempt_paths = vec!["/health".to_owned(), "/admin".to_owned()];
+
+        assert_eq!(routes.unowned_exempt_paths(&exempt_paths), vec!["/admin"]);
+    }
+
+    #[test]
+    fn unowned_exempt_paths_are_empty_for_owned_paths() {
+        let config = test_config(Vec::new());
+        let routes = GatewayRoutes::from_config(&config);
+        let exempt_paths = vec![
+            "/health".to_owned(),
+            "/admin".to_owned(),
+            "/admin/assets/app.js".to_owned(),
+            "/v1/admin/auth/login".to_owned(),
+        ];
+
+        assert!(routes.unowned_exempt_paths(&exempt_paths).is_empty());
+    }
+
+    #[test]
+    fn unowned_exempt_paths_respect_custom_admin_api_prefix() {
+        let mut config = test_config(Vec::new());
+        config.admin_prefix = "/ops".to_owned();
+        let routes = GatewayRoutes::from_config(&config);
+        let exempt_paths = vec![
+            "/v1/ops/auth/login".to_owned(),
+            "/v1/admin/auth/login".to_owned(),
+        ];
+
+        assert_eq!(
+            routes.unowned_exempt_paths(&exempt_paths),
+            vec!["/v1/admin/auth/login"]
         );
     }
 
