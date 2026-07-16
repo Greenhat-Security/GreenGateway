@@ -14,7 +14,8 @@
 //! increase call counts but not distinct principal counts. Latency percentiles
 //! are computed from a bounded deterministic reservoir sample, which keeps
 //! memory bounded while making percentiles approximate once an endpoint has more than
-//! `LATENCY_SAMPLE_LIMIT` observations.
+//! `LATENCY_SAMPLE_LIMIT` observations. The number of distinct endpoint aggregates
+//! is also bounded by configuration with approximate-LRU eviction.
 //!
 //! Known limitation: exact distinct-principal tracking is unbounded. Each
 //! distinct identity tuple observed for a `(method, endpoint_template)` is kept
@@ -42,7 +43,7 @@ use crate::{
     audit::{event, redact::hash_args, AuditEvent, AuditEventSender, AuditSink},
     auth::principal::canonical_issuer,
     discovery::{
-        path_template::{template_stateless, PathTemplateLearner},
+        path_template::{template_stateless, PathTemplateConfig, PathTemplateLearner},
         signals::{
             self, EndpointSignalObservation, ErrorRateSpikeSignalObservation, NewSignal,
             PrincipalNewToEndpointSignalObservation, SchemaMismatchSignalObservation,
@@ -57,6 +58,10 @@ const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
 const AGGREGATOR_BATCH_SIZE: usize = 200;
 const AGGREGATOR_FLUSH_INTERVAL: StdDuration = StdDuration::from_millis(250);
 const LATENCY_SAMPLE_LIMIT: usize = 1024;
+/// Evict a fraction of the least-recently-observed endpoint aggregates at a
+/// time so admitting attacker-controlled novel paths does not rescan the map
+/// on every observation.
+const ENDPOINT_EVICTION_BATCH_DIVISOR: usize = 16;
 const PAYLOAD_SHAPE_SAMPLE_LIMIT: usize = 128;
 const ID_PLACEHOLDER: &str = "{id}";
 const PARAM_PLACEHOLDER: &str = "{param}";
@@ -231,6 +236,7 @@ ON CONFLICT(method, endpoint_template) DO UPDATE SET
 pub struct EndpointAggregatorSinkConfig {
     pub path: PathBuf,
     pub payload_capture_enabled: bool,
+    pub endpoint_limit: usize,
     pub signal_event_sender: Option<AuditEventSender>,
     pub signal_detector_config: SignalDetectorConfig,
 }
@@ -406,6 +412,7 @@ impl EndpointAggregatorSink {
         let state = AggregatorState::load(
             &connection,
             config.payload_capture_enabled,
+            config.endpoint_limit,
             config.signal_detector_config,
         )
         .map_err(|source| EndpointAggregatorSinkError::Load {
@@ -617,6 +624,7 @@ impl EndpointKey {
 #[derive(Clone, Debug)]
 struct EndpointAggregate {
     key: EndpointKey,
+    last_access_seq: u64,
     first_seen: String,
     last_seen: String,
     call_count: u64,
@@ -643,6 +651,7 @@ impl EndpointAggregate {
     fn new(key: EndpointKey, timestamp: &str) -> Self {
         Self {
             key,
+            last_access_seq: 0,
             first_seen: timestamp.to_owned(),
             last_seen: timestamp.to_owned(),
             call_count: 0,
@@ -719,6 +728,7 @@ impl EndpointAggregate {
     }
 
     fn merge_from(&mut self, other: EndpointAggregate) {
+        self.last_access_seq = self.last_access_seq.max(other.last_access_seq);
         if timestamp_before(&other.first_seen, &self.first_seen) {
             self.first_seen = other.first_seen;
         }
@@ -1145,6 +1155,10 @@ impl PrincipalSeen {
 #[derive(Debug, Default)]
 struct AggregatorState {
     payload_capture_enabled: bool,
+    /// Maximum number of endpoint aggregates retained. Zero is reserved for
+    /// internal callers and tests that explicitly need unbounded behavior.
+    endpoint_limit: usize,
+    access_seq: u64,
     signal_evaluator: SignalEvaluator,
     learner: PathTemplateLearner,
     aggregates: HashMap<EndpointKey, EndpointAggregate>,
@@ -1159,11 +1173,17 @@ impl AggregatorState {
     fn load(
         connection: &Connection,
         payload_capture_enabled: bool,
+        endpoint_limit: usize,
         signal_detector_config: SignalDetectorConfig,
     ) -> Result<Self, EndpointAggregatorLoadError> {
         let mut state = Self {
             payload_capture_enabled,
+            endpoint_limit,
             signal_evaluator: SignalEvaluator::new(signal_detector_config),
+            learner: PathTemplateLearner::with_config(PathTemplateConfig {
+                max_groups: endpoint_limit,
+                ..PathTemplateConfig::default()
+            }),
             ..Self::default()
         };
 
@@ -1174,6 +1194,7 @@ impl AggregatorState {
                 key.clone(),
                 EndpointAggregate {
                     key,
+                    last_access_seq: 0,
                     first_seen: row.first_seen,
                     last_seen: row.last_seen,
                     call_count: non_negative_i64_to_u64(row.call_count),
@@ -1328,7 +1349,87 @@ impl AggregatorState {
             }
         }
 
+        state.reseed_access_order_by_last_seen();
+        state.evict_over_capacity();
+
         Ok(state)
+    }
+
+    /// Reconstruct an approximate access order after restart from persisted
+    /// `last_seen` timestamps. Ties are resolved by endpoint key so trimming is
+    /// deterministic even when several rows share a timestamp.
+    fn reseed_access_order_by_last_seen(&mut self) {
+        let mut access_order = self
+            .aggregates
+            .values()
+            .map(|aggregate| (aggregate.last_seen.clone(), aggregate.key.clone()))
+            .collect::<Vec<_>>();
+        access_order.sort_by(|(left_seen, left_key), (right_seen, right_key)| {
+            compare_timestamps(left_seen, right_seen)
+                .then_with(|| left_key.method.cmp(&right_key.method))
+                .then_with(|| left_key.endpoint_template.cmp(&right_key.endpoint_template))
+        });
+
+        self.access_seq = 0;
+        for (_, key) in access_order {
+            let access_seq = self.next_access_seq();
+            if let Some(aggregate) = self.aggregates.get_mut(&key) {
+                aggregate.last_access_seq = access_seq;
+            }
+        }
+    }
+
+    fn next_access_seq(&mut self) -> u64 {
+        self.access_seq = self.access_seq.saturating_add(1);
+        self.access_seq
+    }
+
+    /// Trim a pre-existing database all the way down to the configured cap.
+    /// Every removed key is queued for deletion on the first normal flush.
+    fn evict_over_capacity(&mut self) {
+        if self.endpoint_limit == 0 || self.aggregates.len() <= self.endpoint_limit {
+            return;
+        }
+
+        let excess = self.aggregates.len() - self.endpoint_limit;
+        self.evict_least_recent(excess);
+    }
+
+    /// Free a batch before admitting a new endpoint. If state somehow starts
+    /// above its cap, remove the complete excess plus the admission slot so the
+    /// invariant still holds after insertion.
+    fn evict_for_admission(&mut self) {
+        if self.endpoint_limit == 0 || self.aggregates.len() < self.endpoint_limit {
+            return;
+        }
+
+        let batch_size = (self.endpoint_limit / ENDPOINT_EVICTION_BATCH_DIVISOR).max(1);
+        let required = self
+            .aggregates
+            .len()
+            .saturating_sub(self.endpoint_limit)
+            .saturating_add(1);
+        self.evict_least_recent(batch_size.max(required));
+    }
+
+    fn evict_least_recent(&mut self, count: usize) {
+        let mut by_access = self
+            .aggregates
+            .values()
+            .map(|aggregate| (aggregate.last_access_seq, aggregate.key.clone()))
+            .collect::<Vec<_>>();
+        by_access.sort_unstable_by(|(left_seq, left_key), (right_seq, right_key)| {
+            left_seq
+                .cmp(right_seq)
+                .then_with(|| left_key.method.cmp(&right_key.method))
+                .then_with(|| left_key.endpoint_template.cmp(&right_key.endpoint_template))
+        });
+
+        for (_, key) in by_access.into_iter().take(count) {
+            self.aggregates.remove(&key);
+            self.dirty_keys.remove(&key);
+            self.deleted_keys.insert(key);
+        }
     }
 
     fn observe(&mut self, observation: ObservedRequest) -> bool {
@@ -1338,12 +1439,17 @@ impl AggregatorState {
             .unwrap_or_else(|| self.endpoint_template(&observation.method, &observation.path));
         let key = EndpointKey::new(observation.method.clone(), endpoint_template);
         let is_new_endpoint = !self.aggregates.contains_key(&key);
+        if is_new_endpoint {
+            self.evict_for_admission();
+        }
+        let access_seq = self.next_access_seq();
         let principal = observation.principal.as_ref();
         let observation_effects = {
             let aggregate = self
                 .aggregates
                 .entry(key.clone())
                 .or_insert_with(|| EndpointAggregate::new(key.clone(), &observation.timestamp));
+            aggregate.last_access_seq = access_seq;
             aggregate.observe(&observation)
         };
 
@@ -3080,6 +3186,126 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_cardinality_is_capped_with_eviction() {
+        let db = TempDb::new("endpoint-cardinality-cap");
+        let sink = aggregator_sink_with_endpoint_limit(&db.path, 8);
+
+        for index in 0..100 {
+            sink.emit(&observed_event(
+                "GET",
+                &format!("/rnd-{index}"),
+                404,
+                1,
+                None,
+                timestamp_at(index),
+            ));
+
+            assert!(sink.shared.state_guard().aggregates.len() <= 8);
+        }
+
+        sink.flush_for_test();
+        assert!(aggregate_counts(&db.path).len() <= 8);
+    }
+
+    #[test]
+    fn recently_observed_endpoints_survive_cardinality_eviction() {
+        let db = TempDb::new("endpoint-cardinality-lru");
+        let sink = aggregator_sink_with_endpoint_limit(&db.path, 8);
+        sink.emit(&observed_event(
+            "GET",
+            "/keep",
+            200,
+            1,
+            None,
+            timestamp_at(0),
+        ));
+
+        for index in 1..=50 {
+            sink.emit(&observed_event(
+                "GET",
+                &format!("/rnd-{index}"),
+                404,
+                1,
+                None,
+                timestamp_at(index),
+            ));
+            if index % 5 == 0 {
+                sink.emit(&observed_event(
+                    "GET",
+                    "/keep",
+                    200,
+                    1,
+                    None,
+                    timestamp_at(index + 100),
+                ));
+            }
+        }
+
+        sink.flush_for_test();
+        let aggregates = aggregate_counts(&db.path);
+        assert!(aggregates.len() <= 8);
+        assert!(aggregates.iter().any(|(method, template, call_count)| {
+            method == "GET" && template == "/keep" && *call_count == 11
+        }));
+    }
+
+    #[test]
+    fn load_trims_persisted_aggregates_over_capacity() {
+        let db = TempDb::new("endpoint-cardinality-load-trim");
+        {
+            let sink = aggregator_sink_with_endpoint_limit(&db.path, 0);
+            for index in 0..20 {
+                sink.emit(&observed_event(
+                    "GET",
+                    &format!("/persisted-{index}"),
+                    200,
+                    1,
+                    Some("user-1"),
+                    timestamp_at(index),
+                ));
+            }
+            sink.flush_for_test();
+            assert_eq!(aggregate_counts(&db.path).len(), 20);
+        }
+
+        let sink = aggregator_sink_with_endpoint_limit(&db.path, 5);
+        {
+            let state = sink.shared.state_guard();
+            assert_eq!(state.aggregates.len(), 5);
+            assert_eq!(state.deleted_keys.len(), 15);
+        }
+        sink.flush_for_test();
+
+        let aggregates = aggregate_counts(&db.path);
+        assert_eq!(aggregates.len(), 5);
+        for index in 15..20 {
+            assert!(aggregates.iter().any(|(method, template, _)| {
+                method == "GET" && template == &format!("/persisted-{index}")
+            }));
+        }
+    }
+
+    #[test]
+    fn unlimited_endpoint_limit_zero_disables_cap() {
+        let db = TempDb::new("endpoint-cardinality-unlimited");
+        let sink = aggregator_sink_with_endpoint_limit(&db.path, 0);
+
+        for index in 0..30 {
+            sink.emit(&observed_event(
+                "GET",
+                &format!("/rnd-{index}"),
+                404,
+                1,
+                None,
+                timestamp_at(index),
+            ));
+        }
+
+        sink.flush_for_test();
+        assert_eq!(aggregate_counts(&db.path).len(), 30);
+    }
+
+    #[test]
     fn routing_contexts_preserve_host_and_upstream_variants() {
         let db = TempDb::new("routing-contexts");
         let sink = aggregator_sink(&db.path);
@@ -4541,6 +4767,23 @@ mod tests {
         aggregator_sink_with_interval(path, StdDuration::from_secs(60))
     }
 
+    fn aggregator_sink_with_endpoint_limit(
+        path: &Path,
+        endpoint_limit: usize,
+    ) -> EndpointAggregatorSink {
+        EndpointAggregatorSink::new_with_flush_interval(
+            EndpointAggregatorSinkConfig {
+                path: path.to_owned(),
+                payload_capture_enabled: false,
+                endpoint_limit,
+                signal_event_sender: None,
+                signal_detector_config: SignalDetectorConfig::default(),
+            },
+            StdDuration::from_secs(60),
+        )
+        .expect("aggregator sink should build")
+    }
+
     fn aggregator_sink_with_signal_config(
         path: &Path,
         signal_detector_config: SignalDetectorConfig,
@@ -4549,6 +4792,7 @@ mod tests {
             EndpointAggregatorSinkConfig {
                 path: path.to_owned(),
                 payload_capture_enabled: false,
+                endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
                 signal_event_sender: None,
                 signal_detector_config,
             },
@@ -4565,6 +4809,7 @@ mod tests {
             EndpointAggregatorSinkConfig {
                 path: path.to_owned(),
                 payload_capture_enabled: false,
+                endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
                 signal_event_sender: None,
                 signal_detector_config: SignalDetectorConfig::default(),
             },
@@ -4578,6 +4823,7 @@ mod tests {
             EndpointAggregatorSinkConfig {
                 path: path.to_owned(),
                 payload_capture_enabled: true,
+                endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
                 signal_event_sender: None,
                 signal_detector_config: SignalDetectorConfig::default(),
             },

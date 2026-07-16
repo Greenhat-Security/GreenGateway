@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+- Bound discovery endpoint-template cardinality with approximate-LRU eviction
+  (`DISCOVERY_ENDPOINT_LIMIT`, default `10000`) to prevent unauthenticated
+  storage and memory growth from attacker-controlled request paths (F8).
+
 ## [1.0.0] - 2026-07-15
 
 Phase 6 (native MCP support) is complete and included in this release. See the

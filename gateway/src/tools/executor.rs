@@ -2006,6 +2006,7 @@ mod tests {
         let aggregator = EndpointAggregatorSink::new(EndpointAggregatorSinkConfig {
             path: db.path.clone(),
             payload_capture_enabled: false,
+            endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
             signal_event_sender: None,
             signal_detector_config: Default::default(),
         })
@@ -2170,6 +2171,7 @@ mod tests {
             EndpointAggregatorSink::new(EndpointAggregatorSinkConfig {
                 path: db.path.clone(),
                 payload_capture_enabled: false,
+                endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
                 signal_event_sender: None,
                 signal_detector_config: Default::default(),
             })
@@ -3001,6 +3003,7 @@ mod tests {
             EndpointAggregatorSink::new(EndpointAggregatorSinkConfig {
                 path: db.path.clone(),
                 payload_capture_enabled: false,
+                endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
                 signal_event_sender: None,
                 signal_detector_config: Default::default(),
             })
