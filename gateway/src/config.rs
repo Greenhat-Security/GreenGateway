@@ -51,6 +51,9 @@ pub const DEFAULT_DISCOVERY_ENDPOINT_LIMIT: usize = 10_000;
 const DEFAULT_AUTH_MODE: AuthMode = AuthMode::Required;
 const DEFAULT_AUTH_COOKIE_NAME: &str = "session";
 pub const DEFAULT_ADMIN_PREFIX: &str = "/admin";
+pub const DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS: u64 = 300;
+pub const DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES: usize = 1_024;
+pub const DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP: usize = 16;
 const DEFAULT_EXEMPT_PROBE_PATHS: &[&str] = &["/health", "/version", "/metrics"];
 const DEFAULT_JWT_JWKS_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_ROLES_CLAIM: &str = "roles";
@@ -73,6 +76,9 @@ const DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_EGRESS_DENY_PRIVATE_IPS: bool = true;
 const ADMIN_LISTEN_ADDR: &str = "ADMIN_LISTEN_ADDR";
 const ADMIN_LOGIN_PROVIDER: &str = "ADMIN_LOGIN_PROVIDER";
+const ADMIN_LOGIN_PENDING_TTL_SECS: &str = "ADMIN_LOGIN_PENDING_TTL_SECS";
+const ADMIN_LOGIN_PENDING_MAX_ENTRIES: &str = "ADMIN_LOGIN_PENDING_MAX_ENTRIES";
+const ADMIN_LOGIN_PENDING_MAX_PER_IP: &str = "ADMIN_LOGIN_PENDING_MAX_PER_IP";
 const ADMIN_PREFIX: &str = "ADMIN_PREFIX";
 const AUDIT_LOG_FILE: &str = "AUDIT_LOG_FILE";
 const AUDIT_SQLITE_PATH: &str = "AUDIT_SQLITE_PATH";
@@ -147,6 +153,9 @@ pub struct Config {
     pub admin_listen_addr: Option<SocketAddr>,
     pub admin_prefix: String,
     pub admin_login_provider: Option<String>,
+    pub admin_login_pending_ttl_secs: u64,
+    pub admin_login_pending_max_entries: usize,
+    pub admin_login_pending_max_per_ip: usize,
     pub gateway_public_url: Option<String>,
     pub audit_log_file: Option<String>,
     pub audit_sqlite_path: Option<String>,
@@ -435,6 +444,42 @@ impl Config {
         let admin_login_provider = parse_optional_string(
             ADMIN_LOGIN_PROVIDER,
             get_var(ADMIN_LOGIN_PROVIDER),
+            &mut problems,
+        );
+        let admin_login_pending_ttl_secs = validate_positive_u64(
+            ADMIN_LOGIN_PENDING_TTL_SECS,
+            parse_var(
+                ADMIN_LOGIN_PENDING_TTL_SECS,
+                get_var(ADMIN_LOGIN_PENDING_TTL_SECS),
+                DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,
+                "second duration",
+                &mut problems,
+            ),
+            DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,
+            &mut problems,
+        );
+        let admin_login_pending_max_entries = validate_positive_usize(
+            ADMIN_LOGIN_PENDING_MAX_ENTRIES,
+            parse_var(
+                ADMIN_LOGIN_PENDING_MAX_ENTRIES,
+                get_var(ADMIN_LOGIN_PENDING_MAX_ENTRIES),
+                DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES,
+                "entry count",
+                &mut problems,
+            ),
+            DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES,
+            &mut problems,
+        );
+        let admin_login_pending_max_per_ip = validate_positive_usize(
+            ADMIN_LOGIN_PENDING_MAX_PER_IP,
+            parse_var(
+                ADMIN_LOGIN_PENDING_MAX_PER_IP,
+                get_var(ADMIN_LOGIN_PENDING_MAX_PER_IP),
+                DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP,
+                "entry count",
+                &mut problems,
+            ),
+            DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP,
             &mut problems,
         );
         let gateway_public_url = parse_optional_gateway_public_url(
@@ -916,6 +961,9 @@ impl Config {
                 admin_listen_addr,
                 admin_prefix,
                 admin_login_provider,
+                admin_login_pending_ttl_secs,
+                admin_login_pending_max_entries,
+                admin_login_pending_max_per_ip,
                 gateway_public_url,
                 audit_log_file,
                 audit_sqlite_path,
@@ -2524,6 +2572,18 @@ mod tests {
             )
         );
         assert_eq!(config.admin_prefix, DEFAULT_ADMIN_PREFIX);
+        assert_eq!(
+            config.admin_login_pending_ttl_secs,
+            DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS
+        );
+        assert_eq!(
+            config.admin_login_pending_max_entries,
+            DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES
+        );
+        assert_eq!(
+            config.admin_login_pending_max_per_ip,
+            DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP
+        );
         assert_eq!(config.gateway_public_url, None);
         assert_eq!(config.audit_log_file, None);
         assert_eq!(config.audit_sqlite_path, None);
@@ -2704,6 +2764,18 @@ mod tests {
         );
         assert_eq!(config.admin_listen_addr, None);
         assert_eq!(config.admin_prefix, DEFAULT_ADMIN_PREFIX);
+        assert_eq!(
+            config.admin_login_pending_ttl_secs,
+            DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS
+        );
+        assert_eq!(
+            config.admin_login_pending_max_entries,
+            DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES
+        );
+        assert_eq!(
+            config.admin_login_pending_max_per_ip,
+            DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP
+        );
         assert_eq!(config.audit_log_file, None);
         assert_eq!(config.audit_sqlite_path, None);
         assert_eq!(config.audit_sqlite_retention_days, None);
@@ -3925,6 +3997,38 @@ mod tests {
             config.auth_providers[0].redirect_uri.as_deref(),
             Some("https://gateway.example.test/v1/admin/auth/callback")
         );
+    }
+
+    #[test]
+    fn admin_login_pending_limits_parse() {
+        let config = Config::from_env_vars(|name| match name {
+            "ADMIN_LOGIN_PENDING_TTL_SECS" => Ok("45".to_owned()),
+            "ADMIN_LOGIN_PENDING_MAX_ENTRIES" => Ok("64".to_owned()),
+            "ADMIN_LOGIN_PENDING_MAX_PER_IP" => Ok("3".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("admin login pending-state limits should parse");
+
+        assert_eq!(config.admin_login_pending_ttl_secs, 45);
+        assert_eq!(config.admin_login_pending_max_entries, 64);
+        assert_eq!(config.admin_login_pending_max_per_ip, 3);
+    }
+
+    #[test]
+    fn admin_login_pending_limits_must_be_positive() {
+        let error = Config::from_env_vars(|name| match name {
+            "ADMIN_LOGIN_PENDING_TTL_SECS"
+            | "ADMIN_LOGIN_PENDING_MAX_ENTRIES"
+            | "ADMIN_LOGIN_PENDING_MAX_PER_IP" => Ok("0".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("admin login pending-state limits should reject zero");
+
+        let message = error.to_string();
+        assert!(message.contains("ADMIN_LOGIN_PENDING_TTL_SECS must be greater than 0"));
+        assert!(message.contains("ADMIN_LOGIN_PENDING_MAX_ENTRIES must be greater than 0"));
+        assert!(message.contains("ADMIN_LOGIN_PENDING_MAX_PER_IP must be greater than 0"));
+        assert_eq!(error.problems.len(), 3);
     }
 
     #[test]

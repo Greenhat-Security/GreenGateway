@@ -18,7 +18,7 @@ pub use cookie_session_validator::{CookieSessionAuthConfig, CookieSessionValidat
 #[allow(unused_imports)] // Public JWT API re-export reserved for PR 3 auth middleware.
 pub use jwt::{JwtAuthConfig, JwtValidator, NoopRevocationStore, RevocationStore};
 #[allow(unused_imports)] // Public OIDC-login API is wired by gateway startup.
-pub use oidc_login::{OidcLoginConfig, OidcLoginState};
+pub use oidc_login::{OidcLoginConfig, OidcLoginState, PendingLoginLimits};
 #[allow(unused_imports)] // Public auth API re-export reserved for later identity integration.
 pub use principal::{actor_from_principal, AuthMethod, Principal};
 #[allow(unused_imports)] // Public principal directory handle is wired by gateway startup.

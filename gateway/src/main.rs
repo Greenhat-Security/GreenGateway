@@ -425,6 +425,7 @@ struct ToolAdminState {
 struct AdminAuthState {
     login: auth::OidcLoginState,
     admin_prefix: String,
+    client_ip_policy: client_ip::ClientIpPolicy,
 }
 
 #[derive(Clone)]
@@ -1684,9 +1685,16 @@ fn admin_auth_state_from_config(
         http_timeout: Duration::from_millis(provider.jwks_timeout_ms),
     };
 
+    let pending_limits = auth::PendingLoginLimits {
+        ttl: Duration::from_secs(config.admin_login_pending_ttl_secs),
+        max_entries: config.admin_login_pending_max_entries,
+        max_per_ip: config.admin_login_pending_max_per_ip,
+    };
+
     Ok(Some(AdminAuthState {
-        login: auth::OidcLoginState::new(login_config, egress_client)?,
+        login: auth::OidcLoginState::new(login_config, egress_client, pending_limits)?,
         admin_prefix: config.admin_prefix.clone(),
+        client_ip_policy: client_ip::ClientIpPolicy::from_config(config),
     }))
 }
 
@@ -3011,10 +3019,18 @@ fn payload_too_large(max_body_size: usize) -> Response {
         .into_response()
 }
 
-async fn admin_auth_login_endpoint(State(state): State<AdminAuthState>) -> Response {
+async fn admin_auth_login_endpoint(
+    State(state): State<AdminAuthState>,
+    request: AxumRequest,
+) -> Response {
     record_request(ADMIN_AUTH_LOGIN_ROUTE);
+    let source_ip = client_ip::canonical_client_ip(
+        request.headers(),
+        request.extensions(),
+        &state.client_ip_policy,
+    );
 
-    match state.login.begin_login() {
+    match state.login.begin_login(&source_ip) {
         Ok(start) => found_redirect(start.authorization_url),
         Err(err) => {
             tracing::warn!(error = %err, "failed to start admin OIDC login");
@@ -8003,6 +8019,9 @@ mod tests {
             admin_listen_addr: None,
             admin_prefix: config::DEFAULT_ADMIN_PREFIX.to_owned(),
             admin_login_provider: None,
+            admin_login_pending_ttl_secs: config::DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,
+            admin_login_pending_max_entries: config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES,
+            admin_login_pending_max_per_ip: config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP,
             gateway_public_url: None,
             audit_log_file: None,
             audit_sqlite_path: None,
@@ -8605,6 +8624,27 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("response should include Location")
             .to_owned()
+    }
+
+    fn admin_oidc_login_request(peer_ip: Ipv4Addr, forwarded_for: Option<&str>) -> Request<Body> {
+        let mut request = Request::builder()
+            .uri(ADMIN_AUTH_LOGIN_ROUTE)
+            .body(Body::empty())
+            .expect("admin OIDC login request should build");
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::new(
+                IpAddr::V4(peer_ip),
+                12_345,
+            )));
+        if let Some(forwarded_for) = forwarded_for {
+            request.headers_mut().insert(
+                X_FORWARDED_FOR_HEADER,
+                HeaderValue::from_str(forwarded_for)
+                    .expect("forwarded client IP should be a valid header value"),
+            );
+        }
+        request
     }
 
     fn url_query_pairs(url: &Url) -> HashMap<String, String> {
@@ -22719,6 +22759,104 @@ paths:
             1
         );
         assert_eq!(jwks_server.join().expect("JWKS server should finish"), 1);
+    }
+
+    #[tokio::test]
+    async fn admin_oidc_login_rejects_new_attempt_when_global_pending_limit_is_full() {
+        let oidc = spawn_mock_oidc_discovery_endpoint(None);
+        let mut config = admin_oidc_login_config(&oidc.issuer);
+        config.admin_login_pending_max_entries = 1;
+        config.admin_login_pending_max_per_ip = 1;
+        let router = admin_oidc_login_router_from_config(config);
+
+        let first_response = router
+            .clone()
+            .oneshot(admin_oidc_login_request(Ipv4Addr::new(192, 0, 2, 10), None))
+            .await
+            .expect("first login request should complete");
+        assert_eq!(first_response.status(), StatusCode::FOUND);
+        let first_location = response_location(&first_response);
+        assert_eq!(
+            Url::parse(&first_location)
+                .expect("authorization redirect should be absolute")
+                .as_str()
+                .split('?')
+                .next(),
+            Some(oidc.authorization_endpoint.as_str())
+        );
+
+        let second_response = router
+            .oneshot(admin_oidc_login_request(Ipv4Addr::new(192, 0, 2, 11), None))
+            .await
+            .expect("second login request should complete");
+        assert_eq!(second_response.status(), StatusCode::FOUND);
+        assert!(
+            fragment_query_pairs(&response_location(&second_response), "/auth/error")
+                .expect("capacity rejection should redirect to auth error fragment")
+                .get("error")
+                .is_some_and(|error| error == "login_start_failed")
+        );
+
+        oidc.finish();
+    }
+
+    #[tokio::test]
+    async fn admin_oidc_login_enforces_peer_ip_limit_despite_untrusted_forwarding_headers() {
+        let oidc = spawn_mock_oidc_discovery_endpoint(None);
+        let mut config = admin_oidc_login_config(&oidc.issuer);
+        config.admin_login_pending_max_entries = 3;
+        config.admin_login_pending_max_per_ip = 1;
+        let router = admin_oidc_login_router_from_config(config);
+        let peer_ip = Ipv4Addr::new(192, 0, 2, 20);
+
+        let first_response = router
+            .clone()
+            .oneshot(admin_oidc_login_request(peer_ip, Some("198.51.100.1")))
+            .await
+            .expect("first login request should complete");
+        assert_eq!(first_response.status(), StatusCode::FOUND);
+        let first_location = response_location(&first_response);
+        assert_eq!(
+            Url::parse(&first_location)
+                .expect("authorization redirect should be absolute")
+                .as_str()
+                .split('?')
+                .next(),
+            Some(oidc.authorization_endpoint.as_str())
+        );
+
+        let same_peer_response = router
+            .clone()
+            .oneshot(admin_oidc_login_request(peer_ip, Some("198.51.100.2")))
+            .await
+            .expect("same-peer login request should complete");
+        assert_eq!(same_peer_response.status(), StatusCode::FOUND);
+        assert!(
+            fragment_query_pairs(&response_location(&same_peer_response), "/auth/error")
+                .expect("per-IP rejection should redirect to auth error fragment")
+                .get("error")
+                .is_some_and(|error| error == "login_start_failed")
+        );
+
+        let different_peer_response = router
+            .oneshot(admin_oidc_login_request(
+                Ipv4Addr::new(192, 0, 2, 21),
+                Some("198.51.100.2"),
+            ))
+            .await
+            .expect("different-peer login request should complete");
+        assert_eq!(different_peer_response.status(), StatusCode::FOUND);
+        let different_peer_location = response_location(&different_peer_response);
+        assert_eq!(
+            Url::parse(&different_peer_location)
+                .expect("authorization redirect should be absolute")
+                .as_str()
+                .split('?')
+                .next(),
+            Some(oidc.authorization_endpoint.as_str())
+        );
+
+        oidc.finish();
     }
 
     #[tokio::test]

@@ -26,10 +26,26 @@ use crate::{egress::EgressClient, metrics::LOCK_POISON_RECOVERIES_TOTAL};
 
 use super::{AuthError, JwtAuthConfig, JwtValidator};
 
-const ADMIN_LOGIN_PENDING_TTL: Duration = Duration::from_secs(5 * 60);
-const ADMIN_LOGIN_PENDING_MAX_ENTRIES: usize = 1024;
 const PKCE_VERIFIER_RANDOM_BYTES: usize = 32;
 const OIDC_SCOPE: &str = "openid email profile";
+
+/// Abuse-resistance limits for the OIDC pending-login store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingLoginLimits {
+    pub ttl: Duration,
+    pub max_entries: usize,
+    pub max_per_ip: usize,
+}
+
+impl Default for PendingLoginLimits {
+    fn default() -> Self {
+        Self {
+            ttl: Duration::from_secs(300),
+            max_entries: 1_024,
+            max_per_ip: 16,
+        }
+    }
+}
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct OidcLoginConfig {
@@ -82,6 +98,7 @@ pub enum OidcLoginError {
     Random(getrandom::Error),
     InvalidAuthorizationEndpoint(String),
     InvalidState,
+    PendingStoreFull,
     TokenExchangeTimedOut,
     TokenExchangeFailed,
     InvalidTokenResponse,
@@ -98,6 +115,9 @@ impl fmt::Display for OidcLoginError {
                 write!(formatter, "OIDC authorization endpoint is invalid: {err}")
             }
             Self::InvalidState => write!(formatter, "OIDC login state is unknown or expired"),
+            Self::PendingStoreFull => {
+                write!(formatter, "OIDC login pending-state store is at capacity")
+            }
             Self::TokenExchangeTimedOut => write!(formatter, "OIDC token exchange timed out"),
             Self::TokenExchangeFailed => write!(formatter, "OIDC token exchange failed"),
             Self::InvalidTokenResponse => write!(formatter, "OIDC token response is invalid"),
@@ -126,7 +146,11 @@ impl OidcLoginError {
 }
 
 impl OidcLoginState {
-    pub fn new(cfg: OidcLoginConfig, egress_client: Arc<EgressClient>) -> Result<Self, AuthError> {
+    pub fn new(
+        cfg: OidcLoginConfig,
+        egress_client: Arc<EgressClient>,
+        limits: PendingLoginLimits,
+    ) -> Result<Self, AuthError> {
         let id_token_validator = JwtValidator::new(
             JwtAuthConfig {
                 jwks_url: cfg.jwks_url.clone(),
@@ -145,24 +169,28 @@ impl OidcLoginState {
             cfg: Arc::new(cfg),
             egress_client,
             id_token_validator: Arc::new(id_token_validator),
-            pending: Arc::new(PendingLoginStore::new(ADMIN_LOGIN_PENDING_TTL)),
+            pending: Arc::new(PendingLoginStore::new(limits)),
         })
     }
 
-    pub fn begin_login(&self) -> Result<LoginStart, OidcLoginError> {
+    pub fn begin_login(&self, client_ip: &str) -> Result<LoginStart, OidcLoginError> {
         let state = Uuid::new_v4().to_string();
         let nonce = Uuid::new_v4().to_string();
         let pkce = PkcePair::generate()?;
         let authorization_url = self.authorization_url(&state, &nonce, &pkce.code_challenge)?;
 
-        self.pending.insert(
+        let accepted = self.pending.insert(
             state,
             PendingLogin {
                 code_verifier: pkce.code_verifier,
                 nonce,
                 created_at: Instant::now(),
+                client_ip: client_ip.to_owned(),
             },
         );
+        if !accepted {
+            return Err(OidcLoginError::PendingStoreFull);
+        }
 
         Ok(LoginStart { authorization_url })
     }
@@ -209,6 +237,7 @@ impl OidcLoginState {
             code_verifier,
             nonce,
             created_at: _,
+            client_ip: _,
         } = pending;
 
         let body = token_exchange_body(
@@ -293,39 +322,46 @@ struct PendingLogin {
     code_verifier: String,
     nonce: String,
     created_at: Instant,
+    client_ip: String,
 }
 
 struct PendingLoginStore {
-    ttl: Duration,
+    limits: PendingLoginLimits,
     inner: Mutex<HashMap<String, PendingLogin>>,
 }
 
 impl PendingLoginStore {
-    fn new(ttl: Duration) -> Self {
+    fn new(limits: PendingLoginLimits) -> Self {
         Self {
-            ttl,
+            limits,
             inner: Mutex::new(HashMap::new()),
         }
     }
 
-    fn insert(&self, state: String, pending: PendingLogin) {
+    /// Returns `true` when the pending login was stored and `false` when a
+    /// capacity limit rejected it. Still-valid entries are never evicted.
+    fn insert(&self, state: String, pending: PendingLogin) -> bool {
         let mut inner = self.inner_guard();
-        remove_expired_pending_logins(&mut inner, self.ttl);
-        if inner.len() >= ADMIN_LOGIN_PENDING_MAX_ENTRIES {
-            if let Some(oldest_key) = inner
-                .iter()
-                .min_by_key(|(_, pending)| pending.created_at)
-                .map(|(state, _)| state.clone())
-            {
-                inner.remove(&oldest_key);
-            }
+        remove_expired_pending_logins(&mut inner, self.limits.ttl);
+
+        let client_entries = inner
+            .values()
+            .filter(|existing| existing.client_ip == pending.client_ip)
+            .count();
+        if client_entries >= self.limits.max_per_ip {
+            return false;
         }
+        if inner.len() >= self.limits.max_entries {
+            return false;
+        }
+
         inner.insert(state, pending);
+        true
     }
 
     fn take(&self, state: &str) -> Option<PendingLogin> {
         let mut inner = self.inner_guard();
-        remove_expired_pending_logins(&mut inner, self.ttl);
+        remove_expired_pending_logins(&mut inner, self.limits.ttl);
         inner.remove(state)
     }
 
@@ -439,5 +475,73 @@ mod tests {
             OidcLoginError::MissingIdToken.to_string(),
             "OIDC token response missing id_token"
         );
+    }
+
+    #[test]
+    fn pending_store_rejects_new_entry_when_full_without_evicting_existing() {
+        let store = PendingLoginStore::new(PendingLoginLimits {
+            ttl: Duration::from_secs(60),
+            max_entries: 2,
+            max_per_ip: 10,
+        });
+
+        assert!(store.insert("first".to_owned(), pending_login("192.0.2.1")));
+        assert!(store.insert("second".to_owned(), pending_login("192.0.2.2")));
+        assert!(!store.insert("rejected".to_owned(), pending_login("192.0.2.3")));
+
+        assert!(store.take("first").is_some());
+        assert!(store.take("second").is_some());
+        assert!(store.take("rejected").is_none());
+    }
+
+    #[test]
+    fn pending_store_enforces_per_ip_cap() {
+        let store = PendingLoginStore::new(PendingLoginLimits {
+            ttl: Duration::from_secs(60),
+            max_entries: 100,
+            max_per_ip: 2,
+        });
+
+        assert!(store.insert("same-ip-1".to_owned(), pending_login("192.0.2.1")));
+        assert!(store.insert("same-ip-2".to_owned(), pending_login("192.0.2.1")));
+        assert!(!store.insert("same-ip-3".to_owned(), pending_login("192.0.2.1")));
+        assert!(store.insert("other-ip".to_owned(), pending_login("192.0.2.2")));
+    }
+
+    #[test]
+    fn pending_store_expiry_frees_capacity() {
+        let ttl = Duration::from_millis(10);
+        let store = PendingLoginStore::new(PendingLoginLimits {
+            ttl,
+            max_entries: 1,
+            max_per_ip: 1,
+        });
+        let mut expired = pending_login("192.0.2.1");
+        expired.created_at = Instant::now() - (ttl * 2);
+
+        assert!(store.insert("expired".to_owned(), expired));
+        assert!(store.insert("replacement".to_owned(), pending_login("192.0.2.1")));
+        assert!(store.take("expired").is_none());
+        assert!(store.take("replacement").is_some());
+    }
+
+    #[test]
+    fn pending_store_full_error_has_clear_display_message() {
+        let error = OidcLoginError::PendingStoreFull;
+
+        assert_eq!(
+            error.to_string(),
+            "OIDC login pending-state store is at capacity"
+        );
+        assert!(!error.is_invalid_state());
+    }
+
+    fn pending_login(client_ip: &str) -> PendingLogin {
+        PendingLogin {
+            code_verifier: "test-code-verifier".to_owned(),
+            nonce: "test-nonce".to_owned(),
+            created_at: Instant::now(),
+            client_ip: client_ip.to_owned(),
+        }
     }
 }

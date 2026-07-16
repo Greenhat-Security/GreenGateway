@@ -35,6 +35,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   restart; previously a reload appeared to accept them while long-lived
   egress clients continued enforcing the startup allowlist (F3/F9/F10).
 
+- Hardened admin OIDC login pending-state handling with configurable positive
+  TTL, process-wide, and canonical-client-IP limits. Capacity exhaustion now
+  rejects new login attempts without evicting existing valid states.
+
 ## [1.0.0] - 2026-07-15
 
 Phase 6 (native MCP support) is complete and included in this release. See the
