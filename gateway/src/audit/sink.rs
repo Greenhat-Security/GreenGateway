@@ -25,6 +25,13 @@ pub trait AuditSink: Send + Sync {
 
 pub type ConfiguredAuditSink = (Arc<dyn AuditSink>, AuditEventSender);
 
+#[derive(Clone, Copy)]
+struct DiscoverySinkOptions<'a> {
+    sqlite_path: Option<&'a str>,
+    endpoint_limit: usize,
+    payload_capture_enabled: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct StdoutSink;
 
@@ -186,8 +193,7 @@ fn build_sink(
     audit_log_file: Option<&str>,
     audit_sqlite_path: Option<&str>,
     audit_sqlite_retention_days: Option<u32>,
-    discovery_sqlite_path: Option<&str>,
-    payload_capture_enabled: bool,
+    discovery: DiscoverySinkOptions<'_>,
     signal_event_sender: Option<AuditEventSender>,
     signal_detector_config: SignalDetectorConfig,
 ) -> Result<Arc<dyn AuditSink>, Box<dyn Error>> {
@@ -195,8 +201,7 @@ fn build_sink(
         audit_log_file,
         audit_sqlite_path,
         audit_sqlite_retention_days,
-        discovery_sqlite_path,
-        payload_capture_enabled,
+        discovery,
         signal_event_sender,
         signal_detector_config,
     )?;
@@ -214,8 +219,7 @@ fn build_sink_members(
     audit_log_file: Option<&str>,
     audit_sqlite_path: Option<&str>,
     audit_sqlite_retention_days: Option<u32>,
-    discovery_sqlite_path: Option<&str>,
-    payload_capture_enabled: bool,
+    discovery: DiscoverySinkOptions<'_>,
     signal_event_sender: Option<AuditEventSender>,
     signal_detector_config: SignalDetectorConfig,
 ) -> Result<Vec<Arc<dyn AuditSink>>, Box<dyn Error>> {
@@ -243,19 +247,21 @@ fn build_sink_members(
         );
     }
 
-    if let Some(path) = discovery_sqlite_path
+    if let Some(path) = discovery
+        .sqlite_path
         .map(str::trim)
         .filter(|path| !path.is_empty())
     {
         sinks.push(
             Arc::new(EndpointAggregatorSink::new(EndpointAggregatorSinkConfig {
                 path: PathBuf::from(path),
-                payload_capture_enabled,
+                payload_capture_enabled: discovery.payload_capture_enabled,
+                endpoint_limit: discovery.endpoint_limit,
                 signal_event_sender,
                 signal_detector_config,
             })?) as Arc<dyn AuditSink>,
         );
-    } else if payload_capture_enabled {
+    } else if discovery.payload_capture_enabled {
         return Err("PAYLOAD_CAPTURE_ENABLED=true requires DISCOVERY_SQLITE_PATH to be set".into());
     }
 
@@ -268,8 +274,11 @@ pub fn build_sink_from_config(config: &Config) -> Result<ConfiguredAuditSink, Bo
         config.audit_log_file.as_deref(),
         config.audit_sqlite_path.as_deref(),
         config.audit_sqlite_retention_days,
-        config.discovery_sqlite_path.as_deref(),
-        config.payload_capture_enabled,
+        DiscoverySinkOptions {
+            sqlite_path: config.discovery_sqlite_path.as_deref(),
+            endpoint_limit: config.discovery_endpoint_limit,
+            payload_capture_enabled: config.payload_capture_enabled,
+        },
         Some(broadcast_sender.clone()),
         config.signal_detector_config(),
     )?;
@@ -444,8 +453,11 @@ pub mod tests {
             None,
             None,
             None,
-            None,
-            false,
+            DiscoverySinkOptions {
+                sqlite_path: None,
+                endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
+                payload_capture_enabled: false,
+            },
             None,
             SignalDetectorConfig::default(),
         )
@@ -456,8 +468,11 @@ pub mod tests {
             None,
             None,
             None,
-            Some("   "),
-            false,
+            DiscoverySinkOptions {
+                sqlite_path: Some("   "),
+                endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
+                payload_capture_enabled: false,
+            },
             None,
             SignalDetectorConfig::default(),
         )
@@ -472,8 +487,11 @@ pub mod tests {
             None,
             None,
             None,
-            Some(path.to_str().expect("test path should be valid UTF-8")),
-            false,
+            DiscoverySinkOptions {
+                sqlite_path: Some(path.to_str().expect("test path should be valid UTF-8")),
+                endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
+                payload_capture_enabled: false,
+            },
             None,
             SignalDetectorConfig::default(),
         )

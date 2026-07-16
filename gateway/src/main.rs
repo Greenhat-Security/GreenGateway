@@ -7994,6 +7994,7 @@ mod tests {
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,
             discovery_sqlite_path: None,
+            discovery_endpoint_limit: config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
             principal_sqlite_path: None,
             payload_capture_enabled: false,
             payload_capture_sample_rate: config::DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
@@ -27478,6 +27479,7 @@ O2gecI9QwDJNpm29J9wJB2F8
                 discovery::aggregator::EndpointAggregatorSinkConfig {
                     path: path.clone(),
                     payload_capture_enabled: false,
+                    endpoint_limit: config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
                     signal_event_sender: None,
                     signal_detector_config: discovery::signals::SignalDetectorConfig::default(),
                 },
@@ -28351,6 +28353,7 @@ O2gecI9QwDJNpm29J9wJB2F8
             discovery::aggregator::EndpointAggregatorSinkConfig {
                 path: discovery_path.clone(),
                 payload_capture_enabled: false,
+                endpoint_limit: config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
                 signal_event_sender: None,
                 signal_detector_config: discovery::signals::SignalDetectorConfig::default(),
             },

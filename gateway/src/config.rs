@@ -47,6 +47,7 @@ const DEFAULT_RATE_LIMIT_WRITE_BURST: u32 = 20;
 const DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES: &[&str] = &["application/json"];
 const DEFAULT_AUTH_ENABLED: bool = true;
 pub const DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE: f64 = 0.10;
+pub const DEFAULT_DISCOVERY_ENDPOINT_LIMIT: usize = 10_000;
 const DEFAULT_AUTH_MODE: AuthMode = AuthMode::Required;
 const DEFAULT_AUTH_COOKIE_NAME: &str = "session";
 pub const DEFAULT_ADMIN_PREFIX: &str = "/admin";
@@ -88,6 +89,7 @@ const CSRF_ENABLED: &str = "CSRF_ENABLED";
 const CSRF_EXEMPT_PATHS: &str = "CSRF_EXEMPT_PATHS";
 const CSRF_HEADER_NAME: &str = "CSRF_HEADER_NAME";
 const DISCOVERY_SQLITE_PATH: &str = "DISCOVERY_SQLITE_PATH";
+const DISCOVERY_ENDPOINT_LIMIT: &str = "DISCOVERY_ENDPOINT_LIMIT";
 const ERROR_RATE_SPIKE_SIGNAL_THRESHOLD: &str = "ERROR_RATE_SPIKE_SIGNAL_THRESHOLD";
 const EGRESS_ALLOWED_HOSTS: &str = "EGRESS_ALLOWED_HOSTS";
 const EGRESS_CONNECT_TIMEOUT_MS: &str = "EGRESS_CONNECT_TIMEOUT_MS";
@@ -150,6 +152,7 @@ pub struct Config {
     pub audit_sqlite_path: Option<String>,
     pub audit_sqlite_retention_days: Option<u32>,
     pub discovery_sqlite_path: Option<String>,
+    pub discovery_endpoint_limit: usize,
     pub principal_sqlite_path: Option<String>,
     pub payload_capture_enabled: bool,
     pub payload_capture_sample_rate: f64,
@@ -452,6 +455,18 @@ impl Config {
         let discovery_sqlite_path = parse_optional_string(
             DISCOVERY_SQLITE_PATH,
             get_var(DISCOVERY_SQLITE_PATH),
+            &mut problems,
+        );
+        let discovery_endpoint_limit = validate_positive_usize(
+            DISCOVERY_ENDPOINT_LIMIT,
+            parse_var(
+                DISCOVERY_ENDPOINT_LIMIT,
+                get_var(DISCOVERY_ENDPOINT_LIMIT),
+                DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
+                "positive integer",
+                &mut problems,
+            ),
+            DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
             &mut problems,
         );
         let principal_sqlite_path = parse_optional_string(
@@ -906,6 +921,7 @@ impl Config {
                 audit_sqlite_path,
                 audit_sqlite_retention_days,
                 discovery_sqlite_path,
+                discovery_endpoint_limit,
                 principal_sqlite_path,
                 payload_capture_enabled,
                 payload_capture_sample_rate,
@@ -3009,6 +3025,31 @@ mod tests {
         .expect("config should parse");
 
         assert_eq!(config.discovery_sqlite_path, None);
+    }
+
+    #[test]
+    fn discovery_endpoint_limit_parses() {
+        let config = Config::from_env_vars(|name| match name {
+            "DISCOVERY_ENDPOINT_LIMIT" => Ok("2500".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("discovery endpoint limit should parse");
+
+        assert_eq!(config.discovery_endpoint_limit, 2_500);
+    }
+
+    #[test]
+    fn zero_discovery_endpoint_limit_is_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "DISCOVERY_ENDPOINT_LIMIT" => Ok("0".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("zero discovery endpoint limit should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("DISCOVERY_ENDPOINT_LIMIT must be greater than 0, got '0'"));
+        assert_eq!(error.problems.len(), 1);
     }
 
     #[test]

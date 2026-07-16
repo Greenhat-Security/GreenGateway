@@ -26,11 +26,15 @@ const ID_PLACEHOLDER: &str = "{id}";
 const PARAM_PLACEHOLDER: &str = "{param}";
 const DEFAULT_DISTINCT_VALUE_CAP: usize = 64;
 const DEFAULT_LEARNED_TEMPLATE_THRESHOLD: usize = 4;
+const DEFAULT_PATH_TEMPLATE_MAX_GROUPS: usize = 0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PathTemplateConfig {
     pub distinct_value_cap: usize,
     pub learned_template_threshold: usize,
+    /// Maximum number of learned path-shape groups. Zero keeps the learner
+    /// unbounded for standalone callers that have not opted into a cap.
+    pub max_groups: usize,
 }
 
 impl Default for PathTemplateConfig {
@@ -38,6 +42,7 @@ impl Default for PathTemplateConfig {
         Self {
             distinct_value_cap: DEFAULT_DISTINCT_VALUE_CAP,
             learned_template_threshold: DEFAULT_LEARNED_TEMPLATE_THRESHOLD,
+            max_groups: DEFAULT_PATH_TEMPLATE_MAX_GROUPS,
         }
     }
 }
@@ -83,6 +88,9 @@ impl PathTemplateLearner {
         let group_index = match self.find_group_index(&segments) {
             Some(index) => index,
             None => {
+                if self.config.max_groups != 0 && self.groups.len() >= self.config.max_groups {
+                    return template_stateless_segments(&segments);
+                }
                 self.groups.push(ShapeGroup::from_segments(&segments));
                 self.groups.len() - 1
             }
@@ -455,6 +463,7 @@ mod tests {
         let mut learner = PathTemplateLearner::with_config(PathTemplateConfig {
             distinct_value_cap: 3,
             learned_template_threshold: 100,
+            max_groups: 0,
         });
 
         assert_eq!(learner.observe("/tenants/acme"), "/tenants/acme");
@@ -519,6 +528,23 @@ mod tests {
             SegmentPosition::Learned { .. } => None,
             SegmentPosition::Literal(_) | SegmentPosition::ImmediateId => Some(0),
         }
+    }
+
+    #[test]
+    fn groups_are_capped_and_fall_back_to_stateless() {
+        let mut learner = PathTemplateLearner::with_config(PathTemplateConfig {
+            max_groups: 2,
+            ..PathTemplateConfig::default()
+        });
+
+        assert_eq!(learner.observe("/a"), "/a");
+        assert_eq!(learner.observe("/b"), "/b");
+        assert_eq!(learner.groups.len(), 2);
+
+        assert_eq!(learner.observe("/c"), "/c");
+        assert_eq!(learner.groups.len(), 2);
+        assert_eq!(learner.observe("/c"), "/c");
+        assert_eq!(learner.groups.len(), 2);
     }
 
     fn learned_reason(
