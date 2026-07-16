@@ -45,6 +45,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   explicit exemption names a path the gateway does not own and may therefore
   proxy upstream.
 
+- Made audit retention pruning use an indexed epoch timestamp instead of a
+  repeated full-table `julianday` scan, and limited pruning to at most once per
+  minute (F13).
+
 ## [1.0.0] - 2026-07-15
 
 Phase 6 (native MCP support) is complete and included in this release. See the
