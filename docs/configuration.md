@@ -46,7 +46,31 @@ At startup, GreenGateway fetches the selected provider's OIDC discovery document
 
 The admin UI login flow uses OAuth2 authorization-code with PKCE. `GET /v1{ADMIN_PREFIX}/auth/login` creates a short-lived in-memory pending login state, generates a PKCE S256 challenge, and redirects the browser to the discovered `authorization_endpoint` with `scope=openid email profile`. `GET /v1{ADMIN_PREFIX}/auth/callback` consumes that state exactly once, exchanges the returned `code` at the discovered `token_endpoint` through the shared egress client, and returns the resulting `access_token` to the admin UI in a URL fragment: `{ADMIN_PREFIX}/#/auth/complete?token=...`. The admin UI stores that token through the same `sessionStorage` helper used by the manual paste flow and then clears the fragment from the address bar.
 
-The pending-login state is intentionally process-local and bounded in memory. It is suitable for a single GreenGateway instance; multi-instance deployments need sticky routing or a future shared state store for the login callback.
+The pending-login state is intentionally process-local and bounded in memory. It is suitable for a single GreenGateway instance; multi-instance deployments need sticky routing or a future shared state store for the login callback. When either the global or per-client limit is reached, GreenGateway rejects the new login attempt without evicting an earlier valid state. Expired entries are removed before capacity is evaluated, so capacity self-heals after the configured TTL.
+
+### ADMIN_LOGIN_PENDING_TTL_SECS
+
+Maximum lifetime, in seconds, of an unconsumed admin OIDC login state.
+
+Default: `300`
+
+Format and validation: must be an integer greater than `0`. The value is parsed and validated even when `ADMIN_LOGIN_PROVIDER` is unset. Expired entries cannot complete a login and are removed when the pending-state store is accessed.
+
+### ADMIN_LOGIN_PENDING_MAX_ENTRIES
+
+Maximum number of pending admin OIDC login states retained by one GreenGateway process.
+
+Default: `1024`
+
+Format and validation: must be an integer greater than `0`. The value is parsed and validated even when `ADMIN_LOGIN_PROVIDER` is unset. Once the store reaches this limit, new login attempts fail closed until an existing state is consumed or expires; existing valid states are never evicted to admit a newer request.
+
+### ADMIN_LOGIN_PENDING_MAX_PER_IP
+
+Maximum number of pending admin OIDC login states retained for one canonical client IP.
+
+Default: `16`
+
+Format and validation: must be an integer greater than `0`. The value is parsed and validated even when `ADMIN_LOGIN_PROVIDER` is unset. The client key uses the same trusted-proxy-aware canonical IP policy as the rest of GreenGateway: forwarding headers are honored only when `TRUST_PROXY_HEADERS=true` and the connection peer is within `TRUSTED_PROXY_CIDRS`; otherwise the connection peer address is used. This bound limits abuse from one source, while the process-wide limit remains the backstop for distributed traffic.
 
 ### GATEWAY_PUBLIC_URL
 
