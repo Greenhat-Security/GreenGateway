@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+- MCP routes derived from `GATEWAY_PUBLIC_URL` are no longer treated as
+  authentication, RBAC, or CSRF exempt when they overlap an exempt prefix.
+  Exact MCP aliases remain protected, non-MCP subpaths keep their existing
+  exemption behavior, and startup warns about authentication or RBAC overlaps.
+
 ## [1.0.0] - 2026-07-15
 
 Phase 6 (native MCP support) is complete and included in this release. See the

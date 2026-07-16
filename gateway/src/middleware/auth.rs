@@ -89,10 +89,14 @@ impl AuthState {
 }
 
 impl AuthState {
-    fn mcp_resource_for_path(&self, path: &str) -> Option<String> {
+    fn is_mcp_route_path(&self, path: &str) -> bool {
         self.mcp_route_paths
             .iter()
             .any(|route_path| path == route_path)
+    }
+
+    fn mcp_resource_for_path(&self, path: &str) -> Option<String> {
+        self.is_mcp_route_path(path)
             .then(|| self.mcp_resource.clone())
             .flatten()
     }
@@ -116,10 +120,12 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    if state
-        .exempt_paths
-        .iter()
-        .any(|exempt_path| path_prefix_matches(&path, exempt_path))
+    let is_mcp_route = state.is_mcp_route_path(&path);
+    if !is_mcp_route
+        && state
+            .exempt_paths
+            .iter()
+            .any(|exempt_path| path_prefix_matches(&path, exempt_path))
     {
         return next.run(req).await;
     }
@@ -348,7 +354,7 @@ mod tests {
     use axum::{
         body::{to_bytes, Body},
         middleware::from_fn_with_state,
-        routing::get,
+        routing::{any, get},
         Extension, Router,
     };
     use http::{
@@ -417,6 +423,8 @@ mod tests {
             .route("/metrics", get(ok))
             .route("/admin", get(ok))
             .route("/admin/assets/app.js", get(ok))
+            .route("/admin/mcp", any(ok))
+            .route("/admin/mcp/assets", any(ok))
             .route("/administrator", get(ok))
             .route("/admin-panel", get(ok))
             .route("/protected", get(principal).options(ok))
@@ -430,6 +438,25 @@ mod tests {
     fn test_state_with_mode(
         mode: AuthMode,
         validator: Option<Arc<dyn SessionValidator>>,
+    ) -> (AuthState, CaptureSink) {
+        test_state_with_mode_and_mcp_route_paths(
+            mode,
+            validator,
+            &[protected_resource::MCP_RESOURCE_PATH],
+        )
+    }
+
+    fn test_state_with_mcp_route_paths(
+        validator: Option<Arc<dyn SessionValidator>>,
+        mcp_route_paths: &[&str],
+    ) -> (AuthState, CaptureSink) {
+        test_state_with_mode_and_mcp_route_paths(AuthMode::Required, validator, mcp_route_paths)
+    }
+
+    fn test_state_with_mode_and_mcp_route_paths(
+        mode: AuthMode,
+        validator: Option<Arc<dyn SessionValidator>>,
+        mcp_route_paths: &[&str],
     ) -> (AuthState, CaptureSink) {
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
@@ -448,7 +475,10 @@ mod tests {
                 audit,
                 principal_directory: PrincipalDirectory::disabled(),
                 client_ip_policy: ClientIpPolicy::default(),
-                mcp_route_paths: vec![protected_resource::MCP_RESOURCE_PATH.to_owned()],
+                mcp_route_paths: mcp_route_paths
+                    .iter()
+                    .map(|path| (*path).to_owned())
+                    .collect(),
                 mcp_resource: None,
                 mcp_resource_metadata_url: None,
             },
@@ -557,6 +587,70 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_alias_under_exempt_prefix_requires_authentication() {
+        let (state, capture) = test_state_with_mcp_route_paths(None, &["/mcp", "/admin/mcp"]);
+
+        let response = test_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/mcp")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("MCP alias request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let event = captured_event(&capture, AUTH_FAILURE).await;
+        assert_eq!(event.payload["reason"], json!("missing_credential"));
+        assert_eq!(event.payload["path"], json!("/admin/mcp"));
+    }
+
+    #[tokio::test]
+    async fn mcp_alias_under_exempt_prefix_rejects_junk_bearer() {
+        let (state, capture) = test_state_with_mcp_route_paths(
+            Some(validator(MockOutcome::InvalidSession("invalid bearer"))),
+            &["/mcp", "/admin/mcp"],
+        );
+
+        let response = test_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/mcp")
+                    .header(AUTHORIZATION, "Bearer junk")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("MCP alias request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let event = captured_event(&capture, AUTH_FAILURE).await;
+        assert_eq!(event.payload["reason"], json!("invalid bearer"));
+        assert_eq!(event.payload["path"], json!("/admin/mcp"));
+    }
+
+    #[tokio::test]
+    async fn mcp_alias_non_mcp_subpath_stays_exempt() {
+        let (state, capture) = test_state_with_mcp_route_paths(None, &["/mcp", "/admin/mcp"]);
+
+        let response = test_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/mcp/assets")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("non-MCP subpath request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(capture.events().is_empty());
     }
 
     #[tokio::test]
