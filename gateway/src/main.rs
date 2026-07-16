@@ -4012,8 +4012,13 @@ async fn policy_rule_preview_endpoint(
     let Some(principal) = parts.extensions.get::<auth::Principal>() else {
         return unauthorized();
     };
-    if let Err(error) = authorized_policy_state(&state, principal, ADMIN_POLICY_READ_PERMISSION) {
-        return policy_admin_authz_error_response(error);
+    let rbac_state = match authorized_policy_state(&state, principal, ADMIN_POLICY_READ_PERMISSION)
+    {
+        Ok(rbac_state) => rbac_state,
+        Err(error) => return policy_admin_authz_error_response(error),
+    };
+    if !rbac_state.principal_has_permission(principal, ADMIN_AUDIT_READ_PERMISSION) {
+        return forbidden();
     }
     let Some(query_store) = state.query_store.as_ref() else {
         return service_unavailable(
@@ -17657,7 +17662,7 @@ mod tests {
             .oneshot(policy_admin_request(
                 Method::POST,
                 POLICY_RULE_PREVIEW_ADMIN_ROUTE,
-                Some(test_principal(&["policy-reader"])),
+                Some(test_principal(&["policy-audit-reader"])),
                 Some(preview_body),
                 None,
             ))
@@ -17712,7 +17717,7 @@ mod tests {
             .oneshot(policy_admin_request(
                 Method::POST,
                 POLICY_RULE_PREVIEW_ADMIN_ROUTE,
-                Some(test_principal(&["policy-reader"])),
+                Some(test_principal(&["policy-audit-reader"])),
                 Some(
                     json!({
                         "rule": {
@@ -17771,7 +17776,7 @@ mod tests {
             .oneshot(policy_admin_request(
                 Method::POST,
                 POLICY_RULE_PREVIEW_ADMIN_ROUTE,
-                Some(test_principal(&["policy-reader"])),
+                Some(test_principal(&["policy-audit-reader"])),
                 Some(
                     json!({
                         "rule": {
@@ -17804,7 +17809,7 @@ mod tests {
             .oneshot(policy_admin_request(
                 Method::POST,
                 POLICY_RULE_PREVIEW_ADMIN_ROUTE,
-                Some(test_principal(&["policy-reader"])),
+                Some(test_principal(&["policy-audit-reader"])),
                 Some(
                     json!({
                         "rule": {
@@ -17840,6 +17845,37 @@ mod tests {
                 Method::POST,
                 POLICY_RULE_PREVIEW_ADMIN_ROUTE,
                 Some(test_principal(&["reader"])),
+                Some(
+                    json!({
+                        "rule": {
+                            "methods": ["GET"],
+                            "path": "/api/items/{id}",
+                            "action": "deny"
+                        }
+                    })
+                    .to_string(),
+                ),
+                None,
+            ))
+            .await
+            .expect("policy rule preview should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn policy_rule_preview_requires_audit_read_permission() {
+        let db = TempDb::new("rule-preview-audit-forbidden");
+        create_audit_schema(&db.path);
+        let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+        let router =
+            policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+
+        let response = router
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_RULE_PREVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
                 Some(
                     json!({
                         "rule": {
@@ -24573,6 +24609,12 @@ paths:
                 },
                 "policy-reader": {
                     "permissions": [ADMIN_POLICY_READ_PERMISSION]
+                },
+                "policy-audit-reader": {
+                    "permissions": [
+                        ADMIN_POLICY_READ_PERMISSION,
+                        ADMIN_AUDIT_READ_PERMISSION
+                    ]
                 },
                 "reader": {
                     "permissions": []

@@ -16,6 +16,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   as `service_token.delegation_rejected` audit events. Existing tokens are not
   changed automatically and should be reviewed for over-broad scopes.
 
+- `POST /v1{ADMIN_PREFIX}/policy/rules/preview` now requires both
+  `admin:policy:read` and `admin:audit:read` because its response discloses
+  audit-history samples and counts. Roles that need rule preview must be
+  granted both permissions; previously `admin:policy:read` alone was enough.
+
 ## [1.0.0] - 2026-07-15
 
 Phase 6 (native MCP support) is complete and included in this release. See the
