@@ -49,8 +49,6 @@ services:
       LISTEN_ADDR: 0.0.0.0:8080
       UPSTREAM_URL: http://dev-echo:8080
       AUTH_ENABLED: "true"
-      AUTH_EXEMPT_PATHS: /health,/version,/metrics,/admin
-      RBAC_EXEMPT_PATHS: /health,/version,/metrics,/admin
       JWT_JWKS_URL: http://dev-jwks:8080/jwks.json
       JWT_ISSUER: https://greengateway.dev.local
       JWT_AUDIENCE: greengateway-dev

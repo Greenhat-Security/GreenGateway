@@ -29,8 +29,8 @@ The default deploy is intentionally conservative:
 
 - `AUTH_ENABLED=true`
 - `AUTH_MODE=required`
-- `AUTH_EXEMPT_PATHS=/health,/version,/metrics,/admin`
-- `RBAC_EXEMPT_PATHS=/health,/version,/metrics,/admin`
+- `AUTH_EXEMPT_PATHS` unset, so probe paths and the effective `ADMIN_PREFIX` are exempt
+- `RBAC_EXEMPT_PATHS` unset, so probe paths and the effective `ADMIN_PREFIX` are exempt
 - `ADMIN_PREFIX=/admin`
 - `EGRESS_DENY_PRIVATE_IPS=true`
 - `UPSTREAM_URL=` left blank

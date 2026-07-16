@@ -2984,6 +2984,24 @@ mod tests {
     }
 
     #[test]
+    fn custom_admin_prefix_default_exempts_track_prefix() {
+        let config = Config::from_env_vars(|name| match name {
+            "ADMIN_PREFIX" => Ok("/ops".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        let expected = vec![
+            "/health".to_owned(),
+            "/version".to_owned(),
+            "/metrics".to_owned(),
+            "/ops".to_owned(),
+        ];
+        assert_eq!(config.auth_exempt_paths, expected);
+        assert_eq!(config.rbac_exempt_paths, expected);
+    }
+
+    #[test]
     fn invalid_admin_prefix_values_are_rejected() {
         for value in [
             "",

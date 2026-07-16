@@ -39,6 +39,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   TTL, process-wide, and canonical-client-IP limits. Capacity exhaustion now
   rejects new login attempts without evicting existing valid states.
 
+- Shipped environment and deployment defaults no longer hardcode `/admin` in
+  `AUTH_EXEMPT_PATHS` or `RBAC_EXEMPT_PATHS`; leaving them unset now preserves
+  the dynamic defaults derived from `ADMIN_PREFIX`. Startup also warns when an
+  explicit exemption names a path the gateway does not own and may therefore
+  proxy upstream.
+
 ## [1.0.0] - 2026-07-15
 
 Phase 6 (native MCP support) is complete and included in this release. See the
