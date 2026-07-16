@@ -7,6 +7,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+- Service-token creation now rejects scopes that exceed the creator's current
+  authority. An identity-matched wildcard role may delegate any scope;
+  otherwise every requested scope must be a defined policy role that the
+  creator carries and can activate. Rejected delegation attempts are recorded
+  as `service_token.delegation_rejected` audit events. Existing tokens are not
+  changed automatically and should be reviewed for over-broad scopes.
+
 ## [1.0.0] - 2026-07-15
 
 Phase 6 (native MCP support) is complete and included in this release. See the

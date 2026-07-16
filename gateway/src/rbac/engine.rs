@@ -26,6 +26,28 @@ impl PolicyEngine {
             .flat_map(|entry| entry.permissions.iter())
             .any(|grant| grant == "*" || grant == permission)
     }
+
+    /// True if any identity-matched principal role grants the `"*"` wildcard permission.
+    pub fn principal_has_wildcard(&self, principal: &auth::Principal) -> bool {
+        principal
+            .roles
+            .iter()
+            .filter_map(|role| self.policy.roles.get(role))
+            .filter(|entry| entry.matches_principal_identity(principal))
+            .flat_map(|entry| entry.permissions.iter())
+            .any(|grant| grant == "*")
+    }
+
+    /// True if `role` is carried by the principal, exists in policy, and is active
+    /// for the principal's issuer and authentication method.
+    pub fn principal_has_active_role(&self, principal: &auth::Principal, role: &str) -> bool {
+        principal.roles.iter().any(|held| held == role)
+            && self
+                .policy
+                .roles
+                .get(role)
+                .is_some_and(|entry| entry.matches_principal_identity(principal))
+    }
 }
 
 #[cfg(test)]
@@ -44,6 +66,7 @@ mod tests {
 
         assert!(engine.principal_has_permission(&principal, "data:read"));
         assert!(engine.principal_has_permission(&principal, "settings:write"));
+        assert!(engine.principal_has_wildcard(&principal));
     }
 
     #[test]
@@ -100,6 +123,44 @@ mod tests {
 
         assert!(engine.principal_has_permission(&provider_a, "data:write"));
         assert!(!engine.principal_has_permission(&provider_b, "data:write"));
+    }
+
+    #[test]
+    fn wildcard_detection_respects_the_configured_issuer() {
+        let mut policy = test_policy(&[("admin", &["*"])]);
+        policy
+            .roles
+            .get_mut("admin")
+            .expect("admin role should exist")
+            .issuers = vec!["https://idp-a.example/".to_owned()];
+        let engine = PolicyEngine::new(policy);
+        let mut provider_a = test_principal(&["admin"]);
+        provider_a.issuer = Some("https://idp-a.example/".to_owned());
+        let mut provider_b = provider_a.clone();
+        provider_b.issuer = Some("https://idp-b.example/".to_owned());
+
+        assert!(engine.principal_has_wildcard(&provider_a));
+        assert!(!engine.principal_has_wildcard(&provider_b));
+    }
+
+    #[test]
+    fn active_role_detection_respects_the_configured_auth_method() {
+        let mut policy = test_policy(&[("service-admin", &["*"])]);
+        policy
+            .roles
+            .get_mut("service-admin")
+            .expect("service-admin role should exist")
+            .auth_methods = vec!["service_token".to_owned()];
+        let engine = PolicyEngine::new(policy);
+        let bearer = test_principal(&["service-admin"]);
+        let mut service_token = bearer.clone();
+        service_token.auth_method = AuthMethod::ServiceToken;
+
+        assert!(!engine.principal_has_active_role(&bearer, "service-admin"));
+        assert!(!engine.principal_has_wildcard(&bearer));
+        assert!(engine.principal_has_active_role(&service_token, "service-admin"));
+        assert!(engine.principal_has_wildcard(&service_token));
+        assert!(!engine.principal_has_active_role(&service_token, "unknown-role"));
     }
 
     fn test_policy(entries: &[(&str, &[&str])]) -> Policy {

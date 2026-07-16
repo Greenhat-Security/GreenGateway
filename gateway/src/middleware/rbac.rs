@@ -180,6 +180,26 @@ impl RbacState {
             .principal_has_permission(principal, permission)
     }
 
+    /// Returns requested delegated roles that the principal cannot activate.
+    /// Wildcard principals may delegate any role. The policy is read once so
+    /// the wildcard and per-role decisions use the same live snapshot.
+    pub fn disallowed_delegated_roles(
+        &self,
+        principal: &auth::Principal,
+        requested_roles: &[String],
+    ) -> Vec<String> {
+        let policy = self.policy.load();
+        if policy.engine.principal_has_wildcard(principal) {
+            return Vec::new();
+        }
+
+        requested_roles
+            .iter()
+            .filter(|role| !policy.engine.principal_has_active_role(principal, role))
+            .cloned()
+            .collect()
+    }
+
     fn policy_path_for_request<'a>(&'a self, path: &'a str) -> &'a str {
         if path != protected_resource::MCP_RESOURCE_PATH
             && self

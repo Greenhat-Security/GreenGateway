@@ -985,6 +985,11 @@ enum TokenAdminAuthzError {
     Forbidden,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct TokenScopeAuthzError {
+    disallowed: Vec<String>,
+}
+
 enum ToolAdminAuthzError {
     RbacNotConfigured,
     ToolsFileNotConfigured,
@@ -3654,6 +3659,20 @@ async fn token_create_endpoint(
         Err(response) => return *response,
     };
 
+    let Some(rbac_state) = state.rbac_state.as_ref() else {
+        return token_rbac_not_configured();
+    };
+    if let Err(error) = authorize_requested_scopes(rbac_state, &principal, &requested.scopes) {
+        emit_service_token_delegation_rejected(
+            &state,
+            &parts,
+            &principal,
+            &requested.scopes,
+            &error.disallowed,
+        );
+        return token_scope_authz_error_response(error);
+    }
+
     let created = match store.create(auth::tokens::CreateTokenRequest {
         scopes: requested.scopes,
         created_by: principal.user_id.clone(),
@@ -5642,6 +5661,24 @@ fn authorized_token_store<'a>(
         .ok_or(TokenAdminAuthzError::StoreNotConfigured)
 }
 
+/// Requested service-token scopes may not exceed the creator's own authority.
+/// A creator holding an identity-matched wildcard role may delegate any scope;
+/// otherwise every requested scope must be a policy role the creator carries
+/// and can activate under its current identity.
+fn authorize_requested_scopes(
+    rbac_state: &middleware::rbac::RbacState,
+    creator: &auth::Principal,
+    requested_scopes: &[String],
+) -> Result<(), TokenScopeAuthzError> {
+    let disallowed = rbac_state.disallowed_delegated_roles(creator, requested_scopes);
+
+    if disallowed.is_empty() {
+        Ok(())
+    } else {
+        Err(TokenScopeAuthzError { disallowed })
+    }
+}
+
 fn authorized_tools_file<'a>(
     state: &'a ToolAdminState,
     principal: &auth::Principal,
@@ -5758,6 +5795,21 @@ fn token_admin_authz_error_response(error: TokenAdminAuthzError) -> Response {
         TokenAdminAuthzError::RbacNotConfigured => token_rbac_not_configured(),
         TokenAdminAuthzError::Forbidden => forbidden(),
     }
+}
+
+fn token_scope_authz_error_response(error: TokenScopeAuthzError) -> Response {
+    let mut disallowed = error.disallowed;
+    disallowed.sort();
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            error: format!(
+                "requested scopes exceed creator authority: {}",
+                disallowed.join(", ")
+            ),
+        }),
+    )
+        .into_response()
 }
 
 fn tool_admin_authz_error_response(error: ToolAdminAuthzError) -> Response {
@@ -7256,6 +7308,33 @@ fn emit_service_token_changed(
 
     state.audit.emit(audit::AuditEvent::new(
         audit::event::SERVICE_TOKEN_CHANGED,
+        request_id,
+        source_ip,
+        actor,
+        payload,
+    ));
+}
+
+fn emit_service_token_delegation_rejected(
+    state: &TokenAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    requested_scopes: &[String],
+    disallowed_scopes: &[String],
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    let actor = Some(auth::actor_from_principal(principal));
+    let payload = json!({
+        "decision": "deny",
+        "reason": "requested_scopes_exceed_creator_authority",
+        "requested_scopes": requested_scopes,
+        "disallowed_scopes": disallowed_scopes,
+    });
+
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::SERVICE_TOKEN_DELEGATION_REJECTED,
         request_id,
         source_ip,
         actor,
@@ -16362,6 +16441,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_create_rejects_scopes_the_creator_does_not_hold() {
+        let token_db = TempDb::new("token-create-rejects-escalation");
+        let policy = TempPolicyFile::new(&token_policy_document_string());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = token_admin_router(&token_db, &policy, audit_log);
+
+        let response = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-writer"])),
+                Some(json!({ "scopes": ["token-admin"] }).to_string()),
+            ))
+            .await
+            .expect("token create request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"requested scopes exceed creator authority: token-admin"}"#
+        );
+
+        let list_response = router
+            .oneshot(token_admin_request(
+                Method::GET,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-reader"])),
+                None,
+            ))
+            .await
+            .expect("token list request should complete");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        assert_eq!(json_body(list_response).await["tokens"], json!([]));
+
+        let event = captured_token_delegation_rejection(&capture);
+        assert_token_change_actor(&event);
+        assert!(!event.request_id.is_empty());
+        assert_eq!(event.source_ip, "unknown");
+        assert_eq!(event.payload["decision"], json!("deny"));
+        assert_eq!(
+            event.payload["reason"],
+            json!("requested_scopes_exceed_creator_authority")
+        );
+        assert_eq!(event.payload["requested_scopes"], json!(["token-admin"]));
+        assert_eq!(event.payload["disallowed_scopes"], json!(["token-admin"]));
+        assert!(!capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == audit::event::SERVICE_TOKEN_CHANGED));
+    }
+
+    #[tokio::test]
+    async fn token_create_rejects_carried_role_inactive_for_creator_identity() {
+        let token_db = TempDb::new("token-create-rejects-inactive-role");
+        let policy = TempPolicyFile::new(&token_policy_document_string());
+        let router = token_admin_router(&token_db, &policy, test_audit_log());
+
+        let response = router
+            .oneshot(token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-writer", "service-admin"])),
+                Some(json!({ "scopes": ["service-admin"] }).to_string()),
+            ))
+            .await
+            .expect("token create request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"requested scopes exceed creator authority: service-admin"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn token_create_allows_wildcard_creator_to_delegate_any_scope() {
+        let token_db = TempDb::new("token-create-wildcard-delegation");
+        let policy = TempPolicyFile::new(&token_policy_document_string());
+        let router = token_admin_router(&token_db, &policy, test_audit_log());
+
+        let response = router
+            .oneshot(token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["superadmin"])),
+                Some(json!({ "scopes": ["some-narrow-role", "mcp:tools"] }).to_string()),
+            ))
+            .await
+            .expect("wildcard token create request should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            json_body(response).await["token"]["scopes"],
+            json!(["some-narrow-role", "mcp:tools"])
+        );
+    }
+
+    #[tokio::test]
+    async fn token_create_allows_scopes_within_creator_roles() {
+        let token_db = TempDb::new("token-create-bounded-delegation");
+        let policy = TempPolicyFile::new(&token_policy_document_string());
+        let router = token_admin_router(&token_db, &policy, test_audit_log());
+
+        let response = router
+            .oneshot(token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-writer", "probe-reader"])),
+                Some(json!({ "scopes": ["probe-reader"] }).to_string()),
+            ))
+            .await
+            .expect("bounded token create request should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            json_body(response).await["token"]["scopes"],
+            json!(["probe-reader"])
+        );
+    }
+
+    #[test]
+    fn requested_scope_authorization_enforces_subset_and_wildcard_delegation() {
+        let policy = parse_policy_body(&Bytes::from(token_policy_document_string()))
+            .expect("token policy should parse");
+        let rbac_state =
+            middleware::rbac::RbacState::new(policy, Vec::new(), false, test_audit_log());
+
+        assert_eq!(
+            authorize_requested_scopes(
+                &rbac_state,
+                &test_principal(&["tokens-writer", "probe-reader"]),
+                &["probe-reader".to_owned()],
+            ),
+            Ok(())
+        );
+
+        let error = authorize_requested_scopes(
+            &rbac_state,
+            &test_principal(&["tokens-writer"]),
+            &["token-admin".to_owned(), "mcp:tools".to_owned()],
+        )
+        .expect_err("creator must not delegate roles it does not carry");
+        assert_eq!(
+            error,
+            TokenScopeAuthzError {
+                disallowed: vec!["token-admin".to_owned(), "mcp:tools".to_owned()]
+            }
+        );
+
+        let error = authorize_requested_scopes(
+            &rbac_state,
+            &test_principal(&["tokens-writer", "unknown-future-role"]),
+            &["unknown-future-role".to_owned()],
+        )
+        .expect_err("unknown roles must not become delegatable by carrying their name");
+        assert_eq!(
+            error,
+            TokenScopeAuthzError {
+                disallowed: vec!["unknown-future-role".to_owned()]
+            }
+        );
+
+        assert_eq!(
+            authorize_requested_scopes(
+                &rbac_state,
+                &test_principal(&["superadmin"]),
+                &["unknown-future-role".to_owned(), "mcp:tools".to_owned()],
+            ),
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
     async fn token_admin_create_list_get_require_permissions_and_never_list_secret_material() {
         let token_db = TempDb::new("token-admin-create-list");
         let policy = TempPolicyFile::new(&token_policy_document_string());
@@ -16387,10 +16642,10 @@ mod tests {
             .oneshot(token_admin_request(
                 Method::POST,
                 TOKENS_ADMIN_ROUTE,
-                Some(test_principal(&["tokens-writer"])),
+                Some(test_principal(&["tokens-writer", "probe-reader"])),
                 Some(
                     json!({
-                        "scopes": ["probe-reader", "admin:tokens:read"],
+                        "scopes": ["tokens-writer", "probe-reader"],
                         "expires_at": "2099-01-01T00:00:00Z"
                     })
                     .to_string(),
@@ -16415,7 +16670,7 @@ mod tests {
             .to_owned();
         assert_eq!(
             create_body["token"]["scopes"],
-            json!(["probe-reader", "admin:tokens:read"])
+            json!(["tokens-writer", "probe-reader"])
         );
         let create_serialized = serde_json::to_string(&create_body).unwrap();
         assert!(!create_serialized.contains("token_hash"));
@@ -16486,7 +16741,7 @@ mod tests {
         assert_eq!(event.payload["token_id"], json!(token_id));
         assert_eq!(
             event.payload["scopes"],
-            json!(["probe-reader", "admin:tokens:read"])
+            json!(["tokens-writer", "probe-reader"])
         );
         let audit_serialized = serde_json::to_string(&event).unwrap();
         assert!(!audit_serialized.contains(&plaintext));
@@ -16518,7 +16773,7 @@ mod tests {
                 Method::POST,
                 TOKENS_ADMIN_ROUTE,
                 &token,
-                json!({ "scopes": ["probe-reader"] }).to_string(),
+                json!({ "scopes": ["admin"] }).to_string(),
             ))
             .await
             .expect("token create request should complete");
@@ -24099,12 +24354,15 @@ paths:
     }
 
     async fn create_token_via_endpoint(router: &Router, scopes: &[&str]) -> Value {
+        let creator_roles = std::iter::once("tokens-writer")
+            .chain(scopes.iter().copied())
+            .collect::<Vec<_>>();
         let response = router
             .clone()
             .oneshot(token_admin_request(
                 Method::POST,
                 TOKENS_ADMIN_ROUTE,
-                Some(test_principal(&["tokens-writer"])),
+                Some(test_principal(&creator_roles)),
                 Some(json!({ "scopes": scopes }).to_string()),
             ))
             .await
@@ -24382,6 +24640,13 @@ paths:
                 },
                 "probe-reader": {
                     "permissions": ["test:read"]
+                },
+                "superadmin": {
+                    "permissions": ["*"]
+                },
+                "service-admin": {
+                    "permissions": ["*"],
+                    "auth_methods": ["service_token"]
                 }
             },
             "routes": []
@@ -26106,6 +26371,23 @@ paths:
                     && event.payload["action"] == json!(action)
             })
             .expect("service_token.changed event should be captured")
+    }
+
+    fn captured_token_delegation_rejection(
+        capture: &audit::sink::tests::CaptureSink,
+    ) -> audit::AuditEvent {
+        assert_eventually(Duration::from_secs(1), || {
+            capture
+                .events()
+                .iter()
+                .any(|event| event.event_type == audit::event::SERVICE_TOKEN_DELEGATION_REJECTED)
+        });
+
+        capture
+            .events()
+            .into_iter()
+            .find(|event| event.event_type == audit::event::SERVICE_TOKEN_DELEGATION_REJECTED)
+            .expect("service_token.delegation_rejected event should be captured")
     }
 
     fn captured_tool_registry_change(
