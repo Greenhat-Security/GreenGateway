@@ -27,8 +27,8 @@ use crate::{
     config::Config,
     path_match::{is_unsafe_request_path, path_prefix_matches},
     rbac::{
-        policy::ToolPolicyEntry, DefaultAction, EnforcementMode, Policy, PolicyEngine, RouteRule,
-        RuleAction, RuleDecision, RuleDispatchContext, RuleMatcher,
+        policy::ToolPolicyEntry, DefaultAction, EgressPolicy, EnforcementMode, Policy,
+        PolicyEngine, RouteRule, RuleAction, RuleDecision, RuleDispatchContext, RuleMatcher,
     },
     upstream_route::{
         self, ProxyRouteAuthorizationContext, ProxyRouteClassificationCompleted,
@@ -169,6 +169,10 @@ impl RbacState {
         self.policy.load().engine.policy().clone()
     }
 
+    pub fn current_egress_policy(&self) -> EgressPolicy {
+        self.policy.load().engine.policy().egress.clone()
+    }
+
     pub(crate) fn policy_write_guard(&self) -> LockResult<MutexGuard<'_, ()>> {
         self.policy_write_lock.lock()
     }
@@ -303,6 +307,14 @@ pub fn reload_policy_from_file(
 
     match Policy::from_file(path) {
         Ok(policy) => {
+            if policy.egress != state.current_egress_policy() {
+                tracing::error!(
+                    policy_file = %path.display(),
+                    "RBAC policy reload rejected: egress section changed; egress changes require a gateway restart. Existing policy (including egress allowlist) remains active."
+                );
+                return Err(crate::rbac::policy::PolicyError::EgressReloadRejected);
+            }
+
             let policy_id = policy.id.clone();
             let route_rules = policy.routes.len();
             let direct_rules = policy.rules.len();
@@ -1058,7 +1070,7 @@ mod tests {
         audit::{sink::tests::CaptureSink, AuditSink},
         auth::{AuthMethod, Principal},
         rbac::{
-            policy::{EgressPolicy, RoleEntry},
+            policy::{EgressPolicy, PolicyError, RoleEntry},
             PrincipalMatcher, Rule, RuleAction,
         },
     };
@@ -2519,6 +2531,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn current_egress_policy_reflects_live_policy() {
+        let file = TempPolicyFile::new(&egress_policy_document("deny", "initial.example.test"));
+        let initial_policy =
+            Policy::from_file(file.path()).expect("initial policy should parse before test");
+        let (state, _capture) = test_state(initial_policy, &[]);
+
+        assert_eq!(
+            state.current_egress_policy(),
+            EgressPolicy {
+                hosts: vec!["initial.example.test".to_owned()],
+                ..EgressPolicy::default()
+            }
+        );
+    }
+
+    #[test]
+    fn reload_rejected_when_egress_section_changes() {
+        let file = TempPolicyFile::new(&egress_policy_document("deny", "initial.example.test"));
+        let initial_policy =
+            Policy::from_file(file.path()).expect("initial policy should parse before test");
+        let (state, _capture) = test_state(initial_policy, &[]);
+
+        file.write(&egress_policy_document("allow", "replacement.example.test"));
+        let error = reload_policy_from_file(&state, file.path())
+            .expect_err("egress-changing reload should be rejected");
+
+        assert!(matches!(error, PolicyError::EgressReloadRejected));
+        assert!(error.to_string().contains("restart"));
+        assert_eq!(state.current_policy().default_action, DefaultAction::Deny);
+        assert_eq!(
+            state.current_egress_policy().hosts,
+            vec!["initial.example.test".to_owned()]
+        );
+    }
+
+    #[test]
+    fn reload_accepted_when_egress_section_is_unchanged() {
+        let file = TempPolicyFile::new(&egress_policy_document("deny", "unchanged.example.test"));
+        let initial_policy =
+            Policy::from_file(file.path()).expect("initial policy should parse before test");
+        let (state, _capture) = test_state(initial_policy, &[]);
+
+        file.write(&egress_policy_document("allow", "unchanged.example.test"));
+        reload_policy_from_file(&state, file.path())
+            .expect("RBAC-only reload should be accepted when egress is unchanged");
+
+        assert_eq!(state.current_policy().default_action, DefaultAction::Allow);
+        assert_eq!(
+            state.current_egress_policy().hosts,
+            vec!["unchanged.example.test".to_owned()]
+        );
+    }
+
+    #[test]
+    fn reload_accepted_when_both_policies_have_empty_egress() {
+        let file = TempPolicyFile::new(&default_policy_document("deny"));
+        let initial_policy =
+            Policy::from_file(file.path()).expect("initial policy should parse before test");
+        let (state, _capture) = test_state(initial_policy, &[]);
+
+        file.write(&default_policy_document("allow"));
+        reload_policy_from_file(&state, file.path())
+            .expect("RBAC-only reload should be accepted for empty egress policies");
+
+        assert_eq!(state.current_policy().default_action, DefaultAction::Allow);
+        assert_eq!(state.current_egress_policy(), EgressPolicy::default());
+    }
+
     #[tokio::test]
     async fn valid_policy_reload_updates_default_action() {
         let file = TempPolicyFile::new(&default_policy_document("deny"));
@@ -3091,6 +3172,19 @@ mod tests {
                 "schema_version": "0.1.0",
                 "default_action": "{default_action}",
                 "roles": {{}}
+            }}"#
+        )
+    }
+
+    fn egress_policy_document(default_action: &str, host: &str) -> String {
+        format!(
+            r#"{{
+                "schema_version": "0.1.0",
+                "default_action": "{default_action}",
+                "roles": {{}},
+                "egress": {{
+                    "hosts": ["{host}"]
+                }}
             }}"#
         )
     }

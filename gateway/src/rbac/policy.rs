@@ -243,6 +243,9 @@ pub enum PolicyError {
         source: io::Error,
     },
     Invalid(String),
+    /// A reload/replace changed the `egress` section, which cannot be applied
+    /// without a restart. The existing policy remains active.
+    EgressReloadRejected,
 }
 
 impl Policy {
@@ -728,6 +731,10 @@ impl fmt::Display for PolicyError {
                 path.display()
             ),
             Self::Invalid(message) => write!(formatter, "invalid policy: {message}"),
+            Self::EgressReloadRejected => write!(
+                formatter,
+                "egress allowlist changes cannot be applied by hot reload; edit the policy file and restart the gateway to change egress rules"
+            ),
         }
     }
 }
@@ -740,6 +747,7 @@ impl Error for PolicyError {
             Self::Serialize { source, .. } => Some(source),
             Self::Write { source, .. } => Some(source),
             Self::Invalid(_) => None,
+            Self::EgressReloadRejected => None,
         }
     }
 }

@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+- Policy hot reload and the policy administration API now reject changes to
+  the policy `egress` section. Egress allowlist changes require a gateway
+  restart; previously a reload appeared to accept them while long-lived
+  egress clients continued enforcing the startup allowlist (F3/F9/F10).
+
 ## [1.0.0] - 2026-07-15
 
 Phase 6 (native MCP support) is complete and included in this release. See the
