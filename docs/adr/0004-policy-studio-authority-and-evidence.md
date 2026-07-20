@@ -46,11 +46,15 @@ This ADR does not introduce:
 | Evidence package | A reproducible aggregate report over pinned inputs, limits, and limitations. | Proof that its mutable source data was complete or untampered. |
 | Signed attestation | Proof that a trusted key holder signed unchanged package bytes. | Compliance certification, policy safety, or source completeness. |
 
-No newly allowed decisions were observed among N replayable events.
+Historical comparisons must report their bounded result as:
+
+> No newly allowed decisions were observed among N replayable events.
 
 Missing, stale, unsupported, malformed, pruned, empty, or truncated input cannot become allow, pass, zero, or safe.
 
 ### Authoritative evaluator and adapters
+
+This section defines the target architecture. Accepting this ADR does not mean that the kernel or adapters are implemented; existing production paths remain authoritative until each path is migrated and parity is verified.
 
 A typed, deterministic, side-effect-free `CompiledPolicy` kernel is authoritative for logical policy decisions. Its inputs are a versioned `PolicyEvaluationContext` and a redacted, immutable `ResourceSnapshot`.
 
