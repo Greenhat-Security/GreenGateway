@@ -46,7 +46,7 @@ This ADR does not introduce:
 | Evidence package | A reproducible aggregate report over pinned inputs, limits, and limitations. | Proof that its mutable source data was complete or untampered. |
 | Signed attestation | Proof that a trusted key holder signed unchanged package bytes. | Compliance certification, policy safety, or source completeness. |
 
-Historical comparisons must report their bounded result as:
+When a historical comparison finds no newly allowed decisions, it must report its bounded result as:
 
 > No newly allowed decisions were observed among N replayable events.
 
