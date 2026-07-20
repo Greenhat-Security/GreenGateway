@@ -60,7 +60,7 @@ Add `## Scope` and `## Non-goals`. Scope covers Policy Studio authorization sema
 
 - [ ] **Step 3: Document the eight-way truth model**
 
-Add `## Decision` and `### Truth model`. Include this exact table:
+Add `## Decision` and state that the entire section is target architecture, not shipped behavior; current production paths remain authoritative until migrated behind differential parity tests. Then add `### Truth model`. Include this exact table:
 
 ```markdown
 | Concept | Meaning | Must not be presented as |
@@ -150,6 +150,8 @@ Require this framing for freshness bindings, evidence/manifest/signature subject
 
 Add `### Server authority and state transitions`. Require owner-scoped unpredictable draft IDs, base revision and ETag, candidate digest, resource-snapshot digest, timestamps, TTL, quotas, and strong ETags. Publishing is a separate current-authority operation that revalidates schema, resources, required tests, risks, and conditional bindings. Stale drafts remain reviewable and are never silently rebased.
 
+Define owner authorization independently of operation permission; unpredictable IDs are not authorization and cross-owner recovery needs a separately named permission/audit event. Define the atomic publication tuple: candidate digest, base revision/ETag, resource snapshot, evaluator, exact test suite and complete-result digests, exact risk codes/diagnostic digests, actor, short expiry, intended operation, and payload digest. Bind suggestion application to its identifier/version, source cutoff/evidence digest, candidate/resources, actor, operation, and expiry. Bind idempotency to owner, operation, payload, and the complete tuple; mismatched reuse conflicts.
+
 Include this flow, preserving the independent branches:
 
 ```text
@@ -179,6 +181,8 @@ State that digest-bound completed tests may gate publication, but evidence and s
 
 Add `### API and authorization contract`. Reserve the semantics of capabilities, drafts, simulations, replays, analyses, tests, evidence, and suggestions under the configured admin prefix without freezing #242's final route suffixes.
 
+State that the proposed permission names are reserved target contracts and are not implemented until their endpoint slice adds and tests them.
+
 Include this exact minimum permission matrix:
 
 ```markdown
@@ -198,7 +202,7 @@ Include this exact minimum permission matrix:
 
 Require normal authentication/server RBAC, shared CSRF for cookie mutations, request byte limits before expensive parsing, rejection of unknown request fields, pagination, and separate aggregate/detail projections.
 
-Define the common result envelope fields: schema and evaluator versions; active/base revisions and ETags; source/semantic policy digests; relevant resource digests; mode; logical outcome; enforcement; effective action; completeness and limitation codes; stable terminal reason; matched stable IDs; required/granted permission; bounded trace; and applied limits.
+Define the common result envelope fields: schema and evaluator versions; active/base revisions and ETags; source/semantic policy digests; relevant resource digests; mode and declared completeness domain; logical outcome; enforcement; effective action; completeness and limitation codes; stable terminal reason; matched stable IDs; required/granted permission; bounded stage trace; and applied limits. Require `matched`, `skipped`, `not_applicable`, `unknown`, and `not_evaluated` stage statuses; all out-of-kernel live stages must be explicit and `would_forward` must remain policy-only.
 
 - [ ] **Step 5: Add failure and bounds semantics**
 
@@ -256,12 +260,16 @@ Add `### Privacy projections`. State:
 - Aggregate results contain counts, stable categories, digests, proof bases, and limitations.
 - Audit-derived event or principal detail requires `admin:audit:read`, is separately bounded, and never enters canonical v1 evidence.
 - Secret-marked or forbidden values (credentials, authorization/cookie/proxy/hop-by-hop/configured credential headers, secret-store values) are rejected as synthetic input rather than stripped into an approximate evaluation.
-- Approved bounded non-secret matcher inputs (allowlisted headers, query values, typed identity attributes, validated tool arguments) may exist only in the authenticated request and evaluator memory, then are discarded.
-- Raw matcher values are excluded from persisted results, traces, errors, URLs, browser storage, logs, metrics, audits, temporary files, evidence, and signatures.
+- Approved bounded non-secret matcher inputs for ad hoc simulations (allowlisted headers, query values, typed identity attributes, validated tool arguments) may exist only in the authenticated request and evaluator memory, then are discarded.
+- Strict-versioned saved synthetic test fixtures are the sole persistence exception: bounded, secret-free typed values stored beside policy under owner authorization, strong ETags, stable IDs, canonical digests, lifecycle/retention bounds, and protected policy-resource storage. Only authorized test CRUD returns fixtures; all results and secondary outputs expose identifiers/digests/expectations/sanitized outcomes.
+- Raw ad hoc matcher values and saved fixture values outside authorized test CRUD are excluded from persisted results, traces, errors, URLs, browser storage, logs, metrics, audits, temporary files, evidence, and signatures.
+- Every draft, test revision, job, result, detail projection, and evidence artifact has a positive retention/TTL limit, bounded cleanup, and observable expiry. Exact tested defaults land with later slices; configuration may only lower hard ceilings. Existing audit retention remains the compatibility anchor, and expiry/pruning is never an empty success.
 - Raw HTTP bodies, tool results, serialized production principals, and raw source events are not accepted merely to improve analysis.
 - Existing source IP, request ID, user agent, path, and actor data pass a centralized purpose-specific projection before crossing the audit boundary.
 
-Repeat the evidence limitation: a signature proves package integrity and signer possession only, not source completeness, policy safety, or compliance.
+Repeat the evidence limitation: a valid signature proves only that a holder of a verifier-trusted key produced unchanged package bytes when the trust root is supplied out of band, not source completeness, policy safety, signer identity beyond that key mapping, or compliance.
+
+Also add `### Control-plane observability`. Require structured privacy-safe events for run lifecycle, draft/test changes, cancellation, suggestion application, publication, and evidence export; low-cardinality metrics; explicit safe/forbidden field sets; and fail-closed transaction/outbox behavior when a required event cannot be recorded.
 
 - [ ] **Step 2: Add the embedded threat model**
 
@@ -286,6 +294,7 @@ Include this minimum abuse-case table:
 | Policy lockout or overbroad grant | Cross-resource validation, required tests, risk gates, conditional publish. | Authorized operators can still approve risky policy deliberately. |
 | Canonicalization ambiguity | Exact UTF-8/JCS validation and framed digest contract with cross-platform vectors. | Future schema normalization requires a versioned contract. |
 | Signing-oracle or key misuse | #240 protected key references, evidence-specific payload construction, no arbitrary signing endpoint. | Trust-root distribution and key compromise remain operator concerns. |
+| Malicious, unknown, rotated, or revoked verifier key | #242 out-of-band trust root, versioned key IDs/algorithms, explicit rotation/revocation, fail-closed unknown-key handling. | Operators own authentic trust-root distribution and incident response. |
 | Artifact tampering or archive abuse | Manifest digests, DSSE/in-toto envelope, size/type/path/decompression bounds, offline verification. | Valid signatures do not validate source completeness. |
 | Evidence or compliance overclaim | Mandatory limitation wording in API/UI/docs/artifacts. | Humans may still misuse reports outside GreenGateway. |
 ```
@@ -312,12 +321,12 @@ Add `## Rollout and migration` with this order:
 4. Add snapshots and server drafts before simulation/tests/replay/analyzer/evidence.
 5. Add standalone resources only where semantics are equivalent; report unsupported cluster features until #241 exists.
 6. Route publication/CLI through #242.
-7. Add signing only after #240 protected references and offline trust behavior exist.
+7. Add signed artifact generation only after #240 protected references and #242 artifact, `ggctl` offline-verification, and trust-root contracts exist.
 8. Deprecate legacy per-rule preview and browser pseudo-expressions only after compatible server replacements ship.
 
 Rollback retains the last compatible v0 document and never silently downgrades or discards v1-only semantics.
 
-Add `## Consequences` covering the benefits and costs: one semantic authority, explicit incompleteness, deterministic bindings, more version/limit metadata, new permissions, and staged dependency-aware delivery.
+Add `## Consequences`, first stating that this ADR is documentation-only and ships no runtime behavior. Cover the benefits and costs: one semantic authority, explicit incompleteness, deterministic bindings, more version/limit metadata, new permissions, and staged dependency-aware delivery.
 
 Add `## Rejected alternatives` rejecting: duplicate simulator logic; browser-owned drafts/capabilities; fail-open unknown input; unbounded replay; observation-as-proof; automatic optimizer/suggestion application; ad hoc key-sorted JSON; generic signing endpoints; and waiting for all dependency epics before defining the contract.
 

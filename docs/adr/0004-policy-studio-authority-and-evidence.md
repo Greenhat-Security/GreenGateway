@@ -33,12 +33,14 @@ This ADR does not introduce:
 
 ## Decision
 
+This entire Decision section defines target Policy Studio architecture. Accepting this ADR does not mean that these kernels, permissions, resources, drafts, digests, envelopes, projections, or signing flows are implemented today. Existing HTTP/RBAC middleware, MCP and tool admission, rate selection, egress, policy CRUD/history, and audit-query paths remain authoritative until each named lane is migrated and differential tests prove parity. A currently shipped compatibility anchor is identified explicitly where it appears.
+
 ### Truth model
 
 | Concept | Meaning | Must not be presented as |
 | --- | --- | --- |
 | Synthetic simulation | Deterministic evaluation of a supplied typed hypothetical context. | A live request or historical observation. |
-| Historical replay | Bounded recomputation over retained facts under a pinned cutoff. | A reconstruction of facts that were never captured. |
+| Historical replay | Bounded recomputation over retained facts under a pinned cutoff using the same `CompiledPolicy` kernel. | A reconstruction of facts that were never captured. |
 | Recorded result | What the gateway recorded at the time under its then-current evaluator and resources. | The candidate policy result. |
 | Shadow evidence | Observed live would-deny behavior while the effective request was forwarded. | An enforced denial or proof of policy safety. |
 | Analyzer finding | A proven, bounded-observation, heuristic, or inconclusive statement with an explicit proof basis. | A stronger proof class than it actually has. |
@@ -50,11 +52,11 @@ When a historical comparison finds no newly allowed decisions, it must report it
 
 > No newly allowed decisions were observed among N replayable events.
 
+The sentence is a normative verbatim template; only `N` is substituted.
+
 Missing, stale, unsupported, malformed, pruned, empty, or truncated input cannot become allow, pass, zero, or safe.
 
 ### Authoritative evaluator and adapters
-
-This section defines the target architecture. Accepting this ADR does not mean that the kernel or adapters are implemented; existing production paths remain authoritative until each path is migrated and parity is verified.
 
 A typed, deterministic, side-effect-free `CompiledPolicy` kernel is authoritative for logical policy decisions. Its inputs are a versioned `PolicyEvaluationContext` and a redacted, immutable `ResourceSnapshot`.
 
@@ -69,6 +71,8 @@ When a supported policy-relevant fact is unavailable, the kernel returns `indete
 Analysis is prohibited from performing DNS or HTTP operations; making MCP, provider, or secret-store calls; validating tokens or credentials; invoking tools; acquiring semaphores; reading or writing production rate buckets; mutating policies or suggestions; selecting a physical upstream; or emitting normal data-plane authorization events.
 
 Authentication validity, CSRF, request validation, dynamic rate capacity, future semaphore capacity, unpinned DNS outcomes, transport health, and upstream execution are outside the pure verdict.
+
+Every analysis result enumerates those external stages as `not_evaluated` with stable limitation codes. `complete` is always scoped to the declared, pinned policy-evaluation domain; it never means that authentication, request validation, mutable capacity, DNS, transport, or an upstream operation succeeded. Likewise, `would_forward` is a policy-only hypothetical action that remains conditional on every unevaluated live stage.
 
 ### Exact versions, stable identity, and resource snapshots
 
@@ -98,9 +102,11 @@ This framing is used for freshness bindings, evidence subjects, manifest entries
 
 ### Server authority and state transitions
 
-The browser is a client, not a policy or capability authority. A server-owned draft has an unpredictable owner-scoped identifier and binds its owner, active base revision and ETag, candidate semantic digest, resource-snapshot digest, creation and update times, expiry, and enforced size/count quotas. Draft mutation uses a strong ETag.
+The browser is a client, not a policy or capability authority. A server-owned draft has an unpredictable owner-scoped identifier and binds its owner, active base revision and ETag, candidate semantic digest, resource-snapshot digest, creation and update times, expiry, and enforced size/count quotas. Draft mutation uses a strong ETag. Ownership is checked in addition to operation permissions: owner-scoped read, mutation, and deletion fail closed for every other actor. An unpredictable identifier is defense in depth, not authorization. A future cross-owner recovery operation requires a separately named server capability and permission plus a structured audit event; ordinary policy read or write does not imply it.
 
 Publication is a separate authorized current-authority operation. It revalidates the candidate schema, current resources, required tests, risk acknowledgements, and every conditional binding. A stale draft remains reviewable and returns an explicit conflict; GreenGateway never silently rebases it.
+
+A publication attempt atomically compares the current authority with an immutable conditional tuple containing the candidate semantic digest, base revision and strong ETag, resource-snapshot digest, evaluator-semantics version, exact test-suite digest and complete test-result digest, and the intended publication operation and payload digest. Each risk acknowledgement additionally binds the exact sorted risk-code and diagnostic-digest set, acknowledging actor, issue time, and short expiry; a blanket force flag is invalid. Suggestion application additionally binds the suggestion identifier and version, source cutoff and evidence digest, candidate and resource digests, actor, operation, and expiry. An idempotency record binds owner, operation, payload digest, and the complete conditional tuple: an identical retry returns the authoritative prior result, while reuse with different input returns a conflict. Publication, history, suggestion state, and required audit/outbox state have one compare-and-set winner; an ambiguous response is resolved by reading current authority, never by blind retry.
 
 Publication and evidence are independent branches:
 
@@ -131,6 +137,8 @@ Digest-bound completed test results may satisfy publication gates, but evidence 
 
 Policy Studio reserves the semantics of capabilities, drafts, simulations, replays, analyses, tests, evidence, and suggestions under the configured admin prefix. Issue #242 owns the final OpenAPI route suffixes and generated client contract; changing a suffix must not change these resource semantics.
 
+The permission names below are reserved target contract names, not claims that the current gateway already recognizes or enforces them. Each later endpoint slice must add and test its permissions before exposing the endpoint.
+
 The minimum permission matrix is:
 
 | Operation | Required permissions |
@@ -148,7 +156,15 @@ The minimum permission matrix is:
 
 Every endpoint requires normal authentication and server-side RBAC. Cookie-authenticated mutations use the shared CSRF mechanism. Request bytes are bounded before expensive parsing, unknown request fields are rejected, list and detail results are paginated, and aggregate and audit-derived detail projections remain separate.
 
-The common result envelope carries schema and evaluator versions; active and base revisions and ETags; source and semantic policy digests; relevant resource digests; evaluation mode; logical outcome; enforcement; effective action; completeness and limitation codes; stable terminal reason; matched stable identifiers; required and granted permission where relevant; optional bounded trace; and the limits applied to the run.
+The common result envelope carries schema and evaluator versions; active and base revisions and ETags; source and semantic policy digests; relevant resource digests; evaluation mode and declared completeness domain; logical outcome; enforcement; effective action; completeness and limitation codes; stable terminal reason; matched stable identifiers; required and granted permission where relevant; optional bounded trace; and the limits applied to the run. Bounded stage entries use `matched`, `skipped`, `not_applicable`, `unknown`, or `not_evaluated`. All out-of-kernel stages named in the side-effect boundary appear explicitly rather than being hidden behind a complete policy result.
+
+### Control-plane observability
+
+The authenticated control-plane service, outside the pure evaluator, emits structured, privacy-safe audit events for authorization outcomes and the lifecycle of simulations, analyses, replays, and tests; draft and test changes; cancellation; suggestion application; publication; and evidence export. Stable event names distinguish start, completion, cancellation, and failure where those states exist.
+
+Allowed fields are the existing approved admin actor and request envelope, stable event and reason or risk codes, base and candidate digests, resource-snapshot and evaluator versions, bounded counts, completeness, duration, and result or job identifiers. New audit payloads exclude raw contexts, paths, hosts, principals, claims, headers, query values, tool arguments, samples, arbitrary errors, signing-key references, and policy contents. Metrics are low-cardinality and never label by actor, principal, path, host, stable element, digest, job, or finding fingerprint.
+
+An operation never silently loses its required audit record. A mutation, publication, suggestion application, or export performs no state change or artifact release unless the audit authority accepts the event in the same crash-safe transaction or outbox boundary. A long-running job is not queued unless its start event is accepted; if its terminal event cannot be recorded, its result is failed or incomplete and cannot satisfy publication or evidence-complete gates. Cluster atomicity uses #241; an equivalent crash-safe standalone boundary is required before the corresponding operation ships.
 
 ### Failure and bounds semantics
 
@@ -179,11 +195,17 @@ Policy Studio exposes separate aggregate and detail projections. Aggregate resul
 
 Secret-marked or categorically forbidden fields are rejected as synthetic input rather than silently removed before evaluation. Forbidden fields include credentials, authorization and cookie headers, proxy and hop-by-hop headers, configured credential headers, and secret-store values. This rejection avoids a privacy filter turning a complete evaluation into an undocumented approximation.
 
-Approved, bounded, non-secret matcher inputs may exist transiently in the authenticated request and evaluator memory so the canonical evaluator receives exact typed facts. These inputs include explicitly allowlisted headers, query values, typed identity attributes, and validated tool arguments. Their raw values are discarded after evaluation and excluded from persisted run results, traces, errors, URLs, browser storage, logs, metrics, audit events, temporary files, evidence, and signatures.
+Approved, bounded, non-secret matcher inputs for an ad hoc simulation may exist transiently in the authenticated request and evaluator memory so the canonical evaluator receives exact typed facts. These inputs include explicitly allowlisted headers, query values, typed identity attributes, and validated tool arguments. Their raw values are discarded after evaluation and excluded from persisted run results, traces, errors, URLs, browser storage, logs, metrics, audit events, temporary files, evidence, and signatures.
+
+Deliberately saved synthetic test fixtures are the only persistence exception. They store strict-versioned, bounded, secret-free typed matcher values beside policy under owner-scoped test authorization, strong ETags, stable case identifiers, canonical digests, explicit lifecycle and retention, and the same protected policy-resource storage boundary. Authorized test CRUD may return the fixture itself; run results, traces, audit events, metrics, evidence, exports, URLs, and browser storage may contain only its stable identifier, digest, expectation, and sanitized outcome. A test runner loads the fixture only into evaluator memory and discards that working copy after the run. Test creation rejects forbidden fields before persisting anything.
+
+Every server-side draft, test revision, job, run result, detail projection, and evidence artifact has an explicit positive retention or TTL limit, bounded cleanup work, and an advertised expiry where clients can observe it. Later slices choose and test exact defaults; configuration may lower them but cannot exceed compile-time ceilings. Existing audit retention remains the source-data compatibility anchor and Policy Studio never extends it implicitly. Expiry or source pruning changes completeness to expired, unavailable, or incomplete; it never becomes an empty successful result.
 
 Raw HTTP bodies, tool results, serialized production principals, and raw source events are not accepted merely to improve analysis. Existing retained source IP, request ID, user agent, path, and actor fields pass through a centralized purpose-specific projection before crossing the audit boundary.
 
-A signature proves package integrity and signer possession only. It does not prove source completeness, policy safety, source-database integrity, or compliance with any framework.
+Evidence is reproducible only in the bounded sense that the same pinned inputs held by their authorized authorities produce byte-identical aggregate output. A package is not self-contained and does not embed privacy-sensitive source events or test fixtures merely to make independent replay possible.
+
+A valid signature proves that a holder of a verifier-trusted key produced unchanged package bytes, and only when the verifier receives that trust root out of band. It does not prove source completeness, policy safety, source-database integrity, signer identity beyond the trusted-key mapping, or compliance with any framework.
 
 ## Threat model
 
@@ -229,6 +251,7 @@ Relevant actors include unauthenticated attackers, compromised low-permission op
 | Concurrent suggestion or policy changes partially apply | One compare-and-set winner, idempotent operations, and #241 transactions/outbox integration in cluster mode. | Standalone crash recovery must expose authoritative revision state. |
 | Canonicalization ambiguity breaks bindings | Exact UTF-8/JCS validation, framed digest input, versioned normalization, and cross-platform vectors. | A future schema requires its own reviewed normalization contract. |
 | A signing API becomes a signing oracle | #240 protected key references, evidence-specific package assembly, and no arbitrary bytes or digest signing endpoint. | Trust-root distribution, rotation, revocation, and key compromise remain operator responsibilities. |
+| A verifier trusts a malicious, unknown, rotated, or revoked key | #242 offline verification requires an out-of-band configured trust root, versioned key identifiers and algorithms, explicit rotation/revocation policy, and fail-closed rejection of unknown or ambiguous keys. | Operators remain responsible for authentic trust-root distribution and incident response. |
 | An evidence archive tampers with or exhausts a verifier | Manifest digests, DSSE/in-toto envelopes, media-type and path allowlists, size and decompression limits, and zero-network verification. | A valid signature still does not establish source completeness. |
 | Evidence is presented as safety or compliance proof | Mandatory limitations in APIs, UI, documentation, and artifacts, including bounded no-new-allow wording. | GreenGateway cannot prevent downstream humans from misrepresenting a report. |
 
@@ -240,7 +263,7 @@ Relevant actors include unauthenticated attackers, compromised low-permission op
 | #239 | Transport, readiness, draining, shutdown, and their lifecycle semantics. | Analysis jobs expose bounded cancellation and shutdown hooks, but analysis availability never gates data-plane readiness. Static simulation never performs transport or DNS work. |
 | #240 | Connections, credential and secret resolution, secret providers, and signer-key custody. | Consume redacted Connection/resource digests and protected signer references only. Never resolve, persist, export, or generically sign secret values. |
 | #241 | PostgreSQL repositories, authoritative security revisions, transactions, outbox behavior, durable leases, fencing, and HA job coordination. | Cluster drafts, jobs, suggestions, evidence, and publication use that authority. Until it exists, return explicit unsupported or unavailable results instead of a weaker local fallback. |
-| #242 | `ggctl`, configuration bundles, staging, activation, rollback, GitOps, generated OpenAPI, and CLI version contracts. | Contribute policy-domain resources and commands through those authorities. Evidence is not a deployable configuration archive, backup, or second CLI. |
+| #242 | `ggctl`, configuration bundles, staging, activation, rollback, GitOps, generated OpenAPI, artifact contracts, and offline verification. | Contribute policy-domain resources, artifact handling, and verification commands through those authorities. Evidence is not a deployable configuration archive, backup, or second CLI. |
 
 Existing policy CRUD and history remain authoritative during migration. Policy Studio must not create a second activation, revision, transaction, CLI, secret, transport, or configuration authority.
 
@@ -254,12 +277,14 @@ Implementation proceeds in this order:
 4. Add immutable resource snapshots and server-owned drafts before simulation, tests, replay, analyzer, or evidence resources consume them.
 5. Add standalone resources only where their semantics are equivalent. Return explicit unsupported or unavailable capabilities for cluster behavior until #241 lands.
 6. Route publication, activation, rollback, CLI, and GitOps workflows through #242 rather than creating a parallel authority.
-7. Add signing only after #240 provides protected signer references and offline trust-root behavior.
+7. Add signed artifact generation only after #240 provides protected signer references and #242 provides the artifact, `ggctl` verification, and offline trust-root contracts. Neither half alone is a complete signed-evidence feature.
 8. Deprecate the legacy per-rule preview and browser-generated pseudo-expression only after compatible server-backed replacements ship and a documented migration window passes.
 
 Rollback retains the last compatible v0 source document. GreenGateway never silently downgrades, drops, or rewrites v1-only semantics. An incompatible policy, evaluator, resource, or test version blocks run reuse and publication. A failed migration leaves the previously active revision authoritative.
 
 ## Consequences
+
+This ADR is documentation-only. It ships no runtime code, schema, endpoint, permission, migration, UI, or configuration change.
 
 The principal benefit is one explainable authorization authority for live decisions, simulation, tests, replay, and analyzer semantic checks. Exact versions and deterministic digests make stale work detectable. Explicit completeness and privacy projections prevent missing evidence from appearing safe. Separate permissions and publication bindings reduce the blast radius of compromised operators or browsers.
 
