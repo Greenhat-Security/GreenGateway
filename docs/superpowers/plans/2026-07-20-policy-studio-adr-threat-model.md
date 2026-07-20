@@ -66,7 +66,7 @@ Add `## Decision` and state that the entire section is target architecture, not 
 | Concept | Meaning | Must not be presented as |
 | --- | --- | --- |
 | Synthetic simulation | Deterministic evaluation of a supplied typed hypothetical context. | A live request or historical observation. |
-| Historical replay | Bounded recomputation over retained facts under a pinned cutoff. | A reconstruction of facts that were never captured. |
+| Historical replay | Bounded recomputation over retained facts under a pinned cutoff using the same `CompiledPolicy` kernel. | A reconstruction of facts that were never captured. |
 | Recorded result | What the gateway recorded at the time under its then-current evaluator and resources. | The candidate policy result. |
 | Shadow evidence | Observed live would-deny behavior while the effective request was forwarded. | An enforced denial or proof of policy safety. |
 | Analyzer finding | A proven, bounded-observation, heuristic, or inconclusive statement with an explicit proof basis. | A stronger proof class than it actually has. |
@@ -202,7 +202,7 @@ Include this exact minimum permission matrix:
 
 Require normal authentication/server RBAC, shared CSRF for cookie mutations, request byte limits before expensive parsing, rejection of unknown request fields, pagination, and separate aggregate/detail projections.
 
-Define the common result envelope fields: schema and evaluator versions; active/base revisions and ETags; source/semantic policy digests; relevant resource digests; mode and declared completeness domain; logical outcome; enforcement; effective action; completeness and limitation codes; stable terminal reason; matched stable IDs; required/granted permission; bounded stage trace; and applied limits. Require `matched`, `skipped`, `not_applicable`, `unknown`, and `not_evaluated` stage statuses; all out-of-kernel live stages must be explicit and `would_forward` must remain policy-only.
+Define the common result envelope fields: exact schema and evaluator versions plus gateway build version; active/base revisions and ETags; source/semantic policy digests; relevant resource digests; mode and declared completeness domain; logical outcome; enforcement; effective action; completeness and limitation codes; stable terminal reason; matched stable IDs; required/granted permission; bounded stage trace; and applied limits. Require `matched`, `skipped`, `not_applicable`, `unknown`, and `not_evaluated` stage statuses; all out-of-kernel live stages must be explicit and `would_forward` must remain policy-only. Define `terminal`, `matched`, and `full` trace levels, hard node/byte/depth limits with explicit truncation, admin-only full trace, and no admin trace exposure to public/data-plane callers.
 
 - [ ] **Step 5: Add failure and bounds semantics**
 
@@ -211,7 +211,7 @@ Add a failure table containing all mappings below:
 ```markdown
 | Condition | Required behavior |
 | --- | --- |
-| Unauthenticated or unauthorized | `401` or `403` before evaluator, audit, or job work. |
+| Unauthenticated or unauthorized | `401` or `403` before evaluator, audit-source/detail reads, or job work; attempt only a bounded privacy-safe authorization-outcome event, and preserve denial if that audit write fails. |
 | Malformed input | `400` with sanitized stable error. |
 | Byte/count/depth violation | `413` or bounded `422`; create no job or mutation. |
 | Invalid candidate/context/tests | `422` structured diagnostics; create no artifact or mutation. |
@@ -261,15 +261,16 @@ Add `### Privacy projections`. State:
 - Audit-derived event or principal detail requires `admin:audit:read`, is separately bounded, and never enters canonical v1 evidence.
 - Secret-marked or forbidden values (credentials, authorization/cookie/proxy/hop-by-hop/configured credential headers, secret-store values) are rejected as synthetic input rather than stripped into an approximate evaluation.
 - Approved bounded non-secret matcher inputs for ad hoc simulations (allowlisted headers, query values, typed identity attributes, validated tool arguments) may exist only in the authenticated request and evaluator memory, then are discarded.
-- Strict-versioned saved synthetic test fixtures are the sole persistence exception: bounded, secret-free typed values stored beside policy under owner authorization, strong ETags, stable IDs, canonical digests, lifecycle/retention bounds, and protected policy-resource storage. Only authorized test CRUD returns fixtures; all results and secondary outputs expose identifiers/digests/expectations/sanitized outcomes.
+- Strict-versioned saved synthetic test fixtures are the sole matcher-value persistence exception: shared versioned policy resources under the exact test read/run and policy-write permissions, with bounded secret-free typed values, strong ETags, stable IDs, canonical digests, and protected policy-resource storage. Authorized test-resource reads may return fixtures; all results and secondary outputs expose identifiers/digests/expectations/sanitized outcomes.
 - Raw ad hoc matcher values and saved fixture values outside authorized test CRUD are excluded from persisted results, traces, errors, URLs, browser storage, logs, metrics, audits, temporary files, evidence, and signatures.
-- Every draft, test revision, job, result, detail projection, and evidence artifact has a positive retention/TTL limit, bounded cleanup, and observable expiry. Exact tested defaults land with later slices; configuration may only lower hard ceilings. Existing audit retention remains the compatibility anchor, and expiry/pruning is never an empty success.
+- Ephemeral drafts, jobs, persisted results, and persisted evidence artifacts have positive retention/TTL limits, bounded cleanup, and observable expiry; audit detail is re-fetched after reauthorization rather than cached by default. Current/staged/rollback- or evidence-referenced tests remain pinned through #242, while quotas reject or collect only unreferenced revisions after bounded retention. Exact tested defaults land with later slices; configuration may only lower hard ceilings. Existing audit retention remains the compatibility anchor, and expiry/pruning is never an empty success.
+- Unsaved candidates and authorized fixtures remain in page memory only. Drafts, principals, matcher values, policy, results, detail, and evidence never enter URLs, analytics, local/session storage, IndexedDB, browser/service-worker caches, automatic clipboard writes, or automated screenshots. Sensitive responses and explicit downloads use `Cache-Control: no-store`.
 - Raw HTTP bodies, tool results, serialized production principals, and raw source events are not accepted merely to improve analysis.
 - Existing source IP, request ID, user agent, path, and actor data pass a centralized purpose-specific projection before crossing the audit boundary.
 
 Repeat the evidence limitation: a valid signature proves only that a holder of a verifier-trusted key produced unchanged package bytes when the trust root is supplied out of band, not source completeness, policy safety, signer identity beyond that key mapping, or compliance.
 
-Also add `### Control-plane observability`. Require structured privacy-safe events for run lifecycle, draft/test changes, cancellation, suggestion application, publication, and evidence export; low-cardinality metrics; explicit safe/forbidden field sets; and fail-closed transaction/outbox behavior when a required event cannot be recorded.
+Also add `### Control-plane observability`. Require structured privacy-safe events for authorization outcomes, run lifecycle, draft/test changes, cancellation, suggestion application, publication, and evidence export; low-cardinality metrics; explicit safe/forbidden field sets; and fail-closed transaction/outbox behavior when a required event cannot be recorded. If an already denied request cannot record its bounded event, preserve `401`/`403`, do no other work, and expose only a low-cardinality sink-failure signal.
 
 - [ ] **Step 2: Add the embedded threat model**
 
@@ -288,7 +289,7 @@ Include this minimum abuse-case table:
 | Stale or replayed mutation | Strong ETags plus revision/resource/candidate/test/risk digests and idempotency. | Ambiguous responses require authoritative reads. |
 | Audit-detail disclosure | Separate detail permission, centralized projection, bounded output, privacy-safe audit. | Authorized detail readers still handle sensitive operational data. |
 | Resource exhaustion | Positive hard limits, quotas, deadlines, cancellation, bounded result retention. | Exhaustion may make analysis unavailable but must not weaken data-plane authorization. |
-| Trace/error exfiltration | Stable codes, bounded sanitized messages, no raw matcher values. | New fields require privacy review. |
+| Trace/error exfiltration | Stable codes and sanitized bounds; ad hoc values only in evaluator memory and saved values only in protected test resources, authorized test reads, and evaluator memory, never secondary outputs. | New fields require privacy review. |
 | Replay cutoff or pruning race | Immutable high-water/cutoff, snapshot or explicit incomplete/failure. | Mutable source history may have been incomplete before capture. |
 | False analyzer proof | Canonical evaluator, lane-aware proofs, complexity budgets, inconclusive fallback. | Heuristics remain advisory. |
 | Policy lockout or overbroad grant | Cross-resource validation, required tests, risk gates, conditional publish. | Authorized operators can still approve risky policy deliberately. |
@@ -307,7 +308,7 @@ Add `## Dependency boundaries` and a table for:
 - #239: transport, readiness, drain, shutdown; analysis lifecycle cannot gate data-plane readiness.
 - #240: Connections, secret/credential resolution, signer-key custody; #243 consumes redacted digests and protected key references only.
 - #241: PostgreSQL authority, revisions, transactions, outbox, leases/fencing, HA jobs; unavailable cluster semantics return unsupported/unavailable rather than local fallback.
-- #242: ggctl, configuration bundles, stage/activate/rollback, GitOps, generated OpenAPI; #243 adds policy-domain resources through those authorities and creates no second CLI or configuration archive.
+- #242: ggctl, configuration bundles, stage/activate/rollback, GitOps, generated OpenAPI, evidence-artifact contracts, and offline verification; #243 adds policy-domain resources, artifact handling, and verifier commands through those authorities and creates no second CLI or configuration archive.
 
 State that existing CRUD/history remains authoritative during migration and no second authority may be introduced.
 
@@ -332,13 +333,13 @@ Add `## Rejected alternatives` rejecting: duplicate simulator logic; browser-own
 
 - [ ] **Step 5: Add checklist traceability and commit**
 
-Add `## Checklist item 1 traceability` with rows for truth model, evaluator boundary, versioning/canonicalization, privacy projections, API schemas, limits, permission matrix, evidence trust statement, dependency boundaries, and rollout/migration. Point every row to the exact ADR heading that satisfies it.
+Add `## Checklist item 1 traceability` with rows for truth model, evaluator boundary, versioning/canonicalization, privacy projections, API schemas, control-plane observability, limits, permission matrix, evidence trust statement, dependency boundaries, and rollout/migration. Point every row to the exact ADR heading that satisfies it.
 
 Run:
 
 ```powershell
-rg -n '^### Privacy projections$|^## (Threat model|Dependency boundaries|Rollout and migration|Consequences|Rejected alternatives|Checklist item 1 traceability)$' docs/adr/0004-policy-studio-authority-and-evidence.md
-rg -n 'signature proves package integrity|no second authority|never silently downgrades|inconclusive' docs/adr/0004-policy-studio-authority-and-evidence.md
+rg -n '^### (Privacy projections|Control-plane observability)$|^## (Threat model|Dependency boundaries|Rollout and migration|Consequences|Rejected alternatives|Checklist item 1 traceability)$' docs/adr/0004-policy-studio-authority-and-evidence.md
+rg -n 'verifier-trusted key|must not create a second|never silently downgrades|inconclusive' docs/adr/0004-policy-studio-authority-and-evidence.md
 git diff --check
 ```
 
@@ -362,7 +363,7 @@ git commit -m "Document Policy Studio threats and rollout"
 Append this list item after ADR-0003:
 
 ```markdown
-- [ADR-0004: Policy Studio Authority and Evidence](0004-policy-studio-authority-and-evidence.md): Policy Studio and live authorization share one fail-closed evaluator, versioned resource snapshots, bounded privacy-safe analysis, and evidence that never overstates source completeness or publication authority.
+- [ADR-0004: Policy Studio Authority and Evidence](0004-policy-studio-authority-and-evidence.md): Defines the target in which Policy Studio and live authorization use one fail-closed evaluator, versioned resource snapshots, bounded privacy-safe analysis, and evidence that never overstates source completeness or publication authority.
 ```
 
 - [ ] **Step 2: Verify local links and exact referenced files**
