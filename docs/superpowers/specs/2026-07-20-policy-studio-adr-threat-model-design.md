@@ -60,7 +60,7 @@ Every result will identify its kind, pinned inputs, completeness, and limitation
 
 One typed, deterministic, side-effect-free `CompiledPolicy` kernel will own logical policy decisions. Live HTTP, route/default/shadow, MCP, tool, rate-selection, and trusted-context static egress paths will call it through thin adapters. Simulation, tests, replay, and analyzer semantic checks will call the same kernel rather than reproduce its logic.
 
-The kernel accepts a versioned `PolicyEvaluationContext` and a redacted immutable `ResourceSnapshot`. It returns a bounded typed result containing logical outcome, enforcement, effective action, completeness, stable reason codes, matched stable identifiers, permissions, and optional bounded trace steps. Unknown or internally inconsistent input is indeterminate for analysis and fail-closed for production.
+The kernel accepts a versioned `PolicyEvaluationContext` and a redacted immutable `ResourceSnapshot`. It returns the same bounded typed logical result in every mode, containing outcome, enforcement, effective action, completeness, stable reason codes, matched stable identifiers, permissions, and optional bounded trace steps. Supported but unavailable facts produce `indeterminate` with stable limitation codes; the production adapter preserves that logical outcome while mapping it to an effective block. Malformed or internally inconsistent input is rejected before evaluation. An evaluator invariant or internal error is not an ordinary indeterminate result: it fails an analysis run and blocks the production request.
 
 Authentication validity, CSRF, request-schema validation, mutable rate-bucket capacity, semaphore availability, DNS resolution, transport health, physical upstream selection, and upstream execution stay outside the pure verdict. Analysis performs no DNS, network, provider, secret-store, credential-validation, tool-invocation, production-bucket, semaphore, policy-mutation, or ordinary data-plane audit side effect.
 
@@ -68,13 +68,25 @@ Authentication validity, CSRF, request-schema validation, mutable rate-bucket ca
 
 Policy schemas use exact version dispatch. Policy-relevant elements receive unique non-empty stable identifiers. Resource snapshots carry exact component versions and digests for policy, routing, tools, Connections, configuration, authentication mappings, egress, tests, cluster revision, evaluator semantics, and gateway build.
 
-RFC 8785 JSON Canonicalization Scheme bytes followed by SHA-256 are the normative cross-platform digest contract for canonical JSON artifacts. The design retains both the original source-document digest and normalized semantic digest whenever normalization can erase representational differences. Digests use explicit media-type and schema-version domains so bytes from different artifact classes cannot be confused.
+RFC 8785 JSON Canonicalization Scheme bytes and SHA-256 are the normative cross-platform primitives for canonical JSON artifacts. Before either a source or semantic digest is computed, input must be UTF-8 without a byte-order mark and satisfy the RFC 8785/I-JSON constraints; parsing must reject duplicate object member names and non-finite numbers. JCS performs no Unicode normalization, so the original code points remain significant.
+
+Every digest hashes this unambiguous byte frame:
+
+```text
+ASCII "GGDIGEST" || 0x00 ||
+u64be(len(kind)) || UTF8(kind) ||
+u64be(len(media_type)) || UTF8(media_type) ||
+u64be(len(schema_version)) || UTF8(schema_version) ||
+u64be(len(payload)) || payload
+```
+
+Each `len` is the unsigned 64-bit big-endian byte length of the field that follows. `kind` is `source` or `semantic`. A source payload is the exact accepted source-document bytes. A semantic payload is the RFC 8785 canonical byte sequence of the schema-version-defined normalized policy or artifact; a semantic digest is unavailable when that version has no normative normalization. Media type and exact schema version are mandatory. The external representation is `sha256:` followed by 64 lowercase hexadecimal characters. This framing is used everywhere a digest becomes an ETag input, freshness binding, evidence subject, manifest entry, or signature subject. The design retains both source and semantic digests whenever normalization can erase representational differences.
 
 ### Server authority and state transitions
 
 The browser is a client, never a policy or capability authority. Server-owned drafts bind owner, base revision and ETag, candidate digest, resource-snapshot digest, timestamps, and expiry. Mutation uses strong ETags. Publication is a separate authorized operation that revalidates current schema, resources, tests, risks, and conditional bindings. Stale resources produce an explicit conflict and are not silently rebased.
 
-The documented flow is:
+The documented flow has independent publication and evidence branches:
 
 ```text
 active policy + immutable resource snapshot
@@ -82,23 +94,22 @@ active policy + immutable resource snapshot
                   v
              server draft
                   |
-        +---------+----------+
-        |         |          |
-        v         v          v
-   simulation   tests   replay/analyzer
-        |         |          |
-        +---------+----------+
-                  |
-          immutable run result
-                  |
-          aggregate evidence
-                  |
-       optional protected signing
-                  |
-        conditional publication
+        +---------+-----------------------------+
+        |                                       |
+        v                                       v
+simulation / tests / replay / analyzer   current-authority revalidation
+        |                                + required test/risk gates
+        v                                       |
+immutable completed run results                 v
+        |                               conditional publication
+        v                                       |
+aggregate evidence                              v
+        |                               new active revision
+        v
+optional protected signing
 ```
 
-Optimizer output, discovery suggestions, and remediation actions only create or modify reviewable drafts. They never mutate active policy implicitly.
+Completed test results may be digest-bound inputs to publication gates, but evidence generation and signing never confer publication authority. Optimizer output, discovery suggestions, and remediation actions only create or modify reviewable drafts. They never mutate active policy implicitly.
 
 ### API and authorization contract
 
@@ -127,7 +138,7 @@ This gives later slices a binding boundedness contract while avoiding arbitrary 
 
 The ADR will define separate aggregate and detail projections. Aggregate results contain counts, stable categories, digests, proof bases, and limitation codes. Audit-derived event or principal detail additionally requires `admin:audit:read`, is independently bounded, and is never included in canonical v1 evidence.
 
-Raw credentials, authorization or cookie headers, bodies, sensitive query/header values, tool arguments or results, full principals, source events, and secret material are excluded from simulations, traces, errors, URLs, browser persistence, logs, metrics, temporary files, evidence, and signatures. Existing retained fields such as source IP, request ID, user agent, path, and actor data must pass a centralized purpose-specific projection before leaving the audit boundary.
+Secret-marked or categorically forbidden fields, including credentials, authorization and cookie headers, proxy or hop-by-hop headers, configured credential headers, and secret-store values, are rejected as synthetic inputs rather than silently removed before evaluation. Approved, bounded, non-secret policy matcher inputs such as allowlisted headers, query values, typed identity attributes, and validated tool arguments may exist transiently in the authenticated request and evaluator memory so simulation remains semantically exact. Their raw values are discarded when evaluation completes and are excluded from persisted run results, traces, errors, URLs, browser storage, logs, metrics, audit events, temporary files, evidence, and signatures. Raw HTTP bodies, tool results, serialized production principals, and raw source events are never accepted merely to improve analysis. Existing retained fields such as source IP, request ID, user agent, path, and actor data must pass a centralized purpose-specific projection before leaving the audit boundary.
 
 Evidence is aggregate-first, deterministic, and privacy-minimized. A valid signature proves only that a trusted key holder signed unchanged package bytes. It does not prove that the source audit store was complete or untampered, that a policy is safe, or that a compliance framework is satisfied.
 
