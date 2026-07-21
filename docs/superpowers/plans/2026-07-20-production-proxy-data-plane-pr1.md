@@ -58,8 +58,8 @@ Do not add dependencies, configuration keys/fields, public routes, metrics, prod
 - [ ] Preserve Axum state/middleware order and the current observation context.
 - [ ] Preserve legacy fallback, route order, host matching, URL/base-path behavior, custom CA behavior, timeouts, request/response limits, health behavior, and generic errors, except for the explicit fail-closed ambient-proxy correction.
 - [ ] Preserve every credential, forwarding, hop-by-hop, nominated, request-ID, configured add/strip, and framing header rule.
-- [ ] Replace raw proxy request, response-first-chunk, request-body-read, and health-check errors in logs with bounded safe categories; preserve client status/body behavior.
-- [ ] Test captured proxy/health failure logs do not contain URLs, queries, addresses, DNS messages, certificate paths, or raw reqwest errors.
+- [ ] Replace raw proxy request, response-first-chunk, request-body-read, health-check, and egress enforcement details in logs with bounded safe categories; preserve client status/body behavior.
+- [ ] Test captured proxy/health/egress failure logs do not contain URLs, queries, addresses, DNS messages, certificate paths, or raw reqwest errors.
 - [ ] Add or relocate focused tests without mechanically moving unrelated `main.rs` tests.
 - [ ] Assert authentication denial, both rate-limit stages, validation, CSRF, RBAC/direct-rule denial, unsafe paths, and gateway-owned paths cannot cause request-scoped endpoint selection, resolver calls, or upstream bytes; disable or separately account for background health.
 - [ ] Run focused proxy tests, egress-only guard, formatting, clippy, and diff checks; commit the extraction unit.

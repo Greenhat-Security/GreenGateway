@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
     fs,
-    net::{IpAddr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -19,18 +18,21 @@ use axum::{
     Extension, Json, Router,
 };
 use bytes::Bytes;
-use futures_util::{stream, Stream, StreamExt};
+use futures_util::{stream, Stream};
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::net::SocketAddr;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tower_http::{
     cors::CorsLayer,
     request_id::{MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
     trace::TraceLayer,
 };
+#[cfg(test)]
 use url::Url;
 
 mod audit;
@@ -39,35 +41,27 @@ mod client_ip;
 mod config;
 mod discovery;
 mod egress;
+mod lifecycle;
 mod mcp;
 mod metrics;
 mod middleware;
 mod path_match;
+mod proxy;
 mod rbac;
 mod tools;
 mod upstream_route;
 
+#[cfg(test)]
+use lifecycle::serve_router;
+use lifecycle::{serve_gateway, GatewayApp};
+use proxy::{ProxyClassifier, ProxyState};
+
 const REQUEST_COUNTER: &str = "gateway_http_requests";
 const REQUEST_ID_HEADER: &str = "x-request-id";
+#[cfg(test)]
 const X_FORWARDED_FOR_HEADER: HeaderName = HeaderName::from_static("x-forwarded-for");
+#[cfg(test)]
 const X_REAL_IP_HEADER: HeaderName = HeaderName::from_static("x-real-ip");
-const COMMON_CLIENT_IP_FORWARDING_HEADERS: &[&str] = &[
-    "cf-connecting-ip",
-    "client-ip",
-    "fastly-client-ip",
-    "fly-client-ip",
-    "forwarded",
-    "forwarded-for",
-    "forwarded-for-ip",
-    "true-client-ip",
-    "x-client-ip",
-    "x-cluster-client-ip",
-    "x-envoy-external-address",
-    "x-forwarded",
-    "x-original-forwarded-for",
-    "x-proxyuser-ip",
-    "x-real-ip",
-];
 const ADMIN_UI_ROUTE: &str = "/admin";
 const ADMIN_UI_INDEX: &str = "index.html";
 const ADMIN_UI_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
@@ -141,7 +135,6 @@ const DEFAULT_PRINCIPAL_DETAIL_AUDIT_EVENT_LIMIT: usize = 500;
 const DEFAULT_PRINCIPAL_ANOMALY_HISTORY_LIMIT: usize = 20;
 const DEFAULT_RULE_PREVIEW_SAMPLE_LIMIT: usize = 20;
 const MAX_RULE_PREVIEW_SAMPLE_LIMIT: usize = 100;
-const UPSTREAM_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../admin-ui/dist/"]
@@ -161,51 +154,8 @@ struct AppState {
 
 #[derive(Clone)]
 struct ProxyDispatchState {
-    proxy: Option<ProxyState>,
+    classifier: Option<ProxyClassifier>,
     routes: GatewayRoutes,
-}
-
-#[derive(Clone)]
-struct ProxyState {
-    routes: ProxyRoutes,
-    upstream_health: Vec<UpstreamHealthTarget>,
-    egress_client: Arc<egress::EgressClient>,
-    max_request_body_bytes: usize,
-}
-
-#[derive(Clone)]
-enum ProxyRoutes {
-    Legacy { upstream_origin: String },
-    RoutingTable { routes: Vec<ProxyRoute> },
-}
-
-#[derive(Clone)]
-struct ProxyRoute {
-    path_prefix: Option<String>,
-    host: Option<String>,
-    upstream_origin: String,
-    request_header_policy: RouteRequestHeaderPolicy,
-    egress_client: Arc<egress::EgressClient>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct RouteRequestHeaderPolicy {
-    add_request_headers: Vec<(HeaderName, HeaderValue)>,
-    strip_request_headers: Vec<HeaderName>,
-}
-
-#[derive(Clone)]
-struct MatchedUpstream {
-    upstream_origin: String,
-    request_header_policy: RouteRequestHeaderPolicy,
-    egress_client: Arc<egress::EgressClient>,
-}
-
-#[derive(Clone)]
-struct UpstreamHealthTarget {
-    origin: String,
-    egress_client: Arc<egress::EgressClient>,
-    health: UpstreamHealthState,
 }
 
 #[derive(Clone, Debug)]
@@ -507,39 +457,7 @@ impl MakeRequestId for MakeRequestUuid {
 struct HealthResponse {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    upstream: Option<UpstreamHealthResponse>,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum UpstreamHealthResponse {
-    Single {
-        configured: bool,
-        reachable: Option<bool>,
-        last_checked: Option<String>,
-    },
-    Routes {
-        configured: bool,
-        upstreams: Vec<UpstreamOriginHealthResponse>,
-    },
-}
-
-#[derive(Serialize)]
-struct UpstreamOriginHealthResponse {
-    origin: String,
-    reachable: Option<bool>,
-    last_checked: Option<String>,
-}
-
-#[derive(Clone)]
-struct UpstreamHealthState {
-    snapshot: Arc<tokio::sync::RwLock<UpstreamHealthSnapshot>>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct UpstreamHealthSnapshot {
-    reachable: Option<bool>,
-    last_checked: Option<OffsetDateTime>,
+    upstream: Option<proxy::UpstreamHealthResponse>,
 }
 
 #[derive(Serialize)]
@@ -1099,11 +1017,6 @@ struct InferredSchemaNoSamplesResponse {
     schema_inferred: bool,
 }
 
-enum GatewayApp {
-    Unified(Router),
-    Split { data: Router, admin: Router },
-}
-
 #[derive(Default)]
 struct DiscoveredOidcConfig {
     jwks_urls: HashMap<String, String>,
@@ -1159,63 +1072,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         process_started_at,
     )?;
 
-    match app {
-        GatewayApp::Unified(app) => {
-            let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-            let bound_addr = listener.local_addr()?;
-
-            audit_log.emit(audit::AuditEvent::new(
-                "gateway.startup",
-                "startup",
-                "internal",
-                None::<audit::Actor>,
-                json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "listen_addr": bound_addr.to_string(),
-                }),
-            ));
-
-            tracing::info!(listen_addr = %bound_addr, "gateway listening");
-            serve_router(listener, app).await?;
-        }
-        GatewayApp::Split { data, admin } => {
-            let admin_listen_addr = admin_listen_addr
-                .expect("split gateway app should only be built when ADMIN_LISTEN_ADDR is set");
-            let data_listener = tokio::net::TcpListener::bind(listen_addr).await?;
-            let data_bound_addr = data_listener.local_addr()?;
-            let admin_listener = tokio::net::TcpListener::bind(admin_listen_addr).await?;
-            let admin_bound_addr = admin_listener.local_addr()?;
-
-            audit_log.emit(audit::AuditEvent::new(
-                "gateway.startup",
-                "startup",
-                "internal",
-                None::<audit::Actor>,
-                json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "listen_addr": data_bound_addr.to_string(),
-                    "admin_listen_addr": admin_bound_addr.to_string(),
-                }),
-            ));
-
-            tracing::info!(listen_addr = %data_bound_addr, "gateway data listener listening");
-            tracing::info!(admin_listen_addr = %admin_bound_addr, "gateway admin listener listening");
-            tokio::try_join!(
-                serve_router(data_listener, data),
-                serve_router(admin_listener, admin)
-            )?;
-        }
-    }
+    serve_gateway(app, listen_addr, admin_listen_addr, audit_log).await?;
 
     Ok(())
-}
-
-async fn serve_router(listener: tokio::net::TcpListener, app: Router) -> std::io::Result<()> {
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
 }
 
 #[cfg(test)]
@@ -1287,7 +1146,7 @@ fn gateway_app_with_process_started_at(
             discovery::suggestions::ConfiguredProxyRoute::new(
                 None,
                 None,
-                upstream_origin_from_url(upstream_url, "UPSTREAM_URL"),
+                proxy::upstream_origin_from_url(upstream_url, "UPSTREAM_URL"),
             )
         })
         .into_iter()
@@ -1297,7 +1156,7 @@ fn gateway_app_with_process_started_at(
             discovery::suggestions::ConfiguredProxyRoute::new(
                 route.host.clone(),
                 route.path_prefix.clone(),
-                upstream_origin_from_url(
+                proxy::upstream_origin_from_url(
                     &route.upstream_url,
                     &format!("UPSTREAM_ROUTES[{index}].upstream_url"),
                 ),
@@ -1359,6 +1218,7 @@ fn gateway_app_with_process_started_at(
     let egress_client = Arc::new(egress::EgressClient::new(egress_config)?);
     let proxy_egress_client = Arc::new(egress::EgressClient::new(proxy_egress_config.clone())?);
     let proxy_state = ProxyState::from_config(&config, &proxy_egress_config, proxy_egress_client)?;
+    let proxy_classifier = proxy_state.as_ref().map(ProxyState::classifier);
     if let Some(proxy) = proxy_state.as_ref() {
         proxy.spawn_upstream_health_checks();
     }
@@ -1525,7 +1385,7 @@ fn gateway_app_with_process_started_at(
         rbac_state: rbac_state.clone(),
         auth_state,
         proxy_dispatch_state: ProxyDispatchState {
-            proxy: proxy_state.clone(),
+            classifier: proxy_classifier,
             routes: routes.clone(),
         },
     };
@@ -2223,8 +2083,8 @@ fn apply_middleware(
     let router = router.layer(axum::middleware::from_fn_with_state(
         ProxyDispatchState {
             routes: stack.proxy_dispatch_state.routes.clone(),
-            proxy: proxy_fallback_enabled
-                .then(|| stack.proxy_dispatch_state.proxy.clone())
+            classifier: proxy_fallback_enabled
+                .then(|| stack.proxy_dispatch_state.classifier.clone())
                 .flatten(),
         },
         proxy_dispatch_context_middleware,
@@ -2259,10 +2119,9 @@ async fn proxy_dispatch_context_middleware(
         .insert(upstream_route::ProxyRouteClassificationCompleted);
     let path = request.uri().path();
     let observation_context = if !state.routes.is_gateway_owned_path(path) {
-        state
-            .proxy
-            .as_ref()
-            .and_then(|proxy| proxy.observation_context_for_request(path, request.headers()))
+        state.classifier.as_ref().and_then(|classifier| {
+            classifier.observation_context_for_request(path, request.headers())
+        })
     } else {
         None
     };
@@ -2366,81 +2225,6 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-impl UpstreamHealthState {
-    fn new() -> Self {
-        Self {
-            snapshot: Arc::new(tokio::sync::RwLock::new(UpstreamHealthSnapshot::default())),
-        }
-    }
-
-    async fn response(&self) -> (Option<bool>, Option<String>) {
-        let snapshot = self.snapshot.read().await.clone();
-
-        (
-            snapshot.reachable,
-            snapshot.last_checked.map(rfc3339_timestamp),
-        )
-    }
-
-    async fn update(&self, reachable: bool) {
-        *self.snapshot.write().await = UpstreamHealthSnapshot {
-            reachable: Some(reachable),
-            last_checked: Some(OffsetDateTime::now_utc()),
-        };
-    }
-}
-
-async fn refresh_upstream_health(
-    health: &UpstreamHealthState,
-    egress_client: &egress::EgressClient,
-    upstream_url: &str,
-    first_check: bool,
-) -> bool {
-    match check_upstream_reachable(egress_client, upstream_url).await {
-        Ok(()) => {
-            health.update(true).await;
-            true
-        }
-        Err(err) => {
-            health.update(false).await;
-            if first_check {
-                tracing::warn!(
-                    upstream_url,
-                    error = %err,
-                    "startup upstream reachability check failed; continuing startup"
-                );
-            } else {
-                tracing::warn!(
-                    upstream_url,
-                    error = %err,
-                    "upstream reachability check failed"
-                );
-            }
-            false
-        }
-    }
-}
-
-async fn check_upstream_reachable(
-    egress_client: &egress::EgressClient,
-    upstream_url: &str,
-) -> Result<(), egress::EgressError> {
-    egress_client
-        .request(Method::HEAD, upstream_url)
-        .await
-        .map(|_| ())
-}
-
-fn rfc3339_timestamp(timestamp: OffsetDateTime) -> String {
-    match timestamp.format(&Rfc3339) {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to format upstream health timestamp");
-            timestamp.unix_timestamp().to_string()
-        }
-    }
-}
-
 async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
     record_request("/version");
     Json(VersionResponse {
@@ -2470,335 +2254,6 @@ async fn oauth_protected_resource_metadata_endpoint(State(state): State<AppState
     Json(metadata.document()).into_response()
 }
 
-impl ProxyState {
-    fn from_config(
-        config: &config::Config,
-        default_egress_config: &egress::EgressConfig,
-        egress_client: Arc<egress::EgressClient>,
-    ) -> Result<Option<Self>, egress::EgressError> {
-        if let Some(upstream_url) = config.upstream_url.as_deref() {
-            let upstream_origin = upstream_origin_from_url(upstream_url, "UPSTREAM_URL");
-
-            return Ok(Some(Self {
-                routes: ProxyRoutes::Legacy {
-                    upstream_origin: upstream_origin.clone(),
-                },
-                upstream_health: upstream_health_targets([(
-                    upstream_origin,
-                    Arc::clone(&egress_client),
-                )]),
-                egress_client,
-                max_request_body_bytes: config.egress_max_request_body_bytes,
-            }));
-        }
-
-        if config.upstream_routes.is_empty() {
-            return Ok(None);
-        }
-
-        let mut route_clients = HashMap::new();
-        let routes: Vec<_> = config
-            .upstream_routes
-            .iter()
-            .enumerate()
-            .map(|(index, route)| {
-                let egress_client = route_egress_client(
-                    route,
-                    default_egress_config,
-                    &egress_client,
-                    &mut route_clients,
-                )?;
-
-                Ok(ProxyRoute {
-                    path_prefix: route.path_prefix.clone(),
-                    host: route.host.as_ref().map(|host| host.to_ascii_lowercase()),
-                    upstream_origin: upstream_origin_from_url(
-                        &route.upstream_url,
-                        &format!("UPSTREAM_ROUTES[{index}].upstream_url"),
-                    ),
-                    request_header_policy: route_request_header_policy(route),
-                    egress_client,
-                })
-            })
-            .collect::<Result<_, egress::EgressError>>()?;
-        let upstream_health = upstream_health_targets(routes.iter().map(|route| {
-            (
-                route.upstream_origin.clone(),
-                Arc::clone(&route.egress_client),
-            )
-        }));
-
-        Ok(Some(Self {
-            routes: ProxyRoutes::RoutingTable { routes },
-            upstream_health,
-            egress_client,
-            max_request_body_bytes: config.egress_max_request_body_bytes,
-        }))
-    }
-
-    #[cfg(test)]
-    fn upstream_origin_for_request(&self, path: &str, headers: &HeaderMap) -> Option<&str> {
-        match &self.routes {
-            ProxyRoutes::Legacy { upstream_origin } => Some(upstream_origin),
-            ProxyRoutes::RoutingTable { routes } => {
-                routing_route_for_request(routes, path, headers)
-                    .map(|route| route.upstream_origin.as_str())
-            }
-        }
-    }
-
-    fn upstream_for_request(&self, path: &str, headers: &HeaderMap) -> Option<MatchedUpstream> {
-        match &self.routes {
-            ProxyRoutes::Legacy { upstream_origin } => Some(MatchedUpstream {
-                upstream_origin: upstream_origin.clone(),
-                request_header_policy: RouteRequestHeaderPolicy::default(),
-                egress_client: Arc::clone(&self.egress_client),
-            }),
-            ProxyRoutes::RoutingTable { routes } => {
-                routing_route_for_request(routes, path, headers).map(|route| MatchedUpstream {
-                    upstream_origin: route.upstream_origin.clone(),
-                    request_header_policy: route.request_header_policy.clone(),
-                    egress_client: Arc::clone(&route.egress_client),
-                })
-            }
-        }
-    }
-
-    fn observation_context_for_request(
-        &self,
-        path: &str,
-        headers: &HeaderMap,
-    ) -> Option<upstream_route::ProxyRouteObservationContext> {
-        match &self.routes {
-            ProxyRoutes::Legacy { upstream_origin } => {
-                Some(upstream_route::ProxyRouteObservationContext::new(
-                    None,
-                    None,
-                    upstream_origin.clone(),
-                ))
-            }
-            ProxyRoutes::RoutingTable { routes } => {
-                let route = routing_route_for_request(routes, path, headers)?;
-                Some(upstream_route::ProxyRouteObservationContext::new(
-                    route.host.clone(),
-                    route.path_prefix.clone(),
-                    route.upstream_origin.clone(),
-                ))
-            }
-        }
-    }
-
-    async fn upstream_health_response(&self) -> UpstreamHealthResponse {
-        match &self.routes {
-            ProxyRoutes::Legacy { .. } => {
-                let target = self
-                    .upstream_health
-                    .first()
-                    .expect("legacy proxy state should have one upstream health target");
-                let (reachable, last_checked) = target.health.response().await;
-
-                UpstreamHealthResponse::Single {
-                    configured: true,
-                    reachable,
-                    last_checked,
-                }
-            }
-            ProxyRoutes::RoutingTable { .. } => {
-                let mut upstreams = Vec::with_capacity(self.upstream_health.len());
-                for target in &self.upstream_health {
-                    let (reachable, last_checked) = target.health.response().await;
-                    upstreams.push(UpstreamOriginHealthResponse {
-                        origin: target.origin.clone(),
-                        reachable,
-                        last_checked,
-                    });
-                }
-
-                UpstreamHealthResponse::Routes {
-                    configured: true,
-                    upstreams,
-                }
-            }
-        }
-    }
-
-    fn spawn_upstream_health_checks(&self) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(
-                "upstream reachability checks were not started because no Tokio runtime is active"
-            );
-            return;
-        };
-
-        for target in &self.upstream_health {
-            let health = target.health.clone();
-            let egress_client = Arc::clone(&target.egress_client);
-            let upstream_url = target.origin.clone();
-
-            handle.spawn(async move {
-                let mut first_check = true;
-                let mut last_reachable = None;
-
-                loop {
-                    let reachable =
-                        refresh_upstream_health(&health, &egress_client, &upstream_url, first_check)
-                            .await;
-
-                    if last_reachable == Some(false) && reachable {
-                        tracing::info!(upstream_url = %upstream_url, "upstream reachability restored");
-                    }
-
-                    last_reachable = Some(reachable);
-                    first_check = false;
-                    tokio::time::sleep(UPSTREAM_HEALTH_CHECK_INTERVAL).await;
-                }
-            });
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct RouteEgressClientKey {
-    timeout_ms: Option<u64>,
-    response_idle_timeout_ms: Option<u64>,
-    connect_timeout_ms: Option<u64>,
-    tls_ca_bundle_path: Option<PathBuf>,
-}
-
-impl RouteEgressClientKey {
-    fn from_route(route: &config::UpstreamRouteConfig) -> Self {
-        Self {
-            timeout_ms: route.timeout_ms,
-            response_idle_timeout_ms: route.response_idle_timeout_ms,
-            connect_timeout_ms: route.connect_timeout_ms,
-            tls_ca_bundle_path: route.tls_ca_bundle_path.clone(),
-        }
-    }
-
-    fn is_default(&self) -> bool {
-        self.timeout_ms.is_none()
-            && self.response_idle_timeout_ms.is_none()
-            && self.connect_timeout_ms.is_none()
-            && self.tls_ca_bundle_path.is_none()
-    }
-
-    fn apply_to_config(
-        &self,
-        config: &mut egress::EgressConfig,
-    ) -> Result<(), egress::EgressError> {
-        config.apply_timeout_overrides(
-            self.timeout_ms,
-            self.response_idle_timeout_ms,
-            self.connect_timeout_ms,
-        );
-        if let Some(path) = &self.tls_ca_bundle_path {
-            config.apply_tls_ca_bundle_path(path.clone())?;
-        }
-
-        Ok(())
-    }
-}
-
-fn route_egress_client(
-    route: &config::UpstreamRouteConfig,
-    default_config: &egress::EgressConfig,
-    default_client: &Arc<egress::EgressClient>,
-    route_clients: &mut HashMap<RouteEgressClientKey, Arc<egress::EgressClient>>,
-) -> Result<Arc<egress::EgressClient>, egress::EgressError> {
-    let key = RouteEgressClientKey::from_route(route);
-    if key.is_default() {
-        return Ok(Arc::clone(default_client));
-    }
-    if let Some(client) = route_clients.get(&key) {
-        return Ok(Arc::clone(client));
-    }
-
-    let mut config = default_config.clone();
-    key.apply_to_config(&mut config)?;
-    let client = Arc::new(egress::EgressClient::new(config)?);
-    route_clients.insert(key, Arc::clone(&client));
-
-    Ok(client)
-}
-
-fn route_request_header_policy(route: &config::UpstreamRouteConfig) -> RouteRequestHeaderPolicy {
-    let mut add_request_headers = route
-        .add_request_headers
-        .iter()
-        .map(|(name, value)| {
-            (
-                HeaderName::from_bytes(name.as_bytes())
-                    .expect("validated route add header name should parse"),
-                HeaderValue::from_str(value)
-                    .expect("validated route add header value should parse"),
-            )
-        })
-        .collect::<Vec<_>>();
-    add_request_headers.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-
-    let mut strip_request_headers = route
-        .strip_request_headers
-        .iter()
-        .map(|name| {
-            HeaderName::from_bytes(name.as_bytes())
-                .expect("validated route strip header name should parse")
-        })
-        .collect::<Vec<_>>();
-    strip_request_headers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-
-    RouteRequestHeaderPolicy {
-        add_request_headers,
-        strip_request_headers,
-    }
-}
-
-fn routing_route_for_request<'a>(
-    routes: &'a [ProxyRoute],
-    path: &str,
-    headers: &HeaderMap,
-) -> Option<&'a ProxyRoute> {
-    let request_host = upstream_route::request_host_without_port(headers);
-    upstream_route::matching_route(routes, path, request_host.as_deref())
-}
-
-impl upstream_route::RouteMatch for ProxyRoute {
-    fn path_prefix(&self) -> Option<&str> {
-        self.path_prefix.as_deref()
-    }
-
-    fn host(&self) -> Option<&str> {
-        self.host.as_deref()
-    }
-}
-
-fn upstream_origin_from_url(upstream_url: &str, source: &str) -> String {
-    Url::parse(upstream_url)
-        .unwrap_or_else(|err| {
-            panic!("validated {source} should parse when building proxy state: {err}")
-        })
-        .origin()
-        .ascii_serialization()
-}
-
-fn upstream_health_targets(
-    upstream_origins: impl IntoIterator<Item = (String, Arc<egress::EgressClient>)>,
-) -> Vec<UpstreamHealthTarget> {
-    let mut seen = HashSet::new();
-    let mut targets = Vec::new();
-
-    for (origin, egress_client) in upstream_origins {
-        if seen.insert(origin.clone()) {
-            targets.push(UpstreamHealthTarget {
-                origin,
-                egress_client,
-                health: UpstreamHealthState::new(),
-            });
-        }
-    }
-
-    targets
-}
-
 async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -> Response {
     record_request(PROXY_FALLBACK_ROUTE);
 
@@ -2811,225 +2266,13 @@ async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let Some(upstream) = proxy.upstream_for_request(path, request.headers()) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
     let source_ip = client_ip::canonical_client_ip(
         request.headers(),
         request.extensions(),
         &state.client_ip_policy,
     );
-    let (parts, body) = request.into_parts();
-    let target_url = proxy_target_url(&upstream.upstream_origin, &parts.uri);
-    let mut headers = strip_hop_by_hop_headers(&parts.headers);
-    strip_gateway_credentials(&mut headers);
-    if let Some(request_id) = parts.headers.get(REQUEST_ID_HEADER) {
-        headers.insert(request_id_header(), request_id.clone());
-    }
-    set_upstream_client_ip(&mut headers, &source_ip);
-    apply_route_request_header_policy(&mut headers, &upstream.request_header_policy);
-    let request_id = parts.headers.get(REQUEST_ID_HEADER).cloned();
-    let payload_capture = parts
-        .extensions
-        .get::<middleware::observation::PayloadCaptureHandle>()
-        .cloned();
-    let body = match axum::body::to_bytes(body, proxy.max_request_body_bytes).await {
-        Ok(body) if body.is_empty() => None,
-        Ok(body) => {
-            if let Some(payload_capture) = payload_capture.as_ref() {
-                payload_capture.capture_json_body(&parts.headers, &body);
-            }
-            Some(body.to_vec())
-        }
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                max = proxy.max_request_body_bytes,
-                "failed to read proxied request body"
-            );
-            return payload_too_large(proxy.max_request_body_bytes);
-        }
-    };
 
-    let upstream_started = Instant::now();
-    let upstream = match upstream
-        .egress_client
-        .stream_request_with_headers(parts.method, &target_url, headers, body)
-        .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            let latency_ms = duration_millis(upstream_started.elapsed());
-            tracing::warn!(error = %err, "proxied upstream request failed");
-            let mut response = proxy_error_response(&err);
-            response
-                .extensions_mut()
-                .insert(middleware::decision::UpstreamOutcome {
-                    latency_ms,
-                    status: None,
-                });
-            if let Some(request_id) = request_id {
-                response
-                    .headers_mut()
-                    .insert(request_id_header(), request_id);
-            }
-            return response;
-        }
-    };
-    let upstream_latency_ms = duration_millis(upstream_started.elapsed());
-    let upstream_status = upstream.status;
-    let upstream_headers = strip_hop_by_hop_headers(&upstream.headers);
-    let mut upstream_body = upstream.body;
-    let first_chunk = match upstream_body.next().await {
-        Some(Ok(chunk)) => Some(chunk),
-        Some(Err(err)) => {
-            let latency_ms = duration_millis(upstream_started.elapsed());
-            tracing::warn!(error = %err, "proxied upstream response body failed");
-            let mut response = proxy_error_response(&err);
-            response
-                .extensions_mut()
-                .insert(middleware::decision::UpstreamOutcome {
-                    latency_ms,
-                    status: None,
-                });
-            if let Some(request_id) = request_id {
-                response
-                    .headers_mut()
-                    .insert(request_id_header(), request_id);
-            }
-            return response;
-        }
-        None => None,
-    };
-    let response_body = match first_chunk {
-        Some(chunk) => Body::from_stream(
-            stream::once(async move { Ok::<_, egress::EgressError>(chunk) }).chain(upstream_body),
-        ),
-        None => Body::empty(),
-    };
-    let mut response = Response::new(response_body);
-    *response.status_mut() = upstream_status;
-    *response.headers_mut() = upstream_headers;
-    response
-        .extensions_mut()
-        .insert(middleware::decision::UpstreamOutcome {
-            latency_ms: upstream_latency_ms,
-            status: Some(upstream_status.as_u16()),
-        });
-    if let Some(request_id) = request_id {
-        response
-            .headers_mut()
-            .insert(request_id_header(), request_id);
-    }
-
-    response
-}
-
-fn proxy_target_url(upstream_origin: &str, uri: &http::Uri) -> String {
-    let path_and_query = uri.path_and_query().map_or("/", |value| value.as_str());
-    format!("{upstream_origin}{path_and_query}")
-}
-
-fn strip_hop_by_hop_headers(headers: &HeaderMap) -> HeaderMap {
-    let connection_named_headers = connection_named_headers(headers);
-    let mut forwarded = HeaderMap::new();
-
-    for (name, value) in headers {
-        if is_hop_by_hop_header(name) || connection_named_headers.contains(name) {
-            continue;
-        }
-        forwarded.append(name.clone(), value.clone());
-    }
-
-    forwarded
-}
-
-fn set_upstream_client_ip(headers: &mut HeaderMap, source_ip: &str) {
-    let forwarding_headers = headers
-        .keys()
-        .filter(|name| is_client_forwarding_header(name))
-        .cloned()
-        .collect::<Vec<_>>();
-    for name in forwarding_headers {
-        headers.remove(name);
-    }
-
-    let Ok(source_ip) = source_ip.parse::<IpAddr>() else {
-        return;
-    };
-    let source_ip = source_ip.to_string();
-    let value = HeaderValue::from_bytes(source_ip.as_bytes())
-        .expect("normalized IP address should be a valid header value");
-    headers.insert(X_FORWARDED_FOR_HEADER, value.clone());
-    headers.insert(X_REAL_IP_HEADER, value);
-}
-
-fn is_client_forwarding_header(name: &HeaderName) -> bool {
-    let name = name.as_str();
-    name.starts_with("x-forwarded-") || COMMON_CLIENT_IP_FORWARDING_HEADERS.contains(&name)
-}
-
-fn strip_gateway_credentials(headers: &mut HeaderMap) {
-    headers.remove(header::AUTHORIZATION);
-    headers.remove(header::COOKIE);
-}
-
-fn apply_route_request_header_policy(headers: &mut HeaderMap, policy: &RouteRequestHeaderPolicy) {
-    for name in &policy.strip_request_headers {
-        if name.as_str() == REQUEST_ID_HEADER {
-            continue;
-        }
-        headers.remove(name);
-    }
-
-    for (name, value) in &policy.add_request_headers {
-        if is_hop_by_hop_header(name) || name.as_str() == REQUEST_ID_HEADER {
-            continue;
-        }
-        headers.insert(name.clone(), value.clone());
-    }
-}
-
-fn connection_named_headers(headers: &HeaderMap) -> HashSet<HeaderName> {
-    headers
-        .get_all(header::CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
-        .collect()
-}
-
-fn is_hop_by_hop_header(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "host"
-            | "content-length"
-    )
-}
-
-fn proxy_error_response(error: &egress::EgressError) -> Response {
-    let (status, code) = if error.is_timeout() {
-        (StatusCode::GATEWAY_TIMEOUT, "gateway_timeout")
-    } else {
-        (StatusCode::BAD_GATEWAY, "bad_gateway")
-    };
-
-    (
-        status,
-        Json(ErrorResponse {
-            error: code.to_owned(),
-        }),
-    )
-        .into_response()
+    proxy.forward_request(request, &source_ip).await
 }
 
 fn payload_too_large(max_body_size: usize) -> Response {
@@ -10786,42 +10029,6 @@ mod tests {
         )
         .await;
         assert_eq!(path_only_request.path_and_query, "/api/items");
-    }
-
-    #[test]
-    fn routing_table_equal_specificity_uses_declaration_order() {
-        let egress_client = Arc::new(
-            egress::EgressClient::new(egress::EgressConfig::default())
-                .expect("egress client should build"),
-        );
-        let proxy = ProxyState {
-            routes: ProxyRoutes::RoutingTable {
-                routes: vec![
-                    ProxyRoute {
-                        path_prefix: Some("/api".to_owned()),
-                        host: None,
-                        upstream_origin: "https://first.example.test".to_owned(),
-                        request_header_policy: RouteRequestHeaderPolicy::default(),
-                        egress_client: Arc::clone(&egress_client),
-                    },
-                    ProxyRoute {
-                        path_prefix: Some("/api".to_owned()),
-                        host: None,
-                        upstream_origin: "https://second.example.test".to_owned(),
-                        request_header_policy: RouteRequestHeaderPolicy::default(),
-                        egress_client: Arc::clone(&egress_client),
-                    },
-                ],
-            },
-            upstream_health: Vec::new(),
-            egress_client,
-            max_request_body_bytes: 1_048_576,
-        };
-
-        assert_eq!(
-            proxy.upstream_origin_for_request("/api/items", &HeaderMap::new()),
-            Some("https://first.example.test")
-        );
     }
 
     #[tokio::test]

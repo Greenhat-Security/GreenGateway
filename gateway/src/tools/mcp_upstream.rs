@@ -367,14 +367,7 @@ async fn connect(
     runtime_config: &McpUpstreamRuntimeConfig,
     destination: &CheckedEgressDestination,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
-    let client = rmcp_reqwest::Client::builder()
-        .timeout(server_timeout(server, runtime_config))
-        .read_timeout(server_response_idle_timeout(server, runtime_config))
-        .connect_timeout(server_connect_timeout(server, runtime_config))
-        .redirect(rmcp_reqwest::redirect::Policy::none())
-        .resolve(&destination.host, destination.pinned_addr)
-        .build()
-        .map_err(|_| McpUpstreamCallError::ClientBuild)?;
+    let client = mcp_http_client(server, runtime_config, destination)?;
     let client = LimitedMcpHttpClient::new(
         client,
         runtime_config.max_request_body_bytes,
@@ -393,6 +386,22 @@ async fn connect(
         "MCP upstream client initialized"
     );
     result.map_err(|error| mcp_service_error(error, McpUpstreamCallError::Connect))
+}
+
+fn mcp_http_client(
+    server: &McpUpstreamServerConfig,
+    runtime_config: &McpUpstreamRuntimeConfig,
+    destination: &CheckedEgressDestination,
+) -> Result<rmcp_reqwest::Client, McpUpstreamCallError> {
+    rmcp_reqwest::Client::builder()
+        .no_proxy()
+        .timeout(server_timeout(server, runtime_config))
+        .read_timeout(server_response_idle_timeout(server, runtime_config))
+        .connect_timeout(server_connect_timeout(server, runtime_config))
+        .redirect(rmcp_reqwest::redirect::Policy::none())
+        .resolve(&destination.host, destination.pinned_addr)
+        .build()
+        .map_err(|_| McpUpstreamCallError::ClientBuild)
 }
 
 #[derive(Clone)]
@@ -1041,7 +1050,7 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::{process::Command, sync::Arc};
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1050,6 +1059,109 @@ mod tests {
     };
 
     const TEST_RESPONSE_LIMIT: usize = 64;
+
+    fn proxy_env_child_marker() -> String {
+        ["GREEN_GATEWAY_MCP_PROXY", "ENV_CHILD"].join("_")
+    }
+
+    #[tokio::test]
+    async fn mcp_client_ignores_ambient_proxy_environment() {
+        let child_marker = proxy_env_child_marker();
+        if std::env::var_os(&child_marker).is_some() {
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("direct MCP test listener should bind");
+            let direct_addr = listener
+                .local_addr()
+                .expect("direct MCP test address should be available");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("direct MCP server should accept a request");
+                let mut request = vec![0_u8; 1024];
+                let _ = stream
+                    .read(&mut request)
+                    .await
+                    .expect("direct MCP server should read a request");
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect",
+                    )
+                    .await
+                    .expect("direct MCP server should write a response");
+            });
+            let host = "mcp-proxy-test.example";
+            let upstream = McpUpstreamServerConfig {
+                name: "proxy-test".to_owned(),
+                url: format!("http://{host}:{}/", direct_addr.port()),
+                timeout_ms: Some(2_000),
+                response_idle_timeout_ms: Some(2_000),
+                connect_timeout_ms: Some(500),
+            };
+            let runtime = McpUpstreamRuntimeConfig {
+                timeout: Duration::from_secs(2),
+                response_idle_timeout: Duration::from_secs(2),
+                connect_timeout: Duration::from_millis(500),
+                max_request_body_bytes: 1024,
+                max_response_bytes: 1024,
+            };
+            let client = mcp_http_client(
+                &upstream,
+                &runtime,
+                &CheckedEgressDestination {
+                    host: host.to_owned(),
+                    pinned_addr: direct_addr,
+                },
+            )
+            .expect("MCP client should build");
+
+            let body = client
+                .get(&upstream.url)
+                .send()
+                .await
+                .expect("ambient proxy must not intercept the MCP request")
+                .text()
+                .await
+                .expect("direct MCP response should have a body");
+
+            assert_eq!(body, "direct");
+            server.await.expect("direct MCP server should finish");
+            return;
+        }
+
+        let proxy_listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("ambient MCP proxy sentinel should bind");
+        let proxy_addr = proxy_listener
+            .local_addr()
+            .expect("ambient MCP proxy address should be available");
+        let proxy_url = format!("http://{proxy_addr}");
+        let output = Command::new(std::env::current_exe().expect("test executable should exist"))
+            .args([
+                "--exact",
+                "tools::mcp_upstream::tests::mcp_client_ignores_ambient_proxy_environment",
+                "--nocapture",
+            ])
+            .env(&child_marker, "1")
+            .env("HTTP_PROXY", &proxy_url)
+            .env("HTTPS_PROXY", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("https_proxy", &proxy_url)
+            .env("all_proxy", &proxy_url)
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .output()
+            .expect("MCP proxy-isolation child test should start");
+        drop(proxy_listener);
+
+        assert!(
+            output.status.success(),
+            "MCP proxy-isolation child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[tokio::test]
     async fn get_stream_rejects_oversized_sse_without_content_length() {
@@ -1090,6 +1202,7 @@ mod tests {
 
     async fn oversized_sse_get_stream(url: &str) -> BoxStream<'static, Result<Sse, SseError>> {
         let client = rmcp_reqwest::Client::builder()
+            .no_proxy()
             .build()
             .expect("test MCP HTTP client should build");
         let client = LimitedMcpHttpClient::new(client, usize::MAX, TEST_RESPONSE_LIMIT);
