@@ -1044,6 +1044,28 @@ struct MiddlewareStack {
     proxy_dispatch_state: ProxyDispatchState,
 }
 
+#[derive(Default)]
+struct GatewayAppBuildOverrides {
+    #[cfg(test)]
+    egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
+    #[cfg(test)]
+    request_selection_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    disable_proxy_health_checks: bool,
+}
+
+fn egress_client_for_build(
+    config: egress::EgressConfig,
+    _build_overrides: &GatewayAppBuildOverrides,
+) -> Result<egress::EgressClient, egress::EgressError> {
+    #[cfg(test)]
+    if let Some(resolver) = _build_overrides.egress_resolver.as_ref() {
+        return egress::EgressClient::new_with_resolver(config, Arc::clone(resolver));
+    }
+
+    egress::EgressClient::new(config)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let process_started_at = Instant::now();
@@ -1123,6 +1145,24 @@ fn gateway_app_with_process_started_at(
     audit_log: audit::AuditLog,
     audit_event_sender: audit::AuditEventSender,
     process_started_at: Instant,
+) -> Result<GatewayApp, Box<dyn std::error::Error>> {
+    gateway_app_with_process_started_at_and_overrides(
+        config,
+        metrics_handle,
+        audit_log,
+        audit_event_sender,
+        process_started_at,
+        GatewayAppBuildOverrides::default(),
+    )
+}
+
+fn gateway_app_with_process_started_at_and_overrides(
+    config: config::Config,
+    metrics_handle: PrometheusHandle,
+    audit_log: audit::AuditLog,
+    audit_event_sender: audit::AuditEventSender,
+    process_started_at: Instant,
+    build_overrides: GatewayAppBuildOverrides,
 ) -> Result<GatewayApp, Box<dyn std::error::Error>> {
     let split_admin_listener = config.admin_listen_addr.is_some();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
@@ -1206,7 +1246,10 @@ fn gateway_app_with_process_started_at(
         }
         None => egress::EgressConfig::from_config(&config),
     };
-    let discovery_egress_client = Arc::new(egress::EgressClient::new(egress_config.clone())?);
+    let discovery_egress_client = Arc::new(egress_client_for_build(
+        egress_config.clone(),
+        &build_overrides,
+    )?);
     let discovered_oidc = discover_oidc_from_config(&config, discovery_egress_client)?;
     auto_seed_discovered_oidc_hosts(&mut egress_config, &discovered_oidc);
     let egress_allowed_hosts_count = egress_config.allowed_host_rule_count();
@@ -1215,12 +1258,28 @@ fn gateway_app_with_process_started_at(
         proxy_egress_config.apply_upstream_timeout_overrides(&config);
         proxy_egress_config
     };
-    let egress_client = Arc::new(egress::EgressClient::new(egress_config)?);
-    let proxy_egress_client = Arc::new(egress::EgressClient::new(proxy_egress_config.clone())?);
+    let egress_client = Arc::new(egress_client_for_build(egress_config, &build_overrides)?);
+    let proxy_egress_client = Arc::new(egress_client_for_build(
+        proxy_egress_config.clone(),
+        &build_overrides,
+    )?);
     let proxy_state = ProxyState::from_config(&config, &proxy_egress_config, proxy_egress_client)?;
+    #[cfg(test)]
+    let proxy_state = match build_overrides.request_selection_count.as_ref() {
+        Some(counter) => {
+            proxy_state.map(|state| state.with_request_selection_counter(Arc::clone(counter)))
+        }
+        None => proxy_state,
+    };
     let proxy_classifier = proxy_state.as_ref().map(ProxyState::classifier);
-    if let Some(proxy) = proxy_state.as_ref() {
-        proxy.spawn_upstream_health_checks();
+    #[cfg(test)]
+    let spawn_proxy_health_checks = !build_overrides.disable_proxy_health_checks;
+    #[cfg(not(test))]
+    let spawn_proxy_health_checks = true;
+    if spawn_proxy_health_checks {
+        if let Some(proxy) = proxy_state.as_ref() {
+            proxy.spawn_upstream_health_checks();
+        }
     }
     let routes = GatewayRoutes::from_config(&config);
     warn_on_mcp_exempt_prefix_overlaps(&routes, &config);
@@ -8421,6 +8480,90 @@ mod tests {
         .expect("app should build")
     }
 
+    struct CountingDnsResolver {
+        calls: AtomicUsize,
+        address_ip: IpAddr,
+    }
+
+    #[async_trait::async_trait]
+    impl egress::DnsResolver for CountingDnsResolver {
+        async fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, std::io::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![SocketAddr::new(self.address_ip, port)])
+        }
+    }
+
+    #[derive(Clone)]
+    struct ProxyWorkProbe {
+        resolver: Arc<CountingDnsResolver>,
+        request_selections: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct ProxyWorkSnapshot {
+        resolver_calls: usize,
+        request_selections: usize,
+    }
+
+    impl ProxyWorkProbe {
+        fn snapshot(&self) -> ProxyWorkSnapshot {
+            ProxyWorkSnapshot {
+                resolver_calls: self.resolver.calls.load(Ordering::SeqCst),
+                request_selections: self.request_selections.load(Ordering::SeqCst),
+            }
+        }
+
+        fn assert_no_work(&self, context: &str) {
+            assert_eq!(
+                self.snapshot(),
+                ProxyWorkSnapshot {
+                    resolver_calls: 0,
+                    request_selections: 0,
+                },
+                "{context}"
+            );
+        }
+    }
+
+    fn proxy_router_with_work_probe(
+        config: config::Config,
+        audit_log: audit::AuditLog,
+        upstream_ip: IpAddr,
+    ) -> (Router, ProxyWorkProbe) {
+        let resolver = Arc::new(CountingDnsResolver {
+            calls: AtomicUsize::new(0),
+            address_ip: upstream_ip,
+        });
+        let request_selections = Arc::new(AtomicUsize::new(0));
+        let resolver_trait: Arc<dyn egress::DnsResolver> = resolver.clone();
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let app = gateway_app_with_process_started_at_and_overrides(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+            Instant::now(),
+            GatewayAppBuildOverrides {
+                egress_resolver: Some(resolver_trait),
+                request_selection_count: Some(Arc::clone(&request_selections)),
+                disable_proxy_health_checks: true,
+            },
+        )
+        .expect("instrumented proxy app should build");
+        let router = match app {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("instrumented proxy app should be unified"),
+        };
+
+        (
+            router,
+            ProxyWorkProbe {
+                resolver,
+                request_selections,
+            },
+        )
+    }
+
     async fn preflight_response_to_path(
         config: config::Config,
         path: &str,
@@ -13727,6 +13870,242 @@ mod tests {
         assert_eq!(observed.payload["status"], json!(201));
         assert_eq!(observed.payload["upstream_status"], json!(201));
         assert!(observed.payload["upstream_latency_ms"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn every_pre_forward_denial_performs_zero_physical_proxy_work() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let upstream_ip = upstream_addr.ip();
+
+        let mut auth_config = proxy_config(upstream_addr);
+        auth_config.auth_enabled = true;
+        let (router, probe) =
+            proxy_router_with_work_probe(auth_config, test_audit_log(), upstream_ip);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/auth-denied")
+                    .body(Body::empty())
+                    .expect("auth-denied request should build"),
+            )
+            .await
+            .expect("auth-denied request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        probe.assert_no_work("auth denial must perform zero proxy work");
+        assert_upstream_receives_no_request(&mut captured, "auth denial").await;
+
+        let mut global_rate_config = proxy_config(upstream_addr);
+        global_rate_config.rate_limit_read_rps = 0.001;
+        global_rate_config.rate_limit_read_burst = 1;
+        let (router, probe) =
+            proxy_router_with_work_probe(global_rate_config, test_audit_log(), upstream_ip);
+        let request = || {
+            Request::builder()
+                .uri("/global-rate-limited")
+                .body(Body::empty())
+                .expect("global-rate request should build")
+        };
+        let first = router
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("first global-rate request should complete");
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let _ = next_proxied_request(&mut captured, "first global-rate request").await;
+        let before_denial = probe.snapshot();
+        let second = router
+            .oneshot(request())
+            .await
+            .expect("second global-rate request should complete");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            probe.snapshot(),
+            before_denial,
+            "global rate denial must add no proxy work"
+        );
+        assert_upstream_receives_no_request(&mut captured, "global rate denial").await;
+
+        let policy_rate = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "roles": {},
+                "routes": [],
+                "rate_limits": [
+                    {
+                        "principal": { "auth_methods": ["bearer_token"] },
+                        "methods": ["GET"],
+                        "path": "/policy-rate-limited",
+                        "requests_per_second": 0.000001,
+                        "burst": 1
+                    }
+                ]
+            }"#,
+        );
+        let mut policy_rate_config = proxy_config(upstream_addr);
+        policy_rate_config.policy_file = Some(policy_rate.path.to_string_lossy().into_owned());
+        let (router, probe) =
+            proxy_router_with_work_probe(policy_rate_config, test_audit_log(), upstream_ip);
+        let policy_request = || {
+            let mut request = Request::builder()
+                .uri("/policy-rate-limited")
+                .body(Body::empty())
+                .expect("policy-rate request should build");
+            request.extensions_mut().insert(test_principal(&["member"]));
+            request
+        };
+        let first = router
+            .clone()
+            .oneshot(policy_request())
+            .await
+            .expect("first policy-rate request should complete");
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let _ = next_proxied_request(&mut captured, "first policy-rate request").await;
+        let before_denial = probe.snapshot();
+        let second = router
+            .oneshot(policy_request())
+            .await
+            .expect("second policy-rate request should complete");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            probe.snapshot(),
+            before_denial,
+            "policy rate denial must add no proxy work"
+        );
+        assert_upstream_receives_no_request(&mut captured, "policy rate denial").await;
+
+        let mut validation_config = proxy_config(upstream_addr);
+        validation_config.csrf_enabled = true;
+        validation_config.validation_allowed_content_types = vec!["application/json".to_owned()];
+        let (router, probe) =
+            proxy_router_with_work_probe(validation_config, test_audit_log(), upstream_ip);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/validation-denied")
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from("rejected"))
+                    .expect("validation-denied request should build"),
+            )
+            .await
+            .expect("validation-denied request should complete");
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        probe.assert_no_work("validation denial must perform zero proxy work");
+        assert_upstream_receives_no_request(&mut captured, "validation denial").await;
+
+        let mut csrf_config = proxy_config(upstream_addr);
+        csrf_config.csrf_enabled = true;
+        csrf_config.validation_allowed_content_types = vec!["application/json".to_owned()];
+        let (router, probe) =
+            proxy_router_with_work_probe(csrf_config, test_audit_log(), upstream_ip);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/csrf-denied")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("CSRF-denied request should build"),
+            )
+            .await
+            .expect("CSRF-denied request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        probe.assert_no_work("CSRF denial must perform zero proxy work");
+        assert_upstream_receives_no_request(&mut captured, "CSRF denial").await;
+
+        let rbac_policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "deny",
+                "enforcement_mode": "enforce",
+                "roles": {},
+                "routes": [
+                    { "path_prefix": "/rbac-denied", "permission": "proxy:use" }
+                ]
+            }"#,
+        );
+        let mut rbac_config = proxy_config(upstream_addr);
+        rbac_config.policy_file = Some(rbac_policy.path.to_string_lossy().into_owned());
+        let (router, probe) =
+            proxy_router_with_work_probe(rbac_config, test_audit_log(), upstream_ip);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/rbac-denied/resource")
+                    .body(Body::empty())
+                    .expect("RBAC-denied request should build"),
+            )
+            .await
+            .expect("RBAC-denied request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        probe.assert_no_work("RBAC denial must perform zero proxy work");
+        assert_upstream_receives_no_request(&mut captured, "RBAC denial").await;
+
+        let direct_policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "enforcement_mode": "enforce",
+                "roles": {},
+                "routes": [],
+                "rules": [
+                    { "methods": ["GET"], "path": "/direct-denied/**", "action": "deny" }
+                ]
+            }"#,
+        );
+        let mut direct_config = proxy_config(upstream_addr);
+        direct_config.policy_file = Some(direct_policy.path.to_string_lossy().into_owned());
+        let (router, probe) =
+            proxy_router_with_work_probe(direct_config, test_audit_log(), upstream_ip);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/direct-denied/resource")
+                    .body(Body::empty())
+                    .expect("direct-rule-denied request should build"),
+            )
+            .await
+            .expect("direct-rule-denied request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        probe.assert_no_work("direct-rule denial must perform zero proxy work");
+        assert_upstream_receives_no_request(&mut captured, "direct-rule denial").await;
+
+        let (router, probe) = proxy_router_with_work_probe(
+            proxy_config(upstream_addr),
+            test_audit_log(),
+            upstream_ip,
+        );
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/public/../admin")
+                    .body(Body::empty())
+                    .expect("unsafe-path request should build"),
+            )
+            .await
+            .expect("unsafe-path request should complete");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        probe.assert_no_work("unsafe-path denial must perform zero proxy work");
+        assert_upstream_receives_no_request(&mut captured, "unsafe-path denial").await;
+
+        let (router, probe) = proxy_router_with_work_probe(
+            routing_proxy_config(vec![path_route("/", upstream_addr)]),
+            test_audit_log(),
+            upstream_ip,
+        );
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/not-found")
+                    .body(Body::empty())
+                    .expect("gateway-owned request should build"),
+            )
+            .await
+            .expect("gateway-owned request should complete");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        probe.assert_no_work("gateway-owned denial must perform zero proxy work");
+        assert_upstream_receives_no_request(&mut captured, "gateway-owned denial").await;
     }
 
     #[tokio::test]

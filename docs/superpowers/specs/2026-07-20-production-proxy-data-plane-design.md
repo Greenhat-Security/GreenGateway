@@ -118,7 +118,7 @@ Every reqwest client constructed by `EgressClient`, plus the separately built eg
 
 Extraction must preserve the current per-attempt header boundary:
 
-- Remove hop-by-hop and `Connection`-nominated headers.
+- Remove hop-by-hop, non-standard `Proxy-Connection`, and `Connection`-nominated headers.
 - Ignore inbound `Host`.
 - remove gateway `Authorization` and `Cookie` credentials;
 - replace untrusted forwarding metadata with the canonical client IP;
@@ -296,7 +296,7 @@ Review additionally checks:
 - no direct outbound network primitive outside the egress allowlist;
 - no new public surface exposes credentials, origins, IP addresses, resolver details, or raw transport errors;
 - the existing `/health` JSON field `upstreams[].origin` is treated as a temporary compatibility exception, is not expanded in PR 1, and is migrated only in the dedicated readiness/status PR;
-- proxy, health-check, and egress enforcement logs plus new audit/status paths use bounded safe error categories rather than raw URLs, queries, addresses, resolver details, or transport errors; and
+- proxy (including committed response tails), health-check, identity-egress, MCP transport, and egress enforcement logs plus new audit/status paths use bounded safe error categories rather than raw URLs, queries, addresses, resolver details, or transport errors; and
 - the extracted diff is behavior-preserving rather than a hidden feature implementation; and
 - later target architecture is labeled as target, not current production behavior.
 

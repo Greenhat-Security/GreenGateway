@@ -259,7 +259,10 @@ impl OidcLoginState {
         .await
         .map_err(|_| OidcLoginError::TokenExchangeTimedOut)?
         .map_err(|err| {
-            tracing::warn!(error = %err, "OIDC token exchange through egress failed");
+            tracing::warn!(
+                error_category = err.safe_category(),
+                "OIDC token exchange through egress failed"
+            );
             OidcLoginError::TokenExchangeFailed
         })?;
 

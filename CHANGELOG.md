@@ -7,6 +7,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+- Outbound HTTP used by the egress client, reverse proxy, identity-provider
+  discovery/session calls, and MCP upstream transport now ignores ambient
+  `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and lowercase equivalents. This
+  prevents process-environment proxy discovery from bypassing validated DNS
+  pinning. Deployments that previously depended on those variables now require
+  direct connectivity; an outbound proxy will require a future explicit,
+  validated gateway configuration.
+
+- Proxy, health-check, identity-egress, and MCP transport failures now log only
+  bounded error categories. Post-commit response-stream errors are redacted,
+  and the non-standard hop-by-hop `Proxy-Connection` header is stripped in
+  both directions.
+
 ## [1.0.1] - 2026-07-16
 
 ### Security

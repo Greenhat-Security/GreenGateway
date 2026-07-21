@@ -106,7 +106,7 @@ Every reqwest client built by `EgressClient`, plus the separately built egress-v
 
 Every attempt independently:
 
-- removes hop-by-hop and `Connection`-nominated headers;
+- removes hop-by-hop, non-standard `Proxy-Connection`, and `Connection`-nominated headers;
 - ignores client `Host` and stale/conflicting framing;
 - strips gateway `Authorization` and `Cookie` credentials;
 - replaces untrusted forwarding metadata with the canonical client IP;
@@ -239,7 +239,7 @@ The pre-auth classifier may call only pure logical matching. It cannot call a ph
 | Client disconnect | Cancel upstream and release resources | Not an endpoint failure |
 | Draining | No new admission; bounded existing drain | No new retry/probe work |
 
-New public errors, probes, audit, metrics, and logs never expose credentials, queries, raw URLs, resolved addresses, resolver error details, certificate/key material, or raw transport errors. Checklist item 1 replaces current raw proxy, health-check, and egress enforcement details in logs with bounded safe categories while retaining client status/body behavior. The existing `/health` JSON field `upstreams[].origin` is the explicit compatibility exception described above and is not expanded. Existing `upstream_origin`-keyed metrics remain unchanged as a named compatibility exception until the route-ID migration; no new metric adds an origin label. New metrics use bounded stable route/pool/endpoint identifiers and never principal, path, request ID, origin, address, or raw-error labels.
+New public errors, probes, audit, metrics, and logs never expose credentials, queries, raw URLs, resolved addresses, resolver error details, certificate/key material, or raw transport errors. Checklist item 1 replaces current raw proxy, committed response-stream, health-check, identity-egress, MCP transport, and egress enforcement details in logs with bounded safe categories while retaining client status/body behavior. The existing `/health` JSON field `upstreams[].origin` is the explicit compatibility exception described above and is not expanded. Existing `upstream_origin`-keyed metrics remain unchanged as a named compatibility exception until the route-ID migration; no new metric adds an origin label. New metrics use bounded stable route/pool/endpoint identifiers and never principal, path, request ID, origin, address, or raw-error labels.
 
 ## Threat model
 

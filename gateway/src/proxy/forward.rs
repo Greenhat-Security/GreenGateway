@@ -1,4 +1,4 @@
-use std::{collections::HashSet, net::IpAddr, time::Instant};
+use std::{collections::HashSet, error::Error, fmt, net::IpAddr, time::Instant};
 
 use axum::{
     body::Body,
@@ -32,6 +32,17 @@ const COMMON_CLIENT_IP_FORWARDING_HEADERS: &[&str] = &[
     "x-proxyuser-ip",
     "x-real-ip",
 ];
+
+#[derive(Debug)]
+struct RedactedProxyBodyError(&'static str);
+
+impl fmt::Display for RedactedProxyBodyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "proxied upstream body error: {}", self.0)
+    }
+}
+
+impl Error for RedactedProxyBodyError {}
 
 pub(super) async fn forward_request(
     proxy: &ProxyState,
@@ -117,9 +128,7 @@ async fn forward_to_upstream(
         None => None,
     };
     let response_body = match first_chunk {
-        Some(chunk) => Body::from_stream(
-            stream::once(async move { Ok::<_, egress::EgressError>(chunk) }).chain(upstream_body),
-        ),
+        Some(chunk) => redacted_response_body(chunk, upstream_body),
         None => Body::empty(),
     };
     let mut response = Response::new(response_body);
@@ -138,6 +147,27 @@ async fn forward_to_upstream(
     }
 
     response
+}
+
+fn redacted_response_body(
+    first_chunk: bytes::Bytes,
+    upstream_body: egress::EgressBodyStream,
+) -> Body {
+    let redacted_tail = upstream_body.map(|result| {
+        result.map_err(|error| {
+            let category = error.safe_category();
+            tracing::warn!(
+                error_category = category,
+                "proxied upstream response body failed after response commitment"
+            );
+            RedactedProxyBodyError(category)
+        })
+    });
+
+    Body::from_stream(
+        stream::once(async move { Ok::<_, RedactedProxyBodyError>(first_chunk) })
+            .chain(redacted_tail),
+    )
 }
 
 fn error_response_with_outcome(
@@ -244,6 +274,7 @@ fn is_hop_by_hop_header(name: &HeaderName) -> bool {
         name.as_str(),
         "connection"
             | "keep-alive"
+            | "proxy-connection"
             | "proxy-authenticate"
             | "proxy-authorization"
             | "te"
@@ -267,6 +298,11 @@ fn proxy_error_response(error: &egress::EgressError) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::{io, sync::Arc};
+
+    use std::sync::Mutex;
+    use tracing_subscriber::fmt::MakeWriter;
+
     use super::*;
 
     #[test]
@@ -290,6 +326,10 @@ mod tests {
         );
         headers.insert(header::COOKIE, HeaderValue::from_static("session=secret"));
         headers.insert(header::CONNECTION, HeaderValue::from_static("x-remove"));
+        headers.insert(
+            HeaderName::from_static("proxy-connection"),
+            HeaderValue::from_static("keep-alive"),
+        );
         headers.insert("x-remove", HeaderValue::from_static("private"));
         headers.insert("x-keep", HeaderValue::from_static("public"));
 
@@ -299,9 +339,120 @@ mod tests {
         assert!(!forwarded.contains_key(header::AUTHORIZATION));
         assert!(!forwarded.contains_key(header::COOKIE));
         assert!(!forwarded.contains_key("x-remove"));
+        assert!(!forwarded.contains_key("proxy-connection"));
         assert_eq!(
             forwarded.get("x-keep"),
             Some(&HeaderValue::from_static("public"))
         );
+    }
+
+    #[test]
+    fn response_header_boundary_removes_proxy_connection() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("proxy-connection"),
+            HeaderValue::from_static("keep-alive"),
+        );
+        headers.insert("x-keep", HeaderValue::from_static("public"));
+
+        let forwarded = strip_hop_by_hop_headers(&headers);
+
+        assert!(!forwarded.contains_key("proxy-connection"));
+        assert_eq!(
+            forwarded.get("x-keep"),
+            Some(&HeaderValue::from_static("public"))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn committed_response_tail_errors_are_redacted() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let upstream_body: egress::EgressBodyStream = Box::pin(stream::once(async {
+            Err(egress::EgressError::DnsResolutionFailed(
+                "https://secret.example/private?token=secret-query at 10.0.0.1".to_owned(),
+            ))
+        }));
+        let body = redacted_response_body(bytes::Bytes::from_static(b"first"), upstream_body);
+        let mut body = body.into_data_stream();
+
+        assert_eq!(
+            body.next()
+                .await
+                .expect("first chunk should exist")
+                .expect("first chunk should be successful"),
+            bytes::Bytes::from_static(b"first")
+        );
+        let error = body
+            .next()
+            .await
+            .expect("tail error should exist")
+            .expect_err("tail error should remain an error");
+        drop(_guard);
+
+        let output = format!("{error} {}", logs.contents());
+        assert!(output.contains("dns_resolution_failed"));
+        for secret in [
+            "secret.example",
+            "private",
+            "secret-query",
+            "10.0.0.1",
+            "https://",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "committed response tail leaked {secret}: {output}"
+            );
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(
+                self.buffer
+                    .lock()
+                    .expect("captured logs should not be poisoned")
+                    .clone(),
+            )
+            .expect("captured logs should be UTF-8")
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .map_err(|_| io::Error::other("captured logs lock poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }

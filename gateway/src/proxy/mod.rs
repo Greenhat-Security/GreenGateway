@@ -95,6 +95,8 @@ pub(crate) struct ProxyState {
     upstream_health: Vec<health::UpstreamHealthTarget>,
     egress_client: Arc<egress::EgressClient>,
     max_request_body_bytes: usize,
+    #[cfg(test)]
+    request_selection_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 #[derive(Clone)]
@@ -154,6 +156,8 @@ impl ProxyState {
                 )]),
                 egress_client,
                 max_request_body_bytes: config.egress_max_request_body_bytes,
+                #[cfg(test)]
+                request_selection_count: None,
             }));
         }
 
@@ -198,7 +202,18 @@ impl ProxyState {
             upstream_health,
             egress_client,
             max_request_body_bytes: config.egress_max_request_body_bytes,
+            #[cfg(test)]
+            request_selection_count: None,
         }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_request_selection_counter(
+        mut self,
+        counter: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.request_selection_count = Some(counter);
+        self
     }
 
     pub(crate) fn classifier(&self) -> ProxyClassifier {
@@ -222,7 +237,7 @@ impl ProxyState {
     }
 
     fn upstream_for_request(&self, path: &str, headers: &HeaderMap) -> Option<MatchedUpstream> {
-        match &self.routes {
+        let upstream = match &self.routes {
             ProxyRoutes::Legacy { upstream_origin } => Some(MatchedUpstream {
                 upstream_origin: upstream_origin.clone(),
                 request_header_policy: RouteRequestHeaderPolicy::default(),
@@ -235,7 +250,16 @@ impl ProxyState {
                     egress_client: Arc::clone(&route.egress_client),
                 })
             }
+        };
+
+        #[cfg(test)]
+        if upstream.is_some() {
+            if let Some(counter) = &self.request_selection_count {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
         }
+
+        upstream
     }
 
     pub(crate) async fn forward_request(
@@ -469,6 +493,7 @@ mod tests {
             upstream_health: Vec::new(),
             egress_client,
             max_request_body_bytes: 1024,
+            request_selection_count: None,
         };
 
         let context = state

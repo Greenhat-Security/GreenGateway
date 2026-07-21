@@ -406,7 +406,7 @@ mod tests {
         drop(_guard);
 
         assert!(!reachable);
-        let output = logs.to_string();
+        let output = logs.contents();
         assert!(output.contains("host_not_allowed"));
         for secret in ["secret-upstream", "private", "secret-query", "https://"] {
             assert!(
@@ -422,7 +422,7 @@ mod tests {
     }
 
     impl CapturedLogs {
-        fn to_string(&self) -> String {
+        fn contents(&self) -> String {
             String::from_utf8(
                 self.buffer
                     .lock()

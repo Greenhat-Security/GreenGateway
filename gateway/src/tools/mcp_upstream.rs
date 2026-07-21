@@ -427,7 +427,7 @@ impl LimitedMcpHttpClient {
 
 #[derive(Debug)]
 enum LimitedMcpHttpError {
-    Http(rmcp_reqwest::Error),
+    Http(&'static str),
     Serialize(serde_json::Error),
     RequestBodyTooLarge { size: usize, max: usize },
     ResponseTooLarge { max: usize },
@@ -436,7 +436,7 @@ enum LimitedMcpHttpError {
 impl fmt::Display for LimitedMcpHttpError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Http(error) => write!(formatter, "MCP upstream HTTP error: {error}"),
+            Self::Http(category) => write!(formatter, "MCP upstream HTTP error: {category}"),
             Self::Serialize(error) => {
                 write!(formatter, "MCP upstream JSON serialize error: {error}")
             }
@@ -456,16 +456,17 @@ impl fmt::Display for LimitedMcpHttpError {
 impl Error for LimitedMcpHttpError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Http(error) => Some(error),
             Self::Serialize(error) => Some(error),
-            Self::RequestBodyTooLarge { .. } | Self::ResponseTooLarge { .. } => None,
+            Self::Http(_) | Self::RequestBodyTooLarge { .. } | Self::ResponseTooLarge { .. } => {
+                None
+            }
         }
     }
 }
 
 impl From<rmcp_reqwest::Error> for LimitedMcpHttpError {
     fn from(error: rmcp_reqwest::Error) -> Self {
-        Self::Http(error)
+        Self::Http(mcp_http_error_category(&error))
     }
 }
 
@@ -734,7 +735,7 @@ fn limited_mcp_body_stream(
                     Some((Ok(chunk), (body, streamed_bytes, false)))
                 }
                 Some(Err(error)) => Some((
-                    Err(LimitedMcpHttpError::Http(error)),
+                    Err(LimitedMcpHttpError::from(error)),
                     (body, streamed_bytes, true),
                 )),
                 None => None,
@@ -895,7 +896,25 @@ fn parse_json_rpc_error(body: &str) -> Option<ServerJsonRpcMessage> {
 }
 
 fn mcp_http_error(error: rmcp_reqwest::Error) -> StreamableHttpError<LimitedMcpHttpError> {
-    StreamableHttpError::Client(LimitedMcpHttpError::Http(error))
+    StreamableHttpError::Client(LimitedMcpHttpError::from(error))
+}
+
+fn mcp_http_error_category(error: &rmcp_reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "http_timeout"
+    } else if error.is_connect() {
+        "http_connect"
+    } else if error.is_request() {
+        "http_request"
+    } else if error.is_body() {
+        "http_body"
+    } else if error.is_decode() {
+        "http_decode"
+    } else if error.is_status() {
+        "http_status"
+    } else {
+        "http_other"
+    }
 }
 
 fn mcp_service_error<E>(error: E, fallback: McpUpstreamCallError) -> McpUpstreamCallError
@@ -1050,86 +1069,86 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::*;
 
-    use std::{process::Command, sync::Arc};
+    use std::{
+        io::{self, ErrorKind},
+        process::Command,
+        sync::{Arc, Mutex},
+    };
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
         task::JoinHandle,
     };
+    use tracing_subscriber::fmt::MakeWriter;
 
     const TEST_RESPONSE_LIMIT: usize = 64;
 
-    fn proxy_env_child_marker() -> String {
-        ["GREEN_GATEWAY_MCP_PROXY", "ENV_CHILD"].join("_")
+    #[tokio::test]
+    async fn mcp_client_sends_directly_with_proxy_discovery_disabled() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("direct MCP test listener should bind");
+        let direct_addr = listener
+            .local_addr()
+            .expect("direct MCP test address should be available");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("direct MCP server should accept a request");
+            let mut request = vec![0_u8; 1024];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("direct MCP server should read a request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect",
+                )
+                .await
+                .expect("direct MCP server should write a response");
+        });
+        let host = "mcp-proxy-test.example";
+        let upstream = McpUpstreamServerConfig {
+            name: "proxy-test".to_owned(),
+            url: format!("http://{host}:{}/", direct_addr.port()),
+            timeout_ms: Some(2_000),
+            response_idle_timeout_ms: Some(2_000),
+            connect_timeout_ms: Some(500),
+        };
+        let runtime = McpUpstreamRuntimeConfig {
+            timeout: Duration::from_secs(2),
+            response_idle_timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(500),
+            max_request_body_bytes: 1024,
+            max_response_bytes: 1024,
+        };
+        let client = mcp_http_client(
+            &upstream,
+            &runtime,
+            &CheckedEgressDestination {
+                host: host.to_owned(),
+                pinned_addr: direct_addr,
+            },
+        )
+        .expect("MCP client should build");
+
+        let body = client
+            .get(&upstream.url)
+            .send()
+            .await
+            .expect("ambient proxy must not intercept the MCP request")
+            .text()
+            .await
+            .expect("direct MCP response should have a body");
+
+        assert_eq!(body, "direct");
+        server.await.expect("direct MCP server should finish");
     }
 
-    #[tokio::test]
-    async fn mcp_client_ignores_ambient_proxy_environment() {
-        let child_marker = proxy_env_child_marker();
-        if std::env::var_os(&child_marker).is_some() {
-            let listener = TcpListener::bind(("127.0.0.1", 0))
-                .await
-                .expect("direct MCP test listener should bind");
-            let direct_addr = listener
-                .local_addr()
-                .expect("direct MCP test address should be available");
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener
-                    .accept()
-                    .await
-                    .expect("direct MCP server should accept a request");
-                let mut request = vec![0_u8; 1024];
-                let _ = stream
-                    .read(&mut request)
-                    .await
-                    .expect("direct MCP server should read a request");
-                stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect",
-                    )
-                    .await
-                    .expect("direct MCP server should write a response");
-            });
-            let host = "mcp-proxy-test.example";
-            let upstream = McpUpstreamServerConfig {
-                name: "proxy-test".to_owned(),
-                url: format!("http://{host}:{}/", direct_addr.port()),
-                timeout_ms: Some(2_000),
-                response_idle_timeout_ms: Some(2_000),
-                connect_timeout_ms: Some(500),
-            };
-            let runtime = McpUpstreamRuntimeConfig {
-                timeout: Duration::from_secs(2),
-                response_idle_timeout: Duration::from_secs(2),
-                connect_timeout: Duration::from_millis(500),
-                max_request_body_bytes: 1024,
-                max_response_bytes: 1024,
-            };
-            let client = mcp_http_client(
-                &upstream,
-                &runtime,
-                &CheckedEgressDestination {
-                    host: host.to_owned(),
-                    pinned_addr: direct_addr,
-                },
-            )
-            .expect("MCP client should build");
-
-            let body = client
-                .get(&upstream.url)
-                .send()
-                .await
-                .expect("ambient proxy must not intercept the MCP request")
-                .text()
-                .await
-                .expect("direct MCP response should have a body");
-
-            assert_eq!(body, "direct");
-            server.await.expect("direct MCP server should finish");
-            return;
-        }
-
+    #[test]
+    fn mcp_client_ignores_ambient_proxy_environment() {
         let proxy_listener = std::net::TcpListener::bind(("127.0.0.1", 0))
             .expect("ambient MCP proxy sentinel should bind");
         let proxy_addr = proxy_listener
@@ -1139,10 +1158,9 @@ mod tests {
         let output = Command::new(std::env::current_exe().expect("test executable should exist"))
             .args([
                 "--exact",
-                "tools::mcp_upstream::tests::mcp_client_ignores_ambient_proxy_environment",
+                "tools::mcp_upstream::tests::mcp_client_sends_directly_with_proxy_discovery_disabled",
                 "--nocapture",
             ])
-            .env(&child_marker, "1")
             .env("HTTP_PROXY", &proxy_url)
             .env("HTTPS_PROXY", &proxy_url)
             .env("ALL_PROXY", &proxy_url)
@@ -1153,7 +1171,6 @@ mod tests {
             .env("no_proxy", "")
             .output()
             .expect("MCP proxy-isolation child test should start");
-        drop(proxy_listener);
 
         assert!(
             output.status.success(),
@@ -1161,6 +1178,126 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("running 1 test"),
+            "MCP proxy-isolation child must execute exactly one helper test: {stdout}"
+        );
+        proxy_listener
+            .set_nonblocking(true)
+            .expect("MCP proxy sentinel should become nonblocking");
+        assert!(
+            matches!(proxy_listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock),
+            "ambient MCP proxy sentinel must receive zero connections"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_http_failures_expose_only_bounded_categories() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("timeout sentinel should bind");
+        let address = listener
+            .local_addr()
+            .expect("timeout sentinel address should be available");
+        let host = "secret-mcp.example.test";
+        let inner = rmcp_reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .read_timeout(Duration::from_millis(50))
+            .connect_timeout(Duration::from_millis(50))
+            .resolve(host, address)
+            .build()
+            .expect("limited MCP test client should build");
+        let client = LimitedMcpHttpClient::new(inner, 1024, 1024);
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let error = match client
+            .get_stream(
+                Arc::<str>::from(format!(
+                    "http://{host}:{}/private?token=secret-query",
+                    address.port()
+                )),
+                Arc::<str>::from("test-session"),
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await
+        {
+            Ok(_) => panic!("silent MCP upstream should time out"),
+            Err(error) => error,
+        };
+        tracing::warn!(error = %error, "captured sanitized MCP transport failure");
+        drop(_guard);
+        drop(listener);
+
+        let output = format!("{error} {}", logs.contents());
+        let address_text = address.ip().to_string();
+        assert!(output.contains("http_timeout"));
+        for secret in [
+            host,
+            "private",
+            "secret-query",
+            address_text.as_str(),
+            "http://",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "MCP transport error leaked {secret}: {output}"
+            );
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(
+                self.buffer
+                    .lock()
+                    .expect("captured logs should not be poisoned")
+                    .clone(),
+            )
+            .expect("captured logs should be UTF-8")
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .map_err(|_| io::Error::other("captured logs lock poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]

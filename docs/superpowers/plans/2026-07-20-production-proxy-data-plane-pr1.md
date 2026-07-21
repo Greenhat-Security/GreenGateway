@@ -17,7 +17,7 @@
 - Modify `gateway/src/main.rs` for module wiring and behavior-preserving delegation.
 - Add a focused integration test only if module-level tests cannot prove a required gate.
 
-Do not add dependencies, configuration keys/fields, public routes, metrics, production pooling, retries, streaming, readiness, shutdown, SSE, or mTLS behavior. Two intentional security corrections are in scope: every reqwest client built by `EgressClient` disables ambient process proxy discovery so environment variables cannot bypass exact destination pinning, and proxy/health logs replace raw transport errors with bounded safe categories.
+Do not add dependencies, configuration keys/fields, public routes, metrics, production pooling, retries, streaming, readiness, shutdown, SSE, or mTLS behavior. Three intentional security corrections are in scope: every reqwest client built by `EgressClient` disables ambient process proxy discovery so environment variables cannot bypass exact destination pinning; proxy, health, identity-egress, and MCP transport logs replace raw errors with bounded safe categories; and the non-standard hop-by-hop `Proxy-Connection` header is stripped in both directions.
 
 ## Task 1: Freeze the security design
 
@@ -57,7 +57,7 @@ Do not add dependencies, configuration keys/fields, public routes, metrics, prod
 - [ ] Avoid duplicate implementations or compatibility shims that can drift; use narrow `pub(crate)` exports only where composition requires them.
 - [ ] Preserve Axum state/middleware order and the current observation context.
 - [ ] Preserve legacy fallback, route order, host matching, URL/base-path behavior, custom CA behavior, timeouts, request/response limits, health behavior, and generic errors, except for the explicit fail-closed ambient-proxy correction.
-- [ ] Preserve every credential, forwarding, hop-by-hop, nominated, request-ID, configured add/strip, and framing header rule.
+- [ ] Preserve every credential, forwarding, hop-by-hop, nominated, request-ID, configured add/strip, and framing header rule, with the explicit addition of unconditional `Proxy-Connection` stripping.
 - [ ] Replace raw proxy request, response-first-chunk, request-body-read, health-check, and egress enforcement details in logs with bounded safe categories; preserve client status/body behavior.
 - [ ] Test captured proxy/health/egress failure logs do not contain URLs, queries, addresses, DNS messages, certificate paths, or raw reqwest errors.
 - [ ] Add or relocate focused tests without mechanically moving unrelated `main.rs` tests.

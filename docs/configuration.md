@@ -1035,6 +1035,8 @@ Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, ev
 
 The effective egress allowlist is constructed at startup. Hot reload and the policy administration API reject changes to the policy `egress` section rather than leaving long-lived egress clients stale. To change policy hosts, CIDRs, or ports, edit `POLICY_FILE` and restart the gateway. Changes to egress environment variables likewise require a restart.
 
+Outbound requests deliberately ignore ambient `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and lowercase equivalents. GreenGateway must have direct network connectivity to configured upstreams and identity endpoints. There is currently no supported outbound-proxy setting; proxy support requires an explicit future design that preserves DNS validation and exact address pinning.
+
 ### EGRESS_TIMEOUT_MS
 
 Total timeout for each egress HTTP request, in milliseconds.

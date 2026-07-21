@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{future::Future, net::SocketAddr, time::Duration};
 
 use axum::Router;
 use serde_json::json;
@@ -79,13 +79,26 @@ pub(crate) async fn serve_gateway(
 
             tracing::info!(listen_addr = %data_bound_addr, "gateway data listener listening");
             tracing::info!(admin_listen_addr = %admin_bound_addr, "gateway admin listener listening");
-            tokio::try_join!(
+            serve_split(
                 serve_router(data_listener, data),
-                serve_router(admin_listener, admin)
-            )?;
+                serve_router(admin_listener, admin),
+            )
+            .await?;
         }
     }
 
+    Ok(())
+}
+
+async fn serve_split<DataServer, AdminServer>(
+    data_server: DataServer,
+    admin_server: AdminServer,
+) -> std::io::Result<()>
+where
+    DataServer: Future<Output = std::io::Result<()>>,
+    AdminServer: Future<Output = std::io::Result<()>>,
+{
+    tokio::try_join!(data_server, admin_server)?;
     Ok(())
 }
 
@@ -102,7 +115,14 @@ pub(crate) async fn serve_router(
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, sync::Arc, time::Duration};
+    use std::{
+        net::SocketAddr,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use axum::{extract::ConnectInfo, routing::get};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -139,6 +159,12 @@ mod tests {
 
     #[tokio::test]
     async fn split_second_bind_failure_leaves_no_listener_or_startup_event() {
+        let occupied_admin = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("admin reservation should bind");
+        let admin_addr = occupied_admin
+            .local_addr()
+            .expect("admin reservation address should be available");
         let data_reservation = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("data reservation should bind");
@@ -146,12 +172,6 @@ mod tests {
             .local_addr()
             .expect("data reservation address should be available");
         drop(data_reservation);
-        let occupied_admin = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("admin reservation should bind");
-        let admin_addr = occupied_admin
-            .local_addr()
-            .expect("admin reservation address should be available");
         let capture = CaptureSink::new();
 
         let error = serve_gateway(
@@ -172,6 +192,35 @@ mod tests {
             .await
             .expect("failed split startup must release the data listener");
         drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn split_server_failure_cancels_peer_future() {
+        struct DropSignal(Arc<AtomicBool>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let peer_dropped = Arc::new(AtomicBool::new(false));
+        let peer_guard = DropSignal(Arc::clone(&peer_dropped));
+        let data_server = async { Err(std::io::Error::other("data server failed")) };
+        let admin_server = async move {
+            let _peer_guard = peer_guard;
+            std::future::pending::<std::io::Result<()>>().await
+        };
+
+        let error = serve_split(data_server, admin_server)
+            .await
+            .expect_err("the first server failure should terminate split serving");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(
+            peer_dropped.load(Ordering::SeqCst),
+            "the still-running peer server future must be cancelled"
+        );
     }
 
     #[tokio::test]

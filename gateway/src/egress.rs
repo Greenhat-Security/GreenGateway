@@ -657,7 +657,10 @@ impl EgressClient {
         match parsed.scheme() {
             "http" | "https" => Ok(parsed),
             scheme => {
-                tracing::warn!(scheme, "egress blocked URL scheme");
+                tracing::warn!(
+                    error_category = "scheme_not_allowed",
+                    "egress blocked URL scheme"
+                );
                 Err(EgressError::SchemeNotAllowed(scheme.to_owned()))
             }
         }
@@ -1036,18 +1039,20 @@ fn enforce_request_body_size(size: usize, max: usize) -> Result<(), EgressError>
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap, io::ErrorKind, net::IpAddr, path::PathBuf, process::Command,
-        sync::Mutex, time::Duration,
+        collections::HashMap,
+        io::{self, ErrorKind},
+        net::IpAddr,
+        path::PathBuf,
+        process::Command,
+        sync::Mutex,
+        time::Duration,
     };
 
     use futures_util::StreamExt;
     use tokio::net::{TcpListener, TcpStream};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-
-    fn proxy_env_child_marker() -> String {
-        ["GREEN_GATEWAY_EGRESS_PROXY", "ENV_CHILD"].join("_")
-    }
 
     #[derive(Clone)]
     enum FakeResolution {
@@ -1189,6 +1194,34 @@ mod tests {
                 | "http_status"
                 | "http_other"
         ));
+    }
+
+    #[test]
+    fn rejected_scheme_log_exposes_only_a_bounded_category() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let client = EgressClient::new(EgressConfig::default())
+            .expect("scheme log test client should build");
+
+        let error = client
+            .checked_url("secret-scheme://secret-host.example/private?token=secret-query")
+            .expect_err("unsupported URL scheme should fail closed");
+        assert!(matches!(error, EgressError::SchemeNotAllowed(_)));
+        drop(_guard);
+
+        let output = logs.contents();
+        assert!(output.contains("scheme_not_allowed"));
+        for secret in ["secret-scheme", "secret-host", "private", "secret-query"] {
+            assert!(
+                !output.contains(secret),
+                "scheme rejection log leaked {secret}: {output}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1353,48 +1386,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn egress_client_ignores_ambient_proxy_environment() {
-        let child_marker = proxy_env_child_marker();
-        if std::env::var_os(&child_marker).is_some() {
-            let listener = TcpListener::bind(("127.0.0.1", 0))
+    async fn egress_client_sends_directly_with_proxy_discovery_disabled() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("direct test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("direct listener address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
                 .await
-                .expect("direct test listener should bind");
-            let addr = listener
-                .local_addr()
-                .expect("direct listener address should be available");
-            let server = tokio::spawn(async move {
-                let (stream, _) = listener
-                    .accept()
-                    .await
-                    .expect("direct server should accept one connection");
-                read_one_request(&stream).await;
-                write_all(
-                    &stream,
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect",
-                )
-                .await;
-            });
-            let client = EgressClient::new(EgressConfig {
-                allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
-                deny_private_ips: false,
-                timeout: Duration::from_secs(2),
-                connect_timeout: Duration::from_millis(500),
-                max_response_bytes: 6,
-                ..EgressConfig::default()
-            })
-            .expect("client should build");
+                .expect("direct server should accept one connection");
+            read_one_request(&stream).await;
+            write_all(
+                &stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect",
+            )
+            .await;
+        });
+        let client = EgressClient::new(EgressConfig {
+            allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
+            deny_private_ips: false,
+            timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(500),
+            max_response_bytes: 6,
+            ..EgressConfig::default()
+        })
+        .expect("client should build");
 
-            let response = client
-                .request(Method::GET, &format!("http://{addr}/"))
-                .await
-                .expect("ambient proxy settings must not intercept egress");
+        let response = client
+            .request(Method::GET, &format!("http://{addr}/"))
+            .await
+            .expect("ambient proxy settings must not intercept egress");
 
-            assert_eq!(response.status, StatusCode::OK);
-            assert_eq!(response.body, b"direct");
-            server.await.expect("direct server should finish");
-            return;
-        }
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, b"direct");
+        server.await.expect("direct server should finish");
+    }
 
+    #[test]
+    fn egress_client_ignores_ambient_proxy_environment() {
         let proxy_listener = std::net::TcpListener::bind(("127.0.0.1", 0))
             .expect("ambient proxy sentinel listener should bind");
         let proxy_addr = proxy_listener
@@ -1404,10 +1436,9 @@ mod tests {
         let output = Command::new(std::env::current_exe().expect("test executable should exist"))
             .args([
                 "--exact",
-                "egress::tests::egress_client_ignores_ambient_proxy_environment",
+                "egress::tests::egress_client_sends_directly_with_proxy_discovery_disabled",
                 "--nocapture",
             ])
-            .env(&child_marker, "1")
             .env("HTTP_PROXY", &proxy_url)
             .env("HTTPS_PROXY", &proxy_url)
             .env("ALL_PROXY", &proxy_url)
@@ -1418,13 +1449,24 @@ mod tests {
             .env("no_proxy", "")
             .output()
             .expect("proxy-isolation child test should start");
-        drop(proxy_listener);
 
         assert!(
             output.status.success(),
             "proxy-isolation child failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("running 1 test"),
+            "proxy-isolation child must execute exactly one helper test: {stdout}"
+        );
+        proxy_listener
+            .set_nonblocking(true)
+            .expect("proxy sentinel should become nonblocking");
+        assert!(
+            matches!(proxy_listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock),
+            "ambient proxy sentinel must receive zero connections"
         );
     }
 
@@ -2527,6 +2569,51 @@ mod tests {
 
     fn socket(value: &str) -> SocketAddr {
         value.parse().expect("test socket address should parse")
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(
+                self.buffer
+                    .lock()
+                    .expect("captured logs should not be poisoned")
+                    .clone(),
+            )
+            .expect("captured logs should be UTF-8")
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .map_err(|_| io::Error::other("captured logs lock poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     fn test_config() -> Config {
