@@ -17,7 +17,7 @@
 - Modify `gateway/src/main.rs` for module wiring and behavior-preserving delegation.
 - Add a focused integration test only if module-level tests cannot prove a required gate.
 
-Do not add dependencies, configuration keys/fields, public routes, metrics, production pooling, retries, streaming, readiness, shutdown, SSE, or mTLS behavior. Four intentional security corrections are in scope: every reqwest client built by `EgressClient` disables ambient process proxy discovery so environment variables cannot bypass exact destination pinning; proxy, health, identity-egress, and MCP transport logs replace raw errors with bounded safe categories; the non-standard hop-by-hop `Proxy-Connection` header is stripped in both directions; and known oversized outbound bodies, including MCP tool-call payloads, are rejected before DNS, connection, or session work.
+Do not add dependencies, configuration keys/fields, public routes, metrics, production pooling, retries, streaming, readiness, shutdown, SSE, or mTLS behavior. Four intentional security corrections are in scope: every reqwest client built by `EgressClient` disables ambient process proxy discovery so environment variables cannot bypass exact destination pinning; proxy, health, identity-egress, and MCP transport logs replace raw errors with bounded safe categories; the non-standard hop-by-hop `Proxy-Connection` header is stripped in both directions; and caller-provided direct-egress body vectors plus gateway MCP `call_tool` payloads are rejected before their respective DNS, connection, or session work.
 
 ## Task 1: Freeze the security design
 

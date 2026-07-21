@@ -321,17 +321,7 @@ fn enforce_mcp_call_request_size_before_egress(
     // RMCP adds both a request ID and a progress token before transport serialization. Use the
     // longest numeric forms so a request accepted here cannot cross the configured cap later when
     // RMCP assigns its smaller runtime counters.
-    let mut bounded_request = request.clone();
-    bounded_request.meta = Some(Meta::with_progress_token(ProgressToken(
-        NumberOrString::Number(i64::MIN),
-    )));
-    let message = ClientJsonRpcMessage::request(
-        ClientRequest::CallToolRequest(CallToolRequest::new(bounded_request)),
-        NumberOrString::Number(i64::MIN),
-    );
-    let size = serde_json::to_vec(&message)
-        .map_err(|_| McpUpstreamCallError::Call)?
-        .len();
+    let size = serialized_mcp_call_request_size(request, i64::MIN, i64::MIN)?;
 
     if size > max_request_body_bytes {
         tracing::warn!(
@@ -346,6 +336,25 @@ fn enforce_mcp_call_request_size_before_egress(
     }
 
     Ok(())
+}
+
+fn serialized_mcp_call_request_size(
+    request: &CallToolRequestParams,
+    request_id: i64,
+    progress_token: i64,
+) -> Result<usize, McpUpstreamCallError> {
+    let mut bounded_request = request.clone();
+    bounded_request.meta = Some(Meta::with_progress_token(ProgressToken(
+        NumberOrString::Number(progress_token),
+    )));
+    let message = ClientJsonRpcMessage::request(
+        ClientRequest::CallToolRequest(CallToolRequest::new(bounded_request)),
+        NumberOrString::Number(request_id),
+    );
+    let size = serde_json::to_vec(&message)
+        .map_err(|_| McpUpstreamCallError::Call)?
+        .len();
+    Ok(size)
 }
 
 async fn list_tools(
@@ -1135,6 +1144,45 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![SocketAddr::new(self.address, port)])
         }
+    }
+
+    #[test]
+    fn conservative_mcp_call_size_bounds_runtime_numeric_identifiers() {
+        let arguments = serde_json::json!({
+            "escaped": "quotes: \" and slash: \\",
+            "nested": { "value": 42 }
+        })
+        .as_object()
+        .expect("test arguments should be an object")
+        .clone();
+        let request =
+            CallToolRequestParams::new("boundary_tool".to_owned()).with_arguments(arguments);
+        let conservative = serialized_mcp_call_request_size(&request, i64::MIN, i64::MIN)
+            .expect("conservative MCP request should serialize");
+
+        for (request_id, progress_token) in [
+            (i64::MIN, i64::MIN),
+            (i64::MIN + 1, i64::MAX),
+            (-1, 0),
+            (0, -1),
+            (i64::from(u32::MAX), i64::from(u32::MAX)),
+            (i64::MAX, i64::MAX),
+        ] {
+            let actual = serialized_mcp_call_request_size(&request, request_id, progress_token)
+                .expect("runtime-shaped MCP request should serialize");
+            assert!(
+                actual <= conservative,
+                "runtime identifiers ({request_id}, {progress_token}) produced {actual} bytes, exceeding conservative {conservative}-byte preflight"
+            );
+        }
+
+        enforce_mcp_call_request_size_before_egress(&request, conservative)
+            .expect("request at the conservative bound should be accepted");
+        assert!(matches!(
+            enforce_mcp_call_request_size_before_egress(&request, conservative - 1),
+            Err(McpUpstreamCallError::RequestBodyTooLarge { size, max })
+                if size == conservative && max == conservative - 1
+        ));
     }
 
     #[tokio::test]

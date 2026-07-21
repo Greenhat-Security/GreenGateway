@@ -1075,7 +1075,7 @@ Maximum egress request body size, in bytes.
 
 Default: `1048576` (1 MiB)
 
-Format and validation: must parse as a non-negative byte count that fits in `usize`. Known buffered request bodies are checked before DNS resolution. MCP tool-call payloads are conservatively sized before destination resolution or session initialization and are checked again at transport serialization.
+Format and validation: must parse as a non-negative byte count that fits in `usize`. Caller-provided body vectors on the direct `EgressClient` request paths are checked before DNS resolution. Gateway MCP `call_tool` payloads are conservatively sized before destination resolution or session initialization and are checked again at transport serialization. MCP initialization and discovery messages retain the transport serialization check after destination validation.
 
 ### EGRESS_NAT64_PREFIXES
 
