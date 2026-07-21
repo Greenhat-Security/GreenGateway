@@ -114,6 +114,12 @@ Every cached client also has a finite conservative pool idle timeout, a finite m
 
 Every reqwest client constructed by `EgressClient`, plus the separately built egress-validated/pinned MCP transport client, explicitly disables ambient `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and related environment proxy discovery. Future outbound-proxy support must be configured, validated, and keyed explicitly; it cannot inherit process environment behavior or bypass exact destination pinning. Isolated subprocess tests set hostile proxy environment variables and prove the pinned local destination is still used while the proxy receives no request.
 
+Known buffered outbound bodies are rejected before DNS resolution. MCP
+tool-call payloads are conservatively serialized with maximum-width runtime
+identifiers and rejected before destination resolution, connection, or session
+initialization; exact transport serialization keeps the existing second size
+check.
+
 ### Header, credential, and framing boundary
 
 Extraction must preserve the current per-attempt header boundary:

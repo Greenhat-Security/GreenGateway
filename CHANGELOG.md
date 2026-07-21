@@ -22,6 +22,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   and the non-standard hop-by-hop `Proxy-Connection` header is stripped in
   both directions.
 
+- Known oversized outbound request bodies are now rejected before DNS
+  resolution. MCP tool-call payloads are conservatively sized and rejected
+  before destination resolution, connection, or session initialization, so a
+  guaranteed size denial cannot produce upstream traffic.
+
 ## [1.0.1] - 2026-07-16
 
 ### Security

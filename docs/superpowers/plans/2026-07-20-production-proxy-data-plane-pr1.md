@@ -17,7 +17,7 @@
 - Modify `gateway/src/main.rs` for module wiring and behavior-preserving delegation.
 - Add a focused integration test only if module-level tests cannot prove a required gate.
 
-Do not add dependencies, configuration keys/fields, public routes, metrics, production pooling, retries, streaming, readiness, shutdown, SSE, or mTLS behavior. Three intentional security corrections are in scope: every reqwest client built by `EgressClient` disables ambient process proxy discovery so environment variables cannot bypass exact destination pinning; proxy, health, identity-egress, and MCP transport logs replace raw errors with bounded safe categories; and the non-standard hop-by-hop `Proxy-Connection` header is stripped in both directions.
+Do not add dependencies, configuration keys/fields, public routes, metrics, production pooling, retries, streaming, readiness, shutdown, SSE, or mTLS behavior. Four intentional security corrections are in scope: every reqwest client built by `EgressClient` disables ambient process proxy discovery so environment variables cannot bypass exact destination pinning; proxy, health, identity-egress, and MCP transport logs replace raw errors with bounded safe categories; the non-standard hop-by-hop `Proxy-Connection` header is stripped in both directions; and known oversized outbound bodies, including MCP tool-call payloads, are rejected before DNS, connection, or session work.
 
 ## Task 1: Freeze the security design
 
@@ -42,6 +42,7 @@ Do not add dependencies, configuration keys/fields, public routes, metrics, prod
 - [ ] Call reqwest's `no_proxy()` on the shared base builder and every derived pinned client path; do not honor ambient `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY`.
 - [ ] Call `no_proxy()` on the separately built MCP reqwest transport after egress validation/pinning and cover it with the same hostile-environment isolation model.
 - [ ] Route every existing lookup through the stored resolver.
+- [ ] Reject known oversized buffered and MCP tool-call bodies before DNS resolution or MCP connection/session initialization, while retaining the transport serialization check.
 - [ ] Keep hostname/port validation, all-answer IP/NAT64 validation, first-address selection, exact pinning, SNI, certificate validation, redirects, and error mapping unchanged.
 - [ ] Add a deterministic fake resolver with call accounting.
 - [ ] Test mixed answers, empty answers, resolver errors, and validate-all-before-pin behavior.

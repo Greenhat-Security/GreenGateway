@@ -102,6 +102,12 @@ A later DNS-generation cache requires its own reviewed design with resolver TTL 
 
 Every reqwest client built by `EgressClient`, plus the separately built egress-validated/pinned MCP transport client, explicitly calls `no_proxy()` so `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and related process environment settings cannot redirect a supposedly pinned request. Future outbound-proxy support requires an explicit reviewed configuration that preserves destination validation and is part of the transport key. Certificate and hostname verification remain mandatory; there is no insecure skip-verification option.
 
+Known buffered outbound bodies are rejected before DNS resolution. MCP
+tool-call payloads are conservatively serialized with maximum-width runtime
+identifiers and rejected before destination resolution, connection, or session
+initialization; the transport retains its exact serialization-time check as a
+second fail-closed boundary.
+
 ### Header, body, and response boundary
 
 Every attempt independently:

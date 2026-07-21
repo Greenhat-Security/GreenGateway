@@ -20,8 +20,9 @@ use http::{
 };
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, JsonObject, JsonRpcMessage,
-        PaginatedRequestParams, ServerJsonRpcMessage, Tool,
+        CallToolRequest, CallToolRequestParams, CallToolResult, ClientJsonRpcMessage,
+        ClientRequest, JsonObject, JsonRpcMessage, Meta, NumberOrString, PaginatedRequestParams,
+        ProgressToken, ServerJsonRpcMessage, Tool,
     },
     service::{ClientInitializeError, ServiceError},
     transport::{
@@ -293,16 +294,16 @@ pub async fn call_tool(
     remote_tool_name: &str,
     args: Value,
 ) -> Result<CallToolResult, McpUpstreamCallError> {
-    let destination = egress_client
-        .checked_destination(&server.url)
-        .await
-        .map_err(|_| McpUpstreamCallError::EgressRejected)?;
-
     let arguments = match args {
         Value::Object(arguments) => arguments,
         _ => JsonObject::new(),
     };
     let request = CallToolRequestParams::new(remote_tool_name.to_owned()).with_arguments(arguments);
+    enforce_mcp_call_request_size_before_egress(&request, runtime_config.max_request_body_bytes)?;
+    let destination = egress_client
+        .checked_destination(&server.url)
+        .await
+        .map_err(|_| McpUpstreamCallError::EgressRejected)?;
     let mut service = connect(server, runtime_config, &destination).await?;
     let result = service
         .call_tool(request)
@@ -311,6 +312,40 @@ pub async fn call_tool(
     let _ = service.close_with_timeout(Duration::from_millis(250)).await;
 
     Ok(result)
+}
+
+fn enforce_mcp_call_request_size_before_egress(
+    request: &CallToolRequestParams,
+    max_request_body_bytes: usize,
+) -> Result<(), McpUpstreamCallError> {
+    // RMCP adds both a request ID and a progress token before transport serialization. Use the
+    // longest numeric forms so a request accepted here cannot cross the configured cap later when
+    // RMCP assigns its smaller runtime counters.
+    let mut bounded_request = request.clone();
+    bounded_request.meta = Some(Meta::with_progress_token(ProgressToken(
+        NumberOrString::Number(i64::MIN),
+    )));
+    let message = ClientJsonRpcMessage::request(
+        ClientRequest::CallToolRequest(CallToolRequest::new(bounded_request)),
+        NumberOrString::Number(i64::MIN),
+    );
+    let size = serde_json::to_vec(&message)
+        .map_err(|_| McpUpstreamCallError::Call)?
+        .len();
+
+    if size > max_request_body_bytes {
+        tracing::warn!(
+            size,
+            max = max_request_body_bytes,
+            "egress blocked oversized MCP call before destination resolution"
+        );
+        return Err(McpUpstreamCallError::RequestBodyTooLarge {
+            size,
+            max: max_request_body_bytes,
+        });
+    }
+
+    Ok(())
 }
 
 async fn list_tools(
@@ -1070,9 +1105,14 @@ mod tests {
     use super::*;
 
     use std::{
+        collections::HashSet,
         io::{self, ErrorKind},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         process::Command,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
     };
 
     use tokio::{
@@ -1083,6 +1123,86 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     const TEST_RESPONSE_LIMIT: usize = 64;
+
+    struct CountingDnsResolver {
+        calls: AtomicUsize,
+        address: IpAddr,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::egress::DnsResolver for CountingDnsResolver {
+        async fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, std::io::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![SocketAddr::new(self.address, port)])
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_call_tool_request_is_rejected_before_dns_or_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("MCP connection sentinel should bind");
+        let address = listener
+            .local_addr()
+            .expect("MCP connection sentinel address should be available");
+        let host = "oversized-mcp.example.test";
+        let upstream = McpUpstreamServerConfig {
+            name: "oversized-request-test".to_owned(),
+            url: format!("http://{host}:{}/mcp", address.port()),
+            timeout_ms: Some(500),
+            response_idle_timeout_ms: Some(500),
+            connect_timeout_ms: Some(100),
+        };
+        let runtime = McpUpstreamRuntimeConfig {
+            timeout: Duration::from_millis(500),
+            response_idle_timeout: Duration::from_millis(500),
+            connect_timeout: Duration::from_millis(100),
+            max_request_body_bytes: 128,
+            max_response_bytes: 1024,
+        };
+        let resolver = Arc::new(CountingDnsResolver {
+            calls: AtomicUsize::new(0),
+            address: address.ip(),
+        });
+        let resolver_for_client: Arc<dyn crate::egress::DnsResolver> = resolver.clone();
+        let egress_client = Arc::new(
+            EgressClient::new_with_resolver(
+                crate::egress::EgressConfig {
+                    allowed_hosts: HashSet::from([host.to_owned()]),
+                    deny_private_ips: false,
+                    ..crate::egress::EgressConfig::default()
+                },
+                resolver_for_client,
+            )
+            .expect("MCP egress client should build"),
+        );
+
+        let error = call_tool(
+            &upstream,
+            &runtime,
+            egress_client,
+            "oversized_tool",
+            serde_json::json!({ "payload": "x".repeat(1024) }),
+        )
+        .await
+        .expect_err("oversized MCP call should fail before destination work");
+
+        assert!(matches!(
+            error,
+            McpUpstreamCallError::RequestBodyTooLarge { size, max: 128 } if size > 128
+        ));
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            0,
+            "oversized MCP call denial must not resolve DNS"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "oversized MCP call denial must not open a connection"
+        );
+    }
 
     #[tokio::test]
     async fn mcp_client_sends_directly_with_proxy_discovery_disabled() {

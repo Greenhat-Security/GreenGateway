@@ -585,11 +585,11 @@ impl EgressClient {
         )?;
         let port = checked_port(&parsed)?;
         checked_policy_port(port, &self.config.allowed_ports)?;
-        let pinned_addr = self.resolve_and_check(&host, port).await?;
         enforce_request_body_size(
             body.as_ref().map_or(0, Vec::len),
             self.config.max_request_body_bytes,
         )?;
+        let pinned_addr = self.resolve_and_check(&host, port).await?;
         let client = self.pinned_client(&host, pinned_addr)?;
 
         tracing::debug!("egress request pinned to validated destination");
@@ -630,11 +630,11 @@ impl EgressClient {
         )?;
         let port = checked_port(&parsed)?;
         checked_policy_port(port, &self.config.allowed_ports)?;
-        let pinned_addr = self.resolve_and_check(&host, port).await?;
         enforce_request_body_size(
             body.as_ref().map_or(0, Vec::len),
             self.config.max_request_body_bytes,
         )?;
+        let pinned_addr = self.resolve_and_check(&host, port).await?;
         let client = self.pinned_client(&host, pinned_addr)?;
 
         tracing::debug!("egress streaming request pinned to validated destination");
@@ -2178,6 +2178,49 @@ mod tests {
             EgressError::RequestBodyTooLarge { size: 4, max: 3 }
         ));
         enforce_request_body_size(3, 3).expect("body at limit should be allowed");
+    }
+
+    #[tokio::test]
+    async fn oversized_request_bodies_are_rejected_before_dns_resolution() {
+        let resolver = Arc::new(FakeDnsResolver::with_addresses(vec![socket("8.8.8.8:443")]));
+        let client = EgressClient::new_with_resolver(
+            EgressConfig {
+                max_request_body_bytes: 3,
+                ..egress_config_for_host("oversized.example.test")
+            },
+            resolver.clone(),
+        )
+        .expect("client should build");
+
+        let buffered_error = client
+            .request_with_headers(
+                Method::POST,
+                "https://oversized.example.test/resource",
+                HeaderMap::new(),
+                Some(vec![0; 4]),
+            )
+            .await
+            .expect_err("oversized buffered request should fail");
+        let streaming_error = client
+            .stream_request_with_headers(
+                Method::POST,
+                "https://oversized.example.test/resource",
+                HeaderMap::new(),
+                Some(vec![0; 4]),
+            )
+            .await
+            .expect_err("oversized streaming request should fail");
+
+        for error in [buffered_error, streaming_error] {
+            assert!(matches!(
+                error,
+                EgressError::RequestBodyTooLarge { size: 4, max: 3 }
+            ));
+        }
+        assert!(
+            resolver.calls().is_empty(),
+            "oversized request denial must not resolve DNS"
+        );
     }
 
     #[tokio::test]
