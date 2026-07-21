@@ -569,6 +569,8 @@ Example:
 
 Security note: MCP upstream hosts are not auto-seeded into the egress allowlist. Their URLs are checked at startup and again before each call through the same egress URL, host, port, DNS, and non-global-IP validation used by normal gateway-originated HTTP requests. Configure `EGRESS_ALLOWED_HOSTS` or policy `egress.hosts` for every allowed MCP upstream host.
 
+MCP upstream auth challenges, error bodies, content types, session identifiers, peer metadata, and raw egress/transport details are not emitted to process logs. Dependency-internal `rmcp` tracing is disabled because it does not provide that redaction boundary; GreenGateway continues to emit bounded MCP outcome categories and structured tool audit events.
+
 Startup discovery imports each upstream tool into the same tool registry as `TOOLS_FILE` tools. Namespaced collisions with local tools or other MCP upstream tools fail startup rather than overwriting.
 
 ### POLICY_HISTORY_SQLITE_PATH

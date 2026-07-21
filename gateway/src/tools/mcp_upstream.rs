@@ -21,8 +21,8 @@ use http::{
 use rmcp::{
     model::{
         CallToolRequest, CallToolRequestParams, CallToolResult, ClientJsonRpcMessage,
-        ClientRequest, JsonObject, JsonRpcMessage, Meta, NumberOrString, PaginatedRequestParams,
-        ProgressToken, ServerJsonRpcMessage, Tool,
+        ClientRequest, JsonObject, Meta, NumberOrString, PaginatedRequestParams, ProgressToken,
+        ServerJsonRpcMessage, Tool,
     },
     service::{ClientInitializeError, ServiceError},
     transport::{
@@ -50,6 +50,7 @@ const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
 const JSON_MIME: &str = "application/json";
 const MAX_DISCOVERY_PAGES_PER_UPSTREAM: usize = 32;
 const MAX_DISCOVERY_TOOLS_PER_UPSTREAM: usize = 1024;
+const REDACTED_MCP_UPSTREAM_VALUE: &str = "<redacted>";
 
 #[derive(Debug)]
 pub enum McpUpstreamDiscoveryError {
@@ -59,7 +60,7 @@ pub enum McpUpstreamDiscoveryError {
     ThreadPanicked,
     EgressRejected {
         server_name: String,
-        source: EgressError,
+        reason: &'static str,
     },
     UpstreamListFailed {
         server_name: String,
@@ -79,10 +80,10 @@ impl fmt::Display for McpUpstreamDiscoveryError {
             Self::ThreadPanicked => write!(formatter, "MCP upstream discovery thread panicked"),
             Self::EgressRejected {
                 server_name,
-                source,
+                reason,
             } => write!(
                 formatter,
-                "MCP upstream server '{server_name}' URL is rejected by egress policy: {source}"
+                "MCP upstream server '{server_name}' URL is rejected by egress policy ({reason})"
             ),
             Self::UpstreamListFailed {
                 server_name,
@@ -98,9 +99,8 @@ impl fmt::Display for McpUpstreamDiscoveryError {
 impl Error for McpUpstreamDiscoveryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::EgressRejected { source, .. } => Some(source),
             Self::UpstreamListFailed { source, .. } => Some(source),
-            Self::RuntimeBuild { .. } | Self::ThreadPanicked => None,
+            Self::RuntimeBuild { .. } | Self::ThreadPanicked | Self::EgressRejected { .. } => None,
         }
     }
 }
@@ -257,10 +257,7 @@ async fn discover_upstream_tools(
         let destination = egress_client
             .checked_destination(&server.url)
             .await
-            .map_err(|source| McpUpstreamDiscoveryError::EgressRejected {
-                server_name: server.name.clone(),
-                source,
-            })?;
+            .map_err(|source| mcp_discovery_egress_error(server.name.clone(), source))?;
 
         match list_tools(server, &runtime_config, &destination).await {
             Ok(tools) => {
@@ -285,6 +282,16 @@ async fn discover_upstream_tools(
     }
 
     Ok(definitions)
+}
+
+fn mcp_discovery_egress_error(
+    server_name: String,
+    source: EgressError,
+) -> McpUpstreamDiscoveryError {
+    McpUpstreamDiscoveryError::EgressRejected {
+        server_name,
+        reason: source.safe_category(),
+    }
 }
 
 pub async fn call_tool(
@@ -612,35 +619,19 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
             request = request.header(CONTENT_TYPE, JSON_MIME);
         }
         let response = request.body(body).send().await.map_err(mcp_http_error)?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            if let Some(header) = response.headers().get(WWW_AUTHENTICATE) {
-                let header = header
-                    .to_str()
-                    .map_err(|_| {
-                        StreamableHttpError::UnexpectedServerResponse(Cow::from(
-                            "invalid www-authenticate header value",
-                        ))
-                    })?
-                    .to_string();
-                return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
-                    header,
-                )));
-            }
+        if response.status() == StatusCode::UNAUTHORIZED
+            && response.headers().contains_key(WWW_AUTHENTICATE)
+        {
+            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                REDACTED_MCP_UPSTREAM_VALUE.to_owned(),
+            )));
         }
-        if response.status() == StatusCode::FORBIDDEN {
-            if let Some(header) = response.headers().get(WWW_AUTHENTICATE) {
-                let header_str = header.to_str().map_err(|_| {
-                    StreamableHttpError::UnexpectedServerResponse(Cow::from(
-                        "invalid www-authenticate header value",
-                    ))
-                })?;
-                return Err(StreamableHttpError::InsufficientScope(
-                    InsufficientScopeError::new(
-                        header_str.to_owned(),
-                        extract_mcp_scope_from_header(header_str),
-                    ),
-                ));
-            }
+        if response.status() == StatusCode::FORBIDDEN
+            && response.headers().contains_key(WWW_AUTHENTICATE)
+        {
+            return Err(StreamableHttpError::InsufficientScope(
+                InsufficientScopeError::new(REDACTED_MCP_UPSTREAM_VALUE.to_owned(), None),
+            ));
         }
 
         let status = response.status();
@@ -675,30 +666,14 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
         }
 
         if !status.is_success() {
-            let body = match read_limited_mcp_response_text(response, self.max_response_bytes).await
-            {
-                Ok(body) => body,
+            match read_limited_mcp_response_body(response, self.max_response_bytes).await {
+                Ok(_) => {}
                 Err(error) if mcp_streamable_error_response_too_large(&error).is_some() => {
                     return Err(error);
                 }
-                Err(_) => "<failed to read response body>".to_owned(),
-            };
-            if content_type
-                .as_deref()
-                .is_some_and(|ct| ct.as_bytes().starts_with(JSON_MIME.as_bytes()))
-            {
-                match parse_json_rpc_error(&body) {
-                    Some(message) => {
-                        return Ok(StreamableHttpPostResponse::Json(message, session_id));
-                    }
-                    None => tracing::warn!(
-                        "HTTP {status}: could not parse JSON body as a JSON-RPC error"
-                    ),
-                }
+                Err(_) => {}
             }
-            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                format!("HTTP {status}: {body}"),
-            )));
+            return Err(redacted_mcp_status_error(status));
         }
 
         match content_type.as_deref() {
@@ -722,17 +697,18 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
                     Err(error) if mcp_streamable_error_response_too_large(&error).is_some() => {
                         Err(error)
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            "could not parse JSON response as ServerJsonRpcMessage, treating as accepted: {error}"
-                        );
+                    Err(_) => {
+                        tracing::warn!("could not parse MCP JSON response; treating as accepted");
                         Ok(StreamableHttpPostResponse::Accepted)
                     }
                 }
             }
             _ => {
-                tracing::error!("unexpected content type: {:?}", content_type);
-                Err(StreamableHttpError::UnexpectedContentType(content_type))
+                tracing::error!(
+                    content_type_present = content_type.is_some(),
+                    "unexpected MCP upstream content type"
+                );
+                Err(redacted_mcp_content_type_error(content_type.is_some()))
             }
         }
     }
@@ -804,14 +780,6 @@ async fn read_limited_mcp_response_body(
     Ok(Bytes::from(body))
 }
 
-async fn read_limited_mcp_response_text(
-    response: rmcp_reqwest::Response,
-    max_response_bytes: usize,
-) -> Result<String, StreamableHttpError<LimitedMcpHttpError>> {
-    let body = read_limited_mcp_response_body(response, max_response_bytes).await?;
-    Ok(String::from_utf8_lossy(&body).into_owned())
-}
-
 async fn read_limited_mcp_response_json<T: serde::de::DeserializeOwned>(
     response: rmcp_reqwest::Response,
     max_response_bytes: usize,
@@ -881,12 +849,10 @@ fn validate_mcp_response_content_type(
                 .starts_with(EVENT_STREAM_MIME.as_bytes())
                 && !content_type.as_bytes().starts_with(JSON_MIME.as_bytes())
             {
-                return Err(StreamableHttpError::UnexpectedContentType(Some(
-                    String::from_utf8_lossy(content_type.as_bytes()).to_string(),
-                )));
+                return Err(redacted_mcp_content_type_error(true));
             }
         }
-        None => return Err(StreamableHttpError::UnexpectedContentType(None)),
+        None => return Err(redacted_mcp_content_type_error(false)),
     }
 
     Ok(())
@@ -915,28 +881,18 @@ fn validate_mcp_custom_header(name: &HeaderName) -> Result<(), String> {
     Ok(())
 }
 
-fn extract_mcp_scope_from_header(header: &str) -> Option<String> {
-    let header_lowercase = header.to_ascii_lowercase();
-    let scope_key = "scope=";
-    let position = header_lowercase.find(scope_key)?;
-    let value_slice = &header[position + scope_key.len()..];
-
-    if let Some(stripped) = value_slice.strip_prefix('"') {
-        let end_quote = stripped.find('"')?;
-        return Some(stripped[..end_quote].to_owned());
-    }
-
-    let end = value_slice
-        .find(|character: char| character == ',' || character == ';' || character.is_whitespace())
-        .unwrap_or(value_slice.len());
-    (end > 0).then(|| value_slice[..end].to_owned())
+fn redacted_mcp_status_error(status: StatusCode) -> StreamableHttpError<LimitedMcpHttpError> {
+    StreamableHttpError::UnexpectedServerResponse(Cow::Owned(format!(
+        "HTTP {status}: upstream response details redacted"
+    )))
 }
 
-fn parse_json_rpc_error(body: &str) -> Option<ServerJsonRpcMessage> {
-    match serde_json::from_str::<ServerJsonRpcMessage>(body) {
-        Ok(message @ JsonRpcMessage::Error(_)) => Some(message),
-        _ => None,
-    }
+fn redacted_mcp_content_type_error(
+    content_type_present: bool,
+) -> StreamableHttpError<LimitedMcpHttpError> {
+    StreamableHttpError::UnexpectedContentType(
+        content_type_present.then(|| REDACTED_MCP_UPSTREAM_VALUE.to_owned()),
+    )
 }
 
 fn mcp_http_error(error: rmcp_reqwest::Error) -> StreamableHttpError<LimitedMcpHttpError> {
@@ -1129,7 +1085,7 @@ mod tests {
         net::TcpListener,
         task::JoinHandle,
     };
-    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::{fmt::MakeWriter, prelude::*};
 
     const TEST_RESPONSE_LIMIT: usize = 64;
 
@@ -1143,6 +1099,62 @@ mod tests {
         async fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, std::io::Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![SocketAddr::new(self.address, port)])
+        }
+    }
+
+    #[test]
+    fn discovery_egress_error_keeps_only_the_safe_category() {
+        let secret_host = "secret-discovery-host.example.test";
+        let error = mcp_discovery_egress_error(
+            "configured-upstream".to_owned(),
+            EgressError::HostNotAllowed(secret_host.to_owned()),
+        );
+        let output = format!("{error} {error:?}");
+
+        assert!(output.contains("host_not_allowed"));
+        assert!(!output.contains(secret_host));
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn production_filter_suppresses_rmcp_dependency_secrets() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .without_time()
+                    .with_writer(logs.clone()),
+            )
+            .with(crate::production_tracing_filter());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        tracing::info!(target: "gateway::mcp_filter_test", "green-gateway-marker");
+        tracing::error!(
+            target: "rmcp::service",
+            peer_info = "secret-server-instructions",
+            "dependency peer metadata"
+        );
+        tracing::error!(
+            target: "rmcp::transport::streamable_http_client",
+            session_id = "secret-session-id",
+            error = "https://secret-upstream.example/private?token=secret-query",
+            "dependency transport failure"
+        );
+        drop(_guard);
+
+        let output = logs.contents();
+        assert!(output.contains("green-gateway-marker"));
+        for secret in [
+            "secret-server-instructions",
+            "secret-session-id",
+            "secret-upstream.example",
+            "secret-query",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "production tracing filter leaked rmcp value {secret}: {output}"
+            );
         }
     }
 
@@ -1421,6 +1433,159 @@ mod tests {
                 "MCP transport error leaked {secret}: {output}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_http_response_details_are_redacted() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let auth_error = post_message_against_raw_response(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"secret-auth-challenge\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .as_bytes()
+                .to_vec(),
+        )
+        .await
+        .expect_err("401 MCP response should require authentication");
+        let body = "secret-error-body";
+        let status_error = post_message_against_raw_response(
+            format!(
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; marker=secret-error-content-type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        )
+        .await
+        .expect_err("non-success MCP response should fail");
+        let content_type_error = post_message_against_raw_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/secret-content-type\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                .to_vec(),
+        )
+        .await
+        .expect_err("unsupported MCP content type should fail");
+        let get_content_type_error = match get_stream_against_raw_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/secret-get-content-type\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                .to_vec(),
+        )
+        .await
+        {
+            Ok(_) => panic!("unsupported MCP GET content type should fail"),
+            Err(error) => error,
+        };
+        drop(_guard);
+
+        let output = format!(
+            "{auth_error} {auth_error:?} {status_error} {status_error:?} {content_type_error} {content_type_error:?} {get_content_type_error} {get_content_type_error:?} {}",
+            logs.contents()
+        );
+        assert!(output.contains(REDACTED_MCP_UPSTREAM_VALUE));
+        assert!(output.contains("502 Bad Gateway"));
+        for secret in [
+            "secret-auth-challenge",
+            "secret-error-body",
+            "secret-error-content-type",
+            "secret-content-type",
+            "secret-get-content-type",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "MCP response error or log leaked {secret}: {output}"
+            );
+        }
+    }
+
+    async fn post_message_against_raw_response(
+        response: Vec<u8>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<LimitedMcpHttpError>> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("raw MCP response listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("raw MCP response address should be available");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("raw MCP response server should accept a request");
+            let _request = read_raw_http_request_headers(&mut stream).await;
+            stream
+                .write_all(&response)
+                .await
+                .expect("raw MCP response server should write its response");
+        });
+        let inner = rmcp_reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("raw-response MCP client should build");
+        let client = LimitedMcpHttpClient::new(inner, 1024, 1024);
+        let request = ClientJsonRpcMessage::request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(
+                "redaction_test".to_owned(),
+            ))),
+            NumberOrString::Number(1),
+        );
+
+        let result = client
+            .post_message(
+                Arc::from(format!("http://{address}/mcp")),
+                request,
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await;
+        server.await.expect("raw MCP response server should finish");
+        result
+    }
+
+    async fn get_stream_against_raw_response(
+        response: Vec<u8>,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<LimitedMcpHttpError>>
+    {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("raw MCP GET response listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("raw MCP GET response address should be available");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("raw MCP GET response server should accept a request");
+            let _request = read_raw_http_request_headers(&mut stream).await;
+            stream
+                .write_all(&response)
+                .await
+                .expect("raw MCP GET response server should write its response");
+        });
+        let inner = rmcp_reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("raw-response MCP GET client should build");
+        let client = LimitedMcpHttpClient::new(inner, 1024, 1024);
+
+        let result = client
+            .get_stream(
+                Arc::from(format!("http://{address}/mcp")),
+                Arc::from("redaction-test-session"),
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await;
+        server
+            .await
+            .expect("raw MCP GET response server should finish");
+        result
     }
 
     #[derive(Clone, Default)]

@@ -32,6 +32,10 @@ use tower_http::{
     request_id::{MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
     trace::TraceLayer,
 };
+use tracing_subscriber::{
+    filter::{LevelFilter, Targets},
+    prelude::*,
+};
 #[cfg(test)]
 use url::Url;
 
@@ -1070,9 +1074,13 @@ fn egress_client_for_build(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let process_started_at = Instant::now();
 
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .compact()
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .compact()
+                .with_target(false),
+        )
+        .with(production_tracing_filter())
         .init();
 
     let config = match config::Config::from_env() {
@@ -1097,6 +1105,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     serve_gateway(app, listen_addr, admin_listen_addr, audit_log).await?;
 
     Ok(())
+}
+
+fn production_tracing_filter() -> Targets {
+    // rmcp 2.1 emits peer metadata, raw transport errors, and session identifiers from its
+    // internal tracing calls. Keep the dependency disabled globally; GreenGateway emits its own
+    // bounded MCP outcome categories at the integration boundary.
+    Targets::new()
+        .with_default(LevelFilter::INFO)
+        .with_target("rmcp", LevelFilter::OFF)
 }
 
 #[cfg(test)]
@@ -13091,10 +13108,11 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_upstream_url_rejected_by_egress_allowlist_fails_startup() {
+        let secret_host = "secret-blocked-mcp.example.test";
         let mut config = test_config(Vec::new());
         config.mcp_upstream_servers = vec![config::McpUpstreamServerConfig {
             name: "alpha".to_owned(),
-            url: "http://blocked.example.test/mcp".to_owned(),
+            url: format!("http://{secret_host}/mcp"),
             timeout_ms: Some(500),
             response_idle_timeout_ms: Some(500),
             connect_timeout_ms: Some(500),
@@ -13110,14 +13128,18 @@ mod tests {
             test_audit_event_sender(),
         )
         .expect_err("non-allowlisted MCP upstream should fail startup");
-        let message = error.to_string();
+        let message = format!("{error} {error:?}");
         assert!(
             message.contains("MCP upstream server 'alpha' URL is rejected by egress policy"),
             "unexpected error: {message}"
         );
         assert!(
-            message.contains("egress host is not allowed: blocked.example.test"),
+            message.contains("host_not_allowed"),
             "unexpected error: {message}"
+        );
+        assert!(
+            !message.contains(secret_host),
+            "startup error leaked rejected MCP destination: {message}"
         );
     }
 

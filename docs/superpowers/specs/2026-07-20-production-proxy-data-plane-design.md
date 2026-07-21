@@ -304,6 +304,7 @@ Review additionally checks:
 - no new public surface exposes credentials, origins, IP addresses, resolver details, or raw transport errors;
 - the existing `/health` JSON field `upstreams[].origin` is treated as a temporary compatibility exception, is not expanded in PR 1, and is migrated only in the dedicated readiness/status PR;
 - proxy (including committed response tails), health-check, identity-egress, MCP transport, and egress enforcement logs plus new audit/status paths use bounded safe error categories rather than raw URLs, queries, addresses, resolver details, or transport errors; and
+- MCP challenge headers, response bodies/content types, peer metadata, session identifiers, and raw discovery errors are absent from logs and displayable errors; dependency-internal `rmcp` tracing is disabled while gateway-owned bounded MCP outcomes remain enabled; and
 - the extracted diff is behavior-preserving rather than a hidden feature implementation; and
 - later target architecture is labeled as target, not current production behavior.
 

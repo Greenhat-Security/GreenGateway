@@ -20,7 +20,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Proxy, health-check, identity-egress, and MCP transport failures now log only
   bounded error categories. Post-commit response-stream errors are redacted,
   and the non-standard hop-by-hop `Proxy-Connection` header is stripped in
-  both directions.
+  both directions. MCP auth challenges, response bodies, content types, and
+  discovery egress details are no longer retained in displayable errors.
+  Dependency-internal `rmcp` tracing is disabled because it can include peer
+  metadata and session identifiers; gateway-owned bounded MCP outcome logs and
+  audits remain available.
 
 - Caller-provided buffered bodies on `EgressClient` request paths are now
   rejected before DNS resolution. Gateway MCP `call_tool` payloads are
