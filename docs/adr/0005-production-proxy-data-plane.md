@@ -88,9 +88,19 @@ The later bounded client cache key includes:
 
 Hostname-only, origin-only, route-only, or endpoint-ID-only keys are forbidden. Cache entries have hard cardinality and idle bounds. Eviction remains safe while in-flight requests hold references. Concurrent acquisition cannot serialize unrelated pools behind one global lock.
 
-The first cache implementation resolves and validates before every cache acquisition; only the current immutable validated generation can select a reusable client. A later DNS-generation cache requires its own reviewed design with resolver TTL input, a finite monotonic validation lease, refresh before admitting new work, and fail-closed refresh errors. It cannot serve a stale generation to preserve availability.
+Each cached reqwest client also has a finite conservative pool idle timeout, a finite maximum number of idle connections per host, and a finite TCP keepalive interval. Admission bounds active work; these transport settings separately bound retained idle sockets and detect dead peers. Exact values are versioned, documented, and load-tested before the cache PR merges; no omitted value may inherit an unbounded library default.
 
-Every reqwest client built by `EgressClient` explicitly calls `no_proxy()` so `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and related process environment settings cannot redirect a supposedly pinned request. Future outbound-proxy support requires an explicit reviewed configuration that preserves destination validation and is part of the transport key. Certificate and hostname verification remain mandatory; there is no insecure skip-verification option.
+The first cache implementation obeys all of these rules:
+
+- Resolve and validate before every cache acquisition.
+- Select a reusable client only with the current immutable validated generation.
+- Enforce hard client cardinality and finite idle lifetime.
+- Evict safely while in-flight requests retain references.
+- Coordinate misses per key so unrelated pools do not share a global acquisition lock.
+
+A later DNS-generation cache requires its own reviewed design with resolver TTL input, a finite monotonic validation lease, refresh before admitting new work, and fail-closed refresh errors. It cannot serve a stale generation to preserve availability.
+
+Every reqwest client built by `EgressClient`, plus the separately built egress-validated/pinned MCP transport client, explicitly calls `no_proxy()` so `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and related process environment settings cannot redirect a supposedly pinned request. Future outbound-proxy support requires an explicit reviewed configuration that preserves destination validation and is part of the transport key. Certificate and hostname verification remain mandatory; there is no insecure skip-verification option.
 
 ### Header, body, and response boundary
 
@@ -157,6 +167,12 @@ Later pool configuration is additive and uses these exact field names:
 
 `UPSTREAM_URL` stays a legacy catch-all. A route's existing `upstream_url` maps to one endpoint of weight 1 and is mutually exclusive with `upstreams`. Legacy behavior remains one attempt, no circuit breaker, current buffered request behavior, and current health behavior until explicitly migrated.
 
+Checklist item 1 and later schema evolution continue accepting a legacy-only configuration without requiring any new field or applying new pool validation to it.
+
+For existing syntax, `id` remains optional. The global catch-all uses internal compatibility IDs `legacy-catch-all` and `legacy-catch-all-1`; legacy route entries use bounded declaration-order IDs `legacy-route-N` and `legacy-endpoint-N`. They contain no host, URL, path, or address material and are stable for an unchanged ordered configuration generation. They are transport bookkeeping only: current `upstream_origin` remains the authorization/observation identity until explicit IDs are adopted. Operators requiring identity stability across route insertion/reordering migrate that route to the new syntax with an explicit `id`; every route using `upstreams` requires an explicit route ID and explicit endpoint IDs.
+
+`path_prefix`, `host`, `timeout_ms`, `response_idle_timeout_ms`, `connect_timeout_ms`, `add_request_headers`, `strip_request_headers`, and `openapi_spec_path` remain route-scoped and apply to every physical attempt. The legacy route-level `tls_ca_bundle_path` is accepted only with `upstream_url`; it is rejected with `upstreams`, where TLS CA and client identity are endpoint-scoped. Pool-only `load_balancing`, `request_body`, `limits`, `health_check`, `retry`, and `circuit_breaker` objects are rejected beside legacy `upstream_url`. Header policy and OpenAPI association never vary by selected endpoint.
+
 Route and endpoint IDs are 1 to 64 ASCII characters matching `[a-z][a-z0-9._-]{0,63}` and are unique within their configuration scope. New `upstreams[].url` values use only `http`/`https`, contain no userinfo, query, or fragment, and have an empty or root path; the inbound path/query is appended to the endpoint origin. Legacy `upstream_url` retains the current behavior in which any configured base path is discarded through `Url::origin`. Unknown fields, empty/duplicate IDs, duplicate matchers, empty pools, zero/out-of-range weights, excessive collections, zero durations, invalid statuses, unsafe retry combinations, impossible readiness capacity, unbounded queues, and conflicting TLS inputs fail startup with aggregated sanitized errors before any listener binds.
 
 Exact numeric defaults and maxima not fixed above are owned by the versioned configuration schema in the PR that implements each field. They must be finite, conservative, documented, and tested; absence may never mean unbounded behavior.
@@ -183,9 +199,11 @@ Starting -> Ready -> Draining -> Stopped
     +----------+----------+-> Failed
 ```
 
-`/livez` reports process/event-loop liveness only. `/startupz` reports completion of required initialization. `/readyz` reads cached state and is successful only while accepting work and every pool marked `required_for_readiness` meets `minimum_healthy`. New probe handlers never synchronously access DNS, upstreams, or durable stores and expose aggregate state without origins, IPs, paths, issuer/certificate details, or raw errors. `/readyz` returns 503 immediately on draining. `/health` retains its compatible HTTP 200 top-level contract and currently exposed route-origin field as a named temporary compatibility exception; the dedicated probe/status PR deprecates and migrates that detail rather than silently changing it during extraction.
+Gateway-owned `GET|HEAD /livez`, `/startupz`, and `/readyz` are reserved on the data listener, are default authentication/RBAC/CSRF exemptions, and can never reach proxy fallback. `/livez` reports process/event-loop liveness only. `/startupz` reports completion of required initialization. `/readyz` reads cached state and is successful only while accepting work and every pool marked `required_for_readiness` meets `minimum_healthy`. New probe handlers never synchronously access DNS, upstreams, or durable stores and expose aggregate state without origins, IPs, paths, issuer/certificate details, or raw errors. Detailed endpoint health remains on the admin status surface and requires `admin:status:read`. `/readyz` returns 503 immediately on draining. `/health` retains its compatible HTTP 200 top-level contract and currently exposed route-origin field as a named temporary compatibility exception; the dedicated probe/status PR deprecates and migrates that detail rather than silently changing it during extraction.
 
-On the first termination signal, GreenGateway atomically enters `Draining`, makes readiness false, records `gateway.shutdown_started`, optionally waits a bounded propagation delay, stops accepting on unified or both split listeners, prevents new retries/probes, cancels background work, drains in-flight HTTP/SSE to a hard deadline, records clean or forced outcome, closes audit admission, drains queued events in order, flushes sinks with bounded acknowledgement, and exits according to server/durable-flush success. A second signal may force cancellation. Unexpected loss of one split listener cancels and drains its peer; the process cannot remain half-serving.
+Successful initialization records `gateway.ready`. On the first termination signal, GreenGateway atomically enters `Draining`, makes readiness false, records `gateway.shutdown_started`, optionally waits a bounded propagation delay, stops accepting on unified or both split listeners, stops new admission, prevents new retries/probes, cancels background work, and drains in-flight HTTP/SSE to a hard deadline. A clean drain records `gateway.shutdown_completed`; deadline cancellation or a second forced signal records `gateway.shutdown_forced`. Only then does it close audit admission, drain queued events in order, and flush sinks with bounded acknowledgement before exiting according to server/durable-flush success. Unexpected loss of one split listener cancels and drains its peer; the process cannot remain half-serving.
+
+Audit writer creation failure fails startup. Events attempted after audit admission closes increment the dedicated bounded dropped reason `closed`. Upstream health transitions, circuit transitions, and retry exhaustion use stable structured event types and safe identifiers/reason codes; individual successful probes and raw transport details are not audited.
 
 Policy Studio analysis jobs are control-plane work. They neither gate data-plane readiness nor extend the data-plane shutdown deadline.
 
@@ -221,7 +239,7 @@ The pre-auth classifier may call only pure logical matching. It cannot call a ph
 | Client disconnect | Cancel upstream and release resources | Not an endpoint failure |
 | Draining | No new admission; bounded existing drain | No new retry/probe work |
 
-New public errors, probes, audit, metrics, and logs never expose credentials, queries, raw URLs, resolved addresses, resolver error details, certificate/key material, or raw transport errors. Checklist item 1 replaces current raw proxy transport-error logging with bounded safe categories while retaining client status/body behavior. The existing `/health` route-origin field is the explicit compatibility exception described above and is not expanded. Metrics use bounded stable route/pool/endpoint identifiers and never principal, path, request ID, origin, address, or raw-error labels.
+New public errors, probes, audit, metrics, and logs never expose credentials, queries, raw URLs, resolved addresses, resolver error details, certificate/key material, or raw transport errors. Checklist item 1 replaces current raw proxy transport-error logging with bounded safe categories while retaining client status/body behavior. The existing `/health` JSON field `upstreams[].origin` is the explicit compatibility exception described above and is not expanded. Existing `upstream_origin`-keyed metrics remain unchanged as a named compatibility exception until the route-ID migration; no new metric adds an origin label. New metrics use bounded stable route/pool/endpoint identifiers and never principal, path, request ID, origin, address, or raw-error labels.
 
 ## Threat model
 

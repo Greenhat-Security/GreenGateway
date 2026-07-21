@@ -17,7 +17,7 @@
 - Modify `gateway/src/main.rs` for module wiring and behavior-preserving delegation.
 - Add a focused integration test only if module-level tests cannot prove a required gate.
 
-Do not add dependencies, configuration keys/fields, public routes, metrics, production pooling, retries, streaming, readiness, shutdown, SSE, or mTLS behavior. One intentional security correction is in scope: every reqwest client built by `EgressClient` must disable ambient process proxy discovery so environment variables cannot bypass exact destination pinning.
+Do not add dependencies, configuration keys/fields, public routes, metrics, production pooling, retries, streaming, readiness, shutdown, SSE, or mTLS behavior. Two intentional security corrections are in scope: every reqwest client built by `EgressClient` disables ambient process proxy discovery so environment variables cannot bypass exact destination pinning, and proxy/health logs replace raw transport errors with bounded safe categories.
 
 ## Task 1: Freeze the security design
 
@@ -38,12 +38,15 @@ Do not add dependencies, configuration keys/fields, public routes, metrics, prod
 - [ ] Add `SystemResolver` that delegates to `tokio::net::lookup_host`.
 - [ ] Store `Arc<dyn Resolver>` in `EgressClient`.
 - [ ] Keep `EgressClient::new` as the production constructor and delegate to an internal injectable constructor.
+- [ ] Add `reconfigured`/equivalent derived-client construction that preserves the resolver `Arc`; route timeout/custom-CA overrides must use it rather than `EgressClient::new`.
 - [ ] Call reqwest's `no_proxy()` on the shared base builder and every derived pinned client path; do not honor ambient `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY`.
+- [ ] Call `no_proxy()` on the separately built MCP reqwest transport after egress validation/pinning and cover it with the same hostile-environment isolation model.
 - [ ] Route every existing lookup through the stored resolver.
 - [ ] Keep hostname/port validation, all-answer IP/NAT64 validation, first-address selection, exact pinning, SNI, certificate validation, redirects, and error mapping unchanged.
 - [ ] Add a deterministic fake resolver with call accounting.
 - [ ] Test mixed answers, empty answers, resolver errors, and validate-all-before-pin behavior.
 - [ ] Add an isolated subprocess/environment test proving hostile proxy environment variables receive zero connections while the injected exact pin receives the request.
+- [ ] Test a route-derived timeout/custom-CA client still uses the injected fake resolver and never ambient DNS.
 - [ ] Test at least one non-proxy default-constructor path or shared constructor invariant because OIDC/MCP/tools also use `EgressClient`.
 - [ ] Run focused egress tests, formatting, clippy, and diff checks; commit the resolver unit.
 
@@ -55,6 +58,8 @@ Do not add dependencies, configuration keys/fields, public routes, metrics, prod
 - [ ] Preserve Axum state/middleware order and the current observation context.
 - [ ] Preserve legacy fallback, route order, host matching, URL/base-path behavior, custom CA behavior, timeouts, request/response limits, health behavior, and generic errors, except for the explicit fail-closed ambient-proxy correction.
 - [ ] Preserve every credential, forwarding, hop-by-hop, nominated, request-ID, configured add/strip, and framing header rule.
+- [ ] Replace raw proxy request, response-first-chunk, request-body-read, and health-check errors in logs with bounded safe categories; preserve client status/body behavior.
+- [ ] Test captured proxy/health failure logs do not contain URLs, queries, addresses, DNS messages, certificate paths, or raw reqwest errors.
 - [ ] Add or relocate focused tests without mechanically moving unrelated `main.rs` tests.
 - [ ] Assert authentication denial, both rate-limit stages, validation, CSRF, RBAC/direct-rule denial, unsafe paths, and gateway-owned paths cannot cause request-scoped endpoint selection, resolver calls, or upstream bytes; disable or separately account for background health.
 - [ ] Run focused proxy tests, egress-only guard, formatting, clippy, and diff checks; commit the extraction unit.
@@ -66,6 +71,8 @@ Do not add dependencies, configuration keys/fields, public routes, metrics, prod
 - [ ] Add a minimal injectable clock for current timestamp/sleep behavior only where extraction needs it.
 - [ ] Keep health policy/state in the proxy boundary; do not implement signals, readiness, cancellation, drain, or audit flush.
 - [ ] Add deterministic tests for the clock seam and current immediate-then-30-second health schedule where practical.
+- [ ] Test unified and split ephemeral binding, actual bound addresses in `gateway.startup`, second-bind failure with no startup event or half-serving data listener, and `ConnectInfo` peer-address delivery.
+- [ ] Preserve `tokio::try_join!` peer cancellation/failure propagation and cover it with a focused injected-server-future test if Axum cannot be made to fail deterministically.
 - [ ] Run lifecycle/main focused tests, formatting, clippy, and diff checks; commit the lifecycle unit.
 
 ## Task 5: Production-readiness verification
@@ -83,7 +90,7 @@ Do not add dependencies, configuration keys/fields, public routes, metrics, prod
 ## Task 6: Publish the focused PR
 
 - [ ] Push `codex/issue-239-proxy-design-extraction`.
-- [ ] Open a ready PR stacked on #244 while #244 is unmerged; retarget to `main` after #244 lands if necessary.
+- [ ] Open a ready PR stacked on #244 only while #244 is unmerged because it owns ADR-0004; retargeting to `main` after #244 lands is the normal final state.
 - [ ] Include `Part of #239`, checklist item 1 scope, explicit non-goals, threat controls, test evidence, and review evidence.
 - [ ] State that this PR does not make the full issue #239 epic production-ready.
 - [ ] Inspect remote diff/check status and fix any branch/CI discrepancy before handoff.

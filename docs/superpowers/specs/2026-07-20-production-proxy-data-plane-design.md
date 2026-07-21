@@ -110,7 +110,9 @@ Keying only by hostname, origin, or route is forbidden. A safe-to-private DNS tr
 
 The first client-cache implementation resolves and validates before every cache acquisition. The cache is consulted only after producing the current immutable validated-address generation. A later DNS-generation cache is permitted only through a separate reviewed design with resolver TTL input, a finite monotonic validation lease, refresh-before-new-work behavior, and fail-closed refresh errors; a stale generation is never used to preserve availability. Client entries have a hard cardinality, a finite idle lifetime, in-flight-safe eviction, and per-key acquisition so unrelated pools do not serialize behind one global lock.
 
-Every production reqwest client explicitly disables ambient `HTTP_PROXY`, `HTTPS_PROXY`, and related environment proxy discovery. Future outbound-proxy support must be configured, validated, and keyed explicitly; it cannot inherit process environment behavior or bypass exact destination pinning. Tests set hostile proxy environment variables and prove the pinned local destination is still used.
+Every cached client also has a finite conservative pool idle timeout, a finite maximum idle-connection count per host, and finite TCP keepalive. Admission bounds active requests; these settings separately bound retained sockets. No absent configuration inherits an unbounded library default.
+
+Every reqwest client constructed by `EgressClient`, plus the separately built egress-validated/pinned MCP transport client, explicitly disables ambient `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and related environment proxy discovery. Future outbound-proxy support must be configured, validated, and keyed explicitly; it cannot inherit process environment behavior or bypass exact destination pinning. Isolated subprocess tests set hostile proxy environment variables and prove the pinned local destination is still used while the proxy receives no request.
 
 ### Header, credential, and framing boundary
 
@@ -142,7 +144,9 @@ Later PRs may add strict additive configuration using these names. ADR-0005 owns
 
 Nested field names are fixed by issue #239: `load_balancing.strategy`; `request_body.mode`; `limits.max_in_flight`, `queue_depth`, and `queue_timeout_ms`; `health_check.method`, `path`, `interval_ms`, `timeout_ms`, `healthy_threshold`, `unhealthy_threshold`, `expected_statuses`, `required_for_readiness`, and `minimum_healthy`; `retry.max_attempts`, `methods`, and `statuses`; and `circuit_breaker.failure_threshold`, `open_ms`, `half_open_max_requests`, and `recovery_threshold`.
 
-Route and endpoint IDs are 1 to 64 ASCII characters matching `[a-z][a-z0-9._-]{0,63}`. Endpoint URLs accept only `http`/`https` and reject userinfo, query, and fragment components. The later configuration PR defines finite numeric defaults/maxima and explicit base-path composition, duplicate detection, and mutual exclusion between `upstream_url` and `upstreams`. Unknown fields and invalid combinations fail startup. PR 1 adds none of these fields.
+Route and endpoint IDs are 1 to 64 ASCII characters matching `[a-z][a-z0-9._-]{0,63}`. New endpoint URLs accept only `http`/`https`, reject userinfo, query, and fragment components, and require an empty or root path; the inbound path/query is appended to the endpoint origin. Legacy `upstream_url` keeps its current `Url::origin` behavior that discards a configured base path. The later configuration PR defines finite numeric defaults/maxima, duplicate detection, and mutual exclusion between `upstream_url` and `upstreams`. Unknown fields and invalid combinations fail startup. PR 1 adds none of these fields.
+
+Existing route matchers, timeouts, add/strip headers, and `openapi_spec_path` remain route-scoped for every attempt. Legacy route-level `tls_ca_bundle_path` is valid only with `upstream_url`; new pools use only endpoint-level CA/identity paths. Pool-only resilience objects are rejected beside `upstream_url`. Legacy syntax may omit IDs and receives bounded ordinal internal compatibility IDs that contain no topology; explicit IDs are required for new pool syntax and for stability across route reordering.
 
 ## Target lifecycle model
 
@@ -150,9 +154,8 @@ The eventual lifecycle state machine is:
 
 ```text
 Starting -> Ready -> Draining -> Stopped
-              \-> Failed
-Starting ---------------------> Failed
-Draining ---------------------> Failed
+    |          |          |
+    +----------+----------+-> Failed
 ```
 
 - `Starting` means configuration and required resources are still initializing.
@@ -165,7 +168,7 @@ Unexpected termination of either split listener must eventually cancel and drain
 
 PR 1 only separates lifecycle composition and introduces a minimal clock abstraction used by already-existing timestamp/sleep behavior. It does not change lifecycle states or server semantics.
 
-The later lifecycle PR owns this exact first-signal sequence: atomically enter `Draining`; make readiness false; emit `gateway.shutdown_started`; wait only the configured bounded readiness-propagation delay; stop unified or both split listeners from accepting; prevent new admission, retries, and health probes; cancel background workers; drain in-flight HTTP/SSE until the hard deadline; cancel remaining work and record a forced result at the deadline; emit the terminal shutdown event; then close audit admission, drain in order, and await a bounded sink flush acknowledgement. A second signal may force immediate cancellation. A clean drain exits zero; listener failure or required durable-flush failure exits nonzero. Loss of one split listener coordinates the same failure/drain for its peer.
+The later lifecycle PR emits `gateway.ready` after successful initialization and owns this exact first-signal sequence: atomically enter `Draining`; make readiness false; emit `gateway.shutdown_started`; wait only the configured bounded readiness-propagation delay; stop unified or both split listeners from accepting; stop new admission, retries, and health probes; cancel background workers; drain in-flight HTTP/SSE until the hard deadline; cancel remaining work and emit `gateway.shutdown_forced` at the deadline, otherwise emit `gateway.shutdown_completed`; then close audit admission, drain in order, and await a bounded sink flush acknowledgement. A second signal may force immediate cancellation. A clean drain exits zero; listener failure or required durable-flush failure exits nonzero. Loss of one split listener coordinates the same failure/drain for its peer. Audit writer creation failure blocks startup; events attempted after close increment dropped reason `closed`. Health/circuit transitions and retry exhaustion emit stable structured events, not raw transport detail.
 
 ## Target health, streaming, and TLS boundaries
 
@@ -292,7 +295,7 @@ Review additionally checks:
 - no new dependencies, public configuration, endpoints, or metrics;
 - no direct outbound network primitive outside the egress allowlist;
 - no new public surface exposes credentials, origins, IP addresses, resolver details, or raw transport errors;
-- the existing `/health` origin field is treated as a temporary compatibility exception, is not expanded in PR 1, and is migrated only in the dedicated readiness/status PR;
+- the existing `/health` JSON field `upstreams[].origin` is treated as a temporary compatibility exception, is not expanded in PR 1, and is migrated only in the dedicated readiness/status PR;
 - logs and new audit/status paths use bounded safe error categories rather than raw URLs, queries, resolver details, or transport errors; and
 - the extracted diff is behavior-preserving rather than a hidden feature implementation; and
 - later target architecture is labeled as target, not current production behavior.
