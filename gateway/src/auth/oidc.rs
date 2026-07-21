@@ -61,7 +61,10 @@ pub(crate) async fn discover_document(
     .await
     .map_err(|_| AuthError::Upstream("OIDC discovery fetch failed".to_owned()))?
     .map_err(|err| {
-        tracing::warn!(error = %err, "OIDC discovery fetch through egress failed");
+        tracing::warn!(
+            error_category = err.safe_category(),
+            "OIDC discovery fetch through egress failed"
+        );
         AuthError::Upstream("OIDC discovery fetch failed".to_owned())
     })?;
 
@@ -174,5 +177,95 @@ fn validate_discovery_issuer(
         None => Err(AuthError::Upstream(
             "OIDC discovery response missing issuer".to_owned(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io, sync::Mutex};
+
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use super::*;
+    use crate::egress::EgressConfig;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discovery_egress_failures_log_only_bounded_categories() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let client = EgressClient::new(EgressConfig::default())
+            .expect("OIDC test egress client should build");
+
+        let error = discover_document(
+            "https://secret-issuer.example/private?token=secret-query",
+            Duration::from_millis(100),
+            &client,
+        )
+        .await
+        .expect_err("non-allowlisted discovery host should fail");
+        drop(_guard);
+
+        assert_eq!(
+            error.to_string(),
+            "upstream identity service error: OIDC discovery fetch failed"
+        );
+        let output = logs.contents();
+        assert!(output.contains("host_not_allowed"));
+        for secret in ["secret-issuer", "private", "secret-query", "https://"] {
+            assert!(
+                !output.contains(secret),
+                "OIDC egress log leaked {secret}: {output}"
+            );
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(
+                self.buffer
+                    .lock()
+                    .expect("captured logs should not be poisoned")
+                    .clone(),
+            )
+            .expect("captured logs should be UTF-8")
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .map_err(|_| io::Error::other("captured logs lock poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }

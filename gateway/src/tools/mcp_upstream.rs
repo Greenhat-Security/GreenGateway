@@ -20,8 +20,9 @@ use http::{
 };
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, JsonObject, JsonRpcMessage,
-        PaginatedRequestParams, ServerJsonRpcMessage, Tool,
+        CallToolRequest, CallToolRequestParams, CallToolResult, ClientJsonRpcMessage,
+        ClientRequest, JsonObject, Meta, NumberOrString, PaginatedRequestParams, ProgressToken,
+        ServerJsonRpcMessage, Tool,
     },
     service::{ClientInitializeError, ServiceError},
     transport::{
@@ -49,6 +50,7 @@ const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
 const JSON_MIME: &str = "application/json";
 const MAX_DISCOVERY_PAGES_PER_UPSTREAM: usize = 32;
 const MAX_DISCOVERY_TOOLS_PER_UPSTREAM: usize = 1024;
+const REDACTED_MCP_UPSTREAM_VALUE: &str = "<redacted>";
 
 #[derive(Debug)]
 pub enum McpUpstreamDiscoveryError {
@@ -58,7 +60,7 @@ pub enum McpUpstreamDiscoveryError {
     ThreadPanicked,
     EgressRejected {
         server_name: String,
-        source: EgressError,
+        reason: &'static str,
     },
     UpstreamListFailed {
         server_name: String,
@@ -78,10 +80,10 @@ impl fmt::Display for McpUpstreamDiscoveryError {
             Self::ThreadPanicked => write!(formatter, "MCP upstream discovery thread panicked"),
             Self::EgressRejected {
                 server_name,
-                source,
+                reason,
             } => write!(
                 formatter,
-                "MCP upstream server '{server_name}' URL is rejected by egress policy: {source}"
+                "MCP upstream server '{server_name}' URL is rejected by egress policy ({reason})"
             ),
             Self::UpstreamListFailed {
                 server_name,
@@ -97,9 +99,8 @@ impl fmt::Display for McpUpstreamDiscoveryError {
 impl Error for McpUpstreamDiscoveryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::EgressRejected { source, .. } => Some(source),
             Self::UpstreamListFailed { source, .. } => Some(source),
-            Self::RuntimeBuild { .. } | Self::ThreadPanicked => None,
+            Self::RuntimeBuild { .. } | Self::ThreadPanicked | Self::EgressRejected { .. } => None,
         }
     }
 }
@@ -256,10 +257,7 @@ async fn discover_upstream_tools(
         let destination = egress_client
             .checked_destination(&server.url)
             .await
-            .map_err(|source| McpUpstreamDiscoveryError::EgressRejected {
-                server_name: server.name.clone(),
-                source,
-            })?;
+            .map_err(|source| mcp_discovery_egress_error(server.name.clone(), source))?;
 
         match list_tools(server, &runtime_config, &destination).await {
             Ok(tools) => {
@@ -286,6 +284,16 @@ async fn discover_upstream_tools(
     Ok(definitions)
 }
 
+fn mcp_discovery_egress_error(
+    server_name: String,
+    source: EgressError,
+) -> McpUpstreamDiscoveryError {
+    McpUpstreamDiscoveryError::EgressRejected {
+        server_name,
+        reason: source.safe_category(),
+    }
+}
+
 pub async fn call_tool(
     server: &McpUpstreamServerConfig,
     runtime_config: &McpUpstreamRuntimeConfig,
@@ -293,16 +301,16 @@ pub async fn call_tool(
     remote_tool_name: &str,
     args: Value,
 ) -> Result<CallToolResult, McpUpstreamCallError> {
-    let destination = egress_client
-        .checked_destination(&server.url)
-        .await
-        .map_err(|_| McpUpstreamCallError::EgressRejected)?;
-
     let arguments = match args {
         Value::Object(arguments) => arguments,
         _ => JsonObject::new(),
     };
     let request = CallToolRequestParams::new(remote_tool_name.to_owned()).with_arguments(arguments);
+    enforce_mcp_call_request_size_before_egress(&request, runtime_config.max_request_body_bytes)?;
+    let destination = egress_client
+        .checked_destination(&server.url)
+        .await
+        .map_err(|_| McpUpstreamCallError::EgressRejected)?;
     let mut service = connect(server, runtime_config, &destination).await?;
     let result = service
         .call_tool(request)
@@ -311,6 +319,49 @@ pub async fn call_tool(
     let _ = service.close_with_timeout(Duration::from_millis(250)).await;
 
     Ok(result)
+}
+
+fn enforce_mcp_call_request_size_before_egress(
+    request: &CallToolRequestParams,
+    max_request_body_bytes: usize,
+) -> Result<(), McpUpstreamCallError> {
+    // RMCP adds both a request ID and a progress token before transport serialization. Use the
+    // longest numeric forms so a request accepted here cannot cross the configured cap later when
+    // RMCP assigns its smaller runtime counters.
+    let size = serialized_mcp_call_request_size(request, i64::MIN, i64::MIN)?;
+
+    if size > max_request_body_bytes {
+        tracing::warn!(
+            size,
+            max = max_request_body_bytes,
+            "egress blocked oversized MCP call before destination resolution"
+        );
+        return Err(McpUpstreamCallError::RequestBodyTooLarge {
+            size,
+            max: max_request_body_bytes,
+        });
+    }
+
+    Ok(())
+}
+
+fn serialized_mcp_call_request_size(
+    request: &CallToolRequestParams,
+    request_id: i64,
+    progress_token: i64,
+) -> Result<usize, McpUpstreamCallError> {
+    let mut bounded_request = request.clone();
+    bounded_request.meta = Some(Meta::with_progress_token(ProgressToken(
+        NumberOrString::Number(progress_token),
+    )));
+    let message = ClientJsonRpcMessage::request(
+        ClientRequest::CallToolRequest(CallToolRequest::new(bounded_request)),
+        NumberOrString::Number(request_id),
+    );
+    let size = serde_json::to_vec(&message)
+        .map_err(|_| McpUpstreamCallError::Call)?
+        .len();
+    Ok(size)
 }
 
 async fn list_tools(
@@ -367,14 +418,7 @@ async fn connect(
     runtime_config: &McpUpstreamRuntimeConfig,
     destination: &CheckedEgressDestination,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
-    let client = rmcp_reqwest::Client::builder()
-        .timeout(server_timeout(server, runtime_config))
-        .read_timeout(server_response_idle_timeout(server, runtime_config))
-        .connect_timeout(server_connect_timeout(server, runtime_config))
-        .redirect(rmcp_reqwest::redirect::Policy::none())
-        .resolve(&destination.host, destination.pinned_addr)
-        .build()
-        .map_err(|_| McpUpstreamCallError::ClientBuild)?;
+    let client = mcp_http_client(server, runtime_config, destination)?;
     let client = LimitedMcpHttpClient::new(
         client,
         runtime_config.max_request_body_bytes,
@@ -393,6 +437,22 @@ async fn connect(
         "MCP upstream client initialized"
     );
     result.map_err(|error| mcp_service_error(error, McpUpstreamCallError::Connect))
+}
+
+fn mcp_http_client(
+    server: &McpUpstreamServerConfig,
+    runtime_config: &McpUpstreamRuntimeConfig,
+    destination: &CheckedEgressDestination,
+) -> Result<rmcp_reqwest::Client, McpUpstreamCallError> {
+    rmcp_reqwest::Client::builder()
+        .no_proxy()
+        .timeout(server_timeout(server, runtime_config))
+        .read_timeout(server_response_idle_timeout(server, runtime_config))
+        .connect_timeout(server_connect_timeout(server, runtime_config))
+        .redirect(rmcp_reqwest::redirect::Policy::none())
+        .resolve(&destination.host, destination.pinned_addr)
+        .build()
+        .map_err(|_| McpUpstreamCallError::ClientBuild)
 }
 
 #[derive(Clone)]
@@ -418,7 +478,7 @@ impl LimitedMcpHttpClient {
 
 #[derive(Debug)]
 enum LimitedMcpHttpError {
-    Http(rmcp_reqwest::Error),
+    Http(&'static str),
     Serialize(serde_json::Error),
     RequestBodyTooLarge { size: usize, max: usize },
     ResponseTooLarge { max: usize },
@@ -427,7 +487,7 @@ enum LimitedMcpHttpError {
 impl fmt::Display for LimitedMcpHttpError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Http(error) => write!(formatter, "MCP upstream HTTP error: {error}"),
+            Self::Http(category) => write!(formatter, "MCP upstream HTTP error: {category}"),
             Self::Serialize(error) => {
                 write!(formatter, "MCP upstream JSON serialize error: {error}")
             }
@@ -447,16 +507,17 @@ impl fmt::Display for LimitedMcpHttpError {
 impl Error for LimitedMcpHttpError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Http(error) => Some(error),
             Self::Serialize(error) => Some(error),
-            Self::RequestBodyTooLarge { .. } | Self::ResponseTooLarge { .. } => None,
+            Self::Http(_) | Self::RequestBodyTooLarge { .. } | Self::ResponseTooLarge { .. } => {
+                None
+            }
         }
     }
 }
 
 impl From<rmcp_reqwest::Error> for LimitedMcpHttpError {
     fn from(error: rmcp_reqwest::Error) -> Self {
-        Self::Http(error)
+        Self::Http(mcp_http_error_category(&error))
     }
 }
 
@@ -558,35 +619,19 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
             request = request.header(CONTENT_TYPE, JSON_MIME);
         }
         let response = request.body(body).send().await.map_err(mcp_http_error)?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            if let Some(header) = response.headers().get(WWW_AUTHENTICATE) {
-                let header = header
-                    .to_str()
-                    .map_err(|_| {
-                        StreamableHttpError::UnexpectedServerResponse(Cow::from(
-                            "invalid www-authenticate header value",
-                        ))
-                    })?
-                    .to_string();
-                return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
-                    header,
-                )));
-            }
+        if response.status() == StatusCode::UNAUTHORIZED
+            && response.headers().contains_key(WWW_AUTHENTICATE)
+        {
+            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                REDACTED_MCP_UPSTREAM_VALUE.to_owned(),
+            )));
         }
-        if response.status() == StatusCode::FORBIDDEN {
-            if let Some(header) = response.headers().get(WWW_AUTHENTICATE) {
-                let header_str = header.to_str().map_err(|_| {
-                    StreamableHttpError::UnexpectedServerResponse(Cow::from(
-                        "invalid www-authenticate header value",
-                    ))
-                })?;
-                return Err(StreamableHttpError::InsufficientScope(
-                    InsufficientScopeError::new(
-                        header_str.to_owned(),
-                        extract_mcp_scope_from_header(header_str),
-                    ),
-                ));
-            }
+        if response.status() == StatusCode::FORBIDDEN
+            && response.headers().contains_key(WWW_AUTHENTICATE)
+        {
+            return Err(StreamableHttpError::InsufficientScope(
+                InsufficientScopeError::new(REDACTED_MCP_UPSTREAM_VALUE.to_owned(), None),
+            ));
         }
 
         let status = response.status();
@@ -621,30 +666,14 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
         }
 
         if !status.is_success() {
-            let body = match read_limited_mcp_response_text(response, self.max_response_bytes).await
-            {
-                Ok(body) => body,
+            match read_limited_mcp_response_body(response, self.max_response_bytes).await {
+                Ok(_) => {}
                 Err(error) if mcp_streamable_error_response_too_large(&error).is_some() => {
                     return Err(error);
                 }
-                Err(_) => "<failed to read response body>".to_owned(),
-            };
-            if content_type
-                .as_deref()
-                .is_some_and(|ct| ct.as_bytes().starts_with(JSON_MIME.as_bytes()))
-            {
-                match parse_json_rpc_error(&body) {
-                    Some(message) => {
-                        return Ok(StreamableHttpPostResponse::Json(message, session_id));
-                    }
-                    None => tracing::warn!(
-                        "HTTP {status}: could not parse JSON body as a JSON-RPC error"
-                    ),
-                }
+                Err(_) => {}
             }
-            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                format!("HTTP {status}: {body}"),
-            )));
+            return Err(redacted_mcp_status_error(status));
         }
 
         match content_type.as_deref() {
@@ -668,17 +697,18 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
                     Err(error) if mcp_streamable_error_response_too_large(&error).is_some() => {
                         Err(error)
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            "could not parse JSON response as ServerJsonRpcMessage, treating as accepted: {error}"
-                        );
+                    Err(_) => {
+                        tracing::warn!("could not parse MCP JSON response; treating as accepted");
                         Ok(StreamableHttpPostResponse::Accepted)
                     }
                 }
             }
             _ => {
-                tracing::error!("unexpected content type: {:?}", content_type);
-                Err(StreamableHttpError::UnexpectedContentType(content_type))
+                tracing::error!(
+                    content_type_present = content_type.is_some(),
+                    "unexpected MCP upstream content type"
+                );
+                Err(redacted_mcp_content_type_error(content_type.is_some()))
             }
         }
     }
@@ -725,7 +755,7 @@ fn limited_mcp_body_stream(
                     Some((Ok(chunk), (body, streamed_bytes, false)))
                 }
                 Some(Err(error)) => Some((
-                    Err(LimitedMcpHttpError::Http(error)),
+                    Err(LimitedMcpHttpError::from(error)),
                     (body, streamed_bytes, true),
                 )),
                 None => None,
@@ -748,14 +778,6 @@ async fn read_limited_mcp_response_body(
     }
 
     Ok(Bytes::from(body))
-}
-
-async fn read_limited_mcp_response_text(
-    response: rmcp_reqwest::Response,
-    max_response_bytes: usize,
-) -> Result<String, StreamableHttpError<LimitedMcpHttpError>> {
-    let body = read_limited_mcp_response_body(response, max_response_bytes).await?;
-    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 async fn read_limited_mcp_response_json<T: serde::de::DeserializeOwned>(
@@ -827,12 +849,10 @@ fn validate_mcp_response_content_type(
                 .starts_with(EVENT_STREAM_MIME.as_bytes())
                 && !content_type.as_bytes().starts_with(JSON_MIME.as_bytes())
             {
-                return Err(StreamableHttpError::UnexpectedContentType(Some(
-                    String::from_utf8_lossy(content_type.as_bytes()).to_string(),
-                )));
+                return Err(redacted_mcp_content_type_error(true));
             }
         }
-        None => return Err(StreamableHttpError::UnexpectedContentType(None)),
+        None => return Err(redacted_mcp_content_type_error(false)),
     }
 
     Ok(())
@@ -861,32 +881,40 @@ fn validate_mcp_custom_header(name: &HeaderName) -> Result<(), String> {
     Ok(())
 }
 
-fn extract_mcp_scope_from_header(header: &str) -> Option<String> {
-    let header_lowercase = header.to_ascii_lowercase();
-    let scope_key = "scope=";
-    let position = header_lowercase.find(scope_key)?;
-    let value_slice = &header[position + scope_key.len()..];
-
-    if let Some(stripped) = value_slice.strip_prefix('"') {
-        let end_quote = stripped.find('"')?;
-        return Some(stripped[..end_quote].to_owned());
-    }
-
-    let end = value_slice
-        .find(|character: char| character == ',' || character == ';' || character.is_whitespace())
-        .unwrap_or(value_slice.len());
-    (end > 0).then(|| value_slice[..end].to_owned())
+fn redacted_mcp_status_error(status: StatusCode) -> StreamableHttpError<LimitedMcpHttpError> {
+    StreamableHttpError::UnexpectedServerResponse(Cow::Owned(format!(
+        "HTTP {status}: upstream response details redacted"
+    )))
 }
 
-fn parse_json_rpc_error(body: &str) -> Option<ServerJsonRpcMessage> {
-    match serde_json::from_str::<ServerJsonRpcMessage>(body) {
-        Ok(message @ JsonRpcMessage::Error(_)) => Some(message),
-        _ => None,
-    }
+fn redacted_mcp_content_type_error(
+    content_type_present: bool,
+) -> StreamableHttpError<LimitedMcpHttpError> {
+    StreamableHttpError::UnexpectedContentType(
+        content_type_present.then(|| REDACTED_MCP_UPSTREAM_VALUE.to_owned()),
+    )
 }
 
 fn mcp_http_error(error: rmcp_reqwest::Error) -> StreamableHttpError<LimitedMcpHttpError> {
-    StreamableHttpError::Client(LimitedMcpHttpError::Http(error))
+    StreamableHttpError::Client(LimitedMcpHttpError::from(error))
+}
+
+fn mcp_http_error_category(error: &rmcp_reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "http_timeout"
+    } else if error.is_connect() {
+        "http_connect"
+    } else if error.is_request() {
+        "http_request"
+    } else if error.is_body() {
+        "http_body"
+    } else if error.is_decode() {
+        "http_decode"
+    } else if error.is_status() {
+        "http_status"
+    } else {
+        "http_other"
+    }
 }
 
 fn mcp_service_error<E>(error: E, fallback: McpUpstreamCallError) -> McpUpstreamCallError
@@ -1041,15 +1069,569 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::{
+        collections::HashSet,
+        io::{self, ErrorKind},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        process::Command,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+    };
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
         task::JoinHandle,
     };
+    use tracing_subscriber::{fmt::MakeWriter, prelude::*};
 
     const TEST_RESPONSE_LIMIT: usize = 64;
+
+    struct CountingDnsResolver {
+        calls: AtomicUsize,
+        address: IpAddr,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::egress::DnsResolver for CountingDnsResolver {
+        async fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, std::io::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![SocketAddr::new(self.address, port)])
+        }
+    }
+
+    #[test]
+    fn discovery_egress_error_keeps_only_the_safe_category() {
+        let secret_host = "secret-discovery-host.example.test";
+        let error = mcp_discovery_egress_error(
+            "configured-upstream".to_owned(),
+            EgressError::HostNotAllowed(secret_host.to_owned()),
+        );
+        let output = format!("{error} {error:?}");
+
+        assert!(output.contains("host_not_allowed"));
+        assert!(!output.contains(secret_host));
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn production_filter_suppresses_rmcp_dependency_secrets() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .without_time()
+                    .with_writer(logs.clone()),
+            )
+            .with(crate::production_tracing_filter());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        tracing::info!(target: "gateway::mcp_filter_test", "green-gateway-marker");
+        tracing::error!(
+            target: "rmcp::service",
+            peer_info = "secret-server-instructions",
+            "dependency peer metadata"
+        );
+        tracing::error!(
+            target: "rmcp::transport::streamable_http_client",
+            session_id = "secret-session-id",
+            error = "https://secret-upstream.example/private?token=secret-query",
+            "dependency transport failure"
+        );
+        drop(_guard);
+
+        let output = logs.contents();
+        assert!(output.contains("green-gateway-marker"));
+        for secret in [
+            "secret-server-instructions",
+            "secret-session-id",
+            "secret-upstream.example",
+            "secret-query",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "production tracing filter leaked rmcp value {secret}: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn conservative_mcp_call_size_bounds_runtime_numeric_identifiers() {
+        let arguments = serde_json::json!({
+            "escaped": "quotes: \" and slash: \\",
+            "nested": { "value": 42 }
+        })
+        .as_object()
+        .expect("test arguments should be an object")
+        .clone();
+        let request =
+            CallToolRequestParams::new("boundary_tool".to_owned()).with_arguments(arguments);
+        let conservative = serialized_mcp_call_request_size(&request, i64::MIN, i64::MIN)
+            .expect("conservative MCP request should serialize");
+
+        for (request_id, progress_token) in [
+            (i64::MIN, i64::MIN),
+            (i64::MIN + 1, i64::MAX),
+            (-1, 0),
+            (0, -1),
+            (i64::from(u32::MAX), i64::from(u32::MAX)),
+            (i64::MAX, i64::MAX),
+        ] {
+            let actual = serialized_mcp_call_request_size(&request, request_id, progress_token)
+                .expect("runtime-shaped MCP request should serialize");
+            assert!(
+                actual <= conservative,
+                "runtime identifiers ({request_id}, {progress_token}) produced {actual} bytes, exceeding conservative {conservative}-byte preflight"
+            );
+        }
+
+        enforce_mcp_call_request_size_before_egress(&request, conservative)
+            .expect("request at the conservative bound should be accepted");
+        assert!(matches!(
+            enforce_mcp_call_request_size_before_egress(&request, conservative - 1),
+            Err(McpUpstreamCallError::RequestBodyTooLarge { size, max })
+                if size == conservative && max == conservative - 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_call_tool_request_is_rejected_before_dns_or_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("MCP connection sentinel should bind");
+        let address = listener
+            .local_addr()
+            .expect("MCP connection sentinel address should be available");
+        let host = "oversized-mcp.example.test";
+        let upstream = McpUpstreamServerConfig {
+            name: "oversized-request-test".to_owned(),
+            url: format!("http://{host}:{}/mcp", address.port()),
+            timeout_ms: Some(500),
+            response_idle_timeout_ms: Some(500),
+            connect_timeout_ms: Some(100),
+        };
+        let runtime = McpUpstreamRuntimeConfig {
+            timeout: Duration::from_millis(500),
+            response_idle_timeout: Duration::from_millis(500),
+            connect_timeout: Duration::from_millis(100),
+            max_request_body_bytes: 128,
+            max_response_bytes: 1024,
+        };
+        let resolver = Arc::new(CountingDnsResolver {
+            calls: AtomicUsize::new(0),
+            address: address.ip(),
+        });
+        let resolver_for_client: Arc<dyn crate::egress::DnsResolver> = resolver.clone();
+        let egress_client = Arc::new(
+            EgressClient::new_with_resolver(
+                crate::egress::EgressConfig {
+                    allowed_hosts: HashSet::from([host.to_owned()]),
+                    deny_private_ips: false,
+                    ..crate::egress::EgressConfig::default()
+                },
+                resolver_for_client,
+            )
+            .expect("MCP egress client should build"),
+        );
+
+        let error = call_tool(
+            &upstream,
+            &runtime,
+            egress_client,
+            "oversized_tool",
+            serde_json::json!({ "payload": "x".repeat(1024) }),
+        )
+        .await
+        .expect_err("oversized MCP call should fail before destination work");
+
+        assert!(matches!(
+            error,
+            McpUpstreamCallError::RequestBodyTooLarge { size, max: 128 } if size > 128
+        ));
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            0,
+            "oversized MCP call denial must not resolve DNS"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "oversized MCP call denial must not open a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_client_sends_directly_with_proxy_discovery_disabled() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("direct MCP test listener should bind");
+        let direct_addr = listener
+            .local_addr()
+            .expect("direct MCP test address should be available");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("direct MCP server should accept a request");
+            let mut request = vec![0_u8; 1024];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("direct MCP server should read a request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect",
+                )
+                .await
+                .expect("direct MCP server should write a response");
+        });
+        let host = "mcp-proxy-test.example";
+        let upstream = McpUpstreamServerConfig {
+            name: "proxy-test".to_owned(),
+            url: format!("http://{host}:{}/", direct_addr.port()),
+            timeout_ms: Some(2_000),
+            response_idle_timeout_ms: Some(2_000),
+            connect_timeout_ms: Some(500),
+        };
+        let runtime = McpUpstreamRuntimeConfig {
+            timeout: Duration::from_secs(2),
+            response_idle_timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(500),
+            max_request_body_bytes: 1024,
+            max_response_bytes: 1024,
+        };
+        let client = mcp_http_client(
+            &upstream,
+            &runtime,
+            &CheckedEgressDestination {
+                host: host.to_owned(),
+                pinned_addr: direct_addr,
+            },
+        )
+        .expect("MCP client should build");
+
+        let body = client
+            .get(&upstream.url)
+            .send()
+            .await
+            .expect("ambient proxy must not intercept the MCP request")
+            .text()
+            .await
+            .expect("direct MCP response should have a body");
+
+        assert_eq!(body, "direct");
+        server.await.expect("direct MCP server should finish");
+    }
+
+    #[test]
+    fn mcp_client_ignores_ambient_proxy_environment() {
+        let proxy_listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("ambient MCP proxy sentinel should bind");
+        let proxy_addr = proxy_listener
+            .local_addr()
+            .expect("ambient MCP proxy address should be available");
+        let proxy_url = format!("http://{proxy_addr}");
+        let output = Command::new(std::env::current_exe().expect("test executable should exist"))
+            .args([
+                "--exact",
+                "tools::mcp_upstream::tests::mcp_client_sends_directly_with_proxy_discovery_disabled",
+                "--nocapture",
+            ])
+            .env("HTTP_PROXY", &proxy_url)
+            .env("HTTPS_PROXY", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("https_proxy", &proxy_url)
+            .env("all_proxy", &proxy_url)
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .output()
+            .expect("MCP proxy-isolation child test should start");
+
+        assert!(
+            output.status.success(),
+            "MCP proxy-isolation child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("running 1 test"),
+            "MCP proxy-isolation child must execute exactly one helper test: {stdout}"
+        );
+        proxy_listener
+            .set_nonblocking(true)
+            .expect("MCP proxy sentinel should become nonblocking");
+        assert!(
+            matches!(proxy_listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock),
+            "ambient MCP proxy sentinel must receive zero connections"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_http_failures_expose_only_bounded_categories() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("timeout sentinel should bind");
+        let address = listener
+            .local_addr()
+            .expect("timeout sentinel address should be available");
+        let host = "secret-mcp.example.test";
+        let inner = rmcp_reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .read_timeout(Duration::from_millis(50))
+            .connect_timeout(Duration::from_millis(50))
+            .resolve(host, address)
+            .build()
+            .expect("limited MCP test client should build");
+        let client = LimitedMcpHttpClient::new(inner, 1024, 1024);
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let error = match client
+            .get_stream(
+                Arc::<str>::from(format!(
+                    "http://{host}:{}/private?token=secret-query",
+                    address.port()
+                )),
+                Arc::<str>::from("test-session"),
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await
+        {
+            Ok(_) => panic!("silent MCP upstream should time out"),
+            Err(error) => error,
+        };
+        tracing::warn!(error = %error, "captured sanitized MCP transport failure");
+        drop(_guard);
+        drop(listener);
+
+        let output = format!("{error} {}", logs.contents());
+        let address_text = address.ip().to_string();
+        assert!(output.contains("http_timeout"));
+        for secret in [
+            host,
+            "private",
+            "secret-query",
+            address_text.as_str(),
+            "http://",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "MCP transport error leaked {secret}: {output}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_http_response_details_are_redacted() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let auth_error = post_message_against_raw_response(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"secret-auth-challenge\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .as_bytes()
+                .to_vec(),
+        )
+        .await
+        .expect_err("401 MCP response should require authentication");
+        let body = "secret-error-body";
+        let status_error = post_message_against_raw_response(
+            format!(
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; marker=secret-error-content-type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        )
+        .await
+        .expect_err("non-success MCP response should fail");
+        let content_type_error = post_message_against_raw_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/secret-content-type\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                .to_vec(),
+        )
+        .await
+        .expect_err("unsupported MCP content type should fail");
+        let get_content_type_error = match get_stream_against_raw_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/secret-get-content-type\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                .to_vec(),
+        )
+        .await
+        {
+            Ok(_) => panic!("unsupported MCP GET content type should fail"),
+            Err(error) => error,
+        };
+        drop(_guard);
+
+        let output = format!(
+            "{auth_error} {auth_error:?} {status_error} {status_error:?} {content_type_error} {content_type_error:?} {get_content_type_error} {get_content_type_error:?} {}",
+            logs.contents()
+        );
+        assert!(output.contains(REDACTED_MCP_UPSTREAM_VALUE));
+        assert!(output.contains("502 Bad Gateway"));
+        for secret in [
+            "secret-auth-challenge",
+            "secret-error-body",
+            "secret-error-content-type",
+            "secret-content-type",
+            "secret-get-content-type",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "MCP response error or log leaked {secret}: {output}"
+            );
+        }
+    }
+
+    async fn post_message_against_raw_response(
+        response: Vec<u8>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<LimitedMcpHttpError>> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("raw MCP response listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("raw MCP response address should be available");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("raw MCP response server should accept a request");
+            let _request = read_raw_http_request_headers(&mut stream).await;
+            stream
+                .write_all(&response)
+                .await
+                .expect("raw MCP response server should write its response");
+        });
+        let inner = rmcp_reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("raw-response MCP client should build");
+        let client = LimitedMcpHttpClient::new(inner, 1024, 1024);
+        let request = ClientJsonRpcMessage::request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(
+                "redaction_test".to_owned(),
+            ))),
+            NumberOrString::Number(1),
+        );
+
+        let result = client
+            .post_message(
+                Arc::from(format!("http://{address}/mcp")),
+                request,
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await;
+        server.await.expect("raw MCP response server should finish");
+        result
+    }
+
+    async fn get_stream_against_raw_response(
+        response: Vec<u8>,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<LimitedMcpHttpError>>
+    {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("raw MCP GET response listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("raw MCP GET response address should be available");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("raw MCP GET response server should accept a request");
+            let _request = read_raw_http_request_headers(&mut stream).await;
+            stream
+                .write_all(&response)
+                .await
+                .expect("raw MCP GET response server should write its response");
+        });
+        let inner = rmcp_reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("raw-response MCP GET client should build");
+        let client = LimitedMcpHttpClient::new(inner, 1024, 1024);
+
+        let result = client
+            .get_stream(
+                Arc::from(format!("http://{address}/mcp")),
+                Arc::from("redaction-test-session"),
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await;
+        server
+            .await
+            .expect("raw MCP GET response server should finish");
+        result
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(
+                self.buffer
+                    .lock()
+                    .expect("captured logs should not be poisoned")
+                    .clone(),
+            )
+            .expect("captured logs should be UTF-8")
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .map_err(|_| io::Error::other("captured logs lock poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn get_stream_rejects_oversized_sse_without_content_length() {
@@ -1090,6 +1672,7 @@ mod tests {
 
     async fn oversized_sse_get_stream(url: &str) -> BoxStream<'static, Result<Sse, SseError>> {
         let client = rmcp_reqwest::Client::builder()
+            .no_proxy()
             .build()
             .expect("test MCP HTTP client should build");
         let client = LimitedMcpHttpClient::new(client, usize::MAX, TEST_RESPONSE_LIMIT);

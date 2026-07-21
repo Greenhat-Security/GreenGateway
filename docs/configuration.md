@@ -569,6 +569,8 @@ Example:
 
 Security note: MCP upstream hosts are not auto-seeded into the egress allowlist. Their URLs are checked at startup and again before each call through the same egress URL, host, port, DNS, and non-global-IP validation used by normal gateway-originated HTTP requests. Configure `EGRESS_ALLOWED_HOSTS` or policy `egress.hosts` for every allowed MCP upstream host.
 
+MCP upstream auth challenges, error bodies, content types, session identifiers, peer metadata, and raw egress/transport details are not emitted to process logs. Dependency-internal `rmcp` tracing is disabled because it does not provide that redaction boundary; GreenGateway continues to emit bounded MCP outcome categories and structured tool audit events.
+
 Startup discovery imports each upstream tool into the same tool registry as `TOOLS_FILE` tools. Namespaced collisions with local tools or other MCP upstream tools fail startup rather than overwriting.
 
 ### POLICY_HISTORY_SQLITE_PATH
@@ -1035,6 +1037,8 @@ Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, ev
 
 The effective egress allowlist is constructed at startup. Hot reload and the policy administration API reject changes to the policy `egress` section rather than leaving long-lived egress clients stale. To change policy hosts, CIDRs, or ports, edit `POLICY_FILE` and restart the gateway. Changes to egress environment variables likewise require a restart.
 
+Outbound requests deliberately ignore ambient `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and lowercase equivalents. GreenGateway must have direct network connectivity to configured upstreams and identity endpoints. There is currently no supported outbound-proxy setting; proxy support requires an explicit future design that preserves DNS validation and exact address pinning.
+
 ### EGRESS_TIMEOUT_MS
 
 Total timeout for each egress HTTP request, in milliseconds.
@@ -1073,7 +1077,7 @@ Maximum egress request body size, in bytes.
 
 Default: `1048576` (1 MiB)
 
-Format and validation: must parse as a non-negative byte count that fits in `usize`. The egress client checks this cap before sending a request.
+Format and validation: must parse as a non-negative byte count that fits in `usize`. Caller-provided body vectors on the direct `EgressClient` request paths are checked before DNS resolution. Gateway MCP `call_tool` payloads are conservatively sized before destination resolution or session initialization and are checked again at transport serialization. MCP initialization and discovery messages retain the transport serialization check after destination validation.
 
 ### EGRESS_NAT64_PREFIXES
 

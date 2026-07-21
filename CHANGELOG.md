@@ -7,6 +7,31 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+- Outbound HTTP used by the egress client, reverse proxy, identity-provider
+  discovery/session calls, and MCP upstream transport now ignores ambient
+  `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and lowercase equivalents. This
+  prevents process-environment proxy discovery from bypassing validated DNS
+  pinning. Deployments that previously depended on those variables now require
+  direct connectivity; an outbound proxy will require a future explicit,
+  validated gateway configuration.
+
+- Proxy, health-check, identity-egress, and MCP transport failures now log only
+  bounded error categories. Post-commit response-stream errors are redacted,
+  and the non-standard hop-by-hop `Proxy-Connection` header is stripped in
+  both directions. MCP auth challenges, response bodies, content types, and
+  discovery egress details are no longer retained in displayable errors.
+  Dependency-internal `rmcp` tracing is disabled because it can include peer
+  metadata and session identifiers; gateway-owned bounded MCP outcome logs and
+  audits remain available.
+
+- Caller-provided buffered bodies on `EgressClient` request paths are now
+  rejected before DNS resolution. Gateway MCP `call_tool` payloads are
+  conservatively sized and rejected before destination resolution, connection,
+  or session initialization, so those guaranteed size denials cannot produce
+  upstream traffic.
+
 ## [1.0.1] - 2026-07-16
 
 ### Security

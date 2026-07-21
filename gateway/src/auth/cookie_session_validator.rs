@@ -132,7 +132,10 @@ impl CookieSessionValidator {
         .await
         .map_err(|_| AuthError::Upstream("cookie-session introspection timed out".to_owned()))?
         .map_err(|err| {
-            tracing::warn!(error = %err, "cookie-session introspection through egress failed");
+            tracing::warn!(
+                error_category = err.safe_category(),
+                "cookie-session introspection through egress failed"
+            );
             AuthError::Upstream("cookie-session introspection failed".to_owned())
         })?;
 

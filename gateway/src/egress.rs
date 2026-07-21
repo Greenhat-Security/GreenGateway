@@ -5,10 +5,11 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{stream, Stream, StreamExt};
 use ipnet::IpNet;
@@ -169,6 +170,33 @@ impl EgressError {
             _ => false,
         }
     }
+
+    /// Returns a bounded classification that is safe to emit in logs and audit fields.
+    ///
+    /// Error display strings can contain destination or transport details and must not be
+    /// treated as safe telemetry values.
+    pub(crate) fn safe_category(&self) -> &'static str {
+        match self {
+            Self::HostNotAllowed(_) => "host_not_allowed",
+            Self::PortNotAllowed(_) => "port_not_allowed",
+            Self::NonGlobalIpBlocked(_) => "non_global_ip_blocked",
+            Self::InvalidPolicy(_) => "invalid_policy",
+            Self::DnsResolutionFailed(_) => "dns_resolution_failed",
+            Self::InvalidUrl(_) => "invalid_url",
+            Self::SchemeNotAllowed(_) => "scheme_not_allowed",
+            Self::RequestBodyTooLarge { .. } => "request_body_too_large",
+            Self::ResponseTooLarge { .. } => "response_too_large",
+            Self::ResponseIdleTimeout { .. } => "response_idle_timeout",
+            Self::InvalidTlsCaBundle { .. } => "invalid_tls_ca_bundle",
+            Self::Http(err) if err.is_timeout() => "http_timeout",
+            Self::Http(err) if err.is_connect() => "http_connect",
+            Self::Http(err) if err.is_request() => "http_request",
+            Self::Http(err) if err.is_body() => "http_body",
+            Self::Http(err) if err.is_decode() => "http_decode",
+            Self::Http(err) if err.is_status() => "http_status",
+            Self::Http(_) => "http_other",
+        }
+    }
 }
 
 /// Effective outbound egress controls.
@@ -321,7 +349,7 @@ impl EgressConfig {
 
         if !auto_seeded_hosts.is_empty() {
             tracing::debug!(
-                hosts = ?auto_seeded_hosts,
+                host_count = auto_seeded_hosts.len(),
                 "auto-seeded egress allowlist from infrastructure endpoints"
             );
         }
@@ -487,9 +515,26 @@ impl fmt::Debug for EgressStreamResponse {
 #[derive(Clone)]
 pub struct EgressClient {
     config: EgressConfig,
+    resolver: Arc<dyn DnsResolver>,
     #[allow(dead_code)]
     // Base settings are validated at construction; per-request clients add DNS pins.
     base_client: reqwest::Client,
+}
+
+#[async_trait]
+pub(crate) trait DnsResolver: Send + Sync {
+    /// Returns the complete DNS answer set in resolver order.
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, std::io::Error>;
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SystemDnsResolver;
+
+#[async_trait]
+impl DnsResolver for SystemDnsResolver {
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, std::io::Error> {
+        Ok(lookup_host((host, port)).await?.collect())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -500,12 +545,24 @@ pub struct CheckedEgressDestination {
 
 impl EgressClient {
     pub fn new(config: EgressConfig) -> Result<Self, EgressError> {
+        Self::new_with_resolver(config, Arc::new(SystemDnsResolver))
+    }
+
+    pub(crate) fn new_with_resolver(
+        config: EgressConfig,
+        resolver: Arc<dyn DnsResolver>,
+    ) -> Result<Self, EgressError> {
         let base_client = base_client_builder(&config).build()?;
 
         Ok(Self {
             config,
+            resolver,
             base_client,
         })
+    }
+
+    pub(crate) fn reconfigured(&self, config: EgressConfig) -> Result<Self, EgressError> {
+        Self::new_with_resolver(config, Arc::clone(&self.resolver))
     }
 
     pub async fn request(&self, method: Method, url: &str) -> Result<EgressResponse, EgressError> {
@@ -528,25 +585,14 @@ impl EgressClient {
         )?;
         let port = checked_port(&parsed)?;
         checked_policy_port(port, &self.config.allowed_ports)?;
-        let resolved = resolve_host(&host, port).await?;
-        let pinned_addr = checked_socket_addr(
-            &host,
-            &resolved,
-            self.config.deny_private_ips,
-            &self.config.nat64_prefixes,
-            &self.config.private_ip_allow_cidrs,
-        )?;
         enforce_request_body_size(
             body.as_ref().map_or(0, Vec::len),
             self.config.max_request_body_bytes,
         )?;
+        let pinned_addr = self.resolve_and_check(&host, port).await?;
         let client = self.pinned_client(&host, pinned_addr)?;
 
-        tracing::debug!(
-            host = %host,
-            pinned_addr = %pinned_addr,
-            "egress request pinned to checked address"
-        );
+        tracing::debug!("egress request pinned to validated destination");
 
         self.send_with_client(client, method, parsed, headers, body)
             .await
@@ -564,14 +610,7 @@ impl EgressClient {
         )?;
         let port = checked_port(&parsed)?;
         checked_policy_port(port, &self.config.allowed_ports)?;
-        let resolved = resolve_host(&host, port).await?;
-        let pinned_addr = checked_socket_addr(
-            &host,
-            &resolved,
-            self.config.deny_private_ips,
-            &self.config.nat64_prefixes,
-            &self.config.private_ip_allow_cidrs,
-        )?;
+        let pinned_addr = self.resolve_and_check(&host, port).await?;
 
         Ok(CheckedEgressDestination { host, pinned_addr })
     }
@@ -591,25 +630,14 @@ impl EgressClient {
         )?;
         let port = checked_port(&parsed)?;
         checked_policy_port(port, &self.config.allowed_ports)?;
-        let resolved = resolve_host(&host, port).await?;
-        let pinned_addr = checked_socket_addr(
-            &host,
-            &resolved,
-            self.config.deny_private_ips,
-            &self.config.nat64_prefixes,
-            &self.config.private_ip_allow_cidrs,
-        )?;
         enforce_request_body_size(
             body.as_ref().map_or(0, Vec::len),
             self.config.max_request_body_bytes,
         )?;
+        let pinned_addr = self.resolve_and_check(&host, port).await?;
         let client = self.pinned_client(&host, pinned_addr)?;
 
-        tracing::debug!(
-            host = %host,
-            pinned_addr = %pinned_addr,
-            "egress streaming request pinned to checked address"
-        );
+        tracing::debug!("egress streaming request pinned to validated destination");
 
         self.send_stream_with_client(client, method, parsed, headers, body)
             .await
@@ -619,14 +647,20 @@ impl EgressClient {
         let parsed = Url::parse(url).map_err(|err| EgressError::InvalidUrl(err.to_string()))?;
 
         if parsed.host_str().is_none() {
-            tracing::warn!(url = %redacted_url(&parsed), "egress blocked URL without host");
+            tracing::warn!(
+                error_category = "invalid_url",
+                "egress blocked URL without host"
+            );
             return Err(EgressError::InvalidUrl("missing host".to_owned()));
         }
 
         match parsed.scheme() {
             "http" | "https" => Ok(parsed),
             scheme => {
-                tracing::warn!(scheme, "egress blocked URL scheme");
+                tracing::warn!(
+                    error_category = "scheme_not_allowed",
+                    "egress blocked URL scheme"
+                );
                 Err(EgressError::SchemeNotAllowed(scheme.to_owned()))
             }
         }
@@ -642,6 +676,31 @@ impl EgressClient {
         Ok(base_client_builder(&self.config)
             .resolve(host, pinned_addr)
             .build()?)
+    }
+
+    async fn resolve_and_check(&self, host: &str, port: u16) -> Result<SocketAddr, EgressError> {
+        let resolved = self
+            .resolver
+            .resolve(host, port)
+            .await
+            .map_err(|err| EgressError::DnsResolutionFailed(format!("{host}:{port}: {err}")))?;
+
+        if resolved.is_empty() {
+            return Err(EgressError::DnsResolutionFailed(format!("{host}:{port}")));
+        }
+        if resolved.iter().any(|address| address.port() != port) {
+            return Err(EgressError::DnsResolutionFailed(format!(
+                "{host}:{port}: resolver returned an unexpected port"
+            )));
+        }
+
+        checked_socket_addr(
+            host,
+            &resolved,
+            self.config.deny_private_ips,
+            &self.config.nat64_prefixes,
+            &self.config.private_ip_allow_cidrs,
+        )
     }
 
     async fn send_with_client(
@@ -866,6 +925,7 @@ fn extract_rfc6052_ipv4(ip: Ipv6Addr, prefix_len: u8) -> Option<Ipv4Addr> {
 
 fn base_client_builder(config: &EgressConfig) -> reqwest::ClientBuilder {
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .timeout(config.timeout)
         .connect_timeout(config.connect_timeout)
         .redirect(reqwest::redirect::Policy::none());
@@ -898,7 +958,10 @@ fn checked_host(
     {
         Ok(host)
     } else {
-        tracing::warn!(host = %host, "egress blocked non-allowlisted host");
+        tracing::warn!(
+            error_category = "host_not_allowed",
+            "egress blocked non-allowlisted host"
+        );
         Err(EgressError::HostNotAllowed(host))
     }
 }
@@ -925,21 +988,11 @@ fn checked_policy_port(port: u16, allowed_ports: &HashSet<u16>) -> Result<(), Eg
     if allowed_ports.is_empty() || allowed_ports.contains(&port) {
         Ok(())
     } else {
-        tracing::warn!(port, "egress blocked non-allowlisted port");
+        tracing::warn!(
+            error_category = "port_not_allowed",
+            "egress blocked non-allowlisted port"
+        );
         Err(EgressError::PortNotAllowed(port))
-    }
-}
-
-async fn resolve_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, EgressError> {
-    let resolved = lookup_host((host, port))
-        .await
-        .map_err(|err| EgressError::DnsResolutionFailed(format!("{host}:{port}: {err}")))?
-        .collect::<Vec<_>>();
-
-    if resolved.is_empty() {
-        Err(EgressError::DnsResolutionFailed(format!("{host}:{port}")))
-    } else {
-        Ok(resolved)
     }
 }
 
@@ -960,8 +1013,7 @@ fn checked_socket_addr(
                 && !ip_matches_policy_cidr(*ip, private_ip_allow_cidrs)
         }) {
             tracing::warn!(
-                host,
-                ip = %blocked,
+                error_category = "non_global_ip_blocked",
                 "egress blocked non-global resolved address outside policy CIDRs"
             );
             return Err(EgressError::NonGlobalIpBlocked(blocked));
@@ -984,21 +1036,439 @@ fn enforce_request_body_size(size: usize, max: usize) -> Result<(), EgressError>
     }
 }
 
-fn redacted_url(url: &Url) -> String {
-    let mut redacted = url.clone();
-    let _ = redacted.set_username("");
-    let _ = redacted.set_password(None);
-    redacted.to_string()
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, io::ErrorKind, net::IpAddr, path::PathBuf, time::Duration};
+    use std::{
+        collections::HashMap,
+        io::{self, ErrorKind},
+        net::IpAddr,
+        path::PathBuf,
+        process::Command,
+        sync::Mutex,
+        time::Duration,
+    };
 
     use futures_util::StreamExt;
     use tokio::net::{TcpListener, TcpStream};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+
+    #[derive(Clone)]
+    enum FakeResolution {
+        Addresses(Vec<SocketAddr>),
+        Error(ErrorKind),
+    }
+
+    struct FakeDnsResolver {
+        resolution: FakeResolution,
+        calls: Mutex<Vec<(String, u16)>>,
+    }
+
+    impl FakeDnsResolver {
+        fn with_addresses(addresses: Vec<SocketAddr>) -> Self {
+            Self {
+                resolution: FakeResolution::Addresses(addresses),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_error(kind: ErrorKind) -> Self {
+            Self {
+                resolution: FakeResolution::Error(kind),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, u16)> {
+            self.calls
+                .lock()
+                .expect("fake resolver calls lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl DnsResolver for FakeDnsResolver {
+        async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, std::io::Error> {
+            self.calls
+                .lock()
+                .expect("fake resolver calls lock should not be poisoned")
+                .push((host.to_owned(), port));
+
+            match &self.resolution {
+                FakeResolution::Addresses(addresses) => Ok(addresses.clone()),
+                FakeResolution::Error(kind) => {
+                    Err(std::io::Error::new(*kind, "synthetic DNS failure"))
+                }
+            }
+        }
+    }
+
+    fn egress_config_for_host(host: &str) -> EgressConfig {
+        EgressConfig {
+            allowed_hosts: HashSet::from([host.to_owned()]),
+            ..EgressConfig::default()
+        }
+    }
+
+    #[test]
+    fn egress_error_safe_categories_are_bounded_constants() {
+        let errors = vec![
+            (
+                EgressError::HostNotAllowed("secret-host".to_owned()),
+                "host_not_allowed",
+            ),
+            (EgressError::PortNotAllowed(1234), "port_not_allowed"),
+            (
+                EgressError::NonGlobalIpBlocked(ip("127.0.0.1")),
+                "non_global_ip_blocked",
+            ),
+            (
+                EgressError::InvalidPolicy("secret-policy".to_owned()),
+                "invalid_policy",
+            ),
+            (
+                EgressError::DnsResolutionFailed("secret-dns-detail".to_owned()),
+                "dns_resolution_failed",
+            ),
+            (
+                EgressError::InvalidUrl("secret-url".to_owned()),
+                "invalid_url",
+            ),
+            (
+                EgressError::SchemeNotAllowed("secret-scheme".to_owned()),
+                "scheme_not_allowed",
+            ),
+            (
+                EgressError::RequestBodyTooLarge { size: 2, max: 1 },
+                "request_body_too_large",
+            ),
+            (
+                EgressError::ResponseTooLarge { max: 1 },
+                "response_too_large",
+            ),
+            (
+                EgressError::ResponseIdleTimeout {
+                    timeout: Duration::from_millis(1),
+                },
+                "response_idle_timeout",
+            ),
+            (
+                EgressError::InvalidTlsCaBundle {
+                    path: PathBuf::from("secret-ca-path"),
+                    message: "secret-ca-error".to_owned(),
+                },
+                "invalid_tls_ca_bundle",
+            ),
+        ];
+
+        for (error, expected) in errors {
+            let category = error.safe_category();
+            assert_eq!(category, expected);
+            assert!(category.len() <= 32);
+            assert!(
+                category
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "unsafe category characters in {category}"
+            );
+            assert!(!category.contains("secret"));
+        }
+
+        let http_error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client should build")
+            .get("http://[")
+            .build()
+            .expect_err("invalid URL should create a reqwest error");
+        let http_category = EgressError::Http(http_error).safe_category();
+        assert!(matches!(
+            http_category,
+            "http_timeout"
+                | "http_connect"
+                | "http_request"
+                | "http_body"
+                | "http_decode"
+                | "http_status"
+                | "http_other"
+        ));
+    }
+
+    #[test]
+    fn rejected_scheme_log_exposes_only_a_bounded_category() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let client = EgressClient::new(EgressConfig::default())
+            .expect("scheme log test client should build");
+
+        let error = client
+            .checked_url("secret-scheme://secret-host.example/private?token=secret-query")
+            .expect_err("unsupported URL scheme should fail closed");
+        assert!(matches!(error, EgressError::SchemeNotAllowed(_)));
+        drop(_guard);
+
+        let output = logs.contents();
+        assert!(output.contains("scheme_not_allowed"));
+        for secret in ["secret-scheme", "secret-host", "private", "secret-query"] {
+            assert!(
+                !output.contains(secret),
+                "scheme rejection log leaked {secret}: {output}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_resolver_preserves_answer_order_and_records_host_and_port() {
+        let resolver = Arc::new(FakeDnsResolver::with_addresses(vec![
+            socket("8.8.8.8:8443"),
+            socket("1.1.1.1:8443"),
+        ]));
+        let client = EgressClient::new_with_resolver(
+            egress_config_for_host("api.example.test"),
+            resolver.clone(),
+        )
+        .expect("client should build");
+
+        let destination = client
+            .checked_destination("https://api.example.test:8443/resource")
+            .await
+            .expect("public answer set should be accepted");
+
+        assert_eq!(destination.host, "api.example.test");
+        assert_eq!(destination.pinned_addr, socket("8.8.8.8:8443"));
+        assert_eq!(
+            resolver.calls(),
+            vec![("api.example.test".to_owned(), 8443)]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_dns_path_rejects_a_mixed_public_and_private_answer_set() {
+        let resolver = Arc::new(FakeDnsResolver::with_addresses(vec![
+            socket("8.8.8.8:443"),
+            socket("10.0.0.8:443"),
+        ]));
+        let client = EgressClient::new_with_resolver(
+            egress_config_for_host("api.example.test"),
+            resolver.clone(),
+        )
+        .expect("client should build");
+
+        let destination_error = client
+            .checked_destination("https://api.example.test/resource")
+            .await
+            .expect_err("destination check should reject a mixed answer set");
+        let request_error = client
+            .request_with_headers(
+                Method::GET,
+                "https://api.example.test/resource",
+                HeaderMap::new(),
+                None,
+            )
+            .await
+            .expect_err("buffered request should reject a mixed answer set");
+        let stream_error = client
+            .stream_request_with_headers(
+                Method::GET,
+                "https://api.example.test/resource",
+                HeaderMap::new(),
+                None,
+            )
+            .await
+            .expect_err("streaming request should reject a mixed answer set");
+
+        for error in [destination_error, request_error, stream_error] {
+            assert!(matches!(
+                error,
+                EgressError::NonGlobalIpBlocked(blocked) if blocked == ip("10.0.0.8")
+            ));
+        }
+        assert_eq!(
+            resolver.calls(),
+            vec![("api.example.test".to_owned(), 443); 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_resolver_empty_answer_fails_closed() {
+        let resolver = Arc::new(FakeDnsResolver::with_addresses(Vec::new()));
+        let client =
+            EgressClient::new_with_resolver(egress_config_for_host("empty.example.test"), resolver)
+                .expect("client should build");
+
+        let error = client
+            .checked_destination("https://empty.example.test/resource")
+            .await
+            .expect_err("empty DNS answers should deny");
+
+        assert!(matches!(
+            error,
+            EgressError::DnsResolutionFailed(message)
+                if message == "empty.example.test:443"
+        ));
+    }
+
+    #[tokio::test]
+    async fn injected_resolver_error_fails_closed() {
+        let resolver = Arc::new(FakeDnsResolver::with_error(ErrorKind::TimedOut));
+        let client =
+            EgressClient::new_with_resolver(egress_config_for_host("error.example.test"), resolver)
+                .expect("client should build");
+
+        let error = client
+            .checked_destination("https://error.example.test:8443/resource")
+            .await
+            .expect_err("resolver errors should deny");
+
+        assert!(matches!(
+            error,
+            EgressError::DnsResolutionFailed(message)
+                if message.starts_with("error.example.test:8443:")
+        ));
+    }
+
+    #[tokio::test]
+    async fn injected_resolver_wrong_port_fails_closed() {
+        let resolver = Arc::new(FakeDnsResolver::with_addresses(vec![socket(
+            "8.8.8.8:9443",
+        )]));
+        let client =
+            EgressClient::new_with_resolver(egress_config_for_host("port.example.test"), resolver)
+                .expect("client should build");
+
+        let error = client
+            .checked_destination("https://port.example.test:8443/resource")
+            .await
+            .expect_err("resolver answers for a different port should deny");
+
+        assert!(matches!(
+            error,
+            EgressError::DnsResolutionFailed(message)
+                if message.starts_with("port.example.test:8443:")
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconfigured_client_preserves_injected_resolver() {
+        let resolver = Arc::new(FakeDnsResolver::with_addresses(vec![socket("8.8.8.8:443")]));
+        let client = EgressClient::new_with_resolver(
+            egress_config_for_host("first.example.test"),
+            resolver.clone(),
+        )
+        .expect("client should build");
+        client
+            .checked_destination("https://first.example.test/resource")
+            .await
+            .expect("original client should use injected resolver");
+
+        let reconfigured = client
+            .reconfigured(egress_config_for_host("second.example.test"))
+            .expect("reconfigured client should build");
+        reconfigured
+            .checked_destination("https://second.example.test/resource")
+            .await
+            .expect("reconfigured client should retain injected resolver");
+
+        assert_eq!(
+            resolver.calls(),
+            vec![
+                ("first.example.test".to_owned(), 443),
+                ("second.example.test".to_owned(), 443),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn egress_client_sends_directly_with_proxy_discovery_disabled() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("direct test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("direct listener address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("direct server should accept one connection");
+            read_one_request(&stream).await;
+            write_all(
+                &stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect",
+            )
+            .await;
+        });
+        let client = EgressClient::new(EgressConfig {
+            allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
+            deny_private_ips: false,
+            timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(500),
+            max_response_bytes: 6,
+            ..EgressConfig::default()
+        })
+        .expect("client should build");
+
+        let response = client
+            .request(Method::GET, &format!("http://{addr}/"))
+            .await
+            .expect("ambient proxy settings must not intercept egress");
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, b"direct");
+        server.await.expect("direct server should finish");
+    }
+
+    #[test]
+    fn egress_client_ignores_ambient_proxy_environment() {
+        let proxy_listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("ambient proxy sentinel listener should bind");
+        let proxy_addr = proxy_listener
+            .local_addr()
+            .expect("ambient proxy sentinel address should be available");
+        let proxy_url = format!("http://{proxy_addr}");
+        let output = Command::new(std::env::current_exe().expect("test executable should exist"))
+            .args([
+                "--exact",
+                "egress::tests::egress_client_sends_directly_with_proxy_discovery_disabled",
+                "--nocapture",
+            ])
+            .env("HTTP_PROXY", &proxy_url)
+            .env("HTTPS_PROXY", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("https_proxy", &proxy_url)
+            .env("all_proxy", &proxy_url)
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .output()
+            .expect("proxy-isolation child test should start");
+
+        assert!(
+            output.status.success(),
+            "proxy-isolation child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("running 1 test"),
+            "proxy-isolation child must execute exactly one helper test: {stdout}"
+        );
+        proxy_listener
+            .set_nonblocking(true)
+            .expect("proxy sentinel should become nonblocking");
+        assert!(
+            matches!(proxy_listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock),
+            "ambient proxy sentinel must receive zero connections"
+        );
+    }
 
     #[test]
     fn non_global_ipv4_matches_registry_snapshot_and_multicast_policy() {
@@ -1711,6 +2181,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_request_bodies_are_rejected_before_dns_resolution() {
+        let resolver = Arc::new(FakeDnsResolver::with_addresses(vec![socket("8.8.8.8:443")]));
+        let client = EgressClient::new_with_resolver(
+            EgressConfig {
+                max_request_body_bytes: 3,
+                ..egress_config_for_host("oversized.example.test")
+            },
+            resolver.clone(),
+        )
+        .expect("client should build");
+
+        let buffered_error = client
+            .request_with_headers(
+                Method::POST,
+                "https://oversized.example.test/resource",
+                HeaderMap::new(),
+                Some(vec![0; 4]),
+            )
+            .await
+            .expect_err("oversized buffered request should fail");
+        let streaming_error = client
+            .stream_request_with_headers(
+                Method::POST,
+                "https://oversized.example.test/resource",
+                HeaderMap::new(),
+                Some(vec![0; 4]),
+            )
+            .await
+            .expect_err("oversized streaming request should fail");
+
+        for error in [buffered_error, streaming_error] {
+            assert!(matches!(
+                error,
+                EgressError::RequestBodyTooLarge { size: 4, max: 3 }
+            ));
+        }
+        assert!(
+            resolver.calls().is_empty(),
+            "oversized request denial must not resolve DNS"
+        );
+    }
+
+    #[tokio::test]
     async fn pinned_client_uses_checked_socket_addr_for_connection() {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -2099,6 +2612,51 @@ mod tests {
 
     fn socket(value: &str) -> SocketAddr {
         value.parse().expect("test socket address should parse")
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(
+                self.buffer
+                    .lock()
+                    .expect("captured logs should not be poisoned")
+                    .clone(),
+            )
+            .expect("captured logs should be UTF-8")
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .map_err(|_| io::Error::other("captured logs lock poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     fn test_config() -> Config {

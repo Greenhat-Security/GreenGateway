@@ -226,7 +226,10 @@ impl JwtValidator {
         .await
         .map_err(|_| AuthError::Upstream("JWKS fetch failed".to_owned()))?
         .map_err(|err| {
-            tracing::warn!(error = %err, "JWKS fetch through egress failed");
+            tracing::warn!(
+                error_category = err.safe_category(),
+                "JWKS fetch through egress failed"
+            );
             AuthError::Upstream("JWKS fetch failed".to_owned())
         })?;
 
