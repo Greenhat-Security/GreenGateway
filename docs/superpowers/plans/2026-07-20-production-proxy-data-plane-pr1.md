@@ -17,7 +17,7 @@
 - Modify `gateway/src/main.rs` for module wiring and behavior-preserving delegation.
 - Add a focused integration test only if module-level tests cannot prove a required gate.
 
-Do not add dependencies, configuration keys/fields, public routes, metrics, production pooling, retries, streaming, readiness, shutdown, SSE, or mTLS behavior.
+Do not add dependencies, configuration keys/fields, public routes, metrics, production pooling, retries, streaming, readiness, shutdown, SSE, or mTLS behavior. One intentional security correction is in scope: every reqwest client built by `EgressClient` must disable ambient process proxy discovery so environment variables cannot bypass exact destination pinning.
 
 ## Task 1: Freeze the security design
 
@@ -38,10 +38,12 @@ Do not add dependencies, configuration keys/fields, public routes, metrics, prod
 - [ ] Add `SystemResolver` that delegates to `tokio::net::lookup_host`.
 - [ ] Store `Arc<dyn Resolver>` in `EgressClient`.
 - [ ] Keep `EgressClient::new` as the production constructor and delegate to an internal injectable constructor.
+- [ ] Call reqwest's `no_proxy()` on the shared base builder and every derived pinned client path; do not honor ambient `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY`.
 - [ ] Route every existing lookup through the stored resolver.
 - [ ] Keep hostname/port validation, all-answer IP/NAT64 validation, first-address selection, exact pinning, SNI, certificate validation, redirects, and error mapping unchanged.
 - [ ] Add a deterministic fake resolver with call accounting.
 - [ ] Test mixed answers, empty answers, resolver errors, and validate-all-before-pin behavior.
+- [ ] Add an isolated subprocess/environment test proving hostile proxy environment variables receive zero connections while the injected exact pin receives the request.
 - [ ] Test at least one non-proxy default-constructor path or shared constructor invariant because OIDC/MCP/tools also use `EgressClient`.
 - [ ] Run focused egress tests, formatting, clippy, and diff checks; commit the resolver unit.
 
@@ -51,10 +53,10 @@ Do not add dependencies, configuration keys/fields, public routes, metrics, prod
 - [ ] Keep a small `main.rs` fallback adapter with the current metrics and safety-gate ordering.
 - [ ] Avoid duplicate implementations or compatibility shims that can drift; use narrow `pub(crate)` exports only where composition requires them.
 - [ ] Preserve Axum state/middleware order and the current observation context.
-- [ ] Preserve legacy fallback, route order, host matching, URL/base-path behavior, custom CA behavior, timeouts, request/response limits, health behavior, and generic errors.
+- [ ] Preserve legacy fallback, route order, host matching, URL/base-path behavior, custom CA behavior, timeouts, request/response limits, health behavior, and generic errors, except for the explicit fail-closed ambient-proxy correction.
 - [ ] Preserve every credential, forwarding, hop-by-hop, nominated, request-ID, configured add/strip, and framing header rule.
 - [ ] Add or relocate focused tests without mechanically moving unrelated `main.rs` tests.
-- [ ] Assert denied/unsafe/gateway-owned requests cannot cause resolver calls or upstream bytes.
+- [ ] Assert authentication denial, both rate-limit stages, validation, CSRF, RBAC/direct-rule denial, unsafe paths, and gateway-owned paths cannot cause request-scoped endpoint selection, resolver calls, or upstream bytes; disable or separately account for background health.
 - [ ] Run focused proxy tests, egress-only guard, formatting, clippy, and diff checks; commit the extraction unit.
 
 ## Task 4: Extract lifecycle composition and clock

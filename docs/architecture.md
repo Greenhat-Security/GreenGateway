@@ -24,7 +24,7 @@ Every inbound request is expected to pass through the gateway in this order:
 | 8 | CSRF | #4 | Enforce a double-submit cookie on the gateway's own control-plane endpoints, with bearer-token requests bypassing CSRF checks. |
 | 9 | Authentication | #5 | Run pluggable validators, starting with JWT/JWKS, with cookie sessions and additional identity providers deferred to Phase 7; fail closed with `401` on any non-exempt route. |
 | 10 | Authorization / RBAC | #6 | Evaluate deny-by-default role permissions, starting at route level, with tool-level checks and full rules-as-data deferred to later phases. |
-| 11 | Route handling / proxy | Later phase | Execute the actual handler or proxy behavior; in Phase 1 this remains a placeholder because proxying lands in Phase 3. |
+| 11 | Route handling / proxy | #239 | Forward an already-authorized request through the egress boundary. Current single-upstream compatibility remains authoritative while the bounded production data plane lands incrementally. |
 | 12 | Audit | #8 | Emit structured, versioned audit events for every security-relevant decision made by the layers above. |
 
 Audit is listed last to show that every decision has a durable security record,
@@ -49,6 +49,24 @@ request
 
 audit events are emitted throughout the path and correlated by request ID
 ```
+
+## Production data-plane boundary
+
+The current proxy classifies a configured logical upstream before authentication and authorization so policy can evaluate the intended route. Physical network work still occurs only in the fallback handler after the security middleware has allowed the request. Proxy and health traffic use `EgressClient`, which validates the hostname and port, resolves and validates every DNS answer, pins the selected address, preserves hostname/SNI verification, and disables redirects.
+
+Issue #239 evolves that path without changing the security order:
+
+```text
+stable logical route
+  -> authentication / rate limit / authorization
+  -> bounded pool admission
+  -> eligible physical endpoint
+  -> egress policy + complete DNS validation + exact pin
+  -> bounded attempt(s)
+  -> response and terminal observation
+```
+
+Pre-authorization routing may remain a pure logical classification only. It must not select an endpoint, resolve DNS, acquire a client or permit, or open a socket. Failover and retries stay inside the already-authorized route. See [ADR-0005](adr/0005-production-proxy-data-plane.md) for the target pooling, health, readiness, shutdown, SSE, mTLS, threat, compatibility, and rollout contracts. Later target behavior in that ADR is not implied to be shipped by the initial extraction PR.
 
 ## Crate layout
 
@@ -82,7 +100,7 @@ there.
 | CSRF | 8 | #4 |
 | Authentication | 9 | #5 |
 | Authorization / RBAC | 10 | #6 |
-| Route handling / proxy | 11 | Later phase |
+| Route handling / proxy | 11 | #239 |
 | Audit | Cross-cutting across all positions | #8 |
 | Egress firewall | Applies when outbound proxy behavior exists | #7 |
 | Configuration | Supplies settings consumed by the layers above | #9 |

@@ -4,7 +4,7 @@
 
 **Scope:** checklist item 1 only
 
-**Base:** stacked after the accepted Policy Studio ADR so this decision is ADR-0005
+**Base:** stacked after the Policy Studio ADR branch, reserving this decision as ADR-0005
 
 ## Purpose
 
@@ -60,8 +60,9 @@ Pre-authorization routing may classify only the stable logical identity required
 The order remains:
 
 ```text
-request classification
-  -> request ID and security middleware
+request ID
+  -> stable logical request classification
+  -> remaining security middleware
   -> authentication
   -> authorization / direct rules
   -> unsafe and gateway-owned path protection
@@ -107,6 +108,10 @@ PR 1 records but does not build the cache. A later reusable transport key must c
 
 Keying only by hostname, origin, or route is forbidden. A safe-to-private DNS transition, mixed answer, empty answer, or resolution error makes the destination ineligible for new work; a cached formerly-safe destination cannot bypass revalidation rules.
 
+The first client-cache implementation resolves and validates before every cache acquisition. The cache is consulted only after producing the current immutable validated-address generation. A later DNS-generation cache is permitted only through a separate reviewed design with resolver TTL input, a finite monotonic validation lease, refresh-before-new-work behavior, and fail-closed refresh errors; a stale generation is never used to preserve availability. Client entries have a hard cardinality, a finite idle lifetime, in-flight-safe eviction, and per-key acquisition so unrelated pools do not serialize behind one global lock.
+
+Every production reqwest client explicitly disables ambient `HTTP_PROXY`, `HTTPS_PROXY`, and related environment proxy discovery. Future outbound-proxy support must be configured, validated, and keyed explicitly; it cannot inherit process environment behavior or bypass exact destination pinning. Tests set hostile proxy environment variables and prove the pinned local destination is still used.
+
 ### Header, credential, and framing boundary
 
 Extraction must preserve the current per-attempt header boundary:
@@ -132,10 +137,12 @@ The compatibility default remains exactly one attempt. No error in PR 1 is retri
 Later PRs may add strict additive configuration using these names. ADR-0005 owns their meaning so independent implementations do not drift:
 
 - Logical route: `id`, `upstreams`, `load_balancing`, `request_body`, `limits`, `health_check`, `retry`, `circuit_breaker`.
-- Physical endpoint: `id`, `url`, `weight`, and a TLS identity/trust reference.
+- Physical endpoint: `id`, `url`, `weight`, `tls_ca_bundle_path`, and `client_identity_pem_path`.
 - Existing `upstream_url` remains the single-endpoint compatibility form.
 
-The later configuration PR must define exact defaults and maxima, stable ID grammar and length, URL base-path composition, duplicate detection, and mutual exclusion between `upstream_url` and `upstreams`. Unknown fields and invalid combinations fail startup. PR 1 adds none of these fields.
+Nested field names are fixed by issue #239: `load_balancing.strategy`; `request_body.mode`; `limits.max_in_flight`, `queue_depth`, and `queue_timeout_ms`; `health_check.method`, `path`, `interval_ms`, `timeout_ms`, `healthy_threshold`, `unhealthy_threshold`, `expected_statuses`, `required_for_readiness`, and `minimum_healthy`; `retry.max_attempts`, `methods`, and `statuses`; and `circuit_breaker.failure_threshold`, `open_ms`, `half_open_max_requests`, and `recovery_threshold`.
+
+Route and endpoint IDs are 1 to 64 ASCII characters matching `[a-z][a-z0-9._-]{0,63}`. Endpoint URLs accept only `http`/`https` and reject userinfo, query, and fragment components. The later configuration PR defines finite numeric defaults/maxima and explicit base-path composition, duplicate detection, and mutual exclusion between `upstream_url` and `upstreams`. Unknown fields and invalid combinations fail startup. PR 1 adds none of these fields.
 
 ## Target lifecycle model
 
@@ -158,6 +165,8 @@ Unexpected termination of either split listener must eventually cancel and drain
 
 PR 1 only separates lifecycle composition and introduces a minimal clock abstraction used by already-existing timestamp/sleep behavior. It does not change lifecycle states or server semantics.
 
+The later lifecycle PR owns this exact first-signal sequence: atomically enter `Draining`; make readiness false; emit `gateway.shutdown_started`; wait only the configured bounded readiness-propagation delay; stop unified or both split listeners from accepting; prevent new admission, retries, and health probes; cancel background workers; drain in-flight HTTP/SSE until the hard deadline; cancel remaining work and record a forced result at the deadline; emit the terminal shutdown event; then close audit admission, drain in order, and await a bounded sink flush acknowledgement. A second signal may force immediate cancellation. A clean drain exits zero; listener failure or required durable-flush failure exits nonzero. Loss of one split listener coordinates the same failure/drain for its peer.
+
 ## Target health, streaming, and TLS boundaries
 
 These decisions constrain later work but do not ship in PR 1:
@@ -172,7 +181,12 @@ These decisions constrain later work but do not ship in PR 1:
 
 ### `gateway/src/proxy/mod.rs`
 
-Owns proxy transport state and mechanics after the security gates:
+Owns two deliberately separate interfaces:
+
+- A pre-authorization classifier containing route-matching data only. It returns stable logical policy/observation context and has no resolver, egress client, health selector, admission state, or forwarding method.
+- A post-authorization forwarder containing physical transport/health state and callable only from the root fallback after current security and path gates.
+
+The module owns:
 
 - proxy route matching and compatibility upstream mapping;
 - route-specific egress client selection;
@@ -183,9 +197,9 @@ Owns proxy transport state and mechanics after the security gates:
 - response forwarding; and
 - sanitized proxy error mapping.
 
-`main.rs` keeps a small fallback adapter whose ordering remains visible and auditable: record current metrics, reject unsafe/gateway-owned paths, reject missing proxy/route state, derive canonical client IP, then call the extracted proxy forwarder.
+`main.rs` gives `ProxyDispatchState` only the classifier, never the forwarder. It keeps a small fallback adapter whose ordering remains visible and auditable: record current metrics, reject unsafe/gateway-owned paths, reject missing proxy/route state, derive canonical client IP, then call the extracted proxy forwarder.
 
-The extracted proxy module must not become a second authentication or authorization entry point. Its API accepts only the already-composed application state it needs after middleware has run.
+The extracted proxy module must not become a second authentication or authorization entry point. Tests prove that classification cannot select an endpoint/client or invoke a resolver, independently of request-level DNS call counts.
 
 ### `gateway/src/lifecycle.rs`
 
@@ -212,7 +226,7 @@ The minimal clock supplies current wall-clock time and asynchronous sleep for ex
 
 | Threat | Required control |
 | --- | --- |
-| Pre-auth dialing or DNS | Physical destination work exists only after current request gates; denial tests assert zero resolver/upstream activity. |
+| Pre-auth endpoint/client selection, dialing, or DNS | `ProxyDispatchState` holds only a pure classifier; physical state is available only to the post-gate fallback. Denial tests assert zero selection, resolver, and upstream activity. |
 | Cross-route failover | Physical attempts are scoped to one authorized logical route; no fallback to another route or legacy upstream. |
 | Mixed safe/private DNS answers | Validate all answers before pinning any; one prohibited answer denies the destination. |
 | Resolver failure with stale fallback | Empty/error results fail closed; no last-known-good or ambient resolver fallback. |
@@ -243,7 +257,7 @@ Deterministic tests must show:
 
 Existing tests remain regression anchors. Focused seam tests additionally cover:
 
-- Denied/unsafe/gateway-owned requests produce zero resolver calls and zero upstream bytes.
+- Authentication denial, principal-keyed and IP-keyed rate-limit denial, request validation, CSRF, RBAC/direct-rule denial, unsafe paths, and gateway-owned paths each produce zero request-scoped endpoint selection, resolver calls, and upstream bytes; background health is disabled or separately accounted for in these assertions.
 - Route ordering, host binding, legacy fallback, URL composition, and origin identity remain exact.
 - Hop-by-hop, nominated, credential, forwarding, request-ID, configured add/strip, and framing headers remain exact.
 - Buffered oversize requests return 413 before dialing.
@@ -277,7 +291,9 @@ Review additionally checks:
 
 - no new dependencies, public configuration, endpoints, or metrics;
 - no direct outbound network primitive outside the egress allowlist;
-- no credentials, origins, IP addresses, resolver details, or raw transport errors leak into public surfaces;
+- no new public surface exposes credentials, origins, IP addresses, resolver details, or raw transport errors;
+- the existing `/health` origin field is treated as a temporary compatibility exception, is not expanded in PR 1, and is migrated only in the dedicated readiness/status PR;
+- logs and new audit/status paths use bounded safe error categories rather than raw URLs, queries, resolver details, or transport errors; and
 - the extracted diff is behavior-preserving rather than a hidden feature implementation; and
 - later target architecture is labeled as target, not current production behavior.
 
