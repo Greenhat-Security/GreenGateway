@@ -1056,6 +1056,8 @@ struct GatewayAppBuildOverrides {
     request_selection_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     disable_proxy_health_checks: bool,
+    #[cfg(test)]
+    stream_proxy_request_bodies: bool,
 }
 
 fn egress_client_for_build(
@@ -1287,6 +1289,12 @@ fn gateway_app_with_process_started_at_and_overrides(
             proxy_state.map(|state| state.with_request_selection_counter(Arc::clone(counter)))
         }
         None => proxy_state,
+    };
+    #[cfg(test)]
+    let proxy_state = if build_overrides.stream_proxy_request_bodies {
+        proxy_state.map(ProxyState::with_streaming_request_bodies)
+    } else {
+        proxy_state
     };
     let proxy_classifier = proxy_state.as_ref().map(ProxyState::classifier);
     #[cfg(test)]
@@ -8509,6 +8517,60 @@ mod tests {
         .expect("app should build")
     }
 
+    fn streaming_proxy_router(config: config::Config) -> Router {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let app = gateway_app_with_process_started_at_and_overrides(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+            Instant::now(),
+            GatewayAppBuildOverrides {
+                stream_proxy_request_bodies: true,
+                disable_proxy_health_checks: true,
+                ..GatewayAppBuildOverrides::default()
+            },
+        )
+        .expect("streaming proxy app should build");
+        match app {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("streaming proxy app should be unified"),
+        }
+    }
+
+    async fn observe_streamed_request_body(
+        State(observed): State<tokio::sync::mpsc::Sender<Result<Vec<u8>, usize>>>,
+        body: Body,
+    ) -> Response {
+        let mut body = body.into_data_stream();
+        let mut received = Vec::new();
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    received.extend_from_slice(&chunk);
+                    let _ = observed.send(Ok(received.clone())).await;
+                }
+                Err(_) => {
+                    let _ = observed.send(Err(received.len())).await;
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+
+        (StatusCode::CREATED, received.len().to_string()).into_response()
+    }
+
+    async fn spawn_stream_observer_upstream() -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::Receiver<Result<Vec<u8>, usize>>,
+    ) {
+        let (observed_tx, observed_rx) = tokio::sync::mpsc::channel(16);
+        let router = Router::new()
+            .fallback(any(observe_streamed_request_body))
+            .with_state(observed_tx);
+        (spawn_router(router).await, observed_rx)
+    }
+
     struct CountingDnsResolver {
         calls: AtomicUsize,
         address_ip: IpAddr,
@@ -8576,6 +8638,7 @@ mod tests {
                 egress_resolver: Some(resolver_trait),
                 request_selection_count: Some(Arc::clone(&request_selections)),
                 disable_proxy_health_checks: true,
+                stream_proxy_request_bodies: false,
             },
         )
         .expect("instrumented proxy app should build");
@@ -10566,6 +10629,161 @@ mod tests {
             .expect("body should yield second chunk")
             .expect("second chunk should be ok");
         assert_eq!(&second[..], b"second");
+    }
+
+    #[tokio::test]
+    async fn streaming_proxy_forwards_the_first_request_chunk_before_body_completion() {
+        let (upstream_addr, mut observed) = spawn_stream_observer_upstream().await;
+        let mut config = proxy_config(upstream_addr);
+        config.egress_max_request_body_bytes = 32;
+        let router = streaming_proxy_router(config);
+        let (chunks_tx, chunks_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+        let request_body = Body::from_stream(stream::unfold(chunks_rx, |mut chunks| async move {
+            chunks.recv().await.map(|chunk| (chunk, chunks))
+        }));
+        let request = tokio::spawn(
+            router.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/upload")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(request_body)
+                    .expect("streaming request should build"),
+            ),
+        );
+
+        chunks_tx
+            .send(Ok(Bytes::from_static(b"first")))
+            .await
+            .expect("first client chunk should send");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), observed.recv())
+                .await
+                .expect("upstream should receive the first chunk before completion"),
+            Some(Ok(b"first".to_vec()))
+        );
+        assert!(
+            !request.is_finished(),
+            "proxy response must still wait for the unfinished request body"
+        );
+
+        chunks_tx
+            .send(Ok(Bytes::from_static(b"-second")))
+            .await
+            .expect("second client chunk should send");
+        drop(chunks_tx);
+        let response = tokio::time::timeout(Duration::from_secs(2), request)
+            .await
+            .expect("streamed proxy request should finish")
+            .expect("streamed proxy task should join")
+            .expect("streamed proxy request should complete");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(body_string(response).await, "12");
+        assert_eq!(observed.recv().await, Some(Ok(b"first-second".to_vec())));
+    }
+
+    #[tokio::test]
+    async fn streaming_proxy_preflights_known_oversize_body_without_upstream_bytes() {
+        let (upstream_addr, mut observed) = spawn_stream_observer_upstream().await;
+        let mut config = proxy_config(upstream_addr);
+        config.egress_max_request_body_bytes = 4;
+        let router = streaming_proxy_router(config);
+        let chunks =
+            stream::once(async { Ok::<Bytes, std::io::Error>(Bytes::from_static(b"oversize")) });
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/upload")
+                    .header(header::CONTENT_LENGTH, "8")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from_stream(chunks))
+                    .expect("known-size streaming request should build"),
+            )
+            .await
+            .expect("known-size streaming request should complete");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"payload_too_large"}"#
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), observed.recv())
+                .await
+                .is_err(),
+            "known oversize bodies must be rejected before upstream bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_proxy_unknown_overflow_forwards_only_the_bounded_prefix() {
+        let (upstream_addr, mut observed) = spawn_stream_observer_upstream().await;
+        let mut config = proxy_config(upstream_addr);
+        config.egress_max_request_body_bytes = 4;
+        let router = streaming_proxy_router(config);
+        let (chunks_tx, chunks_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+        let chunks = stream::unfold(chunks_rx, |mut chunks| async move {
+            chunks.recv().await.map(|chunk| (chunk, chunks))
+        });
+        let request = tokio::spawn(
+            router.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/upload")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from_stream(chunks))
+                    .expect("unknown-size streaming request should build"),
+            ),
+        );
+        chunks_tx
+            .send(Ok(Bytes::from_static(b"abc")))
+            .await
+            .expect("bounded client prefix should send");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), observed.recv())
+                .await
+                .expect("upstream should receive the bounded prefix"),
+            Some(Ok(b"abc".to_vec()))
+        );
+        chunks_tx
+            .send(Ok(Bytes::from_static(b"def")))
+            .await
+            .expect("overflowing client chunk should send");
+        drop(chunks_tx);
+        let response = tokio::time::timeout(Duration::from_secs(2), request)
+            .await
+            .expect("unknown-size overflow should finish")
+            .expect("unknown-size overflow task should join")
+            .expect("unknown-size streaming request should complete");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"payload_too_large"}"#
+        );
+        let mut largest_prefix = b"abc".to_vec();
+        let mut saw_body_error = false;
+        while let Ok(Some(observation)) =
+            tokio::time::timeout(Duration::from_millis(100), observed.recv()).await
+        {
+            match observation {
+                Ok(prefix) => largest_prefix = prefix,
+                Err(received) => {
+                    assert!(received <= 4);
+                    assert_eq!(received, largest_prefix.len());
+                    saw_body_error = true;
+                    break;
+                }
+            }
+        }
+        assert!(b"abcd".starts_with(&largest_prefix));
+        assert!(largest_prefix.len() <= 4);
+        assert!(
+            saw_body_error,
+            "upstream should observe a bounded body abort"
+        );
     }
 
     #[tokio::test]
