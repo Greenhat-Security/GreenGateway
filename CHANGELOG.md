@@ -9,6 +9,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Security
 
+- `UPSTREAM_ROUTES` now supports stable logical route IDs and static weighted
+  endpoint pools with strict startup validation. Physical endpoint selection
+  occurs only after authorization and bounded pool admission; configured
+  concurrency, queue depth, and queue timeout prevent unbounded work, and
+  saturation returns a sanitized `503` without DNS or upstream traffic.
+  Existing single-URL routes map to a one-endpoint pool.
+
 - Added a fail-closed request-body abstraction for buffered and streamed proxy
   uploads. Streamed bodies are counted independently of `Content-Length`,
   reject known oversize lengths before DNS, forward no more than the configured

@@ -20,6 +20,7 @@ pub struct RuleDecision {
 #[derive(Clone, Copy, Debug)]
 pub struct RuleDispatchContext<'a> {
     routing_context_known: bool,
+    route_id: Option<&'a str>,
     route_host: Option<&'a str>,
     route_path_prefix: Option<&'a str>,
     upstream_origin: Option<&'a str>,
@@ -29,6 +30,7 @@ impl<'a> RuleDispatchContext<'a> {
     pub fn unknown() -> Self {
         Self {
             routing_context_known: false,
+            route_id: None,
             route_host: None,
             route_path_prefix: None,
             upstream_origin: None,
@@ -38,6 +40,7 @@ impl<'a> RuleDispatchContext<'a> {
     pub fn contextless() -> Self {
         Self {
             routing_context_known: true,
+            route_id: None,
             route_host: None,
             route_path_prefix: None,
             upstream_origin: None,
@@ -51,6 +54,22 @@ impl<'a> RuleDispatchContext<'a> {
     ) -> Self {
         Self {
             routing_context_known: true,
+            route_id: None,
+            route_host,
+            route_path_prefix,
+            upstream_origin,
+        }
+    }
+
+    pub fn classified_with_route_id(
+        route_id: Option<&'a str>,
+        route_host: Option<&'a str>,
+        route_path_prefix: Option<&'a str>,
+        upstream_origin: Option<&'a str>,
+    ) -> Self {
+        Self {
+            routing_context_known: true,
+            route_id,
             route_host,
             route_path_prefix,
             upstream_origin,
@@ -271,6 +290,7 @@ enum RuleTarget {
 struct CompiledDispatchMatcher {
     kind: RuleDispatchKind,
     upstream_origin: Option<String>,
+    route_id: Option<String>,
     valid: bool,
 }
 
@@ -282,13 +302,19 @@ impl CompiledDispatchMatcher {
             .and_then(|origin| Url::parse(origin).ok())
             .map(|origin| origin.origin().ascii_serialization());
         let valid = match matcher.kind {
-            RuleDispatchKind::Contextless => matcher.upstream_origin.is_none(),
-            RuleDispatchKind::Legacy => upstream_origin.is_some(),
+            RuleDispatchKind::Contextless => {
+                matcher.upstream_origin.is_none() && matcher.route_id.is_none()
+            }
+            RuleDispatchKind::Legacy => upstream_origin.is_some() && matcher.route_id.is_none(),
+            RuleDispatchKind::Route => {
+                matcher.upstream_origin.is_none() && matcher.route_id.is_some()
+            }
         };
 
         Self {
             kind: matcher.kind,
             upstream_origin,
+            route_id: matcher.route_id.clone(),
             valid,
         }
     }
@@ -300,7 +326,8 @@ impl CompiledDispatchMatcher {
 
         match self.kind {
             RuleDispatchKind::Contextless => {
-                context.route_host.is_none()
+                context.route_id.is_none()
+                    && context.route_host.is_none()
                     && context.route_path_prefix.is_none()
                     && context.upstream_origin.is_none()
             }
@@ -309,6 +336,7 @@ impl CompiledDispatchMatcher {
                     && context.route_path_prefix.is_none()
                     && self.upstream_origin.as_deref() == context.upstream_origin
             }
+            RuleDispatchKind::Route => self.route_id.as_deref() == context.route_id,
         }
     }
 }
@@ -648,6 +676,57 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn route_dispatch_matches_only_the_trusted_logical_route_id() {
+        let mut route_bound = rule(&["GET"], "/reports/{id}", RuleAction::Deny);
+        route_bound.dispatch = Some(RuleDispatchMatcher::route("payments".to_owned()));
+        let matcher = RuleMatcher::new(&[route_bound]);
+
+        assert!(matcher
+            .evaluate_with_dispatch(
+                "GET",
+                "/reports/123",
+                None,
+                RuleDispatchContext::classified_with_route_id(
+                    Some("payments"),
+                    None,
+                    None,
+                    Some("pool:payments"),
+                ),
+            )
+            .is_some());
+        for context in [
+            RuleDispatchContext::classified_with_route_id(
+                Some("inventory"),
+                None,
+                None,
+                Some("pool:inventory"),
+            ),
+            RuleDispatchContext::classified(None, None, Some("pool:payments")),
+            RuleDispatchContext::unknown(),
+            RuleDispatchContext::contextless(),
+        ] {
+            assert_eq!(
+                matcher.evaluate_with_dispatch("GET", "/reports/123", None, context),
+                None
+            );
+        }
+
+        assert!(matcher
+            .evaluate_with_dispatch(
+                "GET",
+                "/reports/123",
+                None,
+                RuleDispatchContext::classified_with_route_id(
+                    Some("payments"),
+                    Some("payments.example.test"),
+                    Some("/reports"),
+                    Some("pool:payments"),
+                ),
+            )
+            .is_some());
     }
 
     #[test]

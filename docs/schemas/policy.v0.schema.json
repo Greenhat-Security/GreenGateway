@@ -195,12 +195,13 @@
       "required": [
         "kind"
       ],
-      "description": "Optional immutable proxy-dispatch provenance for an HTTP path rule. contextless matches classified requests without proxy dispatch. legacy matches only the configured fallback upstream and excludes host/path routes, even at the same origin. Omitting dispatch preserves globally scoped matching.",
+      "description": "Optional immutable proxy-dispatch provenance for an HTTP path rule. contextless matches classified requests without proxy dispatch. legacy matches only the configured fallback upstream and excludes host/path routes, even at the same origin. route matches one stable logical proxy route ID without binding policy to a physical endpoint. Omitting dispatch preserves globally scoped matching.",
       "properties": {
         "kind": {
           "enum": [
             "contextless",
-            "legacy"
+            "legacy",
+            "route"
           ]
         },
         "upstream_origin": {
@@ -208,6 +209,13 @@
           "format": "uri",
           "pattern": "^https?://[^/?#@]+$",
           "description": "HTTP(S) fallback origin selected before RBAC, including a non-default port when configured. Host spelling and default ports are normalized for matching. Paths, queries, fragments, and credentials are not allowed."
+        },
+        "route_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+          "description": "Stable logical proxy route ID selected from validated configuration before RBAC. Physical endpoint selection, health, and weights do not affect this identity."
         }
       },
       "allOf": [
@@ -221,8 +229,17 @@
           },
           "then": {
             "not": {
-              "required": [
-                "upstream_origin"
+              "anyOf": [
+                {
+                  "required": [
+                    "upstream_origin"
+                  ]
+                },
+                {
+                  "required": [
+                    "route_id"
+                  ]
+                }
               ]
             }
           }
@@ -238,7 +255,31 @@
           "then": {
             "required": [
               "upstream_origin"
-            ]
+            ],
+            "not": {
+              "required": [
+                "route_id"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "route"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "route_id"
+            ],
+            "not": {
+              "required": [
+                "upstream_origin"
+              ]
+            }
           }
         }
       ]

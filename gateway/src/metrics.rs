@@ -2,3 +2,7 @@ pub const LOCK_POISON_RECOVERIES_TOTAL: &str = "lock_poison_recoveries_total";
 pub const EGRESS_CLIENT_CACHE_REQUESTS_TOTAL: &str = "egress_client_cache_requests_total";
 pub const EGRESS_CLIENT_CACHE_EVICTIONS_TOTAL: &str = "egress_client_cache_evictions_total";
 pub const EGRESS_CLIENT_CACHE_ENTRIES: &str = "egress_client_cache_entries";
+pub const PROXY_ADMISSION_ACTIVE: &str = "proxy_admission_active";
+pub const PROXY_ADMISSION_QUEUED: &str = "proxy_admission_queued";
+pub const PROXY_ADMISSION_REJECTIONS_TOTAL: &str = "proxy_admission_rejections_total";
+pub const PROXY_ENDPOINT_SELECTIONS_TOTAL: &str = "proxy_endpoint_selections_total";

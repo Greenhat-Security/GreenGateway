@@ -4,6 +4,16 @@ use http::{header, HeaderMap};
 
 use crate::path_match::path_prefix_matches;
 
+pub(crate) const STABLE_ROUTE_ID_MAX_LEN: usize = 64;
+
+pub(crate) fn is_valid_stable_route_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= STABLE_ROUTE_ID_MAX_LEN
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+        })
+}
+
 pub(crate) trait RouteMatch {
     fn path_prefix(&self) -> Option<&str>;
     fn host(&self) -> Option<&str>;
@@ -11,6 +21,7 @@ pub(crate) trait RouteMatch {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProxyRouteAuthorizationContext {
+    pub(crate) route_id: Option<String>,
     pub(crate) host: String,
     pub(crate) path_prefix: Option<String>,
     pub(crate) upstream_origin: String,
@@ -18,6 +29,7 @@ pub(crate) struct ProxyRouteAuthorizationContext {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProxyRouteObservationContext {
+    pub(crate) route_id: Option<String>,
     pub(crate) route_host: Option<String>,
     pub(crate) route_path_prefix: Option<String>,
     pub(crate) upstream_origin: String,
@@ -27,12 +39,28 @@ pub(crate) struct ProxyRouteObservationContext {
 pub(crate) struct ProxyRouteClassificationCompleted;
 
 impl ProxyRouteObservationContext {
+    #[cfg(test)]
     pub(crate) fn new(
         route_host: Option<String>,
         route_path_prefix: Option<String>,
         upstream_origin: String,
     ) -> Self {
         Self {
+            route_id: None,
+            route_host,
+            route_path_prefix,
+            upstream_origin,
+        }
+    }
+
+    pub(crate) fn new_with_route_id(
+        route_id: String,
+        route_host: Option<String>,
+        route_path_prefix: Option<String>,
+        upstream_origin: String,
+    ) -> Self {
+        Self {
+            route_id: Some(route_id),
             route_host,
             route_path_prefix,
             upstream_origin,
@@ -40,21 +68,30 @@ impl ProxyRouteObservationContext {
     }
 
     pub(crate) fn authorization_context(&self) -> Option<ProxyRouteAuthorizationContext> {
-        Some(ProxyRouteAuthorizationContext::new(
-            self.route_host.clone()?,
-            self.route_path_prefix.clone(),
-            self.upstream_origin.clone(),
-        ))
+        Some(
+            ProxyRouteAuthorizationContext::new(
+                self.route_host.clone()?,
+                self.route_path_prefix.clone(),
+                self.upstream_origin.clone(),
+            )
+            .with_route_id(self.route_id.clone()),
+        )
     }
 }
 
 impl ProxyRouteAuthorizationContext {
     pub(crate) fn new(host: String, path_prefix: Option<String>, upstream_origin: String) -> Self {
         Self {
+            route_id: None,
             host,
             path_prefix,
             upstream_origin,
         }
+    }
+
+    fn with_route_id(mut self, route_id: Option<String>) -> Self {
+        self.route_id = route_id;
+        self
     }
 }
 

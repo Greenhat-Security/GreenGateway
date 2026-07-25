@@ -59,12 +59,14 @@ pub struct PrincipalMatcher {
 pub enum RuleDispatchKind {
     Contextless,
     Legacy,
+    Route,
 }
 
 /// Optional proxy-dispatch provenance for an HTTP firewall rule.
 ///
 /// Presence binds a rule either to classified traffic with no selected proxy
-/// dispatch, or to the legacy fallback upstream at the configured origin.
+/// dispatch, to the legacy fallback upstream at the configured origin, or to
+/// a stable logical proxy route.
 /// Omitting `dispatch` preserves the historical globally scoped behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +78,12 @@ pub struct RuleDispatchMatcher {
         skip_serializing_if = "Option::is_none"
     )]
     pub upstream_origin: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub route_id: Option<String>,
 }
 
 impl RuleDispatchMatcher {
@@ -83,6 +91,7 @@ impl RuleDispatchMatcher {
         Self {
             kind: RuleDispatchKind::Contextless,
             upstream_origin: None,
+            route_id: None,
         }
     }
 
@@ -90,6 +99,15 @@ impl RuleDispatchMatcher {
         Self {
             kind: RuleDispatchKind::Legacy,
             upstream_origin: Some(upstream_origin),
+            route_id: None,
+        }
+    }
+
+    pub fn route(route_id: String) -> Self {
+        Self {
+            kind: RuleDispatchKind::Route,
+            upstream_origin: None,
+            route_id: Some(route_id),
         }
     }
 }
@@ -168,7 +186,8 @@ pub struct Rule {
     pub tool_name: Option<String>,
     /// Optional dispatch provenance. `kind: "contextless"` restricts the rule
     /// to classified requests without proxy dispatch; `kind: "legacy"` also
-    /// requires the configured fallback origin and excludes routed upstreams.
+    /// requires the configured fallback origin and excludes routed upstreams;
+    /// `kind: "route"` binds to one stable logical proxy route ID.
     /// Omitted means any dispatch context for backward compatibility.
     #[serde(
         default,

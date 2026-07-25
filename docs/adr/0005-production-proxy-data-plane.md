@@ -172,7 +172,7 @@ Later pool configuration is additive and uses these exact field names:
 }
 ```
 
-`UPSTREAM_URL` stays a legacy catch-all. A route's existing `upstream_url` maps to one endpoint of weight 1 and is mutually exclusive with `upstreams`. Legacy behavior remains one attempt, no circuit breaker, current buffered request behavior, and current health behavior until explicitly migrated.
+`UPSTREAM_URL` stays a legacy catch-all. A route's existing `upstream_url` maps to endpoint `primary` with weight 1 and is mutually exclusive with `upstreams`. New pools require a stable route ID and stable endpoint IDs. Selection uses a deterministic weighted sequence over configuration-owned endpoints only; request headers, path captures, queries, and bodies cannot influence it. Every pool has hard in-flight and queue bounds. Admission occurs after authorization and before physical endpoint selection, DNS, or dialing; queue saturation and queue timeout return a sanitized `503`, and cancellation drops queue/in-flight permits. Legacy behavior remains one attempt, no circuit breaker, buffered request behavior, and current health behavior until explicitly migrated.
 
 Checklist item 1 and later schema evolution continue accepting a legacy-only configuration without requiring any new field or applying new pool validation to it.
 

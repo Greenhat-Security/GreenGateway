@@ -1,4 +1,4 @@
-use std::{collections::HashSet, error::Error, fmt, net::IpAddr, time::Instant};
+use std::{collections::HashSet, error::Error, fmt, net::IpAddr, sync::Arc, time::Instant};
 
 use axum::{
     body::Body,
@@ -68,7 +68,6 @@ async fn forward_to_upstream(
     source_ip: &str,
 ) -> Response {
     let (parts, body) = request.into_parts();
-    let target_url = proxy_target_url(&upstream.upstream_origin, &parts.uri);
     let mut headers = strip_hop_by_hop_headers(&parts.headers);
     strip_gateway_credentials(&mut headers);
     if let Some(request_id) = parts.headers.get(REQUEST_ID_HEADER) {
@@ -85,14 +84,29 @@ async fn forward_to_upstream(
         Ok(length) => length,
         Err(()) => return invalid_request_body(),
     };
+    if known_length.is_some_and(|size| size > proxy.max_request_body_bytes as u64) {
+        if let Some(payload_capture) = payload_capture.as_ref() {
+            payload_capture.mark_body_capture_incomplete();
+        }
+        return crate::payload_too_large(proxy.max_request_body_bytes);
+    }
+    let admission_permit = match upstream.pool.admission.acquire().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            let reason = match error {
+                super::admission::PoolAdmissionError::QueueFull => "queue_full",
+                super::admission::PoolAdmissionError::QueueTimeout => "queue_timeout",
+            };
+            tracing::warn!(
+                pool_id = upstream.pool.id.as_ref(),
+                error_category = reason,
+                "proxied request rejected by bounded admission"
+            );
+            return admission_unavailable_response(&upstream.pool.id, request_id);
+        }
+    };
     let body = match upstream.request_body_mode {
         RequestBodyMode::Buffered => {
-            if known_length.is_some_and(|size| size > proxy.max_request_body_bytes as u64) {
-                if let Some(payload_capture) = payload_capture.as_ref() {
-                    payload_capture.mark_body_capture_incomplete();
-                }
-                return crate::payload_too_large(proxy.max_request_body_bytes);
-            }
             match axum::body::to_bytes(body, proxy.max_request_body_bytes).await {
                 Ok(body) => {
                     if let Some(payload_capture) = payload_capture.as_ref() {
@@ -123,8 +137,21 @@ async fn forward_to_upstream(
         ),
     };
 
+    let endpoint = upstream.pool.select_endpoint();
+    ::metrics::counter!(
+        crate::metrics::PROXY_ENDPOINT_SELECTIONS_TOTAL,
+        "pool_id" => Arc::clone(&upstream.pool.id),
+        "endpoint_id" => Arc::clone(&endpoint.id)
+    )
+    .increment(1);
+    tracing::debug!(
+        pool_id = upstream.pool.id.as_ref(),
+        endpoint_id = endpoint.id.as_ref(),
+        "selected configured upstream endpoint"
+    );
+    let target_url = proxy_target_url(&endpoint.upstream_origin, &parts.uri);
     let upstream_started = Instant::now();
-    let upstream = match upstream
+    let upstream_response = match endpoint
         .egress_client
         .stream_request_with_body(parts.method, &target_url, headers, body)
         .await
@@ -136,13 +163,19 @@ async fn forward_to_upstream(
                 error_category = err.safe_category(),
                 "proxied upstream request failed"
             );
-            return error_response_with_outcome(&err, latency_ms, request_id);
+            return error_response_with_outcome(
+                &err,
+                latency_ms,
+                request_id,
+                &upstream.pool.id,
+                &endpoint.id,
+            );
         }
     };
     let upstream_latency_ms = crate::duration_millis(upstream_started.elapsed());
-    let upstream_status = upstream.status;
-    let upstream_headers = strip_hop_by_hop_headers(&upstream.headers);
-    let mut upstream_body = upstream.body;
+    let upstream_status = upstream_response.status;
+    let upstream_headers = strip_hop_by_hop_headers(&upstream_response.headers);
+    let mut upstream_body = upstream_response.body;
     let first_chunk = match upstream_body.next().await {
         Some(Ok(chunk)) => Some(chunk),
         Some(Err(err)) => {
@@ -151,12 +184,18 @@ async fn forward_to_upstream(
                 error_category = err.safe_category(),
                 "proxied upstream response body failed"
             );
-            return error_response_with_outcome(&err, latency_ms, request_id);
+            return error_response_with_outcome(
+                &err,
+                latency_ms,
+                request_id,
+                &upstream.pool.id,
+                &endpoint.id,
+            );
         }
         None => None,
     };
     let response_body = match first_chunk {
-        Some(chunk) => redacted_response_body(chunk, upstream_body),
+        Some(chunk) => redacted_response_body(chunk, upstream_body, admission_permit),
         None => Body::empty(),
     };
     let mut response = Response::new(response_body);
@@ -167,6 +206,8 @@ async fn forward_to_upstream(
         .insert(middleware::decision::UpstreamOutcome {
             latency_ms: upstream_latency_ms,
             status: Some(upstream_status.as_u16()),
+            pool_id: Some(upstream.pool.id.to_string()),
+            endpoint_id: Some(endpoint.id.to_string()),
         });
     if let Some(request_id) = request_id {
         response
@@ -180,8 +221,10 @@ async fn forward_to_upstream(
 fn redacted_response_body(
     first_chunk: bytes::Bytes,
     upstream_body: egress::EgressBodyStream,
+    admission_permit: super::admission::PoolAdmissionPermit,
 ) -> Body {
-    let redacted_tail = upstream_body.map(|result| {
+    let redacted_tail = upstream_body.map(move |result| {
+        let _hold_permit = &admission_permit;
         result.map_err(|error| {
             let category = error.safe_category();
             tracing::warn!(
@@ -202,6 +245,8 @@ fn error_response_with_outcome(
     error: &egress::EgressError,
     latency_ms: u64,
     request_id: Option<HeaderValue>,
+    pool_id: &str,
+    endpoint_id: &str,
 ) -> Response {
     let mut response = proxy_error_response(error);
     response
@@ -209,6 +254,30 @@ fn error_response_with_outcome(
         .insert(middleware::decision::UpstreamOutcome {
             latency_ms,
             status: None,
+            pool_id: Some(pool_id.to_owned()),
+            endpoint_id: Some(endpoint_id.to_owned()),
+        });
+    if let Some(request_id) = request_id {
+        response
+            .headers_mut()
+            .insert(request_id_header(), request_id);
+    }
+    response
+}
+
+fn admission_unavailable_response(pool_id: &str, request_id: Option<HeaderValue>) -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "service_unavailable" })),
+    )
+        .into_response();
+    response
+        .extensions_mut()
+        .insert(middleware::decision::UpstreamOutcome {
+            latency_ms: 0,
+            status: None,
+            pool_id: Some(pool_id.to_owned()),
+            endpoint_id: None,
         });
     if let Some(request_id) = request_id {
         response
@@ -558,8 +627,20 @@ mod tests {
                 "https://secret.example/private?token=secret-query at 10.0.0.1".to_owned(),
             ))
         }));
-        let body = redacted_response_body(bytes::Bytes::from_static(b"first"), upstream_body);
+        let admission = super::super::admission::PoolAdmission::new(
+            Arc::from("test"),
+            1,
+            0,
+            std::time::Duration::from_millis(10),
+        );
+        let permit = admission.acquire().await.expect("test admission");
+        let body =
+            redacted_response_body(bytes::Bytes::from_static(b"first"), upstream_body, permit);
         let mut body = body.into_data_stream();
+        assert!(matches!(
+            admission.acquire().await,
+            Err(super::super::admission::PoolAdmissionError::QueueFull)
+        ));
 
         assert_eq!(
             body.next()
@@ -573,6 +654,15 @@ mod tests {
             .await
             .expect("tail error should exist")
             .expect_err("tail error should remain an error");
+        assert!(matches!(
+            admission.acquire().await,
+            Err(super::super::admission::PoolAdmissionError::QueueFull)
+        ));
+        drop(body);
+        admission
+            .acquire()
+            .await
+            .expect("dropping response stream should release admission");
         drop(_guard);
 
         let output = format!("{error} {}", logs.contents());
