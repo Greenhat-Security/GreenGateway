@@ -25,4 +25,6 @@ pub struct PolicyDecision {
 pub struct UpstreamOutcome {
     pub latency_ms: u64,
     pub status: Option<u16>,
+    pub pool_id: Option<String>,
+    pub endpoint_id: Option<String>,
 }

@@ -1212,13 +1212,23 @@ fn gateway_app_with_process_started_at_and_overrides(
         .collect::<Vec<_>>();
     configured_suggestion_routes.extend(config.upstream_routes.iter().enumerate().map(
         |(index, route)| {
-            discovery::suggestions::ConfiguredProxyRoute::new(
-                route.host.clone(),
-                route.path_prefix.clone(),
+            let logical_origin = if route.upstreams.is_empty() {
                 proxy::upstream_origin_from_url(
                     &route.upstream_url,
                     &format!("UPSTREAM_ROUTES[{index}].upstream_url"),
-                ),
+                )
+            } else {
+                proxy::logical_pool_origin(
+                    route
+                        .id
+                        .as_deref()
+                        .expect("validated upstream pool route must have an id"),
+                )
+            };
+            discovery::suggestions::ConfiguredProxyRoute::new(
+                route.host.clone(),
+                route.path_prefix.clone(),
+                logical_origin,
             )
         },
     ));
@@ -8493,9 +8503,14 @@ mod tests {
         upstream_addr: std::net::SocketAddr,
     ) -> config::UpstreamRouteConfig {
         config::UpstreamRouteConfig {
+            id: None,
             path_prefix: path_prefix.map(str::to_owned),
             host: host.map(str::to_owned),
             upstream_url: format!("http://127.0.0.1:{}/ignored-base", upstream_addr.port()),
+            upstreams: Vec::new(),
+            load_balancing: config::UpstreamLoadBalancingConfig::default(),
+            request_body: config::UpstreamRequestBodyConfig::default(),
+            limits: config::UpstreamPoolLimitsConfig::default(),
             timeout_ms: None,
             response_idle_timeout_ms: None,
             connect_timeout_ms: None,
@@ -9665,6 +9680,114 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn proxy_pool_uses_deterministic_weights_without_cross_route_selection() {
+        let (first_addr, mut first_captured) = spawn_capture_upstream().await;
+        let (second_addr, mut second_captured) = spawn_capture_upstream().await;
+        let mut pooled_route = path_route("/pool", first_addr);
+        pooled_route.id = Some("pool-route".to_owned());
+        pooled_route.upstream_url.clear();
+        pooled_route.upstreams = vec![
+            config::UpstreamEndpointConfig {
+                id: "first".to_owned(),
+                url: format!("http://127.0.0.1:{}", first_addr.port()),
+                weight: 3,
+                tls_ca_bundle_path: None,
+            },
+            config::UpstreamEndpointConfig {
+                id: "second".to_owned(),
+                url: format!("http://127.0.0.1:{}", second_addr.port()),
+                weight: 1,
+                tls_ca_bundle_path: None,
+            },
+        ];
+        let capture = audit::sink::tests::CaptureSink::default();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = proxy_router(routing_proxy_config(vec![pooled_route]), audit_log);
+        let health = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("health request should build"),
+            )
+            .await
+            .expect("health request should complete");
+        let health = json_body(health).await;
+        let public_ids = health["upstream"]["upstreams"]
+            .as_array()
+            .expect("pool health should list endpoints")
+            .iter()
+            .map(|entry| entry["origin"].as_str().expect("safe id"))
+            .collect::<Vec<_>>();
+        assert_eq!(public_ids, ["pool-route.first", "pool-route.second"]);
+        assert!(!health.to_string().contains("127.0.0.1"));
+
+        for _ in 0..8 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/pool/item")
+                        .body(Body::empty())
+                        .expect("pooled request should build"),
+                )
+                .await
+                .expect("pooled request should complete");
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        for _ in 0..6 {
+            let request =
+                next_proxied_request(&mut first_captured, "weighted first endpoint").await;
+            assert_eq!(request.path_and_query, "/pool/item");
+        }
+        for _ in 0..2 {
+            let request =
+                next_proxied_request(&mut second_captured, "weighted second endpoint").await;
+            assert_eq!(request.path_and_query, "/pool/item");
+        }
+        assert_upstream_receives_no_request(&mut first_captured, "first endpoint exact weight")
+            .await;
+        assert_upstream_receives_no_request(&mut second_captured, "second endpoint exact weight")
+            .await;
+        assert_eventually(Duration::from_secs(1), || {
+            capture
+                .events()
+                .iter()
+                .filter(|event| {
+                    event.event_type == "http.request_observed"
+                        && event.payload["path"] == json!("/pool/item")
+                })
+                .count()
+                == 8
+        });
+        let observations = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "http.request_observed"
+                    && event.payload["path"] == json!("/pool/item")
+            })
+            .collect::<Vec<_>>();
+        assert!(observations.iter().all(|event| {
+            event.payload["upstream_route_id"] == json!("pool-route")
+                && event.payload["upstream_pool_id"] == json!("pool-route")
+                && event.payload["upstream_origin"] == json!("pool:pool-route")
+        }));
+        let first_count = observations
+            .iter()
+            .filter(|event| event.payload["upstream_endpoint_id"] == json!("first"))
+            .count();
+        let second_count = observations
+            .iter()
+            .filter(|event| event.payload["upstream_endpoint_id"] == json!("second"))
+            .count();
+        assert_eq!((first_count, second_count), (6, 2));
     }
 
     #[tokio::test]
@@ -14122,6 +14245,9 @@ mod tests {
         assert_eq!(observed.payload["status"], json!(201));
         assert_eq!(observed.payload["upstream_status"], json!(201));
         assert!(observed.payload["upstream_latency_ms"].as_u64().is_some());
+        assert_eq!(observed.payload["upstream_route_id"], json!("legacy"));
+        assert_eq!(observed.payload["upstream_pool_id"], json!("legacy"));
+        assert_eq!(observed.payload["upstream_endpoint_id"], json!("primary"));
     }
 
     #[tokio::test]

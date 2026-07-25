@@ -300,6 +300,9 @@ fn observation_payload(input: ObservationPayloadInput<'_>) -> Value {
 
     if let Some(route) = input.upstream_route {
         payload.insert("upstream_origin".to_owned(), json!(route.upstream_origin));
+        if let Some(route_id) = route.route_id.as_deref() {
+            payload.insert("upstream_route_id".to_owned(), json!(route_id));
+        }
         if let Some(host) = route.route_host.as_deref() {
             payload.insert("upstream_route_host".to_owned(), json!(host));
         }
@@ -329,6 +332,12 @@ fn observation_payload(input: ObservationPayloadInput<'_>) -> Value {
 
         if let Some(status) = outcome.status {
             payload.insert("upstream_status".to_owned(), json!(status));
+        }
+        if let Some(pool_id) = outcome.pool_id.as_deref() {
+            payload.insert("upstream_pool_id".to_owned(), json!(pool_id));
+        }
+        if let Some(endpoint_id) = outcome.endpoint_id.as_deref() {
+            payload.insert("upstream_endpoint_id".to_owned(), json!(endpoint_id));
         }
     }
 
@@ -2135,6 +2144,8 @@ paths:
             .insert(crate::middleware::decision::UpstreamOutcome {
                 latency_ms: 42,
                 status: Some(201),
+                pool_id: None,
+                endpoint_id: None,
             });
         response
             .extensions_mut()

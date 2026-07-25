@@ -388,11 +388,20 @@ impl EgressConfig {
             &mut auto_seeded_hosts,
         );
         for route in &config.upstream_routes {
-            auto_seed_endpoint_host(
-                Some(route.upstream_url.as_str()),
-                &mut allowed_hosts,
-                &mut auto_seeded_hosts,
-            );
+            if !route.upstream_url.is_empty() {
+                auto_seed_endpoint_host(
+                    Some(route.upstream_url.as_str()),
+                    &mut allowed_hosts,
+                    &mut auto_seeded_hosts,
+                );
+            }
+            for endpoint in &route.upstreams {
+                auto_seed_endpoint_host(
+                    Some(endpoint.url.as_str()),
+                    &mut allowed_hosts,
+                    &mut auto_seeded_hosts,
+                );
+            }
         }
 
         if !auto_seeded_hosts.is_empty() {
@@ -2438,9 +2447,14 @@ mod tests {
         let mut config = test_config();
         config.upstream_routes = vec![
             crate::config::UpstreamRouteConfig {
+                id: None,
                 path_prefix: Some("/api".to_owned()),
                 host: None,
                 upstream_url: "https://api-upstream.example.test/base".to_owned(),
+                upstreams: Vec::new(),
+                load_balancing: crate::config::UpstreamLoadBalancingConfig::default(),
+                request_body: crate::config::UpstreamRequestBodyConfig::default(),
+                limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 timeout_ms: None,
                 response_idle_timeout_ms: None,
                 connect_timeout_ms: None,
@@ -2450,9 +2464,44 @@ mod tests {
                 openapi_spec_path: None,
             },
             crate::config::UpstreamRouteConfig {
+                id: None,
                 path_prefix: Some("/assets".to_owned()),
                 host: None,
                 upstream_url: "http://assets-upstream.example.test".to_owned(),
+                upstreams: Vec::new(),
+                load_balancing: crate::config::UpstreamLoadBalancingConfig::default(),
+                request_body: crate::config::UpstreamRequestBodyConfig::default(),
+                limits: crate::config::UpstreamPoolLimitsConfig::default(),
+                timeout_ms: None,
+                response_idle_timeout_ms: None,
+                connect_timeout_ms: None,
+                add_request_headers: HashMap::new(),
+                strip_request_headers: Vec::new(),
+                tls_ca_bundle_path: None,
+                openapi_spec_path: None,
+            },
+            crate::config::UpstreamRouteConfig {
+                id: Some("payments".to_owned()),
+                path_prefix: Some("/payments".to_owned()),
+                host: None,
+                upstream_url: String::new(),
+                upstreams: vec![
+                    crate::config::UpstreamEndpointConfig {
+                        id: "payments-a".to_owned(),
+                        url: "https://payments-a.example.test".to_owned(),
+                        weight: 3,
+                        tls_ca_bundle_path: None,
+                    },
+                    crate::config::UpstreamEndpointConfig {
+                        id: "payments-b".to_owned(),
+                        url: "https://payments-b.example.test".to_owned(),
+                        weight: 1,
+                        tls_ca_bundle_path: None,
+                    },
+                ],
+                load_balancing: crate::config::UpstreamLoadBalancingConfig::default(),
+                request_body: crate::config::UpstreamRequestBodyConfig::default(),
+                limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 timeout_ms: None,
                 response_idle_timeout_ms: None,
                 connect_timeout_ms: None,
@@ -2469,6 +2518,8 @@ mod tests {
         assert!(egress
             .allowed_hosts
             .contains("assets-upstream.example.test"));
+        assert!(egress.allowed_hosts.contains("payments-a.example.test"));
+        assert!(egress.allowed_hosts.contains("payments-b.example.test"));
     }
 
     #[test]

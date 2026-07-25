@@ -239,10 +239,21 @@ pub struct McpUpstreamServerConfig {
 #[serde(deny_unknown_fields)]
 pub struct UpstreamRouteConfig {
     #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
     pub path_prefix: Option<String>,
     #[serde(default)]
     pub host: Option<String>,
+    #[serde(default)]
     pub upstream_url: String,
+    #[serde(default)]
+    pub upstreams: Vec<UpstreamEndpointConfig>,
+    #[serde(default)]
+    pub load_balancing: UpstreamLoadBalancingConfig,
+    #[serde(default)]
+    pub request_body: UpstreamRequestBodyConfig,
+    #[serde(default)]
+    pub limits: UpstreamPoolLimitsConfig,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
@@ -257,6 +268,87 @@ pub struct UpstreamRouteConfig {
     pub tls_ca_bundle_path: Option<PathBuf>,
     #[serde(default)]
     pub openapi_spec_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamEndpointConfig {
+    pub id: String,
+    pub url: String,
+    #[serde(default = "default_upstream_weight")]
+    pub weight: u16,
+    #[serde(default)]
+    pub tls_ca_bundle_path: Option<PathBuf>,
+}
+
+fn default_upstream_weight() -> u16 {
+    1
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamLoadBalancingStrategy {
+    #[default]
+    WeightedRoundRobin,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamLoadBalancingConfig {
+    #[serde(default)]
+    pub strategy: UpstreamLoadBalancingStrategy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamRequestBodyMode {
+    #[default]
+    Buffered,
+    Stream,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamRequestBodyConfig {
+    #[serde(default)]
+    pub mode: UpstreamRequestBodyMode,
+}
+
+pub const DEFAULT_UPSTREAM_MAX_IN_FLIGHT: usize = 128;
+pub const DEFAULT_UPSTREAM_QUEUE_DEPTH: usize = 256;
+pub const DEFAULT_UPSTREAM_QUEUE_TIMEOUT_MS: u64 = 100;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamPoolLimitsConfig {
+    #[serde(default = "default_upstream_max_in_flight")]
+    pub max_in_flight: usize,
+    #[serde(default = "default_upstream_queue_depth")]
+    pub queue_depth: usize,
+    #[serde(default = "default_upstream_queue_timeout_ms")]
+    pub queue_timeout_ms: u64,
+}
+
+impl Default for UpstreamPoolLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_in_flight: DEFAULT_UPSTREAM_MAX_IN_FLIGHT,
+            queue_depth: DEFAULT_UPSTREAM_QUEUE_DEPTH,
+            queue_timeout_ms: DEFAULT_UPSTREAM_QUEUE_TIMEOUT_MS,
+        }
+    }
+}
+
+fn default_upstream_max_in_flight() -> usize {
+    DEFAULT_UPSTREAM_MAX_IN_FLIGHT
+}
+
+fn default_upstream_queue_depth() -> usize {
+    DEFAULT_UPSTREAM_QUEUE_DEPTH
+}
+
+fn default_upstream_queue_timeout_ms() -> u64 {
+    DEFAULT_UPSTREAM_QUEUE_TIMEOUT_MS
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2003,7 +2095,7 @@ fn parse_upstream_routes(
         Ok(routes) => routes,
         Err(err) => {
             problems.push(format!(
-                "{name} must be a JSON array of route objects with optional path_prefix, optional host, required upstream_url, and optional per-route settings: {err}"
+                "{name} must be a JSON array of route objects with optional path_prefix/host and exactly one of upstream_url or upstreams: {err}"
             ));
             return Vec::new();
         }
@@ -2105,23 +2197,109 @@ fn validate_upstream_routes(
     routes: Vec<UpstreamRouteConfig>,
     problems: &mut Vec<String>,
 ) -> Vec<UpstreamRouteConfig> {
+    const MAX_UPSTREAM_ROUTES: usize = 128;
+    const MAX_ENDPOINTS_PER_ROUTE: usize = 32;
+    const MAX_ENDPOINT_WEIGHT: u16 = 1_000;
+    const MAX_IN_FLIGHT: usize = 4_096;
+    const MAX_QUEUE_DEPTH: usize = 16_384;
+    const MAX_QUEUE_TIMEOUT_MS: u64 = 60_000;
+
+    if routes.len() > MAX_UPSTREAM_ROUTES {
+        problems.push(format!(
+            "{name} must contain at most {MAX_UPSTREAM_ROUTES} routes"
+        ));
+    }
     let mut validated = Vec::with_capacity(routes.len());
     let mut seen_matchers = HashMap::<(Option<String>, Option<String>), usize>::new();
+    let mut seen_ids = HashMap::<String, usize>::new();
 
     for (index, route) in routes.into_iter().enumerate() {
         let route_name = format!("{name}[{index}]");
+        let id = route
+            .id
+            .and_then(|id| normalize_stable_id(&format!("{route_name}.id"), &id, problems));
+        if let Some(id) = id.as_ref() {
+            if let Some(previous_index) = seen_ids.insert(id.clone(), index) {
+                problems.push(format!(
+                    "{route_name}.id duplicates {name}[{previous_index}].id"
+                ));
+            }
+        }
         let path_prefix = normalize_route_path_prefix(
             &format!("{route_name}.path_prefix"),
             route.path_prefix,
             problems,
         );
         let host = normalize_route_host(&format!("{route_name}.host"), route.host, problems);
-        let upstream_url = validate_upstream_url(
-            &format!("{route_name}.upstream_url"),
-            &route.upstream_url,
-            problems,
-        )
-        .unwrap_or_else(|| route.upstream_url.trim().to_owned());
+        let has_legacy_url = !route.upstream_url.trim().is_empty();
+        let has_pool = !route.upstreams.is_empty();
+        if has_legacy_url == has_pool {
+            problems.push(format!(
+                "{route_name} must set exactly one of upstream_url or a non-empty upstreams pool"
+            ));
+        }
+        if has_pool && id.is_none() {
+            problems.push(format!(
+                "{route_name}.id is required when upstreams is configured"
+            ));
+        }
+        if route.upstreams.len() > MAX_ENDPOINTS_PER_ROUTE {
+            problems.push(format!(
+                "{route_name}.upstreams must contain at most {MAX_ENDPOINTS_PER_ROUTE} endpoints"
+            ));
+        }
+
+        let upstream_url = if has_legacy_url {
+            validate_upstream_url(
+                &format!("{route_name}.upstream_url"),
+                &route.upstream_url,
+                problems,
+            )
+            .unwrap_or_else(|| route.upstream_url.trim().to_owned())
+        } else {
+            String::new()
+        };
+        let mut seen_endpoint_ids = HashMap::<String, usize>::new();
+        let upstreams = route
+            .upstreams
+            .into_iter()
+            .enumerate()
+            .map(|(endpoint_index, endpoint)| {
+                let endpoint_name = format!("{route_name}.upstreams[{endpoint_index}]");
+                let endpoint_id =
+                    normalize_stable_id(&format!("{endpoint_name}.id"), &endpoint.id, problems)
+                        .unwrap_or_else(|| endpoint.id.trim().to_owned());
+                if let Some(previous_index) =
+                    seen_endpoint_ids.insert(endpoint_id.clone(), endpoint_index)
+                {
+                    problems.push(format!(
+                        "{endpoint_name}.id duplicates {route_name}.upstreams[{previous_index}].id"
+                    ));
+                }
+                let url = validate_pool_endpoint_url(
+                    &format!("{endpoint_name}.url"),
+                    &endpoint.url,
+                    problems,
+                )
+                .unwrap_or_else(|| endpoint.url.trim().to_owned());
+                if endpoint.weight == 0 || endpoint.weight > MAX_ENDPOINT_WEIGHT {
+                    problems.push(format!(
+                        "{endpoint_name}.weight must be between 1 and {MAX_ENDPOINT_WEIGHT}"
+                    ));
+                }
+                let tls_ca_bundle_path = normalize_route_tls_ca_bundle_path(
+                    &format!("{endpoint_name}.tls_ca_bundle_path"),
+                    endpoint.tls_ca_bundle_path,
+                    problems,
+                );
+                UpstreamEndpointConfig {
+                    id: endpoint_id,
+                    url,
+                    weight: endpoint.weight,
+                    tls_ca_bundle_path,
+                }
+            })
+            .collect::<Vec<_>>();
         let add_request_headers = normalize_route_add_request_headers(
             &format!("{route_name}.add_request_headers"),
             route.add_request_headers,
@@ -2138,6 +2316,11 @@ fn validate_upstream_routes(
             route.tls_ca_bundle_path,
             problems,
         );
+        if has_pool && tls_ca_bundle_path.is_some() {
+            problems.push(format!(
+                "{route_name}.tls_ca_bundle_path must be configured per endpoint when upstreams is used"
+            ));
+        }
         let openapi_spec_path = normalize_route_openapi_spec_path(
             &format!("{route_name}.openapi_spec_path"),
             route.openapi_spec_path,
@@ -2164,10 +2347,48 @@ fn validate_upstream_routes(
             }
         }
 
+        if route.limits.max_in_flight == 0 || route.limits.max_in_flight > MAX_IN_FLIGHT {
+            problems.push(format!(
+                "{route_name}.limits.max_in_flight must be between 1 and {MAX_IN_FLIGHT}"
+            ));
+        }
+        if route.limits.queue_depth > MAX_QUEUE_DEPTH {
+            problems.push(format!(
+                "{route_name}.limits.queue_depth must be at most {MAX_QUEUE_DEPTH}"
+            ));
+        }
+        if route.limits.queue_timeout_ms == 0
+            || route.limits.queue_timeout_ms > MAX_QUEUE_TIMEOUT_MS
+        {
+            problems.push(format!(
+                "{route_name}.limits.queue_timeout_ms must be between 1 and {MAX_QUEUE_TIMEOUT_MS}"
+            ));
+        }
+        validate_optional_positive_duration(
+            &format!("{route_name}.timeout_ms"),
+            route.timeout_ms,
+            problems,
+        );
+        validate_optional_positive_duration(
+            &format!("{route_name}.response_idle_timeout_ms"),
+            route.response_idle_timeout_ms,
+            problems,
+        );
+        validate_optional_positive_duration(
+            &format!("{route_name}.connect_timeout_ms"),
+            route.connect_timeout_ms,
+            problems,
+        );
+
         validated.push(UpstreamRouteConfig {
+            id,
             path_prefix,
             host,
             upstream_url,
+            upstreams,
+            load_balancing: route.load_balancing,
+            request_body: route.request_body,
+            limits: route.limits,
             timeout_ms: route.timeout_ms,
             response_idle_timeout_ms: route.response_idle_timeout_ms,
             connect_timeout_ms: route.connect_timeout_ms,
@@ -2179,6 +2400,48 @@ fn validate_upstream_routes(
     }
 
     validated
+}
+
+fn normalize_stable_id(name: &str, value: &str, problems: &mut Vec<String>) -> Option<String> {
+    const MAX_ID_LEN: usize = 64;
+    let value = value.trim();
+    let valid = !value.is_empty()
+        && value.len() <= MAX_ID_LEN
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+        });
+    if valid {
+        Some(value.to_owned())
+    } else {
+        problems.push(format!(
+            "{name} must be 1-{MAX_ID_LEN} ASCII letters, digits, '.', '_', or '-', and must start with a letter or digit"
+        ));
+        None
+    }
+}
+
+fn validate_pool_endpoint_url(
+    name: &str,
+    value: &str,
+    problems: &mut Vec<String>,
+) -> Option<String> {
+    let normalized = validate_upstream_url(name, value, problems)?;
+    let parsed = url::Url::parse(&normalized).ok()?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        problems.push(format!(
+            "{name} must not contain userinfo, query, or fragment components"
+        ));
+        return None;
+    }
+    if parsed.path() != "/" {
+        problems.push(format!("{name} must be an origin URL without a base path"));
+        return None;
+    }
+    Some(normalized)
 }
 
 fn normalize_route_add_request_headers(
@@ -5008,9 +5271,14 @@ mod tests {
             config.upstream_routes,
             vec![
                 UpstreamRouteConfig {
+                    id: None,
                     path_prefix: Some("/api".to_owned()),
                     host: Some("api.example.test".to_owned()),
                     upstream_url: "https://api-upstream.example.test/base".to_owned(),
+                    upstreams: Vec::new(),
+                    load_balancing: UpstreamLoadBalancingConfig::default(),
+                    request_body: UpstreamRequestBodyConfig::default(),
+                    limits: UpstreamPoolLimitsConfig::default(),
                     timeout_ms: Some(1500),
                     response_idle_timeout_ms: Some(400),
                     connect_timeout_ms: Some(300),
@@ -5023,9 +5291,14 @@ mod tests {
                     openapi_spec_path: Some(PathBuf::from("specs/api.yaml")),
                 },
                 UpstreamRouteConfig {
+                    id: None,
                     path_prefix: Some("/assets".to_owned()),
                     host: None,
                     upstream_url: "http://assets.example.test".to_owned(),
+                    upstreams: Vec::new(),
+                    load_balancing: UpstreamLoadBalancingConfig::default(),
+                    request_body: UpstreamRequestBodyConfig::default(),
+                    limits: UpstreamPoolLimitsConfig::default(),
                     timeout_ms: None,
                     response_idle_timeout_ms: None,
                     connect_timeout_ms: None,
@@ -5036,6 +5309,83 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn upstream_pool_configuration_parses_with_stable_ids_and_bounds() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[{
+                    "id": "payments",
+                    "path_prefix": "/payments",
+                    "upstreams": [
+                        {"id":"payments-a","url":"https://a.example.test","weight":3},
+                        {"id":"payments-b","url":"https://b.example.test","weight":1}
+                    ],
+                    "load_balancing":{"strategy":"weighted_round_robin"},
+                    "request_body":{"mode":"stream"},
+                    "limits":{"max_in_flight":8,"queue_depth":4,"queue_timeout_ms":25}
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("pool config should parse");
+
+        let route = &config.upstream_routes[0];
+        assert_eq!(route.id.as_deref(), Some("payments"));
+        assert!(route.upstream_url.is_empty());
+        assert_eq!(route.upstreams.len(), 2);
+        assert_eq!(route.upstreams[0].id, "payments-a");
+        assert_eq!(route.upstreams[0].weight, 3);
+        assert_eq!(route.request_body.mode, UpstreamRequestBodyMode::Stream);
+        assert_eq!(route.limits.max_in_flight, 8);
+        assert_eq!(route.limits.queue_depth, 4);
+        assert_eq!(route.limits.queue_timeout_ms, 25);
+    }
+
+    #[test]
+    fn invalid_pool_configuration_aggregates_identity_and_bound_errors() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(
+                r#"[
+                    {
+                        "id":"bad id",
+                        "path_prefix":"/a",
+                        "upstream_url":"https://legacy.example.test",
+                        "upstreams":[
+                            {"id":"same","url":"https://user@a.example.test/path?secret=x","weight":0},
+                            {"id":"same","url":"https://b.example.test","weight":1001}
+                        ],
+                        "limits":{"max_in_flight":0,"queue_depth":20000,"queue_timeout_ms":0}
+                    },
+                    {
+                        "id":"bad id",
+                        "path_prefix":"/a",
+                        "upstreams":[]
+                    }
+                ]"#
+                    .to_owned(),
+            ),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("invalid pool config should fail startup");
+        let message = error.to_string();
+
+        for expected in [
+            ".id must be 1-64 ASCII",
+            "must set exactly one of upstream_url or a non-empty upstreams pool",
+            ".id duplicates",
+            "must not contain userinfo, query, or fragment",
+            ".weight must be between 1 and 1000",
+            ".limits.max_in_flight must be between 1 and 4096",
+            ".limits.queue_depth must be at most 16384",
+            ".limits.queue_timeout_ms must be between 1 and 60000",
+            "duplicates UPSTREAM_ROUTES[0] with the same host and path_prefix matcher",
+        ] {
+            assert!(
+                message.contains(expected),
+                "aggregated validation should contain '{expected}': {message}"
+            );
+        }
     }
 
     #[test]

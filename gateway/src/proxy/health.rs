@@ -32,6 +32,7 @@ pub(crate) struct UpstreamOriginHealthResponse {
 
 #[derive(Clone)]
 pub(super) struct UpstreamHealthTarget {
+    public_id: String,
     origin: String,
     egress_client: Arc<egress::EgressClient>,
     health: UpstreamHealthState,
@@ -73,14 +74,15 @@ impl UpstreamHealthState {
 }
 
 pub(super) fn upstream_health_targets(
-    upstream_origins: impl IntoIterator<Item = (String, Arc<egress::EgressClient>)>,
+    upstream_origins: impl IntoIterator<Item = (String, String, Arc<egress::EgressClient>)>,
 ) -> Vec<UpstreamHealthTarget> {
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
 
-    for (origin, egress_client) in upstream_origins {
-        if seen.insert(origin.clone()) {
+    for (public_id, origin, egress_client) in upstream_origins {
+        if seen.insert(public_id.clone()) {
             targets.push(UpstreamHealthTarget {
+                public_id,
                 origin,
                 egress_client,
                 health: UpstreamHealthState::new(),
@@ -113,7 +115,7 @@ pub(super) async fn upstream_health_response(
             for target in upstream_health {
                 let (reachable, last_checked) = target.health.response().await;
                 upstreams.push(UpstreamOriginHealthResponse {
-                    origin: target.origin.clone(),
+                    origin: target.public_id.clone(),
                     reachable,
                     last_checked,
                 });
