@@ -137,7 +137,14 @@ async fn forward_to_upstream(
         ),
     };
 
-    let endpoint = upstream.pool.select_endpoint();
+    let Some(endpoint) = upstream.pool.select_endpoint() else {
+        tracing::warn!(
+            pool_id = upstream.pool.id.as_ref(),
+            error_category = "no_healthy_endpoint",
+            "proxied request found no healthy upstream endpoint"
+        );
+        return admission_unavailable_response(&upstream.pool.id, request_id);
+    };
     ::metrics::counter!(
         crate::metrics::PROXY_ENDPOINT_SELECTIONS_TOTAL,
         "pool_id" => Arc::clone(&upstream.pool.id),
@@ -158,6 +165,9 @@ async fn forward_to_upstream(
     {
         Ok(response) => response,
         Err(err) => {
+            if let Some(config) = endpoint.health_config.as_deref() {
+                endpoint.health.record_passive_error(&err, config).await;
+            }
             let latency_ms = crate::duration_millis(upstream_started.elapsed());
             tracing::warn!(
                 error_category = err.safe_category(),
@@ -174,11 +184,20 @@ async fn forward_to_upstream(
     };
     let upstream_latency_ms = crate::duration_millis(upstream_started.elapsed());
     let upstream_status = upstream_response.status;
+    if let Some(config) = endpoint.health_config.as_deref() {
+        endpoint
+            .health
+            .record_passive_status(upstream_status.as_u16(), config)
+            .await;
+    }
     let upstream_headers = strip_hop_by_hop_headers(&upstream_response.headers);
     let mut upstream_body = upstream_response.body;
     let first_chunk = match upstream_body.next().await {
         Some(Ok(chunk)) => Some(chunk),
         Some(Err(err)) => {
+            if let Some(config) = endpoint.health_config.as_deref() {
+                endpoint.health.record_passive_error(&err, config).await;
+            }
             let latency_ms = crate::duration_millis(upstream_started.elapsed());
             tracing::warn!(
                 error_category = err.safe_category(),

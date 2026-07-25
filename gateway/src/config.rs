@@ -256,6 +256,8 @@ pub struct UpstreamRouteConfig {
     #[serde(default)]
     pub limits: UpstreamPoolLimitsConfig,
     #[serde(default)]
+    pub health_check: Option<UpstreamHealthCheckConfig>,
+    #[serde(default)]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub response_idle_timeout_ms: Option<u64>,
@@ -318,6 +320,13 @@ pub struct UpstreamRequestBodyConfig {
 pub const DEFAULT_UPSTREAM_MAX_IN_FLIGHT: usize = 128;
 pub const DEFAULT_UPSTREAM_QUEUE_DEPTH: usize = 256;
 pub const DEFAULT_UPSTREAM_QUEUE_TIMEOUT_MS: u64 = 100;
+const MIN_UPSTREAM_HEALTH_INTERVAL_MS: u64 = 100;
+const MAX_UPSTREAM_HEALTH_INTERVAL_MS: u64 = 3_600_000;
+const MIN_UPSTREAM_HEALTH_TIMEOUT_MS: u64 = 10;
+const MAX_UPSTREAM_HEALTH_TIMEOUT_MS: u64 = 60_000;
+const MAX_UPSTREAM_HEALTH_THRESHOLD: u32 = 1_000;
+const MAX_UPSTREAM_HEALTH_STATUSES: usize = 32;
+const MAX_UPSTREAM_HEALTH_PATH_LEN: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -350,6 +359,69 @@ fn default_upstream_queue_depth() -> usize {
 
 fn default_upstream_queue_timeout_ms() -> u64 {
     DEFAULT_UPSTREAM_QUEUE_TIMEOUT_MS
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamHealthCheckConfig {
+    #[serde(default = "default_health_method")]
+    pub method: String,
+    #[serde(default = "default_health_path")]
+    pub path: String,
+    #[serde(default = "default_health_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default)]
+    pub jitter_ms: u64,
+    #[serde(default = "default_health_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_healthy_threshold")]
+    pub healthy_threshold: u32,
+    #[serde(default = "default_unhealthy_threshold")]
+    pub unhealthy_threshold: u32,
+    #[serde(default = "default_expected_statuses")]
+    pub expected_statuses: Vec<u16>,
+    #[serde(default = "default_passive_failure_statuses")]
+    pub passive_failure_statuses: Vec<u16>,
+    #[serde(default)]
+    pub required_for_readiness: bool,
+    #[serde(default = "default_minimum_healthy")]
+    pub minimum_healthy: usize,
+}
+
+fn default_health_method() -> String {
+    "GET".to_owned()
+}
+
+fn default_health_path() -> String {
+    "/".to_owned()
+}
+
+fn default_health_interval_ms() -> u64 {
+    10_000
+}
+
+fn default_health_timeout_ms() -> u64 {
+    1_000
+}
+
+fn default_healthy_threshold() -> u32 {
+    2
+}
+
+fn default_unhealthy_threshold() -> u32 {
+    3
+}
+
+fn default_expected_statuses() -> Vec<u16> {
+    vec![200, 204]
+}
+
+fn default_passive_failure_statuses() -> Vec<u16> {
+    vec![500, 502, 503, 504]
+}
+
+fn default_minimum_healthy() -> usize {
+    1
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2380,6 +2452,89 @@ fn validate_upstream_routes(
             route.connect_timeout_ms,
             problems,
         );
+        if let Some(health) = route.health_check.as_ref() {
+            if !matches!(health.method.as_str(), "GET" | "HEAD") {
+                problems.push(format!(
+                    "{route_name}.health_check.method must be GET or HEAD"
+                ));
+            }
+            let valid_path = health.path.starts_with('/')
+                && health.path.len() <= MAX_UPSTREAM_HEALTH_PATH_LEN
+                && !health.path.contains('?')
+                && !health.path.contains('#')
+                && !crate::path_match::is_unsafe_request_path(&health.path);
+            if !valid_path {
+                problems.push(format!(
+                    "{route_name}.health_check.path must be a safe absolute path of at most {MAX_UPSTREAM_HEALTH_PATH_LEN} bytes without query or fragment"
+                ));
+            }
+            if !(MIN_UPSTREAM_HEALTH_INTERVAL_MS..=MAX_UPSTREAM_HEALTH_INTERVAL_MS)
+                .contains(&health.interval_ms)
+            {
+                problems.push(format!(
+                    "{route_name}.health_check.interval_ms must be between {MIN_UPSTREAM_HEALTH_INTERVAL_MS} and {MAX_UPSTREAM_HEALTH_INTERVAL_MS}"
+                ));
+            }
+            if !(MIN_UPSTREAM_HEALTH_TIMEOUT_MS..=MAX_UPSTREAM_HEALTH_TIMEOUT_MS)
+                .contains(&health.timeout_ms)
+                || health.timeout_ms > health.interval_ms
+            {
+                problems.push(format!(
+                    "{route_name}.health_check.timeout_ms must be between {MIN_UPSTREAM_HEALTH_TIMEOUT_MS} and {MAX_UPSTREAM_HEALTH_TIMEOUT_MS} and no greater than interval_ms"
+                ));
+            }
+            if health.jitter_ms >= health.interval_ms {
+                problems.push(format!(
+                    "{route_name}.health_check.jitter_ms must be less than interval_ms"
+                ));
+            }
+            if !(1..=MAX_UPSTREAM_HEALTH_THRESHOLD).contains(&health.healthy_threshold)
+                || !(1..=MAX_UPSTREAM_HEALTH_THRESHOLD).contains(&health.unhealthy_threshold)
+            {
+                problems.push(format!(
+                    "{route_name}.health_check thresholds must be between 1 and {MAX_UPSTREAM_HEALTH_THRESHOLD}"
+                ));
+            }
+            if health.expected_statuses.is_empty()
+                || health.expected_statuses.len() > MAX_UPSTREAM_HEALTH_STATUSES
+                || health
+                    .expected_statuses
+                    .iter()
+                    .any(|status| !(100..=599).contains(status))
+                || health
+                    .expected_statuses
+                    .iter()
+                    .collect::<HashSet<_>>()
+                    .len()
+                    != health.expected_statuses.len()
+            {
+                problems.push(format!(
+                    "{route_name}.health_check.expected_statuses must contain 1-{MAX_UPSTREAM_HEALTH_STATUSES} unique HTTP statuses from 100 through 599"
+                ));
+            }
+            if health.passive_failure_statuses.len() > MAX_UPSTREAM_HEALTH_STATUSES
+                || health
+                    .passive_failure_statuses
+                    .iter()
+                    .any(|status| !(500..=599).contains(status))
+                || health
+                    .passive_failure_statuses
+                    .iter()
+                    .collect::<HashSet<_>>()
+                    .len()
+                    != health.passive_failure_statuses.len()
+            {
+                problems.push(format!(
+                    "{route_name}.health_check.passive_failure_statuses must contain at most {MAX_UPSTREAM_HEALTH_STATUSES} unique HTTP statuses from 500 through 599"
+                ));
+            }
+            let endpoint_count = upstreams.len().max(1);
+            if health.minimum_healthy == 0 || health.minimum_healthy > endpoint_count {
+                problems.push(format!(
+                    "{route_name}.health_check.minimum_healthy must be between 1 and {endpoint_count}"
+                ));
+            }
+        }
 
         validated.push(UpstreamRouteConfig {
             id,
@@ -2390,6 +2545,7 @@ fn validate_upstream_routes(
             load_balancing: route.load_balancing,
             request_body: route.request_body,
             limits: route.limits,
+            health_check: route.health_check,
             timeout_ms: route.timeout_ms,
             response_idle_timeout_ms: route.response_idle_timeout_ms,
             connect_timeout_ms: route.connect_timeout_ms,
@@ -5275,6 +5431,7 @@ mod tests {
                     load_balancing: UpstreamLoadBalancingConfig::default(),
                     request_body: UpstreamRequestBodyConfig::default(),
                     limits: UpstreamPoolLimitsConfig::default(),
+                    health_check: None,
                     timeout_ms: Some(1500),
                     response_idle_timeout_ms: Some(400),
                     connect_timeout_ms: Some(300),
@@ -5295,6 +5452,7 @@ mod tests {
                     load_balancing: UpstreamLoadBalancingConfig::default(),
                     request_body: UpstreamRequestBodyConfig::default(),
                     limits: UpstreamPoolLimitsConfig::default(),
+                    health_check: None,
                     timeout_ms: None,
                     response_idle_timeout_ms: None,
                     connect_timeout_ms: None,
@@ -5319,7 +5477,20 @@ mod tests {
                     ],
                     "load_balancing":{"strategy":"weighted_round_robin"},
                     "request_body":{"mode":"stream"},
-                    "limits":{"max_in_flight":8,"queue_depth":4,"queue_timeout_ms":25}
+                    "limits":{"max_in_flight":8,"queue_depth":4,"queue_timeout_ms":25},
+                    "health_check":{
+                        "method":"HEAD",
+                        "path":"/ready",
+                        "interval_ms":5000,
+                        "jitter_ms":500,
+                        "timeout_ms":750,
+                        "healthy_threshold":3,
+                        "unhealthy_threshold":4,
+                        "expected_statuses":[200,204],
+                        "passive_failure_statuses":[500,502,503,504],
+                        "required_for_readiness":true,
+                        "minimum_healthy":2
+                    }
                 }]"#
             .to_owned()),
             _ => Err(VarError::NotPresent),
@@ -5336,6 +5507,68 @@ mod tests {
         assert_eq!(route.limits.max_in_flight, 8);
         assert_eq!(route.limits.queue_depth, 4);
         assert_eq!(route.limits.queue_timeout_ms, 25);
+        let health = route
+            .health_check
+            .as_ref()
+            .expect("health check should parse");
+        assert_eq!(health.method, "HEAD");
+        assert_eq!(health.path, "/ready");
+        assert_eq!(health.interval_ms, 5_000);
+        assert_eq!(health.jitter_ms, 500);
+        assert_eq!(health.timeout_ms, 750);
+        assert_eq!(health.healthy_threshold, 3);
+        assert_eq!(health.unhealthy_threshold, 4);
+        assert_eq!(health.expected_statuses, vec![200, 204]);
+        assert_eq!(health.passive_failure_statuses, vec![500, 502, 503, 504]);
+        assert!(health.required_for_readiness);
+        assert_eq!(health.minimum_healthy, 2);
+    }
+
+    #[test]
+    fn invalid_health_configuration_aggregates_conservative_bound_errors() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[{
+                    "id":"payments",
+                    "path_prefix":"/payments",
+                    "upstreams":[
+                        {"id":"a","url":"https://a.example.test"},
+                        {"id":"b","url":"https://b.example.test"}
+                    ],
+                    "health_check":{
+                        "method":"POST",
+                        "path":"/ready?token=secret",
+                        "interval_ms":99,
+                        "jitter_ms":100,
+                        "timeout_ms":0,
+                        "healthy_threshold":0,
+                        "unhealthy_threshold":1001,
+                        "expected_statuses":[200,200,700],
+                        "passive_failure_statuses":[404,500,500],
+                        "minimum_healthy":3
+                    }
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("unsafe health configuration should fail startup");
+        let message = error.to_string();
+
+        for expected in [
+            ".health_check.method must be GET or HEAD",
+            ".health_check.path must be a safe absolute path",
+            ".health_check.interval_ms must be between 100 and 3600000",
+            ".health_check.timeout_ms must be between 10 and 60000",
+            ".health_check.jitter_ms must be less than interval_ms",
+            ".health_check thresholds must be between 1 and 1000",
+            ".health_check.expected_statuses must contain 1-32 unique HTTP statuses",
+            ".health_check.passive_failure_statuses must contain at most 32 unique HTTP statuses",
+            ".health_check.minimum_healthy must be between 1 and 2",
+        ] {
+            assert!(
+                message.contains(expected),
+                "aggregated validation should contain '{expected}': {message}"
+            );
+        }
     }
 
     #[test]

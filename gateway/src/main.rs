@@ -350,6 +350,7 @@ struct StatusAdminState {
     rbac_state: Option<middleware::rbac::RbacState>,
     egress_allowed_hosts_count: usize,
     process_started_at: Instant,
+    proxy: Option<ProxyState>,
 }
 
 #[derive(Clone)]
@@ -516,6 +517,8 @@ struct StatusResponse {
     trust_proxy_headers: bool,
     csrf_enabled: bool,
     egress: EgressStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream: Option<proxy::UpstreamHealthAdminResponse>,
 }
 
 #[derive(Deserialize)]
@@ -1295,7 +1298,12 @@ fn gateway_app_with_process_started_at_and_overrides(
         proxy_egress_config.clone(),
         &build_overrides,
     )?);
-    let proxy_state = ProxyState::from_config(&config, &proxy_egress_config, proxy_egress_client)?;
+    let proxy_state = ProxyState::from_config(
+        &config,
+        &proxy_egress_config,
+        proxy_egress_client,
+        audit_log.clone(),
+    )?;
     #[cfg(test)]
     let proxy_state = match build_overrides.request_selection_count.as_ref() {
         Some(counter) => {
@@ -1422,6 +1430,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         rbac_state: rbac_state.clone(),
         egress_allowed_hosts_count,
         process_started_at,
+        proxy: proxy_state.clone(),
     };
     let policy_admin_state = PolicyAdminState {
         policy_file: config.policy_file.as_ref().map(PathBuf::from),
@@ -2508,7 +2517,7 @@ async fn status_endpoint(
         return status_admin_authz_error_response(error);
     }
 
-    Json(StatusResponse::from_state(&state)).into_response()
+    Json(StatusResponse::from_state(&state).await).into_response()
 }
 
 async fn policy_get_endpoint(
@@ -3744,8 +3753,12 @@ fn content_type_for_path(path: &str) -> HeaderValue {
 }
 
 impl StatusResponse {
-    fn from_state(state: &StatusAdminState) -> Self {
+    async fn from_state(state: &StatusAdminState) -> Self {
         let config = &state.config;
+        let upstream = match state.proxy.as_ref() {
+            Some(proxy) => Some(proxy.upstream_health_admin_response().await),
+            None => None,
+        };
 
         Self {
             version: env!("CARGO_PKG_VERSION"),
@@ -3777,6 +3790,7 @@ impl StatusResponse {
                 nat64_prefixes_count: config.egress_nat64_prefixes.len(),
                 deny_private_ips: config.egress_deny_private_ips,
             },
+            upstream,
         }
     }
 }
@@ -8534,6 +8548,7 @@ mod tests {
             load_balancing: config::UpstreamLoadBalancingConfig::default(),
             request_body: config::UpstreamRequestBodyConfig::default(),
             limits: config::UpstreamPoolLimitsConfig::default(),
+            health_check: None,
             timeout_ms: None,
             response_idle_timeout_ms: None,
             connect_timeout_ms: None,
@@ -8745,9 +8760,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             let body = json_body(response).await;
 
-            if body["upstream"]["reachable"] == json!(reachable)
-                && body["upstream"]["last_checked"].as_str().is_some()
-            {
+            if body["upstream"]["reachable"] == json!(reachable) {
                 return body;
             }
 
@@ -8759,32 +8772,20 @@ mod tests {
         }
     }
 
-    async fn wait_for_routing_upstream_health(
-        router: Router,
-        upstream_count: usize,
-        reachable: bool,
-    ) -> Value {
+    async fn wait_for_routing_upstream_health(router: Router, reachable: bool) -> Value {
         let started = Instant::now();
 
         loop {
             let response = health_response(router.clone()).await;
             assert_eq!(response.status(), StatusCode::OK);
             let body = json_body(response).await;
-            let upstreams = body["upstream"]["upstreams"].as_array();
-
-            if upstreams.is_some_and(|upstreams| {
-                upstreams.len() == upstream_count
-                    && upstreams.iter().all(|upstream| {
-                        upstream["reachable"] == json!(reachable)
-                            && upstream["last_checked"].as_str().is_some()
-                    })
-            }) {
+            if body["upstream"]["reachable"] == json!(reachable) {
                 return body;
             }
 
             assert!(
                 started.elapsed() < Duration::from_secs(2),
-                "routing upstream health did not report {upstream_count} upstreams as {reachable} before timeout: {body}"
+                "routing upstream health did not become {reachable} before timeout: {body}"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -8892,7 +8893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routing_table_health_reports_distinct_upstreams_without_duplicate_probes() {
+    async fn routing_table_health_is_aggregate_and_each_route_keeps_its_probe_identity() {
         let (first_addr, mut first_captured) = spawn_capture_upstream().await;
         let (second_addr, mut second_captured) = spawn_capture_upstream().await;
         let router = proxy_router(
@@ -8904,25 +8905,17 @@ mod tests {
             test_audit_log(),
         );
 
-        let body = wait_for_routing_upstream_health(router, 2, true).await;
-        let upstreams = body["upstream"]["upstreams"]
-            .as_array()
-            .expect("routing health should include upstream list");
+        let body = wait_for_routing_upstream_health(router, true).await;
         assert_eq!(body["status"], json!("ok"));
         assert_eq!(body["upstream"]["configured"], json!(true));
-        assert_eq!(
-            upstreams[0]["origin"],
-            json!(format!("http://127.0.0.1:{}", first_addr.port()))
-        );
-        assert_eq!(
-            upstreams[1]["origin"],
-            json!(format!("http://127.0.0.1:{}", second_addr.port()))
-        );
+        assert_eq!(body["upstream"]["reachable"], json!(true));
+        assert!(body["upstream"].get("upstreams").is_none());
+        assert!(!body.to_string().contains("127.0.0.1"));
 
         assert_eq!(
             health_probe_count(&mut first_captured).await,
-            1,
-            "duplicate route entries pointing at one origin should share one health loop"
+            2,
+            "separate route identities sharing an origin must retain separate health workers"
         );
         assert_eq!(health_probe_count(&mut second_captured).await, 1);
     }
@@ -9741,14 +9734,10 @@ mod tests {
             .await
             .expect("health request should complete");
         let health = json_body(health).await;
-        let public_ids = health["upstream"]["upstreams"]
-            .as_array()
-            .expect("pool health should list endpoints")
-            .iter()
-            .map(|entry| entry["origin"].as_str().expect("safe id"))
-            .collect::<Vec<_>>();
-        assert_eq!(public_ids, ["pool-route.first", "pool-route.second"]);
+        assert_eq!(health["upstream"]["configured"], json!(true));
+        assert!(health["upstream"].get("upstreams").is_none());
         assert!(!health.to_string().contains("127.0.0.1"));
+        assert!(!health.to_string().contains("pool-route"));
 
         for _ in 0..8 {
             let response = router

@@ -925,7 +925,23 @@ Legacy `upstream_url` uses the same validation as `UPSTREAM_URL` and maps intern
 
 When both active work and queue capacity are exhausted, or a queued request times out, GreenGateway returns `503 Service Unavailable` with `{"error":"service_unavailable"}`. These paths do not resolve DNS, select an endpoint, or send upstream bytes. Client cancellation releases queue and in-flight permits. Permits for streaming responses remain held until the response body completes or is dropped.
 
-The compatibility `/health` response does not expose pooled endpoint URLs. Until the dedicated health/readiness schema lands, its existing `upstreams[].origin` slot contains the bounded `<route-id>.<endpoint-id>` identity for pooled routes; legacy single-URL routes retain their existing response shape.
+`health_check` enables endpoint-specific active and passive health tracking for a route. Endpoints begin in `unknown` and are excluded from selection until they reach `healthy_threshold`; an endpoint remains eligible until it reaches `unhealthy_threshold`. If no endpoint is eligible, the route returns the sanitized `503 Service Unavailable` response without attempting a different logical route. The active-check fields and bounds are:
+
+- `method`: `GET` (default) or `HEAD`.
+- `path`: safe absolute path without a query or fragment, default `/`, maximum 1024 bytes.
+- `interval_ms`: interval between checks, default `10000`, range 100-3600000.
+- `jitter_ms`: centered per-check jitter, default `0`, and less than `interval_ms`.
+- `timeout_ms`: per-check timeout, default `1000`, range 10-60000 and no greater than `interval_ms`.
+- `healthy_threshold`: consecutive successes required for eligibility, default `2`, range 1-1000.
+- `unhealthy_threshold`: consecutive failures required for exclusion, default `3`, range 1-1000.
+- `expected_statuses`: unique active-check success statuses, default `[200,204]`, at most 32 values in 100-599.
+- `passive_failure_statuses`: unique proxied response statuses counted as failures, default `[500,502,503,504]`, at most 32 values in 500-599. Connection, DNS-resolution, request, and response-idle timeout failures also count; client/configuration and request-body errors do not.
+- `required_for_readiness`: whether this pool contributes to cached readiness, default `false`.
+- `minimum_healthy`: eligible endpoints required when readiness is evaluated, default `1`, from 1 through the route's endpoint count.
+
+Each logical route and endpoint has independent health state even if multiple entries use the same physical origin. Health workers retain cancellable task handles, and cancellation interrupts both sleeping and in-flight probes. State-change logs, audit events, and metrics are emitted only on threshold transitions and use bounded route and endpoint IDs plus safe error categories.
+
+The compatibility public `/health` response exposes only aggregate `configured` and `reachable` state; it never returns endpoint origins, IPs, paths, or identifiers. Detailed cached pool and endpoint state is part of the authenticated admin status response and requires `admin:status:read`.
 
 `request_body.mode` accepts `buffered` (default) or `stream`. Buffered mode preserves complete bounded validation before upstream forwarding. Stream mode is non-replayable, enforces the actual byte count with backpressure, and can send a bounded prefix before an unknown-length overflow is discovered.
 
@@ -951,7 +967,7 @@ Matching semantics: a route with both `host` and `path_prefix` requires both to 
 
 The proxy and RBAC middleware use the same route-selection implementation. For a selected host-qualified entry, the policy must contain a `routes` rule with the same request host in `hosts`. This prevents a permission granted for a shared path from being reused to reach a different virtual upstream selected by `Host`.
 
-Every distinct routing-table upstream origin is health-checked and auto-seeded into the egress allowlist. Duplicate route entries pointing at the same upstream origin share one health-check loop.
+Every configured route endpoint is health-checked independently and auto-seeded into the egress allowlist. Health checks use the same strict DNS/IP and TLS controls as proxy traffic.
 
 Example:
 
@@ -971,9 +987,26 @@ Example:
     "openapi_spec_path": "/etc/greengateway/api.openapi.yaml"
   },
   {
+    "id": "app",
     "host": "app.example.test",
     "path_prefix": "/",
-    "upstream_url": "https://app.internal.example"
+    "upstreams": [
+      {"id": "app-a", "url": "https://app-a.internal.example", "weight": 2},
+      {"id": "app-b", "url": "https://app-b.internal.example", "weight": 1}
+    ],
+    "health_check": {
+      "method": "GET",
+      "path": "/ready",
+      "interval_ms": 10000,
+      "jitter_ms": 1000,
+      "timeout_ms": 1000,
+      "healthy_threshold": 2,
+      "unhealthy_threshold": 3,
+      "expected_statuses": [200, 204],
+      "passive_failure_statuses": [500, 502, 503, 504],
+      "required_for_readiness": true,
+      "minimum_healthy": 1
+    }
   }
 ]
 ```
