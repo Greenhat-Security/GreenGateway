@@ -9,6 +9,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Security
 
+- Added a fail-closed request-body abstraction for buffered and streamed proxy
+  uploads. Streamed bodies are counted independently of `Content-Length`,
+  reject known oversize lengths before DNS, forward no more than the configured
+  byte ceiling, preserve backpressure and cancellation, and never turn
+  truncated discovery samples into schema evidence. Buffered proxying remains
+  the compatibility default until route/pool configuration exposes stream mode.
+
 - Outbound HTTP used by the egress client, reverse proxy, identity-provider
   discovery/session calls, and MCP upstream transport now ignores ambient
   `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and lowercase equivalents. This

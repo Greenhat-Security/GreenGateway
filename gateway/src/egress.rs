@@ -5,7 +5,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, LazyLock},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, LazyLock,
+    },
     time::Duration,
 };
 
@@ -104,6 +107,7 @@ pub enum EgressError {
     InvalidUrl(String),
     SchemeNotAllowed(String),
     RequestBodyTooLarge { size: usize, max: usize },
+    RequestBodyReadFailed,
     ResponseTooLarge { max: usize },
     ResponseIdleTimeout { timeout: Duration },
     InvalidTlsCaBundle { path: PathBuf, message: String },
@@ -133,6 +137,9 @@ impl fmt::Display for EgressError {
                     formatter,
                     "egress request body is too large: {size} > {max}"
                 )
+            }
+            Self::RequestBodyReadFailed => {
+                write!(formatter, "egress request body could not be read")
             }
             Self::ResponseTooLarge { max } => {
                 write!(formatter, "egress response body exceeded {max} bytes")
@@ -190,6 +197,7 @@ impl EgressError {
             Self::InvalidUrl(_) => "invalid_url",
             Self::SchemeNotAllowed(_) => "scheme_not_allowed",
             Self::RequestBodyTooLarge { .. } => "request_body_too_large",
+            Self::RequestBodyReadFailed => "request_body_read_failed",
             Self::ResponseTooLarge { .. } => "response_too_large",
             Self::ResponseIdleTimeout { .. } => "response_idle_timeout",
             Self::InvalidTlsCaBundle { .. } => "invalid_tls_ca_bundle",
@@ -200,6 +208,38 @@ impl EgressError {
             Self::Http(err) if err.is_decode() => "http_decode",
             Self::Http(err) if err.is_status() => "http_status",
             Self::Http(_) => "http_other",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EgressRequestBodySourceError;
+
+impl fmt::Display for EgressRequestBodySourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("request body source failed")
+    }
+}
+
+impl Error for EgressRequestBodySourceError {}
+
+pub(crate) type EgressRequestBodyStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, EgressRequestBodySourceError>> + Send>>;
+
+pub(crate) enum EgressRequestBody {
+    Empty,
+    Buffered(Vec<u8>),
+    Streaming {
+        stream: EgressRequestBodyStream,
+        known_length: Option<u64>,
+    },
+}
+
+impl EgressRequestBody {
+    pub(crate) fn streaming(stream: EgressRequestBodyStream, known_length: Option<u64>) -> Self {
+        Self::Streaming {
+            stream,
+            known_length,
         }
     }
 }
@@ -644,12 +684,25 @@ impl EgressClient {
         Ok(CheckedEgressDestination { host, pinned_addr })
     }
 
+    #[cfg(test)]
     pub async fn stream_request_with_headers(
         &self,
         method: Method,
         url: &str,
         headers: HeaderMap,
         body: Option<Vec<u8>>,
+    ) -> Result<EgressStreamResponse, EgressError> {
+        let body = body.map_or(EgressRequestBody::Empty, EgressRequestBody::Buffered);
+        self.stream_request_with_body(method, url, headers, body)
+            .await
+    }
+
+    pub(crate) async fn stream_request_with_body(
+        &self,
+        method: Method,
+        url: &str,
+        headers: HeaderMap,
+        body: EgressRequestBody,
     ) -> Result<EgressStreamResponse, EgressError> {
         let parsed = self.checked_url(url)?;
         let host = checked_host(
@@ -659,10 +712,7 @@ impl EgressClient {
         )?;
         let port = checked_port(&parsed)?;
         checked_policy_port(port, &self.config.allowed_ports)?;
-        enforce_request_body_size(
-            body.as_ref().map_or(0, Vec::len),
-            self.config.max_request_body_bytes,
-        )?;
+        body.enforce_known_size(self.config.max_request_body_bytes)?;
         let pinned_addr = self.resolve_and_check(&host, port).await?;
         let client = self.pinned_client(&parsed, &host, pinned_addr)?;
 
@@ -795,15 +845,35 @@ impl EgressClient {
         method: Method,
         url: Url,
         headers: HeaderMap,
-        body: Option<Vec<u8>>,
+        body: EgressRequestBody,
     ) -> Result<EgressStreamResponse, EgressError> {
         let mut request = client.request(method, url).headers(headers);
-
-        if let Some(body) = body {
-            request = request.body(body);
+        let body_failure = Arc::new(AtomicU8::new(REQUEST_BODY_OK));
+        match body {
+            EgressRequestBody::Empty => {}
+            EgressRequestBody::Buffered(body) => request = request.body(body),
+            EgressRequestBody::Streaming { stream, .. } => {
+                let stream = counted_request_body_stream(
+                    stream,
+                    self.config.max_request_body_bytes,
+                    Arc::clone(&body_failure),
+                );
+                request = request.body(reqwest::Body::wrap_stream(stream));
+            }
         }
 
-        let response = request.send().await?;
+        let response =
+            request
+                .send()
+                .await
+                .map_err(|error| match body_failure.load(Ordering::Acquire) {
+                    REQUEST_BODY_TOO_LARGE => EgressError::RequestBodyTooLarge {
+                        size: self.config.max_request_body_bytes.saturating_add(1),
+                        max: self.config.max_request_body_bytes,
+                    },
+                    REQUEST_BODY_READ_FAILED => EgressError::RequestBodyReadFailed,
+                    _ => EgressError::Http(error),
+                })?;
         let status = response.status();
         let headers = response.headers().clone();
         let max_response_bytes = self.config.max_response_bytes;
@@ -1161,6 +1231,78 @@ fn enforce_request_body_size(size: usize, max: usize) -> Result<(), EgressError>
     }
 }
 
+const REQUEST_BODY_OK: u8 = 0;
+const REQUEST_BODY_TOO_LARGE: u8 = 1;
+const REQUEST_BODY_READ_FAILED: u8 = 2;
+
+impl EgressRequestBody {
+    fn enforce_known_size(&self, max: usize) -> Result<(), EgressError> {
+        match self {
+            Self::Empty => Ok(()),
+            Self::Buffered(body) => enforce_request_body_size(body.len(), max),
+            Self::Streaming {
+                known_length: Some(size),
+                ..
+            } if *size > max as u64 => {
+                let size = usize::try_from(*size).unwrap_or(usize::MAX);
+                enforce_request_body_size(size, max)
+            }
+            Self::Streaming { .. } => Ok(()),
+        }
+    }
+}
+
+struct CountedRequestBodyState {
+    stream: EgressRequestBodyStream,
+    streamed_bytes: usize,
+    overflow_pending: bool,
+}
+
+fn counted_request_body_stream(
+    stream: EgressRequestBodyStream,
+    max: usize,
+    failure: Arc<AtomicU8>,
+) -> impl Stream<Item = Result<Bytes, EgressRequestBodySourceError>> + Send {
+    stream::unfold(
+        CountedRequestBodyState {
+            stream,
+            streamed_bytes: 0,
+            overflow_pending: false,
+        },
+        move |mut state| {
+            let failure = Arc::clone(&failure);
+            async move {
+                if state.overflow_pending {
+                    failure.store(REQUEST_BODY_TOO_LARGE, Ordering::Release);
+                    return Some((Err(EgressRequestBodySourceError), state));
+                }
+
+                match state.stream.next().await {
+                    Some(Ok(chunk)) => {
+                        let remaining = max.saturating_sub(state.streamed_bytes);
+                        if chunk.len() <= remaining {
+                            state.streamed_bytes += chunk.len();
+                            Some((Ok(chunk), state))
+                        } else if remaining == 0 {
+                            failure.store(REQUEST_BODY_TOO_LARGE, Ordering::Release);
+                            Some((Err(EgressRequestBodySourceError), state))
+                        } else {
+                            state.streamed_bytes = max;
+                            state.overflow_pending = true;
+                            Some((Ok(chunk.slice(..remaining)), state))
+                        }
+                    }
+                    Some(Err(_)) => {
+                        failure.store(REQUEST_BODY_READ_FAILED, Ordering::Release);
+                        Some((Err(EgressRequestBodySourceError), state))
+                    }
+                    None => None,
+                }
+            }
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1170,7 +1312,7 @@ mod tests {
         path::PathBuf,
         process::Command,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Mutex,
         },
         time::Duration,
@@ -1182,6 +1324,119 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+
+    #[tokio::test]
+    async fn counted_stream_allows_exact_limit_with_backpressure() {
+        let source_polls = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::clone(&source_polls);
+        let source = stream::iter([Bytes::from_static(b"ab"), Bytes::from_static(b"cd")])
+            .inspect(move |_| {
+                polls.fetch_add(1, Ordering::SeqCst);
+            })
+            .map(Ok);
+        let failure = Arc::new(AtomicU8::new(REQUEST_BODY_OK));
+        let counted = counted_request_body_stream(Box::pin(source), 4, Arc::clone(&failure));
+        futures_util::pin_mut!(counted);
+
+        assert_eq!(
+            counted.next().await.expect("first chunk").expect("success"),
+            Bytes::from_static(b"ab")
+        );
+        assert_eq!(source_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            counted
+                .next()
+                .await
+                .expect("second chunk")
+                .expect("success"),
+            Bytes::from_static(b"cd")
+        );
+        assert!(counted.next().await.is_none());
+        assert_eq!(failure.load(Ordering::Acquire), REQUEST_BODY_OK);
+    }
+
+    #[tokio::test]
+    async fn counted_stream_caps_underdeclared_or_chunked_body_before_error() {
+        let source = stream::iter([
+            Ok(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"def")),
+        ]);
+        let failure = Arc::new(AtomicU8::new(REQUEST_BODY_OK));
+        let counted = counted_request_body_stream(Box::pin(source), 4, Arc::clone(&failure));
+        futures_util::pin_mut!(counted);
+
+        assert_eq!(
+            counted.next().await.expect("first chunk").expect("success"),
+            Bytes::from_static(b"abc")
+        );
+        assert_eq!(
+            counted
+                .next()
+                .await
+                .expect("bounded partial chunk")
+                .expect("success"),
+            Bytes::from_static(b"d")
+        );
+        assert!(counted.next().await.expect("overflow marker").is_err());
+        assert_eq!(failure.load(Ordering::Acquire), REQUEST_BODY_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn known_stream_length_over_limit_fails_before_dns_or_dial() {
+        let resolver = Arc::new(FakeDnsResolver::with_addresses(vec![socket(
+            "93.184.216.34:80",
+        )]));
+        let mut config = egress_config_for_host("api.example.test");
+        config.max_request_body_bytes = 3;
+        let client =
+            EgressClient::new_with_resolver(config, resolver.clone()).expect("client should build");
+        let body = EgressRequestBody::streaming(Box::pin(stream::empty()), Some(4));
+
+        let result = client
+            .stream_request_with_body(
+                Method::POST,
+                "http://api.example.test/",
+                HeaderMap::new(),
+                body,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EgressError::RequestBodyTooLarge { size: 4, max: 3 })
+        ));
+        assert!(resolver.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_counted_stream_cancels_and_drops_its_source() {
+        struct DropSignal(Arc<AtomicBool>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropSignal(Arc::clone(&dropped));
+        let source = stream::unfold(Some(guard), |state| async move {
+            let _state = state;
+            std::future::pending::<
+                Option<(
+                    Result<Bytes, EgressRequestBodySourceError>,
+                    Option<DropSignal>,
+                )>,
+            >()
+            .await
+        });
+        let failure = Arc::new(AtomicU8::new(REQUEST_BODY_OK));
+        let counted = counted_request_body_stream(Box::pin(source), 4, failure);
+
+        drop(counted);
+
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 
     #[derive(Clone)]
     enum FakeResolution {

@@ -1335,6 +1335,7 @@ fn egress_error_reason(error: &EgressError) -> &'static str {
         EgressError::InvalidUrl(_) => "invalid_url",
         EgressError::SchemeNotAllowed(_) => "scheme_not_allowed",
         EgressError::RequestBodyTooLarge { .. } => "request_body_too_large",
+        EgressError::RequestBodyReadFailed => "request_body_read_failed",
         EgressError::ResponseTooLarge { .. } => "response_too_large",
         EgressError::ResponseIdleTimeout { .. } => "response_idle_timeout",
         EgressError::InvalidTlsCaBundle { .. } => "invalid_tls_ca_bundle",
