@@ -14,14 +14,19 @@ use bytes::Bytes;
 use futures_util::{stream, Stream, StreamExt};
 use ipnet::IpNet;
 use reqwest::{header::HeaderMap, Method, StatusCode, Url};
+use sha2::{Digest, Sha256};
 use tokio::net::lookup_host;
 
 use crate::{config::Config, rbac::EgressPolicy};
+
+mod client_cache;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+static PROCESS_PINNED_CLIENT_CACHE: LazyLock<Arc<client_cache::PinnedClientCache>> =
+    LazyLock::new(|| Arc::new(client_cache::PinnedClientCache::new()));
 
 // Snapshot: IANA IPv4 and IPv6 Special-Purpose Address Registries, 2026-07-14.
 // Explicit global exceptions are checked before their enclosing special-use blocks.
@@ -226,6 +231,7 @@ pub struct EgressConfig {
     pub deny_private_ips: bool,
     pub tls_ca_bundle_path: Option<PathBuf>,
     pub tls_root_certificates: Vec<reqwest::Certificate>,
+    pub(crate) tls_root_set_fingerprint: [u8; 32],
 }
 
 impl fmt::Debug for EgressConfig {
@@ -267,6 +273,7 @@ impl PartialEq for EgressConfig {
             && self.deny_private_ips == other.deny_private_ips
             && self.tls_ca_bundle_path == other.tls_ca_bundle_path
             && self.tls_root_certificates.len() == other.tls_root_certificates.len()
+            && self.tls_root_set_fingerprint == other.tls_root_set_fingerprint
     }
 }
 
@@ -288,6 +295,7 @@ impl Default for EgressConfig {
             deny_private_ips: true,
             tls_ca_bundle_path: None,
             tls_root_certificates: Vec::new(),
+            tls_root_set_fingerprint: empty_tls_root_set_fingerprint(),
         }
     }
 }
@@ -368,6 +376,7 @@ impl EgressConfig {
             deny_private_ips: config.egress_deny_private_ips,
             tls_ca_bundle_path: None,
             tls_root_certificates: Vec::new(),
+            tls_root_set_fingerprint: empty_tls_root_set_fingerprint(),
         }
     }
 
@@ -461,6 +470,7 @@ impl EgressConfig {
 
         self.tls_ca_bundle_path = Some(path);
         self.tls_root_certificates = certificates;
+        self.tls_root_set_fingerprint = tls_root_set_fingerprint(&bytes);
         Ok(())
     }
 }
@@ -516,9 +526,8 @@ impl fmt::Debug for EgressStreamResponse {
 pub struct EgressClient {
     config: EgressConfig,
     resolver: Arc<dyn DnsResolver>,
-    #[allow(dead_code)]
-    // Base settings are validated at construction; per-request clients add DNS pins.
-    base_client: reqwest::Client,
+    config_generation: [u8; 32],
+    client_cache: Arc<client_cache::PinnedClientCache>,
 }
 
 #[async_trait]
@@ -552,17 +561,37 @@ impl EgressClient {
         config: EgressConfig,
         resolver: Arc<dyn DnsResolver>,
     ) -> Result<Self, EgressError> {
-        let base_client = base_client_builder(&config).build()?;
+        Self::new_with_resolver_and_cache(
+            config,
+            resolver,
+            Arc::clone(&PROCESS_PINNED_CLIENT_CACHE),
+        )
+    }
+
+    fn new_with_resolver_and_cache(
+        config: EgressConfig,
+        resolver: Arc<dyn DnsResolver>,
+        client_cache: Arc<client_cache::PinnedClientCache>,
+    ) -> Result<Self, EgressError> {
+        // Validate the complete transport profile at construction. Actual
+        // exact-pinned clients are created lazily after DNS validation.
+        base_client_builder(&config).build()?;
+        let config_generation = egress_config_generation(&config);
 
         Ok(Self {
             config,
             resolver,
-            base_client,
+            config_generation,
+            client_cache,
         })
     }
 
     pub(crate) fn reconfigured(&self, config: EgressConfig) -> Result<Self, EgressError> {
-        Self::new_with_resolver(config, Arc::clone(&self.resolver))
+        Self::new_with_resolver_and_cache(
+            config,
+            Arc::clone(&self.resolver),
+            Arc::clone(&self.client_cache),
+        )
     }
 
     pub async fn request(&self, method: Method, url: &str) -> Result<EgressResponse, EgressError> {
@@ -590,7 +619,7 @@ impl EgressClient {
             self.config.max_request_body_bytes,
         )?;
         let pinned_addr = self.resolve_and_check(&host, port).await?;
-        let client = self.pinned_client(&host, pinned_addr)?;
+        let client = self.pinned_client(&parsed, &host, pinned_addr)?;
 
         tracing::debug!("egress request pinned to validated destination");
 
@@ -635,7 +664,7 @@ impl EgressClient {
             self.config.max_request_body_bytes,
         )?;
         let pinned_addr = self.resolve_and_check(&host, port).await?;
-        let client = self.pinned_client(&host, pinned_addr)?;
+        let client = self.pinned_client(&parsed, &host, pinned_addr)?;
 
         tracing::debug!("egress streaming request pinned to validated destination");
 
@@ -668,14 +697,31 @@ impl EgressClient {
 
     fn pinned_client(
         &self,
+        url: &Url,
         host: &str,
         pinned_addr: SocketAddr,
     ) -> Result<reqwest::Client, EgressError> {
-        // Per-request clients are deliberate here: reqwest DNS overrides are
-        // configured on ClientBuilder, and egress is not a hot path in this PR.
-        Ok(base_client_builder(&self.config)
-            .resolve(host, pinned_addr)
-            .build()?)
+        let port = checked_port(url)?;
+        let key = client_cache::PinnedClientCacheKey {
+            scheme: url.scheme().to_owned(),
+            host: host.to_owned(),
+            port,
+            pinned_addr,
+            egress_generation: self.config_generation,
+            request_timeout: self.config.timeout,
+            response_idle_timeout: self.config.response_idle_timeout,
+            connect_timeout: self.config.connect_timeout,
+            tls_root_set_fingerprint: self.config.tls_root_set_fingerprint,
+            client_identity_fingerprint: None,
+            protocol_profile: client_cache::ProtocolProfile::Http1AndHttp2,
+            outbound_proxy_policy: client_cache::OutboundProxyPolicy::Disabled,
+        };
+
+        self.client_cache.get_or_build(key, || {
+            Ok(base_client_builder(&self.config)
+                .resolve(host, pinned_addr)
+                .build()?)
+        })
     }
 
     async fn resolve_and_check(&self, host: &str, port: u16) -> Result<SocketAddr, EgressError> {
@@ -928,6 +974,9 @@ fn base_client_builder(config: &EgressConfig) -> reqwest::ClientBuilder {
         .no_proxy()
         .timeout(config.timeout)
         .connect_timeout(config.connect_timeout)
+        .pool_idle_timeout(Some(client_cache::CLIENT_POOL_IDLE_TIMEOUT))
+        .pool_max_idle_per_host(client_cache::CLIENT_POOL_MAX_IDLE_PER_HOST)
+        .tcp_keepalive(Some(client_cache::CLIENT_TCP_KEEPALIVE))
         .redirect(reqwest::redirect::Policy::none());
 
     for certificate in &config.tls_root_certificates {
@@ -935,6 +984,82 @@ fn base_client_builder(config: &EgressConfig) -> reqwest::ClientBuilder {
     }
 
     builder
+}
+
+fn empty_tls_root_set_fingerprint() -> [u8; 32] {
+    tls_root_set_fingerprint(&[])
+}
+
+fn tls_root_set_fingerprint(pem_bundle: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"greengateway:tls-root-set:v1\0");
+    hasher.update((pem_bundle.len() as u64).to_be_bytes());
+    hasher.update(pem_bundle);
+    hasher.finalize().into()
+}
+
+fn egress_config_generation(config: &EgressConfig) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"greengateway:egress-config-generation:v1\0");
+
+    let mut allowed_hosts: Vec<_> = config.allowed_hosts.iter().collect();
+    allowed_hosts.sort_unstable();
+    hash_strings(&mut hasher, allowed_hosts.into_iter().map(String::as_str));
+
+    let mut allowed_host_globs: Vec<_> = config
+        .allowed_host_globs
+        .iter()
+        .map(String::as_str)
+        .collect();
+    allowed_host_globs.sort_unstable();
+    hash_strings(&mut hasher, allowed_host_globs);
+
+    let mut private_cidrs: Vec<_> = config
+        .private_ip_allow_cidrs
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    private_cidrs.sort_unstable();
+    hash_strings(&mut hasher, private_cidrs.iter().map(String::as_str));
+
+    let mut allowed_ports: Vec<_> = config.allowed_ports.iter().copied().collect();
+    allowed_ports.sort_unstable();
+    hasher.update((allowed_ports.len() as u64).to_be_bytes());
+    for port in allowed_ports {
+        hasher.update(port.to_be_bytes());
+    }
+
+    let mut nat64_prefixes: Vec<_> = config
+        .nat64_prefixes
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    nat64_prefixes.sort_unstable();
+    hash_strings(&mut hasher, nat64_prefixes.iter().map(String::as_str));
+
+    hash_duration(&mut hasher, config.timeout);
+    hash_duration(&mut hasher, config.response_idle_timeout);
+    hash_duration(&mut hasher, config.connect_timeout);
+    hasher.update((config.max_response_bytes as u64).to_be_bytes());
+    hasher.update((config.max_request_body_bytes as u64).to_be_bytes());
+    hasher.update([u8::from(config.deny_private_ips)]);
+    hasher.update(config.tls_root_set_fingerprint);
+
+    hasher.finalize().into()
+}
+
+fn hash_strings<'a>(hasher: &mut Sha256, values: impl IntoIterator<Item = &'a str>) {
+    let values: Vec<_> = values.into_iter().collect();
+    hasher.update((values.len() as u64).to_be_bytes());
+    for value in values {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+}
+
+fn hash_duration(hasher: &mut Sha256, duration: Duration) {
+    hasher.update(duration.as_secs().to_be_bytes());
+    hasher.update(duration.subsec_nanos().to_be_bytes());
 }
 
 fn checked_host(
@@ -1039,16 +1164,20 @@ fn enforce_request_body_size(size: usize, max: usize) -> Result<(), EgressError>
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         io::{self, ErrorKind},
         net::IpAddr,
         path::PathBuf,
         process::Command,
-        sync::Mutex,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
         time::Duration,
     };
 
     use futures_util::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -1105,11 +1234,102 @@ mod tests {
         }
     }
 
+    struct SequencedDnsResolver {
+        resolutions: Mutex<VecDeque<FakeResolution>>,
+        calls: AtomicUsize,
+    }
+
+    impl SequencedDnsResolver {
+        fn new(resolutions: impl IntoIterator<Item = FakeResolution>) -> Self {
+            Self {
+                resolutions: Mutex::new(resolutions.into_iter().collect()),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DnsResolver for SequencedDnsResolver {
+        async fn resolve(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> Result<Vec<SocketAddr>, std::io::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let resolution = self
+                .resolutions
+                .lock()
+                .expect("sequenced resolver lock should not be poisoned")
+                .pop_front()
+                .expect("test resolver should have one resolution per call");
+            match resolution {
+                FakeResolution::Addresses(addresses) => Ok(addresses),
+                FakeResolution::Error(kind) => {
+                    Err(std::io::Error::new(kind, "synthetic DNS failure"))
+                }
+            }
+        }
+    }
+
     fn egress_config_for_host(host: &str) -> EgressConfig {
         EgressConfig {
             allowed_hosts: HashSet::from([host.to_owned()]),
             ..EgressConfig::default()
         }
+    }
+
+    #[test]
+    fn egress_generation_is_order_independent_and_change_sensitive() {
+        let mut first = EgressConfig {
+            allowed_hosts: HashSet::from([
+                "a.example.test".to_owned(),
+                "b.example.test".to_owned(),
+            ]),
+            allowed_host_globs: vec!["*.one.example".to_owned(), "*.two.example".to_owned()],
+            private_ip_allow_cidrs: vec![
+                "10.0.0.0/8".parse().expect("first CIDR should parse"),
+                "192.168.0.0/16".parse().expect("second CIDR should parse"),
+            ],
+            allowed_ports: HashSet::from([443, 8443]),
+            nat64_prefixes: vec![
+                "64:ff9b:1::/48"
+                    .parse()
+                    .expect("first NAT64 prefix should parse"),
+                "2001:db8:64::/96"
+                    .parse()
+                    .expect("second NAT64 prefix should parse"),
+            ],
+            ..EgressConfig::default()
+        };
+        let mut second = first.clone();
+        second.allowed_host_globs.reverse();
+        second.private_ip_allow_cidrs.reverse();
+        second.nat64_prefixes.reverse();
+
+        assert_eq!(
+            egress_config_generation(&first),
+            egress_config_generation(&second),
+            "semantically unordered policy collections should hash identically"
+        );
+
+        first.connect_timeout += Duration::from_millis(1);
+        assert_ne!(
+            egress_config_generation(&first),
+            egress_config_generation(&second),
+            "transport-relevant changes must produce another generation"
+        );
+    }
+
+    fn isolated_egress_client(
+        config: EgressConfig,
+        resolver: Arc<dyn DnsResolver>,
+    ) -> EgressClient {
+        EgressClient::new_with_resolver_and_cache(
+            config,
+            resolver,
+            Arc::new(client_cache::PinnedClientCache::new()),
+        )
+        .expect("isolated test client should build")
     }
 
     #[test]
@@ -2250,11 +2470,11 @@ mod tests {
         };
         config.max_response_bytes = 6;
         let client = EgressClient::new(config).expect("client should build");
-        let pinned_client = client
-            .pinned_client("egress-pinned.test", addr)
-            .expect("pinned client should build");
         let url = Url::parse(&format!("http://egress-pinned.test:{}/", addr.port()))
             .expect("test URL should parse");
+        let pinned_client = client
+            .pinned_client(&url, "egress-pinned.test", addr)
+            .expect("pinned client should build");
 
         let response = client
             .send_with_client(pinned_client, Method::GET, url, HeaderMap::new(), None)
@@ -2297,14 +2517,15 @@ mod tests {
             deny_private_ips: false,
             tls_ca_bundle_path: Some(PathBuf::from("test-ca.pem")),
             tls_root_certificates,
+            tls_root_set_fingerprint: tls_root_set_fingerprint(certified.cert.pem().as_bytes()),
             ..EgressConfig::default()
         };
         let client = EgressClient::new(config).expect("client should build");
-        let pinned_client = client
-            .pinned_client("egress-pinned.test", addr)
-            .expect("pinned client should build");
         let url = Url::parse(&format!("http://egress-pinned.test:{}/", addr.port()))
             .expect("test URL should parse");
+        let pinned_client = client
+            .pinned_client(&url, "egress-pinned.test", addr)
+            .expect("pinned client should build");
 
         let response = client
             .send_with_client(pinned_client, Method::GET, url, HeaderMap::new(), None)
@@ -2314,6 +2535,180 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body, b"custom tls");
         server.await.expect("test server task should finish");
+    }
+
+    #[tokio::test]
+    async fn sequential_requests_reuse_connections_but_revalidate_dns() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener local address should be available");
+        let accepted_connections = Arc::new(AtomicUsize::new(0));
+        let served_requests = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(serve_keep_alive(
+            listener,
+            Arc::clone(&accepted_connections),
+            Arc::clone(&served_requests),
+        ));
+        let resolver = Arc::new(FakeDnsResolver::with_addresses(vec![addr]));
+        let client = isolated_egress_client(
+            EgressConfig {
+                allowed_hosts: HashSet::from(["reuse.example.test".to_owned()]),
+                deny_private_ips: false,
+                max_response_bytes: 2,
+                ..EgressConfig::default()
+            },
+            resolver.clone(),
+        );
+        let url = format!("http://reuse.example.test:{}/", addr.port());
+
+        for _ in 0..100 {
+            let response = client
+                .request(Method::GET, &url)
+                .await
+                .expect("sequential request should succeed");
+            assert_eq!(response.status, StatusCode::OK);
+            assert_eq!(response.body, b"ok");
+        }
+
+        assert_eq!(
+            resolver.calls().len(),
+            100,
+            "DNS must be checked every time"
+        );
+        assert_eq!(served_requests.load(Ordering::SeqCst), 100);
+        assert!(
+            accepted_connections.load(Ordering::SeqCst) <= 2,
+            "100 sequential requests should reuse a bounded number of TCP connections"
+        );
+        assert_eq!(client.client_cache.len(), 1);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn safe_to_private_dns_change_never_reuses_cached_destination() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener local address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one connection");
+            read_one_request(&stream).await;
+            write_all(
+                &stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            )
+            .await;
+        });
+        let resolver = Arc::new(SequencedDnsResolver::new([
+            FakeResolution::Addresses(vec![addr]),
+            FakeResolution::Addresses(vec![SocketAddr::from(([10, 0, 0, 1], addr.port()))]),
+        ]));
+        let client = isolated_egress_client(
+            EgressConfig {
+                allowed_hosts: HashSet::from(["rebind.example.test".to_owned()]),
+                private_ip_allow_cidrs: vec!["127.0.0.0/8"
+                    .parse()
+                    .expect("test CIDR should parse")],
+                deny_private_ips: true,
+                max_response_bytes: 2,
+                ..EgressConfig::default()
+            },
+            resolver.clone(),
+        );
+        let url = format!("http://rebind.example.test:{}/", addr.port());
+
+        let first = client
+            .request(Method::GET, &url)
+            .await
+            .expect("first validated destination should succeed");
+        assert_eq!(first.body, b"ok");
+        let error = client
+            .request(Method::GET, &url)
+            .await
+            .expect_err("private rebound destination must fail closed");
+
+        assert!(matches!(
+            error,
+            EgressError::NonGlobalIpBlocked(blocked) if blocked == ip("10.0.0.1")
+        ));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            client.client_cache.len(),
+            1,
+            "the old client may remain idle but must not be selected after failed validation"
+        );
+        server.await.expect("test server task should finish");
+    }
+
+    #[test]
+    fn cache_partitions_exact_address_timeout_trust_and_egress_generations() {
+        let base_config = EgressConfig {
+            allowed_hosts: HashSet::from(["partition.example.test".to_owned()]),
+            deny_private_ips: false,
+            ..EgressConfig::default()
+        };
+        let client = isolated_egress_client(base_config.clone(), Arc::new(SystemDnsResolver));
+        let url = Url::parse("https://partition.example.test/").expect("test URL should parse");
+        let first_addr = socket("8.8.8.8:443");
+        client
+            .pinned_client(&url, "partition.example.test", first_addr)
+            .expect("first client should build");
+        client
+            .pinned_client(&url, "partition.example.test", first_addr)
+            .expect("identical profile should reuse");
+        assert_eq!(client.client_cache.len(), 1);
+
+        client
+            .pinned_client(&url, "partition.example.test", socket("1.1.1.1:443"))
+            .expect("a new exact address should build a separate client");
+        assert_eq!(client.client_cache.len(), 2);
+
+        let mut timeout_config = base_config.clone();
+        timeout_config.timeout += Duration::from_secs(1);
+        let timeout_client = client
+            .reconfigured(timeout_config)
+            .expect("timeout client should build");
+        timeout_client
+            .pinned_client(&url, "partition.example.test", first_addr)
+            .expect("a new timeout profile should build a separate client");
+        assert_eq!(client.client_cache.len(), 3);
+
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["partition.example.test".to_owned()])
+                .expect("test root certificate should generate");
+        let pem = certified.cert.pem();
+        let mut trust_config = base_config.clone();
+        trust_config.tls_root_certificates = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
+            .expect("test root certificate should parse");
+        trust_config.tls_root_set_fingerprint = tls_root_set_fingerprint(pem.as_bytes());
+        let trust_client = client
+            .reconfigured(trust_config)
+            .expect("trust-profile client should build");
+        trust_client
+            .pinned_client(&url, "partition.example.test", first_addr)
+            .expect("a new trust profile should build a separate client");
+        assert_eq!(client.client_cache.len(), 4);
+
+        let mut egress_config = base_config;
+        egress_config
+            .allowed_hosts
+            .insert("additional.example.test".to_owned());
+        let egress_client = client
+            .reconfigured(egress_config)
+            .expect("egress-generation client should build");
+        egress_client
+            .pinned_client(&url, "partition.example.test", first_addr)
+            .expect("a new egress generation should build a separate client");
+        assert_eq!(client.client_cache.len(), 5);
     }
 
     #[tokio::test]
@@ -2343,11 +2738,11 @@ mod tests {
             ..EgressConfig::default()
         };
         let client = EgressClient::new(config).expect("client should build");
-        let pinned_client = client
-            .pinned_client("egress-pinned.test", addr)
-            .expect("pinned client should build");
         let url = Url::parse(&format!("http://egress-pinned.test:{}/", addr.port()))
             .expect("test URL should parse");
+        let pinned_client = client
+            .pinned_client(&url, "egress-pinned.test", addr)
+            .expect("pinned client should build");
 
         let error = client
             .send_with_client(pinned_client, Method::GET, url, HeaderMap::new(), None)
@@ -2585,6 +2980,55 @@ mod tests {
                 Err(err) if err.kind() == ErrorKind::WouldBlock => continue,
                 Err(err) => panic!("failed to read test request: {err}"),
             }
+        }
+    }
+
+    async fn serve_keep_alive(
+        listener: TcpListener,
+        accepted_connections: Arc<AtomicUsize>,
+        served_requests: Arc<AtomicUsize>,
+    ) {
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("keep-alive test server should accept connections");
+            accepted_connections.fetch_add(1, Ordering::SeqCst);
+            let served_requests = Arc::clone(&served_requests);
+            tokio::spawn(async move {
+                serve_keep_alive_connection(stream, served_requests).await;
+            });
+        }
+    }
+
+    async fn serve_keep_alive_connection(mut stream: TcpStream, served_requests: Arc<AtomicUsize>) {
+        let mut pending = Vec::new();
+        loop {
+            let header_end = loop {
+                if let Some(position) = pending.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    break position + 4;
+                }
+
+                let mut buffer = [0_u8; 1024];
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("keep-alive test request should read");
+                if read == 0 {
+                    return;
+                }
+                pending.extend_from_slice(&buffer[..read]);
+            };
+            pending.drain(..header_end);
+
+            served_requests.fetch_add(1, Ordering::SeqCst);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                )
+                .await
+                .expect("keep-alive test response should write");
         }
     }
 

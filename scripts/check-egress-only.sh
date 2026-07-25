@@ -8,9 +8,11 @@ cd "$ROOT"
 matches="$(
     git ls-files '*.rs' |
         while IFS= read -r file; do
-            if [ "$file" = "gateway/src/egress.rs" ]; then
-                continue
-            fi
+            case "$file" in
+                gateway/src/egress.rs | gateway/src/egress/*.rs)
+                    continue
+                    ;;
+            esac
 
             if file_matches="$(grep -nE '\breqwest\b' "$file")"; then
                 printf '%s\n' "$file_matches" | awk -v file="$file" '{ print file ":" $0 }'
