@@ -1,7 +1,7 @@
 //! Route-level RBAC authorization middleware.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, LockResult, Mutex, MutexGuard},
     time::Duration,
@@ -28,13 +28,15 @@ use crate::{
     path_match::{is_unsafe_request_path, path_prefix_matches},
     rbac::{
         policy::ToolPolicyEntry, DefaultAction, EgressPolicy, EnforcementMode, Policy,
-        PolicyEngine, RouteRule, RuleAction, RuleDecision, RuleDispatchContext, RuleMatcher,
+        PolicyEngine, RouteRule, RuleAction, RuleDecision, RuleDispatchContext, RuleDispatchKind,
+        RuleMatcher,
     },
     upstream_route::{
         self, ProxyRouteAuthorizationContext, ProxyRouteClassificationCompleted,
         ProxyRouteObservationContext,
     },
 };
+use url::Url;
 
 use super::{
     decision::{PolicyDecision, PolicyDecisionOutcome},
@@ -55,6 +57,94 @@ pub struct RbacState {
     pub client_ip_policy: ClientIpPolicy,
     pub audit: AuditLog,
     mcp_route_paths: Vec<String>,
+    proxy_dispatch_inventory: Arc<ProxyDispatchInventory>,
+}
+
+#[derive(Default)]
+struct ProxyDispatchInventory {
+    enforce: bool,
+    route_ids: HashSet<String>,
+    migrated_catch_all_origins: HashMap<String, String>,
+}
+
+impl ProxyDispatchInventory {
+    fn from_config(config: &Config) -> Self {
+        let mut inventory = Self {
+            enforce: true,
+            ..Self::default()
+        };
+        if config.upstream_url.is_some() {
+            inventory.route_ids.insert("legacy".to_owned());
+        }
+        for route in &config.upstream_routes {
+            if let Some(route_id) = route.id.as_ref() {
+                inventory.route_ids.insert(route_id.clone());
+            }
+            if route.upstreams.is_empty() || route.host.is_some() || route.path_prefix.is_some() {
+                continue;
+            }
+            let Some(route_id) = route.id.as_ref() else {
+                continue;
+            };
+            for endpoint in &route.upstreams {
+                if let Ok(url) = Url::parse(&endpoint.url) {
+                    inventory
+                        .migrated_catch_all_origins
+                        .insert(url.origin().ascii_serialization(), route_id.clone());
+                }
+            }
+        }
+        inventory
+    }
+
+    fn validate(&self, policy: &Policy) -> Result<(), crate::rbac::policy::PolicyError> {
+        if !self.enforce {
+            return Ok(());
+        }
+        for (rule_index, rule) in policy.rules.iter().enumerate() {
+            let Some(dispatch) = rule.dispatch.as_ref() else {
+                continue;
+            };
+            match dispatch.kind {
+                RuleDispatchKind::Route => {
+                    let route_id = dispatch
+                        .route_id
+                        .as_deref()
+                        .expect("validated route dispatch must have route_id");
+                    if !self.route_ids.contains(route_id) {
+                        return Err(crate::rbac::policy::PolicyError::Invalid(format!(
+                            "rules[{rule_index}].dispatch.route_id '{route_id}' does not match a configured proxy route"
+                        )));
+                    }
+                }
+                RuleDispatchKind::Legacy => {
+                    let origin = dispatch
+                        .upstream_origin
+                        .as_deref()
+                        .and_then(|origin| Url::parse(origin).ok())
+                        .map(|origin| origin.origin().ascii_serialization());
+                    if let Some((origin, route_id)) = origin.as_ref().and_then(|origin| {
+                        self.migrated_catch_all_origins
+                            .get(origin)
+                            .map(|route_id| (origin, route_id))
+                    }) {
+                        return Err(crate::rbac::policy::PolicyError::Invalid(format!(
+                            "rules[{rule_index}].dispatch legacy origin '{origin}' is now part of catch-all pool '{route_id}'; replace it with {{\"kind\":\"route\",\"route_id\":\"{route_id}\"}} before startup or reload"
+                        )));
+                    }
+                }
+                RuleDispatchKind::Contextless => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_policy_proxy_dispatch_config(
+    policy: &Policy,
+    config: &Config,
+) -> Result<(), crate::rbac::policy::PolicyError> {
+    ProxyDispatchInventory::from_config(config).validate(policy)
 }
 
 struct RbacPolicyState {
@@ -102,13 +192,15 @@ struct AuditContext {
 
 impl RbacState {
     pub fn from_policy(policy: Policy, config: &Config, audit: AuditLog) -> Self {
-        Self::new_with_mcp_route_paths(
+        let mut state = Self::new_with_mcp_route_paths(
             policy,
             config.rbac_exempt_paths.clone(),
             ClientIpPolicy::from_config(config),
             audit,
             protected_resource::mcp_route_paths(config),
-        )
+        );
+        state.proxy_dispatch_inventory = Arc::new(ProxyDispatchInventory::from_config(config));
+        state
     }
 
     #[cfg(test)]
@@ -148,6 +240,7 @@ impl RbacState {
             client_ip_policy,
             audit,
             mcp_route_paths,
+            proxy_dispatch_inventory: Arc::new(ProxyDispatchInventory::default()),
         }
     }
 
@@ -175,6 +268,13 @@ impl RbacState {
 
     pub(crate) fn policy_write_guard(&self) -> LockResult<MutexGuard<'_, ()>> {
         self.policy_write_lock.lock()
+    }
+
+    pub(crate) fn validate_proxy_dispatch_policy(
+        &self,
+        policy: &Policy,
+    ) -> Result<(), crate::rbac::policy::PolicyError> {
+        self.proxy_dispatch_inventory.validate(policy)
     }
 
     pub fn principal_has_permission(&self, principal: &auth::Principal, permission: &str) -> bool {
@@ -328,6 +428,7 @@ pub fn reload_policy_from_file(
 
     match Policy::from_file(path) {
         Ok(policy) => {
+            state.validate_proxy_dispatch_policy(&policy)?;
             if policy.egress != state.current_egress_policy() {
                 tracing::error!(
                     policy_file = %path.display(),
@@ -517,7 +618,8 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     {
         RuleDispatchContext::unknown()
     } else if let Some(context) = req.extensions().get::<ProxyRouteObservationContext>() {
-        RuleDispatchContext::classified(
+        RuleDispatchContext::classified_with_route_id(
+            context.route_id.as_deref(),
             context.route_host.as_deref(),
             context.route_path_prefix.as_deref(),
             Some(context.upstream_origin.as_str()),

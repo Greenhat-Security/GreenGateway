@@ -421,7 +421,11 @@ impl RuleSuggestionEngine {
                 &principal,
                 &[RuleAction::Allow, RuleAction::Shadow],
                 observation.route_host.as_deref(),
-                RuleDispatchContext::classified(
+                RuleDispatchContext::classified_with_route_id(
+                    observation
+                        .upstream_origin
+                        .as_deref()
+                        .and_then(|origin| origin.strip_prefix("pool:")),
                     observation.route_host.as_deref(),
                     observation.route_path_prefix.as_deref(),
                     observation.upstream_origin.as_deref(),
@@ -682,7 +686,12 @@ impl RuleSuggestionEngine {
                 }),
                 1 if observed_identity == configured_identity => {
                     observed_identity.and_then(|(_, upstream_origin)| {
-                        upstream_origin.clone().map(RuleDispatchMatcher::legacy)
+                        upstream_origin.clone().map(|origin| {
+                            origin.strip_prefix("pool:").map_or_else(
+                                || RuleDispatchMatcher::legacy(origin.clone()),
+                                |route_id| RuleDispatchMatcher::route(route_id.to_owned()),
+                            )
+                        })
                     })
                 }
                 _ => None,

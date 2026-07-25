@@ -1259,6 +1259,9 @@ fn gateway_app_with_process_started_at_and_overrides(
                 ),
             );
     let loaded_policy = rbac::Policy::from_config(&config)?;
+    if let Some(policy) = loaded_policy.as_ref() {
+        middleware::rbac::validate_policy_proxy_dispatch_config(policy, &config)?;
+    }
     let tool_runtime_config = match loaded_policy.as_ref() {
         Some(policy) => {
             tools::runtime::ToolRuntimeConfig::from_env_defaults(&config).with_policy_tools(policy)
@@ -2595,6 +2598,10 @@ async fn policy_put_endpoint(
         return egress_reload_unsupported();
     }
 
+    if let Err(err) = rbac_state.validate_proxy_dispatch_policy(&candidate) {
+        return policy_validation_failed(vec![policy_error_message(&err)]);
+    }
+
     if let Err(err) = candidate.persist_to_file(policy_file) {
         tracing::error!(policy_file = %policy_file.display(), error = %err, "failed to persist policy");
         return internal_server_error("policy persist failed");
@@ -2766,9 +2773,11 @@ async fn policy_validate_endpoint(
     let Some(principal) = parts.extensions.get::<auth::Principal>() else {
         return unauthorized();
     };
-    if let Err(error) = authorized_policy_state(&state, principal, ADMIN_POLICY_READ_PERMISSION) {
-        return policy_admin_authz_error_response(error);
-    }
+    let rbac_state = match authorized_policy_state(&state, principal, ADMIN_POLICY_READ_PERMISSION)
+    {
+        Ok(rbac_state) => rbac_state,
+        Err(error) => return policy_admin_authz_error_response(error),
+    };
 
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
@@ -2776,11 +2785,14 @@ async fn policy_validate_endpoint(
     };
 
     match parse_policy_body(&body) {
-        Ok(_) => Json(PolicyValidationResponse {
-            valid: true,
-            errors: Vec::new(),
-        })
-        .into_response(),
+        Ok(policy) => match rbac_state.validate_proxy_dispatch_policy(&policy) {
+            Ok(()) => Json(PolicyValidationResponse {
+                valid: true,
+                errors: Vec::new(),
+            })
+            .into_response(),
+            Err(error) => policy_validation_failed(vec![policy_error_message(&error)]),
+        },
         Err(errors) => policy_validation_failed(errors),
     }
 }
@@ -5447,7 +5459,8 @@ fn preview_rule(
                 .and_then(Value::as_bool)
                 == Some(true)
             {
-                rbac::RuleDispatchContext::classified(
+                rbac::RuleDispatchContext::classified_with_route_id(
+                    payload_string("upstream_route_id"),
                     payload_string("upstream_route_host"),
                     payload_string("upstream_route_path_prefix"),
                     payload_string("upstream_origin"),
@@ -5854,7 +5867,11 @@ fn endpoint_coverage_scope(
     let matcher = rbac::RuleMatcher::new(&policy.rules);
     let host_qualified = context.and_then(|context| context.route_host.as_deref());
     let dispatch_context = context.map_or_else(rbac::RuleDispatchContext::unknown, |context| {
-        rbac::RuleDispatchContext::classified(
+        rbac::RuleDispatchContext::classified_with_route_id(
+            context
+                .upstream_origin
+                .as_deref()
+                .and_then(|origin| origin.strip_prefix("pool:")),
             context.route_host.as_deref(),
             context.route_path_prefix.as_deref(),
             context.upstream_origin.as_deref(),
@@ -6349,6 +6366,12 @@ fn persist_policy_mutation(
 ) -> ResponseResult<PolicyMutationCommitResult> {
     if candidate.egress != before_policy.egress {
         return Err(Box::new(egress_reload_unsupported()));
+    }
+
+    if let Err(error) = context.rbac_state.validate_proxy_dispatch_policy(candidate) {
+        return Err(Box::new(policy_validation_failed(vec![
+            policy_error_message(&error),
+        ])));
     }
 
     if let Err(err) = candidate.persist_to_file(context.policy_file) {
@@ -9788,6 +9811,115 @@ mod tests {
             .filter(|event| event.payload["upstream_endpoint_id"] == json!("second"))
             .count();
         assert_eq!((first_count, second_count), (6, 2));
+    }
+
+    #[tokio::test]
+    async fn catch_all_pool_route_deny_performs_zero_physical_work() {
+        let (first_addr, mut first_captured) = spawn_capture_upstream().await;
+        let (second_addr, mut second_captured) = spawn_capture_upstream().await;
+        let mut pooled_route = route(None, None, first_addr);
+        pooled_route.id = Some("payments".to_owned());
+        pooled_route.upstream_url.clear();
+        pooled_route.upstreams = vec![
+            config::UpstreamEndpointConfig {
+                id: "primary".to_owned(),
+                url: format!("http://127.0.0.1:{}", first_addr.port()),
+                weight: 3,
+                tls_ca_bundle_path: None,
+            },
+            config::UpstreamEndpointConfig {
+                id: "secondary".to_owned(),
+                url: format!("http://127.0.0.1:{}", second_addr.port()),
+                weight: 1,
+                tls_ca_bundle_path: None,
+            },
+        ];
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "rules": [{
+                    "methods": ["GET"],
+                    "path": "/private/**",
+                    "dispatch": {
+                        "kind": "route",
+                        "route_id": "payments"
+                    },
+                    "action": "deny"
+                }]
+            }"#,
+        );
+        let mut config = routing_proxy_config(vec![pooled_route]);
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        let (router, probe) =
+            proxy_router_with_work_probe(config, test_audit_log(), first_addr.ip());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/private/account")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route-bound denial should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        probe.assert_no_work(
+            "route-bound denial must not select a weighted endpoint or resolve a destination",
+        );
+        assert_upstream_receives_no_request(&mut first_captured, "primary endpoint denial").await;
+        assert_upstream_receives_no_request(&mut second_captured, "secondary endpoint denial")
+            .await;
+    }
+
+    #[test]
+    fn catch_all_pool_migration_rejects_stale_legacy_origin_policy() {
+        let upstream_addr: SocketAddr = "127.0.0.1:41001".parse().expect("test address");
+        let mut pooled_route = route(None, None, upstream_addr);
+        pooled_route.id = Some("payments".to_owned());
+        pooled_route.upstream_url.clear();
+        pooled_route.upstreams = vec![config::UpstreamEndpointConfig {
+            id: "primary".to_owned(),
+            url: "http://127.0.0.1:41001".to_owned(),
+            weight: 1,
+            tls_ca_bundle_path: None,
+        }];
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "rules": [{
+                    "methods": ["GET"],
+                    "path": "/private/**",
+                    "dispatch": {
+                        "kind": "legacy",
+                        "upstream_origin": "http://127.0.0.1:41001"
+                    },
+                    "action": "deny"
+                }]
+            }"#,
+        );
+        let mut config = routing_proxy_config(vec![pooled_route]);
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+
+        let error = match app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        ) {
+            Ok(_) => panic!("stale legacy-origin policy must fail closed during pool migration"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("replace it with {\"kind\":\"route\",\"route_id\":\"payments\"}"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

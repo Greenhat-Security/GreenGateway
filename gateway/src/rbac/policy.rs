@@ -460,19 +460,41 @@ fn validate_rules(rules: &[Rule]) -> Result<(), PolicyError> {
         if let Some(dispatch) = rule.dispatch.as_ref() {
             match dispatch.kind {
                 RuleDispatchKind::Contextless => {
-                    if dispatch.upstream_origin.is_some() {
+                    if dispatch.upstream_origin.is_some() || dispatch.route_id.is_some() {
                         return Err(PolicyError::Invalid(format!(
-                            "rules[{rule_index}].dispatch.upstream_origin must be omitted for a contextless dispatch"
+                            "rules[{rule_index}].dispatch upstream_origin and route_id must be omitted for a contextless dispatch"
                         )));
                     }
                 }
                 RuleDispatchKind::Legacy => {
+                    if dispatch.route_id.is_some() {
+                        return Err(PolicyError::Invalid(format!(
+                            "rules[{rule_index}].dispatch.route_id must be omitted for a legacy dispatch"
+                        )));
+                    }
                     let upstream_origin = dispatch.upstream_origin.as_deref().ok_or_else(|| {
                         PolicyError::Invalid(format!(
                             "rules[{rule_index}].dispatch.upstream_origin is required for a legacy dispatch"
                         ))
                     })?;
                     validate_rule_dispatch_origin(upstream_origin, rule_index)?;
+                }
+                RuleDispatchKind::Route => {
+                    if dispatch.upstream_origin.is_some() {
+                        return Err(PolicyError::Invalid(format!(
+                            "rules[{rule_index}].dispatch.upstream_origin must be omitted for a route dispatch"
+                        )));
+                    }
+                    let route_id = dispatch.route_id.as_deref().ok_or_else(|| {
+                        PolicyError::Invalid(format!(
+                            "rules[{rule_index}].dispatch.route_id is required for a route dispatch"
+                        ))
+                    })?;
+                    if !crate::upstream_route::is_valid_stable_route_id(route_id) {
+                        return Err(PolicyError::Invalid(format!(
+                            "rules[{rule_index}].dispatch.route_id must be a valid stable route ID"
+                        )));
+                    }
                 }
             }
         }
@@ -1858,6 +1880,21 @@ mod tests {
                 "kind": "legacy",
                 "upstream_origin": null
             }),
+            json!({ "kind": "route" }),
+            json!({
+                "kind": "route",
+                "route_id": null
+            }),
+            json!({
+                "kind": "route",
+                "route_id": "payments",
+                "upstream_origin": "https://example.test"
+            }),
+            json!({
+                "kind": "legacy",
+                "upstream_origin": "https://example.test",
+                "route_id": "payments"
+            }),
         ] {
             Policy::validate_json_value(json!({
                 "schema_version": "0.1.0",
@@ -1898,10 +1935,18 @@ mod tests {
                         "upstream_origin": "https://EXAMPLE.TEST:443"
                     },
                     "action": "allow"
+                },
+                {
+                    "path": "/payments/{id}",
+                    "dispatch": {
+                        "kind": "route",
+                        "route_id": "payments"
+                    },
+                    "action": "deny"
                 }
             ]
         }))
-        .expect("contextless and origin-only legacy dispatch bindings should be valid");
+        .expect("contextless, legacy-origin, and logical-route dispatch bindings should be valid");
     }
 
     #[test]
@@ -2430,6 +2475,21 @@ mod tests {
                 "kind": "legacy",
                 "upstream_origin": "https://user@api.example.test"
             }),
+            json!({ "kind": "route" }),
+            json!({
+                "kind": "route",
+                "route_id": "invalid route"
+            }),
+            json!({
+                "kind": "route",
+                "route_id": "payments",
+                "upstream_origin": "https://api.example.test"
+            }),
+            json!({
+                "kind": "legacy",
+                "upstream_origin": "https://api.example.test",
+                "route_id": "payments"
+            }),
         ] {
             let policy = json!({
                 "schema_version": "0.1.0",
@@ -2441,6 +2501,19 @@ mod tests {
             });
             assert!(!validator.is_valid(&policy), "schema accepted {policy}");
         }
+
+        let policy = json!({
+            "schema_version": "0.1.0",
+            "rules": [{
+                "path": "/api/{id}",
+                "dispatch": {
+                    "kind": "route",
+                    "route_id": "payments"
+                },
+                "action": "deny"
+            }]
+        });
+        assert_schema_accepts(&validator, &policy);
     }
 
     #[test]

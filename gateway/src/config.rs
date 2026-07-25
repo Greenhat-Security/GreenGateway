@@ -26,6 +26,7 @@ use crate::{
             MAX_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
         },
     },
+    upstream_route,
 };
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
@@ -2403,18 +2404,13 @@ fn validate_upstream_routes(
 }
 
 fn normalize_stable_id(name: &str, value: &str, problems: &mut Vec<String>) -> Option<String> {
-    const MAX_ID_LEN: usize = 64;
     let value = value.trim();
-    let valid = !value.is_empty()
-        && value.len() <= MAX_ID_LEN
-        && value.bytes().enumerate().all(|(index, byte)| {
-            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
-        });
-    if valid {
+    if upstream_route::is_valid_stable_route_id(value) {
         Some(value.to_owned())
     } else {
         problems.push(format!(
-            "{name} must be 1-{MAX_ID_LEN} ASCII letters, digits, '.', '_', or '-', and must start with a letter or digit"
+            "{name} must be 1-{} ASCII letters, digits, '.', '_', or '-', and must start with a letter or digit",
+            upstream_route::STABLE_ROUTE_ID_MAX_LEN
         ));
         None
     }
