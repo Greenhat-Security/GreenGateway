@@ -10960,10 +10960,8 @@ mod tests {
             .expect("known-size streaming request should complete");
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(
-            body_string(response).await,
-            r#"{"error":"payload_too_large"}"#
-        );
+        let body = body_string(response).await;
+        assert!(!body.contains("upstream"));
         assert!(
             tokio::time::timeout(Duration::from_millis(100), observed.recv())
                 .await

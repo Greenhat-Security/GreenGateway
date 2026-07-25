@@ -121,6 +121,8 @@ pub(crate) struct ProxyState {
     max_request_body_bytes: usize,
     #[cfg(test)]
     request_selection_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    request_body_mode_override: Option<RequestBodyMode>,
 }
 
 #[derive(Clone)]
@@ -266,6 +268,8 @@ impl ProxyState {
                 max_request_body_bytes: config.egress_max_request_body_bytes,
                 #[cfg(test)]
                 request_selection_count: None,
+                #[cfg(test)]
+                request_body_mode_override: None,
             }));
         }
 
@@ -341,6 +345,8 @@ impl ProxyState {
             max_request_body_bytes: config.egress_max_request_body_bytes,
             #[cfg(test)]
             request_selection_count: None,
+            #[cfg(test)]
+            request_body_mode_override: None,
         }))
     }
 
@@ -350,6 +356,12 @@ impl ProxyState {
         counter: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         self.request_selection_count = Some(counter);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_streaming_request_bodies(mut self) -> Self {
+        self.request_body_mode_override = Some(RequestBodyMode::Stream);
         self
     }
 
@@ -392,11 +404,15 @@ impl ProxyState {
         };
 
         #[cfg(test)]
-        if upstream.is_some() {
+        let upstream = upstream.map(|mut upstream| {
+            if let Some(mode) = self.request_body_mode_override {
+                upstream.request_body_mode = mode;
+            }
             if let Some(counter) = &self.request_selection_count {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-        }
+            upstream
+        });
 
         upstream
     }
@@ -779,6 +795,7 @@ mod tests {
             upstream_health: Vec::new(),
             max_request_body_bytes: 1024,
             request_selection_count: None,
+            request_body_mode_override: None,
         };
 
         let context = state
