@@ -6,3 +6,4 @@ pub const PROXY_ADMISSION_ACTIVE: &str = "proxy_admission_active";
 pub const PROXY_ADMISSION_QUEUED: &str = "proxy_admission_queued";
 pub const PROXY_ADMISSION_REJECTIONS_TOTAL: &str = "proxy_admission_rejections_total";
 pub const PROXY_ENDPOINT_SELECTIONS_TOTAL: &str = "proxy_endpoint_selections_total";
+pub const UPSTREAM_HEALTH_TRANSITIONS_TOTAL: &str = "upstream_health_transitions_total";

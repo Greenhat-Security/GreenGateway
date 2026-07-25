@@ -12,13 +12,13 @@ use http::{HeaderMap, HeaderName, HeaderValue, Request};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::{config, egress, lifecycle, upstream_route};
+use crate::{audit, config, egress, lifecycle, upstream_route};
 
 mod admission;
 mod forward;
 mod health;
 
-pub(crate) use health::UpstreamHealthResponse;
+pub(crate) use health::{UpstreamHealthAdminResponse, UpstreamHealthResponse};
 
 /// Data-only route classifier used before authentication and authorization.
 ///
@@ -119,6 +119,7 @@ pub(crate) struct ProxyState {
     routes: ProxyRoutes,
     upstream_health: Vec<health::UpstreamHealthTarget>,
     max_request_body_bytes: usize,
+    health_runtime: health::UpstreamHealthRuntime,
     #[cfg(test)]
     request_selection_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
@@ -140,7 +141,6 @@ struct ProxyRoute {
     request_header_policy: RouteRequestHeaderPolicy,
     pool: Arc<UpstreamPool>,
     request_body_mode: RequestBodyMode,
-    pooled: bool,
 }
 
 impl upstream_route::RouteMatch for ProxyRoute {
@@ -190,12 +190,13 @@ struct ProxyEndpoint {
     upstream_origin: String,
     weight: u16,
     egress_client: Arc<egress::EgressClient>,
+    health: health::UpstreamHealthState,
+    health_config: Option<Arc<config::UpstreamHealthCheckConfig>>,
 }
 
 struct UpstreamPool {
     id: Arc<str>,
     endpoints: Vec<ProxyEndpoint>,
-    total_weight: u64,
     next_selection: AtomicU64,
     admission: admission::PoolAdmission,
 }
@@ -207,10 +208,6 @@ impl UpstreamPool {
         limits: &config::UpstreamPoolLimitsConfig,
     ) -> Self {
         let id: Arc<str> = Arc::from(id);
-        let total_weight = endpoints
-            .iter()
-            .map(|endpoint| u64::from(endpoint.weight))
-            .sum();
         Self {
             admission: admission::PoolAdmission::new(
                 Arc::clone(&id),
@@ -220,22 +217,40 @@ impl UpstreamPool {
             ),
             id,
             endpoints,
-            total_weight,
             next_selection: AtomicU64::new(0),
         }
     }
 
-    fn select_endpoint(&self) -> ProxyEndpoint {
-        let ticket = self.next_selection.fetch_add(1, Ordering::Relaxed) % self.total_weight;
+    fn select_endpoint(&self) -> Option<ProxyEndpoint> {
+        let total_weight = self
+            .endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint
+                    .health_config
+                    .as_ref()
+                    .is_none_or(|_| endpoint.health.eligible())
+            })
+            .map(|endpoint| u64::from(endpoint.weight))
+            .sum::<u64>();
+        if total_weight == 0 {
+            return None;
+        }
+        let ticket = self.next_selection.fetch_add(1, Ordering::Relaxed) % total_weight;
         let mut cumulative = 0_u64;
         self.endpoints
             .iter()
+            .filter(|endpoint| {
+                endpoint
+                    .health_config
+                    .as_ref()
+                    .is_none_or(|_| endpoint.health.eligible())
+            })
             .find(|endpoint| {
                 cumulative = cumulative.saturating_add(u64::from(endpoint.weight));
                 ticket < cumulative
             })
             .cloned()
-            .expect("validated non-empty weighted pool must select an endpoint")
     }
 }
 
@@ -244,9 +259,11 @@ impl ProxyState {
         config: &config::Config,
         default_egress_config: &egress::EgressConfig,
         egress_client: Arc<egress::EgressClient>,
+        audit: audit::AuditLog,
     ) -> Result<Option<Self>, egress::EgressError> {
         if let Some(upstream_url) = config.upstream_url.as_deref() {
             let upstream_origin = upstream_origin_from_url(upstream_url, "UPSTREAM_URL");
+            let health = health::UpstreamHealthState::new("legacy", "primary", Some(audit.clone()));
             let pool = Arc::new(UpstreamPool::new(
                 "legacy".to_owned(),
                 vec![ProxyEndpoint {
@@ -254,6 +271,8 @@ impl ProxyState {
                     upstream_origin: upstream_origin.clone(),
                     weight: 1,
                     egress_client: Arc::clone(&egress_client),
+                    health: health.clone(),
+                    health_config: None,
                 }],
                 &config::UpstreamPoolLimitsConfig::default(),
             ));
@@ -261,11 +280,15 @@ impl ProxyState {
             return Ok(Some(Self {
                 routes: ProxyRoutes::Legacy { pool },
                 upstream_health: health::upstream_health_targets([(
-                    upstream_origin.clone(),
+                    "legacy".to_owned(),
+                    "primary".to_owned(),
                     upstream_origin,
                     Arc::clone(&egress_client),
+                    health,
+                    None,
                 )]),
                 max_request_body_bytes: config.egress_max_request_body_bytes,
+                health_runtime: health::UpstreamHealthRuntime::default(),
                 #[cfg(test)]
                 request_selection_count: None,
                 #[cfg(test)]
@@ -296,6 +319,8 @@ impl ProxyState {
                     default_egress_config,
                     &egress_client,
                     &mut route_clients,
+                    &route_id,
+                    &audit,
                 )?;
                 let authorization_origin = if route.upstreams.is_empty() {
                     endpoints
@@ -320,21 +345,18 @@ impl ProxyState {
                     request_header_policy: route_request_header_policy(route),
                     pool,
                     request_body_mode: route.request_body.mode.into(),
-                    pooled: !route.upstreams.is_empty(),
                 })
             })
             .collect::<Result<_, egress::EgressError>>()?;
         let upstream_health = health::upstream_health_targets(routes.iter().flat_map(|route| {
             route.pool.endpoints.iter().map(|endpoint| {
-                let public_id = if route.pooled {
-                    format!("{}.{}", route.route_id, endpoint.id)
-                } else {
-                    endpoint.upstream_origin.clone()
-                };
                 (
-                    public_id,
+                    route.route_id.clone(),
+                    endpoint.id.to_string(),
                     endpoint.upstream_origin.clone(),
                     Arc::clone(&endpoint.egress_client),
+                    endpoint.health.clone(),
+                    endpoint.health_config.as_deref().cloned(),
                 )
             })
         }));
@@ -343,6 +365,7 @@ impl ProxyState {
             routes: ProxyRoutes::RoutingTable { routes },
             upstream_health,
             max_request_body_bytes: config.egress_max_request_body_bytes,
+            health_runtime: health::UpstreamHealthRuntime::default(),
             #[cfg(test)]
             request_selection_count: None,
             #[cfg(test)]
@@ -429,11 +452,15 @@ impl ProxyState {
         health::upstream_health_response(&self.routes, &self.upstream_health).await
     }
 
+    pub(crate) async fn upstream_health_admin_response(
+        &self,
+    ) -> health::UpstreamHealthAdminResponse {
+        health::upstream_health_admin_response(&self.upstream_health).await
+    }
+
     pub(crate) fn spawn_upstream_health_checks(&self) {
-        health::spawn_upstream_health_checks(
-            &self.upstream_health,
-            Arc::new(lifecycle::SystemClock),
-        );
+        self.health_runtime
+            .spawn(&self.upstream_health, Arc::new(lifecycle::SystemClock));
     }
 }
 
@@ -511,6 +538,8 @@ fn route_endpoints(
     default_config: &egress::EgressConfig,
     default_client: &Arc<egress::EgressClient>,
     route_clients: &mut HashMap<RouteEgressClientKey, Arc<egress::EgressClient>>,
+    route_id: &str,
+    audit: &audit::AuditLog,
 ) -> Result<Vec<ProxyEndpoint>, egress::EgressError> {
     if route.upstreams.is_empty() {
         let client = route_egress_client(
@@ -520,14 +549,21 @@ fn route_endpoints(
             default_client,
             route_clients,
         )?;
+        let endpoint_id: Arc<str> = Arc::from("primary");
         return Ok(vec![ProxyEndpoint {
-            id: Arc::from("primary"),
+            id: Arc::clone(&endpoint_id),
             upstream_origin: upstream_origin_from_url(
                 &route.upstream_url,
                 &format!("UPSTREAM_ROUTES[{route_index}].upstream_url"),
             ),
             weight: 1,
             egress_client: client,
+            health: health::UpstreamHealthState::new(
+                Arc::<str>::from(route_id),
+                endpoint_id,
+                Some(audit.clone()),
+            ),
+            health_config: route.health_check.clone().map(Arc::new),
         }]);
     }
 
@@ -543,14 +579,21 @@ fn route_endpoints(
                 default_client,
                 route_clients,
             )?;
+            let endpoint_id: Arc<str> = Arc::from(endpoint.id.as_str());
             Ok(ProxyEndpoint {
-                id: Arc::from(endpoint.id.as_str()),
+                id: Arc::clone(&endpoint_id),
                 upstream_origin: upstream_origin_from_url(
                     &endpoint.url,
                     &format!("UPSTREAM_ROUTES[{route_index}].upstreams[{endpoint_index}].url"),
                 ),
                 weight: endpoint.weight,
                 egress_client: client,
+                health: health::UpstreamHealthState::new(
+                    Arc::<str>::from(route_id),
+                    endpoint_id,
+                    Some(audit.clone()),
+                ),
+                health_config: route.health_check.clone().map(Arc::new),
             })
         })
         .collect()
@@ -671,19 +714,28 @@ mod tests {
                     upstream_origin: "https://a.example.test".to_owned(),
                     weight: 3,
                     egress_client: Arc::clone(&client),
+                    health: health::UpstreamHealthState::new("payments", "a", None),
+                    health_config: None,
                 },
                 ProxyEndpoint {
                     id: Arc::from("b"),
                     upstream_origin: "https://b.example.test".to_owned(),
                     weight: 1,
                     egress_client: client,
+                    health: health::UpstreamHealthState::new("payments", "b", None),
+                    health_config: None,
                 },
             ],
             &config::UpstreamPoolLimitsConfig::default(),
         );
 
         let selected = (0..8)
-            .map(|_| pool.select_endpoint().id.to_string())
+            .map(|_| {
+                pool.select_endpoint()
+                    .expect("unconfigured health should remain eligible")
+                    .id
+                    .to_string()
+            })
             .collect::<Vec<_>>();
         assert_eq!(selected, ["a", "a", "a", "b", "a", "a", "a", "b"]);
     }
@@ -699,6 +751,7 @@ mod tests {
             load_balancing: config::UpstreamLoadBalancingConfig::default(),
             request_body: config::UpstreamRequestBodyConfig::default(),
             limits: config::UpstreamPoolLimitsConfig::default(),
+            health_check: None,
             timeout_ms: None,
             response_idle_timeout_ms: None,
             connect_timeout_ms: None,
@@ -787,6 +840,8 @@ mod tests {
                 upstream_origin: "https://upstream.example.test".to_owned(),
                 weight: 1,
                 egress_client,
+                health: health::UpstreamHealthState::new("legacy", "primary", None),
+                health_config: None,
             }],
             &config::UpstreamPoolLimitsConfig::default(),
         ));
@@ -794,6 +849,7 @@ mod tests {
             routes: ProxyRoutes::Legacy { pool },
             upstream_health: Vec::new(),
             max_request_body_bytes: 1024,
+            health_runtime: health::UpstreamHealthRuntime::default(),
             request_selection_count: None,
             request_body_mode_override: None,
         };
@@ -832,6 +888,7 @@ mod tests {
             load_balancing: config::UpstreamLoadBalancingConfig::default(),
             request_body: config::UpstreamRequestBodyConfig::default(),
             limits: config::UpstreamPoolLimitsConfig::default(),
+            health_check: None,
             timeout_ms: Some(1234),
             response_idle_timeout_ms: None,
             connect_timeout_ms: None,

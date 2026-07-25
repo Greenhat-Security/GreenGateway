@@ -1,93 +1,281 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 
 use http::Method;
 use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use super::ProxyRoutes;
-use crate::{egress, lifecycle::Clock};
+use crate::{audit, config, egress, lifecycle::Clock};
 
 const UPSTREAM_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const HEALTH_UNKNOWN: u8 = 0;
+const HEALTHY: u8 = 1;
+const UNHEALTHY: u8 = 2;
 
 #[derive(Serialize)]
-#[serde(untagged)]
-pub(crate) enum UpstreamHealthResponse {
-    Single {
-        configured: bool,
-        reachable: Option<bool>,
-        last_checked: Option<String>,
-    },
-    Routes {
-        configured: bool,
-        upstreams: Vec<UpstreamOriginHealthResponse>,
-    },
+pub(crate) struct UpstreamHealthResponse {
+    configured: bool,
+    reachable: Option<bool>,
 }
 
 #[derive(Serialize)]
-pub(crate) struct UpstreamOriginHealthResponse {
-    origin: String,
-    reachable: Option<bool>,
+pub(crate) struct UpstreamHealthAdminResponse {
+    pub(crate) ready: bool,
+    pub(crate) pools: Vec<UpstreamPoolHealthAdminResponse>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct UpstreamPoolHealthAdminResponse {
+    pool_id: String,
+    required_for_readiness: bool,
+    minimum_healthy: usize,
+    eligible_endpoints: usize,
+    total_endpoints: usize,
+    ready: bool,
+    endpoints: Vec<UpstreamEndpointHealthAdminResponse>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct UpstreamEndpointHealthAdminResponse {
+    endpoint_id: String,
+    state: &'static str,
     last_checked: Option<String>,
+    last_failure_category: Option<String>,
+    consecutive_successes: u32,
+    consecutive_failures: u32,
 }
 
 #[derive(Clone)]
 pub(super) struct UpstreamHealthTarget {
-    public_id: String,
+    pool_id: String,
+    endpoint_id: String,
     origin: String,
     egress_client: Arc<egress::EgressClient>,
     health: UpstreamHealthState,
+    config: Option<config::UpstreamHealthCheckConfig>,
 }
 
 #[derive(Clone)]
-struct UpstreamHealthState {
+pub(super) struct UpstreamHealthState {
+    eligibility: Arc<AtomicU8>,
     snapshot: Arc<tokio::sync::RwLock<UpstreamHealthSnapshot>>,
+    identity: Arc<UpstreamHealthIdentity>,
+    audit: Option<audit::AuditLog>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct UpstreamHealthSnapshot {
-    reachable: Option<bool>,
     last_checked: Option<OffsetDateTime>,
+    last_failure_category: Option<String>,
+    consecutive_successes: u32,
+    consecutive_failures: u32,
+}
+
+#[derive(Debug)]
+struct UpstreamHealthIdentity {
+    pool_id: Arc<str>,
+    endpoint_id: Arc<str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HealthTransition {
+    Healthy,
+    Unhealthy,
 }
 
 impl UpstreamHealthState {
-    fn new() -> Self {
+    pub(super) fn new(
+        pool_id: impl Into<Arc<str>>,
+        endpoint_id: impl Into<Arc<str>>,
+        audit: Option<audit::AuditLog>,
+    ) -> Self {
         Self {
+            eligibility: Arc::new(AtomicU8::new(HEALTH_UNKNOWN)),
             snapshot: Arc::new(tokio::sync::RwLock::new(UpstreamHealthSnapshot::default())),
+            identity: Arc::new(UpstreamHealthIdentity {
+                pool_id: pool_id.into(),
+                endpoint_id: endpoint_id.into(),
+            }),
+            audit,
         }
     }
 
-    async fn response(&self) -> (Option<bool>, Option<String>) {
-        let snapshot = self.snapshot.read().await.clone();
-
-        (
-            snapshot.reachable,
-            snapshot.last_checked.map(rfc3339_timestamp),
-        )
+    pub(super) fn eligible(&self) -> bool {
+        self.eligibility.load(Ordering::Acquire) == HEALTHY
     }
 
-    async fn update(&self, reachable: bool, checked_at: OffsetDateTime) {
-        *self.snapshot.write().await = UpstreamHealthSnapshot {
-            reachable: Some(reachable),
-            last_checked: Some(checked_at),
+    fn state_name(&self) -> &'static str {
+        health_state_name(self.eligibility.load(Ordering::Acquire))
+    }
+
+    async fn update(
+        &self,
+        succeeded: bool,
+        observed_at: OffsetDateTime,
+        active_check: bool,
+        config: &config::UpstreamHealthCheckConfig,
+        source: &'static str,
+        failure_category: Option<&'static str>,
+    ) -> Option<HealthTransition> {
+        let healthy_threshold = config.healthy_threshold;
+        let unhealthy_threshold = config.unhealthy_threshold;
+        let mut snapshot = self.snapshot.write().await;
+        if active_check {
+            snapshot.last_checked = Some(observed_at);
+        }
+        let previous = self.eligibility.load(Ordering::Acquire);
+        let transition = if succeeded {
+            snapshot.consecutive_failures = 0;
+            snapshot.consecutive_successes = snapshot.consecutive_successes.saturating_add(1);
+            if snapshot.consecutive_successes >= healthy_threshold {
+                snapshot.last_failure_category = None;
+                (previous != HEALTHY).then_some(HealthTransition::Healthy)
+            } else {
+                None
+            }
+        } else {
+            snapshot.last_failure_category = failure_category.map(str::to_owned);
+            snapshot.consecutive_successes = 0;
+            snapshot.consecutive_failures = snapshot.consecutive_failures.saturating_add(1);
+            if snapshot.consecutive_failures >= unhealthy_threshold {
+                (previous != UNHEALTHY).then_some(HealthTransition::Unhealthy)
+            } else {
+                None
+            }
         };
+        if let Some(transition) = transition {
+            let next = match transition {
+                HealthTransition::Healthy => HEALTHY,
+                HealthTransition::Unhealthy => UNHEALTHY,
+            };
+            self.eligibility.store(next, Ordering::Release);
+            drop(snapshot);
+            self.emit_transition(transition, source, failure_category);
+        }
+        transition
+    }
+
+    pub(super) async fn record_passive_status(
+        &self,
+        status: u16,
+        config: &config::UpstreamHealthCheckConfig,
+    ) {
+        let failed = config.passive_failure_statuses.contains(&status);
+        let _ = self
+            .update(
+                !failed,
+                OffsetDateTime::now_utc(),
+                false,
+                config,
+                "passive",
+                failed.then_some("upstream_status"),
+            )
+            .await;
+    }
+
+    pub(super) async fn record_passive_error(
+        &self,
+        error: &egress::EgressError,
+        config: &config::UpstreamHealthCheckConfig,
+    ) {
+        if !error.is_passive_health_failure() {
+            return;
+        }
+        let _ = self
+            .update(
+                false,
+                OffsetDateTime::now_utc(),
+                false,
+                config,
+                "passive",
+                Some(error.safe_category()),
+            )
+            .await;
+    }
+
+    fn emit_transition(
+        &self,
+        transition: HealthTransition,
+        source: &'static str,
+        failure_category: Option<&'static str>,
+    ) {
+        let state = match transition {
+            HealthTransition::Healthy => "healthy",
+            HealthTransition::Unhealthy => "unhealthy",
+        };
+        ::metrics::counter!(
+            crate::metrics::UPSTREAM_HEALTH_TRANSITIONS_TOTAL,
+            "pool_id" => Arc::clone(&self.identity.pool_id),
+            "endpoint_id" => Arc::clone(&self.identity.endpoint_id),
+            "state" => state,
+            "source" => source,
+        )
+        .increment(1);
+        match transition {
+            HealthTransition::Healthy => tracing::info!(
+                pool_id = self.identity.pool_id.as_ref(),
+                endpoint_id = self.identity.endpoint_id.as_ref(),
+                source,
+                "upstream endpoint became healthy"
+            ),
+            HealthTransition::Unhealthy => tracing::warn!(
+                pool_id = self.identity.pool_id.as_ref(),
+                endpoint_id = self.identity.endpoint_id.as_ref(),
+                source,
+                error_category = failure_category.unwrap_or("unknown"),
+                "upstream endpoint became unhealthy"
+            ),
+        }
+        if let Some(audit) = self.audit.as_ref() {
+            audit.emit(audit::AuditEvent::new(
+                "upstream.health_state_changed",
+                "health",
+                "internal",
+                None::<audit::Actor>,
+                serde_json::json!({
+                    "pool_id": self.identity.pool_id.as_ref(),
+                    "endpoint_id": self.identity.endpoint_id.as_ref(),
+                    "state": state,
+                    "source": source,
+                    "reason": failure_category.unwrap_or("none"),
+                }),
+            ));
+        }
     }
 }
 
 pub(super) fn upstream_health_targets(
-    upstream_origins: impl IntoIterator<Item = (String, String, Arc<egress::EgressClient>)>,
+    upstream_origins: impl IntoIterator<
+        Item = (
+            String,
+            String,
+            String,
+            Arc<egress::EgressClient>,
+            UpstreamHealthState,
+            Option<config::UpstreamHealthCheckConfig>,
+        ),
+    >,
 ) -> Vec<UpstreamHealthTarget> {
-    let mut seen = HashSet::new();
     let mut targets = Vec::new();
 
-    for (public_id, origin, egress_client) in upstream_origins {
-        if seen.insert(public_id.clone()) {
-            targets.push(UpstreamHealthTarget {
-                public_id,
-                origin,
-                egress_client,
-                health: UpstreamHealthState::new(),
-            });
-        }
+    for (pool_id, endpoint_id, origin, egress_client, health, config) in upstream_origins {
+        targets.push(UpstreamHealthTarget {
+            health,
+            pool_id,
+            endpoint_id,
+            origin,
+            egress_client,
+            config,
+        });
     }
 
     targets
@@ -97,90 +285,165 @@ pub(super) async fn upstream_health_response(
     routes: &ProxyRoutes,
     upstream_health: &[UpstreamHealthTarget],
 ) -> UpstreamHealthResponse {
-    match routes {
-        ProxyRoutes::Legacy { .. } => {
-            let target = upstream_health
-                .first()
-                .expect("legacy proxy state should have one upstream health target");
-            let (reachable, last_checked) = target.health.response().await;
+    let _ = routes;
+    let states = upstream_health
+        .iter()
+        .map(|target| target.health.eligibility.load(Ordering::Acquire))
+        .collect::<Vec<_>>();
+    let reachable = if states.iter().all(|state| *state == HEALTHY) {
+        Some(true)
+    } else if states.contains(&UNHEALTHY) {
+        Some(false)
+    } else {
+        None
+    };
+    UpstreamHealthResponse {
+        configured: true,
+        reachable,
+    }
+}
 
-            UpstreamHealthResponse::Single {
-                configured: true,
-                reachable,
-                last_checked,
+pub(super) async fn upstream_health_admin_response(
+    upstream_health: &[UpstreamHealthTarget],
+) -> UpstreamHealthAdminResponse {
+    let mut pools = BTreeMap::<String, UpstreamPoolHealthAdminResponse>::new();
+    for target in upstream_health {
+        let snapshot = target.health.snapshot.read().await.clone();
+        let config = target.config.as_ref();
+        let pool = pools.entry(target.pool_id.clone()).or_insert_with(|| {
+            UpstreamPoolHealthAdminResponse {
+                pool_id: target.pool_id.clone(),
+                required_for_readiness: config.is_some_and(|config| config.required_for_readiness),
+                minimum_healthy: config.map_or(0, |config| config.minimum_healthy),
+                eligible_endpoints: 0,
+                total_endpoints: 0,
+                ready: true,
+                endpoints: Vec::new(),
             }
+        });
+        pool.total_endpoints = pool.total_endpoints.saturating_add(1);
+        if target.health.eligible() {
+            pool.eligible_endpoints = pool.eligible_endpoints.saturating_add(1);
         }
-        ProxyRoutes::RoutingTable { .. } => {
-            let mut upstreams = Vec::with_capacity(upstream_health.len());
-            for target in upstream_health {
-                let (reachable, last_checked) = target.health.response().await;
-                upstreams.push(UpstreamOriginHealthResponse {
-                    origin: target.public_id.clone(),
-                    reachable,
-                    last_checked,
-                });
-            }
+        pool.endpoints.push(UpstreamEndpointHealthAdminResponse {
+            endpoint_id: target.endpoint_id.clone(),
+            state: target.health.state_name(),
+            last_checked: snapshot.last_checked.map(rfc3339_timestamp),
+            last_failure_category: snapshot.last_failure_category,
+            consecutive_successes: snapshot.consecutive_successes,
+            consecutive_failures: snapshot.consecutive_failures,
+        });
+    }
+    let mut pools = pools.into_values().collect::<Vec<_>>();
+    for pool in &mut pools {
+        pool.ready =
+            !pool.required_for_readiness || pool.eligible_endpoints >= pool.minimum_healthy;
+    }
+    UpstreamHealthAdminResponse {
+        ready: pools.iter().all(|pool| pool.ready),
+        pools,
+    }
+}
 
-            UpstreamHealthResponse::Routes {
-                configured: true,
-                upstreams,
-            }
+#[derive(Clone, Default)]
+pub(super) struct UpstreamHealthRuntime {
+    inner: Arc<UpstreamHealthRuntimeInner>,
+}
+
+#[derive(Default)]
+struct UpstreamHealthRuntimeInner {
+    cancellation: CancellationToken,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Drop for UpstreamHealthRuntimeInner {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        let handles = self
+            .handles
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for handle in handles.drain(..) {
+            handle.abort();
         }
     }
 }
 
-pub(super) fn spawn_upstream_health_checks(
+impl UpstreamHealthRuntime {
+    pub(super) fn spawn(&self, upstream_health: &[UpstreamHealthTarget], clock: Arc<dyn Clock>) {
+        let handles =
+            spawn_upstream_health_checks(upstream_health, clock, self.inner.cancellation.clone());
+        let mut retained = self
+            .inner
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retained.extend(handles);
+    }
+}
+
+fn spawn_upstream_health_checks(
     upstream_health: &[UpstreamHealthTarget],
     clock: Arc<dyn Clock>,
-) {
+    cancellation: CancellationToken,
+) -> Vec<JoinHandle<()>> {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         tracing::warn!(
             "upstream reachability checks were not started because no Tokio runtime is active"
         );
-        return;
+        return Vec::new();
     };
 
+    let mut handles = Vec::with_capacity(upstream_health.len());
     for target in upstream_health {
         let health = target.health.clone();
         let egress_client = Arc::clone(&target.egress_client);
         let upstream_url = target.origin.clone();
+        let config = target.config.clone();
         let clock = Arc::clone(&clock);
+        let cancellation = cancellation.clone();
 
-        handle.spawn(run_upstream_health_check_loop(
+        handles.push(handle.spawn(run_upstream_health_check_loop(
             health,
             egress_client,
             upstream_url,
+            config,
             clock,
-        ));
+            cancellation,
+        )));
     }
+    handles
 }
 
 async fn run_upstream_health_check_loop(
     health: UpstreamHealthState,
     egress_client: Arc<egress::EgressClient>,
     upstream_url: String,
+    config: Option<config::UpstreamHealthCheckConfig>,
     clock: Arc<dyn Clock>,
+    cancellation: CancellationToken,
 ) {
-    let mut first_check = true;
-    let mut last_reachable = None;
-
     loop {
-        let reachable = refresh_upstream_health(
+        let refresh = refresh_upstream_health(
             &health,
             &egress_client,
             &upstream_url,
-            first_check,
+            config.as_ref(),
             clock.as_ref(),
-        )
-        .await;
-
-        if last_reachable == Some(false) && reachable {
-            tracing::info!("upstream reachability restored");
+        );
+        tokio::select! {
+            () = refresh => {}
+            () = cancellation.cancelled() => return,
         }
-
-        last_reachable = Some(reachable);
-        first_check = false;
-        clock.sleep(UPSTREAM_HEALTH_CHECK_INTERVAL).await;
+        let interval = config
+            .as_ref()
+            .map_or(UPSTREAM_HEALTH_CHECK_INTERVAL, |config| {
+                jittered_interval(config.interval_ms, config.jitter_ms, random_u64())
+            });
+        tokio::select! {
+            () = clock.sleep(interval) => {}
+            () = cancellation.cancelled() => return,
+        }
     }
 }
 
@@ -188,40 +451,120 @@ async fn refresh_upstream_health(
     health: &UpstreamHealthState,
     egress_client: &egress::EgressClient,
     upstream_url: &str,
-    first_check: bool,
+    config: Option<&config::UpstreamHealthCheckConfig>,
     clock: &dyn Clock,
-) -> bool {
-    match check_upstream_reachable(egress_client, upstream_url).await {
+) {
+    let check = check_upstream_reachable(egress_client, upstream_url, config);
+    let result = if let Some(config) = config {
+        tokio::time::timeout(Duration::from_millis(config.timeout_ms), check)
+            .await
+            .unwrap_or(Err(egress::EgressError::ResponseIdleTimeout {
+                timeout: Duration::from_millis(config.timeout_ms),
+            }))
+    } else {
+        check.await
+    };
+    match result {
         Ok(()) => {
-            health.update(true, clock.now_utc()).await;
-            true
+            if let Some(config) = config {
+                let _ = health
+                    .update(true, clock.now_utc(), true, config, "active", None)
+                    .await;
+            } else {
+                let compatibility = compatibility_health_config();
+                let _ = health
+                    .update(true, clock.now_utc(), true, &compatibility, "active", None)
+                    .await;
+            }
         }
         Err(err) => {
-            health.update(false, clock.now_utc()).await;
-            if first_check {
-                tracing::warn!(
-                    error_category = err.safe_category(),
-                    "startup upstream reachability check failed; continuing startup"
-                );
+            if let Some(config) = config {
+                let _ = health
+                    .update(
+                        false,
+                        clock.now_utc(),
+                        true,
+                        config,
+                        "active",
+                        Some(err.safe_category()),
+                    )
+                    .await;
             } else {
-                tracing::warn!(
-                    error_category = err.safe_category(),
-                    "upstream reachability check failed"
-                );
+                let compatibility = compatibility_health_config();
+                let _ = health
+                    .update(
+                        false,
+                        clock.now_utc(),
+                        true,
+                        &compatibility,
+                        "active",
+                        Some(err.safe_category()),
+                    )
+                    .await;
             }
-            false
         }
     }
+}
+
+fn compatibility_health_config() -> config::UpstreamHealthCheckConfig {
+    config::UpstreamHealthCheckConfig {
+        method: "HEAD".to_owned(),
+        path: "/".to_owned(),
+        interval_ms: UPSTREAM_HEALTH_CHECK_INTERVAL.as_millis() as u64,
+        jitter_ms: 0,
+        timeout_ms: 1_000,
+        healthy_threshold: 1,
+        unhealthy_threshold: 1,
+        expected_statuses: (100..=599).collect(),
+        passive_failure_statuses: Vec::new(),
+        required_for_readiness: false,
+        minimum_healthy: 1,
+    }
+}
+
+fn random_u64() -> u64 {
+    let mut bytes = [0_u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        return 0;
+    }
+    u64::from_le_bytes(bytes)
+}
+
+fn jittered_interval(interval_ms: u64, jitter_ms: u64, sample: u64) -> Duration {
+    if jitter_ms == 0 {
+        return Duration::from_millis(interval_ms);
+    }
+    let span = jitter_ms.saturating_mul(2).saturating_add(1);
+    let offset = sample % span;
+    Duration::from_millis(interval_ms - jitter_ms + offset)
 }
 
 async fn check_upstream_reachable(
     egress_client: &egress::EgressClient,
     upstream_url: &str,
+    config: Option<&config::UpstreamHealthCheckConfig>,
 ) -> Result<(), egress::EgressError> {
+    let method = config
+        .and_then(|config| config.method.parse().ok())
+        .unwrap_or(Method::HEAD);
+    let url = config.map_or_else(
+        || upstream_url.to_owned(),
+        |config| format!("{upstream_url}{}", config.path),
+    );
     egress_client
-        .request(Method::HEAD, upstream_url)
+        .request(method, &url)
         .await
-        .map(|_| ())
+        .and_then(|response| {
+            if config
+                .is_none_or(|config| config.expected_statuses.contains(&response.status.as_u16()))
+            {
+                Ok(())
+            } else {
+                Err(egress::EgressError::UnexpectedStatus(
+                    response.status.as_u16(),
+                ))
+            }
+        })
 }
 
 fn rfc3339_timestamp(timestamp: OffsetDateTime) -> String {
@@ -234,6 +577,14 @@ fn rfc3339_timestamp(timestamp: OffsetDateTime) -> String {
             );
             timestamp.unix_timestamp().to_string()
         }
+    }
+}
+
+fn health_state_name(state: u8) -> &'static str {
+    match state {
+        HEALTHY => "healthy",
+        UNHEALTHY => "unhealthy",
+        _ => "unknown",
     }
 }
 
@@ -255,6 +606,258 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+    use crate::audit::{sink::tests::CaptureSink, AuditSink};
+
+    fn test_health_config() -> config::UpstreamHealthCheckConfig {
+        config::UpstreamHealthCheckConfig {
+            method: "GET".to_owned(),
+            path: "/ready".to_owned(),
+            interval_ms: 100,
+            jitter_ms: 0,
+            timeout_ms: 50,
+            healthy_threshold: 2,
+            unhealthy_threshold: 2,
+            expected_statuses: vec![200],
+            passive_failure_statuses: vec![500, 502, 503, 504],
+            required_for_readiness: true,
+            minimum_healthy: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_health_uses_thresholds_for_exclusion_and_recovery() {
+        let health = UpstreamHealthState::new("payments", "primary", None);
+        let config = test_health_config();
+        let now = OffsetDateTime::UNIX_EPOCH;
+
+        assert!(!health.eligible());
+        health
+            .update(true, now, true, &config, "active", None)
+            .await;
+        assert!(!health.eligible());
+        health
+            .update(true, now, true, &config, "active", None)
+            .await;
+        assert!(health.eligible());
+        health
+            .update(false, now, true, &config, "active", Some("http_connect"))
+            .await;
+        assert!(health.eligible());
+        health
+            .update(false, now, true, &config, "active", Some("http_connect"))
+            .await;
+        assert!(!health.eligible());
+        health
+            .update(true, now, true, &config, "active", None)
+            .await;
+        health
+            .update(true, now, true, &config, "active", None)
+            .await;
+        assert!(health.eligible());
+    }
+
+    #[test]
+    fn configured_jitter_stays_within_centered_bounds() {
+        assert_eq!(
+            jittered_interval(1_000, 0, u64::MAX),
+            Duration::from_millis(1_000)
+        );
+        assert_eq!(jittered_interval(1_000, 100, 0), Duration::from_millis(900));
+        assert_eq!(
+            jittered_interval(1_000, 100, 200),
+            Duration::from_millis(1_100)
+        );
+        for sample in [1, 7, 99, 1_000, u64::MAX] {
+            let interval = jittered_interval(1_000, 100, sample);
+            assert!((Duration::from_millis(900)..=Duration::from_millis(1_100)).contains(&interval));
+        }
+    }
+
+    #[tokio::test]
+    async fn passive_statuses_apply_thresholds_and_ignore_client_4xx() {
+        let health = UpstreamHealthState::new("payments", "primary", None);
+        let mut config = test_health_config();
+        config.healthy_threshold = 1;
+        health
+            .update(
+                true,
+                OffsetDateTime::UNIX_EPOCH,
+                true,
+                &config,
+                "active",
+                None,
+            )
+            .await;
+        assert!(health.eligible());
+
+        health.record_passive_status(503, &config).await;
+        assert!(health.eligible());
+        health.record_passive_status(404, &config).await;
+        assert!(health.eligible());
+        health.record_passive_status(503, &config).await;
+        health.record_passive_status(503, &config).await;
+        assert!(!health.eligible());
+        assert_eq!(
+            health
+                .snapshot
+                .read()
+                .await
+                .last_failure_category
+                .as_deref(),
+            Some("upstream_status")
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_is_emitted_once_per_transition_with_bounded_identity() {
+        let capture = CaptureSink::new();
+        let audit = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let health = UpstreamHealthState::new("payments", "primary", Some(audit));
+        let config = test_health_config();
+
+        health
+            .update(
+                true,
+                OffsetDateTime::UNIX_EPOCH,
+                true,
+                &config,
+                "active",
+                None,
+            )
+            .await;
+        health
+            .update(
+                true,
+                OffsetDateTime::UNIX_EPOCH,
+                true,
+                &config,
+                "active",
+                None,
+            )
+            .await;
+        health
+            .update(
+                true,
+                OffsetDateTime::UNIX_EPOCH,
+                true,
+                &config,
+                "active",
+                None,
+            )
+            .await;
+        health
+            .update(
+                false,
+                OffsetDateTime::UNIX_EPOCH,
+                true,
+                &config,
+                "active",
+                Some("http_connect"),
+            )
+            .await;
+        health
+            .update(
+                false,
+                OffsetDateTime::UNIX_EPOCH,
+                true,
+                &config,
+                "active",
+                Some("http_connect"),
+            )
+            .await;
+
+        let events = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let events = capture.events();
+                if events.len() == 2 {
+                    break events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("transition audit events should be emitted");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "upstream.health_state_changed",
+                "upstream.health_state_changed"
+            ]
+        );
+        assert_eq!(events[0].payload["state"], "healthy");
+        assert_eq!(events[1].payload["state"], "unhealthy");
+        assert_eq!(events[1].payload["pool_id"], "payments");
+        assert_eq!(events[1].payload["endpoint_id"], "primary");
+        assert_eq!(events[1].payload["reason"], "http_connect");
+        let serialized = serde_json::to_string(&events).expect("events should serialize");
+        assert!(!serialized.contains("://"));
+    }
+
+    #[tokio::test]
+    async fn readiness_uses_cached_required_pool_capacity_without_topology() {
+        let client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::default())
+                .expect("test client should build"),
+        );
+        let mut config = test_health_config();
+        config.healthy_threshold = 1;
+        config.minimum_healthy = 2;
+        let first = UpstreamHealthState::new("payments", "first", None);
+        let second = UpstreamHealthState::new("payments", "second", None);
+        let targets = upstream_health_targets([
+            (
+                "payments".to_owned(),
+                "first".to_owned(),
+                "https://first.internal".to_owned(),
+                Arc::clone(&client),
+                first.clone(),
+                Some(config.clone()),
+            ),
+            (
+                "payments".to_owned(),
+                "second".to_owned(),
+                "https://second.internal".to_owned(),
+                client,
+                second.clone(),
+                Some(config.clone()),
+            ),
+        ]);
+
+        first
+            .update(
+                true,
+                OffsetDateTime::UNIX_EPOCH,
+                true,
+                &config,
+                "active",
+                None,
+            )
+            .await;
+        let status = upstream_health_admin_response(&targets).await;
+        assert!(!status.ready);
+        assert_eq!(status.pools[0].eligible_endpoints, 1);
+        assert_eq!(status.pools[0].minimum_healthy, 2);
+
+        second
+            .update(
+                true,
+                OffsetDateTime::UNIX_EPOCH,
+                true,
+                &config,
+                "active",
+                None,
+            )
+            .await;
+        let status = upstream_health_admin_response(&targets).await;
+        assert!(status.ready);
+        assert_eq!(status.pools[0].eligible_endpoints, 2);
+        let serialized = serde_json::to_string(&status).expect("status should serialize");
+        assert!(!serialized.contains("first.internal"));
+        assert!(!serialized.contains("second.internal"));
+    }
 
     struct StaticResolver {
         address: SocketAddr,
@@ -334,7 +937,7 @@ mod tests {
             )
             .expect("health egress client should build"),
         );
-        let health = UpstreamHealthState::new();
+        let health = UpstreamHealthState::new("legacy", "primary", None);
         let checked_at = OffsetDateTime::from_unix_timestamp(1_700_000_000)
             .expect("fake timestamp should be valid");
         let (sleeps_tx, mut sleeps_rx) = mpsc::unbounded_channel();
@@ -348,7 +951,9 @@ mod tests {
             health.clone(),
             client,
             format!("http://{host}:{}/", address.port()),
+            None,
             clock,
+            CancellationToken::new(),
         ));
 
         tokio::time::timeout(Duration::from_secs(2), probes_rx.recv())
@@ -356,10 +961,8 @@ mod tests {
             .expect("first health check should be immediate")
             .expect("probe channel should stay open");
         assert_eq!(sleeps_rx.recv().await, Some(UPSTREAM_HEALTH_CHECK_INTERVAL));
-        assert_eq!(
-            health.response().await,
-            (Some(true), Some(rfc3339_timestamp(checked_at)))
-        );
+        assert_eq!(health.state_name(), "healthy");
+        assert_eq!(health.snapshot.read().await.last_checked, Some(checked_at));
         assert!(
             tokio::time::timeout(Duration::from_millis(50), probes_rx.recv())
                 .await
@@ -376,6 +979,64 @@ mod tests {
         runner.abort();
         server.abort();
         let _ = runner.await;
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_an_in_flight_health_probe() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("health test server should bind");
+        let address = listener.local_addr().expect("test address");
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("probe should connect");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let host = "health-cancel.example.test";
+        let client = Arc::new(
+            egress::EgressClient::new_with_resolver(
+                egress::EgressConfig {
+                    allowed_hosts: HashSet::from([host.to_owned()]),
+                    deny_private_ips: false,
+                    ..egress::EgressConfig::default()
+                },
+                Arc::new(StaticResolver { address }),
+            )
+            .expect("health egress client should build"),
+        );
+        let mut config = test_health_config();
+        config.interval_ms = 10_000;
+        config.timeout_ms = 5_000;
+        let (sleeps_tx, _sleeps_rx) = mpsc::unbounded_channel();
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock {
+            now: OffsetDateTime::UNIX_EPOCH,
+            sleeps: sleeps_tx,
+            release: Arc::new(Semaphore::new(0)),
+        });
+        let cancellation = CancellationToken::new();
+        let runner = tokio::spawn(run_upstream_health_check_loop(
+            UpstreamHealthState::new("payments", "primary", None),
+            client,
+            format!("http://{host}:{}", address.port()),
+            Some(config),
+            clock,
+            cancellation.clone(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), accepted_rx)
+            .await
+            .expect("probe should start")
+            .expect("probe acceptance should be signaled");
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_millis(250), runner)
+            .await
+            .expect("cancellation should stop the in-flight probe")
+            .expect("health loop should exit cleanly");
+        server.abort();
         let _ = server.await;
     }
 
@@ -397,17 +1058,18 @@ mod tests {
             release: Arc::new(Semaphore::new(0)),
         };
 
-        let reachable = refresh_upstream_health(
-            &UpstreamHealthState::new(),
+        let health = UpstreamHealthState::new("legacy", "primary", None);
+        refresh_upstream_health(
+            &health,
             &client,
             "https://secret-upstream.example/private?token=secret-query",
-            true,
+            None,
             &clock,
         )
         .await;
         drop(_guard);
 
-        assert!(!reachable);
+        assert_eq!(health.state_name(), "unhealthy");
         let output = logs.contents();
         assert!(output.contains("host_not_allowed"));
         for secret in ["secret-upstream", "private", "secret-query", "https://"] {

@@ -108,6 +108,7 @@ pub enum EgressError {
     SchemeNotAllowed(String),
     RequestBodyTooLarge { size: usize, max: usize },
     RequestBodyReadFailed,
+    UnexpectedStatus(u16),
     ResponseTooLarge { max: usize },
     ResponseIdleTimeout { timeout: Duration },
     InvalidTlsCaBundle { path: PathBuf, message: String },
@@ -140,6 +141,9 @@ impl fmt::Display for EgressError {
             }
             Self::RequestBodyReadFailed => {
                 write!(formatter, "egress request body could not be read")
+            }
+            Self::UnexpectedStatus(status) => {
+                write!(formatter, "egress response had unexpected status {status}")
             }
             Self::ResponseTooLarge { max } => {
                 write!(formatter, "egress response body exceeded {max} bytes")
@@ -198,6 +202,7 @@ impl EgressError {
             Self::SchemeNotAllowed(_) => "scheme_not_allowed",
             Self::RequestBodyTooLarge { .. } => "request_body_too_large",
             Self::RequestBodyReadFailed => "request_body_read_failed",
+            Self::UnexpectedStatus(_) => "unexpected_status",
             Self::ResponseTooLarge { .. } => "response_too_large",
             Self::ResponseIdleTimeout { .. } => "response_idle_timeout",
             Self::InvalidTlsCaBundle { .. } => "invalid_tls_ca_bundle",
@@ -208,6 +213,26 @@ impl EgressError {
             Self::Http(err) if err.is_decode() => "http_decode",
             Self::Http(err) if err.is_status() => "http_status",
             Self::Http(_) => "http_other",
+        }
+    }
+
+    pub(crate) fn is_passive_health_failure(&self) -> bool {
+        match self {
+            Self::DnsResolutionFailed(_) | Self::ResponseIdleTimeout { .. } => true,
+            Self::Http(error) => {
+                !error.is_body() && (error.is_connect() || error.is_timeout() || error.is_request())
+            }
+            Self::HostNotAllowed(_)
+            | Self::PortNotAllowed(_)
+            | Self::NonGlobalIpBlocked(_)
+            | Self::InvalidPolicy(_)
+            | Self::InvalidUrl(_)
+            | Self::SchemeNotAllowed(_)
+            | Self::RequestBodyTooLarge { .. }
+            | Self::RequestBodyReadFailed
+            | Self::UnexpectedStatus(_)
+            | Self::ResponseTooLarge { .. }
+            | Self::InvalidTlsCaBundle { .. } => false,
         }
     }
 }
@@ -2455,6 +2480,7 @@ mod tests {
                 load_balancing: crate::config::UpstreamLoadBalancingConfig::default(),
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
+                health_check: None,
                 timeout_ms: None,
                 response_idle_timeout_ms: None,
                 connect_timeout_ms: None,
@@ -2472,6 +2498,7 @@ mod tests {
                 load_balancing: crate::config::UpstreamLoadBalancingConfig::default(),
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
+                health_check: None,
                 timeout_ms: None,
                 response_idle_timeout_ms: None,
                 connect_timeout_ms: None,
@@ -2502,6 +2529,7 @@ mod tests {
                 load_balancing: crate::config::UpstreamLoadBalancingConfig::default(),
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
+                health_check: None,
                 timeout_ms: None,
                 response_idle_timeout_ms: None,
                 connect_timeout_ms: None,
