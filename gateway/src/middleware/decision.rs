@@ -27,4 +27,13 @@ pub struct UpstreamOutcome {
     pub status: Option<u16>,
     pub pool_id: Option<String>,
     pub endpoint_id: Option<String>,
+    pub attempts: Vec<UpstreamAttemptOutcome>,
+    pub retry_exhausted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamAttemptOutcome {
+    pub endpoint_id: String,
+    pub result: String,
+    pub duration_ms: u64,
 }

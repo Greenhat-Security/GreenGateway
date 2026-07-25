@@ -17,6 +17,7 @@ use crate::{audit, config, egress, lifecycle, upstream_route};
 mod admission;
 mod forward;
 mod health;
+mod retry;
 
 pub(crate) use health::{UpstreamHealthAdminResponse, UpstreamHealthResponse};
 
@@ -120,6 +121,7 @@ pub(crate) struct ProxyState {
     upstream_health: Vec<health::UpstreamHealthTarget>,
     max_request_body_bytes: usize,
     health_runtime: health::UpstreamHealthRuntime,
+    audit: audit::AuditLog,
     #[cfg(test)]
     request_selection_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
@@ -199,6 +201,8 @@ struct UpstreamPool {
     endpoints: Vec<ProxyEndpoint>,
     next_selection: AtomicU64,
     admission: admission::PoolAdmission,
+    retry_policy: retry::RetryPolicy,
+    retry_budget: retry::RetryBudget,
 }
 
 impl UpstreamPool {
@@ -206,6 +210,7 @@ impl UpstreamPool {
         id: String,
         endpoints: Vec<ProxyEndpoint>,
         limits: &config::UpstreamPoolLimitsConfig,
+        retry_config: Option<&config::UpstreamRetryConfig>,
     ) -> Self {
         let id: Arc<str> = Arc::from(id);
         Self {
@@ -218,10 +223,35 @@ impl UpstreamPool {
             id,
             endpoints,
             next_selection: AtomicU64::new(0),
+            retry_policy: retry::RetryPolicy::from_config(retry_config),
+            retry_budget: retry::RetryBudget::new(limits.max_in_flight),
         }
     }
 
+    #[cfg(test)]
     fn select_endpoint(&self) -> Option<ProxyEndpoint> {
+        self.select_endpoint_avoiding(&HashSet::new())
+    }
+
+    fn request_timeout(&self) -> Duration {
+        self.endpoints
+            .first()
+            .expect("validated upstream pool must contain an endpoint")
+            .egress_client
+            .request_timeout()
+    }
+
+    fn select_endpoint_avoiding(
+        &self,
+        attempted_endpoint_ids: &HashSet<Arc<str>>,
+    ) -> Option<ProxyEndpoint> {
+        let has_fresh_endpoint = self.endpoints.iter().any(|endpoint| {
+            endpoint
+                .health_config
+                .as_ref()
+                .is_none_or(|_| endpoint.health.eligible())
+                && !attempted_endpoint_ids.contains(&endpoint.id)
+        });
         let total_weight = self
             .endpoints
             .iter()
@@ -230,6 +260,7 @@ impl UpstreamPool {
                     .health_config
                     .as_ref()
                     .is_none_or(|_| endpoint.health.eligible())
+                    && (!has_fresh_endpoint || !attempted_endpoint_ids.contains(&endpoint.id))
             })
             .map(|endpoint| u64::from(endpoint.weight))
             .sum::<u64>();
@@ -245,6 +276,7 @@ impl UpstreamPool {
                     .health_config
                     .as_ref()
                     .is_none_or(|_| endpoint.health.eligible())
+                    && (!has_fresh_endpoint || !attempted_endpoint_ids.contains(&endpoint.id))
             })
             .find(|endpoint| {
                 cumulative = cumulative.saturating_add(u64::from(endpoint.weight));
@@ -275,6 +307,7 @@ impl ProxyState {
                     health_config: None,
                 }],
                 &config::UpstreamPoolLimitsConfig::default(),
+                None,
             ));
 
             return Ok(Some(Self {
@@ -289,6 +322,7 @@ impl ProxyState {
                 )]),
                 max_request_body_bytes: config.egress_max_request_body_bytes,
                 health_runtime: health::UpstreamHealthRuntime::default(),
+                audit,
                 #[cfg(test)]
                 request_selection_count: None,
                 #[cfg(test)]
@@ -335,6 +369,7 @@ impl ProxyState {
                     route_id.clone(),
                     endpoints,
                     &route.limits,
+                    route.retry.as_ref(),
                 ));
 
                 Ok(ProxyRoute {
@@ -366,6 +401,7 @@ impl ProxyState {
             upstream_health,
             max_request_body_bytes: config.egress_max_request_body_bytes,
             health_runtime: health::UpstreamHealthRuntime::default(),
+            audit,
             #[cfg(test)]
             request_selection_count: None,
             #[cfg(test)]
@@ -727,6 +763,7 @@ mod tests {
                 },
             ],
             &config::UpstreamPoolLimitsConfig::default(),
+            None,
         );
 
         let selected = (0..8)
@@ -752,6 +789,7 @@ mod tests {
             request_body: config::UpstreamRequestBodyConfig::default(),
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
+            retry: None,
             timeout_ms: None,
             response_idle_timeout_ms: None,
             connect_timeout_ms: None,
@@ -844,12 +882,14 @@ mod tests {
                 health_config: None,
             }],
             &config::UpstreamPoolLimitsConfig::default(),
+            None,
         ));
         let state = ProxyState {
             routes: ProxyRoutes::Legacy { pool },
             upstream_health: Vec::new(),
             max_request_body_bytes: 1024,
             health_runtime: health::UpstreamHealthRuntime::default(),
+            audit: audit::AuditLog::new(Arc::new(audit::sink::tests::CaptureSink::new())),
             request_selection_count: None,
             request_body_mode_override: None,
         };
@@ -889,6 +929,7 @@ mod tests {
             request_body: config::UpstreamRequestBodyConfig::default(),
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
+            retry: None,
             timeout_ms: Some(1234),
             response_idle_timeout_ms: None,
             connect_timeout_ms: None,

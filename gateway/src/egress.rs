@@ -627,6 +627,10 @@ pub struct CheckedEgressDestination {
 }
 
 impl EgressClient {
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.config.timeout
+    }
+
     pub fn new(config: EgressConfig) -> Result<Self, EgressError> {
         Self::new_with_resolver(config, Arc::new(SystemDnsResolver))
     }
@@ -2481,6 +2485,7 @@ mod tests {
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
+                retry: None,
                 timeout_ms: None,
                 response_idle_timeout_ms: None,
                 connect_timeout_ms: None,
@@ -2499,6 +2504,7 @@ mod tests {
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
+                retry: None,
                 timeout_ms: None,
                 response_idle_timeout_ms: None,
                 connect_timeout_ms: None,
@@ -2530,6 +2536,7 @@ mod tests {
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
+                retry: None,
                 timeout_ms: None,
                 response_idle_timeout_ms: None,
                 connect_timeout_ms: None,

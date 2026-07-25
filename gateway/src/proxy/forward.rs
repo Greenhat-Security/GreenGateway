@@ -1,4 +1,11 @@
-use std::{collections::HashSet, error::Error, fmt, net::IpAddr, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    error::Error,
+    fmt,
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     body::Body,
@@ -12,8 +19,8 @@ use http::{
 };
 use serde_json::json;
 
-use super::{MatchedUpstream, ProxyState, RequestBodyMode, RouteRequestHeaderPolicy};
-use crate::{egress, middleware};
+use super::{retry, MatchedUpstream, ProxyState, RequestBodyMode, RouteRequestHeaderPolicy};
+use crate::{audit, egress, middleware};
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const STREAMING_DISCOVERY_CAPTURE_MAX_BYTES: usize = 64 * 1024;
@@ -68,13 +75,6 @@ async fn forward_to_upstream(
     source_ip: &str,
 ) -> Response {
     let (parts, body) = request.into_parts();
-    let mut headers = strip_hop_by_hop_headers(&parts.headers);
-    strip_gateway_credentials(&mut headers);
-    if let Some(request_id) = parts.headers.get(REQUEST_ID_HEADER) {
-        headers.insert(request_id_header(), request_id.clone());
-    }
-    set_upstream_client_ip(&mut headers, source_ip);
-    apply_route_request_header_policy(&mut headers, &upstream.request_header_policy);
     let request_id = parts.headers.get(REQUEST_ID_HEADER).cloned();
     let payload_capture = parts
         .extensions
@@ -105,7 +105,7 @@ async fn forward_to_upstream(
             return admission_unavailable_response(&upstream.pool.id, request_id);
         }
     };
-    let body = match upstream.request_body_mode {
+    let mut body = match upstream.request_body_mode {
         RequestBodyMode::Buffered => {
             match axum::body::to_bytes(body, proxy.max_request_body_bytes).await {
                 Ok(body) => {
@@ -113,9 +113,9 @@ async fn forward_to_upstream(
                         payload_capture.capture_json_body(&parts.headers, &body);
                     }
                     if body.is_empty() {
-                        egress::EgressRequestBody::Empty
+                        PreparedRequestBody::Empty
                     } else {
-                        egress::EgressRequestBody::Buffered(body.to_vec())
+                        PreparedRequestBody::Buffered(Arc::from(body.to_vec()))
                     }
                 }
                 Err(_) => {
@@ -131,119 +131,544 @@ async fn forward_to_upstream(
                 }
             }
         }
-        RequestBodyMode::Stream => egress::EgressRequestBody::streaming(
-            streamed_request_body(body, &parts.headers, payload_capture),
-            known_length,
-        ),
+        RequestBodyMode::Stream => {
+            PreparedRequestBody::Streaming(Some(egress::EgressRequestBody::streaming(
+                streamed_request_body(body, &parts.headers, payload_capture),
+                known_length,
+            )))
+        }
     };
+    let max_attempts = upstream
+        .pool
+        .retry_policy
+        .max_attempts_for(&parts.method, body.is_replayable());
+    let request_started = Instant::now();
+    let deadline = tokio::time::Instant::now() + upstream.pool.request_timeout();
+    let mut attempted_endpoint_ids = HashSet::new();
+    let mut attempts = Vec::with_capacity(usize::from(max_attempts));
+    let mut active_retry_permit = None;
 
-    let Some(endpoint) = upstream.pool.select_endpoint() else {
-        tracing::warn!(
+    for attempt_number in 1..=max_attempts {
+        let Some(endpoint) = upstream
+            .pool
+            .select_endpoint_avoiding(&attempted_endpoint_ids)
+        else {
+            let retry_exhausted = !attempts.is_empty();
+            if retry_exhausted {
+                emit_retry_exhausted(
+                    proxy,
+                    request_id.as_ref(),
+                    source_ip,
+                    &upstream.pool.id,
+                    &attempts,
+                    "no_eligible_endpoint",
+                );
+            }
+            tracing::warn!(
+                pool_id = upstream.pool.id.as_ref(),
+                error_category = "no_healthy_endpoint",
+                "proxied request found no healthy upstream endpoint"
+            );
+            return unavailable_response_with_outcome(
+                &upstream.pool.id,
+                request_id,
+                attempts,
+                retry_exhausted,
+                request_started.elapsed(),
+            );
+        };
+        attempted_endpoint_ids.insert(Arc::clone(&endpoint.id));
+        ::metrics::counter!(
+            crate::metrics::PROXY_ENDPOINT_SELECTIONS_TOTAL,
+            "pool_id" => Arc::clone(&upstream.pool.id),
+            "endpoint_id" => Arc::clone(&endpoint.id)
+        )
+        .increment(1);
+        tracing::debug!(
             pool_id = upstream.pool.id.as_ref(),
-            error_category = "no_healthy_endpoint",
-            "proxied request found no healthy upstream endpoint"
+            endpoint_id = endpoint.id.as_ref(),
+            attempt = attempt_number,
+            "selected configured upstream endpoint"
         );
-        return admission_unavailable_response(&upstream.pool.id, request_id);
+
+        let Some(attempt_body) = body.next_attempt() else {
+            tracing::error!(
+                pool_id = upstream.pool.id.as_ref(),
+                error_category = "non_replayable_body",
+                "retry planner attempted to replay a non-replayable request body"
+            );
+            return unavailable_response_with_outcome(
+                &upstream.pool.id,
+                request_id,
+                attempts,
+                true,
+                request_started.elapsed(),
+            );
+        };
+        let target_url = proxy_target_url(&endpoint.upstream_origin, &parts.uri);
+        let headers = attempt_headers(&parts.headers, source_ip, &upstream.request_header_policy);
+        let attempt_started = Instant::now();
+        let sent = tokio::time::timeout_at(
+            deadline,
+            endpoint.egress_client.stream_request_with_body(
+                parts.method.clone(),
+                &target_url,
+                headers,
+                attempt_body,
+            ),
+        )
+        .await;
+
+        let mut upstream_response = match sent {
+            Err(_) => {
+                let duration = attempt_started.elapsed();
+                record_attempt(
+                    &upstream.pool.id,
+                    &endpoint.id,
+                    "deadline_exceeded",
+                    duration,
+                );
+                attempts.push(attempt_outcome(&endpoint.id, "deadline_exceeded", duration));
+                let retry_exhausted = max_attempts > 1;
+                if retry_exhausted {
+                    emit_retry_exhausted(
+                        proxy,
+                        request_id.as_ref(),
+                        source_ip,
+                        &upstream.pool.id,
+                        &attempts,
+                        "deadline_exceeded",
+                    );
+                }
+                return gateway_timeout_response(
+                    request_id,
+                    &upstream.pool.id,
+                    &endpoint.id,
+                    attempts,
+                    retry_exhausted,
+                    request_started.elapsed(),
+                );
+            }
+            Ok(Err(error)) => {
+                if let Some(config) = endpoint.health_config.as_deref() {
+                    endpoint.health.record_passive_error(&error, config).await;
+                }
+                let duration = attempt_started.elapsed();
+                let category = error.safe_category();
+                record_attempt(&upstream.pool.id, &endpoint.id, category, duration);
+                attempts.push(attempt_outcome(&endpoint.id, category, duration));
+                tracing::warn!(
+                    error_category = category,
+                    attempt = attempt_number,
+                    "proxied upstream request attempt failed"
+                );
+                let can_retry = attempt_number < max_attempts
+                    && upstream.pool.retry_policy.retries_error(&error);
+                if can_retry {
+                    drop(active_retry_permit.take());
+                    match reserve_retry(
+                        &upstream,
+                        request_id.as_ref(),
+                        attempt_number,
+                        deadline,
+                        "transport",
+                    )
+                    .await
+                    {
+                        Ok(permit) => {
+                            active_retry_permit = Some(permit);
+                            continue;
+                        }
+                        Err(reason) => {
+                            emit_retry_exhausted(
+                                proxy,
+                                request_id.as_ref(),
+                                source_ip,
+                                &upstream.pool.id,
+                                &attempts,
+                                reason,
+                            );
+                            return error_response_with_outcome(
+                                &error,
+                                request_started.elapsed(),
+                                request_id,
+                                &upstream.pool.id,
+                                &endpoint.id,
+                                attempts,
+                                true,
+                            );
+                        }
+                    }
+                }
+                let retry_exhausted =
+                    upstream.pool.retry_policy.retries_error(&error) && max_attempts > 1;
+                if retry_exhausted {
+                    emit_retry_exhausted(
+                        proxy,
+                        request_id.as_ref(),
+                        source_ip,
+                        &upstream.pool.id,
+                        &attempts,
+                        "max_attempts",
+                    );
+                }
+                return error_response_with_outcome(
+                    &error,
+                    request_started.elapsed(),
+                    request_id,
+                    &upstream.pool.id,
+                    &endpoint.id,
+                    attempts,
+                    retry_exhausted,
+                );
+            }
+            Ok(Ok(response)) => response,
+        };
+
+        let upstream_status = upstream_response.status;
+        if let Some(config) = endpoint.health_config.as_deref() {
+            endpoint
+                .health
+                .record_passive_status(upstream_status.as_u16(), config)
+                .await;
+        }
+        let retryable_status = upstream.pool.retry_policy.retries_status(upstream_status);
+        let mut retry_stop_reason = None;
+        if retryable_status && attempt_number < max_attempts {
+            let duration = attempt_started.elapsed();
+            drop(active_retry_permit.take());
+            match reserve_retry(
+                &upstream,
+                request_id.as_ref(),
+                attempt_number,
+                deadline,
+                "status",
+            )
+            .await
+            {
+                Ok(permit) => {
+                    record_attempt(
+                        &upstream.pool.id,
+                        &endpoint.id,
+                        "retryable_status",
+                        duration,
+                    );
+                    attempts.push(attempt_outcome(&endpoint.id, "retryable_status", duration));
+                    active_retry_permit = Some(permit);
+                    continue;
+                }
+                Err(reason) => {
+                    retry_stop_reason = Some(reason);
+                }
+            }
+        }
+
+        let upstream_headers = strip_hop_by_hop_headers(&upstream_response.headers);
+        let first_chunk =
+            match tokio::time::timeout_at(deadline, upstream_response.body.next()).await {
+                Err(_) => {
+                    let duration = attempt_started.elapsed();
+                    record_attempt(
+                        &upstream.pool.id,
+                        &endpoint.id,
+                        "deadline_exceeded",
+                        duration,
+                    );
+                    attempts.push(attempt_outcome(&endpoint.id, "deadline_exceeded", duration));
+                    let retry_exhausted = max_attempts > 1;
+                    if retry_exhausted {
+                        emit_retry_exhausted(
+                            proxy,
+                            request_id.as_ref(),
+                            source_ip,
+                            &upstream.pool.id,
+                            &attempts,
+                            "deadline_exceeded",
+                        );
+                    }
+                    return gateway_timeout_response(
+                        request_id,
+                        &upstream.pool.id,
+                        &endpoint.id,
+                        attempts,
+                        retry_exhausted,
+                        request_started.elapsed(),
+                    );
+                }
+                Ok(Some(Err(error))) => {
+                    if let Some(config) = endpoint.health_config.as_deref() {
+                        endpoint.health.record_passive_error(&error, config).await;
+                    }
+                    let duration = attempt_started.elapsed();
+                    let category = error.safe_category();
+                    record_attempt(&upstream.pool.id, &endpoint.id, category, duration);
+                    attempts.push(attempt_outcome(&endpoint.id, category, duration));
+                    let can_retry = attempt_number < max_attempts
+                        && retry_stop_reason.is_none()
+                        && upstream.pool.retry_policy.retries_error(&error);
+                    if can_retry {
+                        drop(active_retry_permit.take());
+                        match reserve_retry(
+                            &upstream,
+                            request_id.as_ref(),
+                            attempt_number,
+                            deadline,
+                            "response",
+                        )
+                        .await
+                        {
+                            Ok(permit) => {
+                                active_retry_permit = Some(permit);
+                                continue;
+                            }
+                            Err(reason) => {
+                                emit_retry_exhausted(
+                                    proxy,
+                                    request_id.as_ref(),
+                                    source_ip,
+                                    &upstream.pool.id,
+                                    &attempts,
+                                    reason,
+                                );
+                                return error_response_with_outcome(
+                                    &error,
+                                    request_started.elapsed(),
+                                    request_id,
+                                    &upstream.pool.id,
+                                    &endpoint.id,
+                                    attempts,
+                                    true,
+                                );
+                            }
+                        }
+                    }
+                    let retry_exhausted = retry_stop_reason.is_some()
+                        || (upstream.pool.retry_policy.retries_error(&error) && max_attempts > 1);
+                    if retry_exhausted {
+                        emit_retry_exhausted(
+                            proxy,
+                            request_id.as_ref(),
+                            source_ip,
+                            &upstream.pool.id,
+                            &attempts,
+                            retry_stop_reason.unwrap_or("max_attempts"),
+                        );
+                    }
+                    return error_response_with_outcome(
+                        &error,
+                        request_started.elapsed(),
+                        request_id,
+                        &upstream.pool.id,
+                        &endpoint.id,
+                        attempts,
+                        retry_exhausted,
+                    );
+                }
+                Ok(Some(Ok(chunk))) => Some(chunk),
+                Ok(None) => None,
+            };
+        let duration = attempt_started.elapsed();
+        let result = if retryable_status {
+            "retryable_status"
+        } else {
+            "response"
+        };
+        record_attempt(&upstream.pool.id, &endpoint.id, result, duration);
+        attempts.push(attempt_outcome(&endpoint.id, result, duration));
+        let retry_exhausted = retry_stop_reason.is_some() || (retryable_status && max_attempts > 1);
+        if retry_exhausted {
+            emit_retry_exhausted(
+                proxy,
+                request_id.as_ref(),
+                source_ip,
+                &upstream.pool.id,
+                &attempts,
+                retry_stop_reason.unwrap_or("max_attempts"),
+            );
+        }
+        let response_body = match first_chunk {
+            Some(chunk) => redacted_response_body(
+                chunk,
+                upstream_response.body,
+                admission_permit,
+                active_retry_permit.take(),
+            ),
+            None => Body::empty(),
+        };
+        let mut response = Response::new(response_body);
+        *response.status_mut() = upstream_status;
+        *response.headers_mut() = upstream_headers;
+        response
+            .extensions_mut()
+            .insert(middleware::decision::UpstreamOutcome {
+                latency_ms: crate::duration_millis(request_started.elapsed()),
+                status: Some(upstream_status.as_u16()),
+                pool_id: Some(upstream.pool.id.to_string()),
+                endpoint_id: Some(endpoint.id.to_string()),
+                attempts,
+                retry_exhausted,
+            });
+        if let Some(request_id) = request_id {
+            response
+                .headers_mut()
+                .insert(request_id_header(), request_id);
+        }
+        return response;
+    }
+
+    unavailable_response_with_outcome(
+        &upstream.pool.id,
+        request_id,
+        attempts,
+        true,
+        request_started.elapsed(),
+    )
+}
+
+enum PreparedRequestBody {
+    Empty,
+    Buffered(Arc<[u8]>),
+    Streaming(Option<egress::EgressRequestBody>),
+}
+
+impl PreparedRequestBody {
+    fn is_replayable(&self) -> bool {
+        !matches!(self, Self::Streaming(_))
+    }
+
+    fn next_attempt(&mut self) -> Option<egress::EgressRequestBody> {
+        match self {
+            Self::Empty => Some(egress::EgressRequestBody::Empty),
+            Self::Buffered(bytes) => {
+                Some(egress::EgressRequestBody::Buffered(bytes.as_ref().to_vec()))
+            }
+            Self::Streaming(body) => body.take(),
+        }
+    }
+}
+
+fn attempt_headers(
+    inbound: &HeaderMap,
+    source_ip: &str,
+    policy: &RouteRequestHeaderPolicy,
+) -> HeaderMap {
+    let mut headers = strip_hop_by_hop_headers(inbound);
+    strip_gateway_credentials(&mut headers);
+    if let Some(request_id) = inbound.get(REQUEST_ID_HEADER) {
+        headers.insert(request_id_header(), request_id.clone());
+    }
+    set_upstream_client_ip(&mut headers, source_ip);
+    apply_route_request_header_policy(&mut headers, policy);
+    headers
+}
+
+async fn reserve_retry(
+    upstream: &MatchedUpstream,
+    request_id: Option<&HeaderValue>,
+    failed_attempt: u8,
+    deadline: tokio::time::Instant,
+    reason: &'static str,
+) -> Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
+    let request_id = request_id.map_or(b"missing".as_slice(), HeaderValue::as_bytes);
+    let delay = retry::retry_backoff(request_id, failed_attempt);
+    if tokio::time::Instant::now()
+        .checked_add(delay)
+        .is_none_or(|after_backoff| after_backoff >= deadline)
+    {
+        return Err("deadline_exceeded");
+    }
+    let Some(permit) = upstream.pool.retry_budget.try_acquire() else {
+        ::metrics::counter!(
+            crate::metrics::PROXY_RETRY_BUDGET_EXHAUSTED_TOTAL,
+            "pool_id" => Arc::clone(&upstream.pool.id)
+        )
+        .increment(1);
+        return Err("retry_budget_exhausted");
     };
     ::metrics::counter!(
-        crate::metrics::PROXY_ENDPOINT_SELECTIONS_TOTAL,
+        crate::metrics::PROXY_UPSTREAM_RETRIES_TOTAL,
         "pool_id" => Arc::clone(&upstream.pool.id),
-        "endpoint_id" => Arc::clone(&endpoint.id)
+        "reason" => reason
     )
     .increment(1);
-    tracing::debug!(
-        pool_id = upstream.pool.id.as_ref(),
-        endpoint_id = endpoint.id.as_ref(),
-        "selected configured upstream endpoint"
-    );
-    let target_url = proxy_target_url(&endpoint.upstream_origin, &parts.uri);
-    let upstream_started = Instant::now();
-    let upstream_response = match endpoint
-        .egress_client
-        .stream_request_with_body(parts.method, &target_url, headers, body)
-        .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            if let Some(config) = endpoint.health_config.as_deref() {
-                endpoint.health.record_passive_error(&err, config).await;
-            }
-            let latency_ms = crate::duration_millis(upstream_started.elapsed());
-            tracing::warn!(
-                error_category = err.safe_category(),
-                "proxied upstream request failed"
-            );
-            return error_response_with_outcome(
-                &err,
-                latency_ms,
-                request_id,
-                &upstream.pool.id,
-                &endpoint.id,
-            );
-        }
-    };
-    let upstream_latency_ms = crate::duration_millis(upstream_started.elapsed());
-    let upstream_status = upstream_response.status;
-    if let Some(config) = endpoint.health_config.as_deref() {
-        endpoint
-            .health
-            .record_passive_status(upstream_status.as_u16(), config)
-            .await;
-    }
-    let upstream_headers = strip_hop_by_hop_headers(&upstream_response.headers);
-    let mut upstream_body = upstream_response.body;
-    let first_chunk = match upstream_body.next().await {
-        Some(Ok(chunk)) => Some(chunk),
-        Some(Err(err)) => {
-            if let Some(config) = endpoint.health_config.as_deref() {
-                endpoint.health.record_passive_error(&err, config).await;
-            }
-            let latency_ms = crate::duration_millis(upstream_started.elapsed());
-            tracing::warn!(
-                error_category = err.safe_category(),
-                "proxied upstream response body failed"
-            );
-            return error_response_with_outcome(
-                &err,
-                latency_ms,
-                request_id,
-                &upstream.pool.id,
-                &endpoint.id,
-            );
-        }
-        None => None,
-    };
-    let response_body = match first_chunk {
-        Some(chunk) => redacted_response_body(chunk, upstream_body, admission_permit),
-        None => Body::empty(),
-    };
-    let mut response = Response::new(response_body);
-    *response.status_mut() = upstream_status;
-    *response.headers_mut() = upstream_headers;
-    response
-        .extensions_mut()
-        .insert(middleware::decision::UpstreamOutcome {
-            latency_ms: upstream_latency_ms,
-            status: Some(upstream_status.as_u16()),
-            pool_id: Some(upstream.pool.id.to_string()),
-            endpoint_id: Some(endpoint.id.to_string()),
-        });
-    if let Some(request_id) = request_id {
-        response
-            .headers_mut()
-            .insert(request_id_header(), request_id);
-    }
+    tokio::time::sleep(delay).await;
+    Ok(permit)
+}
 
-    response
+fn record_attempt(
+    pool_id: &Arc<str>,
+    endpoint_id: &Arc<str>,
+    result: &'static str,
+    duration: Duration,
+) {
+    ::metrics::counter!(
+        crate::metrics::PROXY_UPSTREAM_ATTEMPTS_TOTAL,
+        "pool_id" => Arc::clone(pool_id),
+        "endpoint_id" => Arc::clone(endpoint_id),
+        "result" => result
+    )
+    .increment(1);
+    ::metrics::histogram!(
+        crate::metrics::PROXY_UPSTREAM_ATTEMPT_DURATION_SECONDS,
+        "pool_id" => Arc::clone(pool_id),
+        "endpoint_id" => Arc::clone(endpoint_id),
+        "result" => result
+    )
+    .record(duration.as_secs_f64());
+}
+
+fn attempt_outcome(
+    endpoint_id: &Arc<str>,
+    result: &'static str,
+    duration: Duration,
+) -> middleware::decision::UpstreamAttemptOutcome {
+    middleware::decision::UpstreamAttemptOutcome {
+        endpoint_id: endpoint_id.to_string(),
+        result: result.to_owned(),
+        duration_ms: crate::duration_millis(duration),
+    }
+}
+
+fn emit_retry_exhausted(
+    proxy: &ProxyState,
+    request_id: Option<&HeaderValue>,
+    source_ip: &str,
+    pool_id: &str,
+    attempts: &[middleware::decision::UpstreamAttemptOutcome],
+    reason: &'static str,
+) {
+    proxy.audit.emit(audit::AuditEvent::new(
+        audit::event::UPSTREAM_RETRY_EXHAUSTED,
+        request_id
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("unknown"),
+        source_ip,
+        None::<audit::Actor>,
+        json!({
+            "pool_id": pool_id,
+            "reason": reason,
+            "attempt_count": attempts.len(),
+            "attempts": attempts
+                .iter()
+                .map(|attempt| json!({
+                    "endpoint_id": attempt.endpoint_id,
+                    "result": attempt.result,
+                    "duration_ms": attempt.duration_ms,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    ));
 }
 
 fn redacted_response_body(
     first_chunk: bytes::Bytes,
     upstream_body: egress::EgressBodyStream,
     admission_permit: super::admission::PoolAdmissionPermit,
+    retry_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Body {
     let redacted_tail = upstream_body.map(move |result| {
         let _hold_permit = &admission_permit;
+        let _hold_retry_budget = &retry_permit;
         result.map_err(|error| {
             let category = error.safe_category();
             tracing::warn!(
@@ -262,19 +687,54 @@ fn redacted_response_body(
 
 fn error_response_with_outcome(
     error: &egress::EgressError,
-    latency_ms: u64,
+    latency: Duration,
     request_id: Option<HeaderValue>,
     pool_id: &str,
     endpoint_id: &str,
+    attempts: Vec<middleware::decision::UpstreamAttemptOutcome>,
+    retry_exhausted: bool,
 ) -> Response {
     let mut response = proxy_error_response(error);
     response
         .extensions_mut()
         .insert(middleware::decision::UpstreamOutcome {
-            latency_ms,
+            latency_ms: crate::duration_millis(latency),
             status: None,
             pool_id: Some(pool_id.to_owned()),
             endpoint_id: Some(endpoint_id.to_owned()),
+            attempts,
+            retry_exhausted,
+        });
+    if let Some(request_id) = request_id {
+        response
+            .headers_mut()
+            .insert(request_id_header(), request_id);
+    }
+    response
+}
+
+fn gateway_timeout_response(
+    request_id: Option<HeaderValue>,
+    pool_id: &str,
+    endpoint_id: &str,
+    attempts: Vec<middleware::decision::UpstreamAttemptOutcome>,
+    retry_exhausted: bool,
+    latency: Duration,
+) -> Response {
+    let mut response = (
+        StatusCode::GATEWAY_TIMEOUT,
+        Json(json!({ "error": "gateway_timeout" })),
+    )
+        .into_response();
+    response
+        .extensions_mut()
+        .insert(middleware::decision::UpstreamOutcome {
+            latency_ms: crate::duration_millis(latency),
+            status: None,
+            pool_id: Some(pool_id.to_owned()),
+            endpoint_id: Some(endpoint_id.to_owned()),
+            attempts,
+            retry_exhausted,
         });
     if let Some(request_id) = request_id {
         response
@@ -285,6 +745,16 @@ fn error_response_with_outcome(
 }
 
 fn admission_unavailable_response(pool_id: &str, request_id: Option<HeaderValue>) -> Response {
+    unavailable_response_with_outcome(pool_id, request_id, Vec::new(), false, Duration::ZERO)
+}
+
+fn unavailable_response_with_outcome(
+    pool_id: &str,
+    request_id: Option<HeaderValue>,
+    attempts: Vec<middleware::decision::UpstreamAttemptOutcome>,
+    retry_exhausted: bool,
+    latency: Duration,
+) -> Response {
     let mut response = (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({ "error": "service_unavailable" })),
@@ -293,10 +763,12 @@ fn admission_unavailable_response(pool_id: &str, request_id: Option<HeaderValue>
     response
         .extensions_mut()
         .insert(middleware::decision::UpstreamOutcome {
-            latency_ms: 0,
+            latency_ms: crate::duration_millis(latency),
             status: None,
             pool_id: Some(pool_id.to_owned()),
             endpoint_id: None,
+            attempts,
+            retry_exhausted,
         });
     if let Some(request_id) = request_id {
         response
@@ -538,12 +1010,18 @@ fn streamed_request_body(
 
 #[cfg(test)]
 mod tests {
-    use std::{io, sync::Arc};
+    use std::{collections::HashSet, io, net::SocketAddr, sync::Arc};
 
+    use axum::Router;
     use std::sync::Mutex;
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+    use crate::{
+        audit::sink::tests::CaptureSink,
+        config,
+        proxy::{health, ProxyEndpoint, ProxyRoute, ProxyRoutes, RequestBodyMode, UpstreamPool},
+    };
 
     #[test]
     fn content_length_preflight_accepts_equal_duplicates_only() {
@@ -653,8 +1131,12 @@ mod tests {
             std::time::Duration::from_millis(10),
         );
         let permit = admission.acquire().await.expect("test admission");
-        let body =
-            redacted_response_body(bytes::Bytes::from_static(b"first"), upstream_body, permit);
+        let body = redacted_response_body(
+            bytes::Bytes::from_static(b"first"),
+            upstream_body,
+            permit,
+            None,
+        );
         let mut body = body.into_data_stream();
         assert!(matches!(
             admission.acquire().await,
@@ -698,6 +1180,420 @@ mod tests {
                 "committed response tail leaked {secret}: {output}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn retryable_status_uses_alternate_endpoint_and_replays_buffered_body() {
+        let first_requests = Arc::new(Mutex::new(Vec::new()));
+        let second_requests = Arc::new(Mutex::new(Vec::new()));
+        let (first_addr, first_server) =
+            spawn_status_upstream(StatusCode::SERVICE_UNAVAILABLE, Arc::clone(&first_requests))
+                .await;
+        let (second_addr, second_server) =
+            spawn_status_upstream(StatusCode::OK, Arc::clone(&second_requests)).await;
+        let (proxy, _) = retry_proxy(
+            [first_addr, second_addr],
+            Some(config::UpstreamRetryConfig {
+                max_attempts: 3,
+                methods: vec!["GET".to_owned()],
+                statuses: vec![503],
+            }),
+            Duration::from_secs(2),
+        );
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/items")
+            .header(REQUEST_ID_HEADER, "request-stable")
+            .body(Body::from("bounded-body"))
+            .expect("request");
+
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        let outcome = response
+            .extensions()
+            .get::<middleware::decision::UpstreamOutcome>()
+            .expect("upstream outcome")
+            .clone();
+        let status = response.status();
+        let response_body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("response body");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response_body, "upstream");
+        assert_eq!(outcome.endpoint_id.as_deref(), Some("b"));
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(outcome.attempts[0].endpoint_id, "a");
+        assert_eq!(outcome.attempts[0].result, "retryable_status");
+        assert_eq!(outcome.attempts[1].endpoint_id, "b");
+        assert_eq!(outcome.attempts[1].result, "response");
+        assert!(!outcome.retry_exhausted);
+        assert_eq!(
+            first_requests.lock().expect("first captures").as_slice(),
+            &[CapturedRequest {
+                request_id: Some("request-stable".to_owned()),
+                body: b"bounded-body".to_vec(),
+            }]
+        );
+        assert_eq!(
+            second_requests.lock().expect("second captures").as_slice(),
+            &[CapturedRequest {
+                request_id: Some("request-stable".to_owned()),
+                body: b"bounded-body".to_vec(),
+            }]
+        );
+
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn retryable_connect_failure_prefers_a_different_endpoint() {
+        let unavailable_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("temporary listener");
+        let unavailable_addr = unavailable_listener
+            .local_addr()
+            .expect("temporary listener address");
+        drop(unavailable_listener);
+        let second_requests = Arc::new(Mutex::new(Vec::new()));
+        let (second_addr, second_server) =
+            spawn_status_upstream(StatusCode::OK, Arc::clone(&second_requests)).await;
+        let (proxy, _) = retry_proxy(
+            [unavailable_addr, second_addr],
+            Some(config::UpstreamRetryConfig {
+                max_attempts: 2,
+                methods: vec!["GET".to_owned()],
+                statuses: vec![503],
+            }),
+            Duration::from_secs(2),
+        );
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/items")
+            .header(REQUEST_ID_HEADER, "connect-failover")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        let outcome = response
+            .extensions()
+            .get::<middleware::decision::UpstreamOutcome>()
+            .expect("upstream outcome");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(outcome.attempts[0].endpoint_id, "a");
+        assert!(matches!(
+            outcome.attempts[0].result.as_str(),
+            "http_connect" | "http_timeout"
+        ));
+        assert_eq!(outcome.attempts[1].endpoint_id, "b");
+        assert_eq!(second_requests.lock().expect("second captures").len(), 1);
+
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn unconfigured_method_and_default_policy_make_exactly_one_attempt() {
+        let first_requests = Arc::new(Mutex::new(Vec::new()));
+        let second_requests = Arc::new(Mutex::new(Vec::new()));
+        let (first_addr, first_server) =
+            spawn_status_upstream(StatusCode::SERVICE_UNAVAILABLE, Arc::clone(&first_requests))
+                .await;
+        let (second_addr, second_server) =
+            spawn_status_upstream(StatusCode::OK, Arc::clone(&second_requests)).await;
+        let (proxy, _) = retry_proxy(
+            [first_addr, second_addr],
+            Some(config::UpstreamRetryConfig {
+                max_attempts: 3,
+                methods: vec!["GET".to_owned()],
+                statuses: vec![503],
+            }),
+            Duration::from_secs(2),
+        );
+        let post = Request::builder()
+            .method(http::Method::POST)
+            .uri("/items")
+            .header(REQUEST_ID_HEADER, "post-once")
+            .body(Body::from("write"))
+            .expect("request");
+
+        let response = proxy.forward_request(post, "203.0.113.8").await;
+        let outcome = response
+            .extensions()
+            .get::<middleware::decision::UpstreamOutcome>()
+            .expect("upstream outcome");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(outcome.attempts.len(), 1);
+        assert!(!outcome.retry_exhausted);
+        assert_eq!(first_requests.lock().expect("first captures").len(), 1);
+        assert!(second_requests.lock().expect("second captures").is_empty());
+
+        let (default_proxy, _) =
+            retry_proxy([first_addr, second_addr], None, Duration::from_secs(2));
+        let get = Request::builder()
+            .method(http::Method::GET)
+            .uri("/items")
+            .header(REQUEST_ID_HEADER, "default-once")
+            .body(Body::empty())
+            .expect("request");
+        let default_response = default_proxy.forward_request(get, "203.0.113.8").await;
+        let default_outcome = default_response
+            .extensions()
+            .get::<middleware::decision::UpstreamOutcome>()
+            .expect("upstream outcome");
+
+        assert_eq!(default_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(default_outcome.attempts.len(), 1);
+        assert!(!default_outcome.retry_exhausted);
+        assert_eq!(first_requests.lock().expect("first captures").len(), 2);
+        assert!(second_requests.lock().expect("second captures").is_empty());
+
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn exhausted_retries_are_exact_and_emit_bounded_audit_summary() {
+        let first_requests = Arc::new(Mutex::new(Vec::new()));
+        let second_requests = Arc::new(Mutex::new(Vec::new()));
+        let (first_addr, first_server) =
+            spawn_status_upstream(StatusCode::BAD_GATEWAY, Arc::clone(&first_requests)).await;
+        let (second_addr, second_server) =
+            spawn_status_upstream(StatusCode::BAD_GATEWAY, Arc::clone(&second_requests)).await;
+        let (proxy, audit_sink) = retry_proxy(
+            [first_addr, second_addr],
+            Some(config::UpstreamRetryConfig {
+                max_attempts: 3,
+                methods: vec!["GET".to_owned()],
+                statuses: vec![502],
+            }),
+            Duration::from_secs(2),
+        );
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/items?secret=not-audited")
+            .header(REQUEST_ID_HEADER, "exhausted-request")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        let outcome = response
+            .extensions()
+            .get::<middleware::decision::UpstreamOutcome>()
+            .expect("upstream outcome");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(outcome.attempts.len(), 3);
+        assert_eq!(
+            outcome
+                .attempts
+                .iter()
+                .map(|attempt| attempt.endpoint_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "a"]
+        );
+        assert!(outcome.retry_exhausted);
+        assert_eq!(first_requests.lock().expect("first captures").len(), 2);
+        assert_eq!(second_requests.lock().expect("second captures").len(), 1);
+
+        let event = wait_for_retry_audit(&audit_sink).await;
+        assert_eq!(event.request_id, "exhausted-request");
+        assert_eq!(event.payload["pool_id"], "payments");
+        assert_eq!(event.payload["reason"], "max_attempts");
+        assert_eq!(event.payload["attempt_count"], 3);
+        let serialized = serde_json::to_string(&event).expect("audit serialization");
+        for secret in ["not-audited", "127.0.0.1", "http://"] {
+            assert!(
+                !serialized.contains(secret),
+                "retry audit leaked {secret}: {serialized}"
+            );
+        }
+
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn total_deadline_bounds_attempts() {
+        let first_requests = Arc::new(Mutex::new(Vec::new()));
+        let second_requests = Arc::new(Mutex::new(Vec::new()));
+        let (first_addr, first_server) = spawn_status_upstream_after(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Arc::clone(&first_requests),
+            Duration::from_millis(500),
+        )
+        .await;
+        let (second_addr, second_server) =
+            spawn_status_upstream(StatusCode::OK, Arc::clone(&second_requests)).await;
+        let (proxy, audit_sink) = retry_proxy(
+            [first_addr, second_addr],
+            Some(config::UpstreamRetryConfig {
+                max_attempts: 3,
+                methods: vec!["GET".to_owned()],
+                statuses: vec![503],
+            }),
+            Duration::from_millis(225),
+        );
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/items")
+            .header(REQUEST_ID_HEADER, "deadline-request")
+            .body(Body::empty())
+            .expect("request");
+        let started = Instant::now();
+
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        let elapsed = started.elapsed();
+        let outcome = response
+            .extensions()
+            .get::<middleware::decision::UpstreamOutcome>()
+            .expect("upstream outcome");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(outcome.attempts.len(), 1);
+        assert!(matches!(
+            outcome.attempts[0].result.as_str(),
+            "deadline_exceeded" | "http_timeout"
+        ));
+        assert!(outcome.retry_exhausted);
+        assert!(elapsed < Duration::from_millis(350));
+        assert!(second_requests.lock().expect("second captures").is_empty());
+        assert_eq!(
+            wait_for_retry_audit(&audit_sink).await.payload["reason"],
+            "deadline_exceeded"
+        );
+
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CapturedRequest {
+        request_id: Option<String>,
+        body: Vec<u8>,
+    }
+
+    async fn spawn_status_upstream(
+        status: StatusCode,
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_status_upstream_after(status, requests, Duration::ZERO).await
+    }
+
+    async fn spawn_status_upstream_after(
+        status: StatusCode,
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        delay: Duration,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener");
+        let addr = listener.local_addr().expect("test listener address");
+        let app = Router::new().fallback(move |request: Request<Body>| {
+            let requests = Arc::clone(&requests);
+            async move {
+                let request_id = request
+                    .headers()
+                    .get(REQUEST_ID_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let body = axum::body::to_bytes(request.into_body(), 1024)
+                    .await
+                    .expect("bounded test request body");
+                requests
+                    .lock()
+                    .expect("request captures")
+                    .push(CapturedRequest {
+                        request_id,
+                        body: body.to_vec(),
+                    });
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                (status, "upstream")
+            }
+        });
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test upstream should serve");
+        });
+        (addr, task)
+    }
+
+    fn retry_proxy(
+        addresses: [SocketAddr; 2],
+        retry: Option<config::UpstreamRetryConfig>,
+        timeout: Duration,
+    ) -> (ProxyState, CaptureSink) {
+        let egress_config = egress::EgressConfig {
+            allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
+            timeout,
+            connect_timeout: timeout.min(Duration::from_millis(100)),
+            response_idle_timeout: timeout,
+            deny_private_ips: false,
+            ..egress::EgressConfig::default()
+        };
+        let client = Arc::new(
+            egress::EgressClient::new(egress_config).expect("test egress client should build"),
+        );
+        let endpoint = |id: &'static str, address: SocketAddr| ProxyEndpoint {
+            id: Arc::from(id),
+            upstream_origin: format!("http://{address}"),
+            weight: 1,
+            egress_client: Arc::clone(&client),
+            health: health::UpstreamHealthState::new("payments", id, None),
+            health_config: None,
+        };
+        let pool = Arc::new(UpstreamPool::new(
+            "payments".to_owned(),
+            vec![endpoint("a", addresses[0]), endpoint("b", addresses[1])],
+            &config::UpstreamPoolLimitsConfig::default(),
+            retry.as_ref(),
+        ));
+        let sink = CaptureSink::new();
+        let audit = audit::AuditLog::new(Arc::new(sink.clone()));
+        (
+            ProxyState {
+                routes: ProxyRoutes::RoutingTable {
+                    routes: vec![ProxyRoute {
+                        route_id: "payments".to_owned(),
+                        path_prefix: Some("/".to_owned()),
+                        host: None,
+                        authorization_origin: "pool:payments".to_owned(),
+                        request_header_policy: RouteRequestHeaderPolicy::default(),
+                        pool,
+                        request_body_mode: RequestBodyMode::Buffered,
+                    }],
+                },
+                upstream_health: Vec::new(),
+                max_request_body_bytes: 1024,
+                health_runtime: health::UpstreamHealthRuntime::default(),
+                audit,
+                request_selection_count: None,
+                request_body_mode_override: None,
+            },
+            sink,
+        )
+    }
+
+    async fn wait_for_retry_audit(sink: &CaptureSink) -> audit::AuditEvent {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(event) = sink
+                    .events()
+                    .into_iter()
+                    .find(|event| event.event_type == audit::event::UPSTREAM_RETRY_EXHAUSTED)
+                {
+                    return event;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retry audit should be emitted")
     }
 
     #[derive(Clone, Default)]

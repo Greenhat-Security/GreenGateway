@@ -258,6 +258,8 @@ pub struct UpstreamRouteConfig {
     #[serde(default)]
     pub health_check: Option<UpstreamHealthCheckConfig>,
     #[serde(default)]
+    pub retry: Option<UpstreamRetryConfig>,
+    #[serde(default)]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub response_idle_timeout_ms: Option<u64>,
@@ -315,6 +317,33 @@ pub enum UpstreamRequestBodyMode {
 pub struct UpstreamRequestBodyConfig {
     #[serde(default)]
     pub mode: UpstreamRequestBodyMode,
+}
+
+pub const DEFAULT_UPSTREAM_RETRY_MAX_ATTEMPTS: u8 = 1;
+pub const MAX_UPSTREAM_RETRY_ATTEMPTS: u8 = 5;
+const MAX_UPSTREAM_RETRY_STATUSES: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamRetryConfig {
+    #[serde(default = "default_upstream_retry_max_attempts")]
+    pub max_attempts: u8,
+    #[serde(default = "default_upstream_retry_methods")]
+    pub methods: Vec<String>,
+    #[serde(default = "default_upstream_retry_statuses")]
+    pub statuses: Vec<u16>,
+}
+
+fn default_upstream_retry_max_attempts() -> u8 {
+    DEFAULT_UPSTREAM_RETRY_MAX_ATTEMPTS
+}
+
+fn default_upstream_retry_methods() -> Vec<String> {
+    vec!["GET".to_owned(), "HEAD".to_owned(), "OPTIONS".to_owned()]
+}
+
+fn default_upstream_retry_statuses() -> Vec<u16> {
+    vec![502, 503, 504]
 }
 
 pub const DEFAULT_UPSTREAM_MAX_IN_FLIGHT: usize = 128;
@@ -2286,7 +2315,7 @@ fn validate_upstream_routes(
     let mut seen_matchers = HashMap::<(Option<String>, Option<String>), usize>::new();
     let mut seen_ids = HashMap::<String, usize>::new();
 
-    for (index, route) in routes.into_iter().enumerate() {
+    for (index, mut route) in routes.into_iter().enumerate() {
         let route_name = format!("{name}[{index}]");
         let id = route
             .id
@@ -2535,6 +2564,52 @@ fn validate_upstream_routes(
                 ));
             }
         }
+        if let Some(retry) = route.retry.as_mut() {
+            retry.methods = retry
+                .methods
+                .iter()
+                .map(|method| method.trim().to_ascii_uppercase())
+                .collect();
+            if !(1..=MAX_UPSTREAM_RETRY_ATTEMPTS).contains(&retry.max_attempts) {
+                problems.push(format!(
+                    "{route_name}.retry.max_attempts must be between 1 and {MAX_UPSTREAM_RETRY_ATTEMPTS}"
+                ));
+            }
+            if retry.methods.is_empty()
+                || retry
+                    .methods
+                    .iter()
+                    .any(|method| !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS"))
+                || retry.methods.iter().collect::<HashSet<_>>().len() != retry.methods.len()
+            {
+                problems.push(format!(
+                    "{route_name}.retry.methods must contain unique replay-safe methods from GET, HEAD, and OPTIONS"
+                ));
+            }
+            if retry.statuses.is_empty()
+                || retry.statuses.len() > MAX_UPSTREAM_RETRY_STATUSES
+                || retry
+                    .statuses
+                    .iter()
+                    .any(|status| !(500..=599).contains(status))
+                || retry.statuses.iter().collect::<HashSet<_>>().len() != retry.statuses.len()
+            {
+                problems.push(format!(
+                    "{route_name}.retry.statuses must contain 1-{MAX_UPSTREAM_RETRY_STATUSES} unique HTTP statuses from 500 through 599"
+                ));
+            }
+            if has_legacy_url {
+                problems.push(format!(
+                    "{route_name}.retry requires an upstreams pool and cannot be used with upstream_url"
+                ));
+            }
+            if retry.max_attempts > 1 && route.request_body.mode == UpstreamRequestBodyMode::Stream
+            {
+                problems.push(format!(
+                    "{route_name}.retry.max_attempts greater than 1 requires request_body.mode buffered"
+                ));
+            }
+        }
 
         validated.push(UpstreamRouteConfig {
             id,
@@ -2546,6 +2621,7 @@ fn validate_upstream_routes(
             request_body: route.request_body,
             limits: route.limits,
             health_check: route.health_check,
+            retry: route.retry,
             timeout_ms: route.timeout_ms,
             response_idle_timeout_ms: route.response_idle_timeout_ms,
             connect_timeout_ms: route.connect_timeout_ms,
@@ -5432,6 +5508,7 @@ mod tests {
                     request_body: UpstreamRequestBodyConfig::default(),
                     limits: UpstreamPoolLimitsConfig::default(),
                     health_check: None,
+                    retry: None,
                     timeout_ms: Some(1500),
                     response_idle_timeout_ms: Some(400),
                     connect_timeout_ms: Some(300),
@@ -5453,6 +5530,7 @@ mod tests {
                     request_body: UpstreamRequestBodyConfig::default(),
                     limits: UpstreamPoolLimitsConfig::default(),
                     health_check: None,
+                    retry: None,
                     timeout_ms: None,
                     response_idle_timeout_ms: None,
                     connect_timeout_ms: None,
@@ -5563,6 +5641,80 @@ mod tests {
             ".health_check.expected_statuses must contain 1-32 unique HTTP statuses",
             ".health_check.passive_failure_statuses must contain at most 32 unique HTTP statuses",
             ".health_check.minimum_healthy must be between 1 and 2",
+        ] {
+            assert!(
+                message.contains(expected),
+                "aggregated validation should contain '{expected}': {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_retry_configuration_parses_and_normalizes_safe_methods() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[{
+                    "id":"payments",
+                    "path_prefix":"/payments",
+                    "upstreams":[
+                        {"id":"a","url":"https://a.example.test"},
+                        {"id":"b","url":"https://b.example.test"}
+                    ],
+                    "retry":{
+                        "max_attempts":3,
+                        "methods":["get","HEAD"," options "],
+                        "statuses":[500,502,503,504]
+                    }
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("safe retry configuration should parse");
+
+        let retry = config.upstream_routes[0]
+            .retry
+            .as_ref()
+            .expect("retry configuration");
+        assert_eq!(retry.max_attempts, 3);
+        assert_eq!(retry.methods, ["GET", "HEAD", "OPTIONS"]);
+        assert_eq!(retry.statuses, [500, 502, 503, 504]);
+    }
+
+    #[test]
+    fn invalid_retry_configuration_fails_closed_with_aggregated_errors() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[
+                {
+                    "id":"payments",
+                    "path_prefix":"/payments",
+                    "upstreams":[
+                        {"id":"a","url":"https://a.example.test"},
+                        {"id":"b","url":"https://b.example.test"}
+                    ],
+                    "request_body":{"mode":"stream"},
+                    "retry":{
+                        "max_attempts":6,
+                        "methods":["GET","get","POST"],
+                        "statuses":[499,500,500]
+                    }
+                },
+                {
+                    "path_prefix":"/legacy",
+                    "upstream_url":"https://legacy.example.test",
+                    "retry":{"max_attempts":2}
+                }
+            ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("unsafe retry configuration should fail startup");
+        let message = error.to_string();
+
+        for expected in [
+            ".retry.max_attempts must be between 1 and 5",
+            ".retry.methods must contain unique replay-safe methods",
+            ".retry.statuses must contain 1-32 unique HTTP statuses",
+            ".retry.max_attempts greater than 1 requires request_body.mode buffered",
+            ".retry requires an upstreams pool and cannot be used with upstream_url",
         ] {
             assert!(
                 message.contains(expected),

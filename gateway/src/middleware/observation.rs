@@ -339,6 +339,22 @@ fn observation_payload(input: ObservationPayloadInput<'_>) -> Value {
         if let Some(endpoint_id) = outcome.endpoint_id.as_deref() {
             payload.insert("upstream_endpoint_id".to_owned(), json!(endpoint_id));
         }
+        payload.insert(
+            "upstream_attempts".to_owned(),
+            json!(outcome
+                .attempts
+                .iter()
+                .map(|attempt| json!({
+                    "endpoint_id": attempt.endpoint_id,
+                    "result": attempt.result,
+                    "duration_ms": attempt.duration_ms,
+                }))
+                .collect::<Vec<_>>()),
+        );
+        payload.insert(
+            "upstream_retry_exhausted".to_owned(),
+            json!(outcome.retry_exhausted),
+        );
     }
 
     if let Some(payload_shape) = input.payload_shape {
@@ -2146,6 +2162,8 @@ paths:
                 status: Some(201),
                 pool_id: None,
                 endpoint_id: None,
+                attempts: Vec::new(),
+                retry_exhausted: false,
             });
         response
             .extensions_mut()

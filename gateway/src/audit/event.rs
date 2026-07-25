@@ -18,6 +18,7 @@ pub const TOOL_UPSTREAM_REQUEST: &str = "tool.upstream_request";
 pub const TOOL_REGISTRY_CHANGED: &str = "tool_registry.changed";
 pub const TOOL_REGISTRY_LOADED: &str = "tool_registry.loaded";
 pub const TOOL_REGISTRY_RELOAD_FAILED: &str = "tool_registry.reload_failed";
+pub const UPSTREAM_RETRY_EXHAUSTED: &str = "upstream.retry_exhausted";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
