@@ -120,7 +120,7 @@ Every attempt independently:
 - restores the gateway-controlled request ID; and
 - applies the configured route add/strip header policy without permitting request-ID replacement.
 
-The current compatibility body mode is `buffered`: GreenGateway consumes and validates the complete bounded body before any outbound request, so a rejected body produces zero upstream bytes. Later `stream` mode is explicit and non-replayable; it rejects known oversize bodies before dialing and aborts at the first byte above the effective global/per-route ceiling. Discovery capture is a separately bounded tee and never converts truncated data into conformance evidence.
+The compatibility body mode remains `buffered`: GreenGateway consumes and validates the complete bounded body before any outbound request, so a rejected body produces zero upstream bytes. The internal request-body abstraction also supports an explicit, non-replayable `stream` mode for the route/pool configuration slice to expose. It rejects known oversize bodies before DNS or dialing, counts the actual stream independently of `Content-Length`, forwards at most the effective ceiling, and then aborts on overflow. Dropping an in-flight request drops the source stream, so downstream cancellation does not leave a detached upload running. Discovery capture is a separate 64 KiB bounded tee; cancellation, source errors, and truncation are reported as incomplete and never converted into payload-shape or body-conformance evidence.
 
 Current response streaming, byte/idle bounds, first-chunk-before-downstream-commit behavior, sanitized 502/504 mapping, and one-attempt default remain unchanged in checklist item 1. SSE header-commit behavior changes only in its dedicated PR.
 

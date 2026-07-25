@@ -6,13 +6,17 @@ use axum::{
     Json,
 };
 use futures_util::{stream, StreamExt};
-use http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
+use http::{
+    header::{self, CONTENT_LENGTH, CONTENT_TYPE},
+    HeaderMap, HeaderName, HeaderValue, Request, StatusCode,
+};
 use serde_json::json;
 
-use super::{MatchedUpstream, ProxyState, RouteRequestHeaderPolicy};
+use super::{MatchedUpstream, ProxyState, RequestBodyMode, RouteRequestHeaderPolicy};
 use crate::{egress, middleware};
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
+const STREAMING_DISCOVERY_CAPTURE_MAX_BYTES: usize = 64 * 1024;
 const X_FORWARDED_FOR_HEADER: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_REAL_IP_HEADER: HeaderName = HeaderName::from_static("x-real-ip");
 const COMMON_CLIENT_IP_FORWARDING_HEADERS: &[&str] = &[
@@ -77,28 +81,52 @@ async fn forward_to_upstream(
         .extensions
         .get::<middleware::observation::PayloadCaptureHandle>()
         .cloned();
-    let body = match axum::body::to_bytes(body, proxy.max_request_body_bytes).await {
-        Ok(body) if body.is_empty() => None,
-        Ok(body) => {
-            if let Some(payload_capture) = payload_capture.as_ref() {
-                payload_capture.capture_json_body(&parts.headers, &body);
+    let known_length = match known_request_body_length(&parts.headers) {
+        Ok(length) => length,
+        Err(()) => return invalid_request_body(),
+    };
+    let body = match upstream.request_body_mode {
+        RequestBodyMode::Buffered => {
+            if known_length.is_some_and(|size| size > proxy.max_request_body_bytes as u64) {
+                if let Some(payload_capture) = payload_capture.as_ref() {
+                    payload_capture.mark_body_capture_incomplete();
+                }
+                return crate::payload_too_large(proxy.max_request_body_bytes);
             }
-            Some(body.to_vec())
+            match axum::body::to_bytes(body, proxy.max_request_body_bytes).await {
+                Ok(body) => {
+                    if let Some(payload_capture) = payload_capture.as_ref() {
+                        payload_capture.capture_json_body(&parts.headers, &body);
+                    }
+                    if body.is_empty() {
+                        egress::EgressRequestBody::Empty
+                    } else {
+                        egress::EgressRequestBody::Buffered(body.to_vec())
+                    }
+                }
+                Err(_) => {
+                    if let Some(payload_capture) = payload_capture.as_ref() {
+                        payload_capture.mark_body_capture_incomplete();
+                    }
+                    tracing::warn!(
+                        error_category = "request_body_read_failed",
+                        max = proxy.max_request_body_bytes,
+                        "failed to read proxied request body"
+                    );
+                    return crate::payload_too_large(proxy.max_request_body_bytes);
+                }
+            }
         }
-        Err(_) => {
-            tracing::warn!(
-                error_category = "request_body_read_failed",
-                max = proxy.max_request_body_bytes,
-                "failed to read proxied request body"
-            );
-            return crate::payload_too_large(proxy.max_request_body_bytes);
-        }
+        RequestBodyMode::Stream => egress::EgressRequestBody::streaming(
+            streamed_request_body(body, &parts.headers, payload_capture),
+            known_length,
+        ),
     };
 
     let upstream_started = Instant::now();
     let upstream = match upstream
         .egress_client
-        .stream_request_with_headers(parts.method, &target_url, headers, body)
+        .stream_request_with_body(parts.method, &target_url, headers, body)
         .await
     {
         Ok(response) => response,
@@ -287,13 +315,137 @@ fn is_hop_by_hop_header(name: &HeaderName) -> bool {
 }
 
 fn proxy_error_response(error: &egress::EgressError) -> Response {
-    let (status, code) = if error.is_timeout() {
-        (StatusCode::GATEWAY_TIMEOUT, "gateway_timeout")
-    } else {
-        (StatusCode::BAD_GATEWAY, "bad_gateway")
+    let (status, code) = match error {
+        egress::EgressError::RequestBodyTooLarge { .. } => {
+            (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
+        }
+        egress::EgressError::RequestBodyReadFailed => {
+            (StatusCode::BAD_REQUEST, "invalid_request_body")
+        }
+        _ if error.is_timeout() => (StatusCode::GATEWAY_TIMEOUT, "gateway_timeout"),
+        _ => (StatusCode::BAD_GATEWAY, "bad_gateway"),
     };
 
     (status, Json(json!({ "error": code }))).into_response()
+}
+
+fn known_request_body_length(headers: &HeaderMap) -> Result<Option<u64>, ()> {
+    let values = headers.get_all(CONTENT_LENGTH);
+    let mut parsed = None;
+    for value in values {
+        let value = value.to_str().map_err(|_| ())?;
+        for value in value.split(',') {
+            let value = value.trim().parse::<u64>().map_err(|_| ())?;
+            if parsed.is_some_and(|previous| previous != value) {
+                return Err(());
+            }
+            parsed = Some(value);
+        }
+    }
+    Ok(parsed)
+}
+
+fn invalid_request_body() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "invalid_request_body" })),
+    )
+        .into_response()
+}
+
+struct StreamingCapture {
+    handle: Option<middleware::observation::PayloadCaptureHandle>,
+    headers: HeaderMap,
+    bytes: Vec<u8>,
+    complete: bool,
+    truncated: bool,
+}
+
+impl StreamingCapture {
+    fn new(
+        headers: &HeaderMap,
+        handle: Option<middleware::observation::PayloadCaptureHandle>,
+    ) -> Self {
+        let mut capture_headers = HeaderMap::new();
+        if let Some(content_type) = headers.get(CONTENT_TYPE) {
+            capture_headers.insert(CONTENT_TYPE, content_type.clone());
+        }
+        Self {
+            handle,
+            headers: capture_headers,
+            bytes: Vec::new(),
+            complete: false,
+            truncated: false,
+        }
+    }
+
+    fn observe(&mut self, chunk: &bytes::Bytes) {
+        if self.handle.is_none() || self.truncated {
+            return;
+        }
+        let remaining = STREAMING_DISCOVERY_CAPTURE_MAX_BYTES.saturating_sub(self.bytes.len());
+        if chunk.len() > remaining {
+            self.bytes.extend_from_slice(&chunk[..remaining]);
+            self.truncated = true;
+            self.mark_incomplete();
+        } else {
+            self.bytes.extend_from_slice(chunk);
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(handle) = &self.handle {
+            if self.truncated {
+                handle.mark_body_capture_incomplete();
+            } else {
+                handle.capture_json_body(&self.headers, &self.bytes);
+            }
+        }
+        self.complete = true;
+    }
+
+    fn mark_incomplete(&self) {
+        if let Some(handle) = &self.handle {
+            handle.mark_body_capture_incomplete();
+        }
+    }
+}
+
+impl Drop for StreamingCapture {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.mark_incomplete();
+        }
+    }
+}
+
+fn streamed_request_body(
+    body: Body,
+    headers: &HeaderMap,
+    payload_capture: Option<middleware::observation::PayloadCaptureHandle>,
+) -> egress::EgressRequestBodyStream {
+    let stream = body.into_data_stream();
+    let capture = StreamingCapture::new(headers, payload_capture);
+    Box::pin(stream::unfold(
+        (stream, capture),
+        |(mut stream, mut capture)| async move {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    capture.observe(&chunk);
+                    Some((Ok(chunk), (stream, capture)))
+                }
+                Some(Err(_)) => {
+                    capture.mark_incomplete();
+                    capture.complete = true;
+                    Some((Err(egress::EgressRequestBodySourceError), (stream, capture)))
+                }
+                None => {
+                    capture.finish();
+                    None
+                }
+            }
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -304,6 +456,34 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+
+    #[test]
+    fn content_length_preflight_accepts_equal_duplicates_only() {
+        let mut headers = HeaderMap::new();
+        headers.append(CONTENT_LENGTH, HeaderValue::from_static("4"));
+        headers.append(CONTENT_LENGTH, HeaderValue::from_static("4"));
+        assert_eq!(known_request_body_length(&headers), Ok(Some(4)));
+
+        headers.append(CONTENT_LENGTH, HeaderValue::from_static("5"));
+        assert_eq!(known_request_body_length(&headers), Err(()));
+    }
+
+    #[test]
+    fn content_length_preflight_rejects_malformed_values() {
+        let headers =
+            HeaderMap::from_iter([(CONTENT_LENGTH, HeaderValue::from_static("not-a-length"))]);
+
+        assert_eq!(known_request_body_length(&headers), Err(()));
+    }
+
+    #[test]
+    fn request_body_failures_use_client_error_responses() {
+        let oversized =
+            proxy_error_response(&egress::EgressError::RequestBodyTooLarge { size: 5, max: 4 });
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let unreadable = proxy_error_response(&egress::EgressError::RequestBodyReadFailed);
+        assert_eq!(unreadable.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn target_url_preserves_path_and_query_and_discards_configured_path() {

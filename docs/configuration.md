@@ -233,7 +233,7 @@ Format and validation: must parse as a boolean. When set to `true`, `DISCOVERY_S
 When enabled and sampled, GreenGateway captures request shape only:
 
 - Query string parameters: parameter names and a coarse `value_type` of `number` or `string`. Query parameter values are read only for this in-memory type guess and are never stored.
-- JSON request bodies for proxied requests: top-level object keys only, after the proxy has already buffered the request body for upstream forwarding. Nested object keys, array contents, and scalar values are not captured.
+- JSON request bodies for proxied requests: top-level object keys only. The default buffered proxy mode captures after the complete bounded body has been read. The internal streaming mode uses a separate 64 KiB capture tee; if that sample is truncated, cancelled, or fails, the observation records `request_body_capture_status:"incomplete"` and omits `payload_shape` rather than inferring that omitted bytes or keys were absent. Nested object keys, array contents, and scalar values are not captured.
 
 The capture output is attached to the existing `http.request_observed` audit event as `payload_shape` and is consumed by the existing SQLite discovery aggregator on the audit writer thread. SQLite writes and reservoir maintenance are not performed in the request handler.
 
@@ -1081,7 +1081,7 @@ Maximum egress request body size, in bytes.
 
 Default: `1048576` (1 MiB)
 
-Format and validation: must parse as a non-negative byte count that fits in `usize`. Caller-provided body vectors on the direct `EgressClient` request paths are checked before DNS resolution. Gateway MCP `call_tool` payloads are conservatively sized before destination resolution or session initialization and are checked again at transport serialization. MCP initialization and discovery messages retain the transport serialization check after destination validation.
+Format and validation: must parse as a non-negative byte count that fits in `usize`. Caller-provided body vectors on the direct `EgressClient` request paths are checked before DNS resolution. The proxy's default buffered mode reads no more than this limit before egress. Its internal streaming mode rejects a valid known length above the limit before DNS, independently counts all actual bytes for missing, chunked, or underdeclared lengths, forwards no more than the configured maximum, and aborts on the first overflow indication. Streaming mode is not operator-selectable until the route/pool configuration slice lands. Gateway MCP `call_tool` payloads are conservatively sized before destination resolution or session initialization and are checked again at transport serialization. MCP initialization and discovery messages retain the transport serialization check after destination validation.
 
 ### EGRESS_NAT64_PREFIXES
 

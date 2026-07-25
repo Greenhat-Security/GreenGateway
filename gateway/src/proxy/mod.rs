@@ -95,6 +95,7 @@ pub(crate) struct ProxyState {
     upstream_health: Vec<health::UpstreamHealthTarget>,
     egress_client: Arc<egress::EgressClient>,
     max_request_body_bytes: usize,
+    request_body_mode: RequestBodyMode,
     #[cfg(test)]
     request_selection_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -135,6 +136,16 @@ struct MatchedUpstream {
     upstream_origin: String,
     request_header_policy: RouteRequestHeaderPolicy,
     egress_client: Arc<egress::EgressClient>,
+    request_body_mode: RequestBodyMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RequestBodyMode {
+    #[default]
+    Buffered,
+    // Public route selection is wired by the stable route/pool PR that follows this one.
+    #[allow(dead_code)]
+    Stream,
 }
 
 impl ProxyState {
@@ -156,6 +167,7 @@ impl ProxyState {
                 )]),
                 egress_client,
                 max_request_body_bytes: config.egress_max_request_body_bytes,
+                request_body_mode: RequestBodyMode::Buffered,
                 #[cfg(test)]
                 request_selection_count: None,
             }));
@@ -202,6 +214,7 @@ impl ProxyState {
             upstream_health,
             egress_client,
             max_request_body_bytes: config.egress_max_request_body_bytes,
+            request_body_mode: RequestBodyMode::Buffered,
             #[cfg(test)]
             request_selection_count: None,
         }))
@@ -213,6 +226,12 @@ impl ProxyState {
         counter: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         self.request_selection_count = Some(counter);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_streaming_request_bodies(mut self) -> Self {
+        self.request_body_mode = RequestBodyMode::Stream;
         self
     }
 
@@ -242,12 +261,14 @@ impl ProxyState {
                 upstream_origin: upstream_origin.clone(),
                 request_header_policy: RouteRequestHeaderPolicy::default(),
                 egress_client: Arc::clone(&self.egress_client),
+                request_body_mode: self.request_body_mode,
             }),
             ProxyRoutes::RoutingTable { routes } => {
                 routing_route_for_request(routes, path, headers).map(|route| MatchedUpstream {
                     upstream_origin: route.upstream_origin.clone(),
                     request_header_policy: route.request_header_policy.clone(),
                     egress_client: Arc::clone(&route.egress_client),
+                    request_body_mode: self.request_body_mode,
                 })
             }
         };
@@ -493,8 +514,11 @@ mod tests {
             upstream_health: Vec::new(),
             egress_client,
             max_request_body_bytes: 1024,
+            request_body_mode: RequestBodyMode::Buffered,
             request_selection_count: None,
-        };
+        }
+        .with_streaming_request_bodies();
+        assert_eq!(state.request_body_mode, RequestBodyMode::Stream);
 
         let context = state
             .classifier()

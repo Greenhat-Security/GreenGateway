@@ -109,7 +109,30 @@ struct EndpointSchemaCacheKey {
 
 #[derive(Clone, Debug)]
 pub struct PayloadCaptureHandle {
-    shape: Arc<Mutex<CapturedPayloadShape>>,
+    state: Arc<Mutex<PayloadCaptureState>>,
+}
+
+#[derive(Clone, Debug)]
+struct PayloadCaptureState {
+    shape: CapturedPayloadShape,
+    body_status: BodyCaptureStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BodyCaptureStatus {
+    NotObserved,
+    Complete,
+    Incomplete,
+}
+
+impl BodyCaptureStatus {
+    fn audit_label(self) -> &'static str {
+        match self {
+            Self::NotObserved => "not_observed",
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -192,9 +215,15 @@ pub async fn observation_middleware(
         })
         .flatten();
     let conformance_shape = payload_capture.as_ref().map(PayloadCaptureHandle::snapshot);
-    let schema_mismatch = conformance_check
+    let body_capture_status = payload_capture
         .as_ref()
-        .map(|check| check.schema_mismatch(conformance_shape.as_ref()));
+        .map(PayloadCaptureHandle::body_capture_status);
+    let schema_mismatch = conformance_check.as_ref().and_then(|check| {
+        check.schema_mismatch(
+            conformance_shape.as_ref(),
+            body_capture_status.unwrap_or(BodyCaptureStatus::NotObserved),
+        )
+    });
 
     state.audit.emit(AuditEvent::new(
         HTTP_REQUEST_OBSERVED,
@@ -213,6 +242,7 @@ pub async fn observation_middleware(
             request_host: request_host.as_deref(),
             upstream_route,
             payload_shape: payload_shape.as_ref(),
+            body_capture_status,
             schema_mismatch,
         }),
     ));
@@ -232,6 +262,7 @@ struct ObservationPayloadInput<'a> {
     request_host: Option<&'a str>,
     upstream_route: Option<&'a ProxyRouteObservationContext>,
     payload_shape: Option<&'a CapturedPayloadShape>,
+    body_capture_status: Option<BodyCaptureStatus>,
     schema_mismatch: Option<bool>,
 }
 
@@ -305,6 +336,13 @@ fn observation_payload(input: ObservationPayloadInput<'_>) -> Value {
         payload.insert(
             "payload_shape".to_owned(),
             serde_json::to_value(payload_shape).expect("captured payload shape should serialize"),
+        );
+    }
+
+    if let Some(status) = input.body_capture_status {
+        payload.insert(
+            "request_body_capture_status".to_owned(),
+            json!(status.audit_label()),
         );
     }
 
@@ -593,13 +631,23 @@ impl PreparedSchemaConformanceCheck {
         }
     }
 
-    fn schema_mismatch(&self, captured_shape: Option<&CapturedPayloadShape>) -> bool {
+    fn schema_mismatch(
+        &self,
+        captured_shape: Option<&CapturedPayloadShape>,
+        body_status: BodyCaptureStatus,
+    ) -> Option<bool> {
         match self {
-            Self::Undocumented => true,
+            Self::Undocumented => Some(true),
             Self::Expected {
                 expected,
                 observed_shape,
-            } => expected.mismatches(captured_shape.unwrap_or(observed_shape)),
+            } if expected.needs_body_capture() && body_status != BodyCaptureStatus::Complete => {
+                None
+            }
+            Self::Expected {
+                expected,
+                observed_shape,
+            } => Some(expected.mismatches(captured_shape.unwrap_or(observed_shape))),
         }
     }
 }
@@ -751,7 +799,10 @@ fn path_prefix_matches(path: &str, path_prefix: &str) -> bool {
 impl PayloadCaptureHandle {
     fn new(shape: CapturedPayloadShape) -> Self {
         Self {
-            shape: Arc::new(Mutex::new(shape)),
+            state: Arc::new(Mutex::new(PayloadCaptureState {
+                shape,
+                body_status: BodyCaptureStatus::NotObserved,
+            })),
         }
     }
 
@@ -759,25 +810,43 @@ impl PayloadCaptureHandle {
         let content_type = headers
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok());
-        let Some(json_body) = captured_json_body_shape(content_type, body) else {
-            return;
-        };
-
-        let mut shape = match self.shape.lock() {
+        let json_body = captured_json_body_shape(content_type, body);
+        let mut state = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        shape.json_body = Some(json_body);
+        state.shape.json_body = json_body;
+        state.body_status = BodyCaptureStatus::Complete;
+    }
+
+    pub fn mark_body_capture_incomplete(&self) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.body_status != BodyCaptureStatus::Complete {
+            state.body_status = BodyCaptureStatus::Incomplete;
+        }
     }
 
     fn snapshot(&self) -> CapturedPayloadShape {
-        match self.shape.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
+        match self.state.lock() {
+            Ok(guard) => guard.shape.clone(),
+            Err(poisoned) => poisoned.into_inner().shape.clone(),
+        }
+    }
+
+    fn body_capture_status(&self) -> BodyCaptureStatus {
+        match self.state.lock() {
+            Ok(guard) => guard.body_status,
+            Err(poisoned) => poisoned.into_inner().body_status,
         }
     }
 
     fn captured_data_snapshot(&self) -> Option<CapturedPayloadShape> {
+        if self.body_capture_status() == BodyCaptureStatus::Incomplete {
+            return None;
+        }
         let shape = self.snapshot();
         shape.has_captured_data().then_some(shape)
     }
@@ -1027,6 +1096,36 @@ mod tests {
             DefaultAction, EnforcementMode, Policy, PrincipalMatcher, RouteRule, Rule, RuleAction,
         },
     };
+
+    #[test]
+    fn incomplete_stream_capture_is_omitted_and_body_conformance_is_unknown() {
+        let handle = PayloadCaptureHandle::new(CapturedPayloadShape::from_query(Some("page=1")));
+        handle.mark_body_capture_incomplete();
+
+        assert_eq!(handle.body_capture_status(), BodyCaptureStatus::Incomplete);
+        assert!(handle.captured_data_snapshot().is_none());
+
+        let check = PreparedSchemaConformanceCheck::Expected {
+            expected: ExpectedRequestShape {
+                required_query_params: Vec::new(),
+                required_json_body_keys: vec![captured_field_name("message")],
+            },
+            observed_shape: CapturedPayloadShape::from_query(None),
+        };
+        assert_eq!(
+            check.schema_mismatch(Some(&handle.snapshot()), handle.body_capture_status()),
+            None
+        );
+    }
+
+    #[test]
+    fn complete_non_json_stream_capture_is_truthfully_complete() {
+        let handle = PayloadCaptureHandle::new(CapturedPayloadShape::from_query(None));
+        handle.capture_json_body(&HeaderMap::new(), b"opaque bytes");
+
+        assert_eq!(handle.body_capture_status(), BodyCaptureStatus::Complete);
+        assert!(handle.snapshot().json_body.is_none());
+    }
 
     #[derive(Clone)]
     enum FakeAuthLayer {
@@ -1483,7 +1582,10 @@ paths:
         let first = conformance
             .prepare_check("POST", "/users", None)
             .expect("initial inferred conformance check should be prepared");
-        assert!(!first.schema_mismatch(Some(&display_name_shape)));
+        assert_eq!(
+            first.schema_mismatch(Some(&display_name_shape), BodyCaptureStatus::Complete),
+            Some(false)
+        );
         assert_eq!(store.query_counts_for_test(), (1, 1));
 
         replace_payload_shape_samples(
@@ -1505,7 +1607,10 @@ paths:
         let cached = conformance
             .prepare_check("POST", "/users", None)
             .expect("cached inferred conformance check should be prepared");
-        assert!(!cached.schema_mismatch(Some(&display_name_shape)));
+        assert_eq!(
+            cached.schema_mismatch(Some(&display_name_shape), BodyCaptureStatus::Complete),
+            Some(false)
+        );
         assert_eq!(store.query_counts_for_test(), (1, 1));
 
         std::thread::sleep(ttl + Duration::from_millis(150));
@@ -1513,7 +1618,10 @@ paths:
         let refreshed = conformance
             .prepare_check("POST", "/users", None)
             .expect("refreshed inferred conformance check should be prepared");
-        assert!(refreshed.schema_mismatch(Some(&display_name_shape)));
+        assert_eq!(
+            refreshed.schema_mismatch(Some(&display_name_shape), BodyCaptureStatus::Complete),
+            Some(true)
+        );
         assert_eq!(store.query_counts_for_test(), (2, 2));
     }
 
