@@ -2244,6 +2244,18 @@ fn install_metrics_recorder() -> Result<PrometheusHandle, metrics_exporter_prome
         metrics::LOCK_POISON_RECOVERIES_TOTAL,
         "Lock poison recoveries by component and lock"
     );
+    ::metrics::describe_counter!(
+        metrics::EGRESS_CLIENT_CACHE_REQUESTS_TOTAL,
+        "Exact-pinned egress client cache lookups by bounded result category"
+    );
+    ::metrics::describe_counter!(
+        metrics::EGRESS_CLIENT_CACHE_EVICTIONS_TOTAL,
+        "Exact-pinned egress client cache evictions by bounded reason"
+    );
+    ::metrics::describe_gauge!(
+        metrics::EGRESS_CLIENT_CACHE_ENTRIES,
+        "Exact-pinned egress clients currently retained across process caches"
+    );
 
     Ok(handle)
 }

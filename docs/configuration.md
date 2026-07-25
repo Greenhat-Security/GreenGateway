@@ -1039,6 +1039,10 @@ The effective egress allowlist is constructed at startup. Hot reload and the pol
 
 Outbound requests deliberately ignore ambient `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and lowercase equivalents. GreenGateway must have direct network connectivity to configured upstreams and identity endpoints. There is currently no supported outbound-proxy setting; proxy support requires an explicit future design that preserves DNS validation and exact address pinning.
 
+GreenGateway resolves and validates the complete DNS answer set before every outbound cache acquisition. A reusable HTTP client is selected only when the current exact pinned socket address, scheme/host/port, effective egress generation, timeout profile, TLS-root fingerprint, protocol profile, and disabled-proxy policy all match. A DNS error, empty answer, mixed prohibited answer, or safe-to-private change fails closed and never falls back to an older cached destination. The first bounded cache retains at most 128 exact-pinned clients process-wide. An entry becomes ineligible after five minutes without a cache hit and is removed lazily on the next access to its shard; idle HTTP pool connections expire after 90 seconds, so lazy removal cannot retain a live idle socket past that separate limit. Each client retains at most eight idle connections per host and uses a 30-second TCP keepalive interval. Eviction is safe for in-flight requests because each request owns a client reference.
+
+The metrics endpoint exposes `egress_client_cache_requests_total{result="hit|miss|build_error"}`, `egress_client_cache_evictions_total{reason="capacity|idle"}`, and `egress_client_cache_entries`. These labels are bounded and contain no host, origin, route, address, certificate, identity, or request data.
+
 ### EGRESS_TIMEOUT_MS
 
 Total timeout for each egress HTTP request, in milliseconds.
