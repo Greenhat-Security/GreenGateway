@@ -19,6 +19,7 @@ use notify::{RecursiveMode, Watcher};
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     audit::{AuditEvent, AuditLog},
@@ -463,31 +464,64 @@ pub fn reload_policy_from_file(
     }
 }
 
+#[cfg(test)]
 pub fn spawn_policy_reload_tasks(
     policy_file: impl Into<PathBuf>,
     state: RbacState,
 ) -> notify::Result<()> {
-    let policy_file = policy_file.into();
-    spawn_policy_file_watcher(policy_file.clone(), state.clone())?;
-    spawn_sighup_reload_task(policy_file, state);
+    let cancellation = CancellationToken::new();
+    spawn_policy_reload_tasks_inner(policy_file.into(), state, cancellation, None)
+}
+
+pub fn spawn_policy_reload_tasks_with_lifecycle(
+    policy_file: impl Into<PathBuf>,
+    state: RbacState,
+    lifecycle: &crate::lifecycle::GatewayLifecycle,
+) -> notify::Result<()> {
+    spawn_policy_reload_tasks_inner(
+        policy_file.into(),
+        state,
+        lifecycle.background_cancellation(),
+        Some(lifecycle),
+    )
+}
+
+fn spawn_policy_reload_tasks_inner(
+    policy_file: PathBuf,
+    state: RbacState,
+    cancellation: CancellationToken,
+    lifecycle: Option<&crate::lifecycle::GatewayLifecycle>,
+) -> notify::Result<()> {
+    let watcher =
+        spawn_policy_file_watcher(policy_file.clone(), state.clone(), cancellation.clone())?;
+    let sighup = spawn_sighup_reload_task(policy_file, state, cancellation);
+    if let Some(lifecycle) = lifecycle {
+        lifecycle.register_background_task(watcher);
+        if let Some(sighup) = sighup {
+            lifecycle.register_background_task(sighup);
+        }
+    }
     Ok(())
 }
 
-fn spawn_policy_file_watcher(policy_file: PathBuf, state: RbacState) -> notify::Result<()> {
+fn spawn_policy_file_watcher(
+    policy_file: PathBuf,
+    state: RbacState,
+    cancellation: CancellationToken,
+) -> notify::Result<tokio::task::JoinHandle<()>> {
     let (sender, receiver) = mpsc::unbounded_channel();
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = sender.send(event);
     })?;
     watcher.watch(&watch_directory(&policy_file), RecursiveMode::NonRecursive)?;
 
-    tokio::spawn(policy_file_watch_loop(
+    Ok(tokio::spawn(policy_file_watch_loop(
         policy_file,
         state,
         receiver,
         watcher,
-    ));
-
-    Ok(())
+        cancellation,
+    )))
 }
 
 async fn policy_file_watch_loop(
@@ -495,13 +529,24 @@ async fn policy_file_watch_loop(
     state: RbacState,
     mut events: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
     _watcher: notify::RecommendedWatcher,
+    cancellation: CancellationToken,
 ) {
-    while let Some(event) = events.recv().await {
+    loop {
+        let event = tokio::select! {
+            event = events.recv() => event,
+            () = cancellation.cancelled() => return,
+        };
+        let Some(event) = event else {
+            return;
+        };
         if !handle_policy_watch_event(&policy_file, event) {
             continue;
         }
 
-        tokio::time::sleep(POLICY_RELOAD_DEBOUNCE).await;
+        tokio::select! {
+            () = tokio::time::sleep(POLICY_RELOAD_DEBOUNCE) => {}
+            () = cancellation.cancelled() => return,
+        }
         while let Ok(event) = events.try_recv() {
             let _ = handle_policy_watch_event(&policy_file, event);
         }
@@ -544,8 +589,12 @@ fn watch_directory(policy_file: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn spawn_sighup_reload_task(policy_file: PathBuf, state: RbacState) {
-    tokio::spawn(async move {
+fn spawn_sighup_reload_task(
+    policy_file: PathBuf,
+    state: RbacState,
+    cancellation: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    Some(tokio::spawn(async move {
         let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
             Ok(signal) => signal,
@@ -555,14 +604,27 @@ fn spawn_sighup_reload_task(policy_file: PathBuf, state: RbacState) {
             }
         };
 
-        while sighup.recv().await.is_some() {
+        loop {
+            let signal = tokio::select! {
+                signal = sighup.recv() => signal,
+                () = cancellation.cancelled() => return,
+            };
+            if signal.is_none() {
+                return;
+            }
             let _ = reload_policy_from_file(&state, &policy_file);
         }
-    });
+    }))
 }
 
 #[cfg(not(unix))]
-fn spawn_sighup_reload_task(_policy_file: PathBuf, _state: RbacState) {}
+fn spawn_sighup_reload_task(
+    _policy_file: PathBuf,
+    _state: RbacState,
+    _cancellation: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    None
+}
 
 pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next: Next) -> Response {
     let path = req.uri().path();

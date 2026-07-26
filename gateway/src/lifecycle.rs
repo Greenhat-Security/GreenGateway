@@ -1,10 +1,188 @@
-use std::{future::Future, net::SocketAddr, time::Duration};
+use std::{
+    future::Future,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
+};
 
 use axum::Router;
 use serde_json::json;
 use time::OffsetDateTime;
+use tokio_util::sync::CancellationToken;
 
-use crate::audit;
+use crate::{audit, config};
+
+const STARTING: u8 = 0;
+const READY: u8 = 1;
+const DRAINING: u8 = 2;
+
+pub(crate) type BackgroundShutdown = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+#[derive(Clone)]
+pub(crate) struct GatewayLifecycle {
+    inner: Arc<GatewayLifecycleInner>,
+}
+
+struct GatewayLifecycleInner {
+    phase: AtomicU8,
+    background_cancellation: CancellationToken,
+    background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Default for GatewayLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GatewayLifecycle {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(GatewayLifecycleInner {
+                phase: AtomicU8::new(STARTING),
+                background_cancellation: CancellationToken::new(),
+                background_tasks: Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    pub(crate) fn mark_ready(&self) {
+        let _ =
+            self.inner
+                .phase
+                .compare_exchange(STARTING, READY, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    pub(crate) fn begin_draining(&self) -> bool {
+        let was_draining = self.inner.phase.swap(DRAINING, Ordering::AcqRel) == DRAINING;
+        self.inner.background_cancellation.cancel();
+        !was_draining
+    }
+
+    pub(crate) fn startup_complete(&self) -> bool {
+        self.inner.phase.load(Ordering::Acquire) != STARTING
+    }
+
+    pub(crate) fn accepting_work(&self) -> bool {
+        self.inner.phase.load(Ordering::Acquire) == READY
+    }
+
+    pub(crate) fn draining(&self) -> bool {
+        self.inner.phase.load(Ordering::Acquire) == DRAINING
+    }
+
+    pub(crate) fn phase_name(&self) -> &'static str {
+        match self.inner.phase.load(Ordering::Acquire) {
+            STARTING => "starting",
+            READY => "ready",
+            DRAINING => "draining",
+            _ => "unknown",
+        }
+    }
+
+    pub(crate) fn background_cancellation(&self) -> CancellationToken {
+        self.inner.background_cancellation.clone()
+    }
+
+    pub(crate) fn register_background_task(&self, handle: tokio::task::JoinHandle<()>) {
+        self.inner
+            .background_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(handle);
+    }
+
+    pub(crate) async fn shutdown_background_tasks(&self) {
+        self.inner.background_cancellation.cancel();
+        let handles = {
+            let mut handles = self
+                .inner
+                .background_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            handles.drain(..).collect::<Vec<_>>()
+        };
+        for handle in handles {
+            if let Err(error) = handle.await {
+                if !error.is_cancelled() {
+                    tracing::error!(%error, "background task failed during shutdown");
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShutdownConfig {
+    drain_delay: Duration,
+    shutdown_timeout: Duration,
+    audit_drain_timeout: Duration,
+}
+
+impl ShutdownConfig {
+    pub(crate) fn from_config(config: &config::Config) -> Self {
+        Self {
+            drain_delay: Duration::from_millis(config.shutdown_drain_delay_ms),
+            shutdown_timeout: Duration::from_millis(config.shutdown_timeout_ms),
+            audit_drain_timeout: Duration::from_millis(config.audit_drain_timeout_ms),
+        }
+    }
+
+    #[cfg(test)]
+    fn immediate() -> Self {
+        Self {
+            drain_delay: Duration::ZERO,
+            shutdown_timeout: Duration::from_secs(1),
+            audit_drain_timeout: Duration::from_secs(1),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+trait ShutdownSignals: Send {
+    async fn recv(&mut self);
+}
+
+struct SystemShutdownSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+impl SystemShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            #[cfg(unix)]
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            #[cfg(windows)]
+            ctrl_c: tokio::signal::windows::ctrl_c()?,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ShutdownSignals for SystemShutdownSignals {
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+        #[cfg(windows)]
+        let _ = self.ctrl_c.recv().await;
+        #[cfg(not(any(unix, windows)))]
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
 
 #[async_trait::async_trait]
 pub(crate) trait Clock: Send + Sync {
@@ -37,6 +215,34 @@ pub(crate) async fn serve_gateway(
     listen_addr: SocketAddr,
     admin_listen_addr: Option<SocketAddr>,
     audit_log: audit::AuditLog,
+    lifecycle: GatewayLifecycle,
+    shutdown_config: ShutdownConfig,
+    background_shutdown: BackgroundShutdown,
+) -> std::io::Result<()> {
+    let mut signals = SystemShutdownSignals::new()?;
+    serve_gateway_with_signals(
+        app,
+        listen_addr,
+        admin_listen_addr,
+        audit_log,
+        lifecycle,
+        shutdown_config,
+        background_shutdown,
+        &mut signals,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // Signal injection keeps shutdown tests deterministic.
+async fn serve_gateway_with_signals(
+    app: GatewayApp,
+    listen_addr: SocketAddr,
+    admin_listen_addr: Option<SocketAddr>,
+    audit_log: audit::AuditLog,
+    lifecycle: GatewayLifecycle,
+    shutdown_config: ShutdownConfig,
+    background_shutdown: BackgroundShutdown,
+    signals: &mut dyn ShutdownSignals,
 ) -> std::io::Result<()> {
     match app {
         GatewayApp::Unified(app) => {
@@ -54,8 +260,35 @@ pub(crate) async fn serve_gateway(
                 }),
             ));
 
+            lifecycle.mark_ready();
+            audit_log.emit(gateway_event(audit::event::GATEWAY_READY, json!({})));
             tracing::info!(listen_addr = %bound_addr, "gateway listening");
-            serve_router(listener, app).await?;
+            let cancellation = CancellationToken::new();
+            let server = serve_router_with_shutdown(listener, app, cancellation.clone());
+            tokio::pin!(server);
+            tokio::select! {
+                result = &mut server => {
+                    return unexpected_listener_termination(
+                        result,
+                        &audit_log,
+                        &lifecycle,
+                        shutdown_config,
+                        background_shutdown,
+                        cancellation,
+                    ).await;
+                }
+                () = signals.recv() => {}
+            }
+            coordinated_shutdown(
+                &audit_log,
+                &lifecycle,
+                shutdown_config,
+                background_shutdown,
+                cancellation,
+                server,
+                signals,
+            )
+            .await?;
         }
         GatewayApp::Split { data, admin } => {
             let admin_listen_addr = admin_listen_addr
@@ -77,11 +310,50 @@ pub(crate) async fn serve_gateway(
                 }),
             ));
 
+            lifecycle.mark_ready();
+            audit_log.emit(gateway_event(audit::event::GATEWAY_READY, json!({})));
             tracing::info!(listen_addr = %data_bound_addr, "gateway data listener listening");
             tracing::info!(admin_listen_addr = %admin_bound_addr, "gateway admin listener listening");
-            serve_split(
-                serve_router(data_listener, data),
-                serve_router(admin_listener, admin),
+            let cancellation = CancellationToken::new();
+            let data_server = serve_router_with_shutdown(data_listener, data, cancellation.clone());
+            let admin_server =
+                serve_router_with_shutdown(admin_listener, admin, cancellation.clone());
+            tokio::pin!(data_server);
+            tokio::pin!(admin_server);
+            tokio::select! {
+                result = &mut data_server => {
+                    return unexpected_listener_termination(
+                        result,
+                        &audit_log,
+                        &lifecycle,
+                        shutdown_config,
+                        background_shutdown,
+                        cancellation,
+                    ).await;
+                }
+                result = &mut admin_server => {
+                    return unexpected_listener_termination(
+                        result,
+                        &audit_log,
+                        &lifecycle,
+                        shutdown_config,
+                        background_shutdown,
+                        cancellation,
+                    ).await;
+                }
+                () = signals.recv() => {}
+            }
+            coordinated_shutdown(
+                &audit_log,
+                &lifecycle,
+                shutdown_config,
+                background_shutdown,
+                cancellation,
+                async move {
+                    tokio::try_join!(data_server, admin_server)?;
+                    Ok(())
+                },
+                signals,
             )
             .await?;
         }
@@ -90,6 +362,147 @@ pub(crate) async fn serve_gateway(
     Ok(())
 }
 
+async fn coordinated_shutdown<Servers>(
+    audit_log: &audit::AuditLog,
+    lifecycle: &GatewayLifecycle,
+    config: ShutdownConfig,
+    background_shutdown: BackgroundShutdown,
+    cancellation: CancellationToken,
+    servers: Servers,
+    signals: &mut dyn ShutdownSignals,
+) -> std::io::Result<()>
+where
+    Servers: Future<Output = std::io::Result<()>>,
+{
+    let started = Instant::now();
+    lifecycle.begin_draining();
+    audit_log.emit(gateway_event(
+        audit::event::GATEWAY_SHUTDOWN_STARTED,
+        json!({}),
+    ));
+
+    let mut forced_reason = None;
+    if !config.drain_delay.is_zero() {
+        tokio::select! {
+            () = tokio::time::sleep(config.drain_delay) => {}
+            () = signals.recv() => forced_reason = Some("second_signal"),
+        }
+    }
+    cancellation.cancel();
+
+    if forced_reason.is_none() {
+        let shutdown = async {
+            let background_shutdown = async {
+                background_shutdown.await;
+                Ok::<(), std::io::Error>(())
+            };
+            tokio::try_join!(servers, background_shutdown)?;
+            Ok::<(), std::io::Error>(())
+        };
+        tokio::select! {
+            result = tokio::time::timeout(config.shutdown_timeout, shutdown) => {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        emit_terminal_shutdown(audit_log, started, Some("listener_error"));
+                        drain_audit(audit_log, config.audit_drain_timeout).await?;
+                        return Err(error);
+                    }
+                    Err(_) => forced_reason = Some("deadline"),
+                }
+            }
+            () = signals.recv() => forced_reason = Some("second_signal"),
+        }
+    }
+
+    emit_terminal_shutdown(audit_log, started, forced_reason);
+    drain_audit(audit_log, config.audit_drain_timeout).await
+}
+
+async fn unexpected_listener_termination(
+    result: std::io::Result<()>,
+    audit_log: &audit::AuditLog,
+    lifecycle: &GatewayLifecycle,
+    config: ShutdownConfig,
+    background_shutdown: BackgroundShutdown,
+    cancellation: CancellationToken,
+) -> std::io::Result<()> {
+    lifecycle.begin_draining();
+    cancellation.cancel();
+    let _ = tokio::time::timeout(config.shutdown_timeout, background_shutdown).await;
+    emit_terminal_shutdown(audit_log, Instant::now(), Some("listener_terminated"));
+    drain_audit(audit_log, config.audit_drain_timeout).await?;
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => Err(std::io::Error::other(
+            "gateway listener terminated unexpectedly",
+        )),
+    }
+}
+
+fn emit_terminal_shutdown(
+    audit_log: &audit::AuditLog,
+    started: Instant,
+    forced_reason: Option<&'static str>,
+) {
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    if let Some(reason) = forced_reason {
+        audit_log.emit(gateway_event(
+            audit::event::GATEWAY_SHUTDOWN_FORCED,
+            json!({
+                "duration_ms": duration_ms,
+                "reason": reason,
+            }),
+        ));
+    } else {
+        audit_log.emit(gateway_event(
+            audit::event::GATEWAY_SHUTDOWN_COMPLETED,
+            json!({
+                "duration_ms": duration_ms,
+            }),
+        ));
+    }
+}
+
+async fn drain_audit(audit_log: &audit::AuditLog, timeout: Duration) -> std::io::Result<()> {
+    audit_log
+        .close_and_drain(timeout)
+        .await
+        .map_err(|error| std::io::Error::other(format!("failed to drain audit events: {error}")))
+}
+
+fn gateway_event(event_type: &'static str, payload: serde_json::Value) -> audit::AuditEvent {
+    audit::AuditEvent::new(
+        event_type,
+        "lifecycle",
+        "internal",
+        None::<audit::Actor>,
+        payload,
+    )
+}
+
+pub(crate) async fn serve_router_with_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown.cancelled_owned())
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn serve_router(
+    listener: tokio::net::TcpListener,
+    app: Router,
+) -> std::io::Result<()> {
+    serve_router_with_shutdown(listener, app, CancellationToken::new()).await
+}
+
+#[cfg(test)]
 async fn serve_split<DataServer, AdminServer>(
     data_server: DataServer,
     admin_server: AdminServer,
@@ -100,17 +513,6 @@ where
 {
     tokio::try_join!(data_server, admin_server)?;
     Ok(())
-}
-
-pub(crate) async fn serve_router(
-    listener: tokio::net::TcpListener,
-    app: Router,
-) -> std::io::Result<()> {
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
 }
 
 #[cfg(test)]
@@ -125,7 +527,10 @@ mod tests {
     };
 
     use axum::{extract::ConnectInfo, routing::get};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::mpsc,
+    };
 
     use super::*;
     use crate::audit::{self, sink::tests::CaptureSink};
@@ -146,6 +551,9 @@ mod tests {
             occupied_addr,
             None,
             audit_log,
+            GatewayLifecycle::new(),
+            ShutdownConfig::immediate(),
+            test_background_shutdown(),
         )
         .await
         .expect_err("binding an occupied address should fail");
@@ -182,6 +590,9 @@ mod tests {
             data_addr,
             Some(admin_addr),
             audit::AuditLog::new(Arc::new(capture.clone())),
+            GatewayLifecycle::new(),
+            ShutdownConfig::immediate(),
+            test_background_shutdown(),
         )
         .await
         .expect_err("occupied admin address should fail the split bind");
@@ -231,6 +642,9 @@ mod tests {
             "127.0.0.1:0".parse().expect("listen address should parse"),
             None,
             audit::AuditLog::new(Arc::new(capture.clone())),
+            GatewayLifecycle::new(),
+            ShutdownConfig::immediate(),
+            test_background_shutdown(),
         ));
 
         let event = wait_for_startup_event(&capture).await;
@@ -263,6 +677,9 @@ mod tests {
             "127.0.0.1:0".parse().expect("data address should parse"),
             Some("127.0.0.1:0".parse().expect("admin address should parse")),
             audit::AuditLog::new(Arc::new(capture.clone())),
+            GatewayLifecycle::new(),
+            ShutdownConfig::immediate(),
+            test_background_shutdown(),
         ));
 
         let event = wait_for_startup_event(&capture).await;
@@ -284,12 +701,176 @@ mod tests {
         let _ = server.await;
     }
 
+    struct ChannelSignals {
+        receiver: mpsc::UnboundedReceiver<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl ShutdownSignals for ChannelSignals {
+        async fn recv(&mut self) {
+            let _ = self.receiver.recv().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn first_signal_drains_servers_background_tasks_and_audit_in_order() {
+        let capture = CaptureSink::new();
+        let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
+        let lifecycle = GatewayLifecycle::new();
+        let observed_lifecycle = lifecycle.clone();
+        let background_finished = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&background_finished);
+        let background_cancellation = lifecycle.background_cancellation();
+        lifecycle.register_background_task(tokio::spawn(async move {
+            background_cancellation.cancelled().await;
+            finished.store(true, Ordering::SeqCst);
+        }));
+        let background_lifecycle = lifecycle.clone();
+        let (signal_tx, signal_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut signals = ChannelSignals {
+                receiver: signal_rx,
+            };
+            serve_gateway_with_signals(
+                GatewayApp::Unified(peer_router()),
+                "127.0.0.1:0".parse().expect("listen address should parse"),
+                None,
+                audit_log,
+                lifecycle,
+                ShutdownConfig::immediate(),
+                Box::pin(async move {
+                    background_lifecycle.shutdown_background_tasks().await;
+                }),
+                &mut signals,
+            )
+            .await
+        });
+
+        wait_for_startup_event(&capture).await;
+        signal_tx
+            .send(())
+            .expect("first signal should be delivered");
+        server
+            .await
+            .expect("server task should join")
+            .expect("graceful shutdown should succeed");
+
+        assert!(observed_lifecycle.draining());
+        assert!(background_finished.load(Ordering::SeqCst));
+        assert_eq!(
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type.starts_with("gateway."))
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>(),
+            vec![
+                "gateway.startup",
+                audit::event::GATEWAY_READY,
+                audit::event::GATEWAY_SHUTDOWN_STARTED,
+                audit::event::GATEWAY_SHUTDOWN_COMPLETED,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn second_signal_forces_shutdown_during_drain_delay() {
+        let capture = CaptureSink::new();
+        let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
+        let (signal_tx, signal_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut signals = ChannelSignals {
+                receiver: signal_rx,
+            };
+            serve_gateway_with_signals(
+                GatewayApp::Unified(Router::new()),
+                "127.0.0.1:0".parse().expect("listen address should parse"),
+                None,
+                audit_log,
+                GatewayLifecycle::new(),
+                ShutdownConfig {
+                    drain_delay: Duration::from_secs(5),
+                    shutdown_timeout: Duration::from_secs(5),
+                    audit_drain_timeout: Duration::from_secs(1),
+                },
+                test_background_shutdown(),
+                &mut signals,
+            )
+            .await
+        });
+
+        wait_for_startup_event(&capture).await;
+        signal_tx
+            .send(())
+            .expect("first signal should be delivered");
+        signal_tx
+            .send(())
+            .expect("second signal should be delivered");
+        server
+            .await
+            .expect("server task should join")
+            .expect("forced shutdown should still complete cleanup");
+
+        let forced = capture
+            .events()
+            .into_iter()
+            .find(|event| event.event_type == audit::event::GATEWAY_SHUTDOWN_FORCED)
+            .expect("forced shutdown event should be emitted");
+        assert_eq!(forced.payload["reason"], "second_signal");
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_forces_stuck_background_work() {
+        let capture = CaptureSink::new();
+        let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
+        let (signal_tx, signal_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut signals = ChannelSignals {
+                receiver: signal_rx,
+            };
+            serve_gateway_with_signals(
+                GatewayApp::Unified(Router::new()),
+                "127.0.0.1:0".parse().expect("listen address should parse"),
+                None,
+                audit_log,
+                GatewayLifecycle::new(),
+                ShutdownConfig {
+                    drain_delay: Duration::ZERO,
+                    shutdown_timeout: Duration::from_millis(25),
+                    audit_drain_timeout: Duration::from_secs(1),
+                },
+                test_background_shutdown(),
+                &mut signals,
+            )
+            .await
+        });
+
+        wait_for_startup_event(&capture).await;
+        signal_tx.send(()).expect("signal should be delivered");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("shutdown deadline should bound stuck work")
+            .expect("server task should join")
+            .expect("forced shutdown should finish");
+
+        let forced = capture
+            .events()
+            .into_iter()
+            .find(|event| event.event_type == audit::event::GATEWAY_SHUTDOWN_FORCED)
+            .expect("forced shutdown event should be emitted");
+        assert_eq!(forced.payload["reason"], "deadline");
+    }
+
     fn peer_router() -> Router {
         async fn peer(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> String {
             peer.to_string()
         }
 
         Router::new().route("/", get(peer))
+    }
+
+    fn test_background_shutdown() -> BackgroundShutdown {
+        Box::pin(std::future::pending())
     }
 
     async fn wait_for_startup_event(capture: &CaptureSink) -> audit::AuditEvent {

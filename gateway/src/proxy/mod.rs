@@ -121,6 +121,7 @@ pub(crate) struct ProxyState {
     upstream_health: Vec<health::UpstreamHealthTarget>,
     max_request_body_bytes: usize,
     health_runtime: health::UpstreamHealthRuntime,
+    lifecycle: lifecycle::GatewayLifecycle,
     audit: audit::AuditLog,
     #[cfg(test)]
     request_selection_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -287,11 +288,12 @@ impl UpstreamPool {
 }
 
 impl ProxyState {
-    pub(crate) fn from_config(
+    pub(crate) fn from_config_with_lifecycle(
         config: &config::Config,
         default_egress_config: &egress::EgressConfig,
         egress_client: Arc<egress::EgressClient>,
         audit: audit::AuditLog,
+        lifecycle: lifecycle::GatewayLifecycle,
     ) -> Result<Option<Self>, egress::EgressError> {
         if let Some(upstream_url) = config.upstream_url.as_deref() {
             let upstream_origin = upstream_origin_from_url(upstream_url, "UPSTREAM_URL");
@@ -322,6 +324,7 @@ impl ProxyState {
                 )]),
                 max_request_body_bytes: config.egress_max_request_body_bytes,
                 health_runtime: health::UpstreamHealthRuntime::default(),
+                lifecycle,
                 audit,
                 #[cfg(test)]
                 request_selection_count: None,
@@ -401,6 +404,7 @@ impl ProxyState {
             upstream_health,
             max_request_body_bytes: config.egress_max_request_body_bytes,
             health_runtime: health::UpstreamHealthRuntime::default(),
+            lifecycle,
             audit,
             #[cfg(test)]
             request_selection_count: None,
@@ -494,9 +498,16 @@ impl ProxyState {
         health::upstream_health_admin_response(&self.upstream_health).await
     }
 
+    pub(crate) fn required_pools_ready(&self) -> bool {
+        health::required_pools_ready(&self.upstream_health)
+    }
+
     pub(crate) fn spawn_upstream_health_checks(&self) {
-        self.health_runtime
-            .spawn(&self.upstream_health, Arc::new(lifecycle::SystemClock));
+        self.health_runtime.spawn(
+            &self.upstream_health,
+            Arc::new(lifecycle::SystemClock),
+            &self.lifecycle,
+        );
     }
 }
 
@@ -889,6 +900,7 @@ mod tests {
             upstream_health: Vec::new(),
             max_request_body_bytes: 1024,
             health_runtime: health::UpstreamHealthRuntime::default(),
+            lifecycle: lifecycle::GatewayLifecycle::new(),
             audit: audit::AuditLog::new(Arc::new(audit::sink::tests::CaptureSink::new())),
             request_selection_count: None,
             request_body_mode_override: None,

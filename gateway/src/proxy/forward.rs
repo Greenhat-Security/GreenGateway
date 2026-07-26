@@ -310,6 +310,7 @@ async fn forward_to_upstream(
                     drop(active_retry_permit.take());
                     match reserve_retry(
                         &upstream,
+                        &proxy.lifecycle,
                         request_id.as_ref(),
                         attempt_number,
                         deadline,
@@ -381,6 +382,7 @@ async fn forward_to_upstream(
             drop(active_retry_permit.take());
             match reserve_retry(
                 &upstream,
+                &proxy.lifecycle,
                 request_id.as_ref(),
                 attempt_number,
                 deadline,
@@ -453,6 +455,7 @@ async fn forward_to_upstream(
                         drop(active_retry_permit.take());
                         match reserve_retry(
                             &upstream,
+                            &proxy.lifecycle,
                             request_id.as_ref(),
                             attempt_number,
                             deadline,
@@ -615,11 +618,15 @@ fn attempt_headers(
 
 async fn reserve_retry(
     upstream: &MatchedUpstream,
+    lifecycle: &crate::lifecycle::GatewayLifecycle,
     request_id: Option<&HeaderValue>,
     failed_attempt: u8,
     deadline: tokio::time::Instant,
     reason: &'static str,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
+    if lifecycle.draining() {
+        return Err("shutdown");
+    }
     let request_id = request_id.map_or(b"missing".as_slice(), HeaderValue::as_bytes);
     let delay = retry::retry_backoff(request_id, failed_attempt);
     if tokio::time::Instant::now()
@@ -636,7 +643,13 @@ async fn reserve_retry(
         .increment(1);
         return Err("retry_budget_exhausted");
     };
-    tokio::time::sleep(delay).await;
+    tokio::select! {
+        () = tokio::time::sleep(delay) => {}
+        () = lifecycle.background_cancellation().cancelled_owned() => return Err("shutdown"),
+    }
+    if lifecycle.draining() {
+        return Err("shutdown");
+    }
     if tokio::time::Instant::now() >= deadline {
         return Err("request_timeout");
     }
@@ -2247,6 +2260,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn draining_lifecycle_prevents_new_retry_attempts() {
+        let first_requests = Arc::new(Mutex::new(Vec::new()));
+        let second_requests = Arc::new(Mutex::new(Vec::new()));
+        let (first_addr, first_server) =
+            spawn_status_upstream(StatusCode::SERVICE_UNAVAILABLE, Arc::clone(&first_requests))
+                .await;
+        let (second_addr, second_server) =
+            spawn_status_upstream(StatusCode::OK, Arc::clone(&second_requests)).await;
+        let (proxy, _, _) = retry_proxy_with_options(
+            [first_addr, second_addr],
+            RetryProxyOptions {
+                retry: Some(config::UpstreamRetryConfig {
+                    max_attempts: 2,
+                    methods: vec!["GET".to_owned()],
+                    statuses: vec![503],
+                }),
+                ..RetryProxyOptions::default()
+            },
+        );
+        proxy.lifecycle.begin_draining();
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/items")
+            .header(REQUEST_ID_HEADER, "shutdown-no-retry")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        let outcome = response
+            .extensions()
+            .get::<middleware::decision::UpstreamOutcome>()
+            .expect("upstream outcome");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(
+            first_requests.lock().expect("first captures").len()
+                + second_requests.lock().expect("second captures").len(),
+            1
+        );
+
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
     async fn concurrent_retries_respect_the_non_waiting_pool_budget() {
         let attempts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
         let (first_addr, first_server) = spawn_attempt_aware_upstream(Arc::clone(&attempts)).await;
@@ -2730,6 +2789,7 @@ mod tests {
                 upstream_health: Vec::new(),
                 max_request_body_bytes: 1024,
                 health_runtime: health::UpstreamHealthRuntime::default(),
+                lifecycle: crate::lifecycle::GatewayLifecycle::new(),
                 audit,
                 request_selection_count: None,
                 request_body_mode_override: None,

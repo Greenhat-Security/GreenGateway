@@ -15,6 +15,7 @@ use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     audit::{self, AuditEvent, AuditLog},
@@ -569,13 +570,55 @@ pub fn spawn_tool_registry_reload_tasks_with_mcp_proxy_definitions_provider(
     registry: ToolRegistry,
     mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
 ) -> notify::Result<()> {
-    let tools_file = tools_file.into();
-    spawn_tool_registry_file_watcher(
+    spawn_tool_registry_reload_tasks_inner(
+        tools_file.into(),
+        registry,
+        mcp_proxy_definitions_provider,
+        CancellationToken::new(),
+        None,
+    )
+}
+
+pub fn spawn_tool_registry_reload_tasks_with_lifecycle(
+    tools_file: impl Into<PathBuf>,
+    registry: ToolRegistry,
+    mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
+    lifecycle: &crate::lifecycle::GatewayLifecycle,
+) -> notify::Result<()> {
+    spawn_tool_registry_reload_tasks_inner(
+        tools_file.into(),
+        registry,
+        mcp_proxy_definitions_provider,
+        lifecycle.background_cancellation(),
+        Some(lifecycle),
+    )
+}
+
+fn spawn_tool_registry_reload_tasks_inner(
+    tools_file: PathBuf,
+    registry: ToolRegistry,
+    mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
+    cancellation: CancellationToken,
+    lifecycle: Option<&crate::lifecycle::GatewayLifecycle>,
+) -> notify::Result<()> {
+    let watcher = spawn_tool_registry_file_watcher(
         tools_file.clone(),
         registry.clone(),
         mcp_proxy_definitions_provider.clone(),
+        cancellation.clone(),
     )?;
-    spawn_sighup_reload_task(tools_file, registry, mcp_proxy_definitions_provider);
+    let sighup = spawn_sighup_reload_task(
+        tools_file,
+        registry,
+        mcp_proxy_definitions_provider,
+        cancellation,
+    );
+    if let Some(lifecycle) = lifecycle {
+        lifecycle.register_background_task(watcher);
+        if let Some(sighup) = sighup {
+            lifecycle.register_background_task(sighup);
+        }
+    }
     Ok(())
 }
 
@@ -583,22 +626,22 @@ fn spawn_tool_registry_file_watcher(
     tools_file: PathBuf,
     registry: ToolRegistry,
     mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
-) -> notify::Result<()> {
+    cancellation: CancellationToken,
+) -> notify::Result<tokio::task::JoinHandle<()>> {
     let (sender, receiver) = mpsc::unbounded_channel();
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = sender.send(event);
     })?;
     watcher.watch(&watch_directory(&tools_file), RecursiveMode::NonRecursive)?;
 
-    tokio::spawn(tool_registry_file_watch_loop(
+    Ok(tokio::spawn(tool_registry_file_watch_loop(
         tools_file,
         registry,
         mcp_proxy_definitions_provider,
         receiver,
         watcher,
-    ));
-
-    Ok(())
+        cancellation,
+    )))
 }
 
 async fn tool_registry_file_watch_loop(
@@ -607,13 +650,24 @@ async fn tool_registry_file_watch_loop(
     mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
     mut events: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
     _watcher: notify::RecommendedWatcher,
+    cancellation: CancellationToken,
 ) {
-    while let Some(event) = events.recv().await {
+    loop {
+        let event = tokio::select! {
+            event = events.recv() => event,
+            () = cancellation.cancelled() => return,
+        };
+        let Some(event) = event else {
+            return;
+        };
         if !handle_tool_registry_watch_event(&tools_file, event) {
             continue;
         }
 
-        tokio::time::sleep(TOOL_REGISTRY_RELOAD_DEBOUNCE).await;
+        tokio::select! {
+            () = tokio::time::sleep(TOOL_REGISTRY_RELOAD_DEBOUNCE) => {}
+            () = cancellation.cancelled() => return,
+        }
         while let Ok(event) = events.try_recv() {
             let _ = handle_tool_registry_watch_event(&tools_file, event);
         }
@@ -667,8 +721,9 @@ fn spawn_sighup_reload_task(
     tools_file: PathBuf,
     registry: ToolRegistry,
     mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
-) {
-    tokio::spawn(async move {
+    cancellation: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    Some(tokio::spawn(async move {
         let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
             Ok(signal) => signal,
@@ -681,14 +736,21 @@ fn spawn_sighup_reload_task(
             }
         };
 
-        while sighup.recv().await.is_some() {
+        loop {
+            let signal = tokio::select! {
+                signal = sighup.recv() => signal,
+                () = cancellation.cancelled() => return,
+            };
+            if signal.is_none() {
+                return;
+            }
             let _ = reload_tool_registry_from_file_with_mcp_proxy_definitions_provider(
                 &registry,
                 &tools_file,
                 mcp_proxy_definitions_provider.as_ref(),
             );
         }
-    });
+    }))
 }
 
 #[cfg(not(unix))]
@@ -696,7 +758,9 @@ fn spawn_sighup_reload_task(
     _tools_file: PathBuf,
     _registry: ToolRegistry,
     _mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
-) {
+    _cancellation: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    None
 }
 
 fn definitions_from_file(path: &Path) -> Result<Vec<ToolDefinition>, ToolRegistryError> {
@@ -2412,6 +2476,9 @@ mod tests {
             audit_log_file: None,
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,
+            shutdown_drain_delay_ms: config::DEFAULT_SHUTDOWN_DRAIN_DELAY_MS,
+            shutdown_timeout_ms: config::DEFAULT_SHUTDOWN_TIMEOUT_MS,
+            audit_drain_timeout_ms: config::DEFAULT_AUDIT_DRAIN_TIMEOUT_MS,
             discovery_sqlite_path: None,
             discovery_endpoint_limit: config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
             principal_sqlite_path: None,

@@ -57,7 +57,7 @@ mod upstream_route;
 
 #[cfg(test)]
 use lifecycle::serve_router;
-use lifecycle::{serve_gateway, GatewayApp};
+use lifecycle::{serve_gateway, GatewayApp, GatewayLifecycle, ShutdownConfig};
 use proxy::{ProxyClassifier, ProxyState};
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
@@ -131,7 +131,14 @@ const ADMIN_MCP_USE_PERMISSION: &str = "admin:mcp:use";
 #[cfg(test)]
 const MCP_ROUTE: &str = auth::protected_resource::MCP_RESOURCE_PATH;
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
-const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
+const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &[
+    "/health",
+    "/livez",
+    "/startupz",
+    "/readyz",
+    "/version",
+    "/metrics",
+];
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
 const MAX_AUDIT_QUERY_LIMIT: usize = 500;
 const DEFAULT_TRAFFIC_RECENT_EVENTS_LIMIT: usize = 20;
@@ -154,6 +161,7 @@ struct AppState {
     max_body_size: usize,
     mcp: mcp::McpState,
     protected_resource_metadata: Option<auth::protected_resource::ProtectedResourceMetadataConfig>,
+    lifecycle: GatewayLifecycle,
 }
 
 #[derive(Clone)]
@@ -351,6 +359,7 @@ struct StatusAdminState {
     egress_allowed_hosts_count: usize,
     process_started_at: Instant,
     proxy: Option<ProxyState>,
+    lifecycle: GatewayLifecycle,
 }
 
 #[derive(Clone)]
@@ -466,6 +475,13 @@ struct HealthResponse {
 }
 
 #[derive(Serialize)]
+struct ProbeResponse {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
+#[derive(Serialize)]
 struct VersionResponse {
     version: &'static str,
     admin_login_configured: bool,
@@ -517,8 +533,15 @@ struct StatusResponse {
     trust_proxy_headers: bool,
     csrf_enabled: bool,
     egress: EgressStatus,
+    lifecycle: LifecycleStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     upstream: Option<proxy::UpstreamHealthAdminResponse>,
+}
+
+#[derive(Serialize)]
+struct LifecycleStatus {
+    phase: &'static str,
+    accepting_work: bool,
 }
 
 #[derive(Deserialize)]
@@ -1053,6 +1076,7 @@ struct MiddlewareStack {
 
 #[derive(Default)]
 struct GatewayAppBuildOverrides {
+    lifecycle: Option<GatewayLifecycle>,
     #[cfg(test)]
     egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
     #[cfg(test)]
@@ -1098,16 +1122,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics_handle = install_metrics_recorder()?;
     let listen_addr = config.listen_addr;
     let admin_listen_addr = config.admin_listen_addr;
+    let shutdown_config = ShutdownConfig::from_config(&config);
+    let lifecycle = GatewayLifecycle::new();
     let (audit_log, audit_event_sender) = audit::AuditLog::from_config(&config)?;
-    let app = gateway_app_with_process_started_at(
+    let app = gateway_app_with_process_started_at_and_overrides(
         config,
         metrics_handle,
         audit_log.clone(),
         audit_event_sender,
         process_started_at,
+        GatewayAppBuildOverrides {
+            lifecycle: Some(lifecycle.clone()),
+            #[cfg(test)]
+            egress_resolver: None,
+            #[cfg(test)]
+            request_selection_count: None,
+            #[cfg(test)]
+            disable_proxy_health_checks: false,
+            #[cfg(test)]
+            stream_proxy_request_bodies: false,
+        },
     )?;
+    let background_lifecycle = lifecycle.clone();
 
-    serve_gateway(app, listen_addr, admin_listen_addr, audit_log).await?;
+    serve_gateway(
+        app,
+        listen_addr,
+        admin_listen_addr,
+        audit_log,
+        lifecycle,
+        shutdown_config,
+        Box::pin(async move {
+            background_lifecycle.shutdown_background_tasks().await;
+        }),
+    )
+    .await?;
 
     Ok(())
 }
@@ -1161,6 +1210,7 @@ fn app_with_process_started_at(
     }
 }
 
+#[cfg(test)]
 fn gateway_app_with_process_started_at(
     config: config::Config,
     metrics_handle: PrometheusHandle,
@@ -1186,6 +1236,7 @@ fn gateway_app_with_process_started_at_and_overrides(
     process_started_at: Instant,
     build_overrides: GatewayAppBuildOverrides,
 ) -> Result<GatewayApp, Box<dyn std::error::Error>> {
+    let lifecycle = build_overrides.lifecycle.clone().unwrap_or_default();
     let split_admin_listener = config.admin_listen_addr.is_some();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
     let audit_query_store = config
@@ -1298,11 +1349,12 @@ fn gateway_app_with_process_started_at_and_overrides(
         proxy_egress_config.clone(),
         &build_overrides,
     )?);
-    let proxy_state = ProxyState::from_config(
+    let proxy_state = ProxyState::from_config_with_lifecycle(
         &config,
         &proxy_egress_config,
         proxy_egress_client,
         audit_log.clone(),
+        lifecycle.clone(),
     )?;
     #[cfg(test)]
     let proxy_state = match build_overrides.request_selection_count.as_ref() {
@@ -1388,7 +1440,11 @@ fn gateway_app_with_process_started_at_and_overrides(
     if let (Some(policy_file), Some(rbac_state)) =
         (config.policy_file.as_ref(), rbac_state.as_ref())
     {
-        middleware::rbac::spawn_policy_reload_tasks(policy_file.clone(), rbac_state.clone())?;
+        middleware::rbac::spawn_policy_reload_tasks_with_lifecycle(
+            policy_file.clone(),
+            rbac_state.clone(),
+            &lifecycle,
+        )?;
     }
     let tool_registry =
         tools::definitions::ToolRegistry::from_config_with_audit(&config, audit_log.clone())?;
@@ -1398,10 +1454,11 @@ fn gateway_app_with_process_started_at_and_overrides(
     let mcp_proxy_definitions_provider =
         mcp_proxy_definitions_provider(&config, Arc::clone(&egress_client));
     if let Some(tools_file) = config.tools_file.as_ref() {
-        tools::definitions::spawn_tool_registry_reload_tasks_with_mcp_proxy_definitions_provider(
+        tools::definitions::spawn_tool_registry_reload_tasks_with_lifecycle(
             tools_file.clone(),
             tool_registry.clone(),
             mcp_proxy_definitions_provider.clone(),
+            &lifecycle,
         )?;
     }
     let tool_runtime = tools::runtime::ToolRuntime::new_with_rbac_state(
@@ -1431,6 +1488,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         egress_allowed_hosts_count,
         process_started_at,
         proxy: proxy_state.clone(),
+        lifecycle: lifecycle.clone(),
     };
     let policy_admin_state = PolicyAdminState {
         policy_file: config.policy_file.as_ref().map(PathBuf::from),
@@ -1504,6 +1562,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         max_body_size: config.max_body_size,
         mcp: mcp_state,
         protected_resource_metadata,
+        lifecycle,
     };
     let audit_admin_state = AuditAdminState {
         query_store: audit_query_store,
@@ -1870,6 +1929,9 @@ fn unified_router(
 ) -> Router {
     let router = Router::new()
         .route("/health", get(health))
+        .route("/livez", get(livez))
+        .route("/startupz", get(startupz))
+        .route("/readyz", get(readyz))
         .route("/version", get(version))
         .route("/metrics", get(metrics_endpoint))
         .route(
@@ -1900,6 +1962,9 @@ fn unified_router(
 fn data_router(app_state: AppState) -> Router {
     let router = Router::new()
         .route("/health", get(health))
+        .route("/livez", get(livez))
+        .route("/startupz", get(startupz))
+        .route("/readyz", get(readyz))
         .route("/version", get(version))
         .route("/metrics", get(metrics_endpoint))
         .route(
@@ -2341,6 +2406,77 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         status: "ok",
         upstream,
     })
+}
+
+async fn livez() -> impl IntoResponse {
+    record_request("/livez");
+    (
+        StatusCode::OK,
+        Json(ProbeResponse {
+            status: "alive",
+            reason: None,
+        }),
+    )
+}
+
+async fn startupz(State(state): State<AppState>) -> Response {
+    record_request("/startupz");
+    if state.lifecycle.startup_complete() {
+        (
+            StatusCode::OK,
+            Json(ProbeResponse {
+                status: "started",
+                reason: None,
+            }),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProbeResponse {
+                status: "not_started",
+                reason: Some("starting"),
+            }),
+        )
+            .into_response()
+    }
+}
+
+async fn readyz(State(state): State<AppState>) -> Response {
+    record_request("/readyz");
+    let reason = if !state.lifecycle.accepting_work() {
+        Some(if state.lifecycle.draining() {
+            "draining"
+        } else {
+            "starting"
+        })
+    } else if state
+        .proxy
+        .as_ref()
+        .is_some_and(|proxy| !proxy.required_pools_ready())
+    {
+        Some("required_upstream_unavailable")
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProbeResponse {
+                status: "not_ready",
+                reason: Some(reason),
+            }),
+        )
+            .into_response(),
+        None => (
+            StatusCode::OK,
+            Json(ProbeResponse {
+                status: "ready",
+                reason: None,
+            }),
+        )
+            .into_response(),
+    }
 }
 
 async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
@@ -3789,6 +3925,10 @@ impl StatusResponse {
                 allowed_hosts_count: state.egress_allowed_hosts_count,
                 nat64_prefixes_count: config.egress_nat64_prefixes.len(),
                 deny_private_ips: config.egress_deny_private_ips,
+            },
+            lifecycle: LifecycleStatus {
+                phase: state.lifecycle.phase_name(),
+                accepting_work: state.lifecycle.accepting_work(),
             },
             upstream,
         }
@@ -7436,6 +7576,9 @@ mod tests {
             audit_log_file: None,
             audit_sqlite_path: None,
             audit_sqlite_retention_days: None,
+            shutdown_drain_delay_ms: config::DEFAULT_SHUTDOWN_DRAIN_DELAY_MS,
+            shutdown_timeout_ms: config::DEFAULT_SHUTDOWN_TIMEOUT_MS,
+            audit_drain_timeout_ms: config::DEFAULT_AUDIT_DRAIN_TIMEOUT_MS,
             discovery_sqlite_path: None,
             discovery_endpoint_limit: config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
             principal_sqlite_path: None,
@@ -7465,6 +7608,9 @@ mod tests {
             trusted_proxy_cidrs: Vec::new(),
             rbac_exempt_paths: vec![
                 "/health".to_owned(),
+                "/livez".to_owned(),
+                "/startupz".to_owned(),
+                "/readyz".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
                 "/admin".to_owned(),
@@ -7475,6 +7621,9 @@ mod tests {
             auth_cookie_name: "session".to_owned(),
             auth_exempt_paths: vec![
                 "/health".to_owned(),
+                "/livez".to_owned(),
+                "/startupz".to_owned(),
+                "/readyz".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
                 "/admin".to_owned(),
@@ -7498,6 +7647,9 @@ mod tests {
             csrf_cookie_domain: None,
             csrf_exempt_paths: vec![
                 "/health".to_owned(),
+                "/livez".to_owned(),
+                "/startupz".to_owned(),
+                "/readyz".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
             ],
@@ -8693,6 +8845,7 @@ mod tests {
                 request_selection_count: Some(Arc::clone(&request_selections)),
                 disable_proxy_health_checks: true,
                 stream_proxy_request_bodies: false,
+                ..GatewayAppBuildOverrides::default()
             },
         )
         .expect("instrumented proxy app should build");
@@ -9183,9 +9336,22 @@ mod tests {
             .expect("admin status body should be JSON");
         assert_eq!(admin_status["version"], json!(env!("CARGO_PKG_VERSION")));
 
-        for path in ["/health", "/version", "/metrics"] {
+        for path in [
+            "/health",
+            "/livez",
+            "/startupz",
+            "/readyz",
+            "/version",
+            "/metrics",
+        ] {
             let data_response = test_http_request(data_addr, "GET", path, None).await;
-            assert_eq!(data_response.status(), StatusCode::OK, "{path}");
+            assert!(
+                matches!(
+                    data_response.status(),
+                    StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE
+                ),
+                "{path}"
+            );
 
             let admin_response = test_http_request(admin_addr, "GET", path, None).await;
             assert_eq!(admin_response.status(), StatusCode::NOT_FOUND, "{path}");
@@ -14288,6 +14454,9 @@ mod tests {
 
         for (uri, expected_status) in [
             ("/health", StatusCode::OK),
+            ("/livez", StatusCode::OK),
+            ("/startupz", StatusCode::SERVICE_UNAVAILABLE),
+            ("/readyz", StatusCode::SERVICE_UNAVAILABLE),
             ("/version", StatusCode::OK),
             ("/metrics", StatusCode::OK),
         ] {
@@ -14309,6 +14478,111 @@ mod tests {
             "fixed probe routes should not be proxied with custom admin prefix",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn cached_lifecycle_probes_transition_without_auth_or_upstream_io() {
+        let lifecycle = GatewayLifecycle::new();
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let app = gateway_app_with_process_started_at_and_overrides(
+            test_config(Vec::new()),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+            Instant::now(),
+            GatewayAppBuildOverrides {
+                lifecycle: Some(lifecycle.clone()),
+                disable_proxy_health_checks: true,
+                ..GatewayAppBuildOverrides::default()
+            },
+        )
+        .expect("gateway app should build");
+        let router = match app {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("test app should be unified"),
+        };
+
+        let live = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/livez")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("liveness request should complete");
+        assert_eq!(live.status(), StatusCode::OK);
+
+        let startup = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/startupz")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("startup request should complete");
+        assert_eq!(startup.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json_body(startup).await["reason"], "starting");
+
+        let readiness = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("readiness request should complete");
+        assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json_body(readiness).await["reason"], "starting");
+
+        lifecycle.mark_ready();
+        for path in ["/startupz", "/readyz", "/health"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("probe request should complete");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+
+        lifecycle.begin_draining();
+        let readiness = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("readiness request should complete");
+        assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        for path in ["/livez", "/startupz", "/health"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("probe request should complete");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
     }
 
     #[tokio::test]
