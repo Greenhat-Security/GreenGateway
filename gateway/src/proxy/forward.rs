@@ -1264,9 +1264,12 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         convert::Infallible,
-        io,
+        fs, io,
         net::SocketAddr,
-        sync::Arc,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
     };
 
     use axum::Router;
@@ -1587,6 +1590,178 @@ mod tests {
         assert_eq!(second_requests.lock().expect("second captures").len(), 1);
 
         second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn tls_certificate_and_hostname_failures_are_never_retried() {
+        for case in [
+            TlsValidationCase::UntrustedCertificate,
+            TlsValidationCase::WrongHostname,
+        ] {
+            let certificate_name = match case {
+                TlsValidationCase::UntrustedCertificate => "127.0.0.1",
+                TlsValidationCase::WrongHostname => "wrong-host.test",
+            };
+            let tls_upstream = spawn_test_tls_upstream(certificate_name).await;
+            let alternate_requests = Arc::new(Mutex::new(Vec::new()));
+            let (alternate_addr, alternate_server) =
+                spawn_status_upstream(StatusCode::OK, Arc::clone(&alternate_requests)).await;
+            let mut egress_config = egress::EgressConfig {
+                allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
+                timeout: Duration::from_secs(1),
+                connect_timeout: Duration::from_millis(500),
+                response_idle_timeout: Duration::from_secs(1),
+                deny_private_ips: false,
+                ..egress::EgressConfig::default()
+            };
+            let ca_path = if case == TlsValidationCase::WrongHostname {
+                let path = std::env::temp_dir().join(format!(
+                    "greengateway-retry-test-ca-{}.pem",
+                    uuid::Uuid::new_v4()
+                ));
+                fs::write(&path, tls_upstream.ca_pem.as_bytes())
+                    .expect("test CA bundle should be written");
+                egress_config
+                    .apply_tls_ca_bundle_path(path.clone())
+                    .expect("test CA bundle should load");
+                Some(path)
+            } else {
+                None
+            };
+            let client = Arc::new(
+                egress::EgressClient::new(egress_config)
+                    .expect("TLS retry test client should build"),
+            );
+            let (proxy, _, _) = retry_proxy_with_endpoints(
+                [
+                    (
+                        format!("https://127.0.0.1:{}", tls_upstream.addr.port()),
+                        Arc::clone(&client),
+                    ),
+                    (format!("http://{alternate_addr}"), client),
+                ],
+                RetryProxyOptions {
+                    retry: Some(config::UpstreamRetryConfig {
+                        max_attempts: 3,
+                        methods: vec!["GET".to_owned()],
+                        statuses: vec![502, 503, 504],
+                    }),
+                    timeout: Duration::from_secs(1),
+                    ..RetryProxyOptions::default()
+                },
+            );
+            let request = Request::builder()
+                .method(http::Method::GET)
+                .uri("/items")
+                .header(REQUEST_ID_HEADER, format!("tls-{case:?}"))
+                .body(Body::empty())
+                .expect("request");
+
+            let response = proxy.forward_request(request, "203.0.113.8").await;
+            let outcome = response
+                .extensions()
+                .get::<middleware::decision::UpstreamOutcome>()
+                .expect("TLS outcome");
+
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(outcome.attempts.len(), 1);
+            assert_eq!(outcome.attempts[0].endpoint_id, "a");
+            assert!(
+                alternate_requests
+                    .lock()
+                    .expect("alternate captures")
+                    .is_empty(),
+                "TLS validation failure must not reach an alternate endpoint"
+            );
+            assert_eq!(tls_upstream.connections.load(Ordering::SeqCst), 1);
+
+            tls_upstream
+                .task
+                .await
+                .expect("TLS test upstream should terminate");
+            alternate_server.abort();
+            if let Some(path) = ca_path {
+                fs::remove_file(path).expect("test CA bundle should be removed");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_attempt_revalidates_dns_and_dns_failure_stops_retrying() {
+        let first_requests = Arc::new(Mutex::new(Vec::new()));
+        let alternate_requests = Arc::new(Mutex::new(Vec::new()));
+        let (first_addr, first_server) =
+            spawn_status_upstream(StatusCode::SERVICE_UNAVAILABLE, Arc::clone(&first_requests))
+                .await;
+        let (alternate_addr, alternate_server) =
+            spawn_status_upstream(StatusCode::OK, Arc::clone(&alternate_requests)).await;
+        let resolver = Arc::new(RetryDnsResolver {
+            first_addr,
+            alternate_calls: AtomicUsize::new(0),
+        });
+        let egress_config = egress::EgressConfig {
+            allowed_hosts: HashSet::from([
+                "retry-a.example.test".to_owned(),
+                "retry-b.example.test".to_owned(),
+            ]),
+            timeout: Duration::from_secs(1),
+            connect_timeout: Duration::from_millis(250),
+            response_idle_timeout: Duration::from_secs(1),
+            deny_private_ips: false,
+            ..egress::EgressConfig::default()
+        };
+        let client = Arc::new(
+            egress::EgressClient::new_with_resolver(egress_config, resolver.clone())
+                .expect("DNS retry test client should build"),
+        );
+        let (proxy, _, _) = retry_proxy_with_endpoints(
+            [
+                (
+                    format!("http://retry-a.example.test:{}", first_addr.port()),
+                    Arc::clone(&client),
+                ),
+                (
+                    format!("http://retry-b.example.test:{}", alternate_addr.port()),
+                    client,
+                ),
+            ],
+            RetryProxyOptions {
+                retry: Some(config::UpstreamRetryConfig {
+                    max_attempts: 3,
+                    methods: vec!["GET".to_owned()],
+                    statuses: vec![503],
+                }),
+                timeout: Duration::from_secs(1),
+                ..RetryProxyOptions::default()
+            },
+        );
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/items")
+            .header(REQUEST_ID_HEADER, "dns-revalidation")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        let outcome = response
+            .extensions()
+            .get::<middleware::decision::UpstreamOutcome>()
+            .expect("DNS outcome");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(outcome.attempts[0].result, "retryable_status");
+        assert_eq!(outcome.attempts[1].endpoint_id, "b");
+        assert_eq!(outcome.attempts[1].result, "dns_resolution_failed");
+        assert_eq!(first_requests.lock().expect("first captures").len(), 1);
+        assert!(alternate_requests
+            .lock()
+            .expect("alternate captures")
+            .is_empty());
+        assert_eq!(resolver.alternate_calls.load(Ordering::SeqCst), 1);
+
+        first_server.abort();
+        alternate_server.abort();
     }
 
     #[tokio::test]
@@ -2169,6 +2344,102 @@ mod tests {
         body: Vec<u8>,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TlsValidationCase {
+        UntrustedCertificate,
+        WrongHostname,
+    }
+
+    struct TestTlsUpstream {
+        addr: SocketAddr,
+        ca_pem: String,
+        connections: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn spawn_test_tls_upstream(certificate_name: &str) -> TestTlsUpstream {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "GreenGateway Retry Test CA");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().expect("test CA key should generate");
+        let ca = ca_params
+            .self_signed(&ca_key)
+            .expect("test CA certificate should build");
+        let mut server_params = rcgen::CertificateParams::new(vec![certificate_name.to_owned()])
+            .expect("test server name should be valid");
+        server_params.distinguished_name = rcgen::DistinguishedName::new();
+        server_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, certificate_name);
+        let server_key = rcgen::KeyPair::generate().expect("test server key should generate");
+        let server = server_params
+            .signed_by(&server_key, &ca, &ca_key)
+            .expect("test server certificate should build");
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
+                    server.der().as_ref().to_vec(),
+                )],
+                tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(
+                        server_key.serialize_der(),
+                    ),
+                ),
+            )
+            .expect("test TLS server config should build");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test TLS listener");
+        let addr = listener.local_addr().expect("test TLS listener address");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let task_connections = Arc::clone(&connections);
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("TLS test upstream should receive one connection");
+            task_connections.fetch_add(1, Ordering::SeqCst);
+            let _ = acceptor.accept(stream).await;
+        });
+        TestTlsUpstream {
+            addr,
+            ca_pem: ca.pem(),
+            connections,
+            task,
+        }
+    }
+
+    struct RetryDnsResolver {
+        first_addr: SocketAddr,
+        alternate_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl egress::DnsResolver for RetryDnsResolver {
+        async fn resolve(&self, host: &str, _port: u16) -> Result<Vec<SocketAddr>, std::io::Error> {
+            match host {
+                "retry-a.example.test" => Ok(vec![self.first_addr]),
+                "retry-b.example.test" => {
+                    self.alternate_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "synthetic retry DNS failure",
+                    ))
+                }
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "unexpected retry test host",
+                )),
+            }
+        }
+    }
+
     async fn spawn_status_upstream(
         status: StatusCode,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
@@ -2398,6 +2669,19 @@ mod tests {
         let client = Arc::new(
             egress::EgressClient::new(egress_config).expect("test egress client should build"),
         );
+        retry_proxy_with_endpoints(
+            [
+                (format!("http://{}", addresses[0]), Arc::clone(&client)),
+                (format!("http://{}", addresses[1]), client),
+            ],
+            options,
+        )
+    }
+
+    fn retry_proxy_with_endpoints(
+        endpoints: [(String, Arc<egress::EgressClient>); 2],
+        options: RetryProxyOptions,
+    ) -> (ProxyState, CaptureSink, [health::UpstreamHealthState; 2]) {
         let health_states = [
             health::UpstreamHealthState::new("payments", "a", None),
             health::UpstreamHealthState::new("payments", "b", None),
@@ -2408,20 +2692,23 @@ mod tests {
                 state.mark_healthy_for_test();
             }
         }
-        let endpoint = |index: usize, id: &'static str, address: SocketAddr| ProxyEndpoint {
-            id: Arc::from(id),
-            upstream_origin: format!("http://{address}"),
-            weight: 1,
-            egress_client: Arc::clone(&client),
-            health: health_states[index].clone(),
-            health_config: health_config.clone(),
-        };
+        let endpoint =
+            |index: usize,
+             id: &'static str,
+             (upstream_origin, egress_client): (String, Arc<egress::EgressClient>)| {
+                ProxyEndpoint {
+                    id: Arc::from(id),
+                    upstream_origin,
+                    weight: 1,
+                    egress_client,
+                    health: health_states[index].clone(),
+                    health_config: health_config.clone(),
+                }
+            };
+        let [endpoint_a, endpoint_b] = endpoints;
         let pool = Arc::new(UpstreamPool::new(
             "payments".to_owned(),
-            vec![
-                endpoint(0, "a", addresses[0]),
-                endpoint(1, "b", addresses[1]),
-            ],
+            vec![endpoint(0, "a", endpoint_a), endpoint(1, "b", endpoint_b)],
             &options.limits,
             options.retry.as_ref(),
         ));
