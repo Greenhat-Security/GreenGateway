@@ -978,6 +978,17 @@ The compatibility public `/health` response exposes only aggregate `configured` 
 
 `request_body.mode` accepts `buffered` (default) or `stream`. Buffered mode preserves complete bounded validation before upstream forwarding. Stream mode is non-replayable, enforces the actual byte count with backpressure, and can send a bounded prefix before an unknown-length overflow is discovered.
 
+`sse` explicitly enables production Server-Sent Events behavior for a route. When omitted, the ordinary compatibility path still waits for the first response body chunk before committing downstream headers, so eligible pre-commit failures can retain their existing retry and sanitized `502`/`504` behavior. When `sse` is present, GreenGateway commits upstream status and headers as soon as they arrive, without waiting for the first event. The route's effective `timeout_ms` remains the bounded deadline for admission, attempts, backoff, connection setup, and response headers; it no longer limits the committed SSE lifetime.
+
+The optional SSE fields are:
+
+- `max_duration_ms`: maximum committed stream lifetime measured from receipt of upstream headers. Default `3600000` (one hour), maximum `604800000` (seven days). Zero explicitly allows unlimited duration.
+- `max_response_bytes`: maximum bytes received from the upstream response stream. When omitted, the route inherits `EGRESS_MAX_RESPONSE_BYTES`. Zero explicitly allows unlimited total bytes.
+
+Unlimited duration or bytes does not remove the other resource bounds: the effective `response_idle_timeout_ms` remains finite and is reset by every received chunk, including SSE keepalives, while `limits.max_in_flight` continues to bound concurrent streams. Backpressure is demand-driven with at most one response chunk in hand. Dropping the client response cancels upstream work and releases admission; shutdown drains an existing SSE stream until the process deadline and then records a `shutdown` terminal outcome.
+
+Every non-empty ordinary response stream and every SSE response emits a payload-free `upstream.stream_terminated` audit event after completion. Outcomes are bounded categories: `completed`, `client_cancelled`, `shutdown`, `upstream_error`, `size_limit`, `idle_timeout`, `duration_limit`, or `request_timeout`. The event includes only the request envelope, stable pool/endpoint IDs, response status, bytes received and handed downstream, time to headers/first byte, total duration, and attempt count. SSE contents, paths, URLs, resolved addresses, and raw transport errors are never captured. The initial HTTP observation sets `upstream_stream_terminal_pending:true` until this correlated terminal event provides the final result.
+
 `retry` is an optional pool-only object. Omitting it preserves the compatibility default of exactly one total attempt. It is rejected on legacy `upstream_url` routes. Its fields are:
 
 - `max_attempts`: total attempts including the initial request, default `1`, range 1-5.
@@ -1045,6 +1056,16 @@ Example:
     ],
     "tls_ca_bundle_path": "/etc/greengateway/internal-ca.pem",
     "openapi_spec_path": "/etc/greengateway/api.openapi.yaml"
+  },
+  {
+    "path_prefix": "/events",
+    "upstream_url": "https://events.internal.example",
+    "timeout_ms": 5000,
+    "response_idle_timeout_ms": 45000,
+    "sse": {
+      "max_duration_ms": 3600000,
+      "max_response_bytes": 0
+    }
   },
   {
     "id": "app",

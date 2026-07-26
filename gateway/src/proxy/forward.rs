@@ -72,11 +72,102 @@ enum ResponseTailTerminal {
     Eof,
 }
 
+struct ResponseStreamTelemetry {
+    audit: audit::AuditLog,
+    lifecycle: crate::lifecycle::GatewayLifecycle,
+    request_id: String,
+    source_ip: String,
+    pool_id: Arc<str>,
+    endpoint_id: Arc<str>,
+    mode: &'static str,
+    status: u16,
+    attempt_count: usize,
+    request_started: Instant,
+    time_to_headers: Duration,
+    time_to_first_byte: Option<Duration>,
+    bytes_received: u64,
+    bytes_sent: u64,
+}
+
+impl ResponseStreamTelemetry {
+    fn observe_received(&mut self, chunk: &bytes::Bytes) {
+        let chunk_bytes = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        self.bytes_received = self.bytes_received.saturating_add(chunk_bytes);
+        self.time_to_first_byte
+            .get_or_insert_with(|| self.request_started.elapsed());
+    }
+
+    fn observe_sent(&mut self, chunk: &bytes::Bytes) {
+        self.bytes_sent = self
+            .bytes_sent
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+    }
+
+    fn terminal_outcome_for_disconnect(&self) -> &'static str {
+        if self.lifecycle.draining() {
+            "shutdown"
+        } else {
+            "client_cancelled"
+        }
+    }
+
+    fn finish(self, outcome: &'static str) {
+        let labels = [
+            ("pool_id", self.pool_id.to_string()),
+            ("endpoint_id", self.endpoint_id.to_string()),
+            ("mode", self.mode.to_owned()),
+            ("outcome", outcome.to_owned()),
+        ];
+        let duration = self.request_started.elapsed();
+        ::metrics::counter!(crate::metrics::PROXY_STREAM_TERMINATIONS_TOTAL, &labels).increment(1);
+        ::metrics::histogram!(crate::metrics::PROXY_STREAM_DURATION_SECONDS, &labels)
+            .record(duration.as_secs_f64());
+        ::metrics::histogram!(
+            crate::metrics::PROXY_STREAM_TIME_TO_HEADERS_SECONDS,
+            &labels
+        )
+        .record(self.time_to_headers.as_secs_f64());
+        if let Some(time_to_first_byte) = self.time_to_first_byte {
+            ::metrics::histogram!(
+                crate::metrics::PROXY_STREAM_TIME_TO_FIRST_BYTE_SECONDS,
+                &labels
+            )
+            .record(time_to_first_byte.as_secs_f64());
+        }
+        ::metrics::histogram!(crate::metrics::PROXY_STREAM_BYTES_RECEIVED, &labels)
+            .record(self.bytes_received as f64);
+        ::metrics::histogram!(crate::metrics::PROXY_STREAM_BYTES_SENT, &labels)
+            .record(self.bytes_sent as f64);
+
+        self.audit.emit(audit::AuditEvent::new(
+            audit::event::UPSTREAM_STREAM_TERMINATED,
+            self.request_id,
+            self.source_ip,
+            None::<audit::Actor>,
+            json!({
+                "pool_id": self.pool_id,
+                "endpoint_id": self.endpoint_id,
+                "mode": self.mode,
+                "status": self.status,
+                "outcome": outcome,
+                "bytes_received": self.bytes_received,
+                "bytes_sent": self.bytes_sent,
+                "time_to_headers_ms": crate::duration_millis(self.time_to_headers),
+                "time_to_first_byte_ms": self.time_to_first_byte.map(crate::duration_millis),
+                "duration_ms": crate::duration_millis(duration),
+                "attempt_count": self.attempt_count,
+            }),
+        ));
+    }
+}
+
 struct ResponsePumpCompletion(Option<tokio::sync::oneshot::Sender<()>>);
 
 struct ResponseTailOptions {
     circuit_permit: Option<super::circuit::CircuitPermit>,
     pump_completed: Option<tokio::sync::oneshot::Sender<()>>,
+    telemetry: Option<ResponseStreamTelemetry>,
+    timeout_outcome: &'static str,
 }
 
 impl Drop for ResponsePumpCompletion {
@@ -88,17 +179,20 @@ impl Drop for ResponsePumpCompletion {
 }
 
 struct ResponseTailPump {
+    pending_chunk: Option<bytes::Bytes>,
     upstream_body: egress::EgressBodyStream,
     demand_receiver: tokio::sync::mpsc::Receiver<ResponseTailDemand>,
     terminal_sender: tokio::sync::watch::Sender<ResponseTailTerminal>,
     admission_permit: super::admission::PoolAdmissionPermit,
     retry_permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
     passive_health: Option<(
         super::health::UpstreamHealthState,
         Arc<crate::config::UpstreamHealthCheckConfig>,
     )>,
     circuit_permit: Option<super::circuit::CircuitPermit>,
+    telemetry: Option<ResponseStreamTelemetry>,
+    timeout_outcome: &'static str,
     completion: ResponsePumpCompletion,
 }
 
@@ -287,16 +381,34 @@ async fn forward_to_upstream(
         let target_url = proxy_target_url(&endpoint.upstream_origin, &parts.uri);
         let headers = attempt_headers(&parts.headers, source_ip, &upstream.request_header_policy);
         let attempt_started = Instant::now();
-        let sent = tokio::time::timeout_at(
-            deadline,
-            endpoint.egress_client.stream_request_with_body(
-                parts.method.clone(),
-                &target_url,
-                headers,
-                attempt_body,
-            ),
-        )
-        .await;
+        let send = async {
+            if let Some(sse) = upstream.sse {
+                let max_response_bytes = sse
+                    .max_response_bytes
+                    .unwrap_or_else(|| Some(endpoint.egress_client.max_response_bytes()));
+                endpoint
+                    .egress_client
+                    .stream_request_with_body_for_sse(
+                        parts.method.clone(),
+                        &target_url,
+                        headers,
+                        attempt_body,
+                        max_response_bytes,
+                    )
+                    .await
+            } else {
+                endpoint
+                    .egress_client
+                    .stream_request_with_body(
+                        parts.method.clone(),
+                        &target_url,
+                        headers,
+                        attempt_body,
+                    )
+                    .await
+            }
+        };
+        let sent = tokio::time::timeout_at(deadline, send).await;
 
         let mut upstream_response = match sent {
             Err(_) => {
@@ -457,7 +569,10 @@ async fn forward_to_upstream(
         }
 
         let upstream_headers = strip_hop_by_hop_headers(&upstream_response.headers);
-        let first_chunk =
+        let time_to_headers = request_started.elapsed();
+        let first_chunk = if upstream.sse.is_some() {
+            None
+        } else {
             match tokio::time::timeout_at(deadline, upstream_response.body.next()).await {
                 Err(_) => {
                     record_circuit_failure(&mut circuit_permit, "request_timeout");
@@ -565,7 +680,8 @@ async fn forward_to_upstream(
                 }
                 Ok(Some(Ok(chunk))) => Some(chunk),
                 Ok(None) => None,
-            };
+            }
+        };
         let duration = attempt_started.elapsed();
         let result = if retryable_status {
             "retryable_status"
@@ -585,26 +701,68 @@ async fn forward_to_upstream(
                 retry_stop_reason.unwrap_or("max_attempts"),
             );
         }
-        let response_body = match first_chunk {
-            Some(chunk) => {
-                let passive_health = endpoint
-                    .health_config
-                    .as_ref()
-                    .map(|config| (endpoint.health.clone(), Arc::clone(config)));
-                redacted_response_body(
-                    chunk,
-                    upstream_response.body,
-                    admission_permit,
-                    active_retry_permit.take(),
-                    deadline,
-                    passive_health,
-                    circuit_permit.take(),
-                )
-            }
-            None => {
-                record_circuit_success(&mut circuit_permit);
-                Body::empty()
-            }
+        if upstream.sse.is_some() {
+            record_circuit_success(&mut circuit_permit);
+            drop(active_retry_permit.take());
+        }
+        let prefetched_bytes = first_chunk
+            .as_ref()
+            .map_or(0, |chunk| u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        let telemetry = ResponseStreamTelemetry {
+            audit: proxy.audit.clone(),
+            lifecycle: proxy.lifecycle.clone(),
+            request_id: request_id
+                .as_ref()
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("unknown")
+                .to_owned(),
+            source_ip: source_ip.to_owned(),
+            pool_id: Arc::clone(&upstream.pool.id),
+            endpoint_id: Arc::clone(&endpoint.id),
+            mode: if upstream.sse.is_some() {
+                "sse"
+            } else {
+                "standard"
+            },
+            status: upstream_status.as_u16(),
+            attempt_count: attempts.len(),
+            request_started,
+            time_to_headers,
+            time_to_first_byte: first_chunk.as_ref().map(|_| request_started.elapsed()),
+            bytes_received: prefetched_bytes,
+            bytes_sent: 0,
+        };
+        let stream_terminal_pending = upstream.sse.is_some() || first_chunk.is_some();
+        let response_body = if stream_terminal_pending {
+            let passive_health = endpoint
+                .health_config
+                .as_ref()
+                .map(|config| (endpoint.health.clone(), Arc::clone(config)));
+            let stream_deadline = upstream.sse.map_or(Some(deadline), |sse| {
+                sse.max_duration
+                    .map(|duration| tokio::time::Instant::now() + duration)
+            });
+            redacted_response_body_inner(
+                first_chunk,
+                upstream_response.body,
+                admission_permit,
+                active_retry_permit.take(),
+                stream_deadline,
+                passive_health,
+                ResponseTailOptions {
+                    circuit_permit: circuit_permit.take(),
+                    pump_completed: None,
+                    telemetry: Some(telemetry),
+                    timeout_outcome: if upstream.sse.is_some() {
+                        "duration_limit"
+                    } else {
+                        "request_timeout"
+                    },
+                },
+            )
+        } else {
+            record_circuit_success(&mut circuit_permit);
+            Body::empty()
         };
         let mut response = Response::new(response_body);
         *response.status_mut() = upstream_status;
@@ -618,6 +776,7 @@ async fn forward_to_upstream(
                 endpoint_id: Some(endpoint.id.to_string()),
                 attempts,
                 retry_exhausted,
+                stream_terminal_pending,
             });
         if let Some(request_id) = request_id {
             response
@@ -815,38 +974,12 @@ fn emit_retry_exhausted(
     ));
 }
 
-fn redacted_response_body(
-    first_chunk: bytes::Bytes,
-    upstream_body: egress::EgressBodyStream,
-    admission_permit: super::admission::PoolAdmissionPermit,
-    retry_permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    deadline: tokio::time::Instant,
-    passive_health: Option<(
-        super::health::UpstreamHealthState,
-        Arc<crate::config::UpstreamHealthCheckConfig>,
-    )>,
-    circuit_permit: Option<super::circuit::CircuitPermit>,
-) -> Body {
-    redacted_response_body_inner(
-        first_chunk,
-        upstream_body,
-        admission_permit,
-        retry_permit,
-        deadline,
-        passive_health,
-        ResponseTailOptions {
-            circuit_permit,
-            pump_completed: None,
-        },
-    )
-}
-
 fn redacted_response_body_inner(
-    first_chunk: bytes::Bytes,
+    first_chunk: Option<bytes::Bytes>,
     upstream_body: egress::EgressBodyStream,
     admission_permit: super::admission::PoolAdmissionPermit,
     retry_permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
     passive_health: Option<(
         super::health::UpstreamHealthState,
         Arc<crate::config::UpstreamHealthCheckConfig>,
@@ -857,6 +990,7 @@ fn redacted_response_body_inner(
     let (terminal_sender, terminal_receiver) =
         tokio::sync::watch::channel(ResponseTailTerminal::Active);
     tokio::spawn(pump_redacted_response_tail(ResponseTailPump {
+        pending_chunk: first_chunk,
         upstream_body,
         demand_receiver,
         terminal_sender,
@@ -865,6 +999,8 @@ fn redacted_response_body_inner(
         deadline,
         passive_health,
         circuit_permit: options.circuit_permit,
+        telemetry: options.telemetry,
+        timeout_outcome: options.timeout_outcome,
         completion: ResponsePumpCompletion(options.pump_completed),
     }));
     let redacted_tail = stream::unfold(
@@ -914,10 +1050,7 @@ fn redacted_response_body_inner(
         },
     );
 
-    Body::from_stream(
-        stream::once(async move { Ok::<_, RedactedProxyBodyError>(first_chunk) })
-            .chain(redacted_tail),
-    )
+    Body::from_stream(redacted_tail)
 }
 
 fn response_tail_terminal_item(
@@ -932,6 +1065,7 @@ fn response_tail_terminal_item(
 
 async fn pump_redacted_response_tail(pump: ResponseTailPump) {
     let ResponseTailPump {
+        mut pending_chunk,
         mut upstream_body,
         mut demand_receiver,
         terminal_sender,
@@ -940,6 +1074,8 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
         deadline,
         passive_health,
         circuit_permit,
+        mut telemetry,
+        timeout_outcome,
         completion: _completion,
     } = pump;
     let mut admission_permit = Some(admission_permit);
@@ -948,14 +1084,18 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
     loop {
         let demand = tokio::select! {
             biased;
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = sleep_until_optional(deadline) => {
                 finish_response_timeout(
                     upstream_body,
-                    &terminal_sender,
-                    &mut admission_permit,
-                    &mut retry_permit,
-                    passive_health.as_ref(),
-                    &mut circuit_permit,
+                    ResponseTimeoutContext {
+                        terminal_sender: &terminal_sender,
+                        admission_permit: &mut admission_permit,
+                        retry_permit: &mut retry_permit,
+                        passive_health: passive_health.as_ref(),
+                        circuit_permit: &mut circuit_permit,
+                        telemetry: &mut telemetry,
+                        timeout_outcome,
+                    },
                     false,
                 ).await;
                 return;
@@ -963,31 +1103,70 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
             demand = demand_receiver.recv() => demand,
         };
         let Some(mut demand) = demand else {
+            release_response_permits(&mut admission_permit, &mut retry_permit);
+            drop(circuit_permit.take());
+            drop(upstream_body);
+            if let Some(telemetry) = telemetry.take() {
+                let outcome = telemetry.terminal_outcome_for_disconnect();
+                telemetry.finish(outcome);
+            }
             return;
         };
-        let result = tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(deadline) => {
-                finish_response_timeout(
-                    upstream_body,
-                    &terminal_sender,
-                    &mut admission_permit,
-                    &mut retry_permit,
-                    passive_health.as_ref(),
-                    &mut circuit_permit,
-                    true,
-                ).await;
-                return;
-            }
-            () = demand.response.closed() => continue,
-            result = upstream_body.next() => result,
+        let (result, already_received) = if let Some(chunk) = pending_chunk.take() {
+            (Some(Ok(chunk)), true)
+        } else {
+            let result = tokio::select! {
+                biased;
+                _ = sleep_until_optional(deadline) => {
+                    finish_response_timeout(
+                        upstream_body,
+                        ResponseTimeoutContext {
+                            terminal_sender: &terminal_sender,
+                            admission_permit: &mut admission_permit,
+                            retry_permit: &mut retry_permit,
+                            passive_health: passive_health.as_ref(),
+                            circuit_permit: &mut circuit_permit,
+                            telemetry: &mut telemetry,
+                            timeout_outcome,
+                        },
+                        true,
+                    ).await;
+                    return;
+                }
+                () = demand.response.closed() => continue,
+                result = upstream_body.next() => result,
+            };
+            (result, false)
         };
         match result {
             Some(Ok(chunk)) => {
-                let _ = demand.response.send(ResponseTailEvent::Chunk(chunk));
+                if !already_received {
+                    if let Some(telemetry) = telemetry.as_mut() {
+                        telemetry.observe_received(&chunk);
+                    }
+                }
+                let sent_chunk = chunk.clone();
+                if demand
+                    .response
+                    .send(ResponseTailEvent::Chunk(chunk))
+                    .is_ok()
+                {
+                    if let Some(telemetry) = telemetry.as_mut() {
+                        telemetry.observe_sent(&sent_chunk);
+                    }
+                } else {
+                    release_response_permits(&mut admission_permit, &mut retry_permit);
+                    drop(circuit_permit.take());
+                    drop(upstream_body);
+                    if let Some(telemetry) = telemetry.take() {
+                        let outcome = telemetry.terminal_outcome_for_disconnect();
+                        telemetry.finish(outcome);
+                    }
+                    return;
+                }
             }
             Some(Err(error)) => {
-                let category = proxy_error_category(&error);
+                let category = stream_body_error_category(&error);
                 release_response_permits(&mut admission_permit, &mut retry_permit);
                 if error.is_retryable_transport_failure() {
                     record_circuit_failure(&mut circuit_permit, circuit_failure_reason(&error));
@@ -1002,47 +1181,88 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
                     "proxied upstream response body failed after response commitment"
                 );
                 let _ = demand.response.send(ResponseTailEvent::Error(category));
+                if let Some(telemetry) = telemetry.take() {
+                    telemetry.finish(stream_error_outcome(&error));
+                }
                 return;
             }
             None => {
+                release_response_permits(&mut admission_permit, &mut retry_permit);
                 record_circuit_success(&mut circuit_permit);
                 terminal_sender.send_replace(ResponseTailTerminal::Eof);
                 let _ = demand.response.send(ResponseTailEvent::Eof);
+                if let Some(telemetry) = telemetry.take() {
+                    telemetry.finish("completed");
+                }
                 return;
             }
         }
     }
 }
 
-async fn finish_response_timeout(
-    upstream_body: egress::EgressBodyStream,
-    terminal_sender: &tokio::sync::watch::Sender<ResponseTailTerminal>,
-    admission_permit: &mut Option<super::admission::PoolAdmissionPermit>,
-    retry_permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
-    passive_health: Option<&(
+async fn sleep_until_optional(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn stream_error_outcome(error: &egress::EgressError) -> &'static str {
+    match error {
+        egress::EgressError::ResponseTooLarge { .. } => "size_limit",
+        egress::EgressError::ResponseIdleTimeout { .. } => "idle_timeout",
+        _ => "upstream_error",
+    }
+}
+
+fn stream_body_error_category(error: &egress::EgressError) -> &'static str {
+    match error {
+        egress::EgressError::ResponseTooLarge { .. } => "size_limit",
+        egress::EgressError::ResponseIdleTimeout { .. } => "idle_timeout",
+        _ => error.safe_category(),
+    }
+}
+
+struct ResponseTimeoutContext<'a> {
+    terminal_sender: &'a tokio::sync::watch::Sender<ResponseTailTerminal>,
+    admission_permit: &'a mut Option<super::admission::PoolAdmissionPermit>,
+    retry_permit: &'a mut Option<tokio::sync::OwnedSemaphorePermit>,
+    passive_health: Option<&'a (
         super::health::UpstreamHealthState,
         Arc<crate::config::UpstreamHealthCheckConfig>,
     )>,
-    circuit_permit: &mut Option<super::circuit::CircuitPermit>,
+    circuit_permit: &'a mut Option<super::circuit::CircuitPermit>,
+    telemetry: &'a mut Option<ResponseStreamTelemetry>,
+    timeout_outcome: &'static str,
+}
+
+async fn finish_response_timeout(
+    upstream_body: egress::EgressBodyStream,
+    context: ResponseTimeoutContext<'_>,
     upstream_was_being_polled: bool,
 ) {
-    release_response_permits(admission_permit, retry_permit);
+    release_response_permits(context.admission_permit, context.retry_permit);
     if upstream_was_being_polled {
-        record_circuit_failure(circuit_permit, "request_timeout");
+        record_circuit_failure(context.circuit_permit, "request_timeout");
     } else {
-        drop(circuit_permit.take());
+        drop(context.circuit_permit.take());
     }
     drop(upstream_body);
-    terminal_sender.send_replace(ResponseTailTerminal::Error("request_timeout"));
+    context
+        .terminal_sender
+        .send_replace(ResponseTailTerminal::Error(context.timeout_outcome));
     if upstream_was_being_polled {
-        if let Some((health, config)) = passive_health {
+        if let Some((health, config)) = context.passive_health {
             health.record_passive_timeout(config).await;
         }
     }
     tracing::warn!(
-        error_category = "request_timeout",
-        "proxied upstream response body exceeded the logical request deadline after response commitment"
+        error_category = context.timeout_outcome,
+        "proxied upstream response body exceeded its stream deadline after response commitment"
     );
+    if let Some(telemetry) = context.telemetry.take() {
+        telemetry.finish(context.timeout_outcome);
+    }
 }
 
 fn release_response_permits(
@@ -1072,6 +1292,7 @@ fn error_response_with_outcome(
             endpoint_id: Some(endpoint_id.to_owned()),
             attempts,
             retry_exhausted,
+            stream_terminal_pending: false,
         });
     if let Some(request_id) = request_id {
         response
@@ -1103,6 +1324,7 @@ fn gateway_timeout_response(
             endpoint_id: Some(endpoint_id.to_owned()),
             attempts,
             retry_exhausted,
+            stream_terminal_pending: false,
         });
     if let Some(request_id) = request_id {
         response
@@ -1137,6 +1359,7 @@ fn unavailable_response_with_outcome(
             endpoint_id: None,
             attempts,
             retry_exhausted,
+            stream_terminal_pending: false,
         });
     if let Some(request_id) = request_id {
         response
@@ -1508,14 +1731,19 @@ mod tests {
             std::time::Duration::from_millis(10),
         );
         let permit = admission.acquire().await.expect("test admission");
-        let body = redacted_response_body(
-            bytes::Bytes::from_static(b"first"),
+        let body = redacted_response_body_inner(
+            Some(bytes::Bytes::from_static(b"first")),
             upstream_body,
             permit,
             None,
-            tokio::time::Instant::now() + Duration::from_secs(1),
+            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
             None,
-            None,
+            ResponseTailOptions {
+                circuit_permit: None,
+                pump_completed: None,
+                telemetry: None,
+                timeout_outcome: "request_timeout",
+            },
         );
         let mut body = body.into_data_stream();
         assert!(matches!(
@@ -1560,6 +1788,268 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sse_commits_headers_before_first_event_and_reports_completion() {
+        let (addr, server) = spawn_sse_upstream(SseTestBody::Chunks(vec![(
+            Duration::from_millis(200),
+            "data: ready\n\n",
+        )]))
+        .await;
+        let (proxy, sink, _) = retry_proxy_with_options(
+            [addr, addr],
+            RetryProxyOptions {
+                timeout: Duration::from_millis(75),
+                response_idle_timeout: Some(Duration::from_millis(500)),
+                sse: Some(config::UpstreamSseConfig {
+                    max_duration_ms: 1_000,
+                    max_response_bytes: None,
+                }),
+                ..RetryProxyOptions::default()
+            },
+        );
+        let request = Request::builder()
+            .uri("/")
+            .header(REQUEST_ID_HEADER, "sse-early-headers")
+            .body(Body::empty())
+            .expect("SSE request");
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(150),
+            proxy.forward_request(request, "203.0.113.8"),
+        )
+        .await
+        .expect("SSE headers must not wait for the first event");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/event-stream"))
+        );
+        let outcome = response
+            .extensions()
+            .get::<middleware::decision::UpstreamOutcome>()
+            .expect("SSE upstream outcome");
+        assert!(outcome.stream_terminal_pending);
+
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(
+            body.next()
+                .await
+                .expect("SSE event")
+                .expect("SSE event should be forwarded"),
+            bytes::Bytes::from_static(b"data: ready\n\n")
+        );
+        assert!(body.next().await.is_none());
+
+        let event = wait_for_stream_audit(&sink, "sse-early-headers").await;
+        assert_eq!(event.payload["outcome"], json!("completed"));
+        assert_eq!(event.payload["mode"], json!("sse"));
+        assert_eq!(event.payload["bytes_received"], json!(13));
+        assert_eq!(event.payload["bytes_sent"], json!(13));
+        assert!(
+            !event.payload.to_string().contains("data: ready"),
+            "terminal audit must not contain SSE payloads"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ordinary_stream_still_applies_precommit_first_byte_deadline() {
+        let (addr, server) = spawn_sse_upstream(SseTestBody::Chunks(vec![(
+            Duration::from_millis(200),
+            "late",
+        )]))
+        .await;
+        let (proxy, _, _) = retry_proxy_with_options(
+            [addr, addr],
+            RetryProxyOptions {
+                timeout: Duration::from_millis(50),
+                ..RetryProxyOptions::default()
+            },
+        );
+        let request = Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .expect("ordinary request");
+
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            !response
+                .extensions()
+                .get::<middleware::decision::UpstreamOutcome>()
+                .expect("ordinary timeout outcome")
+                .stream_terminal_pending
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sse_idle_size_and_duration_limits_report_distinct_terminal_outcomes() {
+        let cases = [
+            (
+                "sse-idle",
+                SseTestBody::Pending,
+                Duration::from_millis(40),
+                config::UpstreamSseConfig {
+                    max_duration_ms: 500,
+                    max_response_bytes: None,
+                },
+                "idle_timeout",
+            ),
+            (
+                "sse-size",
+                SseTestBody::Chunks(vec![(Duration::ZERO, "123456")]),
+                Duration::from_millis(500),
+                config::UpstreamSseConfig {
+                    max_duration_ms: 500,
+                    max_response_bytes: Some(5),
+                },
+                "size_limit",
+            ),
+            (
+                "sse-duration",
+                SseTestBody::Pending,
+                Duration::from_millis(500),
+                config::UpstreamSseConfig {
+                    max_duration_ms: 40,
+                    max_response_bytes: None,
+                },
+                "duration_limit",
+            ),
+        ];
+
+        for (request_id, plan, idle_timeout, sse, expected) in cases {
+            let (addr, server) = spawn_sse_upstream(plan).await;
+            let (proxy, sink, _) = retry_proxy_with_options(
+                [addr, addr],
+                RetryProxyOptions {
+                    timeout: Duration::from_millis(100),
+                    response_idle_timeout: Some(idle_timeout),
+                    sse: Some(sse),
+                    ..RetryProxyOptions::default()
+                },
+            );
+            let request = Request::builder()
+                .uri("/")
+                .header(REQUEST_ID_HEADER, request_id)
+                .body(Body::empty())
+                .expect("limited SSE request");
+            let response = proxy.forward_request(request, "203.0.113.8").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            let error = body
+                .next()
+                .await
+                .expect("limited SSE should terminate with a body error")
+                .expect_err("limited SSE should return a redacted body error");
+            assert!(
+                error.to_string().contains(expected)
+                    || (expected == "idle_timeout"
+                        && error.to_string().contains("response_idle_timeout"))
+                    || (expected == "size_limit"
+                        && error.to_string().contains("response_too_large")),
+                "unexpected {request_id} error: {error}"
+            );
+            let event = wait_for_stream_audit(&sink, request_id).await;
+            assert_eq!(event.payload["outcome"], json!(expected));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_keepalives_reset_idle_timeout_and_body_drop_is_neutral_cancellation() {
+        let (keepalive_addr, keepalive_server) = spawn_sse_upstream(SseTestBody::Chunks(vec![
+            (Duration::from_millis(25), ":\n\n"),
+            (Duration::from_millis(25), ":\n\n"),
+            (Duration::from_millis(25), "data: done\n\n"),
+        ]))
+        .await;
+        let (keepalive_proxy, keepalive_sink, _) = retry_proxy_with_options(
+            [keepalive_addr, keepalive_addr],
+            RetryProxyOptions {
+                timeout: Duration::from_millis(100),
+                response_idle_timeout: Some(Duration::from_millis(50)),
+                sse: Some(config::UpstreamSseConfig {
+                    max_duration_ms: 500,
+                    max_response_bytes: None,
+                }),
+                ..RetryProxyOptions::default()
+            },
+        );
+        let keepalive_request = Request::builder()
+            .uri("/")
+            .header(REQUEST_ID_HEADER, "sse-keepalive")
+            .body(Body::empty())
+            .expect("keepalive request");
+        let keepalive_response = keepalive_proxy
+            .forward_request(keepalive_request, "203.0.113.8")
+            .await;
+        let body = axum::body::to_bytes(keepalive_response.into_body(), 1024)
+            .await
+            .expect("keepalive SSE body");
+        assert_eq!(body, bytes::Bytes::from_static(b":\n\n:\n\ndata: done\n\n"));
+        let keepalive_event = wait_for_stream_audit(&keepalive_sink, "sse-keepalive").await;
+        assert_eq!(keepalive_event.payload["outcome"], json!("completed"));
+        keepalive_server.abort();
+
+        let (pending_addr, pending_server) = spawn_sse_upstream(SseTestBody::Pending).await;
+        let (pending_proxy, pending_sink, _) = retry_proxy_with_options(
+            [pending_addr, pending_addr],
+            RetryProxyOptions {
+                timeout: Duration::from_millis(100),
+                response_idle_timeout: Some(Duration::from_secs(1)),
+                sse: Some(config::UpstreamSseConfig {
+                    max_duration_ms: 1_000,
+                    max_response_bytes: None,
+                }),
+                limits: config::UpstreamPoolLimitsConfig {
+                    max_in_flight: 1,
+                    queue_depth: 0,
+                    queue_timeout_ms: 10,
+                },
+                ..RetryProxyOptions::default()
+            },
+        );
+        let pool = test_pool(&pending_proxy);
+        let pending_request = Request::builder()
+            .uri("/")
+            .header(REQUEST_ID_HEADER, "sse-client-cancelled")
+            .body(Body::empty())
+            .expect("pending SSE request");
+        let pending_response = pending_proxy
+            .forward_request(pending_request, "203.0.113.8")
+            .await;
+        drop(pending_response);
+        let released = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if let Ok(permit) = pool.admission.acquire().await {
+                    return permit;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the SSE body must promptly release admission");
+        drop(released);
+        let pending_event = wait_for_stream_audit(&pending_sink, "sse-client-cancelled").await;
+        assert_eq!(pending_event.payload["outcome"], json!("client_cancelled"));
+
+        let shutdown_request = Request::builder()
+            .uri("/")
+            .header(REQUEST_ID_HEADER, "sse-shutdown")
+            .body(Body::empty())
+            .expect("shutdown SSE request");
+        let shutdown_response = pending_proxy
+            .forward_request(shutdown_request, "203.0.113.8")
+            .await;
+        assert!(pending_proxy.lifecycle.begin_draining());
+        drop(shutdown_response);
+        let shutdown_event = wait_for_stream_audit(&pending_sink, "sse-shutdown").await;
+        assert_eq!(shutdown_event.payload["outcome"], json!("shutdown"));
+        pending_server.abort();
+    }
+
+    #[tokio::test]
     async fn unpolled_response_deadline_terminates_pump_without_queuing_tail_data() {
         let upstream_body: egress::EgressBodyStream =
             Box::pin(stream::pending::<Result<bytes::Bytes, egress::EgressError>>());
@@ -1587,15 +2077,17 @@ mod tests {
         let circuit_permit = circuit.try_acquire().expect("closed circuit permit");
         let (completed_sender, completed_receiver) = tokio::sync::oneshot::channel();
         let body = redacted_response_body_inner(
-            bytes::Bytes::from_static(b"first"),
+            Some(bytes::Bytes::from_static(b"first")),
             upstream_body,
             admission_permit,
             Some(retry_permit),
-            tokio::time::Instant::now() + Duration::from_millis(50),
+            Some(tokio::time::Instant::now() + Duration::from_millis(50)),
             None,
             ResponseTailOptions {
                 circuit_permit: Some(circuit_permit),
                 pump_completed: Some(completed_sender),
+                telemetry: None,
+                timeout_outcome: "request_timeout",
             },
         );
 
@@ -2882,6 +3374,51 @@ mod tests {
         (addr, task)
     }
 
+    #[derive(Clone)]
+    enum SseTestBody {
+        Chunks(Vec<(Duration, &'static str)>),
+        Pending,
+    }
+
+    async fn spawn_sse_upstream(plan: SseTestBody) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test SSE listener");
+        let addr = listener.local_addr().expect("test SSE listener address");
+        let app = Router::new().fallback(move || {
+            let plan = plan.clone();
+            async move {
+                let body = match plan {
+                    SseTestBody::Chunks(chunks) => {
+                        let stream = stream::unfold(chunks.into_iter(), |mut chunks| async move {
+                            let (delay, chunk) = chunks.next()?;
+                            tokio::time::sleep(delay).await;
+                            Some((
+                                Ok::<_, Infallible>(bytes::Bytes::from_static(chunk.as_bytes())),
+                                chunks,
+                            ))
+                        });
+                        Body::from_stream(stream)
+                    }
+                    SseTestBody::Pending => {
+                        Body::from_stream(stream::pending::<Result<bytes::Bytes, Infallible>>())
+                    }
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(body)
+                    .expect("SSE response")
+            }
+        });
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test SSE upstream should serve");
+        });
+        (addr, task)
+    }
+
     async fn spawn_attempt_aware_upstream(
         attempts: Arc<Mutex<HashMap<String, usize>>>,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -2978,8 +3515,10 @@ mod tests {
         retry: Option<config::UpstreamRetryConfig>,
         circuit_config: Option<config::UpstreamCircuitBreakerConfig>,
         timeout: Duration,
+        response_idle_timeout: Option<Duration>,
         limits: config::UpstreamPoolLimitsConfig,
         request_body_mode: RequestBodyMode,
+        sse: Option<config::UpstreamSseConfig>,
         health_config: Option<config::UpstreamHealthCheckConfig>,
         allow_loopback_host: bool,
     }
@@ -2990,8 +3529,10 @@ mod tests {
                 retry: None,
                 circuit_config: None,
                 timeout: Duration::from_secs(2),
+                response_idle_timeout: None,
                 limits: config::UpstreamPoolLimitsConfig::default(),
                 request_body_mode: RequestBodyMode::Buffered,
+                sse: None,
                 health_config: None,
                 allow_loopback_host: true,
             }
@@ -3011,7 +3552,7 @@ mod tests {
             allowed_hosts,
             timeout: options.timeout,
             connect_timeout: options.timeout.min(Duration::from_millis(100)),
-            response_idle_timeout: options.timeout,
+            response_idle_timeout: options.response_idle_timeout.unwrap_or(options.timeout),
             deny_private_ips: false,
             ..egress::EgressConfig::default()
         };
@@ -3044,6 +3585,7 @@ mod tests {
             }
         }
         let circuit_config = options.circuit_config.clone();
+        let sse = options.sse.as_ref().map(Into::into);
         let endpoint =
             |index: usize,
              id: &'static str,
@@ -3084,6 +3626,7 @@ mod tests {
                         request_header_policy: RouteRequestHeaderPolicy::default(),
                         pool,
                         request_body_mode: options.request_body_mode,
+                        sse,
                     }],
                 },
                 upstream_health: Vec::new(),
@@ -3114,6 +3657,22 @@ mod tests {
         })
         .await
         .expect("retry audit should be emitted")
+    }
+
+    async fn wait_for_stream_audit(sink: &CaptureSink, request_id: &str) -> audit::AuditEvent {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(event) = sink.events().into_iter().find(|event| {
+                    event.event_type == audit::event::UPSTREAM_STREAM_TERMINATED
+                        && event.request_id == request_id
+                }) {
+                    return event;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stream terminal audit should be emitted")
     }
 
     #[derive(Clone, Default)]

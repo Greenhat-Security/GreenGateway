@@ -29,6 +29,7 @@ pub struct UpstreamOutcome {
     pub endpoint_id: Option<String>,
     pub attempts: Vec<UpstreamAttemptOutcome>,
     pub retry_exhausted: bool,
+    pub stream_terminal_pending: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

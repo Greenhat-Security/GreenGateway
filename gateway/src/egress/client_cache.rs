@@ -47,6 +47,7 @@ pub(super) struct PinnedClientCacheKey {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum ProtocolProfile {
     Http1AndHttp2,
+    Sse,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

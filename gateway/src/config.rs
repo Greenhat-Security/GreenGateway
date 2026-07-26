@@ -280,6 +280,8 @@ pub struct UpstreamRouteConfig {
     #[serde(default)]
     pub request_body: UpstreamRequestBodyConfig,
     #[serde(default)]
+    pub sse: Option<UpstreamSseConfig>,
+    #[serde(default)]
     pub limits: UpstreamPoolLimitsConfig,
     #[serde(default)]
     pub health_check: Option<UpstreamHealthCheckConfig>,
@@ -345,6 +347,22 @@ pub enum UpstreamRequestBodyMode {
 pub struct UpstreamRequestBodyConfig {
     #[serde(default)]
     pub mode: UpstreamRequestBodyMode,
+}
+
+pub const DEFAULT_UPSTREAM_SSE_MAX_DURATION_MS: u64 = 3_600_000;
+pub const MAX_UPSTREAM_SSE_MAX_DURATION_MS: u64 = 604_800_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamSseConfig {
+    #[serde(default = "default_upstream_sse_max_duration_ms")]
+    pub max_duration_ms: u64,
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+}
+
+fn default_upstream_sse_max_duration_ms() -> u64 {
+    DEFAULT_UPSTREAM_SSE_MAX_DURATION_MS
 }
 
 pub const DEFAULT_UPSTREAM_RETRY_MAX_ATTEMPTS: u8 = 1;
@@ -2620,6 +2638,13 @@ fn validate_upstream_routes(
             route.connect_timeout_ms,
             problems,
         );
+        if let Some(sse) = route.sse.as_ref() {
+            if sse.max_duration_ms > MAX_UPSTREAM_SSE_MAX_DURATION_MS {
+                problems.push(format!(
+                    "{route_name}.sse.max_duration_ms must be 0 (unlimited) or at most {MAX_UPSTREAM_SSE_MAX_DURATION_MS}"
+                ));
+            }
+        }
         if let Some(health) = route.health_check.as_ref() {
             if !matches!(health.method.as_str(), "GET" | "HEAD") {
                 problems.push(format!(
@@ -2790,6 +2815,7 @@ fn validate_upstream_routes(
             upstreams,
             load_balancing: route.load_balancing,
             request_body: route.request_body,
+            sse: route.sse,
             limits: route.limits,
             health_check: route.health_check,
             retry: route.retry,
@@ -5748,6 +5774,7 @@ mod tests {
                     upstreams: Vec::new(),
                     load_balancing: UpstreamLoadBalancingConfig::default(),
                     request_body: UpstreamRequestBodyConfig::default(),
+                    sse: None,
                     limits: UpstreamPoolLimitsConfig::default(),
                     health_check: None,
                     retry: None,
@@ -5771,6 +5798,7 @@ mod tests {
                     upstreams: Vec::new(),
                     load_balancing: UpstreamLoadBalancingConfig::default(),
                     request_body: UpstreamRequestBodyConfig::default(),
+                    sse: None,
                     limits: UpstreamPoolLimitsConfig::default(),
                     health_check: None,
                     retry: None,
@@ -5844,6 +5872,63 @@ mod tests {
         assert_eq!(health.passive_failure_statuses, vec![500, 502, 503, 504]);
         assert!(health.required_for_readiness);
         assert_eq!(health.minimum_healthy, 2);
+    }
+
+    #[test]
+    fn upstream_sse_configuration_is_explicit_and_bounded() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[
+                {
+                    "path_prefix":"/events",
+                    "upstream_url":"https://events.example.test",
+                    "sse":{"max_duration_ms":7200000,"max_response_bytes":0}
+                },
+                {
+                    "path_prefix":"/bounded-events",
+                    "upstream_url":"https://bounded.example.test",
+                    "sse":{"max_response_bytes":1048576}
+                }
+            ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("SSE configuration should parse");
+
+        let unlimited = config.upstream_routes[0]
+            .sse
+            .as_ref()
+            .expect("SSE mode should be explicit");
+        assert_eq!(unlimited.max_duration_ms, 7_200_000);
+        assert_eq!(unlimited.max_response_bytes, Some(0));
+        let bounded = config.upstream_routes[1]
+            .sse
+            .as_ref()
+            .expect("bounded SSE mode");
+        assert_eq!(
+            bounded.max_duration_ms,
+            DEFAULT_UPSTREAM_SSE_MAX_DURATION_MS
+        );
+        assert_eq!(bounded.max_response_bytes, Some(1_048_576));
+    }
+
+    #[test]
+    fn upstream_sse_duration_above_hard_bound_fails_startup() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(format!(
+                r#"[{{
+                    "path_prefix":"/events",
+                    "upstream_url":"https://events.example.test",
+                    "sse":{{"max_duration_ms":{}}}
+                }}]"#,
+                MAX_UPSTREAM_SSE_MAX_DURATION_MS + 1
+            )),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("excessive SSE duration should fail startup");
+
+        assert!(error
+            .to_string()
+            .contains("UPSTREAM_ROUTES[0].sse.max_duration_ms must be 0 (unlimited) or at most"));
     }
 
     #[test]

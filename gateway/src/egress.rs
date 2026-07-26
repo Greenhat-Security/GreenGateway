@@ -673,6 +673,10 @@ impl EgressClient {
         self.config.timeout
     }
 
+    pub(crate) fn max_response_bytes(&self) -> usize {
+        self.config.max_response_bytes
+    }
+
     pub fn new(config: EgressConfig) -> Result<Self, EgressError> {
         Self::new_with_resolver(config, Arc::new(SystemDnsResolver))
     }
@@ -784,6 +788,30 @@ impl EgressClient {
         headers: HeaderMap,
         body: EgressRequestBody,
     ) -> Result<EgressStreamResponse, EgressError> {
+        self.stream_request_with_body_policy(method, url, headers, body, None)
+            .await
+    }
+
+    pub(crate) async fn stream_request_with_body_for_sse(
+        &self,
+        method: Method,
+        url: &str,
+        headers: HeaderMap,
+        body: EgressRequestBody,
+        max_response_bytes: Option<usize>,
+    ) -> Result<EgressStreamResponse, EgressError> {
+        self.stream_request_with_body_policy(method, url, headers, body, Some(max_response_bytes))
+            .await
+    }
+
+    async fn stream_request_with_body_policy(
+        &self,
+        method: Method,
+        url: &str,
+        headers: HeaderMap,
+        body: EgressRequestBody,
+        sse_max_response_bytes: Option<Option<usize>>,
+    ) -> Result<EgressStreamResponse, EgressError> {
         let parsed = self.checked_url(url)?;
         let host = checked_host(
             &parsed,
@@ -794,12 +822,24 @@ impl EgressClient {
         checked_policy_port(port, &self.config.allowed_ports)?;
         body.enforce_known_size(self.config.max_request_body_bytes)?;
         let pinned_addr = self.resolve_and_check(&host, port).await?;
-        let client = self.pinned_client(&parsed, &host, pinned_addr)?;
+        let client = self.pinned_client_with_profile(
+            &parsed,
+            &host,
+            pinned_addr,
+            sse_max_response_bytes.is_some(),
+        )?;
 
         tracing::debug!("egress streaming request pinned to validated destination");
 
-        self.send_stream_with_client(client, method, parsed, headers, body)
-            .await
+        self.send_stream_with_client(
+            client,
+            method,
+            parsed,
+            headers,
+            body,
+            sse_max_response_bytes,
+        )
+        .await
     }
 
     fn checked_url(&self, url: &str) -> Result<Url, EgressError> {
@@ -831,6 +871,16 @@ impl EgressClient {
         host: &str,
         pinned_addr: SocketAddr,
     ) -> Result<reqwest::Client, EgressError> {
+        self.pinned_client_with_profile(url, host, pinned_addr, false)
+    }
+
+    fn pinned_client_with_profile(
+        &self,
+        url: &Url,
+        host: &str,
+        pinned_addr: SocketAddr,
+        sse: bool,
+    ) -> Result<reqwest::Client, EgressError> {
         let port = checked_port(url)?;
         let key = client_cache::PinnedClientCacheKey {
             scheme: url.scheme().to_owned(),
@@ -843,12 +893,16 @@ impl EgressClient {
             connect_timeout: self.config.connect_timeout,
             tls_root_set_fingerprint: self.config.tls_root_set_fingerprint,
             client_identity_fingerprint: None,
-            protocol_profile: client_cache::ProtocolProfile::Http1AndHttp2,
+            protocol_profile: if sse {
+                client_cache::ProtocolProfile::Sse
+            } else {
+                client_cache::ProtocolProfile::Http1AndHttp2
+            },
             outbound_proxy_policy: client_cache::OutboundProxyPolicy::Disabled,
         };
 
         self.client_cache.get_or_build(key, || {
-            Ok(base_client_builder(&self.config)
+            Ok(base_client_builder_for_profile(&self.config, sse)
                 .resolve(host, pinned_addr)
                 .build()?)
         })
@@ -926,6 +980,7 @@ impl EgressClient {
         url: Url,
         headers: HeaderMap,
         body: EgressRequestBody,
+        sse_max_response_bytes: Option<Option<usize>>,
     ) -> Result<EgressStreamResponse, EgressError> {
         let mut request = client.request(method, url).headers(headers);
         let body_failure = Arc::new(AtomicU8::new(REQUEST_BODY_OK));
@@ -956,7 +1011,8 @@ impl EgressClient {
                 })?;
         let status = response.status();
         let headers = response.headers().clone();
-        let max_response_bytes = self.config.max_response_bytes;
+        let max_response_bytes =
+            sse_max_response_bytes.unwrap_or(Some(self.config.max_response_bytes));
         let response_idle_timeout = self.config.response_idle_timeout;
         let body = Box::pin(response.bytes_stream());
         let body = stream::unfold((body, 0usize, false), move |state| async move {
@@ -967,14 +1023,16 @@ impl EgressClient {
 
             match tokio::time::timeout(response_idle_timeout, body.next()).await {
                 Ok(Some(Ok(chunk))) => {
-                    if streamed_bytes.saturating_add(chunk.len()) > max_response_bytes {
+                    if max_response_bytes
+                        .is_some_and(|maximum| streamed_bytes.saturating_add(chunk.len()) > maximum)
+                    {
                         tracing::warn!(
-                            max = max_response_bytes,
+                            max = max_response_bytes.unwrap_or_default(),
                             "egress blocked oversized response"
                         );
                         return Some((
                             Err(EgressError::ResponseTooLarge {
-                                max: max_response_bytes,
+                                max: max_response_bytes.unwrap_or_default(),
                             }),
                             (body, streamed_bytes, true),
                         ));
@@ -1120,14 +1178,20 @@ fn extract_rfc6052_ipv4(ip: Ipv6Addr, prefix_len: u8) -> Option<Ipv4Addr> {
 }
 
 fn base_client_builder(config: &EgressConfig) -> reqwest::ClientBuilder {
+    base_client_builder_for_profile(config, false)
+}
+
+fn base_client_builder_for_profile(config: &EgressConfig, sse: bool) -> reqwest::ClientBuilder {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
-        .timeout(config.timeout)
         .connect_timeout(config.connect_timeout)
         .pool_idle_timeout(Some(client_cache::CLIENT_POOL_IDLE_TIMEOUT))
         .pool_max_idle_per_host(client_cache::CLIENT_POOL_MAX_IDLE_PER_HOST)
         .tcp_keepalive(Some(client_cache::CLIENT_TCP_KEEPALIVE))
         .redirect(reqwest::redirect::Policy::none());
+    if !sse {
+        builder = builder.timeout(config.timeout);
+    }
 
     for certificate in &config.tls_root_certificates {
         builder = builder.add_root_certificate(certificate.clone());
@@ -2525,6 +2589,7 @@ mod tests {
                 upstreams: Vec::new(),
                 load_balancing: crate::config::UpstreamLoadBalancingConfig::default(),
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
+                sse: None,
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
                 retry: None,
@@ -2545,6 +2610,7 @@ mod tests {
                 upstreams: Vec::new(),
                 load_balancing: crate::config::UpstreamLoadBalancingConfig::default(),
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
+                sse: None,
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
                 retry: None,
@@ -2578,6 +2644,7 @@ mod tests {
                 ],
                 load_balancing: crate::config::UpstreamLoadBalancingConfig::default(),
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
+                sse: None,
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
                 retry: None,
