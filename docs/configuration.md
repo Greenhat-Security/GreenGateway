@@ -959,6 +959,19 @@ The route's effective `timeout_ms` is one deadline shared by all attempts and ba
 
 Retry telemetry uses only bounded pool/endpoint IDs and safe result categories. Metrics include `proxy_upstream_attempts_total`, `proxy_upstream_attempt_duration_seconds`, `proxy_upstream_retries_total`, and `proxy_retry_budget_exhausted_total`. A request that exhausts its configured retry opportunity emits `upstream.retry_exhausted` with the logical request ID and a bounded attempt summary; URLs, resolved addresses, queries, credentials, and raw transport errors are excluded.
 
+`circuit_breaker` is an optional pool-only object. Omitting it leaves circuit breaking disabled and preserves legacy behavior. It is rejected on a route using `upstream_url`. Its fields are:
+
+- `failure_threshold`: consecutive qualifying failures within the fixed 60-second monotonic failure window that open a closed endpoint circuit, default `5`, range 1-1000. An incomplete failure sequence expires at the end of the window.
+- `open_ms`: monotonic-clock cool-down before an open endpoint may enter half-open, default `30000`, range 10-3600000.
+- `half_open_max_requests`: concurrent recovery probes per endpoint, default `1`, from 1 through the route's `limits.max_in_flight`.
+- `recovery_threshold`: successful half-open probes required to close the circuit, default `2`, range 1-1000.
+
+Circuit state is isolated per configured pool and endpoint ID. Retryable transport failures, request timeouts, and configured retry statuses count as failures. When `retry` is omitted, the circuit uses `[502,503,504]` as its failure statuses without enabling request retries. Client 4xx responses, authentication or policy denial, egress or TLS validation denial, request-body limits, and cancellation do not count as endpoint failures. A success resets a closed circuit's consecutive-failure count.
+
+Open endpoints receive no ordinary traffic. After the cool-down, endpoint selection atomically reserves one of the bounded half-open probe slots. A half-open failure immediately reopens the endpoint; successful probes close it after `recovery_threshold`. Cancellation releases a probe slot without recording success or failure. Probe permits remain attached through streamed-response completion so late retryable transport failure or timeout cannot be misclassified as recovery. If every healthy endpoint is open or has no available half-open probe slot, the request returns the sanitized `503 Service Unavailable` response without DNS resolution, upstream bytes, a retry loop, or fallback to another logical route.
+
+State changes emit `upstream.circuit_state_changed` audit events and `upstream_circuit_transitions_total`; selection rejected by open or saturated half-open state increments `upstream_circuit_rejections_total`. Telemetry contains only bounded pool/endpoint IDs, state names, and safe reason categories. It does not contain upstream URLs, addresses, queries, credentials, or raw errors.
+
 Route entries may also set these optional per-upstream fields:
 
 - `timeout_ms`: total timeout for this route's upstream requests, in milliseconds. When unset, the route inherits `UPSTREAM_TIMEOUT_MS` if configured, otherwise `EGRESS_TIMEOUT_MS`.
@@ -1025,6 +1038,12 @@ Example:
       "max_attempts": 3,
       "methods": ["GET", "HEAD", "OPTIONS"],
       "statuses": [502, 503, 504]
+    },
+    "circuit_breaker": {
+      "failure_threshold": 5,
+      "open_ms": 30000,
+      "half_open_max_requests": 1,
+      "recovery_threshold": 2
     }
   }
 ]
