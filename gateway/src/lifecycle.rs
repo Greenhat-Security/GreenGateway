@@ -260,8 +260,14 @@ async fn serve_gateway_with_signals(
                 }),
             ));
 
+            if let Err(error) = emit_control_event(
+                &audit_log,
+                gateway_event(audit::event::GATEWAY_READY, json!({})),
+            ) {
+                let _ = drain_audit(&audit_log, shutdown_config.audit_drain_timeout).await;
+                return Err(error);
+            }
             lifecycle.mark_ready();
-            audit_log.emit(gateway_event(audit::event::GATEWAY_READY, json!({})));
             tracing::info!(listen_addr = %bound_addr, "gateway listening");
             let cancellation = CancellationToken::new();
             let server = serve_router_with_shutdown(listener, app, cancellation.clone());
@@ -310,8 +316,14 @@ async fn serve_gateway_with_signals(
                 }),
             ));
 
+            if let Err(error) = emit_control_event(
+                &audit_log,
+                gateway_event(audit::event::GATEWAY_READY, json!({})),
+            ) {
+                let _ = drain_audit(&audit_log, shutdown_config.audit_drain_timeout).await;
+                return Err(error);
+            }
             lifecycle.mark_ready();
-            audit_log.emit(gateway_event(audit::event::GATEWAY_READY, json!({})));
             tracing::info!(listen_addr = %data_bound_addr, "gateway data listener listening");
             tracing::info!(admin_listen_addr = %admin_bound_addr, "gateway admin listener listening");
             let cancellation = CancellationToken::new();
@@ -322,8 +334,9 @@ async fn serve_gateway_with_signals(
             tokio::pin!(admin_server);
             tokio::select! {
                 result = &mut data_server => {
-                    return unexpected_listener_termination(
+                    return unexpected_split_listener_termination(
                         result,
+                        admin_server,
                         &audit_log,
                         &lifecycle,
                         shutdown_config,
@@ -332,8 +345,9 @@ async fn serve_gateway_with_signals(
                     ).await;
                 }
                 result = &mut admin_server => {
-                    return unexpected_listener_termination(
+                    return unexpected_split_listener_termination(
                         result,
+                        data_server,
                         &audit_log,
                         &lifecycle,
                         shutdown_config,
@@ -376,10 +390,11 @@ where
 {
     let started = Instant::now();
     lifecycle.begin_draining();
-    audit_log.emit(gateway_event(
-        audit::event::GATEWAY_SHUTDOWN_STARTED,
-        json!({}),
-    ));
+    let mut audit_control_error = emit_control_event(
+        audit_log,
+        gateway_event(audit::event::GATEWAY_SHUTDOWN_STARTED, json!({})),
+    )
+    .err();
 
     let mut forced_reason = None;
     if !config.drain_delay.is_zero() {
@@ -404,8 +419,16 @@ where
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        emit_terminal_shutdown(audit_log, started, Some("listener_error"));
-                        drain_audit(audit_log, config.audit_drain_timeout).await?;
+                        if let Err(audit_error) =
+                            emit_terminal_shutdown(audit_log, started, Some("listener_error"))
+                        {
+                            tracing::error!(%audit_error, "failed to admit terminal shutdown audit event");
+                        }
+                        if let Err(audit_error) =
+                            drain_audit(audit_log, config.audit_drain_timeout).await
+                        {
+                            tracing::error!(%audit_error, "failed to drain audit after listener error");
+                        }
                         return Err(error);
                     }
                     Err(_) => forced_reason = Some("deadline"),
@@ -415,8 +438,19 @@ where
         }
     }
 
-    emit_terminal_shutdown(audit_log, started, forced_reason);
-    drain_audit(audit_log, config.audit_drain_timeout).await
+    if let Err(error) = emit_terminal_shutdown(audit_log, started, forced_reason) {
+        if audit_control_error.is_none() {
+            audit_control_error = Some(error);
+        }
+    }
+    let drain_result = drain_audit(audit_log, config.audit_drain_timeout).await;
+    if let Some(error) = audit_control_error {
+        if let Err(drain_error) = drain_result {
+            tracing::error!(%drain_error, "audit drain also failed after control-event admission failure");
+        }
+        return Err(error);
+    }
+    drain_result
 }
 
 async fn unexpected_listener_termination(
@@ -430,8 +464,49 @@ async fn unexpected_listener_termination(
     lifecycle.begin_draining();
     cancellation.cancel();
     let _ = tokio::time::timeout(config.shutdown_timeout, background_shutdown).await;
-    emit_terminal_shutdown(audit_log, Instant::now(), Some("listener_terminated"));
-    drain_audit(audit_log, config.audit_drain_timeout).await?;
+    let terminal_result =
+        emit_terminal_shutdown(audit_log, Instant::now(), Some("listener_terminated"));
+    let drain_result = drain_audit(audit_log, config.audit_drain_timeout).await;
+    terminal_result?;
+    drain_result?;
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => Err(std::io::Error::other(
+            "gateway listener terminated unexpectedly",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn unexpected_split_listener_termination<Peer>(
+    result: std::io::Result<()>,
+    peer: Peer,
+    audit_log: &audit::AuditLog,
+    lifecycle: &GatewayLifecycle,
+    config: ShutdownConfig,
+    background_shutdown: BackgroundShutdown,
+    cancellation: CancellationToken,
+) -> std::io::Result<()>
+where
+    Peer: Future<Output = std::io::Result<()>>,
+{
+    lifecycle.begin_draining();
+    cancellation.cancel();
+    let peer_shutdown = async {
+        let (peer_result, ()) = tokio::join!(peer, background_shutdown);
+        peer_result
+    };
+    if tokio::time::timeout(config.shutdown_timeout, peer_shutdown)
+        .await
+        .is_err()
+    {
+        tracing::error!("peer listener exceeded shutdown deadline after split listener failure");
+    }
+    let terminal_result =
+        emit_terminal_shutdown(audit_log, Instant::now(), Some("listener_terminated"));
+    let drain_result = drain_audit(audit_log, config.audit_drain_timeout).await;
+    terminal_result?;
+    drain_result?;
     match result {
         Err(error) => Err(error),
         Ok(()) => Err(std::io::Error::other(
@@ -444,24 +519,39 @@ fn emit_terminal_shutdown(
     audit_log: &audit::AuditLog,
     started: Instant,
     forced_reason: Option<&'static str>,
-) {
+) -> std::io::Result<()> {
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     if let Some(reason) = forced_reason {
-        audit_log.emit(gateway_event(
-            audit::event::GATEWAY_SHUTDOWN_FORCED,
-            json!({
-                "duration_ms": duration_ms,
-                "reason": reason,
-            }),
-        ));
+        emit_control_event(
+            audit_log,
+            gateway_event(
+                audit::event::GATEWAY_SHUTDOWN_FORCED,
+                json!({
+                    "duration_ms": duration_ms,
+                    "reason": reason,
+                }),
+            ),
+        )
     } else {
-        audit_log.emit(gateway_event(
-            audit::event::GATEWAY_SHUTDOWN_COMPLETED,
-            json!({
-                "duration_ms": duration_ms,
-            }),
-        ));
+        emit_control_event(
+            audit_log,
+            gateway_event(
+                audit::event::GATEWAY_SHUTDOWN_COMPLETED,
+                json!({
+                    "duration_ms": duration_ms,
+                }),
+            ),
+        )
     }
+}
+
+fn emit_control_event(
+    audit_log: &audit::AuditLog,
+    event: audit::AuditEvent,
+) -> std::io::Result<()> {
+    audit_log.emit_control(event).map_err(|error| {
+        std::io::Error::other(format!("failed to admit lifecycle audit event: {error}"))
+    })
 }
 
 async fn drain_audit(audit_log: &audit::AuditLog, timeout: Duration) -> std::io::Result<()> {
@@ -503,19 +593,6 @@ pub(crate) async fn serve_router(
 }
 
 #[cfg(test)]
-async fn serve_split<DataServer, AdminServer>(
-    data_server: DataServer,
-    admin_server: AdminServer,
-) -> std::io::Result<()>
-where
-    DataServer: Future<Output = std::io::Result<()>>,
-    AdminServer: Future<Output = std::io::Result<()>>,
-{
-    tokio::try_join!(data_server, admin_server)?;
-    Ok(())
-}
-
-#[cfg(test)]
 mod tests {
     use std::{
         net::SocketAddr,
@@ -529,7 +606,7 @@ mod tests {
     use axum::{extract::ConnectInfo, routing::get};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        sync::mpsc,
+        sync::{mpsc, Notify},
     };
 
     use super::*;
@@ -606,31 +683,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn split_server_failure_cancels_peer_future() {
-        struct DropSignal(Arc<AtomicBool>);
-
-        impl Drop for DropSignal {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let peer_dropped = Arc::new(AtomicBool::new(false));
-        let peer_guard = DropSignal(Arc::clone(&peer_dropped));
-        let data_server = async { Err(std::io::Error::other("data server failed")) };
-        let admin_server = async move {
-            let _peer_guard = peer_guard;
-            std::future::pending::<std::io::Result<()>>().await
-        };
-
-        let error = serve_split(data_server, admin_server)
+    async fn split_listener_failure_gracefully_drains_in_flight_peer_request() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
-            .expect_err("the first server failure should terminate split serving");
+            .expect("peer listener should bind");
+        let peer_addr = listener.local_addr().expect("peer address");
+        let handler_started = Arc::new(Notify::new());
+        let release_handler = Arc::new(Notify::new());
+        let app = Router::new().route(
+            "/",
+            get({
+                let handler_started = Arc::clone(&handler_started);
+                let release_handler = Arc::clone(&release_handler);
+                move || {
+                    let handler_started = Arc::clone(&handler_started);
+                    let release_handler = Arc::clone(&release_handler);
+                    async move {
+                        handler_started.notify_one();
+                        release_handler.notified().await;
+                        "peer-drained"
+                    }
+                }
+            }),
+        );
+        let cancellation = CancellationToken::new();
+        let peer_server = tokio::spawn(serve_router_with_shutdown(
+            listener,
+            app,
+            cancellation.clone(),
+        ));
+        let response_task = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(peer_addr)
+                .await
+                .expect("peer request should connect");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("peer request should write");
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("peer response should read");
+            response
+        });
+        handler_started.notified().await;
+        let release_after_cancel = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                cancellation.cancelled().await;
+                release_handler.notify_one();
+            }
+        });
+        let capture = CaptureSink::new();
+        let audit_log = audit::AuditLog::new(Arc::new(capture));
 
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        let error = unexpected_split_listener_termination(
+            Err(std::io::Error::other("data listener failed")),
+            async move {
+                peer_server
+                    .await
+                    .map_err(|error| std::io::Error::other(error.to_string()))?
+            },
+            &audit_log,
+            &GatewayLifecycle::new(),
+            ShutdownConfig::immediate(),
+            test_background_shutdown(),
+            cancellation,
+        )
+        .await
+        .expect_err("the original listener failure should remain fatal");
+        let response = response_task.await.expect("peer request task should join");
+        release_after_cancel
+            .await
+            .expect("release task should observe cancellation");
+
+        assert_eq!(error.to_string(), "data listener failed");
         assert!(
-            peer_dropped.load(Ordering::SeqCst),
-            "the still-running peer server future must be cancelled"
+            String::from_utf8_lossy(&response).contains("peer-drained"),
+            "in-flight peer response must complete before split shutdown returns"
         );
     }
 
@@ -771,6 +902,59 @@ mod tests {
                 audit::event::GATEWAY_SHUTDOWN_COMPLETED,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn durable_audit_flush_failure_makes_shutdown_fail() {
+        struct FailingFlushSink;
+
+        impl audit::AuditSink for FailingFlushSink {
+            fn emit(&self, _event: &audit::AuditEvent) {}
+
+            fn flush(&self) -> Result<(), String> {
+                Err("injected lifecycle flush failure".to_owned())
+            }
+        }
+
+        let audit_log = audit::AuditLog::new(Arc::new(FailingFlushSink));
+        let lifecycle = GatewayLifecycle::new();
+        let observed_lifecycle = lifecycle.clone();
+        let (signal_tx, signal_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut signals = ChannelSignals {
+                receiver: signal_rx,
+            };
+            serve_gateway_with_signals(
+                GatewayApp::Unified(Router::new()),
+                "127.0.0.1:0".parse().expect("listen address should parse"),
+                None,
+                audit_log,
+                lifecycle,
+                ShutdownConfig::immediate(),
+                test_background_shutdown(),
+                &mut signals,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !observed_lifecycle.accepting_work() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("gateway should become ready");
+
+        signal_tx
+            .send(())
+            .expect("shutdown signal should be delivered");
+        let error = server
+            .await
+            .expect("server task should join")
+            .expect_err("durable flush failure must make shutdown fail");
+
+        assert!(error
+            .to_string()
+            .contains("injected lifecycle flush failure"));
     }
 
     #[tokio::test]

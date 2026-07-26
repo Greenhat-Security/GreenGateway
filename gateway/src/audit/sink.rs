@@ -1,5 +1,6 @@
 use std::{
     error::Error,
+    fmt,
     fs::{File, OpenOptions},
     io::{self, Write},
     path::PathBuf,
@@ -21,6 +22,15 @@ pub const AUDIT_BROADCAST_CAPACITY: usize = 512;
 
 pub trait AuditSink: Send + Sync {
     fn emit(&self, event: &AuditEvent);
+
+    /// Finish any sink-owned background work and durably flush accepted events.
+    ///
+    /// The audit writer calls this exactly after its admission channel closes
+    /// and all queued events have been emitted. Implementations must be
+    /// idempotent and return a bounded, display-safe error on failure.
+    fn flush(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub type ConfiguredAuditSink = (Arc<dyn AuditSink>, AuditEventSender);
@@ -68,6 +78,7 @@ impl AuditSink for StdoutSink {
 pub struct FileSink {
     path: PathBuf,
     file: Mutex<Option<File>>,
+    failure: Mutex<Option<String>>,
 }
 
 impl FileSink {
@@ -75,6 +86,7 @@ impl FileSink {
         Self {
             path: path.into(),
             file: Mutex::new(None),
+            failure: Mutex::new(None),
         }
     }
 
@@ -114,6 +126,16 @@ impl FileSink {
         writeln!(file, "{line}")?;
         file.flush()
     }
+
+    fn record_failure(&self, error: impl fmt::Display) {
+        let mut failure = self
+            .failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if failure.is_none() {
+            *failure = Some(format!("audit file sink failed: {error}"));
+        }
+    }
 }
 
 impl AuditSink for FileSink {
@@ -121,6 +143,7 @@ impl AuditSink for FileSink {
         let line = match serde_json::to_string(event) {
             Ok(line) => line,
             Err(err) => {
+                self.record_failure(&err);
                 tracing::error!(error = %err, "failed to serialize audit event for file sink");
                 return;
             }
@@ -136,6 +159,7 @@ impl AuditSink for FileSink {
             *file = None;
 
             if let Err(err) = self.write_locked(&mut file, &line) {
+                self.record_failure(&err);
                 ::metrics::counter!(
                     AUDIT_EVENTS_DROPPED_TOTAL,
                     "reason" => "sink_error"
@@ -148,6 +172,24 @@ impl AuditSink for FileSink {
                 );
             }
         }
+    }
+
+    fn flush(&self) -> Result<(), String> {
+        let flush_result = {
+            let mut file = self.file_guard();
+            match file.as_mut() {
+                Some(file) => file.flush().map_err(|error| error.to_string()),
+                None => Ok(()),
+            }
+        };
+        if let Err(error) = flush_result {
+            self.record_failure(&error);
+        }
+        self.failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .map_or(Ok(()), Err)
     }
 }
 
@@ -186,6 +228,18 @@ impl AuditSink for CompositeSink {
         for sink in &self.sinks {
             sink.emit(event);
         }
+    }
+
+    fn flush(&self) -> Result<(), String> {
+        let mut first_error = None;
+        for sink in &self.sinks {
+            if let Err(error) = sink.flush() {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 

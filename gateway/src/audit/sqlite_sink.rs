@@ -174,6 +174,7 @@ impl SqliteSink {
             retention_days: config.retention_days,
             connection: Mutex::new(connection),
             buffer: Mutex::new(Vec::with_capacity(SQLITE_BATCH_SIZE)),
+            flush_failure: Mutex::new(None),
         });
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let flusher_shared = Arc::clone(&shared);
@@ -195,6 +196,27 @@ impl SqliteSink {
     fn flush_for_test(&self) {
         self.shared.flush_buffer();
     }
+
+    fn shutdown_and_flush(&self) -> Result<(), String> {
+        if let Some(shutdown_tx) = take_mutex_value(&self.shutdown_tx, "shutdown_tx", &self.shared)
+        {
+            let _ = shutdown_tx.send(());
+        }
+
+        if let Some(flusher) = take_mutex_value(&self.flusher, "flusher", &self.shared) {
+            if flusher.join().is_err() {
+                return Err("SQLite audit flusher thread panicked during shutdown".to_owned());
+            }
+        }
+
+        self.shared.flush_buffer();
+        self.shared
+            .flush_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .map_or(Ok(()), Err)
+    }
 }
 
 impl AuditSink for SqliteSink {
@@ -203,25 +225,21 @@ impl AuditSink for SqliteSink {
             self.shared.flush_buffer();
         }
     }
+
+    fn flush(&self) -> Result<(), String> {
+        self.shutdown_and_flush()
+    }
 }
 
 impl Drop for SqliteSink {
     fn drop(&mut self) {
-        if let Some(shutdown_tx) = take_mutex_value(&self.shutdown_tx, "shutdown_tx", &self.shared)
-        {
-            let _ = shutdown_tx.send(());
+        if let Err(error) = self.shutdown_and_flush() {
+            tracing::error!(
+                path = %self.shared.path.display(),
+                %error,
+                "SQLite audit sink failed during shutdown"
+            );
         }
-
-        if let Some(flusher) = take_mutex_value(&self.flusher, "flusher", &self.shared) {
-            if flusher.join().is_err() {
-                tracing::error!(
-                    path = %self.shared.path.display(),
-                    "SQLite audit flusher thread panicked during shutdown"
-                );
-            }
-        }
-
-        self.shared.flush_buffer();
     }
 }
 
@@ -230,6 +248,7 @@ struct SqliteSinkShared {
     retention_days: Option<u32>,
     connection: Mutex<Connection>,
     buffer: Mutex<Vec<AuditEvent>>,
+    flush_failure: Mutex<Option<String>>,
 }
 
 impl SqliteSinkShared {
@@ -250,6 +269,13 @@ impl SqliteSinkShared {
         };
 
         if let Err(err) = self.write_events(&events) {
+            let mut failure = self
+                .flush_failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if failure.is_none() {
+                *failure = Some(format!("SQLite audit flush failed: {err}"));
+            }
             ::metrics::counter!(
                 AUDIT_SQLITE_FLUSH_ERRORS_TOTAL,
                 "operation" => "flush"

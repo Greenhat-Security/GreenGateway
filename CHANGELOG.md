@@ -9,6 +9,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Security
 
+- Added gateway-owned `/livez`, `/startupz`, and `/readyz` lifecycle probes,
+  coordinated Ctrl-C/SIGTERM shutdown, bounded in-flight draining, and durable
+  audit flush acknowledgement. These three probe paths are now reserved and
+  can no longer fall through to an upstream route, which is a proxy-path
+  compatibility change. Deployments should use `/readyz` for readiness while
+  retaining `/health` only for its legacy compatibility contract.
+
 - `UPSTREAM_ROUTES` now supports stable logical route IDs and static weighted
   endpoint pools with strict startup validation. Physical endpoint selection
   occurs only after authorization and bounded pool admission; configured

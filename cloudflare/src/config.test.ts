@@ -50,4 +50,18 @@ describe("buildGreenGatewayContainerEnv", () => {
       TRUSTED_PROXY_CIDRS: "10.0.0.0/8,2001:db8:1234::/48",
     });
   });
+
+  it("forwards the complete graceful-shutdown budget", () => {
+    const env = buildGreenGatewayContainerEnv({
+      SHUTDOWN_DRAIN_DELAY_MS: "5000",
+      SHUTDOWN_TIMEOUT_MS: "30000",
+      AUDIT_DRAIN_TIMEOUT_MS: "5000",
+    });
+
+    expect(env).toMatchObject({
+      SHUTDOWN_DRAIN_DELAY_MS: "5000",
+      SHUTDOWN_TIMEOUT_MS: "30000",
+      AUDIT_DRAIN_TIMEOUT_MS: "5000",
+    });
+  });
 });

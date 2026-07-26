@@ -143,7 +143,7 @@ Maximum time allowed for the asynchronous audit writer to close admission and de
 
 Default: `5000`
 
-Format and validation: must parse as a `u64` between `1` and `60000`. GreenGateway emits one terminal `gateway.shutdown_completed` or `gateway.shutdown_forced` event before closing the audit queue, then waits for the writer acknowledgment. A writer panic or drain timeout makes shutdown return an error so the process exits unsuccessfully instead of reporting a clean stop without its terminal audit record.
+Format and validation: must parse as a `u64` between `1` and `60000`. GreenGateway admits lifecycle events through capacity reserved from ordinary request audit traffic, emits one terminal `gateway.shutdown_completed` or `gateway.shutdown_forced` event before closing the audit queue, then waits for the writer and sink-flush acknowledgement. A control-event admission failure, writer panic, drain timeout, or required sink flush failure makes shutdown return an error so the process exits unsuccessfully instead of reporting a clean stop without its terminal audit record.
 
 ### DISCOVERY_SQLITE_PATH
 

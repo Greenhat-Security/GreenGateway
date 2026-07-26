@@ -137,7 +137,28 @@ async fn forward_to_upstream(
         }
         return crate::payload_too_large(proxy.max_request_body_bytes);
     }
-    let admission_permit = match upstream.pool.admission.acquire().await {
+    if proxy.lifecycle.draining() {
+        tracing::info!(
+            pool_id = upstream.pool.id.as_ref(),
+            error_category = "shutdown",
+            "proxied request rejected because gateway shutdown is draining"
+        );
+        return admission_unavailable_response(&upstream.pool.id, request_id);
+    }
+    let shutdown = proxy.lifecycle.background_cancellation();
+    let admission_result = tokio::select! {
+        biased;
+        () = shutdown.cancelled_owned() => {
+            tracing::info!(
+                pool_id = upstream.pool.id.as_ref(),
+                error_category = "shutdown",
+                "queued proxied request cancelled because gateway shutdown began"
+            );
+            return admission_unavailable_response(&upstream.pool.id, request_id);
+        }
+        result = upstream.pool.admission.acquire() => result,
+    };
+    let admission_permit = match admission_result {
         Ok(permit) => permit,
         Err(error) => {
             let reason = match error {
@@ -152,6 +173,15 @@ async fn forward_to_upstream(
             return admission_unavailable_response(&upstream.pool.id, request_id);
         }
     };
+    if proxy.lifecycle.draining() {
+        drop(admission_permit);
+        tracing::info!(
+            pool_id = upstream.pool.id.as_ref(),
+            error_category = "shutdown",
+            "proxied request rejected after admission because gateway shutdown began"
+        );
+        return admission_unavailable_response(&upstream.pool.id, request_id);
+    }
     let mut body = match upstream.request_body_mode {
         RequestBodyMode::Buffered => {
             match axum::body::to_bytes(body, proxy.max_request_body_bytes).await {
@@ -2452,7 +2482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn draining_lifecycle_prevents_new_retry_attempts() {
+    async fn draining_lifecycle_prevents_new_admission_and_attempts() {
         let first_requests = Arc::new(Mutex::new(Vec::new()));
         let second_requests = Arc::new(Mutex::new(Vec::new()));
         let (first_addr, first_server) =
@@ -2486,11 +2516,77 @@ mod tests {
             .expect("upstream outcome");
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(outcome.attempts.len(), 1);
+        assert!(outcome.attempts.is_empty());
         assert_eq!(
             first_requests.lock().expect("first captures").len()
                 + second_requests.lock().expect("second captures").len(),
-            1
+            0
+        );
+
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn draining_lifecycle_cancels_queued_admission_before_upstream_work() {
+        let first_requests = Arc::new(Mutex::new(Vec::new()));
+        let second_requests = Arc::new(Mutex::new(Vec::new()));
+        let (first_addr, first_server) =
+            spawn_status_upstream(StatusCode::OK, Arc::clone(&first_requests)).await;
+        let (second_addr, second_server) =
+            spawn_status_upstream(StatusCode::OK, Arc::clone(&second_requests)).await;
+        let (proxy, _, _) = retry_proxy_with_options(
+            [first_addr, second_addr],
+            RetryProxyOptions {
+                limits: config::UpstreamPoolLimitsConfig {
+                    max_in_flight: 1,
+                    queue_depth: 1,
+                    queue_timeout_ms: 1_000,
+                },
+                ..RetryProxyOptions::default()
+            },
+        );
+        let proxy = Arc::new(proxy);
+        let held_admission = test_pool(&proxy)
+            .admission
+            .acquire()
+            .await
+            .expect("test should hold the only admission permit");
+        let request_task = tokio::spawn({
+            let proxy = Arc::clone(&proxy);
+            async move {
+                proxy
+                    .forward_request(
+                        Request::builder()
+                            .method(http::Method::GET)
+                            .uri("/items")
+                            .header(REQUEST_ID_HEADER, "shutdown-queued-admission")
+                            .body(Body::empty())
+                            .expect("request"),
+                        "203.0.113.8",
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        proxy.lifecycle.begin_draining();
+        drop(held_admission);
+        let response = tokio::time::timeout(Duration::from_secs(1), request_task)
+            .await
+            .expect("queued request should be cancelled promptly")
+            .expect("queued request task should not panic");
+        let outcome = response
+            .extensions()
+            .get::<middleware::decision::UpstreamOutcome>()
+            .expect("upstream outcome");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(outcome.attempts.is_empty());
+        assert_eq!(
+            first_requests.lock().expect("first captures").len()
+                + second_requests.lock().expect("second captures").len(),
+            0
         );
 
         first_server.abort();
