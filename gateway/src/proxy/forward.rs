@@ -55,10 +55,46 @@ impl fmt::Display for RedactedProxyBodyError {
 
 impl Error for RedactedProxyBodyError {}
 
-type PumpedResponseItem = (
-    Result<bytes::Bytes, RedactedProxyBodyError>,
-    Option<tokio::sync::oneshot::Sender<()>>,
-);
+struct ResponseTailDemand {
+    response: tokio::sync::oneshot::Sender<ResponseTailEvent>,
+}
+
+enum ResponseTailEvent {
+    Chunk(bytes::Bytes),
+    Error(&'static str),
+    Eof,
+}
+
+#[derive(Clone, Copy)]
+enum ResponseTailTerminal {
+    Active,
+    Error(&'static str),
+    Eof,
+}
+
+struct ResponsePumpCompletion(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for ResponsePumpCompletion {
+    fn drop(&mut self) {
+        if let Some(completed) = self.0.take() {
+            let _ = completed.send(());
+        }
+    }
+}
+
+struct ResponseTailPump {
+    upstream_body: egress::EgressBodyStream,
+    demand_receiver: tokio::sync::mpsc::Receiver<ResponseTailDemand>,
+    terminal_sender: tokio::sync::watch::Sender<ResponseTailTerminal>,
+    admission_permit: super::admission::PoolAdmissionPermit,
+    retry_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    deadline: tokio::time::Instant,
+    passive_health: Option<(
+        super::health::UpstreamHealthState,
+        Arc<crate::config::UpstreamHealthCheckConfig>,
+    )>,
+    completion: ResponsePumpCompletion,
+}
 
 pub(super) async fn forward_request(
     proxy: &ProxyState,
@@ -697,33 +733,20 @@ fn redacted_response_body(
         Arc<crate::config::UpstreamHealthCheckConfig>,
     )>,
 ) -> Body {
-    let (tail_sender, tail_receiver) = tokio::sync::mpsc::channel(1);
-    tokio::spawn(pump_redacted_response_tail(
+    redacted_response_body_inner(
+        first_chunk,
         upstream_body,
-        tail_sender,
         admission_permit,
         retry_permit,
         deadline,
         passive_health,
-    ));
-    let redacted_tail = stream::unfold(tail_receiver, |mut receiver| async {
-        receiver.recv().await.map(|(item, consumed)| {
-            if let Some(consumed) = consumed {
-                let _ = consumed.send(());
-            }
-            (item, receiver)
-        })
-    });
-
-    Body::from_stream(
-        stream::once(async move { Ok::<_, RedactedProxyBodyError>(first_chunk) })
-            .chain(redacted_tail),
+        None,
     )
 }
 
-async fn pump_redacted_response_tail(
-    mut upstream_body: egress::EgressBodyStream,
-    tail_sender: tokio::sync::mpsc::Sender<PumpedResponseItem>,
+fn redacted_response_body_inner(
+    first_chunk: bytes::Bytes,
+    upstream_body: egress::EgressBodyStream,
     admission_permit: super::admission::PoolAdmissionPermit,
     retry_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     deadline: tokio::time::Instant,
@@ -731,74 +754,139 @@ async fn pump_redacted_response_tail(
         super::health::UpstreamHealthState,
         Arc<crate::config::UpstreamHealthCheckConfig>,
     )>,
-) {
+    pump_completed: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Body {
+    let (demand_sender, demand_receiver) = tokio::sync::mpsc::channel(1);
+    let (terminal_sender, terminal_receiver) =
+        tokio::sync::watch::channel(ResponseTailTerminal::Active);
+    tokio::spawn(pump_redacted_response_tail(ResponseTailPump {
+        upstream_body,
+        demand_receiver,
+        terminal_sender,
+        admission_permit,
+        retry_permit,
+        deadline,
+        passive_health,
+        completion: ResponsePumpCompletion(pump_completed),
+    }));
+    let redacted_tail = stream::unfold(
+        (demand_sender, terminal_receiver, false),
+        |(demand_sender, terminal_receiver, done)| async move {
+            if done {
+                return None;
+            }
+            let terminal = *terminal_receiver.borrow();
+            match terminal {
+                ResponseTailTerminal::Active => {}
+                ResponseTailTerminal::Error(category) => {
+                    return Some((
+                        Err(RedactedProxyBodyError(category)),
+                        (demand_sender, terminal_receiver, true),
+                    ));
+                }
+                ResponseTailTerminal::Eof => return None,
+            }
+            let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+            if demand_sender
+                .send(ResponseTailDemand {
+                    response: response_sender,
+                })
+                .await
+                .is_err()
+            {
+                let terminal = *terminal_receiver.borrow();
+                return response_tail_terminal_item(terminal)
+                    .map(|item| (item, (demand_sender, terminal_receiver, true)));
+            }
+            match response_receiver.await {
+                Ok(ResponseTailEvent::Chunk(chunk)) => {
+                    Some((Ok(chunk), (demand_sender, terminal_receiver, false)))
+                }
+                Ok(ResponseTailEvent::Error(category)) => Some((
+                    Err(RedactedProxyBodyError(category)),
+                    (demand_sender, terminal_receiver, true),
+                )),
+                Ok(ResponseTailEvent::Eof) => None,
+                Err(_) => {
+                    let terminal = *terminal_receiver.borrow();
+                    response_tail_terminal_item(terminal)
+                        .map(|item| (item, (demand_sender, terminal_receiver, true)))
+                }
+            }
+        },
+    );
+
+    Body::from_stream(
+        stream::once(async move { Ok::<_, RedactedProxyBodyError>(first_chunk) })
+            .chain(redacted_tail),
+    )
+}
+
+fn response_tail_terminal_item(
+    terminal: ResponseTailTerminal,
+) -> Option<Result<bytes::Bytes, RedactedProxyBodyError>> {
+    match terminal {
+        ResponseTailTerminal::Error(category) => Some(Err(RedactedProxyBodyError(category))),
+        ResponseTailTerminal::Eof => None,
+        ResponseTailTerminal::Active => Some(Err(RedactedProxyBodyError("response_body_failed"))),
+    }
+}
+
+async fn pump_redacted_response_tail(pump: ResponseTailPump) {
+    let ResponseTailPump {
+        mut upstream_body,
+        mut demand_receiver,
+        terminal_sender,
+        admission_permit,
+        retry_permit,
+        deadline,
+        passive_health,
+        completion: _completion,
+    } = pump;
     let mut admission_permit = Some(admission_permit);
     let mut retry_permit = retry_permit;
     loop {
-        let next = tokio::select! {
+        let demand = tokio::select! {
             biased;
             _ = tokio::time::sleep_until(deadline) => {
                 finish_response_timeout(
                     upstream_body,
-                    &tail_sender,
+                    &terminal_sender,
                     &mut admission_permit,
                     &mut retry_permit,
                     passive_health.as_ref(),
                 ).await;
                 return;
             }
-            () = tail_sender.closed() => return,
-            next = upstream_body.next() => next,
+            demand = demand_receiver.recv() => demand,
         };
-        let Some(result) = next else {
+        let Some(mut demand) = demand else {
             return;
         };
-        match result {
-            Ok(chunk) => {
-                let (consumed_sender, consumed_receiver) = tokio::sync::oneshot::channel();
-                tokio::select! {
-                    biased;
-                    _ = tokio::time::sleep_until(deadline) => {
-                        finish_response_timeout(
-                            upstream_body,
-                            &tail_sender,
-                            &mut admission_permit,
-                            &mut retry_permit,
-                            passive_health.as_ref(),
-                        ).await;
-                        return;
-                    }
-                    () = tail_sender.closed() => return,
-                    result = tail_sender.send((Ok(chunk), Some(consumed_sender))) => {
-                        if result.is_err() {
-                            return;
-                        }
-                    }
-                }
-                tokio::select! {
-                    biased;
-                    _ = tokio::time::sleep_until(deadline) => {
-                        finish_response_timeout(
-                            upstream_body,
-                            &tail_sender,
-                            &mut admission_permit,
-                            &mut retry_permit,
-                            passive_health.as_ref(),
-                        ).await;
-                        return;
-                    }
-                    () = tail_sender.closed() => return,
-                    consumed = consumed_receiver => {
-                        if consumed.is_err() {
-                            return;
-                        }
-                    }
-                }
+        let result = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                finish_response_timeout(
+                    upstream_body,
+                    &terminal_sender,
+                    &mut admission_permit,
+                    &mut retry_permit,
+                    passive_health.as_ref(),
+                ).await;
+                return;
             }
-            Err(error) => {
+            () = demand.response.closed() => continue,
+            result = upstream_body.next() => result,
+        };
+        match result {
+            Some(Ok(chunk)) => {
+                let _ = demand.response.send(ResponseTailEvent::Chunk(chunk));
+            }
+            Some(Err(error)) => {
                 let category = proxy_error_category(&error);
                 release_response_permits(&mut admission_permit, &mut retry_permit);
                 drop(upstream_body);
+                terminal_sender.send_replace(ResponseTailTerminal::Error(category));
                 if let Some((health, config)) = passive_health.as_ref() {
                     health.record_passive_proxy_error(&error, config).await;
                 }
@@ -806,9 +894,12 @@ async fn pump_redacted_response_tail(
                     error_category = category,
                     "proxied upstream response body failed after response commitment"
                 );
-                let _ = tail_sender
-                    .send((Err(RedactedProxyBodyError(category)), None))
-                    .await;
+                let _ = demand.response.send(ResponseTailEvent::Error(category));
+                return;
+            }
+            None => {
+                terminal_sender.send_replace(ResponseTailTerminal::Eof);
+                let _ = demand.response.send(ResponseTailEvent::Eof);
                 return;
             }
         }
@@ -817,7 +908,7 @@ async fn pump_redacted_response_tail(
 
 async fn finish_response_timeout(
     upstream_body: egress::EgressBodyStream,
-    tail_sender: &tokio::sync::mpsc::Sender<PumpedResponseItem>,
+    terminal_sender: &tokio::sync::watch::Sender<ResponseTailTerminal>,
     admission_permit: &mut Option<super::admission::PoolAdmissionPermit>,
     retry_permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
     passive_health: Option<&(
@@ -827,6 +918,7 @@ async fn finish_response_timeout(
 ) {
     release_response_permits(admission_permit, retry_permit);
     drop(upstream_body);
+    terminal_sender.send_replace(ResponseTailTerminal::Error("request_timeout"));
     if let Some((health, config)) = passive_health {
         health.record_passive_timeout(config).await;
     }
@@ -834,9 +926,6 @@ async fn finish_response_timeout(
         error_category = "request_timeout",
         "proxied upstream response body exceeded the logical request deadline after response commitment"
     );
-    let _ = tail_sender
-        .send((Err(RedactedProxyBodyError("request_timeout")), None))
-        .await;
 }
 
 fn release_response_permits(
@@ -1347,6 +1436,46 @@ mod tests {
                 "committed response tail leaked {secret}: {output}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn unpolled_response_deadline_terminates_pump_without_queuing_tail_data() {
+        let upstream_body: egress::EgressBodyStream =
+            Box::pin(stream::pending::<Result<bytes::Bytes, egress::EgressError>>());
+        let admission = super::super::admission::PoolAdmission::new(
+            Arc::from("test"),
+            1,
+            0,
+            Duration::from_millis(10),
+        );
+        let admission_permit = admission.acquire().await.expect("test admission");
+        let retry_budget = super::super::retry::RetryBudget::new(1);
+        let retry_permit = retry_budget.try_acquire().expect("test retry budget");
+        let (completed_sender, completed_receiver) = tokio::sync::oneshot::channel();
+        let body = redacted_response_body_inner(
+            bytes::Bytes::from_static(b"first"),
+            upstream_body,
+            admission_permit,
+            Some(retry_permit),
+            tokio::time::Instant::now() + Duration::from_millis(50),
+            None,
+            Some(completed_sender),
+        );
+
+        tokio::time::timeout(Duration::from_millis(200), completed_receiver)
+            .await
+            .expect("deadline should terminate the pump while the body remains open")
+            .expect("completion observer should remain connected");
+        let released_admission = admission
+            .acquire()
+            .await
+            .expect("terminated pump should release admission");
+        let released_retry = retry_budget
+            .try_acquire()
+            .expect("terminated pump should release retry budget");
+        drop(released_admission);
+        drop(released_retry);
+        drop(body);
     }
 
     #[tokio::test]
@@ -2007,15 +2136,26 @@ mod tests {
             assert_eq!(attempts.values().filter(|count| **count == 2).count(), 1);
             assert_eq!(attempts.values().filter(|count| **count == 1).count(), 4);
         }
-        let admission = pool
-            .admission
-            .acquire()
-            .await
-            .expect("completed requests must release admission");
-        let retry_budget = pool
-            .retry_budget
-            .try_acquire()
-            .expect("completed retry must release retry budget");
+        let admission = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(permit) = pool.admission.acquire().await {
+                    return permit;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed requests must release admission");
+        let retry_budget = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(permit) = pool.retry_budget.try_acquire() {
+                    return permit;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed retry must release retry budget");
         drop(admission);
         drop(retry_budget);
 
