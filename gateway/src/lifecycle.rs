@@ -12,7 +12,10 @@ use std::{
 use axum::Router;
 use serde_json::json;
 use time::OffsetDateTime;
-use tokio_util::sync::CancellationToken;
+use tokio_util::{
+    sync::CancellationToken,
+    task::{task_tracker::TaskTrackerToken, TaskTracker},
+};
 
 use crate::{audit, config};
 
@@ -31,6 +34,9 @@ struct GatewayLifecycleInner {
     phase: AtomicU8,
     background_cancellation: CancellationToken,
     background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    response_stream_cancellation: CancellationToken,
+    response_stream_tasks: TaskTracker,
+    response_stream_registration_open: Mutex<bool>,
 }
 
 impl Default for GatewayLifecycle {
@@ -46,6 +52,9 @@ impl GatewayLifecycle {
                 phase: AtomicU8::new(STARTING),
                 background_cancellation: CancellationToken::new(),
                 background_tasks: Mutex::new(Vec::new()),
+                response_stream_cancellation: CancellationToken::new(),
+                response_stream_tasks: TaskTracker::new(),
+                response_stream_registration_open: Mutex::new(true),
             }),
         }
     }
@@ -60,6 +69,7 @@ impl GatewayLifecycle {
     pub(crate) fn begin_draining(&self) -> bool {
         let was_draining = self.inner.phase.swap(DRAINING, Ordering::AcqRel) == DRAINING;
         self.inner.background_cancellation.cancel();
+        self.close_response_stream_registration();
         !was_draining
     }
 
@@ -96,8 +106,28 @@ impl GatewayLifecycle {
             .push(handle);
     }
 
+    pub(crate) fn response_stream_cancellation(&self) -> CancellationToken {
+        self.inner.response_stream_cancellation.clone()
+    }
+
+    pub(crate) fn try_register_response_stream(&self) -> Option<TaskTrackerToken> {
+        let registration_open = self
+            .inner
+            .response_stream_registration_open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registration_open.then(|| self.inner.response_stream_tasks.token())
+    }
+
+    pub(crate) async fn force_shutdown_response_streams(&self) {
+        self.close_response_stream_registration();
+        self.inner.response_stream_cancellation.cancel();
+        self.inner.response_stream_tasks.wait().await;
+    }
+
     pub(crate) async fn shutdown_background_tasks(&self) {
         self.inner.background_cancellation.cancel();
+        self.close_response_stream_registration();
         let handles = {
             let mut handles = self
                 .inner
@@ -113,6 +143,17 @@ impl GatewayLifecycle {
                 }
             }
         }
+        self.inner.response_stream_tasks.wait().await;
+    }
+
+    fn close_response_stream_registration(&self) {
+        let mut registration_open = self
+            .inner
+            .response_stream_registration_open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *registration_open = false;
+        self.inner.response_stream_tasks.close();
     }
 }
 
@@ -419,6 +460,7 @@ where
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
+                        lifecycle.force_shutdown_response_streams().await;
                         if let Err(audit_error) =
                             emit_terminal_shutdown(audit_log, started, Some("listener_error"))
                         {
@@ -438,6 +480,9 @@ where
         }
     }
 
+    if forced_reason.is_some() {
+        lifecycle.force_shutdown_response_streams().await;
+    }
     if let Err(error) = emit_terminal_shutdown(audit_log, started, forced_reason) {
         if audit_control_error.is_none() {
             audit_control_error = Some(error);
@@ -464,6 +509,7 @@ async fn unexpected_listener_termination(
     lifecycle.begin_draining();
     cancellation.cancel();
     let _ = tokio::time::timeout(config.shutdown_timeout, background_shutdown).await;
+    lifecycle.force_shutdown_response_streams().await;
     let terminal_result =
         emit_terminal_shutdown(audit_log, Instant::now(), Some("listener_terminated"));
     let drain_result = drain_audit(audit_log, config.audit_drain_timeout).await;
@@ -502,6 +548,7 @@ where
     {
         tracing::error!("peer listener exceeded shutdown deadline after split listener failure");
     }
+    lifecycle.force_shutdown_response_streams().await;
     let terminal_result =
         emit_terminal_shutdown(audit_log, Instant::now(), Some("listener_terminated"));
     let drain_result = drain_audit(audit_log, config.audit_drain_timeout).await;

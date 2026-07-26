@@ -145,6 +145,7 @@ struct ProxyRoute {
     request_header_policy: RouteRequestHeaderPolicy,
     pool: Arc<UpstreamPool>,
     request_body_mode: RequestBodyMode,
+    sse: Option<SseResponseConfig>,
 }
 
 impl upstream_route::RouteMatch for ProxyRoute {
@@ -168,6 +169,25 @@ struct MatchedUpstream {
     request_header_policy: RouteRequestHeaderPolicy,
     pool: Arc<UpstreamPool>,
     request_body_mode: RequestBodyMode,
+    sse: Option<SseResponseConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SseResponseConfig {
+    max_duration: Option<Duration>,
+    max_response_bytes: Option<Option<usize>>,
+}
+
+impl From<&config::UpstreamSseConfig> for SseResponseConfig {
+    fn from(config: &config::UpstreamSseConfig) -> Self {
+        Self {
+            max_duration: (config.max_duration_ms != 0)
+                .then(|| Duration::from_millis(config.max_duration_ms)),
+            max_response_bytes: config
+                .max_response_bytes
+                .map(|maximum| (maximum != 0).then_some(maximum)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -408,6 +428,7 @@ impl ProxyState {
                     request_header_policy: route_request_header_policy(route),
                     pool,
                     request_body_mode: route.request_body.mode.into(),
+                    sse: route.sse.as_ref().map(Into::into),
                 })
             })
             .collect::<Result<_, egress::EgressError>>()?;
@@ -481,12 +502,14 @@ impl ProxyState {
                 request_header_policy: RouteRequestHeaderPolicy::default(),
                 pool: Arc::clone(pool),
                 request_body_mode: RequestBodyMode::Buffered,
+                sse: None,
             }),
             ProxyRoutes::RoutingTable { routes } => {
                 routing_route_for_request(routes, path, headers).map(|route| MatchedUpstream {
                     request_header_policy: route.request_header_policy.clone(),
                     pool: Arc::clone(&route.pool),
                     request_body_mode: route.request_body_mode,
+                    sse: route.sse,
                 })
             }
         };
@@ -835,6 +858,7 @@ mod tests {
             upstreams: Vec::new(),
             load_balancing: config::UpstreamLoadBalancingConfig::default(),
             request_body: config::UpstreamRequestBodyConfig::default(),
+            sse: None,
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,
@@ -978,6 +1002,7 @@ mod tests {
             upstreams: Vec::new(),
             load_balancing: config::UpstreamLoadBalancingConfig::default(),
             request_body: config::UpstreamRequestBodyConfig::default(),
+            sse: None,
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,

@@ -8699,6 +8699,7 @@ mod tests {
             upstreams: Vec::new(),
             load_balancing: config::UpstreamLoadBalancingConfig::default(),
             request_body: config::UpstreamRequestBodyConfig::default(),
+            sse: None,
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,

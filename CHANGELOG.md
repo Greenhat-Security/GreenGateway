@@ -9,6 +9,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Security
 
+- Added explicit per-route SSE streaming with prompt response-header commitment,
+  separate pre-commit/idle/byte/duration controls, bounded backpressure, and
+  payload-free terminal audit/metric outcomes for completion, disconnect,
+  limits, upstream failure, and shutdown. Ordinary proxy routes retain their
+  existing first-chunk pre-commit behavior.
+
 - Added gateway-owned `/livez`, `/startupz`, and `/readyz` lifecycle probes,
   coordinated Ctrl-C/SIGTERM shutdown, bounded in-flight draining, and durable
   audit flush acknowledgement. These three probe paths are now reserved and

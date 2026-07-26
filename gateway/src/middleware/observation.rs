@@ -355,6 +355,10 @@ fn observation_payload(input: ObservationPayloadInput<'_>) -> Value {
             "upstream_retry_exhausted".to_owned(),
             json!(outcome.retry_exhausted),
         );
+        payload.insert(
+            "upstream_stream_terminal_pending".to_owned(),
+            json!(outcome.stream_terminal_pending),
+        );
     }
 
     if let Some(payload_shape) = input.payload_shape {
@@ -2164,6 +2168,7 @@ paths:
                 endpoint_id: None,
                 attempts: Vec::new(),
                 retry_exhausted: false,
+                stream_terminal_pending: false,
             });
         response
             .extensions_mut()
