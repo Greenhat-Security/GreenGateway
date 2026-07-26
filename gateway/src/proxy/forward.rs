@@ -169,6 +169,7 @@ struct ResponseTailOptions {
     pump_completed: Option<tokio::sync::oneshot::Sender<()>>,
     telemetry: Option<ResponseStreamTelemetry>,
     timeout_outcome: &'static str,
+    registration: Option<tokio_util::task::task_tracker::TaskTrackerToken>,
 }
 
 impl Drop for ResponsePumpCompletion {
@@ -195,6 +196,7 @@ struct ResponseTailPump {
     telemetry: Option<ResponseStreamTelemetry>,
     timeout_outcome: &'static str,
     shutdown: tokio_util::sync::CancellationToken,
+    registration: Option<tokio_util::task::task_tracker::TaskTrackerToken>,
     completion: ResponsePumpCompletion,
 }
 
@@ -219,6 +221,16 @@ async fn forward_to_upstream(
 ) -> Response {
     let (parts, body) = request.into_parts();
     let request_id = parts.headers.get(REQUEST_ID_HEADER).cloned();
+    let Some(response_stream_registration) = proxy.lifecycle.try_register_response_stream() else {
+        tracing::info!(
+            pool_id = upstream.pool.id.as_ref(),
+            error_category = "shutdown",
+            "proxied request rejected because gateway shutdown is draining"
+        );
+        return admission_unavailable_response(&upstream.pool.id, request_id);
+    };
+    let mut response_stream_registration = Some(response_stream_registration);
+    let forced_shutdown = proxy.lifecycle.response_stream_cancellation();
     let payload_capture = parts
         .extensions
         .get::<middleware::observation::PayloadCaptureHandle>()
@@ -280,7 +292,14 @@ async fn forward_to_upstream(
     }
     let mut body = match upstream.request_body_mode {
         RequestBodyMode::Buffered => {
-            match axum::body::to_bytes(body, proxy.max_request_body_bytes).await {
+            let buffered = tokio::select! {
+                biased;
+                () = forced_shutdown.cancelled() => {
+                    return admission_unavailable_response(&upstream.pool.id, request_id);
+                }
+                buffered = axum::body::to_bytes(body, proxy.max_request_body_bytes) => buffered,
+            };
+            match buffered {
                 Ok(body) => {
                     if let Some(payload_capture) = payload_capture.as_ref() {
                         payload_capture.capture_json_body(&parts.headers, &body);
@@ -410,7 +429,13 @@ async fn forward_to_upstream(
                     .await
             }
         };
-        let sent = tokio::time::timeout_at(deadline, send).await;
+        let sent = tokio::select! {
+            biased;
+            () = forced_shutdown.cancelled() => {
+                return admission_unavailable_response(&upstream.pool.id, request_id);
+            }
+            sent = tokio::time::timeout_at(deadline, send) => sent,
+        };
 
         let mut upstream_response = match sent {
             Err(_) => {
@@ -575,7 +600,14 @@ async fn forward_to_upstream(
         let first_chunk = if upstream.sse.is_some() {
             None
         } else {
-            match tokio::time::timeout_at(deadline, upstream_response.body.next()).await {
+            let first = tokio::select! {
+                biased;
+                () = forced_shutdown.cancelled() => {
+                    return admission_unavailable_response(&upstream.pool.id, request_id);
+                }
+                first = tokio::time::timeout_at(deadline, upstream_response.body.next()) => first,
+            };
+            match first {
                 Err(_) => {
                     record_circuit_failure(&mut circuit_permit, "request_timeout");
                     if let Some(config) = endpoint.health_config.as_deref() {
@@ -759,6 +791,7 @@ async fn forward_to_upstream(
                     } else {
                         "request_timeout"
                     },
+                    registration: response_stream_registration.take(),
                 },
             )
         } else {
@@ -992,14 +1025,12 @@ fn redacted_response_body_inner(
         pump_completed,
         telemetry,
         timeout_outcome,
+        registration,
     } = options;
-    let response_lifecycle = telemetry
+    let shutdown = telemetry
         .as_ref()
-        .map(|telemetry| telemetry.lifecycle.clone());
-    let shutdown = response_lifecycle
-        .as_ref()
-        .map_or_else(tokio_util::sync::CancellationToken::new, |lifecycle| {
-            lifecycle.response_stream_cancellation()
+        .map_or_else(tokio_util::sync::CancellationToken::new, |telemetry| {
+            telemetry.lifecycle.response_stream_cancellation()
         });
     let (demand_sender, demand_receiver) = tokio::sync::mpsc::channel(1);
     let (terminal_sender, terminal_receiver) =
@@ -1017,13 +1048,10 @@ fn redacted_response_body_inner(
         telemetry,
         timeout_outcome,
         shutdown,
+        registration,
         completion: ResponsePumpCompletion(pump_completed),
     });
-    if let Some(lifecycle) = response_lifecycle {
-        lifecycle.spawn_response_stream(pump);
-    } else {
-        tokio::spawn(pump);
-    }
+    tokio::spawn(pump);
     let redacted_tail = stream::unfold(
         (demand_sender, terminal_receiver, false),
         |(demand_sender, terminal_receiver, done)| async move {
@@ -1098,6 +1126,7 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
         mut telemetry,
         timeout_outcome,
         shutdown,
+        registration: _registration,
         completion: _completion,
     } = pump;
     let mut admission_permit = Some(admission_permit);
@@ -1815,6 +1844,7 @@ mod tests {
                 pump_completed: None,
                 telemetry: None,
                 timeout_outcome: "request_timeout",
+                registration: None,
             },
         );
         let mut body = body.into_data_stream();
@@ -2171,18 +2201,21 @@ mod tests {
     #[tokio::test]
     async fn sse_keepalives_reset_idle_timeout_and_cancellation_outcomes_are_explicit() {
         let (keepalive_addr, keepalive_server) = spawn_sse_upstream(SseTestBody::Chunks(vec![
-            (Duration::from_millis(25), ":\n\n"),
-            (Duration::from_millis(25), ":\n\n"),
-            (Duration::from_millis(25), "data: done\n\n"),
+            (Duration::from_millis(100), ":\n\n"),
+            (Duration::from_millis(100), ":\n\n"),
+            (Duration::from_millis(100), ":\n\n"),
+            (Duration::from_millis(100), ":\n\n"),
+            (Duration::from_millis(100), ":\n\n"),
+            (Duration::from_millis(100), "data: done\n\n"),
         ]))
         .await;
         let (keepalive_proxy, keepalive_sink, _) = retry_proxy_with_options(
             [keepalive_addr, keepalive_addr],
             RetryProxyOptions {
                 timeout: Duration::from_millis(100),
-                response_idle_timeout: Some(Duration::from_millis(50)),
+                response_idle_timeout: Some(Duration::from_millis(500)),
                 sse: Some(config::UpstreamSseConfig {
-                    max_duration_ms: 500,
+                    max_duration_ms: 1_500,
                     max_response_bytes: None,
                 }),
                 ..RetryProxyOptions::default()
@@ -2199,7 +2232,10 @@ mod tests {
         let body = axum::body::to_bytes(keepalive_response.into_body(), 1024)
             .await
             .expect("keepalive SSE body");
-        assert_eq!(body, bytes::Bytes::from_static(b":\n\n:\n\ndata: done\n\n"));
+        assert_eq!(
+            body,
+            bytes::Bytes::from_static(b":\n\n:\n\n:\n\n:\n\n:\n\ndata: done\n\n")
+        );
         let keepalive_event = wait_for_stream_audit(&keepalive_sink, "sse-keepalive").await;
         assert_eq!(keepalive_event.payload["outcome"], json!("completed"));
         keepalive_server.abort();
@@ -2295,6 +2331,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forced_shutdown_cancels_registered_sse_request_before_headers() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("delayed SSE listener");
+        let addr = listener.local_addr().expect("delayed SSE address");
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let started_sender = Arc::new(Mutex::new(Some(started_sender)));
+        let app = Router::new().fallback(move || {
+            let started_sender = Arc::clone(&started_sender);
+            async move {
+                if let Some(started_sender) = started_sender.lock().expect("start sender").take() {
+                    let _ = started_sender.send(());
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::empty())
+                    .expect("delayed SSE response")
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("delayed SSE upstream");
+        });
+        let (proxy, sink, _) = retry_proxy_with_options(
+            [addr, addr],
+            RetryProxyOptions {
+                timeout: Duration::from_secs(10),
+                response_idle_timeout: Some(Duration::from_secs(10)),
+                sse: Some(config::UpstreamSseConfig {
+                    max_duration_ms: 1_000,
+                    max_response_bytes: None,
+                }),
+                ..RetryProxyOptions::default()
+            },
+        );
+        let lifecycle = proxy.lifecycle.clone();
+        let request = Request::builder()
+            .uri("/")
+            .header(REQUEST_ID_HEADER, "sse-preheader-shutdown")
+            .body(Body::empty())
+            .expect("pre-header SSE request");
+        let request_task =
+            tokio::spawn(async move { proxy.forward_request(request, "203.0.113.8").await });
+        started_receiver
+            .await
+            .expect("upstream request should start before forced shutdown");
+
+        assert!(lifecycle.begin_draining());
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            lifecycle.force_shutdown_response_streams(),
+        )
+        .await
+        .expect("forced shutdown must cancel and await a pre-header request");
+        let response = request_task.await.expect("pre-header request task");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            lifecycle.try_register_response_stream().is_none(),
+            "draining permanently closes late response-stream registration"
+        );
+        assert!(
+            sink.events()
+                .iter()
+                .all(|event| event.event_type != audit::event::UPSTREAM_STREAM_TERMINATED),
+            "a response cancelled before commitment must not create a late terminal stream event"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn unpolled_response_deadline_terminates_pump_without_queuing_tail_data() {
         let upstream_body: egress::EgressBodyStream =
             Box::pin(stream::pending::<Result<bytes::Bytes, egress::EgressError>>());
@@ -2333,6 +2442,7 @@ mod tests {
                 pump_completed: Some(completed_sender),
                 telemetry: None,
                 timeout_outcome: "request_timeout",
+                registration: None,
             },
         );
 

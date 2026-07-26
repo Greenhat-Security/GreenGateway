@@ -12,7 +12,10 @@ use std::{
 use axum::Router;
 use serde_json::json;
 use time::OffsetDateTime;
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio_util::{
+    sync::CancellationToken,
+    task::{task_tracker::TaskTrackerToken, TaskTracker},
+};
 
 use crate::{audit, config};
 
@@ -33,6 +36,7 @@ struct GatewayLifecycleInner {
     background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     response_stream_cancellation: CancellationToken,
     response_stream_tasks: TaskTracker,
+    response_stream_registration_open: Mutex<bool>,
 }
 
 impl Default for GatewayLifecycle {
@@ -50,6 +54,7 @@ impl GatewayLifecycle {
                 background_tasks: Mutex::new(Vec::new()),
                 response_stream_cancellation: CancellationToken::new(),
                 response_stream_tasks: TaskTracker::new(),
+                response_stream_registration_open: Mutex::new(true),
             }),
         }
     }
@@ -64,7 +69,7 @@ impl GatewayLifecycle {
     pub(crate) fn begin_draining(&self) -> bool {
         let was_draining = self.inner.phase.swap(DRAINING, Ordering::AcqRel) == DRAINING;
         self.inner.background_cancellation.cancel();
-        self.inner.response_stream_tasks.close();
+        self.close_response_stream_registration();
         !was_draining
     }
 
@@ -105,22 +110,24 @@ impl GatewayLifecycle {
         self.inner.response_stream_cancellation.clone()
     }
 
-    pub(crate) fn spawn_response_stream<F>(&self, future: F)
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.inner.response_stream_tasks.spawn(future);
+    pub(crate) fn try_register_response_stream(&self) -> Option<TaskTrackerToken> {
+        let registration_open = self
+            .inner
+            .response_stream_registration_open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registration_open.then(|| self.inner.response_stream_tasks.token())
     }
 
     pub(crate) async fn force_shutdown_response_streams(&self) {
-        self.inner.response_stream_tasks.close();
+        self.close_response_stream_registration();
         self.inner.response_stream_cancellation.cancel();
         self.inner.response_stream_tasks.wait().await;
     }
 
     pub(crate) async fn shutdown_background_tasks(&self) {
         self.inner.background_cancellation.cancel();
-        self.inner.response_stream_tasks.close();
+        self.close_response_stream_registration();
         let handles = {
             let mut handles = self
                 .inner
@@ -137,6 +144,16 @@ impl GatewayLifecycle {
             }
         }
         self.inner.response_stream_tasks.wait().await;
+    }
+
+    fn close_response_stream_registration(&self) {
+        let mut registration_open = self
+            .inner
+            .response_stream_registration_open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *registration_open = false;
+        self.inner.response_stream_tasks.close();
     }
 }
 
