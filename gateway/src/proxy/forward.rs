@@ -97,18 +97,19 @@ impl ResponseStreamTelemetry {
             .get_or_insert_with(|| self.request_started.elapsed());
     }
 
+    fn observe_received_total(&mut self, total: usize) {
+        let total = u64::try_from(total).unwrap_or(u64::MAX);
+        self.bytes_received = self.bytes_received.max(total);
+        if total > 0 {
+            self.time_to_first_byte
+                .get_or_insert_with(|| self.request_started.elapsed());
+        }
+    }
+
     fn observe_sent(&mut self, chunk: &bytes::Bytes) {
         self.bytes_sent = self
             .bytes_sent
             .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-    }
-
-    fn terminal_outcome_for_disconnect(&self) -> &'static str {
-        if self.lifecycle.draining() {
-            "shutdown"
-        } else {
-            "client_cancelled"
-        }
     }
 
     fn finish(self, outcome: &'static str) {
@@ -193,6 +194,7 @@ struct ResponseTailPump {
     circuit_permit: Option<super::circuit::CircuitPermit>,
     telemetry: Option<ResponseStreamTelemetry>,
     timeout_outcome: &'static str,
+    shutdown: tokio_util::sync::CancellationToken,
     completion: ResponsePumpCompletion,
 }
 
@@ -702,7 +704,6 @@ async fn forward_to_upstream(
             );
         }
         if upstream.sse.is_some() {
-            record_circuit_success(&mut circuit_permit);
             drop(active_retry_permit.take());
         }
         let prefetched_bytes = first_chunk
@@ -986,10 +987,24 @@ fn redacted_response_body_inner(
     )>,
     options: ResponseTailOptions,
 ) -> Body {
+    let ResponseTailOptions {
+        circuit_permit,
+        pump_completed,
+        telemetry,
+        timeout_outcome,
+    } = options;
+    let response_lifecycle = telemetry
+        .as_ref()
+        .map(|telemetry| telemetry.lifecycle.clone());
+    let shutdown = response_lifecycle
+        .as_ref()
+        .map_or_else(tokio_util::sync::CancellationToken::new, |lifecycle| {
+            lifecycle.response_stream_cancellation()
+        });
     let (demand_sender, demand_receiver) = tokio::sync::mpsc::channel(1);
     let (terminal_sender, terminal_receiver) =
         tokio::sync::watch::channel(ResponseTailTerminal::Active);
-    tokio::spawn(pump_redacted_response_tail(ResponseTailPump {
+    let pump = pump_redacted_response_tail(ResponseTailPump {
         pending_chunk: first_chunk,
         upstream_body,
         demand_receiver,
@@ -998,11 +1013,17 @@ fn redacted_response_body_inner(
         retry_permit,
         deadline,
         passive_health,
-        circuit_permit: options.circuit_permit,
-        telemetry: options.telemetry,
-        timeout_outcome: options.timeout_outcome,
-        completion: ResponsePumpCompletion(options.pump_completed),
-    }));
+        circuit_permit,
+        telemetry,
+        timeout_outcome,
+        shutdown,
+        completion: ResponsePumpCompletion(pump_completed),
+    });
+    if let Some(lifecycle) = response_lifecycle {
+        lifecycle.spawn_response_stream(pump);
+    } else {
+        tokio::spawn(pump);
+    }
     let redacted_tail = stream::unfold(
         (demand_sender, terminal_receiver, false),
         |(demand_sender, terminal_receiver, done)| async move {
@@ -1076,6 +1097,7 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
         circuit_permit,
         mut telemetry,
         timeout_outcome,
+        shutdown,
         completion: _completion,
     } = pump;
     let mut admission_permit = Some(admission_permit);
@@ -1084,6 +1106,18 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
     loop {
         let demand = tokio::select! {
             biased;
+            () = shutdown.cancelled() => {
+                finish_response_shutdown(
+                    upstream_body,
+                    &terminal_sender,
+                    &mut admission_permit,
+                    &mut retry_permit,
+                    &mut circuit_permit,
+                    &mut telemetry,
+                    None,
+                );
+                return;
+            }
             _ = sleep_until_optional(deadline) => {
                 finish_response_timeout(
                     upstream_body,
@@ -1107,8 +1141,7 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
             drop(circuit_permit.take());
             drop(upstream_body);
             if let Some(telemetry) = telemetry.take() {
-                let outcome = telemetry.terminal_outcome_for_disconnect();
-                telemetry.finish(outcome);
+                telemetry.finish("client_cancelled");
             }
             return;
         };
@@ -1117,6 +1150,18 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
         } else {
             let result = tokio::select! {
                 biased;
+                () = shutdown.cancelled() => {
+                    finish_response_shutdown(
+                        upstream_body,
+                        &terminal_sender,
+                        &mut admission_permit,
+                        &mut retry_permit,
+                        &mut circuit_permit,
+                        &mut telemetry,
+                        Some(demand.response),
+                    );
+                    return;
+                }
                 _ = sleep_until_optional(deadline) => {
                     finish_response_timeout(
                         upstream_body,
@@ -1159,13 +1204,17 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
                     drop(circuit_permit.take());
                     drop(upstream_body);
                     if let Some(telemetry) = telemetry.take() {
-                        let outcome = telemetry.terminal_outcome_for_disconnect();
-                        telemetry.finish(outcome);
+                        telemetry.finish("client_cancelled");
                     }
                     return;
                 }
             }
             Some(Err(error)) => {
+                if let egress::EgressError::ResponseTooLarge { size, .. } = &error {
+                    if let Some(telemetry) = telemetry.as_mut() {
+                        telemetry.observe_received_total(*size);
+                    }
+                }
                 let category = stream_body_error_category(&error);
                 release_response_permits(&mut admission_permit, &mut retry_permit);
                 if error.is_retryable_transport_failure() {
@@ -1236,13 +1285,36 @@ struct ResponseTimeoutContext<'a> {
     timeout_outcome: &'static str,
 }
 
+fn finish_response_shutdown(
+    upstream_body: egress::EgressBodyStream,
+    terminal_sender: &tokio::sync::watch::Sender<ResponseTailTerminal>,
+    admission_permit: &mut Option<super::admission::PoolAdmissionPermit>,
+    retry_permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+    circuit_permit: &mut Option<super::circuit::CircuitPermit>,
+    telemetry: &mut Option<ResponseStreamTelemetry>,
+    demand_response: Option<tokio::sync::oneshot::Sender<ResponseTailEvent>>,
+) {
+    release_response_permits(admission_permit, retry_permit);
+    drop(circuit_permit.take());
+    drop(upstream_body);
+    terminal_sender.send_replace(ResponseTailTerminal::Error("shutdown"));
+    if let Some(response) = demand_response {
+        let _ = response.send(ResponseTailEvent::Error("shutdown"));
+    }
+    if let Some(telemetry) = telemetry.take() {
+        telemetry.finish("shutdown");
+    }
+}
+
 async fn finish_response_timeout(
     upstream_body: egress::EgressBodyStream,
     context: ResponseTimeoutContext<'_>,
     upstream_was_being_polled: bool,
 ) {
     release_response_permits(context.admission_permit, context.retry_permit);
-    if upstream_was_being_polled {
+    let upstream_timed_out =
+        upstream_was_being_polled && context.timeout_outcome == "request_timeout";
+    if upstream_timed_out {
         record_circuit_failure(context.circuit_permit, "request_timeout");
     } else {
         drop(context.circuit_permit.take());
@@ -1251,7 +1323,7 @@ async fn finish_response_timeout(
     context
         .terminal_sender
         .send_replace(ResponseTailTerminal::Error(context.timeout_outcome));
-    if upstream_was_being_polled {
+    if upstream_timed_out {
         if let Some((health, config)) = context.passive_health {
             health.record_passive_timeout(config).await;
         }
@@ -1952,12 +2024,152 @@ mod tests {
             );
             let event = wait_for_stream_audit(&sink, request_id).await;
             assert_eq!(event.payload["outcome"], json!(expected));
+            if expected == "size_limit" {
+                assert_eq!(event.payload["bytes_received"], json!(6));
+                assert!(
+                    !event.payload["time_to_first_byte_ms"].is_null(),
+                    "an over-limit first chunk still establishes time to first byte"
+                );
+            }
             server.abort();
         }
     }
 
     #[tokio::test]
-    async fn sse_keepalives_reset_idle_timeout_and_body_drop_is_neutral_cancellation() {
+    async fn sse_circuit_permit_stays_pending_until_stream_completion() {
+        let (addr, server) = spawn_sse_upstream(SseTestBody::Pending).await;
+        let (proxy, sink, _) = retry_proxy_with_options(
+            [addr, addr],
+            RetryProxyOptions {
+                timeout: Duration::from_millis(100),
+                response_idle_timeout: Some(Duration::from_millis(30)),
+                sse: Some(config::UpstreamSseConfig {
+                    max_duration_ms: 1_000,
+                    max_response_bytes: None,
+                }),
+                circuit_config: Some(config::UpstreamCircuitBreakerConfig {
+                    failure_threshold: 1,
+                    open_ms: 30,
+                    half_open_max_requests: 1,
+                    recovery_threshold: 1,
+                }),
+                ..RetryProxyOptions::default()
+            },
+        );
+        let pool = test_pool(&proxy);
+        let circuit = pool.endpoints[0].circuit.clone().expect("test circuit");
+
+        let first = Request::builder()
+            .uri("/")
+            .header(REQUEST_ID_HEADER, "sse-circuit-open")
+            .body(Body::empty())
+            .expect("first SSE request");
+        let first = proxy.forward_request(first, "203.0.113.8").await;
+        let first_error = first
+            .into_body()
+            .into_data_stream()
+            .next()
+            .await
+            .expect("idle stream error")
+            .expect_err("idle stream should fail");
+        assert!(first_error.to_string().contains("idle_timeout"));
+        assert_eq!(
+            wait_for_stream_audit(&sink, "sse-circuit-open")
+                .await
+                .payload["outcome"],
+            json!("idle_timeout")
+        );
+        assert!(
+            circuit.try_acquire().is_none(),
+            "late SSE idle failure must open the endpoint circuit"
+        );
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        pool.next_selection.store(0, Ordering::Relaxed);
+        let half_open = Request::builder()
+            .uri("/")
+            .header(REQUEST_ID_HEADER, "sse-circuit-half-open")
+            .body(Body::empty())
+            .expect("half-open SSE request");
+        let half_open = proxy.forward_request(half_open, "203.0.113.8").await;
+        assert_eq!(half_open.status(), StatusCode::OK);
+        assert!(
+            circuit.try_acquire().is_none(),
+            "receiving SSE headers must not recover or release a half-open permit"
+        );
+        let half_open_error = half_open
+            .into_body()
+            .into_data_stream()
+            .next()
+            .await
+            .expect("half-open idle stream error")
+            .expect_err("half-open idle stream should fail");
+        assert!(half_open_error.to_string().contains("idle_timeout"));
+        assert!(
+            circuit.try_acquire().is_none(),
+            "late half-open SSE failure must reopen the circuit"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sse_duration_limit_is_neutral_to_health_and_circuit_state() {
+        let (addr, server) = spawn_sse_upstream(SseTestBody::Pending).await;
+        let (proxy, sink, health_states) = retry_proxy_with_options(
+            [addr, addr],
+            RetryProxyOptions {
+                timeout: Duration::from_millis(100),
+                response_idle_timeout: Some(Duration::from_millis(500)),
+                sse: Some(config::UpstreamSseConfig {
+                    max_duration_ms: 30,
+                    max_response_bytes: None,
+                }),
+                health_config: Some(passive_health_config()),
+                circuit_config: Some(config::UpstreamCircuitBreakerConfig {
+                    failure_threshold: 1,
+                    open_ms: 60_000,
+                    half_open_max_requests: 1,
+                    recovery_threshold: 1,
+                }),
+                ..RetryProxyOptions::default()
+            },
+        );
+        let pool = test_pool(&proxy);
+        let circuit = pool.endpoints[0].circuit.clone().expect("test circuit");
+        let request = Request::builder()
+            .uri("/")
+            .header(REQUEST_ID_HEADER, "sse-duration-neutral")
+            .body(Body::empty())
+            .expect("duration-limited SSE request");
+
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        let error = response
+            .into_body()
+            .into_data_stream()
+            .next()
+            .await
+            .expect("duration stream error")
+            .expect_err("duration-limited stream should fail");
+        assert!(error.to_string().contains("duration_limit"));
+        assert_eq!(
+            wait_for_stream_audit(&sink, "sse-duration-neutral")
+                .await
+                .payload["outcome"],
+            json!("duration_limit")
+        );
+        assert!(
+            health_states[0].eligible(),
+            "an intentional stream duration cap must not evict a healthy endpoint"
+        );
+        let neutral_permit = circuit
+            .try_acquire()
+            .expect("an intentional duration cap must not open the circuit");
+        drop(neutral_permit);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sse_keepalives_reset_idle_timeout_and_cancellation_outcomes_are_explicit() {
         let (keepalive_addr, keepalive_server) = spawn_sse_upstream(SseTestBody::Chunks(vec![
             (Duration::from_millis(25), ":\n\n"),
             (Duration::from_millis(25), ":\n\n"),
@@ -2045,7 +2257,40 @@ mod tests {
         assert!(pending_proxy.lifecycle.begin_draining());
         drop(shutdown_response);
         let shutdown_event = wait_for_stream_audit(&pending_sink, "sse-shutdown").await;
-        assert_eq!(shutdown_event.payload["outcome"], json!("shutdown"));
+        assert_eq!(
+            shutdown_event.payload["outcome"],
+            json!("client_cancelled"),
+            "an independent disconnect during graceful drain is not a forced shutdown"
+        );
+
+        let (forced_proxy, forced_sink, _) = retry_proxy_with_options(
+            [pending_addr, pending_addr],
+            RetryProxyOptions {
+                timeout: Duration::from_millis(100),
+                response_idle_timeout: Some(Duration::from_secs(1)),
+                sse: Some(config::UpstreamSseConfig {
+                    max_duration_ms: 1_000,
+                    max_response_bytes: None,
+                }),
+                ..RetryProxyOptions::default()
+            },
+        );
+        let forced_request = Request::builder()
+            .uri("/")
+            .header(REQUEST_ID_HEADER, "sse-forced-shutdown")
+            .body(Body::empty())
+            .expect("forced shutdown SSE request");
+        let forced_response = forced_proxy
+            .forward_request(forced_request, "203.0.113.8")
+            .await;
+        assert!(forced_proxy.lifecycle.begin_draining());
+        forced_proxy
+            .lifecycle
+            .force_shutdown_response_streams()
+            .await;
+        let forced_event = wait_for_stream_audit(&forced_sink, "sse-forced-shutdown").await;
+        assert_eq!(forced_event.payload["outcome"], json!("shutdown"));
+        drop(forced_response);
         pending_server.abort();
     }
 

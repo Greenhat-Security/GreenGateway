@@ -110,7 +110,7 @@ pub enum EgressError {
     RequestBodyTooLarge { size: usize, max: usize },
     RequestBodyReadFailed,
     UnexpectedStatus(u16),
-    ResponseTooLarge { max: usize },
+    ResponseTooLarge { size: usize, max: usize },
     ResponseIdleTimeout { timeout: Duration },
     InvalidTlsCaBundle { path: PathBuf, message: String },
     Http(reqwest::Error),
@@ -146,7 +146,7 @@ impl fmt::Display for EgressError {
             Self::UnexpectedStatus(status) => {
                 write!(formatter, "egress response had unexpected status {status}")
             }
-            Self::ResponseTooLarge { max } => {
+            Self::ResponseTooLarge { max, .. } => {
                 write!(formatter, "egress response body exceeded {max} bytes")
             }
             Self::ResponseIdleTimeout { timeout } => write!(
@@ -959,6 +959,7 @@ impl EgressClient {
                     "egress blocked oversized response"
                 );
                 return Err(EgressError::ResponseTooLarge {
+                    size: body.len().saturating_add(chunk.len()),
                     max: self.config.max_response_bytes,
                 });
             }
@@ -1032,6 +1033,7 @@ impl EgressClient {
                         );
                         return Some((
                             Err(EgressError::ResponseTooLarge {
+                                size: streamed_bytes.saturating_add(chunk.len()),
                                 max: max_response_bytes.unwrap_or_default(),
                             }),
                             (body, streamed_bytes, true),
@@ -1764,7 +1766,7 @@ mod tests {
                 "request_body_too_large",
             ),
             (
-                EgressError::ResponseTooLarge { max: 1 },
+                EgressError::ResponseTooLarge { size: 2, max: 1 },
                 "response_too_large",
             ),
             (
@@ -3202,7 +3204,10 @@ mod tests {
             .await
             .expect_err("oversized response should deny");
 
-        assert!(matches!(error, EgressError::ResponseTooLarge { max: 6 }));
+        assert!(matches!(
+            error,
+            EgressError::ResponseTooLarge { size: 7, max: 6 }
+        ));
         server.await.expect("test server task should finish");
     }
 
@@ -3316,7 +3321,8 @@ mod tests {
         while let Some(chunk) = body.next().await {
             match chunk {
                 Ok(_) => {}
-                Err(EgressError::ResponseTooLarge { max }) => {
+                Err(EgressError::ResponseTooLarge { size, max }) => {
+                    assert_eq!(size, 6);
                     assert_eq!(max, 5);
                     saw_limit_error = true;
                     break;
