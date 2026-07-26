@@ -314,6 +314,8 @@ pub struct UpstreamEndpointConfig {
     pub weight: u16,
     #[serde(default)]
     pub tls_ca_bundle_path: Option<PathBuf>,
+    #[serde(default)]
+    pub client_identity_pem_path: Option<PathBuf>,
 }
 
 fn default_upstream_weight() -> u16 {
@@ -2546,16 +2548,29 @@ fn validate_upstream_routes(
                         "{endpoint_name}.weight must be between 1 and {MAX_ENDPOINT_WEIGHT}"
                     ));
                 }
-                let tls_ca_bundle_path = normalize_route_tls_ca_bundle_path(
+                let tls_ca_bundle_path = normalize_route_tls_material_path(
                     &format!("{endpoint_name}.tls_ca_bundle_path"),
                     endpoint.tls_ca_bundle_path,
                     problems,
                 );
+                let client_identity_pem_path = normalize_client_identity_pem_path(
+                    &format!("{endpoint_name}.client_identity_pem_path"),
+                    endpoint.client_identity_pem_path,
+                    problems,
+                );
+                if client_identity_pem_path.is_some()
+                    && url::Url::parse(&url).is_ok_and(|url| url.scheme() != "https")
+                {
+                    problems.push(format!(
+                        "{endpoint_name}.client_identity_pem_path requires an https endpoint URL"
+                    ));
+                }
                 UpstreamEndpointConfig {
                     id: endpoint_id,
                     url,
                     weight: endpoint.weight,
                     tls_ca_bundle_path,
+                    client_identity_pem_path,
                 }
             })
             .collect::<Vec<_>>();
@@ -2570,7 +2585,7 @@ fn validate_upstream_routes(
             &add_request_headers,
             problems,
         );
-        let tls_ca_bundle_path = normalize_route_tls_ca_bundle_path(
+        let tls_ca_bundle_path = normalize_route_tls_material_path(
             &format!("{route_name}.tls_ca_bundle_path"),
             route.tls_ca_bundle_path,
             problems,
@@ -2977,7 +2992,7 @@ fn normalize_route_header_name(
     }
 }
 
-fn normalize_route_tls_ca_bundle_path(
+fn normalize_route_tls_material_path(
     name: &str,
     value: Option<PathBuf>,
     problems: &mut Vec<String>,
@@ -2989,6 +3004,28 @@ fn normalize_route_tls_ca_bundle_path(
     } else {
         Some(value)
     }
+}
+
+fn normalize_client_identity_pem_path(
+    name: &str,
+    value: Option<PathBuf>,
+    problems: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let value = value?;
+    if value.as_os_str().is_empty() {
+        problems.push(format!("{name} must be a non-empty filesystem path"));
+        return None;
+    }
+
+    let rendered = value.to_string_lossy();
+    if rendered.contains('\n') || rendered.contains('\r') || rendered.contains("-----BEGIN") {
+        problems.push(format!(
+            "{name} must reference a mounted PEM file and must not contain inline PEM material"
+        ));
+        return None;
+    }
+
+    Some(value)
 }
 
 fn normalize_route_openapi_spec_path(
@@ -5823,7 +5860,13 @@ mod tests {
                     "path_prefix": "/payments",
                     "upstreams": [
                         {"id":"payments-a","url":"https://a.example.test","weight":3},
-                        {"id":"payments-b","url":"https://b.example.test","weight":1}
+                        {
+                            "id":"payments-b",
+                            "url":"https://b.example.test",
+                            "weight":1,
+                            "tls_ca_bundle_path":"/run/secrets/payments-ca.pem",
+                            "client_identity_pem_path":"/run/secrets/payments-client.pem"
+                        }
                     ],
                     "load_balancing":{"strategy":"weighted_round_robin"},
                     "request_body":{"mode":"stream"},
@@ -5853,6 +5896,14 @@ mod tests {
         assert_eq!(route.upstreams.len(), 2);
         assert_eq!(route.upstreams[0].id, "payments-a");
         assert_eq!(route.upstreams[0].weight, 3);
+        assert_eq!(
+            route.upstreams[1].tls_ca_bundle_path.as_deref(),
+            Some(std::path::Path::new("/run/secrets/payments-ca.pem"))
+        );
+        assert_eq!(
+            route.upstreams[1].client_identity_pem_path.as_deref(),
+            Some(std::path::Path::new("/run/secrets/payments-client.pem"))
+        );
         assert_eq!(route.request_body.mode, UpstreamRequestBodyMode::Stream);
         assert_eq!(route.limits.max_in_flight, 8);
         assert_eq!(route.limits.queue_depth, 4);
@@ -5872,6 +5923,92 @@ mod tests {
         assert_eq!(health.passive_failure_statuses, vec![500, 502, 503, 504]);
         assert!(health.required_for_readiness);
         assert_eq!(health.minimum_healthy, 2);
+    }
+
+    #[test]
+    fn upstream_client_identity_requires_a_non_empty_mounted_path() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[{
+                    "id":"payments",
+                    "path_prefix":"/payments",
+                    "upstreams":[{
+                        "id":"payments-a",
+                        "url":"https://a.example.test",
+                        "client_identity_pem_path":""
+                    }]
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("an empty client identity path should fail startup");
+
+        assert!(error.to_string().contains(
+            "UPSTREAM_ROUTES[0].upstreams[0].client_identity_pem_path must be a non-empty filesystem path"
+        ));
+    }
+
+    #[test]
+    fn upstream_client_identity_rejects_http_and_inline_private_key_fields() {
+        let inline_secret = "TOP_SECRET_INLINE_PRIVATE_KEY";
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(format!(
+                r#"[{{
+                    "id":"payments",
+                    "path_prefix":"/payments",
+                    "upstreams":[{{
+                        "id":"payments-a",
+                        "url":"http://a.example.test",
+                        "client_identity_pem_path":"/run/secrets/client.pem",
+                        "client_identity_pem":"{inline_secret}"
+                    }}]
+                }}]"#
+            )),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("inline identity material and mTLS on HTTP must fail startup");
+        let message = error.to_string();
+
+        assert!(message.contains("unknown field `client_identity_pem`"));
+        assert!(!message.contains(inline_secret));
+
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(format!(
+                r#"[{{
+                    "id":"payments",
+                    "path_prefix":"/payments",
+                    "upstreams":[{{
+                        "id":"payments-a",
+                        "url":"https://a.example.test",
+                        "client_identity_pem_path":"-----BEGIN PRIVATE KEY-----\n{inline_secret}"
+                    }}]
+                }}]"#
+            )),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("inline identity material in the path field must fail startup");
+        let message = error.to_string();
+        assert!(message.contains(
+            "client_identity_pem_path must reference a mounted PEM file and must not contain inline PEM material"
+        ));
+        assert!(!message.contains(inline_secret));
+
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[{
+                    "id":"payments",
+                    "path_prefix":"/payments",
+                    "upstreams":[{
+                        "id":"payments-a",
+                        "url":"http://a.example.test",
+                        "client_identity_pem_path":"/run/secrets/client.pem"
+                    }]
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("client identities must require TLS");
+        assert!(error.to_string().contains(
+            "UPSTREAM_ROUTES[0].upstreams[0].client_identity_pem_path requires an https endpoint URL"
+        ));
     }
 
     #[test]

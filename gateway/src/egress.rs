@@ -2,9 +2,9 @@ use std::{
     collections::HashSet,
     error::Error,
     fmt, fs,
-    io::ErrorKind,
+    io::{ErrorKind, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         atomic::{AtomicU8, Ordering},
@@ -24,11 +24,14 @@ use tokio::net::lookup_host;
 use crate::{config::Config, rbac::EgressPolicy};
 
 mod client_cache;
+#[cfg(test)]
+mod mtls_tests;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+const MAX_TLS_CLIENT_IDENTITY_PEM_BYTES: usize = 1024 * 1024;
 static PROCESS_PINNED_CLIENT_CACHE: LazyLock<Arc<client_cache::PinnedClientCache>> =
     LazyLock::new(|| Arc::new(client_cache::PinnedClientCache::new()));
 
@@ -113,6 +116,7 @@ pub enum EgressError {
     ResponseTooLarge { size: usize, max: usize },
     ResponseIdleTimeout { timeout: Duration },
     InvalidTlsCaBundle { path: PathBuf, message: String },
+    InvalidTlsClientIdentity,
     Http(reqwest::Error),
 }
 
@@ -159,6 +163,9 @@ impl fmt::Display for EgressError {
                 "egress TLS CA bundle '{}' is invalid: {message}",
                 path.display()
             ),
+            Self::InvalidTlsClientIdentity => {
+                formatter.write_str("egress TLS client identity is invalid")
+            }
             Self::Http(err) => write!(formatter, "egress HTTP error: {err}"),
         }
     }
@@ -207,6 +214,7 @@ impl EgressError {
             Self::ResponseTooLarge { .. } => "response_too_large",
             Self::ResponseIdleTimeout { .. } => "response_idle_timeout",
             Self::InvalidTlsCaBundle { .. } => "invalid_tls_ca_bundle",
+            Self::InvalidTlsClientIdentity => "invalid_tls_client_identity",
             Self::Http(err) if err.is_timeout() => "http_timeout",
             Self::Http(err) if err.is_connect() => "http_connect",
             Self::Http(err) if err.is_request() => "http_request",
@@ -233,7 +241,8 @@ impl EgressError {
             | Self::RequestBodyReadFailed
             | Self::UnexpectedStatus(_)
             | Self::ResponseTooLarge { .. }
-            | Self::InvalidTlsCaBundle { .. } => false,
+            | Self::InvalidTlsCaBundle { .. }
+            | Self::InvalidTlsClientIdentity => false,
         }
     }
 
@@ -254,6 +263,7 @@ impl EgressError {
             | Self::UnexpectedStatus(_)
             | Self::ResponseTooLarge { .. }
             | Self::InvalidTlsCaBundle { .. }
+            | Self::InvalidTlsClientIdentity
             | Self::Http(_) => false,
         }
     }
@@ -339,6 +349,8 @@ pub struct EgressConfig {
     pub tls_ca_bundle_path: Option<PathBuf>,
     pub tls_root_certificates: Vec<reqwest::Certificate>,
     pub(crate) tls_root_set_fingerprint: [u8; 32],
+    pub(crate) client_identity: Option<reqwest::Identity>,
+    pub(crate) client_identity_fingerprint: Option<[u8; 32]>,
 }
 
 impl fmt::Debug for EgressConfig {
@@ -361,6 +373,10 @@ impl fmt::Debug for EgressConfig {
                 "tls_root_certificate_count",
                 &self.tls_root_certificates.len(),
             )
+            .field(
+                "client_identity_configured",
+                &self.client_identity.is_some(),
+            )
             .finish()
     }
 }
@@ -381,6 +397,7 @@ impl PartialEq for EgressConfig {
             && self.tls_ca_bundle_path == other.tls_ca_bundle_path
             && self.tls_root_certificates.len() == other.tls_root_certificates.len()
             && self.tls_root_set_fingerprint == other.tls_root_set_fingerprint
+            && self.client_identity_fingerprint == other.client_identity_fingerprint
     }
 }
 
@@ -403,6 +420,8 @@ impl Default for EgressConfig {
             tls_ca_bundle_path: None,
             tls_root_certificates: Vec::new(),
             tls_root_set_fingerprint: empty_tls_root_set_fingerprint(),
+            client_identity: None,
+            client_identity_fingerprint: None,
         }
     }
 }
@@ -493,6 +512,8 @@ impl EgressConfig {
             tls_ca_bundle_path: None,
             tls_root_certificates: Vec::new(),
             tls_root_set_fingerprint: empty_tls_root_set_fingerprint(),
+            client_identity: None,
+            client_identity_fingerprint: None,
         }
     }
 
@@ -589,6 +610,54 @@ impl EgressConfig {
         self.tls_root_set_fingerprint = tls_root_set_fingerprint(&bytes);
         Ok(())
     }
+
+    pub fn apply_tls_client_identity_pem_path(&mut self, path: PathBuf) -> Result<(), EgressError> {
+        let bytes = read_tls_client_identity_pem(&path)?;
+        if !tls_client_identity_pem_shape_is_valid(&bytes) {
+            return Err(EgressError::InvalidTlsClientIdentity);
+        }
+        let identity = reqwest::Identity::from_pem(&bytes)
+            .map_err(|_| EgressError::InvalidTlsClientIdentity)?;
+
+        reqwest::Client::builder()
+            .no_proxy()
+            .identity(identity.clone())
+            .build()
+            .map_err(|_| EgressError::InvalidTlsClientIdentity)?;
+
+        self.client_identity = Some(identity);
+        self.client_identity_fingerprint = Some(tls_client_identity_fingerprint(&bytes));
+        Ok(())
+    }
+}
+
+fn read_tls_client_identity_pem(path: &Path) -> Result<Vec<u8>, EgressError> {
+    let metadata = fs::metadata(path).map_err(|_| EgressError::InvalidTlsClientIdentity)?;
+    if !metadata.is_file() || metadata.len() > MAX_TLS_CLIENT_IDENTITY_PEM_BYTES as u64 {
+        return Err(EgressError::InvalidTlsClientIdentity);
+    }
+
+    let file = fs::File::open(path).map_err(|_| EgressError::InvalidTlsClientIdentity)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| EgressError::InvalidTlsClientIdentity)?;
+    if !metadata.is_file() || metadata.len() > MAX_TLS_CLIENT_IDENTITY_PEM_BYTES as u64 {
+        return Err(EgressError::InvalidTlsClientIdentity);
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_TLS_CLIENT_IDENTITY_PEM_BYTES)
+            .min(MAX_TLS_CLIENT_IDENTITY_PEM_BYTES),
+    );
+    file.take(MAX_TLS_CLIENT_IDENTITY_PEM_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| EgressError::InvalidTlsClientIdentity)?;
+    if bytes.len() > MAX_TLS_CLIENT_IDENTITY_PEM_BYTES {
+        return Err(EgressError::InvalidTlsClientIdentity);
+    }
+
+    Ok(bytes)
 }
 
 fn auto_seed_endpoint_host(
@@ -675,6 +744,11 @@ impl EgressClient {
 
     pub(crate) fn max_response_bytes(&self) -> usize {
         self.config.max_response_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn client_identity_fingerprint(&self) -> Option<[u8; 32]> {
+        self.config.client_identity_fingerprint
     }
 
     pub fn new(config: EgressConfig) -> Result<Self, EgressError> {
@@ -892,7 +966,7 @@ impl EgressClient {
             response_idle_timeout: self.config.response_idle_timeout,
             connect_timeout: self.config.connect_timeout,
             tls_root_set_fingerprint: self.config.tls_root_set_fingerprint,
-            client_identity_fingerprint: None,
+            client_identity_fingerprint: self.config.client_identity_fingerprint,
             protocol_profile: if sse {
                 client_cache::ProtocolProfile::Sse
             } else {
@@ -1198,6 +1272,9 @@ fn base_client_builder_for_profile(config: &EgressConfig, sse: bool) -> reqwest:
     for certificate in &config.tls_root_certificates {
         builder = builder.add_root_certificate(certificate.clone());
     }
+    if let Some(identity) = &config.client_identity {
+        builder = builder.identity(identity.clone());
+    }
 
     builder
 }
@@ -1212,6 +1289,31 @@ fn tls_root_set_fingerprint(pem_bundle: &[u8]) -> [u8; 32] {
     hasher.update((pem_bundle.len() as u64).to_be_bytes());
     hasher.update(pem_bundle);
     hasher.finalize().into()
+}
+
+fn tls_client_identity_fingerprint(pem_identity: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"greengateway:tls-client-identity:v1\0");
+    hasher.update((pem_identity.len() as u64).to_be_bytes());
+    hasher.update(pem_identity);
+    hasher.finalize().into()
+}
+
+fn tls_client_identity_pem_shape_is_valid(pem_identity: &[u8]) -> bool {
+    let Ok(pem_identity) = std::str::from_utf8(pem_identity) else {
+        return false;
+    };
+    let certificate_count = pem_identity.matches("-----BEGIN CERTIFICATE-----").count();
+    let private_key_count = [
+        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+    ]
+    .into_iter()
+    .map(|label| pem_identity.matches(label).count())
+    .sum::<usize>();
+
+    certificate_count >= 1 && private_key_count == 1
 }
 
 fn egress_config_generation(config: &EgressConfig) -> [u8; 32] {
@@ -1260,6 +1362,13 @@ fn egress_config_generation(config: &EgressConfig) -> [u8; 32] {
     hasher.update((config.max_request_body_bytes as u64).to_be_bytes());
     hasher.update([u8::from(config.deny_private_ips)]);
     hasher.update(config.tls_root_set_fingerprint);
+    match config.client_identity_fingerprint {
+        Some(fingerprint) => {
+            hasher.update([1]);
+            hasher.update(fingerprint);
+        }
+        None => hasher.update([0]),
+    }
 
     hasher.finalize().into()
 }
@@ -1719,6 +1828,14 @@ mod tests {
             egress_config_generation(&second),
             "transport-relevant changes must produce another generation"
         );
+
+        first = second.clone();
+        first.client_identity_fingerprint = Some([7; 32]);
+        assert_ne!(
+            egress_config_generation(&first),
+            egress_config_generation(&second),
+            "client identity changes must produce another egress generation"
+        );
     }
 
     fn isolated_egress_client(
@@ -1782,6 +1899,10 @@ mod tests {
                 },
                 "invalid_tls_ca_bundle",
             ),
+            (
+                EgressError::InvalidTlsClientIdentity,
+                "invalid_tls_client_identity",
+            ),
         ];
 
         for (error, expected) in errors {
@@ -1815,6 +1936,101 @@ mod tests {
                 | "http_status"
                 | "http_other"
         ));
+    }
+
+    #[test]
+    fn mounted_tls_client_identity_is_validated_and_redacted() {
+        let key = rcgen::KeyPair::generate().expect("test identity key should generate");
+        let certificate = rcgen::CertificateParams::new(vec!["client.example.test".to_owned()])
+            .expect("test identity parameters should build")
+            .self_signed(&key)
+            .expect("test identity certificate should build");
+        let valid_pem = format!("{}{}", certificate.pem(), key.serialize_pem());
+        let valid_path = std::env::temp_dir().join(format!(
+            "greengateway-valid-client-identity-{}.pem",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&valid_path, valid_pem.as_bytes())
+            .expect("valid test identity should be written");
+
+        let mut config = EgressConfig::default();
+        config
+            .apply_tls_client_identity_pem_path(valid_path.clone())
+            .expect("matching certificate and key should be accepted");
+        assert!(config.client_identity.is_some());
+        assert!(config.client_identity_fingerprint.is_some());
+        let debug = format!("{config:?}");
+        assert!(debug.contains("client_identity_configured: true"));
+        assert!(!debug.contains("BEGIN CERTIFICATE"));
+        assert!(!debug.contains("BEGIN PRIVATE KEY"));
+
+        let other_key =
+            rcgen::KeyPair::generate().expect("mismatched test identity key should generate");
+        let mismatched_pem = format!("{}{}", certificate.pem(), other_key.serialize_pem());
+        let mismatched_path = std::env::temp_dir().join(format!(
+            "greengateway-mismatched-client-identity-{}.pem",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&mismatched_path, mismatched_pem.as_bytes())
+            .expect("mismatched test identity should be written");
+
+        let error = EgressConfig::default()
+            .apply_tls_client_identity_pem_path(mismatched_path.clone())
+            .expect_err("a certificate and unrelated private key must fail startup validation");
+        assert_eq!(error.safe_category(), "invalid_tls_client_identity");
+        let rendered = format!("{error:?}\n{error}");
+        assert!(!rendered.contains("BEGIN CERTIFICATE"));
+        assert!(!rendered.contains("BEGIN PRIVATE KEY"));
+        assert!(!rendered.contains(&other_key.serialize_pem()));
+
+        let duplicate_key_pem = format!("{valid_pem}{}", key.serialize_pem());
+        let duplicate_key_path = std::env::temp_dir().join(format!(
+            "greengateway-duplicate-client-key-{}.pem",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&duplicate_key_path, duplicate_key_pem.as_bytes())
+            .expect("duplicate-key test identity should be written");
+        EgressConfig::default()
+            .apply_tls_client_identity_pem_path(duplicate_key_path.clone())
+            .expect_err("an identity PEM with multiple private keys must fail validation");
+
+        let secret_marker = "TOP_SECRET_CLIENT_IDENTITY_BYTES";
+        let invalid_path = std::env::temp_dir().join(format!(
+            "greengateway-invalid-client-identity-{}.pem",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&invalid_path, secret_marker).expect("invalid test identity should be written");
+        let error = EgressConfig::default()
+            .apply_tls_client_identity_pem_path(invalid_path.clone())
+            .expect_err("non-PEM identity bytes must fail startup validation");
+        assert!(!format!("{error:?}\n{error}").contains(secret_marker));
+
+        let oversized_path = std::env::temp_dir().join(format!(
+            "greengateway-oversized-client-identity-{}.pem",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &oversized_path,
+            vec![b'x'; MAX_TLS_CLIENT_IDENTITY_PEM_BYTES + 1],
+        )
+        .expect("oversized test identity should be written");
+        let error = EgressConfig::default()
+            .apply_tls_client_identity_pem_path(oversized_path.clone())
+            .expect_err("an oversized identity PEM must fail bounded startup validation");
+        assert_eq!(error.safe_category(), "invalid_tls_client_identity");
+        assert!(!format!("{error:?}\n{error}").contains(
+            oversized_path
+                .file_name()
+                .expect("oversized test file should have a name")
+                .to_string_lossy()
+                .as_ref()
+        ));
+
+        let _ = fs::remove_file(valid_path);
+        let _ = fs::remove_file(mismatched_path);
+        let _ = fs::remove_file(duplicate_key_path);
+        let _ = fs::remove_file(invalid_path);
+        let _ = fs::remove_file(oversized_path);
     }
 
     #[test]
@@ -2636,12 +2852,14 @@ mod tests {
                         url: "https://payments-a.example.test".to_owned(),
                         weight: 3,
                         tls_ca_bundle_path: None,
+                        client_identity_pem_path: None,
                     },
                     crate::config::UpstreamEndpointConfig {
                         id: "payments-b".to_owned(),
                         url: "https://payments-b.example.test".to_owned(),
                         weight: 1,
                         tls_ca_bundle_path: None,
+                        client_identity_pem_path: None,
                     },
                 ],
                 load_balancing: crate::config::UpstreamLoadBalancingConfig::default(),
@@ -3105,7 +3323,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_partitions_exact_address_timeout_trust_and_egress_generations() {
+    fn cache_partitions_address_timeout_trust_identity_and_egress_generations() {
         let base_config = EgressConfig {
             allowed_hosts: HashSet::from(["partition.example.test".to_owned()]),
             deny_private_ips: false,
@@ -3153,6 +3371,54 @@ mod tests {
             .expect("a new trust profile should build a separate client");
         assert_eq!(client.client_cache.len(), 4);
 
+        let mut first_identity_config = base_config.clone();
+        let first_identity =
+            rcgen::generate_simple_self_signed(vec!["client-a.example.test".to_owned()])
+                .expect("first test identity should generate");
+        let first_identity_pem = format!(
+            "{}{}",
+            first_identity.cert.pem(),
+            first_identity.key_pair.serialize_pem()
+        );
+        first_identity_config.client_identity = Some(
+            reqwest::Identity::from_pem(first_identity_pem.as_bytes())
+                .expect("first test identity should parse"),
+        );
+        first_identity_config.client_identity_fingerprint = Some(tls_client_identity_fingerprint(
+            first_identity_pem.as_bytes(),
+        ));
+        let first_identity_client = client
+            .reconfigured(first_identity_config)
+            .expect("first identity client should build");
+        first_identity_client
+            .pinned_client(&url, "partition.example.test", first_addr)
+            .expect("a client identity should build a separate client");
+        assert_eq!(client.client_cache.len(), 5);
+
+        let mut second_identity_config = base_config.clone();
+        let second_identity =
+            rcgen::generate_simple_self_signed(vec!["client-b.example.test".to_owned()])
+                .expect("second test identity should generate");
+        let second_identity_pem = format!(
+            "{}{}",
+            second_identity.cert.pem(),
+            second_identity.key_pair.serialize_pem()
+        );
+        second_identity_config.client_identity = Some(
+            reqwest::Identity::from_pem(second_identity_pem.as_bytes())
+                .expect("second test identity should parse"),
+        );
+        second_identity_config.client_identity_fingerprint = Some(tls_client_identity_fingerprint(
+            second_identity_pem.as_bytes(),
+        ));
+        let second_identity_client = client
+            .reconfigured(second_identity_config)
+            .expect("second identity client should build");
+        second_identity_client
+            .pinned_client(&url, "partition.example.test", first_addr)
+            .expect("another client identity should build a separate client");
+        assert_eq!(client.client_cache.len(), 6);
+
         let mut egress_config = base_config;
         egress_config
             .allowed_hosts
@@ -3163,7 +3429,7 @@ mod tests {
         egress_client
             .pinned_client(&url, "partition.example.test", first_addr)
             .expect("a new egress generation should build a separate client");
-        assert_eq!(client.client_cache.len(), 5);
+        assert_eq!(client.client_cache.len(), 7);
     }
 
     #[tokio::test]

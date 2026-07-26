@@ -1,5 +1,6 @@
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
+    fmt,
     hash::{Hash, Hasher},
     net::SocketAddr,
     sync::{
@@ -28,7 +29,7 @@ const CACHE_LOCK_COMPONENT: &str = "egress_client_cache";
 
 static PROCESS_CACHE_ENTRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub(super) struct PinnedClientCacheKey {
     pub scheme: String,
     pub host: String,
@@ -42,6 +43,27 @@ pub(super) struct PinnedClientCacheKey {
     pub client_identity_fingerprint: Option<[u8; 32]>,
     pub protocol_profile: ProtocolProfile,
     pub outbound_proxy_policy: OutboundProxyPolicy,
+}
+
+impl fmt::Debug for PinnedClientCacheKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PinnedClientCacheKey")
+            .field("scheme", &self.scheme)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("pinned_addr", &self.pinned_addr)
+            .field("request_timeout", &self.request_timeout)
+            .field("response_idle_timeout", &self.response_idle_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field(
+                "client_identity_configured",
+                &self.client_identity_fingerprint.is_some(),
+            )
+            .field("protocol_profile", &self.protocol_profile)
+            .field("outbound_proxy_policy", &self.outbound_proxy_policy)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -366,6 +388,45 @@ mod tests {
         assert_eq!(builds.load(Ordering::SeqCst), 1);
         assert_eq!(cache.len(), 1);
         drop((first, second));
+    }
+
+    #[test]
+    fn client_identity_fingerprint_is_an_explicit_cache_partition() {
+        let clock = Arc::new(FakeCacheClock::default());
+        let cache = PinnedClientCache::with_limits(4, Duration::from_secs(30), clock);
+        let mut first_key = key(1);
+        first_key.egress_generation = [9; 32];
+        first_key.client_identity_fingerprint = Some([1; 32]);
+        let mut second_key = first_key.clone();
+        second_key.client_identity_fingerprint = Some([2; 32]);
+
+        cache
+            .get_or_build(first_key, || Ok(client()))
+            .expect("first identity client should build");
+        cache
+            .get_or_build(second_key, || Ok(client()))
+            .expect("second identity client should build");
+
+        assert_eq!(
+            cache.len(),
+            2,
+            "identity fingerprints must partition otherwise identical transports"
+        );
+    }
+
+    #[test]
+    fn cache_key_debug_redacts_transport_fingerprints() {
+        let mut cache_key = key(7);
+        cache_key.egress_generation = [11; 32];
+        cache_key.tls_root_set_fingerprint = [12; 32];
+        cache_key.client_identity_fingerprint = Some([13; 32]);
+
+        let debug = format!("{cache_key:?}");
+
+        assert!(debug.contains("client_identity_configured: true"));
+        assert!(!debug.contains("egress_generation"));
+        assert!(!debug.contains("tls_root_set_fingerprint"));
+        assert!(!debug.contains("client_identity_fingerprint"));
     }
 
     #[test]

@@ -946,7 +946,7 @@ Default: empty, which disables route-table proxying. `UPSTREAM_URL` continues to
 
 Format and validation: unset, empty, or whitespace-only values become an empty route table. Non-empty values must be a JSON array of at most 128 objects. Unknown fields are rejected. Each object has optional `path_prefix` and optional `host`, and must set exactly one of the legacy `upstream_url` field or a non-empty `upstreams` pool. `path_prefix`, when present, must be a URI path starting with `/`. `host`, when present, must be a hostname without a port and is normalized to lowercase. Each entry must set at least one of `path_prefix` or `host`; an entry with only `path_prefix: "/"` is rejected because it would be an unconditional catch-all. Use `UPSTREAM_URL` for the legacy catch-all behavior or add a host to make the root prefix host-specific. Duplicate host/path matchers are rejected. Any entry with `host` also requires `POLICY_FILE`; startup fails without a policy because host-qualified upstream authorization must be bound explicitly.
 
-Legacy `upstream_url` uses the same validation as `UPSTREAM_URL` and maps internally to one endpoint named `primary` with weight 1. An existing route without `id` receives a deterministic bounded ID derived from its normalized logical host/path matcher, not its endpoint URL or declaration order. A route using `upstreams` must set a unique explicit `id`. It may contain at most 32 endpoints, each with a unique `id`, required `url`, optional `weight` from 1 through 1000 (default 1), and optional `tls_ca_bundle_path`. Route and endpoint IDs are 1-64 ASCII letters, digits, `.`, `_`, or `-`, must start with a letter or digit, and are the only pool/endpoint values used as audit and metric dimensions. A pooled endpoint URL must be an `http` or `https` origin without userinfo, a base path, query, or fragment. Configure endpoint CA bundles on the endpoint; route-level `tls_ca_bundle_path` is rejected for a multi-endpoint pool.
+Legacy `upstream_url` uses the same validation as `UPSTREAM_URL` and maps internally to one endpoint named `primary` with weight 1. An existing route without `id` receives a deterministic bounded ID derived from its normalized logical host/path matcher, not its endpoint URL or declaration order. A route using `upstreams` must set a unique explicit `id`. It may contain at most 32 endpoints, each with a unique `id`, required `url`, optional `weight` from 1 through 1000 (default 1), optional `tls_ca_bundle_path`, and optional `client_identity_pem_path`. Route and endpoint IDs are 1-64 ASCII letters, digits, `.`, `_`, or `-`, must start with a letter or digit, and are the only pool/endpoint values used as audit and metric dimensions. A pooled endpoint URL must be an `http` or `https` origin without userinfo, a base path, query, or fragment. Configure CA bundles and client identities on the endpoint; route-level TLS fields are rejected for a multi-endpoint pool.
 
 `load_balancing.strategy` currently accepts only `weighted_round_robin`. Selection is a deterministic weighted sequence over the endpoints in the already-authorized logical route. Endpoint selection happens after authentication, rate limiting, RBAC/direct-policy evaluation, body preflight, and bounded pool admission. No request header, query value, path capture, or body field can select an endpoint, and selection never falls through to another route.
 
@@ -1024,6 +1024,7 @@ Route entries may also set these optional per-upstream fields:
 - `add_request_headers`: object mapping header names to values added to requests sent to this route's upstream after the gateway strips hop-by-hop headers, propagates `x-request-id`, and sets gateway-controlled client-IP forwarding headers.
 - `strip_request_headers`: array of request header names removed before sending to this route's upstream after the gateway strips hop-by-hop headers, propagates `x-request-id`, and sets gateway-controlled client-IP forwarding headers.
 - `tls_ca_bundle_path`: filesystem path to a PEM CA bundle whose certificates are added to this route's TLS trust store.
+- `client_identity_pem_path`: pooled-endpoint-only filesystem path to a mounted PEM file containing the client certificate chain and exactly one matching private key.
 - `openapi_spec_path`: filesystem path to a local OpenAPI 3.x JSON or YAML document for this upstream route's schema coverage.
 
 Per-route header validation rejects invalid header names or values, rejects adding hop-by-hop or gateway-managed headers such as `connection`, `host`, and `content-length`, and rejects adding or stripping `x-request-id`. The gateway owns request-id propagation so audit and tracing correlation cannot be disabled by route configuration. A route also cannot add and strip the same header.
@@ -1031,6 +1032,10 @@ Per-route header validation rejects invalid header names or values, rejects addi
 GreenGateway always removes inbound `Authorization` and `Cookie` headers before proxying because those credentials belong to the gateway authentication boundary. An upstream credential must be configured explicitly with `add_request_headers`; configured headers are applied only after inbound credentials are removed, so a client credential is never reused as an upstream credential.
 
 `tls_ca_bundle_path` is the supported mechanism for upstreams served by private or internal certificate authorities. Certificate verification remains strict by default, and no route inherits a custom CA unless it explicitly configures one. GreenGateway does not expose a per-route skip-verify option; use a local test CA bundle for development instead of disabling verification.
+
+`client_identity_pem_path` enables mutual TLS for one physical `https` endpoint and is rejected with an `http` URL. It accepts only a mounted regular-file reference of at most 1 MiB inside a pooled endpoint object; inline certificate or private-key values are not supported. At startup GreenGateway reads the file through that hard byte limit, requires a PEM certificate chain plus exactly one matching PKCS#1, PKCS#8, or SEC1 private key, and refuses to start if the file is absent, oversized, malformed, incomplete, or mismatched. The parsed identity and custom CA are applied together without changing the configured hostname, so exact-address pinning still preserves TLS SNI and hostname verification.
+
+Client identities and custom root sets are fingerprinted internally and form separate reusable-transport cache partitions. An identity configured for one endpoint is never inherited by another endpoint, even when their origins, timeouts, or CA bundles otherwise match. Debug output, logs, metrics, status, audit records, and errors expose neither certificate/private-key contents nor identity fingerprints. Rotate a mounted identity by replacing the secret and restarting GreenGateway; external secret-provider integration and live credential rotation are outside this configuration contract.
 
 `openapi_spec_path` uses the same parser and startup validation as `OPENAPI_SPEC_PATH`. For route-table specs, coverage is scoped by `path_prefix` when a route has one. The current discovery aggregate table stores only `(method, endpoint_template)` and not the matched upstream route or request host, so host-only routes cannot yet be separated from the global observed inventory. If a route has a `path_prefix`, schema paths may be written either as gateway paths such as `/api/users/{userId}` or as upstream-local paths such as `/users/{userId}`; the coverage matcher considers both the raw spec path and the path prefixed with the route's `path_prefix`.
 
@@ -1073,7 +1078,13 @@ Example:
     "path_prefix": "/",
     "upstreams": [
       {"id": "app-a", "url": "https://app-a.internal.example", "weight": 2},
-      {"id": "app-b", "url": "https://app-b.internal.example", "weight": 1}
+      {
+        "id": "app-b",
+        "url": "https://app-b.internal.example",
+        "weight": 1,
+        "tls_ca_bundle_path": "/run/secrets/app-ca.pem",
+        "client_identity_pem_path": "/run/secrets/app-client.pem"
+      }
     ],
     "health_check": {
       "method": "GET",
