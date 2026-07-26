@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     error::Error,
     fmt, fs,
+    io::ErrorKind,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
@@ -235,6 +236,47 @@ impl EgressError {
             | Self::InvalidTlsCaBundle { .. } => false,
         }
     }
+
+    pub(crate) fn is_retryable_transport_failure(&self) -> bool {
+        match self {
+            Self::ResponseIdleTimeout { .. } => true,
+            Self::Http(error) if error.is_timeout() => true,
+            Self::Http(error) if error.is_connect() => error_chain_has_retryable_io(error),
+            Self::HostNotAllowed(_)
+            | Self::PortNotAllowed(_)
+            | Self::NonGlobalIpBlocked(_)
+            | Self::InvalidPolicy(_)
+            | Self::DnsResolutionFailed(_)
+            | Self::InvalidUrl(_)
+            | Self::SchemeNotAllowed(_)
+            | Self::RequestBodyTooLarge { .. }
+            | Self::RequestBodyReadFailed
+            | Self::UnexpectedStatus(_)
+            | Self::ResponseTooLarge { .. }
+            | Self::InvalidTlsCaBundle { .. }
+            | Self::Http(_) => false,
+        }
+    }
+}
+
+fn error_chain_has_retryable_io(error: &reqwest::Error) -> bool {
+    let mut source = error.source();
+    while let Some(error) = source {
+        if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_error.kind(),
+                ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::NotConnected
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::TimedOut
+                    | ErrorKind::UnexpectedEof
+            );
+        }
+        source = error.source();
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -627,6 +669,10 @@ pub struct CheckedEgressDestination {
 }
 
 impl EgressClient {
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.config.timeout
+    }
+
     pub fn new(config: EgressConfig) -> Result<Self, EgressError> {
         Self::new_with_resolver(config, Arc::new(SystemDnsResolver))
     }
@@ -2481,6 +2527,7 @@ mod tests {
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
+                retry: None,
                 timeout_ms: None,
                 response_idle_timeout_ms: None,
                 connect_timeout_ms: None,
@@ -2499,6 +2546,7 @@ mod tests {
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
+                retry: None,
                 timeout_ms: None,
                 response_idle_timeout_ms: None,
                 connect_timeout_ms: None,
@@ -2530,6 +2578,7 @@ mod tests {
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
+                retry: None,
                 timeout_ms: None,
                 response_idle_timeout_ms: None,
                 connect_timeout_ms: None,

@@ -945,6 +945,20 @@ The compatibility public `/health` response exposes only aggregate `configured` 
 
 `request_body.mode` accepts `buffered` (default) or `stream`. Buffered mode preserves complete bounded validation before upstream forwarding. Stream mode is non-replayable, enforces the actual byte count with backpressure, and can send a bounded prefix before an unknown-length overflow is discovered.
 
+`retry` is an optional pool-only object. Omitting it preserves the compatibility default of exactly one total attempt. It is rejected on legacy `upstream_url` routes. Its fields are:
+
+- `max_attempts`: total attempts including the initial request, default `1`, range 1-5.
+- `methods`: unique replay-safe methods, default `["GET","HEAD","OPTIONS"]`. Only `GET`, `HEAD`, and `OPTIONS` are accepted.
+- `statuses`: unique upstream response statuses that may trigger a retry before downstream response commitment, default `[502,503,504]`, with 1-32 values in 500-599.
+
+Retries are enabled only when `max_attempts` is greater than one, the request method is listed, and the request body is replayable. Routes using `request_body.mode:"stream"` therefore cannot set `max_attempts` above one. Buffered bodies are read and bounded once, then replayed byte-for-byte; every attempt independently reapplies credential, hop-by-hop, forwarding, framing, configured-header, and request-ID controls.
+
+Configured statuses, retryable TCP connection failures, and pre-commit transport timeouts may retry. Policy or egress denial, DNS validation failure, TLS configuration or certificate failure, request-body failure, response-size failure, cancellation, and any error after downstream response commitment never retry. Every attempt resolves and validates its destination again through the egress boundary, stays within the already-authorized logical pool, and prefers an eligible endpoint not yet attempted by the request.
+
+The route's effective `timeout_ms` is one deadline shared by all attempts and backoff. Retry backoff uses deterministic request-scoped jitter over an exponential 25-250 ms ceiling and is skipped when it cannot fit within the remaining deadline. Each pool also has a non-waiting concurrent retry budget equal to 10% of `limits.max_in_flight`, rounded up and clamped to 1-32. Exhausting that budget stops amplification and returns the last sanitized upstream outcome instead of queueing more retry work.
+
+Retry telemetry uses only bounded pool/endpoint IDs and safe result categories. Metrics include `proxy_upstream_attempts_total`, `proxy_upstream_attempt_duration_seconds`, `proxy_upstream_retries_total`, and `proxy_retry_budget_exhausted_total`. A request that exhausts its configured retry opportunity emits `upstream.retry_exhausted` with the logical request ID and a bounded attempt summary; URLs, resolved addresses, queries, credentials, and raw transport errors are excluded.
+
 Route entries may also set these optional per-upstream fields:
 
 - `timeout_ms`: total timeout for this route's upstream requests, in milliseconds. When unset, the route inherits `UPSTREAM_TIMEOUT_MS` if configured, otherwise `EGRESS_TIMEOUT_MS`.
@@ -1006,6 +1020,11 @@ Example:
       "passive_failure_statuses": [500, 502, 503, 504],
       "required_for_readiness": true,
       "minimum_healthy": 1
+    },
+    "retry": {
+      "max_attempts": 3,
+      "methods": ["GET", "HEAD", "OPTIONS"],
+      "statuses": [502, 503, 504]
     }
   }
 ]

@@ -202,6 +202,41 @@ impl UpstreamHealthState {
             .await;
     }
 
+    pub(super) async fn record_passive_proxy_error(
+        &self,
+        error: &egress::EgressError,
+        config: &config::UpstreamHealthCheckConfig,
+    ) {
+        if error.is_timeout() {
+            self.record_passive_timeout(config).await;
+        } else {
+            self.record_passive_error(error, config).await;
+        }
+    }
+
+    pub(super) async fn record_passive_timeout(&self, config: &config::UpstreamHealthCheckConfig) {
+        let _ = self
+            .update(
+                false,
+                OffsetDateTime::now_utc(),
+                false,
+                config,
+                "passive",
+                Some("request_timeout"),
+            )
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(super) async fn last_failure_category(&self) -> Option<String> {
+        self.snapshot.read().await.last_failure_category.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_healthy_for_test(&self) {
+        self.eligibility.store(HEALTHY, Ordering::Release);
+    }
+
     fn emit_transition(
         &self,
         transition: HealthTransition,
