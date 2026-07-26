@@ -9880,12 +9880,14 @@ mod tests {
                 url: format!("http://127.0.0.1:{}", first_addr.port()),
                 weight: 3,
                 tls_ca_bundle_path: None,
+                client_identity_pem_path: None,
             },
             config::UpstreamEndpointConfig {
                 id: "second".to_owned(),
                 url: format!("http://127.0.0.1:{}", second_addr.port()),
                 weight: 1,
                 tls_ca_bundle_path: None,
+                client_identity_pem_path: None,
             },
         ];
         let capture = audit::sink::tests::CaptureSink::default();
@@ -9984,12 +9986,14 @@ mod tests {
                 url: format!("http://127.0.0.1:{}", first_addr.port()),
                 weight: 3,
                 tls_ca_bundle_path: None,
+                client_identity_pem_path: None,
             },
             config::UpstreamEndpointConfig {
                 id: "secondary".to_owned(),
                 url: format!("http://127.0.0.1:{}", second_addr.port()),
                 weight: 1,
                 tls_ca_bundle_path: None,
+                client_identity_pem_path: None,
             },
         ];
         let policy = TempPolicyFile::new(
@@ -10042,6 +10046,7 @@ mod tests {
             url: "http://127.0.0.1:41001".to_owned(),
             weight: 1,
             tls_ca_bundle_path: None,
+            client_identity_pem_path: None,
         }];
         let policy = TempPolicyFile::new(
             r#"{

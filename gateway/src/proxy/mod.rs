@@ -565,18 +565,21 @@ struct RouteEgressClientKey {
     response_idle_timeout_ms: Option<u64>,
     connect_timeout_ms: Option<u64>,
     tls_ca_bundle_path: Option<PathBuf>,
+    client_identity_pem_path: Option<PathBuf>,
 }
 
 impl RouteEgressClientKey {
     fn from_route(
         route: &config::UpstreamRouteConfig,
         tls_ca_bundle_path: Option<PathBuf>,
+        client_identity_pem_path: Option<PathBuf>,
     ) -> Self {
         Self {
             timeout_ms: route.timeout_ms,
             response_idle_timeout_ms: route.response_idle_timeout_ms,
             connect_timeout_ms: route.connect_timeout_ms,
             tls_ca_bundle_path,
+            client_identity_pem_path,
         }
     }
 
@@ -585,6 +588,7 @@ impl RouteEgressClientKey {
             && self.response_idle_timeout_ms.is_none()
             && self.connect_timeout_ms.is_none()
             && self.tls_ca_bundle_path.is_none()
+            && self.client_identity_pem_path.is_none()
     }
 
     fn apply_to_config(
@@ -599,6 +603,9 @@ impl RouteEgressClientKey {
         if let Some(path) = &self.tls_ca_bundle_path {
             config.apply_tls_ca_bundle_path(path.clone())?;
         }
+        if let Some(path) = &self.client_identity_pem_path {
+            config.apply_tls_client_identity_pem_path(path.clone())?;
+        }
 
         Ok(())
     }
@@ -607,11 +614,12 @@ impl RouteEgressClientKey {
 fn route_egress_client(
     route: &config::UpstreamRouteConfig,
     tls_ca_bundle_path: Option<PathBuf>,
+    client_identity_pem_path: Option<PathBuf>,
     default_config: &egress::EgressConfig,
     default_client: &Arc<egress::EgressClient>,
     route_clients: &mut HashMap<RouteEgressClientKey, Arc<egress::EgressClient>>,
 ) -> Result<Arc<egress::EgressClient>, egress::EgressError> {
-    let key = RouteEgressClientKey::from_route(route, tls_ca_bundle_path);
+    let key = RouteEgressClientKey::from_route(route, tls_ca_bundle_path, client_identity_pem_path);
     if key.is_default() {
         return Ok(Arc::clone(default_client));
     }
@@ -640,6 +648,7 @@ fn route_endpoints(
         let client = route_egress_client(
             route,
             route.tls_ca_bundle_path.clone(),
+            None,
             default_config,
             default_client,
             route_clients,
@@ -671,6 +680,7 @@ fn route_endpoints(
             let client = route_egress_client(
                 route,
                 endpoint.tls_ca_bundle_path.clone(),
+                endpoint.client_identity_pem_path.clone(),
                 default_config,
                 default_client,
                 route_clients,
@@ -780,7 +790,9 @@ fn legacy_route_id(route: &config::UpstreamRouteConfig) -> String {
 mod tests {
     use std::{
         collections::HashSet,
+        fs,
         net::SocketAddr,
+        path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
     };
 
@@ -803,6 +815,22 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![self.address])
         }
+    }
+
+    fn write_test_client_identity(name: &str) -> PathBuf {
+        let identity = rcgen::generate_simple_self_signed(vec![format!("{name}.example.test")])
+            .expect("test client identity should generate");
+        let pem = format!(
+            "{}{}",
+            identity.cert.pem(),
+            identity.key_pair.serialize_pem()
+        );
+        let path = std::env::temp_dir().join(format!(
+            "greengateway-proxy-{name}-{}.pem",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&path, pem).expect("test client identity should be written");
+        path
     }
 
     #[test]
@@ -1020,6 +1048,7 @@ mod tests {
         let derived = route_egress_client(
             &route,
             None,
+            None,
             &egress_config,
             &default_client,
             &mut route_clients,
@@ -1032,5 +1061,83 @@ mod tests {
 
         assert_eq!(destination.pinned_addr, resolver.address);
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pooled_endpoints_receive_distinct_mounted_client_identities() {
+        let first_identity_path = write_test_client_identity("first");
+        let second_identity_path = write_test_client_identity("second");
+        let route = config::UpstreamRouteConfig {
+            id: Some("payments".to_owned()),
+            path_prefix: Some("/payments".to_owned()),
+            host: None,
+            upstream_url: String::new(),
+            upstreams: vec![
+                config::UpstreamEndpointConfig {
+                    id: "first".to_owned(),
+                    url: "https://first.example.test".to_owned(),
+                    weight: 1,
+                    tls_ca_bundle_path: None,
+                    client_identity_pem_path: Some(first_identity_path.clone()),
+                },
+                config::UpstreamEndpointConfig {
+                    id: "second".to_owned(),
+                    url: "https://second.example.test".to_owned(),
+                    weight: 1,
+                    tls_ca_bundle_path: None,
+                    client_identity_pem_path: Some(second_identity_path.clone()),
+                },
+            ],
+            load_balancing: config::UpstreamLoadBalancingConfig::default(),
+            request_body: config::UpstreamRequestBodyConfig::default(),
+            sse: None,
+            limits: config::UpstreamPoolLimitsConfig::default(),
+            health_check: None,
+            retry: None,
+            circuit_breaker: None,
+            timeout_ms: None,
+            response_idle_timeout_ms: None,
+            connect_timeout_ms: None,
+            add_request_headers: HashMap::new(),
+            strip_request_headers: Vec::new(),
+            tls_ca_bundle_path: None,
+            openapi_spec_path: None,
+        };
+        let default_config = egress::EgressConfig::default();
+        let default_client = Arc::new(
+            egress::EgressClient::new(default_config.clone())
+                .expect("default egress client should build"),
+        );
+        let mut route_clients = HashMap::new();
+        let audit = audit::AuditLog::new(Arc::new(audit::sink::tests::CaptureSink::new()));
+
+        let endpoints = route_endpoints(
+            &route,
+            0,
+            &default_config,
+            &default_client,
+            &mut route_clients,
+            "payments",
+            &audit,
+        )
+        .expect("endpoint-specific identities should validate at startup");
+
+        let first_fingerprint = endpoints[0]
+            .egress_client
+            .client_identity_fingerprint()
+            .expect("first identity fingerprint");
+        let second_fingerprint = endpoints[1]
+            .egress_client
+            .client_identity_fingerprint()
+            .expect("second identity fingerprint");
+        assert_ne!(first_fingerprint, second_fingerprint);
+        assert_eq!(
+            route_clients.len(),
+            2,
+            "identity path is part of endpoint client isolation"
+        );
+
+        let _ = fs::remove_file(first_identity_path);
+        let _ = fs::remove_file(second_identity_path);
     }
 }

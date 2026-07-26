@@ -369,6 +369,30 @@ mod tests {
     }
 
     #[test]
+    fn client_identity_fingerprint_is_an_explicit_cache_partition() {
+        let clock = Arc::new(FakeCacheClock::default());
+        let cache = PinnedClientCache::with_limits(4, Duration::from_secs(30), clock);
+        let mut first_key = key(1);
+        first_key.egress_generation = [9; 32];
+        first_key.client_identity_fingerprint = Some([1; 32]);
+        let mut second_key = first_key.clone();
+        second_key.client_identity_fingerprint = Some([2; 32]);
+
+        cache
+            .get_or_build(first_key, || Ok(client()))
+            .expect("first identity client should build");
+        cache
+            .get_or_build(second_key, || Ok(client()))
+            .expect("second identity client should build");
+
+        assert_eq!(
+            cache.len(),
+            2,
+            "identity fingerprints must partition otherwise identical transports"
+        );
+    }
+
+    #[test]
     fn capacity_is_hard_and_evicts_least_recently_used_entry() {
         let clock = Arc::new(FakeCacheClock::default());
         let cache = PinnedClientCache::with_limits(2, Duration::from_secs(30), clock.clone());

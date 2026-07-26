@@ -9,6 +9,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Security
 
+- Added per-endpoint mutual TLS for pooled upstreams through mounted
+  `client_identity_pem_path` files. Certificate/key pairing is validated at
+  startup, client identities and custom roots partition reusable transports,
+  hostname/SNI verification remains mandatory, and certificate/private-key
+  contents are excluded from diagnostics and telemetry.
+
 - Added explicit per-route SSE streaming with prompt response-header commitment,
   separate pre-commit/idle/byte/duration controls, bounded backpressure, and
   payload-free terminal audit/metric outcomes for completion, disconnect,
