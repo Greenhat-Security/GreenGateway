@@ -913,6 +913,7 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
                     &mut retry_permit,
                     passive_health.as_ref(),
                     &mut circuit_permit,
+                    false,
                 ).await;
                 return;
             }
@@ -931,6 +932,7 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
                     &mut retry_permit,
                     passive_health.as_ref(),
                     &mut circuit_permit,
+                    true,
                 ).await;
                 return;
             }
@@ -979,13 +981,20 @@ async fn finish_response_timeout(
         Arc<crate::config::UpstreamHealthCheckConfig>,
     )>,
     circuit_permit: &mut Option<super::circuit::CircuitPermit>,
+    upstream_was_being_polled: bool,
 ) {
     release_response_permits(admission_permit, retry_permit);
-    record_circuit_failure(circuit_permit, "request_timeout");
+    if upstream_was_being_polled {
+        record_circuit_failure(circuit_permit, "request_timeout");
+    } else {
+        drop(circuit_permit.take());
+    }
     drop(upstream_body);
     terminal_sender.send_replace(ResponseTailTerminal::Error("request_timeout"));
-    if let Some((health, config)) = passive_health {
-        health.record_passive_timeout(config).await;
+    if upstream_was_being_polled {
+        if let Some((health, config)) = passive_health {
+            health.record_passive_timeout(config).await;
+        }
     }
     tracing::warn!(
         error_category = "request_timeout",
@@ -1520,6 +1529,19 @@ mod tests {
         let admission_permit = admission.acquire().await.expect("test admission");
         let retry_budget = super::super::retry::RetryBudget::new(1);
         let retry_permit = retry_budget.try_acquire().expect("test retry budget");
+        let circuit = super::super::circuit::CircuitBreaker::new(
+            Arc::from("test"),
+            Arc::from("primary"),
+            config::UpstreamCircuitBreakerConfig {
+                failure_threshold: 1,
+                open_ms: 60_000,
+                half_open_max_requests: 1,
+                recovery_threshold: 1,
+            },
+            None,
+            None,
+        );
+        let circuit_permit = circuit.try_acquire().expect("closed circuit permit");
         let (completed_sender, completed_receiver) = tokio::sync::oneshot::channel();
         let body = redacted_response_body_inner(
             bytes::Bytes::from_static(b"first"),
@@ -1529,7 +1551,7 @@ mod tests {
             tokio::time::Instant::now() + Duration::from_millis(50),
             None,
             ResponseTailOptions {
-                circuit_permit: None,
+                circuit_permit: Some(circuit_permit),
                 pump_completed: Some(completed_sender),
             },
         );
@@ -1545,8 +1567,12 @@ mod tests {
         let released_retry = retry_budget
             .try_acquire()
             .expect("terminated pump should release retry budget");
+        let neutral_circuit_permit = circuit
+            .try_acquire()
+            .expect("downstream no-demand timeout must not open the upstream circuit");
         drop(released_admission);
         drop(released_retry);
+        drop(neutral_circuit_permit);
         drop(body);
     }
 
@@ -2263,11 +2289,11 @@ mod tests {
             .retry_budget
             .try_acquire()
             .expect("deadline must release retry budget without downstream polling");
-        assert!(!health_states[1].eligible());
-        assert_eq!(
-            health_states[1].last_failure_category().await.as_deref(),
-            Some("request_timeout")
+        assert!(
+            health_states[1].eligible(),
+            "a downstream that never requests the response tail must not poison endpoint health"
         );
+        assert_eq!(health_states[1].last_failure_category().await, None);
         drop(admission);
         drop(retry_budget);
         drop(response);

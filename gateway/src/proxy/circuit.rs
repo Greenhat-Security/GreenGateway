@@ -8,6 +8,7 @@ use serde_json::json;
 use crate::{audit, config};
 
 const DEFAULT_FAILURE_STATUSES: &[u16] = &[502, 503, 504];
+const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub(super) struct CircuitBreaker {
@@ -29,6 +30,7 @@ enum CircuitState {
     Closed {
         generation: u64,
         consecutive_failures: u32,
+        window_started_at: Option<Instant>,
     },
     Open {
         generation: u64,
@@ -107,6 +109,7 @@ impl CircuitBreaker {
                 state: Mutex::new(CircuitState::Closed {
                     generation: 0,
                     consecutive_failures: 0,
+                    window_started_at: None,
                 }),
             }),
         }
@@ -193,6 +196,7 @@ impl CircuitBreaker {
                     *state = CircuitState::Closed {
                         generation,
                         consecutive_failures: 0,
+                        window_started_at: None,
                     };
                 }
                 (
@@ -209,6 +213,7 @@ impl CircuitBreaker {
                         *state = CircuitState::Closed {
                             generation: next_generation,
                             consecutive_failures: 0,
+                            window_started_at: None,
                         };
                         transition = Some(("half_open", "closed", "recovery_threshold"));
                     } else {
@@ -237,10 +242,23 @@ impl CircuitBreaker {
                     CircuitState::Closed {
                         generation: current,
                         consecutive_failures,
+                        window_started_at,
                     },
                     PermitKind::Closed,
                 ) if current == generation => {
-                    let failures = consecutive_failures.saturating_add(1);
+                    let window_expired = window_started_at.is_some_and(|started| {
+                        now.saturating_duration_since(started) >= FAILURE_WINDOW
+                    });
+                    let failures = if window_expired {
+                        1
+                    } else {
+                        consecutive_failures.saturating_add(1)
+                    };
+                    let window_started_at = if consecutive_failures == 0 || window_expired {
+                        Some(now)
+                    } else {
+                        window_started_at
+                    };
                     if failures >= self.inner.config.failure_threshold {
                         let next_generation = generation.wrapping_add(1);
                         *state = CircuitState::Open {
@@ -252,6 +270,7 @@ impl CircuitBreaker {
                         *state = CircuitState::Closed {
                             generation,
                             consecutive_failures: failures,
+                            window_started_at,
                         };
                     }
                 }
@@ -455,6 +474,29 @@ mod tests {
         assert_eq!(breaker.state_name(), "half_open");
         breaker.try_acquire().expect("second probe").success();
         assert_eq!(breaker.state_name(), "closed");
+    }
+
+    #[test]
+    fn closed_failure_window_expires_before_threshold_is_reached() {
+        let clock = Arc::new(FakeClock::new());
+        let breaker = breaker(Arc::clone(&clock), 2, 1, 1);
+
+        breaker
+            .try_acquire()
+            .expect("first closed permit")
+            .failure("connect");
+        clock.advance(FAILURE_WINDOW);
+        breaker
+            .try_acquire()
+            .expect("expired failure should start a new window")
+            .failure("connect");
+
+        assert_eq!(breaker.state_name(), "closed");
+        breaker
+            .try_acquire()
+            .expect("second failure in the new window")
+            .failure("connect");
+        assert_eq!(breaker.state_name(), "open");
     }
 
     #[test]

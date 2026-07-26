@@ -961,7 +961,7 @@ Retry telemetry uses only bounded pool/endpoint IDs and safe result categories. 
 
 `circuit_breaker` is an optional pool-only object. Omitting it leaves circuit breaking disabled and preserves legacy behavior. It is rejected on a route using `upstream_url`. Its fields are:
 
-- `failure_threshold`: consecutive qualifying failures that open a closed endpoint circuit, default `5`, range 1-1000.
+- `failure_threshold`: consecutive qualifying failures within the fixed 60-second monotonic failure window that open a closed endpoint circuit, default `5`, range 1-1000. An incomplete failure sequence expires at the end of the window.
 - `open_ms`: monotonic-clock cool-down before an open endpoint may enter half-open, default `30000`, range 10-3600000.
 - `half_open_max_requests`: concurrent recovery probes per endpoint, default `1`, from 1 through the route's `limits.max_in_flight`.
 - `recovery_threshold`: successful half-open probes required to close the circuit, default `2`, range 1-1000.
