@@ -18,7 +18,16 @@ Default: empty, which serves the admin surface on `LISTEN_ADDR` with the data-pa
 
 Format and validation: unset, empty, or whitespace-only values disable split-listener mode. Non-empty values must parse as a Rust `SocketAddr`, using the same validation as `LISTEN_ADDR`. When set, `ADMIN_LISTEN_ADDR` must differ from `LISTEN_ADDR`.
 
-When set, GreenGateway starts two listeners in the same process. `LISTEN_ADDR` serves `/health`, `/version`, `/metrics`, and the reverse proxy fallback when `UPSTREAM_URL` is configured. `ADMIN_LISTEN_ADDR` serves the admin UI at `ADMIN_PREFIX` and admin APIs under `/v1{ADMIN_PREFIX}`. The same security middleware stack applies to both listeners; only the route sets differ.
+When set, GreenGateway starts two listeners in the same process. `LISTEN_ADDR` serves `/health`, `/livez`, `/startupz`, `/readyz`, `/version`, `/metrics`, and the reverse proxy fallback when `UPSTREAM_URL` is configured. `ADMIN_LISTEN_ADDR` serves the admin UI at `ADMIN_PREFIX` and admin APIs under `/v1{ADMIN_PREFIX}`. The same security middleware stack applies to both listeners; only the route sets differ.
+
+The deployment probes are exact, gateway-owned `GET`/`HEAD` routes on the data listener. They never fall through to an upstream and their handlers read cached process state only:
+
+- `/livez` returns `200` while the process is running, including while it is draining.
+- `/startupz` returns `503` until listener startup completes, then remains `200` for the lifetime of the process.
+- `/readyz` returns `200` only while the process accepts work and every upstream pool configured with `required_for_readiness:true` has at least `minimum_healthy` eligible endpoints. It returns `503` while starting, while draining, or when a required pool lacks capacity. Pools not marked as required do not affect readiness.
+- `/health` remains a backward-compatible `200` aggregate response. Detailed per-pool and per-endpoint state remains available only from the protected admin status endpoint.
+
+Probe bodies contain only aggregate state and stable reason categories; they do not expose upstream URLs, endpoint topology, credentials, or internal errors. The default authentication, RBAC, and CSRF exemptions include all four probe routes. Setting an exempt-path variable explicitly replaces that default, so operators using explicit lists should retain the probes needed by their orchestrator.
 
 ### ADMIN_PREFIX
 
@@ -111,6 +120,30 @@ Optional SQLite audit event retention window, in days.
 Default: empty, which disables SQLite pruning.
 
 Format and validation: must parse as a `u32` day count when set. This value is only applied when `AUDIT_SQLITE_PATH` is also set; if the path is unset, the parsed retention value is accepted but has no effect. Retention pruning uses the indexed epoch column and runs at most once per minute, independently of the more frequent audit flush cadence. Rows with malformed external timestamps retain a `NULL` epoch and are not deleted automatically.
+
+### SHUTDOWN_DRAIN_DELAY_MS
+
+Delay between entering the draining phase and stopping the listeners, in milliseconds.
+
+Default: `1000`
+
+Format and validation: must parse as a `u64` no greater than `30000`; `0` is allowed. On the first Ctrl-C or Unix `SIGTERM`, GreenGateway immediately marks readiness false, emits `gateway.shutdown_started`, and cancels retry and health-check work. This delay gives external load balancers time to observe `/readyz` before the listeners stop accepting work.
+
+### SHUTDOWN_TIMEOUT_MS
+
+Maximum time allowed for listeners and registered background tasks to finish after the drain delay.
+
+Default: `30000`
+
+Format and validation: must parse as a `u64` between `1` and `300000`. When the deadline expires, GreenGateway cancels the remaining server futures, emits `gateway.shutdown_forced` with the safe reason `deadline`, and continues to the bounded audit drain. A second termination signal forces the same path immediately with reason `second_signal`.
+
+### AUDIT_DRAIN_TIMEOUT_MS
+
+Maximum time allowed for the asynchronous audit writer to close admission and deliver queued events during shutdown, in milliseconds.
+
+Default: `5000`
+
+Format and validation: must parse as a `u64` between `1` and `60000`. GreenGateway admits lifecycle events through capacity reserved from ordinary request audit traffic, emits one terminal `gateway.shutdown_completed` or `gateway.shutdown_forced` event before closing the audit queue, then waits for the writer and sink-flush acknowledgement. A control-event admission failure, writer panic, drain timeout, or required sink flush failure makes shutdown return an error so the process exits unsuccessfully instead of reporting a clean stop without its terminal audit record.
 
 ### DISCOVERY_SQLITE_PATH
 
@@ -587,9 +620,9 @@ This is deliberately separate from `DISCOVERY_SQLITE_PATH` and `AUDIT_SQLITE_PAT
 
 Comma-separated paths that bypass RBAC authorization.
 
-Default: `/health,/version,/metrics` plus the effective `ADMIN_PREFIX` (for example, `/admin` with the default prefix).
+Default: `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX` (for example, `/admin` with the default prefix).
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without RBAC permission checks and do not emit authz audit events, except that an exact configured MCP route is never RBAC-exempt. Non-MCP subpaths beneath an MCP alias keep the normal prefix behavior. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without RBAC; this warning is non-fatal because exempting an upstream path may be intentional.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without RBAC permission checks and do not emit authz audit events, except that an exact configured MCP route is never RBAC-exempt. Non-MCP subpaths beneath an MCP alias keep the normal prefix behavior. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without RBAC; this warning is non-fatal because exempting an upstream path may be intentional.
 
 ### CORS_ALLOW_ORIGINS
 
@@ -699,9 +732,9 @@ Format and validation: must be a non-empty RFC 6265 cookie name. The cookie valu
 
 Comma-separated paths that bypass authentication.
 
-Default: `/health,/version,/metrics` plus the effective `ADMIN_PREFIX` (for example, `/admin` with the default prefix).
+Default: `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX` (for example, `/admin` with the default prefix).
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without credential extraction and do not emit auth audit events, except that an exact configured MCP route is never authentication-exempt. Non-MCP subpaths beneath an MCP alias keep the normal prefix behavior. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without authentication; this warning is non-fatal because exempting an upstream path may be intentional.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without credential extraction and do not emit auth audit events, except that an exact configured MCP route is never authentication-exempt. Non-MCP subpaths beneath an MCP alias keep the normal prefix behavior. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without authentication; this warning is non-fatal because exempting an upstream path may be intentional.
 
 ### AUTH_PROVIDERS
 
@@ -889,7 +922,7 @@ Format and validation: unset or empty values become `None`. Non-empty values mus
 
 Comma-separated paths that bypass CSRF checks.
 
-Default: `/health,/version,/metrics`
+Default: `/health,/livez,/startupz,/readyz,/version,/metrics`
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. Exempt paths return before CSRF cookie issuance, so the default probe routes do not receive a CSRF cookie today. Exact configured MCP routes ignore matching CSRF exempt entries and remain protected; non-MCP paths are unchanged.
 

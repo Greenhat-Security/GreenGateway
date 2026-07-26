@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         atomic::{AtomicU8, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::Duration,
 };
@@ -14,7 +14,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::ProxyRoutes;
-use crate::{audit, config, egress, lifecycle::Clock};
+use crate::{
+    audit, config, egress,
+    lifecycle::{Clock, GatewayLifecycle},
+};
 
 const UPSTREAM_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const HEALTH_UNKNOWN: u8 = 0;
@@ -380,6 +383,28 @@ pub(super) async fn upstream_health_admin_response(
     }
 }
 
+pub(super) fn required_pools_ready(upstream_health: &[UpstreamHealthTarget]) -> bool {
+    let mut pools = BTreeMap::<&str, (usize, usize)>::new();
+    for target in upstream_health {
+        let Some(config) = target
+            .config
+            .as_ref()
+            .filter(|config| config.required_for_readiness)
+        else {
+            continue;
+        };
+        let pool = pools
+            .entry(target.pool_id.as_str())
+            .or_insert((config.minimum_healthy, 0));
+        if target.health.eligible() {
+            pool.1 = pool.1.saturating_add(1);
+        }
+    }
+    pools
+        .into_values()
+        .all(|(minimum_healthy, eligible)| eligible >= minimum_healthy)
+}
+
 #[derive(Clone, Default)]
 pub(super) struct UpstreamHealthRuntime {
     inner: Arc<UpstreamHealthRuntimeInner>,
@@ -388,32 +413,30 @@ pub(super) struct UpstreamHealthRuntime {
 #[derive(Default)]
 struct UpstreamHealthRuntimeInner {
     cancellation: CancellationToken,
-    handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Drop for UpstreamHealthRuntimeInner {
     fn drop(&mut self) {
         self.cancellation.cancel();
-        let handles = self
-            .handles
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for handle in handles.drain(..) {
-            handle.abort();
-        }
     }
 }
 
 impl UpstreamHealthRuntime {
-    pub(super) fn spawn(&self, upstream_health: &[UpstreamHealthTarget], clock: Arc<dyn Clock>) {
-        let handles =
-            spawn_upstream_health_checks(upstream_health, clock, self.inner.cancellation.clone());
-        let mut retained = self
-            .inner
-            .handles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        retained.extend(handles);
+    pub(super) fn spawn(
+        &self,
+        upstream_health: &[UpstreamHealthTarget],
+        clock: Arc<dyn Clock>,
+        lifecycle: &GatewayLifecycle,
+    ) {
+        let handles = spawn_upstream_health_checks(
+            upstream_health,
+            clock,
+            self.inner.cancellation.clone(),
+            lifecycle.background_cancellation(),
+        );
+        for handle in handles {
+            lifecycle.register_background_task(handle);
+        }
     }
 }
 
@@ -421,6 +444,7 @@ fn spawn_upstream_health_checks(
     upstream_health: &[UpstreamHealthTarget],
     clock: Arc<dyn Clock>,
     cancellation: CancellationToken,
+    lifecycle_cancellation: CancellationToken,
 ) -> Vec<JoinHandle<()>> {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         tracing::warn!(
@@ -437,6 +461,7 @@ fn spawn_upstream_health_checks(
         let config = target.config.clone();
         let clock = Arc::clone(&clock);
         let cancellation = cancellation.clone();
+        let lifecycle_cancellation = lifecycle_cancellation.clone();
 
         handles.push(handle.spawn(run_upstream_health_check_loop(
             health,
@@ -445,6 +470,7 @@ fn spawn_upstream_health_checks(
             config,
             clock,
             cancellation,
+            lifecycle_cancellation,
         )));
     }
     handles
@@ -457,6 +483,7 @@ async fn run_upstream_health_check_loop(
     config: Option<config::UpstreamHealthCheckConfig>,
     clock: Arc<dyn Clock>,
     cancellation: CancellationToken,
+    lifecycle_cancellation: CancellationToken,
 ) {
     loop {
         let refresh = refresh_upstream_health(
@@ -469,6 +496,7 @@ async fn run_upstream_health_check_loop(
         tokio::select! {
             () = refresh => {}
             () = cancellation.cancelled() => return,
+            () = lifecycle_cancellation.cancelled() => return,
         }
         let interval = config
             .as_ref()
@@ -478,6 +506,7 @@ async fn run_upstream_health_check_loop(
         tokio::select! {
             () = clock.sleep(interval) => {}
             () = cancellation.cancelled() => return,
+            () = lifecycle_cancellation.cancelled() => return,
         }
     }
 }
@@ -873,6 +902,7 @@ mod tests {
             .await;
         let status = upstream_health_admin_response(&targets).await;
         assert!(!status.ready);
+        assert!(!required_pools_ready(&targets));
         assert_eq!(status.pools[0].eligible_endpoints, 1);
         assert_eq!(status.pools[0].minimum_healthy, 2);
 
@@ -888,10 +918,32 @@ mod tests {
             .await;
         let status = upstream_health_admin_response(&targets).await;
         assert!(status.ready);
+        assert!(required_pools_ready(&targets));
         assert_eq!(status.pools[0].eligible_endpoints, 2);
         let serialized = serde_json::to_string(&status).expect("status should serialize");
         assert!(!serialized.contains("first.internal"));
         assert!(!serialized.contains("second.internal"));
+    }
+
+    #[test]
+    fn readiness_ignores_non_required_pools() {
+        let client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::default())
+                .expect("test client should build"),
+        );
+        let mut config = test_health_config();
+        config.required_for_readiness = false;
+        config.minimum_healthy = 2;
+        let targets = upstream_health_targets([(
+            "analytics".to_owned(),
+            "optional".to_owned(),
+            "https://analytics.internal".to_owned(),
+            client,
+            UpstreamHealthState::new("analytics", "optional", None),
+            Some(config),
+        )]);
+
+        assert!(required_pools_ready(&targets));
     }
 
     struct StaticResolver {
@@ -989,6 +1041,7 @@ mod tests {
             None,
             clock,
             CancellationToken::new(),
+            CancellationToken::new(),
         ));
 
         tokio::time::timeout(Duration::from_secs(2), probes_rx.recv())
@@ -1060,6 +1113,7 @@ mod tests {
             Some(config),
             clock,
             cancellation.clone(),
+            CancellationToken::new(),
         ));
 
         tokio::time::timeout(Duration::from_secs(2), accepted_rx)

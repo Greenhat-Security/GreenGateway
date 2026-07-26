@@ -444,6 +444,26 @@ impl EndpointAggregatorSink {
     fn flush_for_test(&self) {
         self.shared.flush_state();
     }
+
+    fn shutdown_and_flush(&self) -> Result<(), String> {
+        if let Some(shutdown_tx) = take_mutex_value(&self.shutdown_tx, "shutdown_tx", &self.shared)
+        {
+            let _ = shutdown_tx.send(());
+        }
+
+        if let Some(flusher) = take_mutex_value(&self.flusher, "flusher", &self.shared) {
+            if flusher.join().is_err() {
+                return Err(
+                    "SQLite discovery aggregator flusher thread panicked during shutdown"
+                        .to_owned(),
+                );
+            }
+        }
+
+        self.shared
+            .try_flush_state()
+            .map_err(|error| format!("SQLite discovery aggregator flush failed: {error}"))
+    }
 }
 
 impl AuditSink for EndpointAggregatorSink {
@@ -456,25 +476,21 @@ impl AuditSink for EndpointAggregatorSink {
             self.shared.flush_state();
         }
     }
+
+    fn flush(&self) -> Result<(), String> {
+        self.shutdown_and_flush()
+    }
 }
 
 impl Drop for EndpointAggregatorSink {
     fn drop(&mut self) {
-        if let Some(shutdown_tx) = take_mutex_value(&self.shutdown_tx, "shutdown_tx", &self.shared)
-        {
-            let _ = shutdown_tx.send(());
+        if let Err(error) = self.shutdown_and_flush() {
+            tracing::error!(
+                path = %self.shared.path.display(),
+                %error,
+                "SQLite discovery aggregator failed during shutdown"
+            );
         }
-
-        if let Some(flusher) = take_mutex_value(&self.flusher, "flusher", &self.shared) {
-            if flusher.join().is_err() {
-                tracing::error!(
-                    path = %self.shared.path.display(),
-                    "SQLite discovery aggregator flusher thread panicked during shutdown"
-                );
-            }
-        }
-
-        self.shared.flush_state();
     }
 }
 
@@ -492,9 +508,19 @@ impl EndpointAggregatorShared {
     }
 
     fn flush_state(&self) {
+        if let Err(err) = self.try_flush_state() {
+            tracing::error!(
+                path = %self.path.display(),
+                error = %err,
+                "failed to flush SQLite discovery aggregates; keeping dirty state for retry"
+            );
+        }
+    }
+
+    fn try_flush_state(&self) -> Result<(), EndpointAggregatorFlushError> {
         let mut state = self.state_guard();
         if !state.has_pending_flush() {
-            return;
+            return Ok(());
         }
 
         let deleted_keys = state.deleted_keys.iter().cloned().collect::<Vec<_>>();
@@ -521,17 +547,9 @@ impl EndpointAggregatorShared {
             Ok(opened_signals) => {
                 state.mark_flushed(&deleted_keys, &dirty_keys, pending_signals.len());
                 self.emit_signal_opened_events(&opened_signals);
+                Ok(())
             }
-            Err(err) => {
-                tracing::error!(
-                    path = %self.path.display(),
-                    deleted_count = deleted_keys.len(),
-                    aggregate_count = dirty_aggregates.len(),
-                    signal_count = pending_signals.len(),
-                    error = %err,
-                    "failed to flush SQLite discovery aggregates; keeping dirty state for retry"
-                );
-            }
+            Err(err) => Err(err),
         }
     }
 

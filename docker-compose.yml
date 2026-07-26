@@ -5,5 +5,6 @@ services:
       dockerfile: Dockerfile
     environment:
       LISTEN_ADDR: 0.0.0.0:8080
+    stop_grace_period: 45s
     ports:
       - "8080:8080"

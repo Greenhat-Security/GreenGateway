@@ -49,13 +49,26 @@ const DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES: &[&str] = &["application/json"];
 const DEFAULT_AUTH_ENABLED: bool = true;
 pub const DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE: f64 = 0.10;
 pub const DEFAULT_DISCOVERY_ENDPOINT_LIMIT: usize = 10_000;
+pub const DEFAULT_SHUTDOWN_DRAIN_DELAY_MS: u64 = 1_000;
+pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_AUDIT_DRAIN_TIMEOUT_MS: u64 = 5_000;
+const MAX_SHUTDOWN_DRAIN_DELAY_MS: u64 = 30_000;
+const MAX_SHUTDOWN_TIMEOUT_MS: u64 = 300_000;
+const MAX_AUDIT_DRAIN_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_AUTH_MODE: AuthMode = AuthMode::Required;
 const DEFAULT_AUTH_COOKIE_NAME: &str = "session";
 pub const DEFAULT_ADMIN_PREFIX: &str = "/admin";
 pub const DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS: u64 = 300;
 pub const DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES: usize = 1_024;
 pub const DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP: usize = 16;
-const DEFAULT_EXEMPT_PROBE_PATHS: &[&str] = &["/health", "/version", "/metrics"];
+const DEFAULT_EXEMPT_PROBE_PATHS: &[&str] = &[
+    "/health",
+    "/livez",
+    "/startupz",
+    "/readyz",
+    "/version",
+    "/metrics",
+];
 const DEFAULT_JWT_JWKS_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_ROLES_CLAIM: &str = "roles";
 pub const DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS: u64 = 2000;
@@ -68,7 +81,14 @@ pub const DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_CSRF_ENABLED: bool = true;
 const DEFAULT_CSRF_COOKIE_NAME: &str = "csrf_token";
 const DEFAULT_CSRF_HEADER_NAME: &str = "x-csrf-token";
-const DEFAULT_CSRF_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
+const DEFAULT_CSRF_EXEMPT_PATHS: &[&str] = &[
+    "/health",
+    "/livez",
+    "/startupz",
+    "/readyz",
+    "/version",
+    "/metrics",
+];
 const DEFAULT_EGRESS_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_EGRESS_RESPONSE_IDLE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_EGRESS_CONNECT_TIMEOUT_MS: u64 = 10_000;
@@ -84,6 +104,7 @@ const ADMIN_PREFIX: &str = "ADMIN_PREFIX";
 const AUDIT_LOG_FILE: &str = "AUDIT_LOG_FILE";
 const AUDIT_SQLITE_PATH: &str = "AUDIT_SQLITE_PATH";
 const AUDIT_SQLITE_RETENTION_DAYS: &str = "AUDIT_SQLITE_RETENTION_DAYS";
+const AUDIT_DRAIN_TIMEOUT_MS: &str = "AUDIT_DRAIN_TIMEOUT_MS";
 const AUTH_COOKIE_NAME: &str = "AUTH_COOKIE_NAME";
 const AUTH_ENABLED: &str = "AUTH_ENABLED";
 const AUTH_EXEMPT_PATHS: &str = "AUTH_EXEMPT_PATHS";
@@ -132,6 +153,8 @@ const ROLES_CLAIM: &str = "ROLES_CLAIM";
 const SERVICE_TOKEN_CACHE_TTL_MS: &str = "SERVICE_TOKEN_CACHE_TTL_MS";
 const SERVICE_TOKEN_SQLITE_PATH: &str = "SERVICE_TOKEN_SQLITE_PATH";
 const SCHEMA_MISMATCH_SIGNAL_THRESHOLD: &str = "SCHEMA_MISMATCH_SIGNAL_THRESHOLD";
+const SHUTDOWN_DRAIN_DELAY_MS: &str = "SHUTDOWN_DRAIN_DELAY_MS";
+const SHUTDOWN_TIMEOUT_MS: &str = "SHUTDOWN_TIMEOUT_MS";
 const TOOL_RUNTIME_DEFAULT_TIMEOUT_MS: &str = "TOOL_RUNTIME_DEFAULT_TIMEOUT_MS";
 const TOOL_RUNTIME_GLOBAL_CONCURRENCY: &str = "TOOL_RUNTIME_GLOBAL_CONCURRENCY";
 const TOOL_RUNTIME_QUEUE_DEPTH: &str = "TOOL_RUNTIME_QUEUE_DEPTH";
@@ -161,6 +184,9 @@ pub struct Config {
     pub audit_log_file: Option<String>,
     pub audit_sqlite_path: Option<String>,
     pub audit_sqlite_retention_days: Option<u32>,
+    pub shutdown_drain_delay_ms: u64,
+    pub shutdown_timeout_ms: u64,
+    pub audit_drain_timeout_ms: u64,
     pub discovery_sqlite_path: Option<String>,
     pub discovery_endpoint_limit: usize,
     pub principal_sqlite_path: Option<String>,
@@ -730,6 +756,45 @@ impl Config {
             "day count",
             &mut problems,
         );
+        let shutdown_drain_delay_ms = validate_maximum_u64(
+            SHUTDOWN_DRAIN_DELAY_MS,
+            parse_var(
+                SHUTDOWN_DRAIN_DELAY_MS,
+                get_var(SHUTDOWN_DRAIN_DELAY_MS),
+                DEFAULT_SHUTDOWN_DRAIN_DELAY_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            MAX_SHUTDOWN_DRAIN_DELAY_MS,
+            DEFAULT_SHUTDOWN_DRAIN_DELAY_MS,
+            &mut problems,
+        );
+        let shutdown_timeout_ms = validate_positive_bounded_u64(
+            SHUTDOWN_TIMEOUT_MS,
+            parse_var(
+                SHUTDOWN_TIMEOUT_MS,
+                get_var(SHUTDOWN_TIMEOUT_MS),
+                DEFAULT_SHUTDOWN_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            MAX_SHUTDOWN_TIMEOUT_MS,
+            DEFAULT_SHUTDOWN_TIMEOUT_MS,
+            &mut problems,
+        );
+        let audit_drain_timeout_ms = validate_positive_bounded_u64(
+            AUDIT_DRAIN_TIMEOUT_MS,
+            parse_var(
+                AUDIT_DRAIN_TIMEOUT_MS,
+                get_var(AUDIT_DRAIN_TIMEOUT_MS),
+                DEFAULT_AUDIT_DRAIN_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            MAX_AUDIT_DRAIN_TIMEOUT_MS,
+            DEFAULT_AUDIT_DRAIN_TIMEOUT_MS,
+            &mut problems,
+        );
         let discovery_sqlite_path = parse_optional_string(
             DISCOVERY_SQLITE_PATH,
             get_var(DISCOVERY_SQLITE_PATH),
@@ -1201,6 +1266,9 @@ impl Config {
                 audit_log_file,
                 audit_sqlite_path,
                 audit_sqlite_retention_days,
+                shutdown_drain_delay_ms,
+                shutdown_timeout_ms,
+                audit_drain_timeout_ms,
                 discovery_sqlite_path,
                 discovery_endpoint_limit,
                 principal_sqlite_path,
@@ -1333,6 +1401,38 @@ fn validate_positive_u64(name: &str, value: u64, default: u64, problems: &mut Ve
         value
     } else {
         problems.push(format!("{name} must be greater than 0, got '{value}'"));
+        default
+    }
+}
+
+fn validate_maximum_u64(
+    name: &str,
+    value: u64,
+    maximum: u64,
+    default: u64,
+    problems: &mut Vec<String>,
+) -> u64 {
+    if value <= maximum {
+        value
+    } else {
+        problems.push(format!("{name} must be at most {maximum}, got '{value}'"));
+        default
+    }
+}
+
+fn validate_positive_bounded_u64(
+    name: &str,
+    value: u64,
+    maximum: u64,
+    default: u64,
+    problems: &mut Vec<String>,
+) -> u64 {
+    if (1..=maximum).contains(&value) {
+        value
+    } else {
+        problems.push(format!(
+            "{name} must be between 1 and {maximum}, got '{value}'"
+        ));
         default
     }
 }
@@ -3171,6 +3271,9 @@ mod tests {
             config.rbac_exempt_paths,
             vec![
                 "/health".to_owned(),
+                "/livez".to_owned(),
+                "/startupz".to_owned(),
+                "/readyz".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
                 "/admin".to_owned(),
@@ -3187,6 +3290,9 @@ mod tests {
             config.auth_exempt_paths,
             vec![
                 "/health".to_owned(),
+                "/livez".to_owned(),
+                "/startupz".to_owned(),
+                "/readyz".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
                 "/admin".to_owned(),
@@ -3227,6 +3333,9 @@ mod tests {
             config.csrf_exempt_paths,
             vec![
                 "/health".to_owned(),
+                "/livez".to_owned(),
+                "/startupz".to_owned(),
+                "/readyz".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
             ]
@@ -3375,6 +3484,9 @@ mod tests {
             config.rbac_exempt_paths,
             vec![
                 "/health".to_owned(),
+                "/livez".to_owned(),
+                "/startupz".to_owned(),
+                "/readyz".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
                 "/admin".to_owned(),
@@ -3391,6 +3503,9 @@ mod tests {
             config.auth_exempt_paths,
             vec![
                 "/health".to_owned(),
+                "/livez".to_owned(),
+                "/startupz".to_owned(),
+                "/readyz".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
                 "/admin".to_owned(),
@@ -3431,6 +3546,9 @@ mod tests {
             config.csrf_exempt_paths,
             vec![
                 "/health".to_owned(),
+                "/livez".to_owned(),
+                "/startupz".to_owned(),
+                "/readyz".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
             ]
@@ -3530,6 +3648,9 @@ mod tests {
             config.rbac_exempt_paths,
             vec![
                 "/health".to_owned(),
+                "/livez".to_owned(),
+                "/startupz".to_owned(),
+                "/readyz".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
                 "/ops/admin".to_owned(),
@@ -3539,6 +3660,9 @@ mod tests {
             config.auth_exempt_paths,
             vec![
                 "/health".to_owned(),
+                "/livez".to_owned(),
+                "/startupz".to_owned(),
+                "/readyz".to_owned(),
                 "/version".to_owned(),
                 "/metrics".to_owned(),
                 "/ops/admin".to_owned(),
@@ -3556,6 +3680,9 @@ mod tests {
 
         let expected = vec![
             "/health".to_owned(),
+            "/livez".to_owned(),
+            "/startupz".to_owned(),
+            "/readyz".to_owned(),
             "/version".to_owned(),
             "/metrics".to_owned(),
             "/ops".to_owned(),
@@ -3999,6 +4126,49 @@ mod tests {
                 "2001:db8::/32".parse::<IpNet>().unwrap()
             ]
         );
+    }
+
+    #[test]
+    fn shutdown_config_defaults_and_explicit_values_parse() {
+        let defaults =
+            Config::from_env_vars(|_| Err(VarError::NotPresent)).expect("config should parse");
+        assert_eq!(
+            defaults.shutdown_drain_delay_ms,
+            DEFAULT_SHUTDOWN_DRAIN_DELAY_MS
+        );
+        assert_eq!(defaults.shutdown_timeout_ms, DEFAULT_SHUTDOWN_TIMEOUT_MS);
+        assert_eq!(
+            defaults.audit_drain_timeout_ms,
+            DEFAULT_AUDIT_DRAIN_TIMEOUT_MS
+        );
+
+        let configured = Config::from_env_vars(|name| match name {
+            "SHUTDOWN_DRAIN_DELAY_MS" => Ok("0".to_owned()),
+            "SHUTDOWN_TIMEOUT_MS" => Ok("45000".to_owned()),
+            "AUDIT_DRAIN_TIMEOUT_MS" => Ok("7500".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("shutdown configuration should parse");
+        assert_eq!(configured.shutdown_drain_delay_ms, 0);
+        assert_eq!(configured.shutdown_timeout_ms, 45_000);
+        assert_eq!(configured.audit_drain_timeout_ms, 7_500);
+    }
+
+    #[test]
+    fn invalid_shutdown_config_is_rejected_with_all_problems() {
+        let error = Config::from_env_vars(|name| match name {
+            "SHUTDOWN_DRAIN_DELAY_MS" => Ok("30001".to_owned()),
+            "SHUTDOWN_TIMEOUT_MS" => Ok("0".to_owned()),
+            "AUDIT_DRAIN_TIMEOUT_MS" => Ok("not-a-duration".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("invalid shutdown configuration must fail startup");
+
+        let message = error.to_string();
+        assert!(message.contains("SHUTDOWN_DRAIN_DELAY_MS must be at most 30000"));
+        assert!(message.contains("SHUTDOWN_TIMEOUT_MS must be between 1 and 300000"));
+        assert!(message.contains("AUDIT_DRAIN_TIMEOUT_MS must be a valid millisecond duration"));
+        assert_eq!(error.problems.len(), 3);
     }
 
     #[test]
