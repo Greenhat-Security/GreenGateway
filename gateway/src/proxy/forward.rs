@@ -55,6 +55,11 @@ impl fmt::Display for RedactedProxyBodyError {
 
 impl Error for RedactedProxyBodyError {}
 
+type PumpedResponseItem = (
+    Result<bytes::Bytes, RedactedProxyBodyError>,
+    Option<tokio::sync::oneshot::Sender<()>>,
+);
+
 pub(super) async fn forward_request(
     proxy: &ProxyState,
     request: Request<Body>,
@@ -692,81 +697,154 @@ fn redacted_response_body(
         Arc<crate::config::UpstreamHealthCheckConfig>,
     )>,
 ) -> Body {
-    let redacted_tail = stream::unfold(
-        (
-            upstream_body,
-            Some(admission_permit),
-            retry_permit,
-            passive_health,
-            false,
-        ),
-        move |(mut upstream_body, mut admission_permit, mut retry_permit, passive_health, done)| async move {
-            if done {
-                return None;
+    let (tail_sender, tail_receiver) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(pump_redacted_response_tail(
+        upstream_body,
+        tail_sender,
+        admission_permit,
+        retry_permit,
+        deadline,
+        passive_health,
+    ));
+    let redacted_tail = stream::unfold(tail_receiver, |mut receiver| async {
+        receiver.recv().await.map(|(item, consumed)| {
+            if let Some(consumed) = consumed {
+                let _ = consumed.send(());
             }
-            match tokio::time::timeout_at(deadline, upstream_body.next()).await {
-                Ok(Some(Ok(chunk))) => Some((
-                    Ok(chunk),
-                    (
-                        upstream_body,
-                        admission_permit,
-                        retry_permit,
-                        passive_health,
-                        false,
-                    ),
-                )),
-                Ok(Some(Err(error))) => {
-                    let category = proxy_error_category(&error);
-                    drop(admission_permit.take());
-                    drop(retry_permit.take());
-                    if let Some((health, config)) = passive_health.as_ref() {
-                        health.record_passive_proxy_error(&error, config).await;
-                    }
-                    tracing::warn!(
-                        error_category = category,
-                        "proxied upstream response body failed after response commitment"
-                    );
-                    Some((
-                        Err(RedactedProxyBodyError(category)),
-                        (
-                            upstream_body,
-                            admission_permit,
-                            retry_permit,
-                            passive_health,
-                            true,
-                        ),
-                    ))
-                }
-                Ok(None) => None,
-                Err(_) => {
-                    drop(admission_permit.take());
-                    drop(retry_permit.take());
-                    if let Some((health, config)) = passive_health.as_ref() {
-                        health.record_passive_timeout(config).await;
-                    }
-                    tracing::warn!(
-                        error_category = "request_timeout",
-                        "proxied upstream response body exceeded the logical request deadline after response commitment"
-                    );
-                    Some((
-                        Err(RedactedProxyBodyError("request_timeout")),
-                        (
-                            upstream_body,
-                            admission_permit,
-                            retry_permit,
-                            passive_health,
-                            true,
-                        ),
-                    ))
-                }
-            }
-        },
-    );
+            (item, receiver)
+        })
+    });
 
     Body::from_stream(
         stream::once(async move { Ok::<_, RedactedProxyBodyError>(first_chunk) })
             .chain(redacted_tail),
     )
+}
+
+async fn pump_redacted_response_tail(
+    mut upstream_body: egress::EgressBodyStream,
+    tail_sender: tokio::sync::mpsc::Sender<PumpedResponseItem>,
+    admission_permit: super::admission::PoolAdmissionPermit,
+    retry_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    deadline: tokio::time::Instant,
+    passive_health: Option<(
+        super::health::UpstreamHealthState,
+        Arc<crate::config::UpstreamHealthCheckConfig>,
+    )>,
+) {
+    let mut admission_permit = Some(admission_permit);
+    let mut retry_permit = retry_permit;
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                finish_response_timeout(
+                    upstream_body,
+                    &tail_sender,
+                    &mut admission_permit,
+                    &mut retry_permit,
+                    passive_health.as_ref(),
+                ).await;
+                return;
+            }
+            () = tail_sender.closed() => return,
+            next = upstream_body.next() => next,
+        };
+        let Some(result) = next else {
+            return;
+        };
+        match result {
+            Ok(chunk) => {
+                let (consumed_sender, consumed_receiver) = tokio::sync::oneshot::channel();
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => {
+                        finish_response_timeout(
+                            upstream_body,
+                            &tail_sender,
+                            &mut admission_permit,
+                            &mut retry_permit,
+                            passive_health.as_ref(),
+                        ).await;
+                        return;
+                    }
+                    () = tail_sender.closed() => return,
+                    result = tail_sender.send((Ok(chunk), Some(consumed_sender))) => {
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => {
+                        finish_response_timeout(
+                            upstream_body,
+                            &tail_sender,
+                            &mut admission_permit,
+                            &mut retry_permit,
+                            passive_health.as_ref(),
+                        ).await;
+                        return;
+                    }
+                    () = tail_sender.closed() => return,
+                    consumed = consumed_receiver => {
+                        if consumed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                let category = proxy_error_category(&error);
+                release_response_permits(&mut admission_permit, &mut retry_permit);
+                drop(upstream_body);
+                if let Some((health, config)) = passive_health.as_ref() {
+                    health.record_passive_proxy_error(&error, config).await;
+                }
+                tracing::warn!(
+                    error_category = category,
+                    "proxied upstream response body failed after response commitment"
+                );
+                let _ = tail_sender
+                    .send((Err(RedactedProxyBodyError(category)), None))
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+async fn finish_response_timeout(
+    upstream_body: egress::EgressBodyStream,
+    tail_sender: &tokio::sync::mpsc::Sender<PumpedResponseItem>,
+    admission_permit: &mut Option<super::admission::PoolAdmissionPermit>,
+    retry_permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+    passive_health: Option<&(
+        super::health::UpstreamHealthState,
+        Arc<crate::config::UpstreamHealthCheckConfig>,
+    )>,
+) {
+    release_response_permits(admission_permit, retry_permit);
+    drop(upstream_body);
+    if let Some((health, config)) = passive_health {
+        health.record_passive_timeout(config).await;
+    }
+    tracing::warn!(
+        error_category = "request_timeout",
+        "proxied upstream response body exceeded the logical request deadline after response commitment"
+    );
+    let _ = tail_sender
+        .send((Err(RedactedProxyBodyError("request_timeout")), None))
+        .await;
+}
+
+fn release_response_permits(
+    admission_permit: &mut Option<super::admission::PoolAdmissionPermit>,
+    retry_permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+) {
+    drop(admission_permit.take());
+    drop(retry_permit.take());
 }
 
 fn error_response_with_outcome(
@@ -1650,6 +1728,79 @@ mod tests {
         drop(admission);
         drop(retry_budget);
         drop(body);
+
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn committed_tail_deadline_releases_capacity_without_downstream_polling() {
+        let first_requests = Arc::new(Mutex::new(Vec::new()));
+        let second_requests = Arc::new(Mutex::new(Vec::new()));
+        let (first_addr, first_server) = spawn_status_upstream_after(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Arc::clone(&first_requests),
+            Duration::from_millis(75),
+        )
+        .await;
+        let (second_addr, second_server) =
+            spawn_trickling_upstream(Arc::clone(&second_requests), Duration::ZERO).await;
+        let (proxy, _, health_states) = retry_proxy_with_options(
+            [first_addr, second_addr],
+            RetryProxyOptions {
+                retry: Some(config::UpstreamRetryConfig {
+                    max_attempts: 2,
+                    methods: vec!["GET".to_owned()],
+                    statuses: vec![503],
+                }),
+                timeout: Duration::from_millis(250),
+                limits: config::UpstreamPoolLimitsConfig {
+                    max_in_flight: 1,
+                    queue_depth: 0,
+                    queue_timeout_ms: 10,
+                },
+                health_config: Some(passive_health_config()),
+                ..RetryProxyOptions::default()
+            },
+        );
+        let pool = test_pool(&proxy);
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/items")
+            .header(REQUEST_ID_HEADER, "unpolled-tail-deadline")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(
+            pool.admission.acquire().await,
+            Err(super::super::admission::PoolAdmissionError::QueueFull)
+        ));
+        assert!(
+            pool.retry_budget.try_acquire().is_none(),
+            "retry budget must be held before the deadline"
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let admission = pool
+            .admission
+            .acquire()
+            .await
+            .expect("deadline must release admission without downstream polling");
+        let retry_budget = pool
+            .retry_budget
+            .try_acquire()
+            .expect("deadline must release retry budget without downstream polling");
+        assert!(!health_states[1].eligible());
+        assert_eq!(
+            health_states[1].last_failure_category().await.as_deref(),
+            Some("request_timeout")
+        );
+        drop(admission);
+        drop(retry_budget);
+        drop(response);
 
         first_server.abort();
         second_server.abort();
