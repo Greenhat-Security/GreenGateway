@@ -1,4 +1,4 @@
-use std::{collections::HashSet, error::Error, io::ErrorKind, sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use http::{Method, StatusCode};
 use sha2::{Digest, Sha256};
@@ -64,47 +64,8 @@ impl RetryPolicy {
     }
 
     pub(super) fn retries_error(&self, error: &egress::EgressError) -> bool {
-        match error {
-            egress::EgressError::ResponseIdleTimeout { .. } => true,
-            egress::EgressError::Http(error) if error.is_timeout() => true,
-            egress::EgressError::Http(error) if error.is_connect() => {
-                error_chain_has_retryable_io(error)
-            }
-            egress::EgressError::HostNotAllowed(_)
-            | egress::EgressError::PortNotAllowed(_)
-            | egress::EgressError::NonGlobalIpBlocked(_)
-            | egress::EgressError::InvalidPolicy(_)
-            | egress::EgressError::DnsResolutionFailed(_)
-            | egress::EgressError::InvalidUrl(_)
-            | egress::EgressError::SchemeNotAllowed(_)
-            | egress::EgressError::RequestBodyTooLarge { .. }
-            | egress::EgressError::RequestBodyReadFailed
-            | egress::EgressError::UnexpectedStatus(_)
-            | egress::EgressError::ResponseTooLarge { .. }
-            | egress::EgressError::InvalidTlsCaBundle { .. }
-            | egress::EgressError::Http(_) => false,
-        }
+        error.is_retryable_transport_failure()
     }
-}
-
-fn error_chain_has_retryable_io(error: &reqwest::Error) -> bool {
-    let mut source = error.source();
-    while let Some(error) = source {
-        if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
-            return matches!(
-                io_error.kind(),
-                ErrorKind::ConnectionRefused
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::NotConnected
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::TimedOut
-                    | ErrorKind::UnexpectedEof
-            );
-        }
-        source = error.source();
-    }
-    false
 }
 
 #[derive(Clone)]
