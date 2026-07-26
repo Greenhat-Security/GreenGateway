@@ -8702,6 +8702,7 @@ mod tests {
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,
+            circuit_breaker: None,
             timeout_ms: None,
             response_idle_timeout_ms: None,
             connect_timeout_ms: None,

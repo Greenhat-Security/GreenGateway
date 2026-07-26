@@ -11,3 +11,5 @@ pub const PROXY_UPSTREAM_ATTEMPT_DURATION_SECONDS: &str = "proxy_upstream_attemp
 pub const PROXY_UPSTREAM_RETRIES_TOTAL: &str = "proxy_upstream_retries_total";
 pub const PROXY_RETRY_BUDGET_EXHAUSTED_TOTAL: &str = "proxy_retry_budget_exhausted_total";
 pub const UPSTREAM_HEALTH_TRANSITIONS_TOTAL: &str = "upstream_health_transitions_total";
+pub const UPSTREAM_CIRCUIT_TRANSITIONS_TOTAL: &str = "upstream_circuit_transitions_total";
+pub const UPSTREAM_CIRCUIT_REJECTIONS_TOTAL: &str = "upstream_circuit_rejections_total";

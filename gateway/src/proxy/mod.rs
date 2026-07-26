@@ -15,6 +15,7 @@ use url::Url;
 use crate::{audit, config, egress, lifecycle, upstream_route};
 
 mod admission;
+mod circuit;
 mod forward;
 mod health;
 mod retry;
@@ -195,6 +196,12 @@ struct ProxyEndpoint {
     egress_client: Arc<egress::EgressClient>,
     health: health::UpstreamHealthState,
     health_config: Option<Arc<config::UpstreamHealthCheckConfig>>,
+    circuit: Option<circuit::CircuitBreaker>,
+}
+
+struct SelectedEndpoint {
+    endpoint: ProxyEndpoint,
+    circuit_permit: Option<circuit::CircuitPermit>,
 }
 
 struct UpstreamPool {
@@ -232,6 +239,7 @@ impl UpstreamPool {
     #[cfg(test)]
     fn select_endpoint(&self) -> Option<ProxyEndpoint> {
         self.select_endpoint_avoiding(&HashSet::new())
+            .map(|selected| selected.endpoint)
     }
 
     fn request_timeout(&self) -> Duration {
@@ -245,45 +253,61 @@ impl UpstreamPool {
     fn select_endpoint_avoiding(
         &self,
         attempted_endpoint_ids: &HashSet<Arc<str>>,
-    ) -> Option<ProxyEndpoint> {
-        let has_fresh_endpoint = self.endpoints.iter().any(|endpoint| {
-            endpoint
-                .health_config
-                .as_ref()
-                .is_none_or(|_| endpoint.health.eligible())
-                && !attempted_endpoint_ids.contains(&endpoint.id)
-        });
-        let total_weight = self
-            .endpoints
-            .iter()
-            .filter(|endpoint| {
+    ) -> Option<SelectedEndpoint> {
+        let mut unavailable_circuits = HashSet::new();
+        loop {
+            let health_eligible = |endpoint: &&ProxyEndpoint| {
                 endpoint
                     .health_config
                     .as_ref()
                     .is_none_or(|_| endpoint.health.eligible())
+                    && !unavailable_circuits.contains(&endpoint.id)
+            };
+            let has_fresh_endpoint = self
+                .endpoints
+                .iter()
+                .filter(health_eligible)
+                .any(|endpoint| !attempted_endpoint_ids.contains(&endpoint.id));
+            let eligible = |endpoint: &&ProxyEndpoint| {
+                health_eligible(endpoint)
                     && (!has_fresh_endpoint || !attempted_endpoint_ids.contains(&endpoint.id))
-            })
-            .map(|endpoint| u64::from(endpoint.weight))
-            .sum::<u64>();
-        if total_weight == 0 {
-            return None;
+            };
+            let total_weight = self
+                .endpoints
+                .iter()
+                .filter(eligible)
+                .map(|endpoint| u64::from(endpoint.weight))
+                .sum::<u64>();
+            if total_weight == 0 {
+                return None;
+            }
+            let ticket = self.next_selection.fetch_add(1, Ordering::Relaxed) % total_weight;
+            let mut cumulative = 0_u64;
+            let endpoint = self
+                .endpoints
+                .iter()
+                .filter(eligible)
+                .find(|endpoint| {
+                    cumulative = cumulative.saturating_add(u64::from(endpoint.weight));
+                    ticket < cumulative
+                })
+                .expect("positive eligible weight must select an endpoint")
+                .clone();
+            let circuit_permit = match endpoint.circuit.as_ref() {
+                Some(circuit) => match circuit.try_acquire() {
+                    Some(permit) => Some(permit),
+                    None => {
+                        unavailable_circuits.insert(Arc::clone(&endpoint.id));
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            return Some(SelectedEndpoint {
+                endpoint,
+                circuit_permit,
+            });
         }
-        let ticket = self.next_selection.fetch_add(1, Ordering::Relaxed) % total_weight;
-        let mut cumulative = 0_u64;
-        self.endpoints
-            .iter()
-            .filter(|endpoint| {
-                endpoint
-                    .health_config
-                    .as_ref()
-                    .is_none_or(|_| endpoint.health.eligible())
-                    && (!has_fresh_endpoint || !attempted_endpoint_ids.contains(&endpoint.id))
-            })
-            .find(|endpoint| {
-                cumulative = cumulative.saturating_add(u64::from(endpoint.weight));
-                ticket < cumulative
-            })
-            .cloned()
     }
 }
 
@@ -307,6 +331,7 @@ impl ProxyState {
                     egress_client: Arc::clone(&egress_client),
                     health: health.clone(),
                     health_config: None,
+                    circuit: None,
                 }],
                 &config::UpstreamPoolLimitsConfig::default(),
                 None,
@@ -611,6 +636,7 @@ fn route_endpoints(
                 Some(audit.clone()),
             ),
             health_config: route.health_check.clone().map(Arc::new),
+            circuit: None,
         }]);
     }
 
@@ -637,10 +663,19 @@ fn route_endpoints(
                 egress_client: client,
                 health: health::UpstreamHealthState::new(
                     Arc::<str>::from(route_id),
-                    endpoint_id,
+                    Arc::clone(&endpoint_id),
                     Some(audit.clone()),
                 ),
                 health_config: route.health_check.clone().map(Arc::new),
+                circuit: route.circuit_breaker.as_ref().map(|config| {
+                    circuit::CircuitBreaker::new(
+                        Arc::<str>::from(route_id),
+                        Arc::clone(&endpoint_id),
+                        config.clone(),
+                        route.retry.as_ref(),
+                        Some(audit.clone()),
+                    )
+                }),
             })
         })
         .collect()
@@ -763,6 +798,7 @@ mod tests {
                     egress_client: Arc::clone(&client),
                     health: health::UpstreamHealthState::new("payments", "a", None),
                     health_config: None,
+                    circuit: None,
                 },
                 ProxyEndpoint {
                     id: Arc::from("b"),
@@ -771,6 +807,7 @@ mod tests {
                     egress_client: client,
                     health: health::UpstreamHealthState::new("payments", "b", None),
                     health_config: None,
+                    circuit: None,
                 },
             ],
             &config::UpstreamPoolLimitsConfig::default(),
@@ -801,6 +838,7 @@ mod tests {
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,
+            circuit_breaker: None,
             timeout_ms: None,
             response_idle_timeout_ms: None,
             connect_timeout_ms: None,
@@ -891,6 +929,7 @@ mod tests {
                 egress_client,
                 health: health::UpstreamHealthState::new("legacy", "primary", None),
                 health_config: None,
+                circuit: None,
             }],
             &config::UpstreamPoolLimitsConfig::default(),
             None,
@@ -942,6 +981,7 @@ mod tests {
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,
+            circuit_breaker: None,
             timeout_ms: Some(1234),
             response_idle_timeout_ms: None,
             connect_timeout_ms: None,
