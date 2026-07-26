@@ -1340,7 +1340,7 @@ fn egress_error_reason(error: &EgressError) -> &'static str {
         EgressError::ResponseTooLarge { .. } => "response_too_large",
         EgressError::ResponseIdleTimeout { .. } => "response_idle_timeout",
         EgressError::InvalidTlsCaBundle { .. } => "invalid_tls_ca_bundle",
-        EgressError::InvalidTlsClientIdentity { .. } => "invalid_tls_client_identity",
+        EgressError::InvalidTlsClientIdentity => "invalid_tls_client_identity",
         EgressError::Http(err) if err.is_timeout() => "timeout",
         EgressError::Http(_) => "http_error",
     }

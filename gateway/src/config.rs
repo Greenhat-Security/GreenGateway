@@ -2553,7 +2553,7 @@ fn validate_upstream_routes(
                     endpoint.tls_ca_bundle_path,
                     problems,
                 );
-                let client_identity_pem_path = normalize_route_tls_material_path(
+                let client_identity_pem_path = normalize_client_identity_pem_path(
                     &format!("{endpoint_name}.client_identity_pem_path"),
                     endpoint.client_identity_pem_path,
                     problems,
@@ -3004,6 +3004,28 @@ fn normalize_route_tls_material_path(
     } else {
         Some(value)
     }
+}
+
+fn normalize_client_identity_pem_path(
+    name: &str,
+    value: Option<PathBuf>,
+    problems: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let value = value?;
+    if value.as_os_str().is_empty() {
+        problems.push(format!("{name} must be a non-empty filesystem path"));
+        return None;
+    }
+
+    let rendered = value.to_string_lossy();
+    if rendered.contains('\n') || rendered.contains('\r') || rendered.contains("-----BEGIN") {
+        problems.push(format!(
+            "{name} must reference a mounted PEM file and must not contain inline PEM material"
+        ));
+        return None;
+    }
+
+    Some(value)
 }
 
 fn normalize_route_openapi_spec_path(
@@ -5947,6 +5969,27 @@ mod tests {
         let message = error.to_string();
 
         assert!(message.contains("unknown field `client_identity_pem`"));
+        assert!(!message.contains(inline_secret));
+
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(format!(
+                r#"[{{
+                    "id":"payments",
+                    "path_prefix":"/payments",
+                    "upstreams":[{{
+                        "id":"payments-a",
+                        "url":"https://a.example.test",
+                        "client_identity_pem_path":"-----BEGIN PRIVATE KEY-----\n{inline_secret}"
+                    }}]
+                }}]"#
+            )),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("inline identity material in the path field must fail startup");
+        let message = error.to_string();
+        assert!(message.contains(
+            "client_identity_pem_path must reference a mounted PEM file and must not contain inline PEM material"
+        ));
         assert!(!message.contains(inline_secret));
 
         let error = Config::from_env_vars(|name| match name {

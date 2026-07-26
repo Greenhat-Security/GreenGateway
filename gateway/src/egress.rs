@@ -2,9 +2,9 @@ use std::{
     collections::HashSet,
     error::Error,
     fmt, fs,
-    io::ErrorKind,
+    io::{ErrorKind, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         atomic::{AtomicU8, Ordering},
@@ -31,6 +31,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+const MAX_TLS_CLIENT_IDENTITY_PEM_BYTES: usize = 1024 * 1024;
 static PROCESS_PINNED_CLIENT_CACHE: LazyLock<Arc<client_cache::PinnedClientCache>> =
     LazyLock::new(|| Arc::new(client_cache::PinnedClientCache::new()));
 
@@ -115,7 +116,7 @@ pub enum EgressError {
     ResponseTooLarge { size: usize, max: usize },
     ResponseIdleTimeout { timeout: Duration },
     InvalidTlsCaBundle { path: PathBuf, message: String },
-    InvalidTlsClientIdentity { path: PathBuf },
+    InvalidTlsClientIdentity,
     Http(reqwest::Error),
 }
 
@@ -162,11 +163,9 @@ impl fmt::Display for EgressError {
                 "egress TLS CA bundle '{}' is invalid: {message}",
                 path.display()
             ),
-            Self::InvalidTlsClientIdentity { path } => write!(
-                formatter,
-                "egress TLS client identity '{}' is invalid",
-                path.display()
-            ),
+            Self::InvalidTlsClientIdentity => {
+                formatter.write_str("egress TLS client identity is invalid")
+            }
             Self::Http(err) => write!(formatter, "egress HTTP error: {err}"),
         }
     }
@@ -215,7 +214,7 @@ impl EgressError {
             Self::ResponseTooLarge { .. } => "response_too_large",
             Self::ResponseIdleTimeout { .. } => "response_idle_timeout",
             Self::InvalidTlsCaBundle { .. } => "invalid_tls_ca_bundle",
-            Self::InvalidTlsClientIdentity { .. } => "invalid_tls_client_identity",
+            Self::InvalidTlsClientIdentity => "invalid_tls_client_identity",
             Self::Http(err) if err.is_timeout() => "http_timeout",
             Self::Http(err) if err.is_connect() => "http_connect",
             Self::Http(err) if err.is_request() => "http_request",
@@ -243,7 +242,7 @@ impl EgressError {
             | Self::UnexpectedStatus(_)
             | Self::ResponseTooLarge { .. }
             | Self::InvalidTlsCaBundle { .. }
-            | Self::InvalidTlsClientIdentity { .. } => false,
+            | Self::InvalidTlsClientIdentity => false,
         }
     }
 
@@ -264,7 +263,7 @@ impl EgressError {
             | Self::UnexpectedStatus(_)
             | Self::ResponseTooLarge { .. }
             | Self::InvalidTlsCaBundle { .. }
-            | Self::InvalidTlsClientIdentity { .. }
+            | Self::InvalidTlsClientIdentity
             | Self::Http(_) => false,
         }
     }
@@ -613,24 +612,52 @@ impl EgressConfig {
     }
 
     pub fn apply_tls_client_identity_pem_path(&mut self, path: PathBuf) -> Result<(), EgressError> {
-        let bytes = fs::read(&path)
-            .map_err(|_| EgressError::InvalidTlsClientIdentity { path: path.clone() })?;
+        let bytes = read_tls_client_identity_pem(&path)?;
         if !tls_client_identity_pem_shape_is_valid(&bytes) {
-            return Err(EgressError::InvalidTlsClientIdentity { path });
+            return Err(EgressError::InvalidTlsClientIdentity);
         }
         let identity = reqwest::Identity::from_pem(&bytes)
-            .map_err(|_| EgressError::InvalidTlsClientIdentity { path: path.clone() })?;
+            .map_err(|_| EgressError::InvalidTlsClientIdentity)?;
 
         reqwest::Client::builder()
             .no_proxy()
             .identity(identity.clone())
             .build()
-            .map_err(|_| EgressError::InvalidTlsClientIdentity { path: path.clone() })?;
+            .map_err(|_| EgressError::InvalidTlsClientIdentity)?;
 
         self.client_identity = Some(identity);
         self.client_identity_fingerprint = Some(tls_client_identity_fingerprint(&bytes));
         Ok(())
     }
+}
+
+fn read_tls_client_identity_pem(path: &Path) -> Result<Vec<u8>, EgressError> {
+    let metadata = fs::metadata(path).map_err(|_| EgressError::InvalidTlsClientIdentity)?;
+    if !metadata.is_file() || metadata.len() > MAX_TLS_CLIENT_IDENTITY_PEM_BYTES as u64 {
+        return Err(EgressError::InvalidTlsClientIdentity);
+    }
+
+    let file = fs::File::open(path).map_err(|_| EgressError::InvalidTlsClientIdentity)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| EgressError::InvalidTlsClientIdentity)?;
+    if !metadata.is_file() || metadata.len() > MAX_TLS_CLIENT_IDENTITY_PEM_BYTES as u64 {
+        return Err(EgressError::InvalidTlsClientIdentity);
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_TLS_CLIENT_IDENTITY_PEM_BYTES)
+            .min(MAX_TLS_CLIENT_IDENTITY_PEM_BYTES),
+    );
+    file.take(MAX_TLS_CLIENT_IDENTITY_PEM_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| EgressError::InvalidTlsClientIdentity)?;
+    if bytes.len() > MAX_TLS_CLIENT_IDENTITY_PEM_BYTES {
+        return Err(EgressError::InvalidTlsClientIdentity);
+    }
+
+    Ok(bytes)
 }
 
 fn auto_seed_endpoint_host(
@@ -1873,9 +1900,7 @@ mod tests {
                 "invalid_tls_ca_bundle",
             ),
             (
-                EgressError::InvalidTlsClientIdentity {
-                    path: PathBuf::from("secret-identity-path"),
-                },
+                EgressError::InvalidTlsClientIdentity,
                 "invalid_tls_client_identity",
             ),
         ];
@@ -1980,10 +2005,32 @@ mod tests {
             .expect_err("non-PEM identity bytes must fail startup validation");
         assert!(!format!("{error:?}\n{error}").contains(secret_marker));
 
+        let oversized_path = std::env::temp_dir().join(format!(
+            "greengateway-oversized-client-identity-{}.pem",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &oversized_path,
+            vec![b'x'; MAX_TLS_CLIENT_IDENTITY_PEM_BYTES + 1],
+        )
+        .expect("oversized test identity should be written");
+        let error = EgressConfig::default()
+            .apply_tls_client_identity_pem_path(oversized_path.clone())
+            .expect_err("an oversized identity PEM must fail bounded startup validation");
+        assert_eq!(error.safe_category(), "invalid_tls_client_identity");
+        assert!(!format!("{error:?}\n{error}").contains(
+            oversized_path
+                .file_name()
+                .expect("oversized test file should have a name")
+                .to_string_lossy()
+                .as_ref()
+        ));
+
         let _ = fs::remove_file(valid_path);
         let _ = fs::remove_file(mismatched_path);
         let _ = fs::remove_file(duplicate_key_path);
         let _ = fs::remove_file(invalid_path);
+        let _ = fs::remove_file(oversized_path);
     }
 
     #[test]
