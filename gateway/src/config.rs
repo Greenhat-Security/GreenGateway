@@ -260,6 +260,8 @@ pub struct UpstreamRouteConfig {
     #[serde(default)]
     pub retry: Option<UpstreamRetryConfig>,
     #[serde(default)]
+    pub circuit_breaker: Option<UpstreamCircuitBreakerConfig>,
+    #[serde(default)]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub response_idle_timeout_ms: Option<u64>,
@@ -332,6 +334,43 @@ pub struct UpstreamRetryConfig {
     pub methods: Vec<String>,
     #[serde(default = "default_upstream_retry_statuses")]
     pub statuses: Vec<u16>,
+}
+
+pub const DEFAULT_UPSTREAM_CIRCUIT_FAILURE_THRESHOLD: u32 = 5;
+pub const DEFAULT_UPSTREAM_CIRCUIT_OPEN_MS: u64 = 30_000;
+pub const DEFAULT_UPSTREAM_CIRCUIT_HALF_OPEN_MAX_REQUESTS: u32 = 1;
+pub const DEFAULT_UPSTREAM_CIRCUIT_RECOVERY_THRESHOLD: u32 = 2;
+const MAX_UPSTREAM_CIRCUIT_THRESHOLD: u32 = 1_000;
+const MIN_UPSTREAM_CIRCUIT_OPEN_MS: u64 = 10;
+const MAX_UPSTREAM_CIRCUIT_OPEN_MS: u64 = 3_600_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamCircuitBreakerConfig {
+    #[serde(default = "default_upstream_circuit_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_upstream_circuit_open_ms")]
+    pub open_ms: u64,
+    #[serde(default = "default_upstream_circuit_half_open_max_requests")]
+    pub half_open_max_requests: u32,
+    #[serde(default = "default_upstream_circuit_recovery_threshold")]
+    pub recovery_threshold: u32,
+}
+
+fn default_upstream_circuit_failure_threshold() -> u32 {
+    DEFAULT_UPSTREAM_CIRCUIT_FAILURE_THRESHOLD
+}
+
+fn default_upstream_circuit_open_ms() -> u64 {
+    DEFAULT_UPSTREAM_CIRCUIT_OPEN_MS
+}
+
+fn default_upstream_circuit_half_open_max_requests() -> u32 {
+    DEFAULT_UPSTREAM_CIRCUIT_HALF_OPEN_MAX_REQUESTS
+}
+
+fn default_upstream_circuit_recovery_threshold() -> u32 {
+    DEFAULT_UPSTREAM_CIRCUIT_RECOVERY_THRESHOLD
 }
 
 fn default_upstream_retry_max_attempts() -> u8 {
@@ -2610,6 +2649,38 @@ fn validate_upstream_routes(
                 ));
             }
         }
+        if let Some(circuit) = route.circuit_breaker.as_ref() {
+            if !(1..=MAX_UPSTREAM_CIRCUIT_THRESHOLD).contains(&circuit.failure_threshold) {
+                problems.push(format!(
+                    "{route_name}.circuit_breaker.failure_threshold must be between 1 and {MAX_UPSTREAM_CIRCUIT_THRESHOLD}"
+                ));
+            }
+            if !(MIN_UPSTREAM_CIRCUIT_OPEN_MS..=MAX_UPSTREAM_CIRCUIT_OPEN_MS)
+                .contains(&circuit.open_ms)
+            {
+                problems.push(format!(
+                    "{route_name}.circuit_breaker.open_ms must be between {MIN_UPSTREAM_CIRCUIT_OPEN_MS} and {MAX_UPSTREAM_CIRCUIT_OPEN_MS}"
+                ));
+            }
+            if circuit.half_open_max_requests == 0
+                || usize::try_from(circuit.half_open_max_requests)
+                    .map_or(true, |maximum| maximum > route.limits.max_in_flight)
+            {
+                problems.push(format!(
+                    "{route_name}.circuit_breaker.half_open_max_requests must be between 1 and limits.max_in_flight"
+                ));
+            }
+            if !(1..=MAX_UPSTREAM_CIRCUIT_THRESHOLD).contains(&circuit.recovery_threshold) {
+                problems.push(format!(
+                    "{route_name}.circuit_breaker.recovery_threshold must be between 1 and {MAX_UPSTREAM_CIRCUIT_THRESHOLD}"
+                ));
+            }
+            if has_legacy_url {
+                problems.push(format!(
+                    "{route_name}.circuit_breaker requires an upstreams pool and cannot be used with upstream_url"
+                ));
+            }
+        }
 
         validated.push(UpstreamRouteConfig {
             id,
@@ -2622,6 +2693,7 @@ fn validate_upstream_routes(
             limits: route.limits,
             health_check: route.health_check,
             retry: route.retry,
+            circuit_breaker: route.circuit_breaker,
             timeout_ms: route.timeout_ms,
             response_idle_timeout_ms: route.response_idle_timeout_ms,
             connect_timeout_ms: route.connect_timeout_ms,
@@ -5509,6 +5581,7 @@ mod tests {
                     limits: UpstreamPoolLimitsConfig::default(),
                     health_check: None,
                     retry: None,
+                    circuit_breaker: None,
                     timeout_ms: Some(1500),
                     response_idle_timeout_ms: Some(400),
                     connect_timeout_ms: Some(300),
@@ -5531,6 +5604,7 @@ mod tests {
                     limits: UpstreamPoolLimitsConfig::default(),
                     health_check: None,
                     retry: None,
+                    circuit_breaker: None,
                     timeout_ms: None,
                     response_idle_timeout_ms: None,
                     connect_timeout_ms: None,
@@ -5715,6 +5789,78 @@ mod tests {
             ".retry.statuses must contain 1-32 unique HTTP statuses",
             ".retry.max_attempts greater than 1 requires request_body.mode buffered",
             ".retry requires an upstreams pool and cannot be used with upstream_url",
+        ] {
+            assert!(
+                message.contains(expected),
+                "aggregated validation should contain '{expected}': {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_circuit_breaker_configuration_parses_with_bounded_defaults() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[{
+                    "id":"payments",
+                    "path_prefix":"/payments",
+                    "upstreams":[
+                        {"id":"a","url":"https://a.example.test"},
+                        {"id":"b","url":"https://b.example.test"}
+                    ],
+                    "circuit_breaker":{}
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("bounded circuit-breaker defaults should parse");
+
+        let circuit = config.upstream_routes[0]
+            .circuit_breaker
+            .as_ref()
+            .expect("circuit-breaker configuration");
+        assert_eq!(circuit.failure_threshold, 5);
+        assert_eq!(circuit.open_ms, 30_000);
+        assert_eq!(circuit.half_open_max_requests, 1);
+        assert_eq!(circuit.recovery_threshold, 2);
+    }
+
+    #[test]
+    fn invalid_circuit_breaker_configuration_fails_closed_with_aggregated_errors() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[
+                {
+                    "id":"payments",
+                    "path_prefix":"/payments",
+                    "upstreams":[
+                        {"id":"a","url":"https://a.example.test"},
+                        {"id":"b","url":"https://b.example.test"}
+                    ],
+                    "limits":{"max_in_flight":1},
+                    "circuit_breaker":{
+                        "failure_threshold":0,
+                        "open_ms":0,
+                        "half_open_max_requests":2,
+                        "recovery_threshold":1001
+                    }
+                },
+                {
+                    "path_prefix":"/legacy",
+                    "upstream_url":"https://legacy.example.test",
+                    "circuit_breaker":{}
+                }
+            ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("unsafe circuit-breaker configuration should fail startup");
+        let message = error.to_string();
+
+        for expected in [
+            ".circuit_breaker.failure_threshold must be between 1 and 1000",
+            ".circuit_breaker.open_ms must be between 10 and 3600000",
+            ".circuit_breaker.half_open_max_requests must be between 1 and limits.max_in_flight",
+            ".circuit_breaker.recovery_threshold must be between 1 and 1000",
+            ".circuit_breaker requires an upstreams pool and cannot be used with upstream_url",
         ] {
             assert!(
                 message.contains(expected),

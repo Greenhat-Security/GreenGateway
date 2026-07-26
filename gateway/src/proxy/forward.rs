@@ -74,6 +74,11 @@ enum ResponseTailTerminal {
 
 struct ResponsePumpCompletion(Option<tokio::sync::oneshot::Sender<()>>);
 
+struct ResponseTailOptions {
+    circuit_permit: Option<super::circuit::CircuitPermit>,
+    pump_completed: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
 impl Drop for ResponsePumpCompletion {
     fn drop(&mut self) {
         if let Some(completed) = self.0.take() {
@@ -93,6 +98,7 @@ struct ResponseTailPump {
         super::health::UpstreamHealthState,
         Arc<crate::config::UpstreamHealthCheckConfig>,
     )>,
+    circuit_permit: Option<super::circuit::CircuitPermit>,
     completion: ResponsePumpCompletion,
 }
 
@@ -190,7 +196,7 @@ async fn forward_to_upstream(
     let mut active_retry_permit = None;
 
     for attempt_number in 1..=max_attempts {
-        let Some(endpoint) = upstream
+        let Some(selected) = upstream
             .pool
             .select_endpoint_avoiding(&attempted_endpoint_ids)
         else {
@@ -218,6 +224,8 @@ async fn forward_to_upstream(
                 request_started.elapsed(),
             );
         };
+        let endpoint = selected.endpoint;
+        let mut circuit_permit = selected.circuit_permit;
         attempted_endpoint_ids.insert(Arc::clone(&endpoint.id));
         ::metrics::counter!(
             crate::metrics::PROXY_ENDPOINT_SELECTIONS_TOTAL,
@@ -262,6 +270,7 @@ async fn forward_to_upstream(
 
         let mut upstream_response = match sent {
             Err(_) => {
+                record_circuit_failure(&mut circuit_permit, "request_timeout");
                 if let Some(config) = endpoint.health_config.as_deref() {
                     endpoint.health.record_passive_timeout(config).await;
                 }
@@ -289,6 +298,9 @@ async fn forward_to_upstream(
                 );
             }
             Ok(Err(error)) => {
+                if upstream.pool.retry_policy.retries_error(&error) {
+                    record_circuit_failure(&mut circuit_permit, circuit_failure_reason(&error));
+                }
                 if let Some(config) = endpoint.health_config.as_deref() {
                     endpoint
                         .health
@@ -368,13 +380,20 @@ async fn forward_to_upstream(
         };
 
         let upstream_status = upstream_response.status;
+        let retryable_status = upstream.pool.retry_policy.retries_status(upstream_status);
+        if endpoint
+            .circuit
+            .as_ref()
+            .is_some_and(|circuit| circuit.is_failure_status(upstream_status.as_u16()))
+        {
+            record_circuit_failure(&mut circuit_permit, "retryable_status");
+        }
         if let Some(config) = endpoint.health_config.as_deref() {
             endpoint
                 .health
                 .record_passive_status(upstream_status.as_u16(), config)
                 .await;
         }
-        let retryable_status = upstream.pool.retry_policy.retries_status(upstream_status);
         let mut retry_stop_reason = None;
         if retryable_status && attempt_number < max_attempts {
             let duration = attempt_started.elapsed();
@@ -409,6 +428,7 @@ async fn forward_to_upstream(
         let first_chunk =
             match tokio::time::timeout_at(deadline, upstream_response.body.next()).await {
                 Err(_) => {
+                    record_circuit_failure(&mut circuit_permit, "request_timeout");
                     if let Some(config) = endpoint.health_config.as_deref() {
                         endpoint.health.record_passive_timeout(config).await;
                     }
@@ -436,6 +456,9 @@ async fn forward_to_upstream(
                     );
                 }
                 Ok(Some(Err(error))) => {
+                    if upstream.pool.retry_policy.retries_error(&error) {
+                        record_circuit_failure(&mut circuit_permit, circuit_failure_reason(&error));
+                    }
                     if let Some(config) = endpoint.health_config.as_deref() {
                         endpoint
                             .health
@@ -542,9 +565,13 @@ async fn forward_to_upstream(
                     active_retry_permit.take(),
                     deadline,
                     passive_health,
+                    circuit_permit.take(),
                 )
             }
-            None => Body::empty(),
+            None => {
+                record_circuit_success(&mut circuit_permit);
+                Body::empty()
+            }
         };
         let mut response = Response::new(response_body);
         *response.status_mut() = upstream_status;
@@ -657,6 +684,29 @@ fn proxy_error_category(error: &egress::EgressError) -> &'static str {
     }
 }
 
+fn circuit_failure_reason(error: &egress::EgressError) -> &'static str {
+    if error.is_timeout() {
+        "request_timeout"
+    } else {
+        "transport_failure"
+    }
+}
+
+fn record_circuit_success(permit: &mut Option<super::circuit::CircuitPermit>) {
+    if let Some(permit) = permit.take() {
+        permit.success();
+    }
+}
+
+fn record_circuit_failure(
+    permit: &mut Option<super::circuit::CircuitPermit>,
+    reason: &'static str,
+) {
+    if let Some(permit) = permit.take() {
+        permit.failure(reason);
+    }
+}
+
 fn record_attempt(
     pool_id: &Arc<str>,
     endpoint_id: &Arc<str>,
@@ -732,6 +782,7 @@ fn redacted_response_body(
         super::health::UpstreamHealthState,
         Arc<crate::config::UpstreamHealthCheckConfig>,
     )>,
+    circuit_permit: Option<super::circuit::CircuitPermit>,
 ) -> Body {
     redacted_response_body_inner(
         first_chunk,
@@ -740,7 +791,10 @@ fn redacted_response_body(
         retry_permit,
         deadline,
         passive_health,
-        None,
+        ResponseTailOptions {
+            circuit_permit,
+            pump_completed: None,
+        },
     )
 }
 
@@ -754,7 +808,7 @@ fn redacted_response_body_inner(
         super::health::UpstreamHealthState,
         Arc<crate::config::UpstreamHealthCheckConfig>,
     )>,
-    pump_completed: Option<tokio::sync::oneshot::Sender<()>>,
+    options: ResponseTailOptions,
 ) -> Body {
     let (demand_sender, demand_receiver) = tokio::sync::mpsc::channel(1);
     let (terminal_sender, terminal_receiver) =
@@ -767,7 +821,8 @@ fn redacted_response_body_inner(
         retry_permit,
         deadline,
         passive_health,
-        completion: ResponsePumpCompletion(pump_completed),
+        circuit_permit: options.circuit_permit,
+        completion: ResponsePumpCompletion(options.pump_completed),
     }));
     let redacted_tail = stream::unfold(
         (demand_sender, terminal_receiver, false),
@@ -841,10 +896,12 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
         retry_permit,
         deadline,
         passive_health,
+        circuit_permit,
         completion: _completion,
     } = pump;
     let mut admission_permit = Some(admission_permit);
     let mut retry_permit = retry_permit;
+    let mut circuit_permit = circuit_permit;
     loop {
         let demand = tokio::select! {
             biased;
@@ -855,6 +912,7 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
                     &mut admission_permit,
                     &mut retry_permit,
                     passive_health.as_ref(),
+                    &mut circuit_permit,
                 ).await;
                 return;
             }
@@ -872,6 +930,7 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
                     &mut admission_permit,
                     &mut retry_permit,
                     passive_health.as_ref(),
+                    &mut circuit_permit,
                 ).await;
                 return;
             }
@@ -885,6 +944,9 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
             Some(Err(error)) => {
                 let category = proxy_error_category(&error);
                 release_response_permits(&mut admission_permit, &mut retry_permit);
+                if error.is_retryable_transport_failure() {
+                    record_circuit_failure(&mut circuit_permit, circuit_failure_reason(&error));
+                }
                 drop(upstream_body);
                 terminal_sender.send_replace(ResponseTailTerminal::Error(category));
                 if let Some((health, config)) = passive_health.as_ref() {
@@ -898,6 +960,7 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
                 return;
             }
             None => {
+                record_circuit_success(&mut circuit_permit);
                 terminal_sender.send_replace(ResponseTailTerminal::Eof);
                 let _ = demand.response.send(ResponseTailEvent::Eof);
                 return;
@@ -915,8 +978,10 @@ async fn finish_response_timeout(
         super::health::UpstreamHealthState,
         Arc<crate::config::UpstreamHealthCheckConfig>,
     )>,
+    circuit_permit: &mut Option<super::circuit::CircuitPermit>,
 ) {
     release_response_permits(admission_permit, retry_permit);
+    record_circuit_failure(circuit_permit, "request_timeout");
     drop(upstream_body);
     terminal_sender.send_replace(ResponseTailTerminal::Error("request_timeout"));
     if let Some((health, config)) = passive_health {
@@ -1398,6 +1463,7 @@ mod tests {
             None,
             tokio::time::Instant::now() + Duration::from_secs(1),
             None,
+            None,
         );
         let mut body = body.into_data_stream();
         assert!(matches!(
@@ -1462,7 +1528,10 @@ mod tests {
             Some(retry_permit),
             tokio::time::Instant::now() + Duration::from_millis(50),
             None,
-            Some(completed_sender),
+            ResponseTailOptions {
+                circuit_permit: None,
+                pump_completed: Some(completed_sender),
+            },
         );
 
         tokio::time::timeout(Duration::from_millis(200), completed_receiver)
@@ -1540,6 +1609,103 @@ mod tests {
                 body: b"bounded-body".to_vec(),
             }]
         );
+
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn all_open_pool_fails_fast_without_an_extra_attempt() {
+        let first_requests = Arc::new(Mutex::new(Vec::new()));
+        let second_requests = Arc::new(Mutex::new(Vec::new()));
+        let (first_addr, first_server) =
+            spawn_status_upstream(StatusCode::SERVICE_UNAVAILABLE, Arc::clone(&first_requests))
+                .await;
+        let (second_addr, second_server) = spawn_status_upstream(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Arc::clone(&second_requests),
+        )
+        .await;
+        let (proxy, audit_sink, _) = retry_proxy_with_options(
+            [first_addr, second_addr],
+            RetryProxyOptions {
+                retry: Some(config::UpstreamRetryConfig {
+                    max_attempts: 1,
+                    methods: vec!["GET".to_owned()],
+                    statuses: vec![503],
+                }),
+                circuit_config: Some(config::UpstreamCircuitBreakerConfig {
+                    failure_threshold: 1,
+                    open_ms: 60_000,
+                    half_open_max_requests: 1,
+                    recovery_threshold: 1,
+                }),
+                ..RetryProxyOptions::default()
+            },
+        );
+
+        for request_id in ["open-a", "open-b"] {
+            let response = proxy
+                .forward_request(
+                    Request::builder()
+                        .method(http::Method::GET)
+                        .uri("/items")
+                        .header(REQUEST_ID_HEADER, request_id)
+                        .body(Body::empty())
+                        .expect("request"),
+                    "203.0.113.8",
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("bounded response body");
+        }
+
+        let response = proxy
+            .forward_request(
+                Request::builder()
+                    .method(http::Method::GET)
+                    .uri("/items")
+                    .header(REQUEST_ID_HEADER, "all-open")
+                    .body(Body::empty())
+                    .expect("request"),
+                "203.0.113.8",
+            )
+            .await;
+        let outcome = response
+            .extensions()
+            .get::<middleware::decision::UpstreamOutcome>()
+            .expect("upstream outcome");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(outcome.attempts.is_empty());
+        assert_eq!(first_requests.lock().expect("first captures").len(), 1);
+        assert_eq!(second_requests.lock().expect("second captures").len(), 1);
+        let transitions = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let transitions = audit_sink
+                    .events()
+                    .into_iter()
+                    .filter(|event| {
+                        event.event_type == audit::event::UPSTREAM_CIRCUIT_STATE_CHANGED
+                    })
+                    .collect::<Vec<_>>();
+                if transitions.len() >= 2 {
+                    return transitions;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("circuit transition audits should be emitted");
+        assert_eq!(transitions.len(), 2);
+        assert!(transitions.iter().all(|event| {
+            event.payload["state"] == "open"
+                && event.payload["from"] == "closed"
+                && event.payload["reason"] == "retryable_status"
+                && event.payload.get("url").is_none()
+        }));
 
         first_server.abort();
         second_server.abort();
@@ -2629,6 +2795,7 @@ mod tests {
 
     struct RetryProxyOptions {
         retry: Option<config::UpstreamRetryConfig>,
+        circuit_config: Option<config::UpstreamCircuitBreakerConfig>,
         timeout: Duration,
         limits: config::UpstreamPoolLimitsConfig,
         request_body_mode: RequestBodyMode,
@@ -2640,6 +2807,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 retry: None,
+                circuit_config: None,
                 timeout: Duration::from_secs(2),
                 limits: config::UpstreamPoolLimitsConfig::default(),
                 request_body_mode: RequestBodyMode::Buffered,
@@ -2682,6 +2850,8 @@ mod tests {
         endpoints: [(String, Arc<egress::EgressClient>); 2],
         options: RetryProxyOptions,
     ) -> (ProxyState, CaptureSink, [health::UpstreamHealthState; 2]) {
+        let sink = CaptureSink::new();
+        let audit = audit::AuditLog::new(Arc::new(sink.clone()));
         let health_states = [
             health::UpstreamHealthState::new("payments", "a", None),
             health::UpstreamHealthState::new("payments", "b", None),
@@ -2692,6 +2862,7 @@ mod tests {
                 state.mark_healthy_for_test();
             }
         }
+        let circuit_config = options.circuit_config.clone();
         let endpoint =
             |index: usize,
              id: &'static str,
@@ -2703,6 +2874,15 @@ mod tests {
                     egress_client,
                     health: health_states[index].clone(),
                     health_config: health_config.clone(),
+                    circuit: circuit_config.as_ref().map(|config| {
+                        super::super::circuit::CircuitBreaker::new(
+                            Arc::from("payments"),
+                            Arc::from(id),
+                            config.clone(),
+                            options.retry.as_ref(),
+                            Some(audit.clone()),
+                        )
+                    }),
                 }
             };
         let [endpoint_a, endpoint_b] = endpoints;
@@ -2712,8 +2892,6 @@ mod tests {
             &options.limits,
             options.retry.as_ref(),
         ));
-        let sink = CaptureSink::new();
-        let audit = audit::AuditLog::new(Arc::new(sink.clone()));
         (
             ProxyState {
                 routes: ProxyRoutes::RoutingTable {
