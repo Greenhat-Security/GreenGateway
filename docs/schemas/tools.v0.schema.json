@@ -49,10 +49,141 @@
           "$ref": "#/$defs/json_schema_document",
           "description": "A complete JSON Schema document for this tool's argument object. The loader also compiles this schema to reject malformed schemas at load time."
         },
+        "target": {
+          "$ref": "#/$defs/tool_target",
+          "description": "Optional typed connection target for connection-aware tools. The legacy upstream mapping remains required during migration."
+        },
+        "source": {
+          "$ref": "#/$defs/tool_source",
+          "description": "Optional typed provenance. Omission means legacy behavior."
+        },
         "upstream": {
           "$ref": "#/$defs/upstream_mapping"
         }
       }
+    },
+    "stable_connection_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "tool_target": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "connection_id",
+            "mapping"
+          ],
+          "properties": {
+            "type": {
+              "const": "http"
+            },
+            "connection_id": {
+              "$ref": "#/$defs/stable_connection_id"
+            },
+            "mapping": {
+              "$ref": "#/$defs/upstream_mapping"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "connection_id",
+            "remote_tool_name"
+          ],
+          "properties": {
+            "type": {
+              "const": "mcp"
+            },
+            "connection_id": {
+              "$ref": "#/$defs/stable_connection_id"
+            },
+            "remote_tool_name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        }
+      ]
+    },
+    "tool_source": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "manual"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "connection_id"
+          ],
+          "properties": {
+            "type": {
+              "const": "open_api"
+            },
+            "connection_id": {
+              "$ref": "#/$defs/stable_connection_id"
+            },
+            "operation_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "connection_id",
+            "remote_tool_name"
+          ],
+          "properties": {
+            "type": {
+              "const": "mcp"
+            },
+            "connection_id": {
+              "$ref": "#/$defs/stable_connection_id"
+            },
+            "remote_tool_name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "legacy"
+            }
+          }
+        }
+      ]
     },
     "json_schema_document": {
       "description": "A JSON Schema document for a tool argument object. Tool schemas must declare an object-valued properties keyword so path-template placeholders can be checked against explicit arguments. Semantic schema validity is enforced by jsonschema::validator_for at registry load time.",
