@@ -85,7 +85,17 @@ class EchoHandler(BaseHTTPRequestHandler):
             parsed.path == "/__dev-echo/retry-probe"
             and os.environ.get("FAIL_RETRY_PROBE", "").lower() == "true"
         ):
-            if retry_probe_header_boundary_violation(self.headers):
+            expected_request_ids = parse_qs(parsed.query).get(
+                "__dev_expected_request_id",
+                [],
+            )
+            expected_request_id = (
+                expected_request_ids[0] if len(expected_request_ids) == 1 else None
+            )
+            if retry_probe_header_boundary_violation(
+                self.headers,
+                expected_request_id,
+            ):
                 self._send_json(
                     {"error": "header_boundary_violation"},
                     status=418,
@@ -254,7 +264,7 @@ def bounded_query_int(query, name, minimum, maximum, default=None):
     return max(minimum, min(maximum, value))
 
 
-def retry_probe_header_boundary_violation(headers):
+def retry_probe_header_boundary_violation(headers, expected_request_id):
     if headers.get("authorization") or headers.get("cookie"):
         return True
     request_id = headers.get("x-request-id", "")
@@ -262,7 +272,8 @@ def retry_probe_header_boundary_violation(headers):
     real_ip = headers.get("x-real-ip", "")
     forwarding = f"{forwarded_for},{real_ip}"
     return (
-        not request_id
+        not expected_request_id
+        or request_id != expected_request_id
         or not forwarded_for
         or real_ip != forwarded_for
         or "198.51.100.10" in forwarding

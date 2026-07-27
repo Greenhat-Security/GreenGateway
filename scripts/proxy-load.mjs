@@ -42,6 +42,7 @@ Options:
   --require-metrics       Fail if the gateway metrics endpoint is unavailable
   --expected-upstream-attempts N  Require an exact upstream-attempt delta
   --expected-retries N    Require an exact retry delta
+  --min-retry-amplification N  Require attempts / completed responses at or above N
   --max-retry-amplification N  Bound attempts / completed responses
   --output PATH           Write the JSON result to PATH
   --help                  Show this help text
@@ -67,6 +68,7 @@ function parseArgs(argv) {
     requireMetrics: false,
     expectedUpstreamAttempts: null,
     expectedRetries: null,
+    minRetryAmplification: null,
     maxRetryAmplification: null,
     output: null,
   };
@@ -126,6 +128,9 @@ function parseArgs(argv) {
         break;
       case "--expected-retries":
         parsed.expectedRetries = nonnegativeInteger(name, value);
+        break;
+      case "--min-retry-amplification":
+        parsed.minRetryAmplification = positiveNumber(name, value);
         break;
       case "--max-retry-amplification":
         parsed.maxRetryAmplification = positiveNumber(name, value);
@@ -421,6 +426,23 @@ async function main() {
     options.baseUrl,
     options.requireMetrics,
   );
+  if (options.requireMetrics) {
+    const requiredAfterMetrics = new Set([
+      "gateway_http_requests_total",
+      "proxy_upstream_attempts_total",
+      "egress_client_cache_requests_total",
+    ]);
+    if (options.expectedRetries !== null || options.scenario === "mixed") {
+      requiredAfterMetrics.add("proxy_upstream_retries_total");
+    }
+    for (const metric of requiredAfterMetrics) {
+      if (!(metric in metricsAfter)) {
+        throw new Error(
+          `required gateway metric missing from after snapshot: ${metric}`,
+        );
+      }
+    }
+  }
   const attempts = metricDelta(
     metricsBefore,
     metricsAfter,
@@ -506,6 +528,15 @@ async function main() {
   if (options.expectedRetries !== null && retries !== options.expectedRetries) {
     assertionFailures.push(
       `retries: expected ${options.expectedRetries}, received ${retries}`,
+    );
+  }
+  if (
+    options.minRetryAmplification !== null &&
+    (retryAmplification === null ||
+      retryAmplification < options.minRetryAmplification)
+  ) {
+    assertionFailures.push(
+      `retry amplification: minimum ${options.minRetryAmplification}, received ${retryAmplification}`,
     );
   }
   if (

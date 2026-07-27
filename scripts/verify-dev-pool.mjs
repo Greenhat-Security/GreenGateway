@@ -214,9 +214,13 @@ async function sendPoolRequests({
   const results = [];
   for (let index = 0; index < count; index += 1) {
     const requestId = `${runId}-${method.toLowerCase()}-${index}`;
+    const effectiveRequestPath =
+      requestPath === "/__dev-echo/retry-probe"
+        ? `${requestPath}?__dev_expected_request_id=${encodeURIComponent(requestId)}`
+        : requestPath;
     results.push({
       requestId,
-      ...(await request(baseUrl, token, requestPath, {
+      ...(await request(baseUrl, token, effectiveRequestPath, {
         method,
         headers: {
           "content-type": "application/json",

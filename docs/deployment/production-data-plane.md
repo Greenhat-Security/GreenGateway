@@ -250,9 +250,10 @@ response bytes, upstream-attempt delta, retry delta, cache-request delta, and
 retry amplification. The harness exits nonzero on client errors, `429`, or any
 other status outside the scenario's expected set. Suite runners also require a
 parseable GreenGateway `/metrics` response, require the deterministic mixed
-status counts, cap flapping retry amplification at `1.1`, and require exactly
-zero upstream attempts and retries after every endpoint is unhealthy. Capture
-host/container resource evidence at the start, peak, and end of each run:
+status counts, require flapping attempt amplification within `1.0`–`1.1`, and
+require exactly zero upstream attempts and retries after every endpoint is
+unhealthy. Capture host/container resource evidence at the start, peak, and end
+of each run:
 
 ```sh
 docker stats --no-stream

@@ -46,6 +46,8 @@ try {
     "--concurrency",
     "50",
     "--require-metrics",
+    "--min-retry-amplification",
+    "1.0",
     "--max-retry-amplification",
     "1.1",
     "--expected-statuses",
