@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     path::{Path, PathBuf},
@@ -8,14 +8,15 @@ use std::{
 };
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
 use super::{
     model::{
         ConnectionAuthentication, ConnectionId, ConnectionManagementSource, ConnectionWrite,
-        DiscoveryConfig, CONNECTION_SCHEMA_VERSION, MAX_CATALOG_ENTRIES, MAX_CONNECTIONS,
-        MAX_CREDENTIALS, MAX_MANAGED_SPEC_BYTES, MAX_STATUS_HISTORY_ROWS,
+        CONNECTION_SCHEMA_VERSION, MAX_CATALOG_ENTRIES, MAX_CONNECTIONS, MAX_CREDENTIALS,
+        MAX_MANAGED_SPEC_BYTES, MAX_STATUS_HISTORY_ROWS,
     },
     status::{
         ConnectionOperationalState, ConnectionRevisions, ConnectionStatusReason,
@@ -314,7 +315,8 @@ impl StoredConnection {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConnectionDependencyKind {
     ProxyRoute,
     ManualTool,
@@ -331,6 +333,23 @@ impl ConnectionDependencyKind {
             Self::ControlPlane => "control_plane",
         }
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "proxy_route" => Some(Self::ProxyRoute),
+            "manual_tool" => Some(Self::ManualTool),
+            "managed_tool" => Some(Self::ManagedTool),
+            "control_plane" => Some(Self::ControlPlane),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionDependency {
+    pub kind: ConnectionDependencyKind,
+    pub consumer_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -590,6 +609,112 @@ impl SqliteConnectionStore {
             )
             .map_err(|source| sqlite_error(&self.path, "dependency delete", source))?;
         Ok(())
+    }
+
+    pub fn dependencies(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<Vec<ConnectionDependency>, ConnectionStoreError> {
+        let mut connection = self.connection_guard();
+        let transaction = connection
+            .transaction()
+            .map_err(|source| sqlite_error(&self.path, "dependency read transaction", source))?;
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM connection_records WHERE id = ?1)",
+                params![id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.path, "dependency owner lookup", source))?;
+        if !exists {
+            return Err(ConnectionStoreError::NotFound { id: id.to_string() });
+        }
+        let mut statement = transaction
+            .prepare(
+                r#"
+                SELECT consumer_kind, consumer_id
+                FROM connection_dependencies
+                WHERE connection_id = ?1
+                ORDER BY consumer_kind ASC, consumer_id ASC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(|source| sqlite_error(&self.path, "dependency read prepare", source))?;
+        let raw = statement
+            .query_map(
+                params![
+                    id.as_str(),
+                    i64::try_from(MAX_CONNECTION_DEPENDENCIES + 1).unwrap_or(i64::MAX)
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|source| sqlite_error(&self.path, "dependency read query", source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| sqlite_error(&self.path, "dependency read", source))?;
+        drop(statement);
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, "dependency read commit", source))?;
+        if raw.len() > MAX_CONNECTION_DEPENDENCIES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection dependencies",
+                maximum: MAX_CONNECTION_DEPENDENCIES,
+            });
+        }
+        raw.into_iter()
+            .map(|(kind, consumer_id)| {
+                let kind = ConnectionDependencyKind::parse(&kind).ok_or_else(|| {
+                    ConnectionStoreError::CorruptRecord {
+                        id: id.to_string(),
+                        reason: "unknown dependency kind",
+                    }
+                })?;
+                Ok(ConnectionDependency { kind, consumer_id })
+            })
+            .collect()
+    }
+
+    pub fn dependency_counts(&self) -> Result<BTreeMap<ConnectionId, usize>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT connection_id, COUNT(*)
+                FROM connection_dependencies
+                GROUP BY connection_id
+                ORDER BY connection_id ASC
+                "#,
+            )
+            .map_err(|source| sqlite_error(&self.path, "dependency counts prepare", source))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|source| sqlite_error(&self.path, "dependency counts query", source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| sqlite_error(&self.path, "dependency counts read", source))?;
+        rows.into_iter()
+            .map(|(id, count)| {
+                let parsed = ConnectionId::parse(id.clone()).map_err(|_| {
+                    ConnectionStoreError::CorruptRecord {
+                        id,
+                        reason: "invalid dependency owner ID",
+                    }
+                })?;
+                let count =
+                    usize::try_from(count).map_err(|_| ConnectionStoreError::CorruptRecord {
+                        id: parsed.to_string(),
+                        reason: "invalid dependency count",
+                    })?;
+                if count > MAX_CONNECTION_DEPENDENCIES {
+                    return Err(ConnectionStoreError::LimitExceeded {
+                        resource: "connection dependencies",
+                        maximum: MAX_CONNECTION_DEPENDENCIES,
+                    });
+                }
+                Ok((parsed, count))
+            })
+            .collect()
     }
 
     pub fn append_status(
@@ -1758,7 +1883,7 @@ fn replacement_revisions(
     current: &StoredConnection,
     candidate: &ConnectionWrite,
 ) -> Result<ConnectionRevisions, ConnectionStoreError> {
-    let credential_changed = sensitive_credential_fields_changed(&current.write, candidate);
+    let credential_changed = current.write.requires_secrets_write_to_replace(candidate);
     Ok(ConnectionRevisions {
         connection: increment_revision(id, current.revisions.connection)?,
         credential: if credential_changed {
@@ -1780,34 +1905,8 @@ fn replacement_revisions(
     })
 }
 
-fn sensitive_credential_fields_changed(
-    current: &ConnectionWrite,
-    candidate: &ConnectionWrite,
-) -> bool {
-    current.authentication != candidate.authentication
-        || current.tls != candidate.tls
-        || ((has_credential_binding(current) || has_credential_binding(candidate))
-            && current.endpoint != candidate.endpoint)
-        || (discovery_uses_authentication(current.discovery.as_ref())
-            || discovery_uses_authentication(candidate.discovery.as_ref()))
-            && current.discovery != candidate.discovery
-}
-
 fn has_credential_binding(write: &ConnectionWrite) -> bool {
-    !matches!(write.authentication, ConnectionAuthentication::None) || !write.tls.is_empty()
-}
-
-fn discovery_uses_authentication(discovery: Option<&DiscoveryConfig>) -> bool {
-    match discovery {
-        Some(DiscoveryConfig::ManagedOpenapi {
-            use_connection_authentication,
-            ..
-        })
-        | Some(DiscoveryConfig::ManagedMcp {
-            use_connection_authentication,
-        }) => *use_connection_authentication,
-        None => false,
-    }
+    write.configures_credential_authority()
 }
 
 fn safe_authentication_kind(authentication: &ConnectionAuthentication) -> SafeAuthenticationKind {
@@ -2269,6 +2368,67 @@ mod tests {
             .get(&created.id)
             .expect("get should succeed")
             .is_none());
+    }
+
+    #[test]
+    fn dependency_detail_and_counts_are_sorted_bounded_admin_metadata() {
+        let (_directory, _path, store) = temporary_store("dependency-detail");
+        let first = store.create(candidate()).expect("create should succeed");
+        let mut second_candidate = candidate();
+        second_candidate.display_name = "Second API".to_owned();
+        let second = store
+            .create(second_candidate)
+            .expect("second create should succeed");
+
+        store
+            .add_dependency(
+                &first.id,
+                ConnectionDependencyKind::ProxyRoute,
+                "billing-route",
+            )
+            .expect("route dependency should insert");
+        store
+            .add_dependency(
+                &first.id,
+                ConnectionDependencyKind::ManualTool,
+                "billing.get",
+            )
+            .expect("tool dependency should insert");
+        store
+            .add_dependency(
+                &second.id,
+                ConnectionDependencyKind::ManagedTool,
+                "catalog.get",
+            )
+            .expect("managed tool dependency should insert");
+
+        assert_eq!(
+            store
+                .dependencies(&first.id)
+                .expect("dependency detail should load"),
+            vec![
+                ConnectionDependency {
+                    kind: ConnectionDependencyKind::ManualTool,
+                    consumer_id: "billing.get".to_owned(),
+                },
+                ConnectionDependency {
+                    kind: ConnectionDependencyKind::ProxyRoute,
+                    consumer_id: "billing-route".to_owned(),
+                },
+            ]
+        );
+        let counts = store
+            .dependency_counts()
+            .expect("dependency counts should load");
+        assert_eq!(counts.get(&first.id), Some(&2));
+        assert_eq!(counts.get(&second.id), Some(&1));
+
+        let missing =
+            ConnectionId::parse("00000000-0000-0000-0000-000000000000").expect("id should parse");
+        assert!(matches!(
+            store.dependencies(&missing),
+            Err(ConnectionStoreError::NotFound { .. })
+        ));
     }
 
     #[test]

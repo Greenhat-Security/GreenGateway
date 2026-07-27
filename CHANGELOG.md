@@ -68,6 +68,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Added permission-separated managed Connection CRUD under
+  `/v1{ADMIN_PREFIX}/connections`, with redacted read models, server-derived
+  actions, cursor pagination, conditional collection/resource ETags, bounded
+  request bodies, dependency-safe deletion, atomic runtime publication, and
+  payload-safe connection and credential-change audit events.
 - Expanded the Docker development stack to three controllable weighted
   upstreams and added CI smoke scenarios for incremental upload/download,
   forwarding and credential boundaries, healthy distribution, safe GET retry,

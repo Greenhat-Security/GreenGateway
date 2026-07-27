@@ -28,6 +28,16 @@
     },
     {
       "methods": ["GET"],
+      "path_prefix": "/v1/admin/connections",
+      "permission": "admin:connections:read"
+    },
+    {
+      "methods": ["POST", "PUT", "DELETE"],
+      "path_prefix": "/v1/admin/connections",
+      "permission": "admin:connections:write"
+    },
+    {
+      "methods": ["GET"],
       "path_prefix": "/v1/admin/policy",
       "permission": "admin:policy:read"
     },

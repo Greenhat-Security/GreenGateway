@@ -1,6 +1,13 @@
-use std::{collections::BTreeSet, error::Error, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    sync::{Arc, Mutex, MutexGuard},
+};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 
@@ -9,13 +16,16 @@ use super::{
         LocalSecretError, LocalSecretKeyring, LocalSecretKeyringConfigError, LocalSecretManager,
         LocalSecretProvider,
     },
-    model::MAX_CONNECTIONS,
+    model::{ConnectionId, ConnectionWrite, MAX_CONNECTIONS},
     projection::{project_legacy_connections, LegacyConnectionProjection, LegacyProjectionError},
     secret::{
         OperatorAliasResolver, ResolvedSecret, SecretAliasMetadata, SecretProviderConfigError,
         SecretPurpose, SecretResolveError, SecretResolver,
     },
-    store::{ConnectionStore, ConnectionStoreError, SqliteConnectionStore},
+    store::{
+        ConnectionEtag, ConnectionStore, ConnectionStoreError, SqliteConnectionStore,
+        StoredConnection,
+    },
 };
 
 #[derive(Clone)]
@@ -23,8 +33,64 @@ pub struct ConnectionControlPlane {
     managed: Option<SqliteConnectionStore>,
     legacy: Arc<[LegacyConnectionProjection]>,
     omitted_legacy_projection_count: usize,
+    runtime: Arc<ArcSwap<ConnectionRuntimeSnapshot>>,
+    mutation_lock: Arc<Mutex<()>>,
     secret_resolver: Arc<ConnectionSecretResolver>,
     local_secret_provider: Option<Arc<LocalSecretProvider>>,
+}
+
+#[derive(Clone)]
+pub struct ConnectionRuntimeSnapshot {
+    managed: Arc<BTreeMap<ConnectionId, StoredConnection>>,
+    legacy: Arc<[LegacyConnectionProjection]>,
+    omitted_legacy_projection_count: usize,
+    collection_etag: Arc<str>,
+}
+
+impl fmt::Debug for ConnectionRuntimeSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectionRuntimeSnapshot")
+            .field("managed_count", &self.managed.len())
+            .field("legacy_count", &self.legacy.len())
+            .field(
+                "omitted_legacy_projection_count",
+                &self.omitted_legacy_projection_count,
+            )
+            .finish()
+    }
+}
+
+impl ConnectionRuntimeSnapshot {
+    fn new(
+        managed: BTreeMap<ConnectionId, StoredConnection>,
+        legacy: Arc<[LegacyConnectionProjection]>,
+        omitted_legacy_projection_count: usize,
+    ) -> Self {
+        let collection_etag = collection_etag(&managed, &legacy, omitted_legacy_projection_count);
+        Self {
+            managed: Arc::new(managed),
+            legacy,
+            omitted_legacy_projection_count,
+            collection_etag: Arc::from(collection_etag),
+        }
+    }
+
+    pub fn managed(&self) -> &BTreeMap<ConnectionId, StoredConnection> {
+        &self.managed
+    }
+
+    pub fn legacy(&self) -> &[LegacyConnectionProjection] {
+        &self.legacy
+    }
+
+    pub fn omitted_legacy_projection_count(&self) -> usize {
+        self.omitted_legacy_projection_count
+    }
+
+    pub fn collection_etag(&self) -> &str {
+        &self.collection_etag
+    }
 }
 
 impl ConnectionControlPlane {
@@ -90,14 +156,18 @@ impl ConnectionControlPlane {
             });
         }
 
-        if let Some(store) = managed.as_ref() {
+        let managed_records = managed
+            .as_ref()
+            .map(ConnectionStore::list)
+            .transpose()?
+            .unwrap_or_default();
+        if managed.is_some() {
             let legacy_ids = legacy
                 .iter()
                 .map(|projection| projection.id().as_str())
                 .collect::<BTreeSet<_>>();
-            if let Some(collision) = store
-                .list()?
-                .into_iter()
+            if let Some(collision) = managed_records
+                .iter()
                 .find(|record| legacy_ids.contains(record.id.as_str()))
             {
                 return Err(ConnectionControlPlaneError::IdCollision {
@@ -135,11 +205,39 @@ impl ConnectionControlPlane {
             operator: secret_resolver,
             local: local_secret_provider.clone(),
         });
+        let configured_alias_ids = secret_resolver
+            .aliases()
+            .into_iter()
+            .filter(|alias| alias.configured)
+            .map(|alias| alias.id)
+            .collect::<BTreeSet<_>>();
+        if let Some(record) = managed_records.iter().find(|record| {
+            !record
+                .write
+                .unresolved_enabled_binding_fields(|id| configured_alias_ids.contains(id))
+                .is_empty()
+        }) {
+            return Err(ConnectionControlPlaneError::UnresolvableBindings {
+                id: record.id.to_string(),
+            });
+        }
+        let legacy: Arc<[LegacyConnectionProjection]> = legacy.into();
+        let managed_runtime = managed_records
+            .into_iter()
+            .map(|record| (record.id.clone(), record))
+            .collect();
+        let runtime = Arc::new(ArcSwap::from_pointee(ConnectionRuntimeSnapshot::new(
+            managed_runtime,
+            legacy.clone(),
+            omitted_legacy_projection_count,
+        )));
 
         Ok(Self {
             managed,
-            legacy: legacy.into(),
+            legacy,
             omitted_legacy_projection_count,
+            runtime,
+            mutation_lock: Arc::new(Mutex::new(())),
             secret_resolver,
             local_secret_provider,
         })
@@ -176,6 +274,177 @@ impl ConnectionControlPlane {
             .as_deref()
             .map(|provider| provider as &(dyn LocalSecretManager + Send + Sync))
             .ok_or(LocalSecretMutationUnavailable)
+    }
+
+    pub fn runtime_snapshot(&self) -> Arc<ConnectionRuntimeSnapshot> {
+        self.runtime.load_full()
+    }
+
+    pub fn create_managed(
+        &self,
+        expected_collection_etag: &str,
+        candidate: ConnectionWrite,
+    ) -> Result<StoredConnection, ConnectionMutationError> {
+        let _guard = self.mutation_guard();
+        let current = self.runtime.load_full();
+        if current.collection_etag() != expected_collection_etag {
+            return Err(ConnectionMutationError::CollectionConflict {
+                current: current.collection_etag().to_owned(),
+            });
+        }
+        self.ensure_activatable(&candidate)?;
+        let created = self.managed_store()?.create(candidate)?;
+        let mut managed = current.managed().clone();
+        managed.insert(created.id.clone(), created.clone());
+        self.publish_runtime(managed);
+        Ok(created)
+    }
+
+    pub fn replace_managed(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        candidate: ConnectionWrite,
+    ) -> Result<StoredConnection, ConnectionMutationError> {
+        let _guard = self.mutation_guard();
+        self.ensure_activatable(&candidate)?;
+        let replaced = self.managed_store()?.replace(id, expected, candidate)?;
+        let current = self.runtime.load_full();
+        let mut managed = current.managed().clone();
+        managed.insert(id.clone(), replaced.clone());
+        self.publish_runtime(managed);
+        Ok(replaced)
+    }
+
+    pub fn delete_managed(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+    ) -> Result<(), ConnectionMutationError> {
+        let _guard = self.mutation_guard();
+        self.managed_store()?.delete(id, expected)?;
+        let current = self.runtime.load_full();
+        let mut managed = current.managed().clone();
+        managed.remove(id);
+        self.publish_runtime(managed);
+        Ok(())
+    }
+
+    fn publish_runtime(&self, managed: BTreeMap<ConnectionId, StoredConnection>) {
+        self.runtime.store(Arc::new(ConnectionRuntimeSnapshot::new(
+            managed,
+            self.legacy.clone(),
+            self.omitted_legacy_projection_count,
+        )));
+    }
+
+    fn ensure_activatable(
+        &self,
+        candidate: &ConnectionWrite,
+    ) -> Result<(), ConnectionMutationError> {
+        let configured_alias_ids = self
+            .secret_resolver
+            .aliases()
+            .into_iter()
+            .filter(|alias| alias.configured)
+            .map(|alias| alias.id)
+            .collect::<BTreeSet<_>>();
+        let fields =
+            candidate.unresolved_enabled_binding_fields(|id| configured_alias_ids.contains(id));
+        if fields.is_empty() {
+            Ok(())
+        } else {
+            Err(ConnectionMutationError::UnresolvableBindings { fields })
+        }
+    }
+
+    fn mutation_guard(&self) -> MutexGuard<'_, ()> {
+        match self.mutation_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    "Connection control-plane mutation lock poisoned; recovering fail-closed state"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+}
+
+fn collection_etag(
+    managed: &BTreeMap<ConnectionId, StoredConnection>,
+    legacy: &[LegacyConnectionProjection],
+    omitted_legacy_projection_count: usize,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"greengateway.connections.collection.v1");
+    digest.update(
+        u64::try_from(omitted_legacy_projection_count)
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for projection in legacy {
+        digest.update(b"legacy");
+        update_digest_field(&mut digest, projection.id().as_str());
+    }
+    for (id, record) in managed {
+        digest.update(b"managed");
+        update_digest_field(&mut digest, id.as_str());
+        update_digest_field(&mut digest, record.etag().as_str());
+    }
+    format!("\"connections:sha256:{}\"", hex::encode(digest.finalize()))
+}
+
+fn update_digest_field(digest: &mut Sha256, value: &str) {
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(value.as_bytes());
+}
+
+#[derive(Debug)]
+pub enum ConnectionMutationError {
+    Unavailable(ManagedConnectionMutationUnavailable),
+    CollectionConflict { current: String },
+    UnresolvableBindings { fields: Vec<&'static str> },
+    Store(ConnectionStoreError),
+}
+
+impl fmt::Display for ConnectionMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(error) => error.fmt(formatter),
+            Self::CollectionConflict { current } => write!(
+                formatter,
+                "connection collection changed; current ETag is {current}"
+            ),
+            Self::UnresolvableBindings { fields } => write!(
+                formatter,
+                "enabled connection has unresolvable bindings in {} field(s)",
+                fields.len()
+            ),
+            Self::Store(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ConnectionMutationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Unavailable(error) => Some(error),
+            Self::Store(error) => Some(error),
+            Self::CollectionConflict { .. } | Self::UnresolvableBindings { .. } => None,
+        }
+    }
+}
+
+impl From<ManagedConnectionMutationUnavailable> for ConnectionMutationError {
+    fn from(error: ManagedConnectionMutationUnavailable) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+impl From<ConnectionStoreError> for ConnectionMutationError {
+    fn from(error: ConnectionStoreError) -> Self {
+        Self::Store(error)
     }
 }
 
@@ -231,6 +500,7 @@ pub enum ConnectionControlPlaneError {
     LocalSecretKeyringRequired,
     LimitExceeded { count: usize, maximum: usize },
     IdCollision { id: String },
+    UnresolvableBindings { id: String },
 }
 
 impl fmt::Display for ConnectionControlPlaneError {
@@ -251,6 +521,10 @@ impl fmt::Display for ConnectionControlPlaneError {
             Self::IdCollision { id } => write!(
                 formatter,
                 "managed connection ID '{id}' collides with a reserved legacy projection"
+            ),
+            Self::UnresolvableBindings { id } => write!(
+                formatter,
+                "enabled managed connection '{id}' references a secret binding that is not configured"
             ),
         }
     }
@@ -692,6 +966,197 @@ mod tests {
                 LocalSecretError::IdentifierCollision
             ))
         ));
+    }
+
+    #[test]
+    fn enabled_persisted_connection_with_unknown_binding_fails_restart_closed() {
+        let temporary = TemporaryLocalControlPlane::new("unknown-persisted-binding");
+        let config = temporary.config();
+        let store = SqliteConnectionStore::open(
+            config
+                .connections_sqlite_path
+                .as_deref()
+                .expect("managed store path should be configured"),
+        )
+        .expect("store should open");
+        let candidate = serde_json::from_value(serde_json::json!({
+            "display_name": "Billing API",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {
+                "type": "static_bearer",
+                "secret_id": "unknown-token"
+            }
+        }))
+        .expect("candidate should deserialize");
+        let created = store
+            .create(candidate)
+            .expect("fixture should persist directly");
+        drop(store);
+
+        assert!(matches!(
+            ConnectionControlPlane::from_config(&config),
+            Err(ConnectionControlPlaneError::UnresolvableBindings { id })
+                if id == created.id.as_str()
+        ));
+    }
+
+    fn managed_candidate() -> ConnectionWrite {
+        serde_json::from_value(serde_json::json!({
+            "display_name": "Billing API",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {
+                "type": "none"
+            }
+        }))
+        .expect("managed candidate should deserialize")
+    }
+
+    #[test]
+    fn successful_mutations_publish_one_atomic_runtime_snapshot() {
+        let temporary = TemporaryLocalControlPlane::new("runtime-mutations");
+        let control_plane = ConnectionControlPlane::from_config(&temporary.config())
+            .expect("control plane should build");
+        let initial = control_plane.runtime_snapshot();
+        assert!(initial.managed().is_empty());
+
+        let created = control_plane
+            .create_managed(initial.collection_etag(), managed_candidate())
+            .expect("create should succeed");
+        let after_create = control_plane.runtime_snapshot();
+        assert!(
+            initial.managed().is_empty(),
+            "old snapshot must remain immutable"
+        );
+        assert_eq!(after_create.managed().get(&created.id), Some(&created));
+        assert_ne!(initial.collection_etag(), after_create.collection_etag());
+
+        assert!(matches!(
+            control_plane.create_managed(initial.collection_etag(), managed_candidate()),
+            Err(ConnectionMutationError::CollectionConflict { .. })
+        ));
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .count()
+                .expect("count should load"),
+            1,
+            "stale collection mutation must not reach storage"
+        );
+
+        let mut replacement = created.write.clone();
+        replacement.display_name = "Billing API v2".to_owned();
+        let replaced = control_plane
+            .replace_managed(&created.id, &created.etag(), replacement)
+            .expect("replace should succeed");
+        let after_replace = control_plane.runtime_snapshot();
+        assert_eq!(after_create.managed().get(&created.id), Some(&created));
+        assert_eq!(after_replace.managed().get(&created.id), Some(&replaced));
+
+        control_plane
+            .delete_managed(&created.id, &replaced.etag())
+            .expect("delete should succeed");
+        let after_delete = control_plane.runtime_snapshot();
+        assert!(!after_delete.managed().contains_key(&created.id));
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .count()
+                .expect("count should load"),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_mutation_preserves_runtime_and_persisted_state() {
+        let temporary = TemporaryLocalControlPlane::new("runtime-failure");
+        let control_plane = ConnectionControlPlane::from_config(&temporary.config())
+            .expect("control plane should build");
+        let before = control_plane.runtime_snapshot();
+        let mut invalid = managed_candidate();
+        invalid.endpoint.base_url = "https://billing.example.test?secret=forbidden".to_owned();
+
+        assert!(matches!(
+            control_plane.create_managed(before.collection_etag(), invalid),
+            Err(ConnectionMutationError::Store(
+                ConnectionStoreError::Validation { .. }
+            ))
+        ));
+        let after = control_plane.runtime_snapshot();
+        assert!(after.managed().is_empty());
+        assert_eq!(before.collection_etag(), after.collection_etag());
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .count()
+                .expect("count should load"),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_creates_with_one_collection_etag_have_exactly_one_winner() {
+        let temporary = TemporaryLocalControlPlane::new("runtime-one-winner");
+        let control_plane = Arc::new(
+            ConnectionControlPlane::from_config(&temporary.config())
+                .expect("control plane should build"),
+        );
+        let expected = control_plane
+            .runtime_snapshot()
+            .collection_etag()
+            .to_owned();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for index in 0..2 {
+            let control_plane = Arc::clone(&control_plane);
+            let barrier = Arc::clone(&barrier);
+            let expected = expected.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut candidate = managed_candidate();
+                candidate.display_name = format!("Concurrent API {index}");
+                barrier.wait();
+                control_plane.create_managed(&expected, candidate)
+            }));
+        }
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker should join"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        result,
+                        Err(ConnectionMutationError::CollectionConflict { .. })
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(control_plane.runtime_snapshot().managed().len(), 1);
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .count()
+                .expect("count should load"),
+            1
+        );
     }
 
     #[cfg(unix)]
