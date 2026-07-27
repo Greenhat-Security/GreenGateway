@@ -364,15 +364,23 @@ impl OperatorAliasResolver {
         alias_id: &str,
         purpose: SecretPurpose,
     ) -> Result<ResolvedSecret, SecretResolveError> {
+        let _permit = Arc::clone(&self.concurrent_reads)
+            .try_acquire_owned()
+            .map_err(|_| SecretResolveError::new(alias_id, SecretResolveErrorKind::ProviderBusy))?;
+        self.resolve_blocking_inner(alias_id, purpose)
+    }
+
+    fn resolve_blocking_inner(
+        &self,
+        alias_id: &str,
+        purpose: SecretPurpose,
+    ) -> Result<ResolvedSecret, SecretResolveError> {
         let alias = self.aliases.get(alias_id).cloned().ok_or_else(|| {
             SecretResolveError::new(
                 safe_error_alias_id(alias_id),
                 SecretResolveErrorKind::UnknownAlias,
             )
         })?;
-        let _permit = Arc::clone(&self.concurrent_reads)
-            .try_acquire_owned()
-            .map_err(|_| SecretResolveError::new(alias_id, SecretResolveErrorKind::ProviderBusy))?;
         match &alias.source {
             OperatorSecretAliasSource::Environment { key } => {
                 let value = (self.environment)(key).map_err(|_| {
@@ -402,11 +410,19 @@ impl SecretResolver for OperatorAliasResolver {
         let resolver = self.clone();
         let alias_id = safe_error_alias_id(alias_id);
         let join_alias_id = alias_id.clone();
-        tokio::task::spawn_blocking(move || resolver.resolve_blocking(&alias_id, purpose))
-            .await
+        let permit = Arc::clone(&self.concurrent_reads)
+            .try_acquire_owned()
             .map_err(|_| {
-                SecretResolveError::new(join_alias_id, SecretResolveErrorKind::ProviderFailure)
-            })?
+                SecretResolveError::new(&alias_id, SecretResolveErrorKind::ProviderBusy)
+            })?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            resolver.resolve_blocking_inner(&alias_id, purpose)
+        })
+        .await
+        .map_err(|_| {
+            SecretResolveError::new(join_alias_id, SecretResolveErrorKind::ProviderFailure)
+        })?
     }
 
     fn aliases(&self) -> Vec<SecretAliasMetadata> {
@@ -1069,6 +1085,57 @@ mod tests {
                 .expose(),
             b"value"
         );
+    }
+
+    #[test]
+    fn saturated_provider_rejects_before_entering_the_blocking_queue() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("bounded test runtime should build");
+        runtime.block_on(async {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx
+                    .send(())
+                    .expect("blocking-pool fixture should report admission");
+                release_rx
+                    .recv()
+                    .expect("blocking-pool fixture should be released");
+            });
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("blocking pool should be occupied");
+
+            let values = Arc::new(Mutex::new(BTreeMap::from([(
+                "BILLING_TOKEN".to_owned(),
+                "value".to_owned(),
+            )])));
+            let mut resolver = resolver_with_environment(
+                &[environment_alias("billing", "BILLING_TOKEN")],
+                values,
+                1,
+            );
+            resolver.concurrent_reads = Arc::new(Semaphore::new(0));
+            let error = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                resolver.resolve("billing", SecretPurpose::StaticBearer),
+            )
+            .await
+            .expect("saturated admission must not wait behind a blocking task")
+            .expect_err("saturated admission must fail closed");
+            assert_eq!(error.kind(), SecretResolveErrorKind::ProviderBusy);
+
+            release_tx
+                .send(())
+                .expect("blocking-pool fixture should release");
+            blocker
+                .await
+                .expect("blocking-pool fixture should finish cleanly");
+        });
     }
 
     #[tokio::test]

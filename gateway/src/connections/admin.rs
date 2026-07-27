@@ -140,8 +140,8 @@ impl SafeConnectionConfiguration {
             ),
             tls: SafeTlsConfiguration {
                 ca_bundle_configured: write.tls.ca_bundle_alias.is_some(),
-                client_identity_configured: write.tls.client_certificate_id.is_some()
-                    && write.tls.client_private_key_id.is_some(),
+                client_certificate_configured: write.tls.client_certificate_id.is_some(),
+                client_private_key_configured: write.tls.client_private_key_id.is_some(),
             },
             timeouts: write.timeouts.clone(),
             discovery: write.discovery.clone(),
@@ -214,7 +214,8 @@ impl SafeConnectionAuthentication {
 #[serde(deny_unknown_fields)]
 pub struct SafeTlsConfiguration {
     pub ca_bundle_configured: bool,
-    pub client_identity_configured: bool,
+    pub client_certificate_configured: bool,
+    pub client_private_key_configured: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -453,6 +454,8 @@ mod tests {
         assert!(!serialized.contains("billing-ca-id-canary"));
         assert!(serialized.contains("\"secret_configured\":true"));
         assert!(serialized.contains("\"ca_bundle_configured\":true"));
+        assert!(serialized.contains("\"client_certificate_configured\":false"));
+        assert!(serialized.contains("\"client_private_key_configured\":false"));
     }
 
     #[test]

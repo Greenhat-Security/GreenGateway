@@ -6064,19 +6064,18 @@ fn retain_hidden_connection_bindings(
         current.tls.ca_bundle_alias.as_deref(),
         true,
     )?;
-    let identity_marker = take_redacted_marker(tls, "client_identity_configured")?;
-    retain_hidden_binding_with_marker(
+    retain_hidden_binding(
         tls,
         "client_certificate_id",
+        "client_certificate_configured",
         current.tls.client_certificate_id.as_deref(),
-        identity_marker,
         true,
     )?;
-    retain_hidden_binding_with_marker(
+    retain_hidden_binding(
         tls,
         "client_private_key_id",
+        "client_private_key_configured",
         current.tls.client_private_key_id.as_deref(),
-        identity_marker,
         true,
     )
 }
@@ -18132,6 +18131,87 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    #[test]
+    fn redacted_partial_mtls_draft_round_trips_each_hidden_binding_independently() {
+        let current: connections::model::ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Partial mTLS draft",
+            "enabled": false,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://partial.example.test",
+                "base_path": "/"
+            },
+            "authentication": {
+                "type": "none"
+            },
+            "tls": {
+                "client_certificate_id": "certificate-only-binding-canary"
+            }
+        }))
+        .expect("partial disabled draft should deserialize");
+        let redacted_edit = json!({
+            "display_name": "Partial mTLS draft renamed",
+            "enabled": false,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://partial.example.test",
+                "base_path": "/"
+            },
+            "authentication": {
+                "type": "none"
+            },
+            "tls": {
+                "ca_bundle_configured": false,
+                "client_certificate_configured": true,
+                "client_private_key_configured": false
+            }
+        });
+
+        let candidate =
+            parse_connection_write_body(&Bytes::from(redacted_edit.to_string()), &current)
+                .expect("redacted partial draft should retain its lone certificate binding");
+
+        assert_eq!(
+            candidate.tls.client_certificate_id.as_deref(),
+            Some("certificate-only-binding-canary")
+        );
+        assert!(candidate.tls.client_private_key_id.is_none());
+        assert!(!current.requires_secrets_write_to_replace(&candidate));
+
+        let mut private_key_only = current.clone();
+        private_key_only.tls.client_certificate_id = None;
+        private_key_only.tls.client_private_key_id =
+            Some("private-key-only-binding-canary".to_owned());
+        let private_key_edit = json!({
+            "display_name": "Private-key-only mTLS draft renamed",
+            "enabled": false,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://partial.example.test",
+                "base_path": "/"
+            },
+            "authentication": {
+                "type": "none"
+            },
+            "tls": {
+                "ca_bundle_configured": false,
+                "client_certificate_configured": false,
+                "client_private_key_configured": true
+            }
+        });
+        let private_key_candidate = parse_connection_write_body(
+            &Bytes::from(private_key_edit.to_string()),
+            &private_key_only,
+        )
+        .expect("redacted partial draft should retain its lone private-key binding");
+        assert!(private_key_candidate.tls.client_certificate_id.is_none());
+        assert_eq!(
+            private_key_candidate.tls.client_private_key_id.as_deref(),
+            Some("private-key-only-binding-canary")
+        );
+        assert!(!private_key_only.requires_secrets_write_to_replace(&private_key_candidate));
     }
 
     #[tokio::test]

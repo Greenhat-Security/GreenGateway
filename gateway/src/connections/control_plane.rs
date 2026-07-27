@@ -231,6 +231,8 @@ impl ConnectionControlPlane {
             Arc::new(CoordinatedLocalSecretManager {
                 provider,
                 mutation_lock: Arc::clone(&mutation_lock),
+                runtime: Arc::clone(&runtime),
+                secret_resolver: Arc::clone(&secret_resolver),
             })
         });
 
@@ -590,16 +592,93 @@ impl ConnectionSecretResolver {
         if let (Some(certificate), Some(private_key)) =
             (client_certificate.as_ref(), client_private_key.as_ref())
         {
-            let mut identity = Zeroizing::new(Vec::with_capacity(
-                certificate.expose().len() + private_key.expose().len(),
-            ));
-            identity.extend_from_slice(certificate.expose());
-            identity.extend_from_slice(private_key.expose());
-            if !crate::egress::tls_client_identity_pem_is_valid(identity.as_slice()) {
+            validate_client_identity_material(certificate.expose(), private_key.expose())?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_enabled_candidate_with_rotated_secret(
+        &self,
+        candidate: &ConnectionWrite,
+        rotated_id: &str,
+        replacement: &ResolvedSecret,
+    ) -> Result<(), BindingActivationError> {
+        if !candidate.enabled {
+            return Ok(());
+        }
+
+        let authentication_purpose = match &candidate.authentication {
+            ConnectionAuthentication::HeaderApiKey {
+                secret_id: Some(secret_id),
+                ..
+            } if secret_id == rotated_id => Some(SecretPurpose::HeaderApiKey),
+            ConnectionAuthentication::StaticBearer {
+                secret_id: Some(secret_id),
+            } if secret_id == rotated_id => Some(SecretPurpose::StaticBearer),
+            ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id: Some(secret_id),
+                ..
+            } if secret_id == rotated_id => Some(SecretPurpose::OAuthClientSecret),
+            _ => None,
+        };
+        if authentication_purpose.is_some_and(|purpose| replacement.purpose() != purpose) {
+            return Err(BindingActivationError::Invalid {
+                fields: vec!["authentication"],
+            });
+        }
+
+        if candidate.tls.ca_bundle_alias.as_deref() == Some(rotated_id)
+            && (replacement.purpose() != SecretPurpose::TlsCaBundle
+                || !crate::egress::tls_ca_bundle_pem_is_valid(replacement.expose()))
+        {
+            return Err(BindingActivationError::Invalid {
+                fields: vec!["tls.ca_bundle_alias"],
+            });
+        }
+
+        if candidate.tls.client_certificate_id.as_deref() == Some(rotated_id) {
+            if replacement.purpose() != SecretPurpose::TlsCertificate {
                 return Err(BindingActivationError::Invalid {
-                    fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
+                    fields: vec!["tls.client_certificate_id"],
                 });
             }
+            let private_key_id =
+                candidate
+                    .tls
+                    .client_private_key_id
+                    .as_deref()
+                    .ok_or_else(|| BindingActivationError::Invalid {
+                        fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
+                    })?;
+            let private_key = self.resolve_required(
+                "tls.client_private_key_id",
+                private_key_id,
+                SecretPurpose::TlsPrivateKey,
+            )?;
+            validate_client_identity_material(replacement.expose(), private_key.expose())?;
+        }
+
+        if candidate.tls.client_private_key_id.as_deref() == Some(rotated_id) {
+            if replacement.purpose() != SecretPurpose::TlsPrivateKey {
+                return Err(BindingActivationError::Invalid {
+                    fields: vec!["tls.client_private_key_id"],
+                });
+            }
+            let certificate_id =
+                candidate
+                    .tls
+                    .client_certificate_id
+                    .as_deref()
+                    .ok_or_else(|| BindingActivationError::Invalid {
+                        fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
+                    })?;
+            let certificate = self.resolve_required(
+                "tls.client_certificate_id",
+                certificate_id,
+                SecretPurpose::TlsCertificate,
+            )?;
+            validate_client_identity_material(certificate.expose(), replacement.expose())?;
         }
 
         Ok(())
@@ -623,6 +702,22 @@ impl ConnectionSecretResolver {
                 | SecretResolveErrorKind::UnsafeSource
                 | SecretResolveErrorKind::ProviderFailure => BindingActivationError::Unavailable,
             })
+    }
+}
+
+fn validate_client_identity_material(
+    certificate: &[u8],
+    private_key: &[u8],
+) -> Result<(), BindingActivationError> {
+    let mut identity = Zeroizing::new(Vec::with_capacity(certificate.len() + private_key.len()));
+    identity.extend_from_slice(certificate);
+    identity.extend_from_slice(private_key);
+    if crate::egress::tls_client_identity_pem_is_valid(identity.as_slice()) {
+        Ok(())
+    } else {
+        Err(BindingActivationError::Invalid {
+            fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
+        })
     }
 }
 
@@ -656,6 +751,8 @@ impl SecretResolver for ConnectionSecretResolver {
 struct CoordinatedLocalSecretManager {
     provider: Arc<LocalSecretProvider>,
     mutation_lock: Arc<Mutex<()>>,
+    runtime: Arc<ArcSwap<ConnectionRuntimeSnapshot>>,
+    secret_resolver: Arc<ConnectionSecretResolver>,
 }
 
 impl CoordinatedLocalSecretManager {
@@ -688,6 +785,15 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
         replacement: ResolvedSecret,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
         let _guard = self.mutation_guard();
+        let snapshot = self.runtime.load_full();
+        for record in snapshot.managed().values() {
+            self.secret_resolver
+                .validate_enabled_candidate_with_rotated_secret(&record.write, id, &replacement)
+                .map_err(|error| match error {
+                    BindingActivationError::Invalid { .. } => LocalSecretError::InvalidSecret,
+                    BindingActivationError::Unavailable => LocalSecretError::StorageFailure,
+                })?;
+        }
         self.provider.rotate(id, replacement)
     }
 
@@ -1359,6 +1465,96 @@ mod tests {
                 .expect("count should load"),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn in_use_local_tls_rotation_is_preflighted_and_preserves_previous_material() {
+        let temporary = TemporaryLocalControlPlane::new("tls-rotation-preflight");
+        let config = temporary.config();
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let key = rcgen::KeyPair::generate().expect("test identity key should generate");
+        let certificate = rcgen::CertificateParams::new(vec!["client.example.test".to_owned()])
+            .expect("test identity parameters should build")
+            .self_signed(&key)
+            .expect("test identity certificate should build");
+        let certificate_pem = certificate.pem().into_bytes();
+        let private_key_pem = key.serialize_pem().into_bytes();
+        let manager = control_plane
+            .local_secret_manager()
+            .expect("local manager should exist");
+        let certificate_secret = manager
+            .create(
+                "Client certificate",
+                ResolvedSecret::new(SecretPurpose::TlsCertificate, certificate_pem.clone())
+                    .expect("certificate secret should validate"),
+            )
+            .expect("certificate secret should create");
+        let private_key_secret = manager
+            .create(
+                "Client private key",
+                ResolvedSecret::new(SecretPurpose::TlsPrivateKey, private_key_pem.clone())
+                    .expect("private-key secret should validate"),
+            )
+            .expect("private-key secret should create");
+        let before = control_plane.runtime_snapshot();
+        let mut candidate = managed_candidate();
+        candidate.tls.client_certificate_id = Some(certificate_secret.id.clone());
+        candidate.tls.client_private_key_id = Some(private_key_secret.id.clone());
+        let created = control_plane
+            .create_managed(before.collection_etag(), candidate)
+            .expect("valid mTLS connection should activate");
+
+        assert_eq!(
+            manager.rotate(
+                &certificate_secret.id,
+                ResolvedSecret::new(
+                    SecretPurpose::TlsCertificate,
+                    b"malformed-certificate-canary".to_vec(),
+                )
+                .expect("bounded malformed fixture should construct"),
+            ),
+            Err(LocalSecretError::InvalidSecret)
+        );
+        let mismatched_key =
+            rcgen::KeyPair::generate().expect("mismatched identity key should generate");
+        assert_eq!(
+            manager.rotate(
+                &private_key_secret.id,
+                ResolvedSecret::new(
+                    SecretPurpose::TlsPrivateKey,
+                    mismatched_key.serialize_pem().into_bytes(),
+                )
+                .expect("mismatched key fixture should construct"),
+            ),
+            Err(LocalSecretError::InvalidSecret)
+        );
+
+        assert_eq!(
+            control_plane
+                .secret_resolver()
+                .resolve(&certificate_secret.id, SecretPurpose::TlsCertificate,)
+                .await
+                .expect("previous certificate should remain resolvable")
+                .expose(),
+            certificate_pem
+        );
+        assert_eq!(
+            control_plane
+                .secret_resolver()
+                .resolve(&private_key_secret.id, SecretPurpose::TlsPrivateKey,)
+                .await
+                .expect("previous private key should remain resolvable")
+                .expose(),
+            private_key_pem
+        );
+        assert_eq!(
+            control_plane.runtime_snapshot().managed().get(&created.id),
+            Some(&created)
+        );
+        drop(control_plane);
+        ConnectionControlPlane::from_config(&config)
+            .expect("rejected rotations must leave restartable state");
     }
 
     #[test]

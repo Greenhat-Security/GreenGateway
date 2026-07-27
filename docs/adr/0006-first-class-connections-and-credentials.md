@@ -224,7 +224,9 @@ opened relative to that handle without following links and in nonblocking mode,
 validated from the opened handle, and read through a purpose-specific byte cap.
 Values are resolved on every authorized use rather than cached, so atomic
 mounted-file replacement affects the next resolution without changing an
-already in-flight redacted value.
+already in-flight redacted value. A finite provider permit is reserved before
+submitting blocking environment, filesystem, or encrypted-store work; saturated
+resolution therefore fails closed without building an unbounded blocking queue.
 
 Internal resolved secret wrappers do not implement `Serialize` or `Clone`.
 Their manual `Debug` output is exactly `<redacted>`, their bytes are bounded by
@@ -250,7 +252,10 @@ The management interface can create, rotate, delete, list safe metadata,
 re-encrypt a bounded key batch, and verify old-key disuse. It deliberately has
 no reveal method; runtime plaintext resolution is a separate capability.
 Create and rotate consume a redacted zeroizing value and return only stable
-metadata. Referenced deletion fails with bounded connection dependency IDs.
+metadata. Rotation preflights proposed material against every enabled
+referencing Connection, including CA parsing and client certificate/private-key
+pairing, before changing ciphertext; a failed preflight preserves the prior
+value and runtime. Referenced deletion fails with bounded connection dependency IDs.
 The database, WAL, and database backups contain ciphertext only. Database and
 key backups are separate recovery artifacts and must be restored together.
 
