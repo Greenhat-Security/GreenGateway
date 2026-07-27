@@ -163,6 +163,7 @@ struct AppState {
     mcp: mcp::McpState,
     protected_resource_metadata: Option<auth::protected_resource::ProtectedResourceMetadataConfig>,
     lifecycle: GatewayLifecycle,
+    _connections: connections::control_plane::ConnectionControlPlane,
 }
 
 #[derive(Clone)]
@@ -1253,6 +1254,8 @@ fn gateway_app_with_process_started_at_and_overrides(
         .map(discovery::query::DiscoveryQueryStore::open)
         .transpose()?
         .map(Arc::new);
+    let connection_control_plane =
+        connections::control_plane::ConnectionControlPlane::from_config(&config)?;
     let mut configured_suggestion_routes = config
         .upstream_url
         .as_deref()
@@ -1564,6 +1567,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         mcp: mcp_state,
         protected_resource_metadata,
         lifecycle,
+        _connections: connection_control_plane,
     };
     let audit_admin_state = AuditAdminState {
         query_store: audit_query_store,
@@ -7583,6 +7587,7 @@ mod tests {
             discovery_sqlite_path: None,
             discovery_endpoint_limit: config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
             principal_sqlite_path: None,
+            connections_sqlite_path: None,
             payload_capture_enabled: false,
             payload_capture_sample_rate: config::DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
             schema_mismatch_signal_threshold:

@@ -116,6 +116,7 @@ const CSRF_COOKIE_NAME: &str = "CSRF_COOKIE_NAME";
 const CSRF_ENABLED: &str = "CSRF_ENABLED";
 const CSRF_EXEMPT_PATHS: &str = "CSRF_EXEMPT_PATHS";
 const CSRF_HEADER_NAME: &str = "CSRF_HEADER_NAME";
+const CONNECTIONS_SQLITE_PATH: &str = "CONNECTIONS_SQLITE_PATH";
 const DISCOVERY_SQLITE_PATH: &str = "DISCOVERY_SQLITE_PATH";
 const DISCOVERY_ENDPOINT_LIMIT: &str = "DISCOVERY_ENDPOINT_LIMIT";
 const ERROR_RATE_SPIKE_SIGNAL_THRESHOLD: &str = "ERROR_RATE_SPIKE_SIGNAL_THRESHOLD";
@@ -190,6 +191,7 @@ pub struct Config {
     pub discovery_sqlite_path: Option<String>,
     pub discovery_endpoint_limit: usize,
     pub principal_sqlite_path: Option<String>,
+    pub connections_sqlite_path: Option<String>,
     pub payload_capture_enabled: bool,
     pub payload_capture_sample_rate: f64,
     pub schema_mismatch_signal_threshold: u64,
@@ -690,6 +692,12 @@ impl Config {
         Self::from_env_vars(|name| env::var(name))
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_defaults() -> Self {
+        Self::from_env_vars(|_| Err(VarError::NotPresent))
+            .expect("the default test configuration should validate")
+    }
+
     fn from_env_vars(
         mut get_var: impl FnMut(&str) -> Result<String, VarError>,
     ) -> Result<Self, ConfigError> {
@@ -835,6 +843,11 @@ impl Config {
         let principal_sqlite_path = parse_optional_string(
             PRINCIPAL_SQLITE_PATH,
             get_var(PRINCIPAL_SQLITE_PATH),
+            &mut problems,
+        );
+        let connections_sqlite_path = parse_optional_string(
+            CONNECTIONS_SQLITE_PATH,
+            get_var(CONNECTIONS_SQLITE_PATH),
             &mut problems,
         );
         let payload_capture_enabled = parse_var(
@@ -1292,6 +1305,7 @@ impl Config {
                 discovery_sqlite_path,
                 discovery_endpoint_limit,
                 principal_sqlite_path,
+                connections_sqlite_path,
                 payload_capture_enabled,
                 payload_capture_sample_rate,
                 schema_mismatch_signal_threshold,
@@ -3918,6 +3932,28 @@ mod tests {
         .expect("config should parse");
 
         assert_eq!(config.principal_sqlite_path, None);
+    }
+
+    #[test]
+    fn connections_sqlite_path_is_explicit_and_optional() {
+        let configured = Config::from_env_vars(|name| match name {
+            "CONNECTIONS_SQLITE_PATH" => {
+                Ok("  /var/lib/greengateway/connections.sqlite  ".to_owned())
+            }
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+        assert_eq!(
+            configured.connections_sqlite_path,
+            Some("/var/lib/greengateway/connections.sqlite".to_owned())
+        );
+
+        let unset = Config::from_env_vars(|name| match name {
+            "CONNECTIONS_SQLITE_PATH" => Ok("   ".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("empty path should parse");
+        assert_eq!(unset.connections_sqlite_path, None);
     }
 
     #[test]

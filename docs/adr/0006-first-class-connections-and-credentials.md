@@ -241,9 +241,10 @@ the ceiling.
 |---|---:|
 | Managed and projected connections | 256 |
 | Credential records | 512 |
+| Retained connection dependency rows | 4,096 |
 | Managed OpenAPI document | 2 MiB |
 | Published catalog entries | 4,096 |
-| Retained safe status/history rows | 4,096 |
+| Current plus retained safe status/history rows | 4,096 |
 | Concurrent refreshes | 4 |
 | Connection/secret ID | 128 bytes |
 | Display name | 128 characters |
