@@ -774,11 +774,14 @@ impl LocalSecretProvider {
         }
     }
 
-    fn resolve_sync(
+    pub(crate) fn resolve_blocking(
         &self,
         alias_id: &str,
         purpose: SecretPurpose,
     ) -> Result<ResolvedSecret, SecretResolveError> {
+        let _permit = Arc::clone(&self.concurrent_reads)
+            .try_acquire_owned()
+            .map_err(|_| SecretResolveError::new(alias_id, SecretResolveErrorKind::ProviderBusy))?;
         let record = query_record(&self.connection_guard(), alias_id)
             .map_err(|_| {
                 SecretResolveError::new(alias_id, SecretResolveErrorKind::ProviderFailure)
@@ -959,21 +962,13 @@ impl SecretResolver for LocalSecretProvider {
         purpose: SecretPurpose,
     ) -> Result<ResolvedSecret, SecretResolveError> {
         let safe_alias_id = safe_error_alias_id(alias_id);
-        let permit = Arc::clone(&self.concurrent_reads)
-            .try_acquire_owned()
-            .map_err(|_| {
-                SecretResolveError::new(&safe_alias_id, SecretResolveErrorKind::ProviderBusy)
-            })?;
         let provider = self.clone();
         let join_alias_id = safe_alias_id.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            provider.resolve_sync(&safe_alias_id, purpose)
-        })
-        .await
-        .map_err(|_| {
-            SecretResolveError::new(join_alias_id, SecretResolveErrorKind::ProviderFailure)
-        })?
+        tokio::task::spawn_blocking(move || provider.resolve_blocking(&safe_alias_id, purpose))
+            .await
+            .map_err(|_| {
+                SecretResolveError::new(join_alias_id, SecretResolveErrorKind::ProviderFailure)
+            })?
     }
 
     fn aliases(&self) -> Vec<SecretAliasMetadata> {

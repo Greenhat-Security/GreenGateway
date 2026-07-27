@@ -358,11 +358,8 @@ impl OperatorAliasResolver {
     pub fn contains_alias(&self, alias_id: &str) -> bool {
         self.aliases.contains_key(alias_id)
     }
-}
 
-#[async_trait]
-impl SecretResolver for OperatorAliasResolver {
-    async fn resolve(
+    pub(crate) fn resolve_blocking(
         &self,
         alias_id: &str,
         purpose: SecretPurpose,
@@ -373,39 +370,43 @@ impl SecretResolver for OperatorAliasResolver {
                 SecretResolveErrorKind::UnknownAlias,
             )
         })?;
-        let permit = Arc::clone(&self.concurrent_reads)
+        let _permit = Arc::clone(&self.concurrent_reads)
             .try_acquire_owned()
             .map_err(|_| SecretResolveError::new(alias_id, SecretResolveErrorKind::ProviderBusy))?;
-        let root = self.secrets_root.clone();
-        let environment = Arc::clone(&self.environment);
-        let alias_id = alias.id.clone();
-        let join_alias_id = alias_id.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            match &alias.source {
-                OperatorSecretAliasSource::Environment { key } => {
-                    let value = environment(key).map_err(|_| {
-                        SecretResolveError::new(
-                            &alias_id,
-                            SecretResolveErrorKind::SourceUnavailable,
-                        )
-                    })?;
-                    ResolvedSecret::new(purpose, value.into_bytes()).map_err(|_| {
-                        SecretResolveError::new(&alias_id, SecretResolveErrorKind::InvalidMaterial)
-                    })
-                }
-                OperatorSecretAliasSource::File { key } => {
-                    let root = root.as_deref().ok_or_else(|| {
-                        SecretResolveError::new(&alias_id, SecretResolveErrorKind::ProviderFailure)
-                    })?;
-                    read_file_secret(&alias_id, root, key, purpose)
-                }
+        match &alias.source {
+            OperatorSecretAliasSource::Environment { key } => {
+                let value = (self.environment)(key).map_err(|_| {
+                    SecretResolveError::new(&alias.id, SecretResolveErrorKind::SourceUnavailable)
+                })?;
+                ResolvedSecret::new(purpose, value.into_bytes()).map_err(|_| {
+                    SecretResolveError::new(&alias.id, SecretResolveErrorKind::InvalidMaterial)
+                })
             }
-        })
-        .await
-        .map_err(|_| {
-            SecretResolveError::new(join_alias_id, SecretResolveErrorKind::ProviderFailure)
-        })?
+            OperatorSecretAliasSource::File { key } => {
+                let root = self.secrets_root.as_deref().ok_or_else(|| {
+                    SecretResolveError::new(&alias.id, SecretResolveErrorKind::ProviderFailure)
+                })?;
+                read_file_secret(&alias.id, root, key, purpose)
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl SecretResolver for OperatorAliasResolver {
+    async fn resolve(
+        &self,
+        alias_id: &str,
+        purpose: SecretPurpose,
+    ) -> Result<ResolvedSecret, SecretResolveError> {
+        let resolver = self.clone();
+        let alias_id = safe_error_alias_id(alias_id);
+        let join_alias_id = alias_id.clone();
+        tokio::task::spawn_blocking(move || resolver.resolve_blocking(&alias_id, purpose))
+            .await
+            .map_err(|_| {
+                SecretResolveError::new(join_alias_id, SecretResolveErrorKind::ProviderFailure)
+            })?
     }
 
     fn aliases(&self) -> Vec<SecretAliasMetadata> {

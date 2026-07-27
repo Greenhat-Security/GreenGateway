@@ -2961,6 +2961,9 @@ async fn connection_put_endpoint(
             Ok(rbac_state) => rbac_state,
             Err(error) => return connection_admin_authz_error_response(error),
         };
+    if !state.control_plane.is_managed_store_configured() {
+        return connection_store_not_configured();
+    }
     let id = match connections::model::ConnectionId::parse(raw_id) {
         Ok(id) => id,
         Err(_) => return not_found("connection was not found"),
@@ -2981,7 +2984,7 @@ async fn connection_put_endpoint(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let candidate = match parse_connection_write_body(&body) {
+    let candidate = match parse_connection_write_body(&body, &current.write) {
         Ok(candidate) => candidate,
         Err(response) => return *response,
     };
@@ -3072,6 +3075,9 @@ async fn connection_delete_endpoint(
             Ok(rbac_state) => rbac_state,
             Err(error) => return connection_admin_authz_error_response(error),
         };
+    if !state.control_plane.is_managed_store_configured() {
+        return connection_store_not_configured();
+    }
     let body = match read_request_body(body, connection_admin_body_limit(&state)).await {
         Ok(body) => body,
         Err(response) => return response,
@@ -5982,10 +5988,175 @@ fn connection_admin_body_limit(state: &ConnectionAdminState) -> usize {
 
 fn parse_connection_write_body(
     body: &Bytes,
+    current: &connections::model::ConnectionWrite,
 ) -> ResponseResult<connections::model::ConnectionWrite> {
-    let candidate = serde_json::from_slice::<connections::model::ConnectionWrite>(body)
+    let mut candidate = serde_json::from_slice::<Value>(body)
+        .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
+    retain_hidden_connection_bindings(&mut candidate, current)?;
+    let candidate = serde_json::from_value::<connections::model::ConnectionWrite>(candidate)
         .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
     validate_connection_write(candidate)
+}
+
+fn retain_hidden_connection_bindings(
+    candidate: &mut Value,
+    current: &connections::model::ConnectionWrite,
+) -> ResponseResult<()> {
+    let object = candidate
+        .as_object_mut()
+        .ok_or_else(|| Box::new(bad_request("connection JSON must be an object")))?;
+    let authentication = object
+        .get_mut("authentication")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| Box::new(bad_request("connection authentication must be an object")))?;
+    let authentication_type = authentication
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Box::new(bad_request("connection authentication type is required")))?;
+
+    match (&current.authentication, authentication_type) {
+        (
+            connections::model::ConnectionAuthentication::HeaderApiKey { secret_id, .. },
+            "header_api_key",
+        )
+        | (
+            connections::model::ConnectionAuthentication::StaticBearer { secret_id },
+            "static_bearer",
+        ) => retain_hidden_binding(
+            authentication,
+            "secret_id",
+            "secret_configured",
+            secret_id.as_deref(),
+            true,
+        )?,
+        (
+            connections::model::ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id,
+                ..
+            },
+            "oauth2_client_credentials",
+        ) => retain_hidden_binding(
+            authentication,
+            "client_secret_id",
+            "client_secret_configured",
+            client_secret_id.as_deref(),
+            true,
+        )?,
+        _ => {
+            reject_redacted_marker(authentication, "secret_configured")?;
+            reject_redacted_marker(authentication, "client_secret_configured")?;
+        }
+    }
+
+    let tls = object
+        .entry("tls")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            Box::new(bad_request(
+                "connection TLS configuration must be an object",
+            ))
+        })?;
+    retain_hidden_binding(
+        tls,
+        "ca_bundle_alias",
+        "ca_bundle_configured",
+        current.tls.ca_bundle_alias.as_deref(),
+        true,
+    )?;
+    let identity_marker = take_redacted_marker(tls, "client_identity_configured")?;
+    retain_hidden_binding_with_marker(
+        tls,
+        "client_certificate_id",
+        current.tls.client_certificate_id.as_deref(),
+        identity_marker,
+        true,
+    )?;
+    retain_hidden_binding_with_marker(
+        tls,
+        "client_private_key_id",
+        current.tls.client_private_key_id.as_deref(),
+        identity_marker,
+        true,
+    )
+}
+
+fn retain_hidden_binding(
+    object: &mut serde_json::Map<String, Value>,
+    binding_field: &'static str,
+    marker_field: &'static str,
+    current: Option<&str>,
+    allow_preserve: bool,
+) -> ResponseResult<()> {
+    let marker = take_redacted_marker(object, marker_field)?;
+    retain_hidden_binding_with_marker(object, binding_field, current, marker, allow_preserve)
+}
+
+fn retain_hidden_binding_with_marker(
+    object: &mut serde_json::Map<String, Value>,
+    binding_field: &'static str,
+    current: Option<&str>,
+    marker: Option<bool>,
+    allow_preserve: bool,
+) -> ResponseResult<()> {
+    if object.contains_key(binding_field) {
+        if marker.is_some() {
+            return Err(Box::new(bad_request(
+                "redacted connection binding markers cannot be combined with explicit binding IDs",
+            )));
+        }
+        return Ok(());
+    }
+    if !allow_preserve {
+        if marker.is_some() {
+            return Err(Box::new(bad_request(
+                "redacted connection binding marker cannot be used for a different authentication type",
+            )));
+        }
+        return Ok(());
+    }
+    if marker == Some(false) {
+        return Ok(());
+    }
+    if let Some(current) = current {
+        object.insert(binding_field.to_owned(), Value::String(current.to_owned()));
+        Ok(())
+    } else if marker == Some(true) {
+        Err(Box::new(bad_request(
+            "redacted connection binding marker does not match the current resource",
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn take_redacted_marker(
+    object: &mut serde_json::Map<String, Value>,
+    marker_field: &'static str,
+) -> ResponseResult<Option<bool>> {
+    object
+        .remove(marker_field)
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                Box::new(bad_request(
+                    "redacted connection binding marker must be a boolean",
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn reject_redacted_marker(
+    object: &mut serde_json::Map<String, Value>,
+    marker_field: &'static str,
+) -> ResponseResult<()> {
+    if object.contains_key(marker_field) {
+        Err(Box::new(bad_request(
+            "redacted connection binding marker cannot be used for a different authentication type",
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_connection_create_body(
@@ -6112,6 +6283,9 @@ fn connection_mutation_error_response(
             }),
         )
             .into_response(),
+        connections::control_plane::ConnectionMutationError::BindingUnavailable => {
+            service_unavailable("connection binding validation is unavailable")
+        }
         connections::control_plane::ConnectionMutationError::Store(error) => {
             connection_store_error_response(error)
         }
@@ -7999,7 +8173,7 @@ fn connection_rbac_not_configured() -> Response {
 
 fn connection_store_not_configured() -> Response {
     (
-        StatusCode::NOT_FOUND,
+        StatusCode::SERVICE_UNAVAILABLE,
         Json(ErrorResponse {
             error: "connection mutations require CONNECTIONS_SQLITE_PATH to be configured"
                 .to_owned(),
@@ -18138,7 +18312,7 @@ mod tests {
             .await
             .expect("credentialed connection create should complete");
         assert_eq!(credentialed.status(), StatusCode::CREATED);
-        let credentialed_etag = credentialed
+        let mut credentialed_etag = credentialed
             .headers()
             .get(header::ETAG)
             .and_then(|value| value.to_str().ok())
@@ -18156,6 +18330,57 @@ mod tests {
             .as_str()
             .expect("credentialed connection should include an ID")
             .to_owned();
+
+        let credentialed_detail = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{credentialed_id}"),
+                Some(editor.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("credentialed detail should complete");
+        assert_eq!(credentialed_detail.status(), StatusCode::OK);
+        let credentialed_detail = json_body(credentialed_detail).await;
+        assert_eq!(credentialed_detail["actions"]["can_update"], json!(true));
+        assert_eq!(
+            credentialed_detail["actions"]["can_bind_secret"],
+            json!(false)
+        );
+        let presentation_update = json!({
+            "display_name": "Credentialed billing API renamed",
+            "enabled": credentialed_detail["enabled"].clone(),
+            "kind": credentialed_detail["kind"].clone(),
+            "endpoint": credentialed_detail["configuration"]["endpoint"].clone(),
+            "authentication": credentialed_detail["configuration"]["authentication"].clone(),
+            "tls": credentialed_detail["configuration"]["tls"].clone()
+        })
+        .to_string();
+        let presentation_updated = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{credentialed_id}"),
+                Some(editor.clone()),
+                Some(presentation_update),
+                Some(&credentialed_etag),
+                true,
+            ))
+            .await
+            .expect("presentation-only credentialed update should complete");
+        assert_eq!(presentation_updated.status(), StatusCode::OK);
+        credentialed_etag = presentation_updated
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("presentation update should include an ETag")
+            .to_owned();
+        let presentation_updated_body = body_string(presentation_updated).await;
+        assert!(!presentation_updated_body.contains("credential-secret-id-canary"));
+        assert!(!presentation_updated_body.contains("credential-material-value-canary"));
 
         let first_page = router
             .clone()
@@ -18309,7 +18534,7 @@ mod tests {
                 .iter()
                 .filter(|event| event.event_type == audit::event::CONNECTION_CHANGED)
                 .count()
-                == 5
+                == 6
                 && events
                     .iter()
                     .filter(|event| event.event_type == audit::event::CONNECTION_CREDENTIAL_CHANGED)
@@ -18322,7 +18547,7 @@ mod tests {
                 .iter()
                 .filter(|event| event.event_type == audit::event::CONNECTION_CHANGED)
                 .count(),
-            5
+            6
         );
         assert_eq!(
             events
@@ -18334,6 +18559,7 @@ mod tests {
         let serialized_events =
             serde_json::to_string(&events).expect("audit events should serialize");
         assert!(!serialized_events.contains("credential-secret-id-canary"));
+        assert!(!serialized_events.contains("credential-material-value-canary"));
         assert!(!serialized_events.contains("credentialed.example.test"));
     }
 
@@ -18463,6 +18689,67 @@ mod tests {
             .await
             .expect("oversized connection body should complete");
         assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn all_connection_mutations_report_unconfigured_store_as_unavailable() {
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config
+            .rbac_exempt_paths
+            .push(CONNECTIONS_ADMIN_ROUTE.to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("read-only connection app should build");
+        let editor = test_principal(&["connections-editor"]);
+
+        for (method, uri, body) in [
+            (
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE.to_owned(),
+                Some(plain_connection_body("Unavailable create")),
+            ),
+            (
+                Method::PUT,
+                format!("{CONNECTIONS_ADMIN_ROUTE}/missing"),
+                Some(plain_connection_body("Unavailable update")),
+            ),
+            (
+                Method::DELETE,
+                format!("{CONNECTIONS_ADMIN_ROUTE}/missing"),
+                None,
+            ),
+        ] {
+            let expected_method = method.clone();
+            let response = router
+                .clone()
+                .oneshot(connection_admin_request(
+                    method,
+                    &uri,
+                    Some(editor.clone()),
+                    body,
+                    Some("\"unused\""),
+                    true,
+                ))
+                .await
+                .expect("unconfigured-store mutation should complete");
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{expected_method} mutation should report the unconfigured store"
+            );
+            assert_eq!(
+                json_body(response).await["error"],
+                json!("connection mutations require CONNECTIONS_SQLITE_PATH to be configured")
+            );
+        }
     }
 
     #[tokio::test]
@@ -26469,15 +26756,30 @@ paths:
         policy: &TempPolicyFile,
         audit_log: audit::AuditLog,
     ) -> Router {
+        let secret_root = connection_db.path.with_extension("secrets");
+        fs::create_dir_all(&secret_root).expect("connection test secret root should create");
+        let secret_file = secret_root.join("credential-token");
+        fs::write(&secret_file, b"credential-material-value-canary")
+            .expect("connection test secret should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&secret_root, fs::Permissions::from_mode(0o700))
+                .expect("connection test secret root permissions should set");
+            fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600))
+                .expect("connection test secret permissions should set");
+        }
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
         config.policy_file = Some(policy.path.to_string_lossy().into_owned());
         config.connections_sqlite_path = Some(connection_db.path.to_string_lossy().into_owned());
+        config.connection_secrets_root =
+            Some(connections::secret::SecretRootConfig::new(secret_root));
         config.connection_secret_aliases = vec![connections::secret::OperatorSecretAliasConfig {
             id: "credential-secret-id-canary".to_owned(),
             label: "Credential test alias".to_owned(),
-            source: connections::secret::OperatorSecretAliasSource::Environment {
-                key: "GGW_CONNECTION_TEST_SECRET".to_owned(),
+            source: connections::secret::OperatorSecretAliasSource::File {
+                key: "credential-token".to_owned(),
             },
         }];
         config
@@ -30944,6 +31246,7 @@ O2gecI9QwDJNpm29J9wJB2F8
                 let path = PathBuf::from(format!("{}{}", self.path.display(), suffix));
                 let _ = fs::remove_file(path);
             }
+            let _ = fs::remove_dir_all(self.path.with_extension("secrets"));
         }
     }
 
