@@ -197,9 +197,25 @@ Default: empty. When unset, GreenGateway creates no implicit database, keeps the
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. GreenGateway opens the configured database, applies ordered connection-schema migrations in one immediate transaction, validates the resulting schema and foreign keys, and fails startup before either listener is built if opening, migration, or validation fails. Reopening an already migrated store is idempotent.
 
-The store contains connection metadata, opaque credential-binding IDs, dependency records, monotonic revisions, and bounded safe status history. It does not store resolved secret values, OAuth access tokens, or private-key material. Connection changes use transactions and canonical ETags; dependent records prevent deletion rather than being silently cascaded. A status observation is accepted only for the exact connection ETag it tested, and reconfiguration invalidates the prior current observation. With managed storage configured, the combined managed and projected connection count is capped at `256`; credential-binding rows are capped at `512`; dependency rows are capped at `4096`; and current plus historical safe-status rows are capped at `4096`. Every persisted bound is revalidated before startup.
+The store contains connection metadata, opaque credential-binding IDs, dependency records, monotonic revisions, bounded safe status history, and—only when the encrypted local provider is enabled—authenticated ciphertext envelopes. It does not store resolved plaintext, master keys, OAuth access tokens, or unencrypted private-key material. Connection changes use transactions and canonical ETags; dependent records prevent deletion rather than being silently cascaded. A status observation is accepted only for the exact connection ETag it tested, and reconfiguration invalidates the prior current observation. With managed storage configured, the combined managed and projected connection count is capped at `256`; credential-binding and encrypted-local-secret rows are each capped at `512`; dependency rows are capped at `4096`; and current plus historical safe-status rows are capped at `4096`. Every persisted bound is revalidated before startup.
 
 Use a durable filesystem location and include the SQLite database, WAL, and SHM files in the same operational backup boundary. An ephemeral container path does not make managed configuration durable.
+
+### CONNECTION_LOCAL_SECRET_KEYRING
+
+Optional startup keyring for the encrypted local secret provider.
+
+Default: `[]`, which disables local-secret creation and rotation. If the configured Connections database already contains encrypted local-secret rows, an empty keyring fails startup closed rather than making those bindings appear absent.
+
+Format: a JSON array of at most `16 KiB` with at most `8` entries. Each entry contains a safe opaque `id`, a one-segment `file` below `CONNECTION_SECRETS_ROOT`, and `role` equal to `primary` or `decrypt_only`. Exactly one key must be primary. The setting requires both `CONNECTIONS_SQLITE_PATH` and `CONNECTION_SECRETS_ROOT`. File keys use the same traversal, device-name, symlink, reparse-point, regular-file, nonblocking-open, and platform permission protections as operator file aliases. Each file must contain exactly 32 raw random bytes with no newline or encoding. Configuration `Debug`, startup errors, metadata, and provider errors never expose key IDs, filenames, root paths, or key material.
+
+Generate a new key directly into the protected mount rather than printing it or placing it in shell history. On Unix, for example, set a restrictive umask and run `openssl rand -out /protected/greengateway-secrets/local-secret-primary.key 32`, then verify the file is owned by the gateway account and has mode `0600`. On Windows, apply an ACL that grants read access only to the gateway service identity and administrators. Never commit, base64-wrap, newline-terminate, or place the key beside the database, an image, or a source checkout.
+
+The primary key encrypts all newly created or rotated values with XChaCha20-Poly1305 and a fresh cryptographically random 24-byte nonce. Previous keys are decrypt-only. Canonical authenticated additional data binds schema version, secret UUID, secret version, credential purpose, and the encrypted field purpose, so moving ciphertext, nonces, tags, or metadata between rows fails authentication. Unknown algorithms, missing/wrong keys, changed AAD, modified ciphertext, and invalid decrypted material fail startup or resolution closed.
+
+To rotate a master key, mount the new 32-byte key, change the former primary to `decrypt_only`, add the new entry as `primary`, and restart. Run the bounded transactional re-encryption operation until it reports zero remaining rows, then verify the former key is unused before removing its entry and file. A failed batch rolls back the entire batch. Rotating a stored credential value is independent: it increments that secret's version and uses the current primary immediately.
+
+Back up the SQLite database (including its WAL boundary) and the mounted key files separately. A database backup without every key still referenced by its rows is intentionally unrecoverable; a key backup without the database contains no secret records. Test restore by opening a copy with the copied keyring. There is no reveal/export-value operation: create and rotate consume a value once and return only stable safe metadata, while delete refuses referenced secrets with bounded connection dependency IDs.
 
 ### CONNECTION_SECRET_ALIASES
 
@@ -217,7 +233,7 @@ Values are resolved afresh for each authorized use and are never cached by this 
 
 Canonical root directory for `file` entries in `CONNECTION_SECRET_ALIASES`.
 
-Default: empty. It is required when any file alias is configured.
+Default: empty. It is required when any file alias or encrypted-local-secret keyring entry is configured.
 
 Format and validation: a valid Unicode filesystem path that exists and canonicalizes to a directory at startup. GreenGateway retains a capability-backed handle to that validated directory, so renaming or replacing the configured path or an ancestor after startup cannot redirect later reads. File aliases are restricted to one validated filename segment relative to the retained handle. Every resolution rejects symbolic links and Windows reparse points, opens the leaf without following links and in nonblocking mode, validates the opened handle as a regular file, and caps the read before material is parsed. On Unix, the root must not be group/other writable and secret files must grant no group/other permissions. Windows enforces the regular-file and reparse-point boundary, but ACL ownership/readability policy remains an operator and deployment-platform responsibility.
 

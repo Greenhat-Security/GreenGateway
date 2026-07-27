@@ -1685,6 +1685,7 @@ RowSUZV5FSmOGJ7JyROZ80k=
             discovery_endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
             principal_sqlite_path: None,
             connections_sqlite_path: None,
+            connection_local_secret_keyring: Vec::new(),
             connection_secret_aliases: Vec::new(),
             connection_secrets_root: None,
             payload_capture_enabled: false,

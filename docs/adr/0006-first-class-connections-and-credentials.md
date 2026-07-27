@@ -234,14 +234,25 @@ from internal material and omit resolved values, ciphertext, nonces, hashes,
 fingerprints, locators, master-key IDs, access tokens, private keys, and
 low-entropy suffixes.
 
-The encrypted local provider will use XChaCha20-Poly1305 with a fresh random
-24-byte nonce for every encrypted field and a 32-byte primary master key loaded
-from a mounted file outside the database. Canonical authenticated additional
-data includes schema version, secret UUID, secret version,
-connection/credential purpose, and field purpose. A keyring has one primary
-encrypt key and explicit decrypt-only predecessors. Unknown algorithms,
-missing/wrong keys, AAD mismatch, ciphertext/tag modification, or interrupted
-rotation fail closed. Database, WAL, and backups contain ciphertext only.
+The encrypted local provider uses XChaCha20-Poly1305 with a fresh random
+24-byte nonce for every encrypted field and 32-byte master keys loaded from
+protected mounted files below the canonical secrets root, outside the
+database. Canonical authenticated additional data includes schema version,
+secret UUID, secret version, connection/credential purpose, and field purpose.
+A bounded keyring has exactly one primary encrypt key and explicit decrypt-only
+predecessors. Master-key re-encryption runs in bounded immediate transactions;
+an unauthenticated row rolls back the whole batch, and an old key cannot be
+declared unused while any row still names it. Unknown algorithms, missing or
+wrong keys, AAD mismatch, ciphertext/tag modification, or interrupted rotation
+fail closed.
+
+The management interface can create, rotate, delete, list safe metadata,
+re-encrypt a bounded key batch, and verify old-key disuse. It deliberately has
+no reveal method; runtime plaintext resolution is a separate capability.
+Create and rotate consume a redacted zeroizing value and return only stable
+metadata. Referenced deletion fails with bounded connection dependency IDs.
+The database, WAL, and database backups contain ciphertext only. Database and
+key backups are separate recovery artifacts and must be restored together.
 
 ### Fixed conservative limits
 

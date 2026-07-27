@@ -97,6 +97,7 @@ impl fmt::Debug for SecretRootConfig {
 pub enum SecretProviderKind {
     OperatorEnvironment,
     OperatorFile,
+    LocalEncrypted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -229,7 +230,7 @@ pub struct SecretResolveError {
 }
 
 impl SecretResolveError {
-    fn new(alias_id: impl Into<String>, kind: SecretResolveErrorKind) -> Self {
+    pub(crate) fn new(alias_id: impl Into<String>, kind: SecretResolveErrorKind) -> Self {
         Self {
             alias_id: alias_id.into(),
             kind,
@@ -352,6 +353,10 @@ impl OperatorAliasResolver {
             environment,
             concurrent_reads: Arc::new(Semaphore::new(maximum_concurrent_reads)),
         })
+    }
+
+    pub fn contains_alias(&self, alias_id: &str) -> bool {
+        self.aliases.contains_key(alias_id)
     }
 }
 
@@ -541,7 +546,7 @@ fn validate_file_permissions(_: &str, _: &fs::Metadata) -> Result<(), SecretReso
     Ok(())
 }
 
-fn is_valid_opaque_id(value: &str, maximum: usize) -> bool {
+pub(crate) fn is_valid_opaque_id(value: &str, maximum: usize) -> bool {
     !value.is_empty()
         && value.len() <= maximum
         && value.bytes().enumerate().all(|(index, byte)| match byte {
@@ -551,7 +556,7 @@ fn is_valid_opaque_id(value: &str, maximum: usize) -> bool {
         })
 }
 
-fn safe_error_alias_id(value: &str) -> String {
+pub(crate) fn safe_error_alias_id(value: &str) -> String {
     if is_valid_opaque_id(value, MAX_SECRET_ID_BYTES) {
         value.to_owned()
     } else {
@@ -568,7 +573,7 @@ fn is_valid_environment_key(value: &str) -> bool {
         })
 }
 
-fn is_valid_file_key(value: &str) -> bool {
+pub(crate) fn is_valid_file_key(value: &str) -> bool {
     is_valid_opaque_id(value, MAX_FILE_KEY_BYTES)
         && value != "."
         && value != ".."
@@ -600,7 +605,7 @@ pub enum SecretPurpose {
 }
 
 impl SecretPurpose {
-    const fn max_bytes(self) -> usize {
+    pub(crate) const fn max_bytes(self) -> usize {
         match self {
             Self::HeaderApiKey | Self::StaticBearer | Self::OAuthClientSecret => {
                 MAX_HTTP_CREDENTIAL_BYTES

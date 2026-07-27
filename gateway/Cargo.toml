@@ -11,6 +11,7 @@ axum.workspace = true
 bytes.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
+chacha20poly1305.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 hex.workspace = true
