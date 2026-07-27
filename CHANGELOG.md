@@ -87,6 +87,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   latency; Linux release-runner investigation remains a manual gate and this
   release makes no performance-improvement claim.
 
+### Fixed
+
+- Concurrent first-use JWT validation now re-checks the verified JWKS key cache
+  after a coalesced refresh. Valid waiters no longer receive a spurious
+  `unknown kid` rejection when the leading request has populated the key; an
+  absent or unverifiable key still fails closed.
+- Configured replay-safe proxy methods can now retry a request-phase transport
+  disconnect that occurs before response headers, such as a severed reused
+  HTTP/1.1 connection. The configured attempt limit, total deadline, alternate
+  endpoint preference, and retry budget remain authoritative. Streamed or
+  otherwise non-replayable bodies, unsafe methods, TLS validation, policy/DNS
+  denial, body failures, cancellation, and post-commit failures remain
+  non-retryable.
+
 ## [1.0.1] - 2026-07-16
 
 ### Security

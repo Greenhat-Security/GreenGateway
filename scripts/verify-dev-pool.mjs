@@ -223,7 +223,7 @@ async function sendPoolRequests({
           "x-request-id": requestId,
           "x-forwarded-for": "198.51.100.10",
           "x-real-ip": "198.51.100.11",
-          ...(method === "GET" ? { cookie: "session=must-not-forward" } : {}),
+          cookie: "session=must-not-forward",
         },
         body: method === "POST" ? JSON.stringify({ requestId }) : undefined,
       })),
@@ -512,6 +512,7 @@ async function verifyDegraded(baseUrl, token, runId, endpoint) {
     requestPath: "/__dev-echo/degraded",
   });
   assertAllStatuses(results, 200);
+  assertAttemptHeaderBoundary(results);
   const seen = endpointSet(results);
   assert(!seen.has(endpoint), `${endpoint} still received ordinary traffic`);
   assert(seen.size >= 2, `expected both remaining endpoints, saw ${[...seen].join(", ")}`);
@@ -531,6 +532,7 @@ async function verifyRecovered(baseUrl, token, runId, endpoint) {
     requestPath: "/__dev-echo/recovered",
   });
   assertAllStatuses(results, 200);
+  assertAttemptHeaderBoundary(results);
   const seen = endpointSet(results);
   assert(seen.has(endpoint), `${endpoint} did not re-enter weighted traffic`);
   assert(

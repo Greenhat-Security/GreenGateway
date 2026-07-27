@@ -39,6 +39,10 @@ Options:
   --timeout-ms N          Client-side timeout per request (default: ${DEFAULT_TIMEOUT_MS})
   --token TOKEN           Use an explicit bearer token instead of the seeded dev key
   --expected-statuses CSV Override accepted HTTP statuses (for resilience runs)
+  --require-metrics       Fail if the gateway metrics endpoint is unavailable
+  --expected-upstream-attempts N  Require an exact upstream-attempt delta
+  --expected-retries N    Require an exact retry delta
+  --max-retry-amplification N  Bound attempts / completed responses
   --output PATH           Write the JSON result to PATH
   --help                  Show this help text
 
@@ -60,6 +64,10 @@ function parseArgs(argv) {
     timeoutMs: DEFAULT_TIMEOUT_MS,
     token: process.env.GREENGATEWAY_BEARER_TOKEN || null,
     expectedStatuses: null,
+    requireMetrics: false,
+    expectedUpstreamAttempts: null,
+    expectedRetries: null,
+    maxRetryAmplification: null,
     output: null,
   };
 
@@ -68,6 +76,10 @@ function parseArgs(argv) {
     if (arg === "--help" || arg === "-h") {
       console.log(usage());
       process.exit(0);
+    }
+    if (arg === "--require-metrics") {
+      parsed.requireMetrics = true;
+      continue;
     }
     const [name, inlineValue] = arg.split("=", 2);
     const value = inlineValue ?? argv[index + 1];
@@ -108,6 +120,15 @@ function parseArgs(argv) {
         break;
       case "--expected-statuses":
         parsed.expectedStatuses = statusSet(name, value);
+        break;
+      case "--expected-upstream-attempts":
+        parsed.expectedUpstreamAttempts = nonnegativeInteger(name, value);
+        break;
+      case "--expected-retries":
+        parsed.expectedRetries = nonnegativeInteger(name, value);
+        break;
+      case "--max-retry-amplification":
+        parsed.maxRetryAmplification = positiveNumber(name, value);
         break;
       case "--output":
         parsed.output = requireValue(name, value);
@@ -241,14 +262,21 @@ function requestPath(options, sequence) {
   return `${options.path}?${query.toString()}`;
 }
 
-async function fetchMetrics(baseUrl) {
+async function fetchMetrics(baseUrl, required) {
   try {
     const response = await fetch(`${baseUrl}/metrics`);
     if (!response.ok) {
-      return {};
+      throw new Error(`HTTP ${response.status}`);
     }
-    return aggregatePrometheus(await response.text());
-  } catch {
+    const metrics = aggregatePrometheus(await response.text());
+    if (required && !("gateway_http_requests_total" in metrics)) {
+      throw new Error("response did not contain GreenGateway metrics");
+    }
+    return metrics;
+  } catch (error) {
+    if (required) {
+      throw new Error(`required gateway metrics unavailable: ${error.message}`);
+    }
     return {};
   }
 }
@@ -271,11 +299,22 @@ function aggregatePrometheus(text) {
   return totals;
 }
 
-function metricDelta(before, after, name) {
+function metricDelta(before, after, name, absentIsZero = false) {
   if (!(name in before) && !(name in after)) {
-    return null;
+    return absentIsZero ? 0 : null;
   }
   return (after[name] || 0) - (before[name] || 0);
+}
+
+function expectedMixedStatusCounts(completed) {
+  const fullCycles = Math.floor(completed / 10);
+  const remainder = completed % 10;
+  return {
+    200: fullCycles * 7 + Math.min(remainder, 7),
+    500: fullCycles + (remainder > 7 ? 1 : 0),
+    503: fullCycles + (remainder > 8 ? 1 : 0),
+    504: fullCycles + (remainder > 9 ? 1 : 0),
+  };
 }
 
 function percentile(sortedValues, quantile) {
@@ -373,14 +412,37 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   const runId = `proxy-load-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
   const token = await loadToken(options.token, runId);
-  const metricsBefore = await fetchMetrics(options.baseUrl);
+  const metricsBefore = await fetchMetrics(
+    options.baseUrl,
+    options.requireMetrics,
+  );
   const result = await run(options, token, runId);
-  const metricsAfter = await fetchMetrics(options.baseUrl);
+  const metricsAfter = await fetchMetrics(
+    options.baseUrl,
+    options.requireMetrics,
+  );
   const attempts = metricDelta(
     metricsBefore,
     metricsAfter,
     "proxy_upstream_attempts_total",
+    options.requireMetrics,
   );
+  const retries = metricDelta(
+    metricsBefore,
+    metricsAfter,
+    "proxy_upstream_retries_total",
+    options.requireMetrics,
+  );
+  const cacheRequests = metricDelta(
+    metricsBefore,
+    metricsAfter,
+    "egress_client_cache_requests_total",
+    options.requireMetrics,
+  );
+  const retryAmplification =
+    attempts === null || result.completed === 0
+      ? null
+      : Number((attempts / result.completed).toFixed(6));
   const report = {
     schema_version: "1",
     recorded_at: new Date().toISOString(),
@@ -406,20 +468,9 @@ async function main() {
     result,
     gateway_metric_delta: {
       upstream_attempts: attempts,
-      retries: metricDelta(
-        metricsBefore,
-        metricsAfter,
-        "proxy_upstream_retries_total",
-      ),
-      cache_requests: metricDelta(
-        metricsBefore,
-        metricsAfter,
-        "egress_client_cache_requests_total",
-      ),
-      retry_amplification:
-        attempts === null || result.completed === 0
-          ? null
-          : Number((attempts / result.completed).toFixed(6)),
+      retries,
+      cache_requests: cacheRequests,
+      retry_amplification: retryAmplification,
     },
   };
   const expectedStatuses =
@@ -431,6 +482,42 @@ async function main() {
     (status) => !expectedStatuses.has(status),
   );
   report.result.unexpected_statuses = unexpectedStatuses;
+  const assertionFailures = [];
+
+  if (options.scenario === "mixed") {
+    const expectedCounts = expectedMixedStatusCounts(result.completed);
+    for (const [status, expected] of Object.entries(expectedCounts)) {
+      const actual = result.status_counts[status] || 0;
+      if (actual !== expected) {
+        assertionFailures.push(
+          `mixed status ${status}: expected ${expected}, received ${actual}`,
+        );
+      }
+    }
+  }
+  if (
+    options.expectedUpstreamAttempts !== null &&
+    attempts !== options.expectedUpstreamAttempts
+  ) {
+    assertionFailures.push(
+      `upstream attempts: expected ${options.expectedUpstreamAttempts}, received ${attempts}`,
+    );
+  }
+  if (options.expectedRetries !== null && retries !== options.expectedRetries) {
+    assertionFailures.push(
+      `retries: expected ${options.expectedRetries}, received ${retries}`,
+    );
+  }
+  if (
+    options.maxRetryAmplification !== null &&
+    (retryAmplification === null ||
+      retryAmplification > options.maxRetryAmplification)
+  ) {
+    assertionFailures.push(
+      `retry amplification: maximum ${options.maxRetryAmplification}, received ${retryAmplification}`,
+    );
+  }
+  report.result.assertion_failures = assertionFailures;
 
   const rendered = `${JSON.stringify(report, null, 2)}\n`;
   process.stdout.write(rendered);
@@ -441,7 +528,8 @@ async function main() {
 
   if (
     Object.keys(result.error_counts).length > 0 ||
-    unexpectedStatuses.length > 0
+    unexpectedStatuses.length > 0 ||
+    assertionFailures.length > 0
   ) {
     process.exitCode = 2;
   }

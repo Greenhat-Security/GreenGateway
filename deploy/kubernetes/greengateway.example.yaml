@@ -26,6 +26,7 @@ spec:
       labels:
         app: greengateway
     spec:
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 45
       containers:
         - name: gateway

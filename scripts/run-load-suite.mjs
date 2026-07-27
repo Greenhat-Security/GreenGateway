@@ -89,6 +89,7 @@ for (const [name, ...argumentsForScenario] of scenarios) {
   console.log(`\n=== ${name} ===`);
   await runNode([
     "scripts/proxy-load.mjs",
+    "--require-metrics",
     ...argumentsForScenario,
     "--output",
     output,

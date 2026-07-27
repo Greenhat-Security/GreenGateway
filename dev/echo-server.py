@@ -85,6 +85,13 @@ class EchoHandler(BaseHTTPRequestHandler):
             parsed.path == "/__dev-echo/retry-probe"
             and os.environ.get("FAIL_RETRY_PROBE", "").lower() == "true"
         ):
+            if retry_probe_header_boundary_violation(self.headers):
+                self._send_json(
+                    {"error": "header_boundary_violation"},
+                    status=418,
+                    include_body=include_body,
+                )
+                return
             self._send_json(
                 {"error": "intentional retry probe failure", "upstream_id": upstream_id},
                 status=503,
@@ -245,6 +252,22 @@ def bounded_query_int(query, name, minimum, maximum, default=None):
     except (TypeError, ValueError):
         return minimum if default is None else default
     return max(minimum, min(maximum, value))
+
+
+def retry_probe_header_boundary_violation(headers):
+    if headers.get("authorization") or headers.get("cookie"):
+        return True
+    request_id = headers.get("x-request-id", "")
+    forwarded_for = headers.get("x-forwarded-for", "")
+    real_ip = headers.get("x-real-ip", "")
+    forwarding = f"{forwarded_for},{real_ip}"
+    return (
+        not request_id
+        or not forwarded_for
+        or real_ip != forwarded_for
+        or "198.51.100.10" in forwarding
+        or "198.51.100.11" in forwarding
+    )
 
 
 def epoch_millis():
