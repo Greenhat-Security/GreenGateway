@@ -499,8 +499,8 @@ impl SqliteConnectionStore {
         self.maximum_connections
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
+    pub(crate) fn shared_connection(&self) -> Arc<Mutex<Connection>> {
+        Arc::clone(&self.connection)
     }
 
     pub(crate) fn local_secret_count(&self) -> Result<usize, ConnectionStoreError> {

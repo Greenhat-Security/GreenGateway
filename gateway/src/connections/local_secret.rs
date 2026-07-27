@@ -3,9 +3,7 @@ use std::{
     error::Error,
     fmt, fs,
     io::Read,
-    path::PathBuf,
     sync::{Arc, Mutex, MutexGuard, RwLock},
-    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -422,7 +420,6 @@ pub trait LocalSecretManager: Send + Sync {
 
 #[derive(Clone)]
 pub struct LocalSecretProvider {
-    path: Arc<PathBuf>,
     connection: Arc<Mutex<Connection>>,
     keyring: LocalSecretKeyring,
     metadata: Arc<RwLock<Vec<SecretAliasMetadata>>>,
@@ -451,12 +448,8 @@ impl LocalSecretProvider {
         keyring: LocalSecretKeyring,
         reserved_ids: BTreeSet<String>,
     ) -> Result<Self, LocalSecretError> {
-        let path = store.path().to_path_buf();
-        let connection = Connection::open(&path).map_err(|_| LocalSecretError::StorageFailure)?;
-        configure_connection(&connection)?;
         let provider = Self {
-            path: Arc::new(path),
-            connection: Arc::new(Mutex::new(connection)),
+            connection: store.shared_connection(),
             keyring,
             metadata: Arc::new(RwLock::new(Vec::new())),
             reserved_ids: Arc::new(reserved_ids),
@@ -762,7 +755,7 @@ impl LocalSecretProvider {
     }
 
     pub fn ensure_key_unused(&self, key_id: &str) -> Result<(), LocalSecretError> {
-        if !is_valid_opaque_id(key_id, MAX_SECRET_ID_BYTES) {
+        if !is_valid_opaque_id(key_id, MAX_SECRET_ID_BYTES) || self.keyring.key(key_id).is_none() {
             return Err(LocalSecretError::KeyUnavailable);
         }
         let count: i64 = self
@@ -956,11 +949,6 @@ impl LocalSecretProvider {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
-
-    #[cfg(test)]
-    fn path(&self) -> &std::path::Path {
-        self.path.as_path()
-    }
 }
 
 #[async_trait]
@@ -1030,21 +1018,6 @@ impl LocalSecretManager for LocalSecretProvider {
     }
 }
 
-fn configure_connection(connection: &Connection) -> Result<(), LocalSecretError> {
-    connection
-        .busy_timeout(Duration::from_secs(5))
-        .map_err(|_| LocalSecretError::StorageFailure)?;
-    connection
-        .execute_batch(
-            r#"
-            PRAGMA foreign_keys = ON;
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = FULL;
-            "#,
-        )
-        .map_err(|_| LocalSecretError::StorageFailure)
-}
-
 fn query_record(
     connection: &Connection,
     id: &str,
@@ -1083,7 +1056,7 @@ struct EncryptedSecretRecord {
 impl EncryptedSecretRecord {
     fn validate(&self) -> Result<(), LocalSecretError> {
         if self.schema_version != LOCAL_SECRET_SCHEMA_VERSION
-            || Uuid::parse_str(&self.id).is_err()
+            || !is_valid_local_secret_id(&self.id)
             || !is_valid_opaque_id(&self.key_id, MAX_SECRET_ID_BYTES)
             || purpose_as_str(self.purpose) != self.purpose_name
             || self.algorithm != LOCAL_SECRET_ALGORITHM
@@ -1141,6 +1114,9 @@ fn canonical_aad(
     version: u64,
     purpose: SecretPurpose,
 ) -> Result<Vec<u8>, LocalSecretError> {
+    if !is_valid_local_secret_id(id) {
+        return Err(LocalSecretError::CorruptRecord);
+    }
     let uuid = Uuid::parse_str(id).map_err(|_| LocalSecretError::CorruptRecord)?;
     let purpose = purpose_as_str(purpose).as_bytes();
     let mut aad = Vec::with_capacity(96);
@@ -1194,7 +1170,8 @@ fn validate_label(label: &str) -> Result<(), LocalSecretError> {
 }
 
 fn is_valid_local_secret_id(value: &str) -> bool {
-    is_valid_opaque_id(value, MAX_SECRET_ID_BYTES) && Uuid::parse_str(value).is_ok()
+    is_valid_opaque_id(value, MAX_SECRET_ID_BYTES)
+        && Uuid::parse_str(value).is_ok_and(|uuid| uuid.to_string() == value)
 }
 
 fn utc_timestamp() -> Result<String, LocalSecretError> {
@@ -1577,7 +1554,7 @@ mod tests {
             .create("Second", secret(SecretPurpose::OAuthClientSecret, CANARY))
             .expect("second secret should create");
 
-        let connection = Connection::open(provider.path()).expect("database should open");
+        let connection = Connection::open(&environment.database).expect("database should open");
         let first_envelope: (Vec<u8>, Vec<u8>) = connection
             .query_row(
                 "SELECT nonce, ciphertext FROM connection_local_secrets WHERE id = ?1",
@@ -1753,6 +1730,123 @@ mod tests {
         }
     }
 
+    #[test]
+    fn alternate_uuid_spellings_fail_startup_closed() {
+        for representation in ["uppercase", "hyphenless"] {
+            let environment = TestEnvironment::new(representation);
+            environment.write_key(PRIMARY_FILE, 30);
+            let configs = environment.primary_config();
+            let (store, provider) = environment
+                .provider(&configs)
+                .expect("provider should open");
+            let created = provider
+                .create("Canonical ID", secret(SecretPurpose::StaticBearer, CANARY))
+                .expect("secret should create");
+            drop(provider);
+
+            let uuid = Uuid::parse_str(&created.id).expect("generated ID should parse");
+            let replacement = match representation {
+                "uppercase" => created.id.to_ascii_uppercase(),
+                "hyphenless" => uuid.simple().to_string(),
+                _ => unreachable!("test representation is exhaustive"),
+            };
+            assert_ne!(replacement, created.id);
+            assert_eq!(
+                Uuid::parse_str(&replacement).expect("alternate spelling should parse"),
+                uuid
+            );
+            Connection::open(&environment.database)
+                .expect("database should open for ID mutation")
+                .execute(
+                    "UPDATE connection_local_secrets SET id = ?1 WHERE id = ?2",
+                    params![replacement, created.id],
+                )
+                .expect("stored ID should mutate");
+
+            let keyring = environment
+                .load_keyring(&configs)
+                .expect("keyring should reload");
+            assert!(matches!(
+                LocalSecretProvider::open(&store, keyring, BTreeSet::new()),
+                Err(LocalSecretError::CorruptRecord)
+            ));
+        }
+    }
+
+    #[test]
+    fn in_memory_store_and_local_secrets_share_one_database_identity() {
+        let environment = TestEnvironment::new("memory-database-identity");
+        environment.write_key(PRIMARY_FILE, 30);
+        let store = SqliteConnectionStore::open(":memory:").expect("in-memory store should open");
+        let provider = LocalSecretProvider::open(
+            &store,
+            environment
+                .load_keyring(&environment.primary_config())
+                .expect("keyring should load"),
+            BTreeSet::new(),
+        )
+        .expect("provider should use the store's in-memory connection");
+        provider
+            .create(
+                "Shared database",
+                secret(SecretPurpose::StaticBearer, CANARY),
+            )
+            .expect("secret should create in the shared database");
+        assert_eq!(
+            store
+                .local_secret_count()
+                .expect("store should observe provider rows"),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_path_retarget_cannot_split_connections_from_local_secrets() {
+        let environment = TestEnvironment::new("database-path-retarget");
+        environment.write_key(PRIMARY_FILE, 30);
+        let store = environment.store();
+        let keyring = environment
+            .load_keyring(&environment.primary_config())
+            .expect("keyring should load before path retargeting");
+
+        let moved_root = environment.root.with_extension("opened");
+        fs::rename(&environment.root, &moved_root).expect("opened database directory should move");
+        fs::create_dir(&environment.root).expect("replacement directory should create");
+        set_directory_permissions(&environment.root, 0o700);
+        let decoy_store = SqliteConnectionStore::open(&environment.database)
+            .expect("replacement-path database should open");
+
+        let provider = LocalSecretProvider::open(&store, keyring, BTreeSet::new())
+            .expect("provider should retain the store's opened database identity");
+        provider
+            .create(
+                "Anchored database",
+                secret(SecretPurpose::StaticBearer, CANARY),
+            )
+            .expect("secret should create in the store's opened database");
+        assert_eq!(
+            store
+                .local_secret_count()
+                .expect("original store should observe provider rows"),
+            1
+        );
+        assert_eq!(
+            decoy_store
+                .local_secret_count()
+                .expect("replacement store should remain independent"),
+            0
+        );
+
+        drop(provider);
+        drop(store);
+        drop(decoy_store);
+        fs::remove_dir_all(&environment.root)
+            .expect("replacement database directory should remove");
+        fs::rename(&moved_root, &environment.root)
+            .expect("opened database directory should restore for cleanup");
+    }
+
     #[tokio::test]
     async fn master_key_rotation_is_bounded_transactional_and_allows_verified_removal() {
         let environment = TestEnvironment::new("master-key-rotation");
@@ -1795,6 +1889,10 @@ mod tests {
         assert_eq!(
             provider.ensure_key_unused("old-key"),
             Err(LocalSecretError::KeyStillInUse { count: 2 })
+        );
+        assert_eq!(
+            provider.ensure_key_unused("unknown-key"),
+            Err(LocalSecretError::KeyUnavailable)
         );
         assert_eq!(
             provider
