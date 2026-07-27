@@ -42,18 +42,64 @@ pub struct ToolDefinition {
     pub description: String,
     #[serde(rename = "input_json_schema")]
     pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ToolTarget>,
+    #[serde(default, skip_serializing_if = "ToolSource::is_legacy")]
+    pub source: ToolSource,
     pub upstream: UpstreamMapping,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct UpstreamMapping {
+pub struct HttpToolMapping {
     pub method: String,
     pub path_template: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub query_params: Vec<QueryParamMapping>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<BodyMapping>,
+}
+
+/// Compatibility name for the legacy tools-file field.
+///
+/// Runtime execution continues to read `ToolDefinition::upstream` until the
+/// connection-aware executor lands. New code should use `HttpToolMapping`.
+pub type UpstreamMapping = HttpToolMapping;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ToolTarget {
+    Http {
+        connection_id: String,
+        mapping: HttpToolMapping,
+    },
+    Mcp {
+        connection_id: String,
+        remote_tool_name: String,
+    },
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ToolSource {
+    Manual,
+    OpenApi {
+        connection_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+    },
+    Mcp {
+        connection_id: String,
+        remote_tool_name: String,
+    },
+    #[default]
+    Legacy,
+}
+
+impl ToolSource {
+    fn is_legacy(&self) -> bool {
+        matches!(self, Self::Legacy)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,12 +126,14 @@ impl ToolDefinition {
             name,
             description,
             input_schema,
+            target: None,
+            source: ToolSource::Legacy,
             upstream: UpstreamMapping::mcp_proxy(server_name, tool_name),
         }
     }
 }
 
-impl UpstreamMapping {
+impl HttpToolMapping {
     pub fn mcp_proxy(server_name: String, tool_name: String) -> Self {
         let path_template = serde_json::to_string(&SerializedMcpProxyMapping {
             server_name,
@@ -862,6 +910,8 @@ fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
             ));
         }
 
+        problems.extend(typed_tool_metadata_problems(index, definition));
+
         if let Some(mapping) = definition.upstream.mcp_proxy_mapping() {
             if mapping.server_name.trim().is_empty() {
                 problems.push(format!(
@@ -905,6 +955,101 @@ fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
 
         if is_http_mapping {
             problems.extend(tool_mapping_schema_problems(index, definition));
+        }
+    }
+
+    problems
+}
+
+fn typed_tool_metadata_problems(index: usize, definition: &ToolDefinition) -> Vec<String> {
+    use crate::connections::model::is_valid_connection_id;
+
+    const MAX_REMOTE_TOOL_NAME_CHARS: usize = 128;
+    const MAX_OPERATION_ID_CHARS: usize = 256;
+
+    let mut problems = Vec::new();
+    let validate_connection_id = |field: &str, connection_id: &str, problems: &mut Vec<String>| {
+        if !is_valid_connection_id(connection_id) {
+            problems.push(format!(
+                "tools[{index}].{field} must be a stable URL-safe connection ID"
+            ));
+        }
+    };
+    let validate_remote_name = |field: &str, remote_tool_name: &str, problems: &mut Vec<String>| {
+        let length = remote_tool_name.chars().count();
+        if length == 0 || length > MAX_REMOTE_TOOL_NAME_CHARS {
+            problems.push(format!(
+                "tools[{index}].{field} must contain 1-{MAX_REMOTE_TOOL_NAME_CHARS} characters"
+            ));
+        }
+    };
+
+    if let Some(target) = &definition.target {
+        match target {
+            ToolTarget::Http {
+                connection_id,
+                mapping,
+            } => {
+                validate_connection_id("target.connection_id", connection_id, &mut problems);
+                if let Err(error) = crate::connections::model::normalize_origin_relative_path(
+                    "target.mapping.path_template",
+                    &mapping.path_template,
+                ) {
+                    problems.push(format!(
+                        "tools[{index}].target.mapping.path_template {}",
+                        error.message
+                    ));
+                }
+                if mapping != &definition.upstream {
+                    problems.push(format!(
+                        "tools[{index}].target.mapping must equal the legacy upstream mapping during migration"
+                    ));
+                }
+                if mapping.is_mcp_proxy() {
+                    problems.push(format!(
+                        "tools[{index}].target HTTP mapping must not use the legacy MCP sentinel"
+                    ));
+                }
+            }
+            ToolTarget::Mcp {
+                connection_id,
+                remote_tool_name,
+            } => {
+                validate_connection_id("target.connection_id", connection_id, &mut problems);
+                validate_remote_name("target.remote_tool_name", remote_tool_name, &mut problems);
+                match definition.upstream.mcp_proxy_mapping() {
+                    Some(mapping)
+                        if mapping.server_name == *connection_id
+                            && mapping.tool_name == *remote_tool_name => {}
+                    _ => problems.push(format!(
+                        "tools[{index}].target MCP metadata must equal the legacy MCP proxy mapping during migration"
+                    )),
+                }
+            }
+        }
+    }
+
+    match &definition.source {
+        ToolSource::Manual | ToolSource::Legacy => {}
+        ToolSource::OpenApi {
+            connection_id,
+            operation_id,
+        } => {
+            validate_connection_id("source.connection_id", connection_id, &mut problems);
+            if operation_id.as_ref().is_some_and(|operation_id| {
+                operation_id.is_empty() || operation_id.chars().count() > MAX_OPERATION_ID_CHARS
+            }) {
+                problems.push(format!(
+                    "tools[{index}].source.operation_id must contain 1-{MAX_OPERATION_ID_CHARS} characters when present"
+                ));
+            }
+        }
+        ToolSource::Mcp {
+            connection_id,
+            remote_tool_name,
+        } => {
+            validate_connection_id("source.connection_id", connection_id, &mut problems);
+            validate_remote_name("source.remote_tool_name", remote_tool_name, &mut problems);
         }
     }
 
@@ -2144,6 +2289,135 @@ mod tests {
 
         assert_schema_accepts(&validator, &document);
         ToolRegistry::from_json_value(document).expect("schema-valid tools should parse");
+    }
+
+    #[test]
+    fn typed_target_and_source_are_schema_valid_and_round_trip() {
+        let mapping = json!({
+            "method": "POST",
+            "path_template": "/v1/echo",
+            "body": { "mode": "whole_args_json" }
+        });
+        let document = json!({
+            "schema_version": "0.1.0",
+            "tools": [
+                {
+                    "name": "echo",
+                    "description": "Echoes the provided message.",
+                    "input_json_schema": {
+                        "type": "object",
+                        "properties": {
+                            "message": { "type": "string" }
+                        },
+                        "additionalProperties": false
+                    },
+                    "target": {
+                        "type": "http",
+                        "connection_id": "billing-api",
+                        "mapping": mapping
+                    },
+                    "source": {
+                        "type": "open_api",
+                        "connection_id": "billing-api",
+                        "operation_id": "echoMessage"
+                    },
+                    "upstream": mapping
+                }
+            ]
+        });
+
+        assert_schema_accepts(&tools_schema_validator(), &document);
+        let registry =
+            ToolRegistry::from_json_value(document).expect("typed metadata should parse");
+        let tool = registry.get("echo").expect("tool should be registered");
+        assert!(matches!(
+            tool.target,
+            Some(ToolTarget::Http {
+                ref connection_id,
+                ..
+            }) if connection_id == "billing-api"
+        ));
+        assert!(matches!(
+            tool.source,
+            ToolSource::OpenApi {
+                ref connection_id,
+                operation_id: Some(ref operation_id),
+            } if connection_id == "billing-api" && operation_id == "echoMessage"
+        ));
+    }
+
+    #[test]
+    fn legacy_tools_omit_typed_metadata_when_serialized() {
+        let registry = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [echo_tool("echo", "POST", "/v1/echo")]
+        }))
+        .expect("legacy tool should parse");
+        let serialized =
+            serde_json::to_value(registry.get("echo").expect("tool should exist").as_ref())
+                .expect("tool should serialize");
+
+        assert!(serialized.get("target").is_none());
+        assert!(serialized.get("source").is_none());
+        assert!(serialized.get("upstream").is_some());
+    }
+
+    #[test]
+    fn typed_metadata_cannot_disagree_with_legacy_execution_mapping() {
+        let mut tool = echo_tool("echo", "POST", "/v1/echo");
+        tool["target"] = json!({
+            "type": "http",
+            "connection_id": "billing-api",
+            "mapping": {
+                "method": "GET",
+                "path_template": "/different"
+            }
+        });
+        let document = json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        });
+
+        let error = ToolRegistry::from_json_value(document)
+            .expect_err("conflicting compatibility mappings must fail");
+        assert!(error
+            .to_string()
+            .contains("target.mapping must equal the legacy upstream mapping"));
+    }
+
+    #[test]
+    fn typed_http_target_rejects_authority_and_path_confusion_without_tightening_legacy() {
+        for path_template in [
+            "//attacker.example.test/resource",
+            "/v1\\admin",
+            "/v1/../admin",
+            "/v1/%2e%2e/admin",
+            "/v1/%2fadmin",
+        ] {
+            let mut typed = echo_tool("echo", "POST", path_template);
+            typed["target"] = json!({
+                "type": "http",
+                "connection_id": "billing-api",
+                "mapping": typed["upstream"].clone()
+            });
+            let error = ToolRegistry::from_json_value(json!({
+                "schema_version": "0.1.0",
+                "tools": [typed]
+            }))
+            .expect_err("typed unsafe mapping must fail");
+            let message = error.to_string();
+            assert!(
+                message.contains("target.mapping.path_template")
+                    || message.contains("tools file schema validation failed"),
+                "unexpected error for {path_template}: {error}"
+            );
+
+            ToolRegistry::from_json_value(json!({
+                "schema_version": "0.1.0",
+                "tools": [echo_tool("echo", "POST", path_template)]
+            }))
+            .expect("legacy-only mapping behavior must remain unchanged");
+        }
     }
 
     #[test]

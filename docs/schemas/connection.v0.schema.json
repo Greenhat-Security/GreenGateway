@@ -1,0 +1,383 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/connection.v0.schema.json",
+  "title": "GreenGateway Connection Write Model",
+  "description": "Version 0.1 write model for a logical upstream Connection. It contains opaque secret references only and never resolved secret material.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "display_name",
+    "enabled",
+    "kind",
+    "endpoint",
+    "authentication"
+  ],
+  "properties": {
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 1024
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "kind": {
+      "enum": [
+        "http_api",
+        "mcp_streamable_http"
+      ]
+    },
+    "endpoint": {
+      "$ref": "#/$defs/endpoint"
+    },
+    "authentication": {
+      "$ref": "#/$defs/authentication"
+    },
+    "tls": {
+      "$ref": "#/$defs/tls"
+    },
+    "timeouts": {
+      "$ref": "#/$defs/timeouts"
+    },
+    "discovery": {
+      "$ref": "#/$defs/discovery"
+    },
+    "test_profile": {
+      "$ref": "#/$defs/test_profile"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "enabled": {
+            "const": true
+          }
+        },
+        "required": [
+          "enabled"
+        ]
+      },
+      "then": {
+        "properties": {
+          "authentication": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/authentication"
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "header_api_key"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "secret_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "static_bearer"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "secret_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "oauth2_client_credentials"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "client_secret_id"
+                  ]
+                }
+              }
+            ]
+          },
+          "tls": {
+            "dependentRequired": {
+              "client_certificate_id": [
+                "client_private_key_id"
+              ],
+              "client_private_key_id": [
+                "client_certificate_id"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "stable_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "description": "Opaque URL-safe identifier. Environment names, filesystem paths, and provider locators are not accepted by the admin connection model."
+    },
+    "origin_relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^/(?!/)[^?#\\\\]*$"
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "base_url",
+        "base_path"
+      ],
+      "properties": {
+        "base_url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "format": "uri",
+          "pattern": "^https?://"
+        },
+        "base_path": {
+          "$ref": "#/$defs/origin_relative_path"
+        }
+      }
+    },
+    "authentication": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "header_name"
+          ],
+          "properties": {
+            "type": {
+              "const": "header_api_key"
+            },
+            "header_name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "secret_id": {
+              "$ref": "#/$defs/stable_id"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "static_bearer"
+            },
+            "secret_id": {
+              "$ref": "#/$defs/stable_id"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "client_id",
+            "token_url",
+            "client_auth_method"
+          ],
+          "properties": {
+            "type": {
+              "const": "oauth2_client_credentials"
+            },
+            "client_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "client_secret_id": {
+              "$ref": "#/$defs/stable_id"
+            },
+            "token_url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "format": "uri",
+              "pattern": "^https://"
+            },
+            "scopes": {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^\\S+$"
+              }
+            },
+            "audience": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "resource": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "client_auth_method": {
+              "const": "client_secret_basic"
+            }
+          }
+        }
+      ]
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ca_bundle_alias": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "client_certificate_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "client_private_key_id": {
+          "$ref": "#/$defs/stable_id"
+        }
+      }
+    },
+    "timeouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connect_timeout_ms",
+        "request_timeout_ms",
+        "response_idle_timeout_ms"
+      ],
+      "properties": {
+        "connect_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120000
+        },
+        "request_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120000
+        },
+        "response_idle_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120000
+        }
+      }
+    },
+    "discovery": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "use_connection_authentication"
+          ],
+          "properties": {
+            "type": {
+              "const": "managed_openapi"
+            },
+            "path": {
+              "$ref": "#/$defs/origin_relative_path"
+            },
+            "use_connection_authentication": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "use_connection_authentication"
+          ],
+          "properties": {
+            "type": {
+              "const": "managed_mcp"
+            },
+            "use_connection_authentication": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "test_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "path",
+        "expected_statuses"
+      ],
+      "properties": {
+        "method": {
+          "enum": [
+            "GET",
+            "HEAD",
+            "OPTIONS"
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/origin_relative_path"
+        },
+        "expected_statuses": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599
+          }
+        }
+      }
+    }
+  }
+}

@@ -215,6 +215,8 @@ pub fn generate_tools_from_openapi_str(
             name: tool_name,
             description: description_for(operation, operation_value),
             input_schema,
+            target: None,
+            source: crate::tools::definitions::ToolSource::Legacy,
             upstream: UpstreamMapping {
                 method: operation.method.clone(),
                 path_template: operation.path_template.clone(),
