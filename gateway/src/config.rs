@@ -15,6 +15,10 @@ use serde::Deserialize;
 
 use crate::{
     auth::principal::{canonical_issuer, provider_issuer, PROVIDER_ISSUER_PREFIX},
+    connections::secret::{
+        validate_operator_secret_alias_config, OperatorSecretAliasConfig, SecretRootConfig,
+        MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES,
+    },
     discovery::{
         signals::{
             SignalDetectorConfig, DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
@@ -117,6 +121,8 @@ const CSRF_ENABLED: &str = "CSRF_ENABLED";
 const CSRF_EXEMPT_PATHS: &str = "CSRF_EXEMPT_PATHS";
 const CSRF_HEADER_NAME: &str = "CSRF_HEADER_NAME";
 const CONNECTIONS_SQLITE_PATH: &str = "CONNECTIONS_SQLITE_PATH";
+const CONNECTION_SECRET_ALIASES: &str = "CONNECTION_SECRET_ALIASES";
+const CONNECTION_SECRETS_ROOT: &str = "CONNECTION_SECRETS_ROOT";
 const DISCOVERY_SQLITE_PATH: &str = "DISCOVERY_SQLITE_PATH";
 const DISCOVERY_ENDPOINT_LIMIT: &str = "DISCOVERY_ENDPOINT_LIMIT";
 const ERROR_RATE_SPIKE_SIGNAL_THRESHOLD: &str = "ERROR_RATE_SPIKE_SIGNAL_THRESHOLD";
@@ -192,6 +198,8 @@ pub struct Config {
     pub discovery_endpoint_limit: usize,
     pub principal_sqlite_path: Option<String>,
     pub connections_sqlite_path: Option<String>,
+    pub connection_secret_aliases: Vec<OperatorSecretAliasConfig>,
+    pub connection_secrets_root: Option<SecretRootConfig>,
     pub payload_capture_enabled: bool,
     pub payload_capture_sample_rate: f64,
     pub schema_mismatch_signal_threshold: u64,
@@ -850,6 +858,22 @@ impl Config {
             get_var(CONNECTIONS_SQLITE_PATH),
             &mut problems,
         );
+        let connection_secrets_root = parse_optional_secret_root(
+            CONNECTION_SECRETS_ROOT,
+            get_var(CONNECTION_SECRETS_ROOT),
+            &mut problems,
+        );
+        let connection_secret_aliases = parse_operator_secret_aliases(
+            CONNECTION_SECRET_ALIASES,
+            get_var(CONNECTION_SECRET_ALIASES),
+            &mut problems,
+        );
+        if let Err(error) = validate_operator_secret_alias_config(
+            &connection_secret_aliases,
+            connection_secrets_root.is_some(),
+        ) {
+            problems.push(format!("{CONNECTION_SECRET_ALIASES}: {error}"));
+        }
         let payload_capture_enabled = parse_var(
             PAYLOAD_CAPTURE_ENABLED,
             get_var(PAYLOAD_CAPTURE_ENABLED),
@@ -1306,6 +1330,8 @@ impl Config {
                 discovery_endpoint_limit,
                 principal_sqlite_path,
                 connections_sqlite_path,
+                connection_secret_aliases,
+                connection_secrets_root,
                 payload_capture_enabled,
                 payload_capture_sample_rate,
                 schema_mismatch_signal_threshold,
@@ -2344,6 +2370,57 @@ fn url_host_is_loopback(url: &url::Url) -> bool {
                     .is_some_and(|mapped_ip| mapped_ip.is_loopback())
         }
         None => false,
+    }
+}
+
+fn parse_operator_secret_aliases(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Vec<OperatorSecretAliasConfig> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return Vec::new(),
+        Err(VarError::NotUnicode(_)) => {
+            problems.push(format!("{name} must be valid Unicode"));
+            return Vec::new();
+        }
+    };
+    if value.len() > MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES {
+        problems.push(format!(
+            "{name} must contain at most {MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES} bytes"
+        ));
+        return Vec::new();
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str(value).unwrap_or_else(|error| {
+        problems.push(format!(
+            "{name} must be a JSON array of operator alias objects with id, label, and a typed environment/file source (invalid shape at line {} column {})",
+            error.line(),
+            error.column()
+        ));
+        Vec::new()
+    })
+}
+
+fn parse_optional_secret_root(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Option<SecretRootConfig> {
+    match value {
+        Ok(value) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| SecretRootConfig::new(PathBuf::from(value)))
+        }
+        Err(VarError::NotPresent) => None,
+        Err(VarError::NotUnicode(_)) => {
+            problems.push(format!("{name} must be valid Unicode"));
+            None
+        }
     }
 }
 
@@ -3954,6 +4031,114 @@ mod tests {
         })
         .expect("empty path should parse");
         assert_eq!(unset.connections_sqlite_path, None);
+    }
+
+    #[test]
+    fn operator_secret_aliases_parse_without_exposing_locators_in_debug() {
+        let environment_locator = "GGW_BILLING_SECRET_CANARY";
+        let file_locator = "partner-private-key.pem";
+        let root_locator = "/var/run/greengateway-secret-root-canary";
+        let aliases = format!(
+            r#"[
+                {{"id":"billing-token","label":"Billing token","source":{{"type":"environment","key":"{environment_locator}"}}}},
+                {{"id":"partner-key","label":"Partner key","source":{{"type":"file","key":"{file_locator}"}}}}
+            ]"#
+        );
+        let config = Config::from_env_vars(|name| match name {
+            "CONNECTION_SECRET_ALIASES" => Ok(aliases.clone()),
+            "CONNECTION_SECRETS_ROOT" => Ok(root_locator.to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("operator aliases should parse");
+
+        assert_eq!(config.connection_secret_aliases.len(), 2);
+        assert_eq!(
+            config.connection_secret_aliases[0].source,
+            crate::connections::secret::OperatorSecretAliasSource::Environment {
+                key: environment_locator.to_owned()
+            }
+        );
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(environment_locator));
+        assert!(!debug.contains(file_locator));
+        assert!(!debug.contains(root_locator));
+        assert!(debug.contains("<redacted-locator>"));
+    }
+
+    #[test]
+    fn operator_file_alias_requires_root_and_errors_redact_locator() {
+        let locator_canary = "../host-secret-locator-canary";
+        let aliases = format!(
+            r#"[{{"id":"billing-token","label":"Billing token","source":{{"type":"file","key":"{locator_canary}"}}}}]"#
+        );
+        let error = Config::from_env_vars(|name| match name {
+            "CONNECTION_SECRET_ALIASES" => Ok(aliases.clone()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("file alias without a root must fail");
+        let message = error.to_string();
+
+        assert!(message.contains("requires CONNECTION_SECRETS_ROOT"));
+        assert!(!message.contains(locator_canary));
+
+        let invalid_with_root = Config::from_env_vars(|name| match name {
+            "CONNECTION_SECRET_ALIASES" => Ok(aliases.clone()),
+            "CONNECTION_SECRETS_ROOT" => Ok("/safe/root".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("traversal file key must fail");
+        let message = invalid_with_root.to_string();
+        assert!(message.contains("invalid file key"));
+        assert!(!message.contains(locator_canary));
+    }
+
+    #[test]
+    fn malformed_operator_alias_json_does_not_echo_input() {
+        let locator_canary = "ENVIRONMENT_LOCATOR_CANARY";
+        let raw = format!(
+            r#"[{{"id":"billing","label":"Billing","source":{{"type":"environment","key":"{locator_canary}"}},"unexpected":true}}]"#
+        );
+        let error = Config::from_env_vars(|name| match name {
+            "CONNECTION_SECRET_ALIASES" => Ok(raw.clone()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("unknown fields must fail");
+        let message = error.to_string();
+
+        assert!(message.contains("invalid shape at line"));
+        assert!(!message.contains(locator_canary));
+    }
+
+    #[test]
+    fn operator_alias_json_is_bounded_before_parsing() {
+        let raw = "x".repeat(MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES + 1);
+        let error = Config::from_env_vars(|name| match name {
+            "CONNECTION_SECRET_ALIASES" => Ok(raw.clone()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("oversized alias JSON must fail before parsing");
+
+        assert!(error.to_string().contains(&format!(
+            "CONNECTION_SECRET_ALIASES must contain at most {MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES} bytes"
+        )));
+    }
+
+    #[test]
+    fn operator_alias_json_bound_includes_surrounding_whitespace() {
+        let raw = format!(
+            "{}[]{}",
+            " ".repeat(MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES),
+            " ".repeat(1)
+        );
+        let error = Config::from_env_vars(|name| match name {
+            "CONNECTION_SECRET_ALIASES" => Ok(raw.clone()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("oversized whitespace around valid JSON must fail before trimming");
+
+        assert!(error.to_string().contains(&format!(
+            "CONNECTION_SECRET_ALIASES must contain at most {MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES} bytes"
+        )));
     }
 
     #[test]

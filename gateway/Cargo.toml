@@ -9,6 +9,8 @@ arc-swap.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 hex.workspace = true
@@ -45,4 +47,5 @@ zeroize.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 rcgen.workspace = true
+rustix.workspace = true
 tokio-rustls.workspace = true

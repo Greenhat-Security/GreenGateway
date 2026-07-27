@@ -2757,6 +2757,8 @@ mod tests {
             discovery_endpoint_limit: config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
             principal_sqlite_path: None,
             connections_sqlite_path: None,
+            connection_secret_aliases: Vec::new(),
+            connection_secrets_root: None,
             payload_capture_enabled: false,
             payload_capture_sample_rate: config::DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
             schema_mismatch_signal_threshold:

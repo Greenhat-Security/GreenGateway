@@ -201,6 +201,28 @@ The store contains connection metadata, opaque credential-binding IDs, dependenc
 
 Use a durable filesystem location and include the SQLite database, WAL, and SHM files in the same operational backup boundary. An ephemeral container path does not make managed configuration durable.
 
+### CONNECTION_SECRET_ALIASES
+
+Trusted startup configuration for opaque operator-provisioned secret aliases.
+
+Default: `[]`.
+
+Format: a JSON array of at most `256 KiB` with at most `512` entries. Every entry has a safe opaque `id`, a non-control-character `label` of at most `128` characters, and a typed `source`. Environment sources use `{"type":"environment","key":"GGW_BILLING_TOKEN"}`. File sources use `{"type":"file","key":"billing-token"}` and require `CONNECTION_SECRETS_ROOT`. IDs are unique, contain 1–128 URL-safe ASCII characters, and start with an ASCII letter or digit. Environment keys contain at most 128 ASCII letters, digits, or underscores and start with a letter or underscore. File keys are one safe filename segment of at most 255 bytes: absolute paths, `.`/`..`, separators, drive/alternate-stream syntax, control bytes, trailing dot/space, and Windows device names are rejected.
+
+The JSON is an operator trust boundary, not an admin payload. Ordinary connection APIs accept and expose only alias IDs and safe labels; they never accept or return environment keys, file keys, host paths, or values. Configuration `Debug` and errors redact both environment and filesystem locators. Alias metadata reports the operator provider kind and configured alias record but has no secret reveal operation.
+
+Values are resolved afresh for each authorized use and are never cached by this provider. An atomic mounted-file replacement is therefore visible to the next resolution while already resolved in-flight values remain isolated until their redacted, zeroizing wrapper is dropped. Environment values are also re-read, although most deployment environments require a process restart to change them. Reads are capped at 16 concurrent resolutions and at the credential-purpose byte limit. Missing, empty, oversized, NUL-bearing, inaccessible, or invalid-Unicode environment values fail closed without an anonymous fallback.
+
+### CONNECTION_SECRETS_ROOT
+
+Canonical root directory for `file` entries in `CONNECTION_SECRET_ALIASES`.
+
+Default: empty. It is required when any file alias is configured.
+
+Format and validation: a valid Unicode filesystem path that exists and canonicalizes to a directory at startup. GreenGateway retains a capability-backed handle to that validated directory, so renaming or replacing the configured path or an ancestor after startup cannot redirect later reads. File aliases are restricted to one validated filename segment relative to the retained handle. Every resolution rejects symbolic links and Windows reparse points, opens the leaf without following links and in nonblocking mode, validates the opened handle as a regular file, and caps the read before material is parsed. On Unix, the root must not be group/other writable and secret files must grant no group/other permissions. Windows enforces the regular-file and reparse-point boundary, but ACL ownership/readability policy remains an operator and deployment-platform responsibility.
+
+Use atomic replacement within the same protected root for file rotation. Do not point this setting at a general configuration, home, host-root, or service-account directory. Cloudflare container deployments must provide an explicit durable secret mount; forwarding the path alone does not create or persist that mount.
+
 ### SCHEMA_MISMATCH_SIGNAL_THRESHOLD
 
 Cumulative schema mismatch count that opens a `schema_mismatch` discovery signal for an endpoint.
