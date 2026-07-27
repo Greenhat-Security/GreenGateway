@@ -3,13 +3,18 @@ use std::{
     env,
     error::Error,
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use async_trait::async_trait;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions as CapabilityOpenOptions},
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
@@ -26,8 +31,6 @@ const MAX_ENVIRONMENT_KEY_BYTES: usize = 128;
 const MAX_FILE_KEY_BYTES: usize = 255;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-#[cfg(windows)]
-const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -279,7 +282,7 @@ type EnvironmentReader = dyn Fn(&str) -> Result<String, ()> + Send + Sync;
 #[derive(Clone)]
 pub struct OperatorAliasResolver {
     aliases: Arc<BTreeMap<String, OperatorSecretAliasConfig>>,
-    canonical_secrets_root: Option<Arc<PathBuf>>,
+    secrets_root: Option<Arc<Dir>>,
     environment: Arc<EnvironmentReader>,
     concurrent_reads: Arc<Semaphore>,
 }
@@ -290,11 +293,8 @@ impl fmt::Debug for OperatorAliasResolver {
             .debug_struct("OperatorAliasResolver")
             .field("alias_count", &self.aliases.len())
             .field(
-                "canonical_secrets_root",
-                &self
-                    .canonical_secrets_root
-                    .as_ref()
-                    .map(|_| "<redacted-locator>"),
+                "secrets_root",
+                &self.secrets_root.as_ref().map(|_| "<redacted-locator>"),
             )
             .field(
                 "maximum_concurrent_reads",
@@ -324,16 +324,20 @@ impl OperatorAliasResolver {
         maximum_concurrent_reads: usize,
     ) -> Result<Self, SecretProviderConfigError> {
         validate_operator_secret_alias_config(aliases, secrets_root.is_some())?;
-        let canonical_secrets_root = if let Some(root) = secrets_root {
+        let secrets_root = if let Some(root) = secrets_root {
             let canonical = fs::canonicalize(root.as_path())
                 .map_err(|_| SecretProviderConfigError::SecretsRootUnavailable)?;
-            let metadata = fs::metadata(&canonical)
+            let directory = Dir::open_ambient_dir(&canonical, ambient_authority())
+                .map_err(|_| SecretProviderConfigError::SecretsRootUnavailable)?;
+            let metadata = directory
+                .try_clone()
+                .and_then(|directory| directory.into_std_file().metadata())
                 .map_err(|_| SecretProviderConfigError::SecretsRootUnavailable)?;
             if !metadata.is_dir() {
                 return Err(SecretProviderConfigError::SecretsRootNotDirectory);
             }
             validate_root_permissions(&metadata)?;
-            Some(Arc::new(canonical))
+            Some(Arc::new(directory))
         } else {
             None
         };
@@ -344,7 +348,7 @@ impl OperatorAliasResolver {
             .collect();
         Ok(Self {
             aliases: Arc::new(aliases),
-            canonical_secrets_root,
+            secrets_root,
             environment,
             concurrent_reads: Arc::new(Semaphore::new(maximum_concurrent_reads)),
         })
@@ -367,7 +371,7 @@ impl SecretResolver for OperatorAliasResolver {
         let permit = Arc::clone(&self.concurrent_reads)
             .try_acquire_owned()
             .map_err(|_| SecretResolveError::new(alias_id, SecretResolveErrorKind::ProviderBusy))?;
-        let root = self.canonical_secrets_root.clone();
+        let root = self.secrets_root.clone();
         let environment = Arc::clone(&self.environment);
         let alias_id = alias.id.clone();
         let join_alias_id = alias_id.clone();
@@ -421,24 +425,21 @@ impl SecretResolver for OperatorAliasResolver {
 
 fn read_file_secret(
     alias_id: &str,
-    root: &Path,
+    root: &Dir,
     key: &str,
     purpose: SecretPurpose,
 ) -> Result<ResolvedSecret, SecretResolveError> {
-    let candidate = root.join(key);
-    let link_metadata =
-        fs::symlink_metadata(&candidate).map_err(|error| map_file_error(alias_id, error, false))?;
-    if !link_metadata.is_file()
-        || link_metadata.file_type().is_symlink()
-        || is_reparse_point(&link_metadata)
-    {
+    let initial_metadata = root
+        .symlink_metadata(key)
+        .map_err(|error| map_file_error(alias_id, error, false))?;
+    if !initial_metadata.is_file() || initial_metadata.is_symlink() {
         return Err(SecretResolveError::new(
             alias_id,
             SecretResolveErrorKind::UnsafeSource,
         ));
     }
     let file =
-        open_file_no_follow(&candidate).map_err(|error| map_file_error(alias_id, error, true))?;
+        open_file_beneath(root, key).map_err(|error| map_file_error(alias_id, error, true))?;
     let metadata = file
         .metadata()
         .map_err(|error| map_file_error(alias_id, error, false))?;
@@ -485,20 +486,12 @@ fn map_file_error(alias_id: &str, error: io::Error, unsafe_on_other: bool) -> Se
     SecretResolveError::new(alias_id, kind)
 }
 
-fn open_file_no_follow(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
+fn open_file_beneath(root: &Dir, key: &str) -> io::Result<File> {
+    let mut options = CapabilityOpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    options.open(path)
+    options.follow(FollowSymlinks::No);
+    options.nonblock(true);
+    root.open_with(key, &options).map(|file| file.into_std())
 }
 
 #[cfg(windows)]
@@ -1194,17 +1187,122 @@ mod tests {
         fs::remove_file(outside).expect("outside fixture should remove");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_resolution_remains_anchored_when_root_path_is_replaced() {
+        let temporary = TemporarySecrets::new("unix-root-replacement");
+        temporary.write("billing", b"trusted-value");
+        let resolver = OperatorAliasResolver::from_config(
+            &[file_alias("billing", "billing")],
+            Some(&temporary.root_config()),
+        )
+        .expect("resolver should build");
+        let moved_root = temporary.root.with_extension("anchored-root");
+        fs::rename(&temporary.root, &moved_root).expect("original root should move");
+        fs::create_dir(&temporary.root).expect("replacement root should create");
+        set_directory_permissions(&temporary.root, 0o755);
+        temporary.write("billing", b"outside-canary");
+
+        let secret = resolver
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect("resolution must remain anchored to the opened root");
+        assert_eq!(secret.expose(), b"trusted-value");
+        assert_ne!(secret.expose(), b"outside-canary");
+
+        drop(secret);
+        drop(resolver);
+        fs::remove_dir_all(moved_root).expect("moved root should remove");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_fifo_leaf_fails_closed_without_blocking_a_provider_slot() {
+        use rustix::fs::{mkfifoat, Mode, CWD};
+
+        let temporary = TemporarySecrets::new("unix-fifo");
+        mkfifoat(
+            CWD,
+            temporary.root.join("blocking-fifo"),
+            Mode::from_bits_truncate(0o600),
+        )
+        .expect("FIFO fixture should create");
+        let resolver = OperatorAliasResolver::from_config(
+            &[file_alias("fifo", "blocking-fifo")],
+            Some(&temporary.root_config()),
+        )
+        .expect("resolver should build");
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            resolver.resolve("fifo", SecretPurpose::StaticBearer),
+        )
+        .await
+        .expect("nonblocking leaf open must not wait for a FIFO peer")
+        .expect_err("FIFO must fail closed");
+        assert_eq!(error.kind(), SecretResolveErrorKind::UnsafeSource);
+    }
+
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_reparse_point_file_fails_closed_when_supported() {
+    async fn windows_resolution_remains_anchored_when_root_junction_is_retargeted() {
+        let container = std::env::temp_dir().join(format!(
+            "greengateway-secret-windows-root-replacement-{}",
+            Uuid::new_v4()
+        ));
+        let trusted_root = container.join("trusted");
+        let outside_root = container.join("outside");
+        let configured_root = container.join("configured");
+        fs::create_dir_all(&trusted_root).expect("trusted root should create");
+        fs::create_dir(&outside_root).expect("outside root should create");
+        fs::write(trusted_root.join("billing"), b"trusted-value")
+            .expect("trusted value should write");
+        fs::write(outside_root.join("billing"), b"outside-canary")
+            .expect("outside canary should write");
+        create_windows_junction(&trusted_root, &configured_root);
+        let resolver = OperatorAliasResolver::from_config(
+            &[file_alias("billing", "billing")],
+            Some(&SecretRootConfig::new(configured_root.clone())),
+        )
+        .expect("resolver should build");
+        fs::remove_dir(&configured_root).expect("initial junction should remove");
+        create_windows_junction(&outside_root, &configured_root);
+
+        let secret = resolver
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect("resolution must remain anchored to the opened root");
+        assert_eq!(secret.expose(), b"trusted-value");
+        assert_ne!(secret.expose(), b"outside-canary");
+
+        drop(secret);
+        drop(resolver);
+        fs::remove_dir(&configured_root).expect("replacement junction should remove");
+        fs::remove_dir_all(container).expect("fixture should remove");
+    }
+
+    #[cfg(windows)]
+    fn create_windows_junction(target: &Path, junction: &Path) {
+        let output = std::process::Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(junction)
+            .arg(target)
+            .output()
+            .expect("Windows command processor should start");
+        assert!(output.status.success(), "Windows junction should create");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires Windows Developer Mode or SeCreateSymbolicLinkPrivilege"]
+    async fn windows_file_symlink_fails_closed() {
         use std::os::windows::fs::symlink_file;
 
         let temporary = TemporarySecrets::new("windows-safety");
         temporary.write("real", b"real-secret");
         let linked = temporary.root.join("linked");
-        if symlink_file(temporary.root.join("real"), &linked).is_err() {
-            return;
-        }
+        symlink_file(temporary.root.join("real"), &linked)
+            .expect("Windows symbolic-link privilege is required for this ignored test");
         let resolver = OperatorAliasResolver::from_config(
             &[file_alias("linked", "linked")],
             Some(&temporary.root_config()),

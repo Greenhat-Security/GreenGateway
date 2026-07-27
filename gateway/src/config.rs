@@ -2386,14 +2386,14 @@ fn parse_operator_secret_aliases(
             return Vec::new();
         }
     };
-    let value = value.trim();
-    if value.is_empty() {
-        return Vec::new();
-    }
     if value.len() > MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES {
         problems.push(format!(
             "{name} must contain at most {MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES} bytes"
         ));
+        return Vec::new();
+    }
+    let value = value.trim();
+    if value.is_empty() {
         return Vec::new();
     }
     serde_json::from_str(value).unwrap_or_else(|error| {
@@ -4117,6 +4117,24 @@ mod tests {
             _ => Err(VarError::NotPresent),
         })
         .expect_err("oversized alias JSON must fail before parsing");
+
+        assert!(error.to_string().contains(&format!(
+            "CONNECTION_SECRET_ALIASES must contain at most {MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES} bytes"
+        )));
+    }
+
+    #[test]
+    fn operator_alias_json_bound_includes_surrounding_whitespace() {
+        let raw = format!(
+            "{}[]{}",
+            " ".repeat(MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES),
+            " ".repeat(1)
+        );
+        let error = Config::from_env_vars(|name| match name {
+            "CONNECTION_SECRET_ALIASES" => Ok(raw.clone()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("oversized whitespace around valid JSON must fail before trimming");
 
         assert!(error.to_string().contains(&format!(
             "CONNECTION_SECRET_ALIASES must contain at most {MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES} bytes"

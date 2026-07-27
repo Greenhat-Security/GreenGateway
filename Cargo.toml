@@ -11,6 +11,8 @@ arc-swap = "1.7.1"
 async-trait = "0.1.89"
 axum = "0.8.9"
 bytes = "1.11.0"
+cap-fs-ext = "4.0.2"
+cap-std = "4.0.2"
 hex = "0.4.3"
 futures-util = "0.3.31"
 getrandom = "0.3.4"
@@ -18,7 +20,6 @@ http = "1.4.2"
 ipnet = "2.11.0"
 jsonschema = { version = "0.46.9", default-features = false }
 jsonwebtoken = "9"
-libc = "0.2.186"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 mime_guess = "2"
@@ -28,6 +29,7 @@ proptest = "1.9.0"
 rcgen = "0.13.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = "8"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

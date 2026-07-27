@@ -218,11 +218,13 @@ Operator aliases are bounded startup JSON. Environment locators use validated
 ASCII variable names. File locators are one validated filename segment below a
 canonical configured root; traversal, absolute/drive/alternate-stream forms,
 symbolic links, Windows reparse points, non-regular files, and unsafe
-platform-supported permissions fail closed. The leaf is opened without
-following links and read through a purpose-specific byte cap. Values are
-resolved on every authorized use rather than cached, so atomic mounted-file
-replacement affects the next resolution without changing an already in-flight
-redacted value.
+platform-supported permissions fail closed. A capability-backed handle anchors
+the validated root across later path or ancestor replacement. The leaf is
+opened relative to that handle without following links and in nonblocking mode,
+validated from the opened handle, and read through a purpose-specific byte cap.
+Values are resolved on every authorized use rather than cached, so atomic
+mounted-file replacement affects the next resolution without changing an
+already in-flight redacted value.
 
 Internal resolved secret wrappers do not implement `Serialize` or `Clone`.
 Their manual `Debug` output is exactly `<redacted>`, their bytes are bounded by
