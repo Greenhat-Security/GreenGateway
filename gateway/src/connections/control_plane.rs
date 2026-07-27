@@ -1432,17 +1432,20 @@ mod tests {
     }
 
     #[test]
-    fn malformed_tls_material_is_rejected_before_persistence_and_publication() {
-        let temporary = TemporaryLocalControlPlane::new("malformed-tls");
+    fn invalid_der_ca_is_rejected_before_persistence_and_publication() {
+        let temporary = TemporaryLocalControlPlane::new("invalid-der-ca");
         let control_plane = ConnectionControlPlane::from_config(&temporary.config())
             .expect("control plane should build");
         let secret = control_plane
             .local_secret_manager()
             .expect("local manager should exist")
             .create(
-                "Malformed CA",
-                ResolvedSecret::new(SecretPurpose::TlsCaBundle, b"not-a-pem-bundle".to_vec())
-                    .expect("bounded fixture should validate"),
+                "Invalid DER CA",
+                ResolvedSecret::new(
+                    SecretPurpose::TlsCaBundle,
+                    b"-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n".to_vec(),
+                )
+                .expect("bounded invalid-DER PEM fixture should validate"),
             )
             .expect("fixture secret should create");
         let before = control_plane.runtime_snapshot();
@@ -1465,6 +1468,65 @@ mod tests {
                 .expect("count should load"),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn mixed_valid_and_invalid_ca_rotation_preserves_previous_material() {
+        let temporary = TemporaryLocalControlPlane::new("mixed-ca-rotation");
+        let config = temporary.config();
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let key = rcgen::KeyPair::generate().expect("test CA key should generate");
+        let certificate = rcgen::CertificateParams::new(vec!["ca.example.test".to_owned()])
+            .expect("test CA parameters should build")
+            .self_signed(&key)
+            .expect("test CA certificate should build");
+        let valid_ca_pem = certificate.pem().into_bytes();
+        let manager = control_plane
+            .local_secret_manager()
+            .expect("local manager should exist");
+        let ca_secret = manager
+            .create(
+                "CA bundle",
+                ResolvedSecret::new(SecretPurpose::TlsCaBundle, valid_ca_pem.clone())
+                    .expect("valid CA secret should construct"),
+            )
+            .expect("valid CA secret should create");
+        let before = control_plane.runtime_snapshot();
+        let mut candidate = managed_candidate();
+        candidate.tls.ca_bundle_alias = Some(ca_secret.id.clone());
+        let created = control_plane
+            .create_managed(before.collection_etag(), candidate)
+            .expect("valid CA connection should activate");
+
+        let mut mixed_bundle = valid_ca_pem.clone();
+        mixed_bundle.extend_from_slice(
+            b"\n-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n",
+        );
+        assert_eq!(
+            manager.rotate(
+                &ca_secret.id,
+                ResolvedSecret::new(SecretPurpose::TlsCaBundle, mixed_bundle)
+                    .expect("bounded mixed CA fixture should construct"),
+            ),
+            Err(LocalSecretError::InvalidSecret)
+        );
+        assert_eq!(
+            control_plane
+                .secret_resolver()
+                .resolve(&ca_secret.id, SecretPurpose::TlsCaBundle)
+                .await
+                .expect("previous CA bundle should remain resolvable")
+                .expose(),
+            valid_ca_pem
+        );
+        assert_eq!(
+            control_plane.runtime_snapshot().managed().get(&created.id),
+            Some(&created)
+        );
+        drop(control_plane);
+        ConnectionControlPlane::from_config(&config)
+            .expect("rejected CA rotation must leave restartable state");
     }
 
     #[tokio::test]

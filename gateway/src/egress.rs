@@ -1323,8 +1323,21 @@ fn tls_client_identity_pem_shape_is_valid(pem_identity: &[u8]) -> bool {
 }
 
 pub(crate) fn tls_ca_bundle_pem_is_valid(pem_bundle: &[u8]) -> bool {
-    reqwest::Certificate::from_pem_bundle(pem_bundle)
-        .is_ok_and(|certificates| !certificates.is_empty())
+    let Ok(certificates) = reqwest::Certificate::from_pem_bundle(pem_bundle) else {
+        return false;
+    };
+    if certificates.is_empty() {
+        return false;
+    }
+
+    certificates
+        .into_iter()
+        .fold(
+            reqwest::Client::builder().no_proxy(),
+            |builder, certificate| builder.add_root_certificate(certificate),
+        )
+        .build()
+        .is_ok()
 }
 
 pub(crate) fn tls_client_identity_pem_is_valid(pem_identity: &[u8]) -> bool {

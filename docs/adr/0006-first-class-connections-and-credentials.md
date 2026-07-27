@@ -253,9 +253,11 @@ re-encrypt a bounded key batch, and verify old-key disuse. It deliberately has
 no reveal method; runtime plaintext resolution is a separate capability.
 Create and rotate consume a redacted zeroizing value and return only stable
 metadata. Rotation preflights proposed material against every enabled
-referencing Connection, including CA parsing and client certificate/private-key
-pairing, before changing ciphertext; a failed preflight preserves the prior
-value and runtime. Referenced deletion fails with bounded connection dependency IDs.
+referencing Connection, including parsing every CA bundle entry as valid X.509
+DER and client certificate/private-key pairing, before changing ciphertext; a
+malformed entry in an otherwise valid CA bundle fails the whole preflight, and
+a failed preflight preserves the prior value and runtime. Referenced deletion
+fails with bounded connection dependency IDs.
 The database, WAL, and database backups contain ciphertext only. Database and
 key backups are separate recovery artifacts and must be restored together.
 
