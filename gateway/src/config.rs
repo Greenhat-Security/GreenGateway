@@ -5853,6 +5853,26 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_upstream_pool_example_parses_without_inline_secrets() {
+        let example = include_str!("../../docs/examples/upstream-pool.json");
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(example.to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("checked-in upstream pool example should parse");
+
+        assert_eq!(config.upstream_routes.len(), 1);
+        assert_eq!(config.upstream_routes[0].id.as_deref(), Some("payments"));
+        assert_eq!(config.upstream_routes[0].upstreams.len(), 2);
+        assert!(config.upstream_routes[0]
+            .upstreams
+            .iter()
+            .all(|endpoint| endpoint.url.contains(".example.test")));
+        assert!(!example.contains("BEGIN CERTIFICATE"));
+        assert!(!example.contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[test]
     fn upstream_pool_configuration_parses_with_stable_ids_and_bounds() {
         let config = Config::from_env_vars(|name| match name {
             "UPSTREAM_ROUTES" => Ok(r#"[{

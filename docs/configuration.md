@@ -1233,7 +1233,7 @@ Maximum egress request body size, in bytes.
 
 Default: `1048576` (1 MiB)
 
-Format and validation: must parse as a non-negative byte count that fits in `usize`. Caller-provided body vectors on the direct `EgressClient` request paths are checked before DNS resolution. The proxy's default buffered mode reads no more than this limit before egress. Its internal streaming mode rejects a valid known length above the limit before DNS, independently counts all actual bytes for missing, chunked, or underdeclared lengths, forwards no more than the configured maximum, and aborts on the first overflow indication. Streaming mode is not operator-selectable until the route/pool configuration slice lands. Gateway MCP `call_tool` payloads are conservatively sized before destination resolution or session initialization and are checked again at transport serialization. MCP initialization and discovery messages retain the transport serialization check after destination validation.
+Format and validation: must parse as a non-negative byte count that fits in `usize`. Caller-provided body vectors on the direct `EgressClient` request paths are checked before DNS resolution. The proxy's default buffered mode reads no more than this limit before egress. A pooled route may opt into `request_body.mode: "stream"`; that mode rejects a valid known length above the limit before DNS, independently counts all actual bytes for missing, chunked, or underdeclared lengths, forwards no more than the configured maximum, and aborts on the first overflow indication. Gateway MCP `call_tool` payloads are conservatively sized before destination resolution or session initialization and are checked again at transport serialization. MCP initialization and discovery messages retain the transport serialization check after destination validation.
 
 ### EGRESS_NAT64_PREFIXES
 
@@ -1250,3 +1250,36 @@ Whether the egress client blocks non-global and special-use resolved IP ranges. 
 Default: `true`
 
 Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, the egress client blocks the non-global entries in the IANA IPv4 and IPv6 special-purpose registries, including private, shared, loopback, link-local, documentation, benchmarking, deprecated transition, discard, multicast, and reserved ranges. Registry-defined global exceptions remain allowed. IPv4-mapped IPv6 and recognized NAT64 addresses are classified by their embedded IPv4 destination. If any resolved address for a hostname is non-global, the complete request is denied before the selected address is pinned.
+
+## Production Deployment And Migration
+
+Adopt pool behavior one logical route at a time. Existing `UPSTREAM_URL` and
+legacy `UPSTREAM_ROUTES[].upstream_url` entries remain one-endpoint,
+single-attempt, buffered compatibility routes. A pool migration assigns stable
+route/endpoint IDs, moves endpoint-specific CA and client-identity paths into
+the selected endpoint object, and opts into health, retry, circuit, streaming,
+or SSE behavior explicitly.
+
+Before rollout, validate:
+
+- policy dispatch bindings use the stable logical route ID;
+- `limits`, health thresholds, retry methods/statuses, circuit bounds, and
+  stream limits fit the deployment;
+- every endpoint passes complete DNS/egress validation;
+- mounted CA/identity files are read-only, regular files and contain no real
+  secret values in environment JSON;
+- `/startupz`, `/livez`, and `/readyz` are wired to their intended supervisor
+  roles; and
+- the supervisor grace period exceeds the drain delay, request/background
+  timeout, and audit-drain timeout.
+
+Expected pre-commit proxy failures remain sanitized: body limit `413`, no
+eligible capacity `503`, upstream transport/protocol failure `502`, and
+connect/total/idle timeout `504`. Detailed endpoint state is available only
+through the authorized admin status API.
+
+See the
+[production data-plane deployment guide](deployment/production-data-plane.md)
+for a migration example, Docker Compose and Kubernetes probes, multi-upstream
+smoke scenarios, mTLS rotation, alert guidance, load/soak reproduction, and
+rollback steps.

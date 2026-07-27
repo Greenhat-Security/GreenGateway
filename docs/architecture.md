@@ -1,12 +1,9 @@
 # GreenGateway Architecture
 
-GreenGateway is pre-alpha. This document describes the target architecture for
-the first implementation wave so future contributors can place their work in
-the same request path. It is not a description of code that has already shipped.
-
-The middleware ordering below is the design target for issues #4 through #9 to
-implement consistently. If any of those issues change the order or ownership of
-a concern, this document should be updated in the same change set.
+GreenGateway is alpha software. This document describes the request and
+production proxy data-plane boundaries implemented in the current `main`
+branch. The security order is a compatibility contract: new availability
+features must remain after authorization and behind egress validation.
 
 ## Request lifecycle
 
@@ -26,7 +23,7 @@ Every inbound request is expected to pass through the gateway in this order:
 | 10 | Authentication | #5 | Run pluggable validators, starting with JWT/JWKS, with cookie sessions and additional identity providers deferred to Phase 7; fail closed with `401` on any non-exempt route. |
 | 11 | Principal/policy rate limiting | #4 | Apply the authenticated-principal and policy override stage without changing the classified route. |
 | 12 | Authorization / RBAC | #6 | Evaluate deny-by-default role permissions, starting at route level, with tool-level checks and full rules-as-data deferred to later phases. |
-| 13 | Route handling / proxy | #239 | Forward an already-authorized request through the egress boundary. Current single-upstream compatibility remains authoritative while the bounded production data plane lands incrementally. |
+| 13 | Route handling / proxy | #239 | Admit an already-authorized request to its logical pool, select an eligible configured endpoint, and forward bounded attempt(s) through the egress boundary. |
 | 14 | Audit | #8 | Emit structured, versioned audit events for every security-relevant decision made by the layers above. |
 
 Audit is listed last to show that every decision has a durable security record,
@@ -48,7 +45,7 @@ request
   -> authentication
   -> principal/policy rate limiting
   -> authorization / RBAC
-  -> route handling / proxy placeholder
+  -> bounded route handling / proxy
   -> response
 
 audit events are emitted throughout the path and correlated by request ID
@@ -56,7 +53,13 @@ audit events are emitted throughout the path and correlated by request ID
 
 ## Production data-plane boundary
 
-The current proxy classifies a configured logical upstream before authentication and authorization so policy can evaluate the intended route. Physical network work still occurs only in the fallback handler after the security middleware has allowed the request. Proxy and health traffic use `EgressClient`, which validates the hostname and port, resolves and validates every DNS answer, pins the selected address, preserves hostname/SNI verification, and disables redirects.
+The proxy classifies a configured logical route before authentication and
+authorization so policy can evaluate stable dispatch identity. Physical network
+work still occurs only in the fallback handler after the security middleware
+has allowed the request. Proxy attempts and active health checks use
+`EgressClient`, which validates the hostname and port, resolves and validates
+every DNS answer, pins the selected address, preserves hostname/SNI
+verification, and disables redirects.
 
 Issue #239 evolves that path without changing the security order:
 
@@ -74,25 +77,104 @@ stable logical route
   -> response and terminal observation
 ```
 
-Pre-authorization routing may remain a pure logical classification only. It must not select an endpoint, resolve DNS, acquire a client or permit, or open a socket. Failover and retries stay inside the already-authorized route. See [ADR-0005](adr/0005-production-proxy-data-plane.md) for the target pooling, health, readiness, shutdown, SSE, mTLS, threat, compatibility, and rollout contracts. Later target behavior in that ADR is not implied to be shipped by the initial extraction PR.
+Pre-authorization routing is a pure logical classification. It does not select
+an endpoint, resolve DNS, acquire a client or permit, or open a socket. Failover
+and retries stay inside the already-authorized route. See
+[ADR-0005](adr/0005-production-proxy-data-plane.md) for the threat,
+compatibility, and rollout contracts.
+
+### Destination and transport flow
+
+```text
+configured endpoint URL
+  -> scheme/host/port allowlist
+  -> resolve through injectable resolver
+  -> validate every IPv4/IPv6/mapped/NAT64 answer
+  -> exact validated socket address
+  -> bounded cache key
+       (origin + exact address + egress generation + timeouts
+        + TLS roots + client identity + protocol/proxy policy)
+  -> reused reqwest client with redirects and ambient proxies disabled
+  -> hostname URL sent with SNI and certificate verification intact
+```
+
+The client cache is sharded, has a hard process-wide entry ceiling, and expires
+idle entries. In-flight callers hold their own client reference, so eviction
+does not invalidate active work. DNS is resolved and validated before each new
+request attempt; a stale cached client is not a substitute for failed or unsafe
+current DNS.
+
+### Pool, health, retry, and circuit state
+
+```text
+logical pool (stable policy identity)
+  +-- bounded admission queue / in-flight permits
+  +-- endpoint A -> health state -> circuit state -> egress config/identity A
+  +-- endpoint B -> health state -> circuit state -> egress config/identity B
+  `-- retry budget (safe replayable methods only)
+```
+
+Weighted selection uses only configured endpoint state. Health workers are one
+per configured endpoint with health enabled, use the same egress/TLS boundary,
+and stop during drain. Passive failures, active health, and circuits use safe
+bounded categories. Retry prefers an eligible endpoint not already attempted,
+shares one request deadline, and never replays streamed bodies or unsafe
+methods.
+
+Client certificates and custom roots are parsed at startup and remain
+endpoint-local. Their fingerprints partition transport reuse but are excluded
+from diagnostics and telemetry.
+
+### Response and SSE completion
+
+Ordinary response mode preserves the compatibility first-chunk commitment
+boundary. Explicit SSE mode commits status and headers promptly, then streams
+with one-chunk backpressure plus independent idle, byte, duration, and shutdown
+limits. A correlated `upstream.stream_terminated` audit event records a bounded
+terminal outcome after a streamed response finishes; payload bytes are never
+captured by this telemetry.
+
+### Readiness and shutdown
+
+```text
+running
+  -> first termination signal
+  -> readiness false; retry/health work cancelled
+  -> drain delay (load balancers observe /readyz=503)
+  -> listeners stop accepting; registered HTTP/SSE/background work drains
+  -> hard request/background deadline
+  -> terminal shutdown audit event
+  -> audit admission closes; queued events and sinks flush
+  -> process exit
+```
+
+`/livez` is process liveness, `/startupz` is required initialization, and
+`/readyz` combines accepting-work state with required pool capacity. These
+handlers read cached state and do no synchronous network or durable-store work.
+Unified and split listeners share one lifecycle coordinator; unexpected exit of
+one listener cancels and drains the other.
 
 ## Crate layout
 
-The intended workspace shape is a gateway binary crate that wires together a
-small set of focused library crates or modules. At a high level, those focused
-areas are:
+The Cargo workspace currently contains the `gateway` binary crate. Its focused
+modules include:
 
-- Security middleware and response hardening.
-- Authentication.
-- RBAC and policy evaluation.
-- Egress firewalling.
-- Audit event production and delivery.
+- `middleware/` for ingress validation, auth decision propagation, rate limits,
+  and end-to-end observations;
+- `auth/` and `rbac/` for identities, tokens, policy, and authorization;
+- `egress.rs` plus `egress/client_cache.rs` for SSRF validation, exact pinning,
+  TLS identities, and bounded reusable clients;
+- `proxy/` for classification, admission, health, retry, circuits, request and
+  response streaming, and terminal telemetry;
+- `lifecycle.rs` for probes, signal coordination, task/request tracking, and
+  bounded shutdown;
+- `audit/` and `discovery/` for event delivery, durable queries, inventory, and
+  signals; and
+- `tools/` and `mcp.rs` for local tools, upstream MCP, and MCP protocol handling.
 
-This is deliberately vague until issue #3 defines the authoritative Rust
-workspace shape. Do not treat the concern list above as final crate names,
-module paths, or API boundaries. Once #3 lands, this section should be updated
-to reflect the actual workspace layout without contradicting the decisions made
-there.
+`main.rs` composes these modules and owns the HTTP route surfaces. Outbound HTTP
+must not be added outside `egress.rs`; CI enforces that boundary with
+`scripts/check-egress-only.sh`.
 
 ## Concern Ownership
 

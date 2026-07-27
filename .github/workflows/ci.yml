@@ -109,18 +109,14 @@ jobs:
         run: |
           set -eu
 
-          compose_files="-f docker-compose.yml -f docker-compose.dev.yml"
+          compose_files=(-f docker-compose.yml -f docker-compose.dev.yml)
+          trap 'docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v || true' EXIT
 
-          cleanup() {
-            docker compose $compose_files down -v || true
-          }
-          trap cleanup EXIT
-
-          docker compose $compose_files up -d --build
+          docker compose "${compose_files[@]}" up -d --build
 
           healthy=0
-          for attempt in {1..60}; do
-            if curl -fsS http://127.0.0.1:8080/health >/dev/null; then
+          for _ in {1..60}; do
+            if curl -fsS http://127.0.0.1:8080/readyz >/dev/null; then
               healthy=1
               break
             fi
@@ -128,14 +124,48 @@ jobs:
           done
 
           if [ "$healthy" -ne 1 ]; then
-            docker compose $compose_files logs gateway dev-jwks dev-echo
+            docker compose "${compose_files[@]}" logs gateway dev-jwks dev-echo-a dev-echo-b dev-echo-c
             exit 1
           fi
 
           set +e
           node scripts/generate-traffic.mjs --smoke-test
           smoke_status=$?
+          if [ "$smoke_status" -eq 0 ]; then
+            node scripts/verify-dev-pool.mjs healthy
+            smoke_status=$?
+          fi
+          if [ "$smoke_status" -eq 0 ]; then
+            node scripts/proxy-load.mjs \
+              --path /__dev-stream \
+              --method POST \
+              --body-bytes 1048576 \
+              --response-bytes 128 \
+              --concurrency 1 \
+              --requests 3 \
+              --output artifacts/proxy-load/ci-stream.json
+            smoke_status=$?
+          fi
+          if [ "$smoke_status" -eq 0 ]; then
+            docker compose "${compose_files[@]}" stop dev-echo-b
+            node scripts/verify-dev-pool.mjs degraded --endpoint dev-echo-b
+            smoke_status=$?
+          fi
+          if [ "$smoke_status" -eq 0 ]; then
+            docker compose "${compose_files[@]}" start dev-echo-b
+            node scripts/verify-dev-pool.mjs recovered --endpoint dev-echo-b
+            smoke_status=$?
+          fi
+          if [ "$smoke_status" -eq 0 ]; then
+            docker compose "${compose_files[@]}" stop dev-echo-a dev-echo-b dev-echo-c
+            node scripts/verify-dev-pool.mjs unavailable
+            smoke_status=$?
+          fi
           set -e
+
+          if [ "$smoke_status" -ne 0 ]; then
+            docker compose "${compose_files[@]}" logs gateway dev-jwks dev-echo-a dev-echo-b dev-echo-c
+          fi
 
           exit "$smoke_status"
 

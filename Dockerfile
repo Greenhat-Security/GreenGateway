@@ -27,8 +27,11 @@ RUN cargo build --release -p gateway
 
 FROM debian:bookworm-slim AS runtime
 
-RUN groupadd --system greengateway \
-    && useradd --system --gid greengateway --home-dir /nonexistent --shell /usr/sbin/nologin greengateway
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 greengateway \
+    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin greengateway
 
 COPY --from=builder /app/target/release/gateway /usr/local/bin/gateway
 
@@ -36,6 +39,9 @@ ENV LISTEN_ADDR=0.0.0.0:8080
 
 EXPOSE 8080
 
-USER greengateway:greengateway
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/livez"]
+
+USER 10001:10001
 
 ENTRYPOINT ["/usr/local/bin/gateway"]

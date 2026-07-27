@@ -5,6 +5,22 @@ services:
       dockerfile: Dockerfile
     environment:
       LISTEN_ADDR: 0.0.0.0:8080
+      SHUTDOWN_DRAIN_DELAY_MS: "5000"
+      SHUTDOWN_TIMEOUT_MS: "30000"
+      AUDIT_DRAIN_TIMEOUT_MS: "5000"
+    stop_signal: SIGTERM
     stop_grace_period: 45s
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:8080/readyz
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
     ports:
       - "8080:8080"

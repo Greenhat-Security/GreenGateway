@@ -261,10 +261,11 @@ impl JwtValidator {
             return self.decode_with_key(token, &key);
         }
 
-        if !self.refresh_jwks().await? {
-            return Err(AuthError::InvalidSession("unknown kid".to_owned()));
-        }
+        self.refresh_jwks().await?;
 
+        // A concurrent request may have populated this key while this caller
+        // waited for the refresh mutex. Recheck even when the refresh interval
+        // suppressed this caller's own fetch.
         if let Some(key) = self.keys.read().await.get(&kid).cloned() {
             return self.decode_with_key(token, &key);
         }
@@ -1287,6 +1288,71 @@ RowSUZV5FSmOGJ7JyROZ80k=
 
         assert_eq!(principal.user_id, "user-123");
         assert_eq!(principal.email, Some("user@example.com".to_owned()));
+        server.await.expect("JWKS test server task should finish");
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_use_shares_jwks_refresh_without_rejecting_valid_tokens() {
+        const CONCURRENCY: usize = 50;
+        let jwks = json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": KID,
+                "use": "sig",
+                "alg": "RS256",
+                "n": TEST_PUBLIC_KEY_N,
+                "e": TEST_PUBLIC_KEY_E
+            }]
+        })
+        .to_string();
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("JWKS test server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("JWKS test server address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("JWKS test server should accept one request");
+            read_one_request(&stream).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                jwks.len(),
+                jwks
+            );
+            write_all(&stream, response.as_bytes()).await;
+        });
+        let mut cfg = default_cfg();
+        cfg.jwks_url = format!("http://127.0.0.1:{}/.well-known/jwks.json", addr.port());
+        let egress_client = egress_client(HashSet::from(["127.0.0.1".to_owned()]), false);
+        let validator =
+            Arc::new(JwtValidator::new(cfg, egress_client).expect("validator should build"));
+        let token = signed_token(base_claims(), TEST_PRIVATE_KEY);
+        let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
+        let mut validations = Vec::with_capacity(CONCURRENCY);
+
+        for _ in 0..CONCURRENCY {
+            let validator = Arc::clone(&validator);
+            let token = token.clone();
+            let barrier = Arc::clone(&barrier);
+            validations.push(tokio::spawn(async move {
+                barrier.wait().await;
+                validator
+                    .validate_session(&SessionCredential::Bearer(token))
+                    .await
+            }));
+        }
+
+        for validation in validations {
+            let principal = validation
+                .await
+                .expect("validation task should complete")
+                .expect("valid concurrent token should not be rejected");
+            assert_eq!(principal.user_id, "user-123");
+        }
         server.await.expect("JWKS test server task should finish");
     }
 

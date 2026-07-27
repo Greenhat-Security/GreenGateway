@@ -1,0 +1,101 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: greengateway
+data:
+  LISTEN_ADDR: "0.0.0.0:8080"
+  AUTH_ENABLED: "true"
+  AUTH_MODE: "required"
+  UPSTREAM_ROUTES: "[]"
+  EGRESS_DENY_PRIVATE_IPS: "true"
+  SHUTDOWN_DRAIN_DELAY_MS: "5000"
+  SHUTDOWN_TIMEOUT_MS: "30000"
+  AUDIT_DRAIN_TIMEOUT_MS: "5000"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: greengateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: greengateway
+  template:
+    metadata:
+      labels:
+        app: greengateway
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: gateway
+          # Replace latest with an immutable release digest before production.
+          image: ghcr.io/greenhat-security/greengateway:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: greengateway
+            - secretRef:
+                name: greengateway-secrets
+          ports:
+            - name: http
+              containerPort: 8080
+          startupProbe:
+            httpGet:
+              path: /startupz
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: greengateway
+spec:
+  selector:
+    app: greengateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: greengateway-secrets
+type: Opaque
+stringData:
+  # Replace these placeholders through the deployment's secret manager.
+  JWT_JWKS_URL: "https://identity.example.test/.well-known/jwks.json"
+  JWT_ISSUER: "https://identity.example.test"
+  JWT_AUDIENCE: "greengateway"

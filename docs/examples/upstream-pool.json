@@ -1,0 +1,55 @@
+[
+  {
+    "id": "payments",
+    "path_prefix": "/payments",
+    "upstreams": [
+      {
+        "id": "payments-a",
+        "url": "https://payments-a.example.test",
+        "weight": 3
+      },
+      {
+        "id": "payments-b",
+        "url": "https://payments-b.example.test",
+        "weight": 1,
+        "tls_ca_bundle_path": "/run/secrets/payments-ca.pem",
+        "client_identity_pem_path": "/run/secrets/payments-client.pem"
+      }
+    ],
+    "load_balancing": {
+      "strategy": "weighted_round_robin"
+    },
+    "request_body": {
+      "mode": "buffered"
+    },
+    "limits": {
+      "max_in_flight": 128,
+      "queue_depth": 256,
+      "queue_timeout_ms": 100
+    },
+    "health_check": {
+      "method": "GET",
+      "path": "/ready",
+      "interval_ms": 10000,
+      "jitter_ms": 500,
+      "timeout_ms": 1000,
+      "healthy_threshold": 2,
+      "unhealthy_threshold": 3,
+      "expected_statuses": [200, 204],
+      "passive_failure_statuses": [500, 502, 503, 504],
+      "required_for_readiness": true,
+      "minimum_healthy": 1
+    },
+    "retry": {
+      "max_attempts": 2,
+      "methods": ["GET", "HEAD", "OPTIONS"],
+      "statuses": [502, 503, 504]
+    },
+    "circuit_breaker": {
+      "failure_threshold": 5,
+      "open_ms": 30000,
+      "half_open_max_requests": 1,
+      "recovery_threshold": 2
+    }
+  }
+]

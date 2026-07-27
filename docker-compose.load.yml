@@ -1,0 +1,10 @@
+services:
+  gateway:
+    environment:
+      # The correctness overlay intentionally keeps conservative rate limits.
+      # The load overlay raises them so proxy transport measurements are not
+      # dominated by the gateway's ingress limiter.
+      RATE_LIMIT_READ_RPS: "100000"
+      RATE_LIMIT_READ_BURST: "200000"
+      RATE_LIMIT_WRITE_RPS: "100000"
+      RATE_LIMIT_WRITE_BURST: "200000"

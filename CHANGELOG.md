@@ -41,7 +41,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   reject known oversize lengths before DNS, forward no more than the configured
   byte ceiling, preserve backpressure and cancellation, and never turn
   truncated discovery samples into schema evidence. Buffered proxying remains
-  the compatibility default until route/pool configuration exposes stream mode.
+  the compatibility default; pooled routes may opt into stream mode.
 
 - Outbound HTTP used by the egress client, reverse proxy, identity-provider
   discovery/session calls, and MCP upstream transport now ignores ambient
@@ -65,6 +65,27 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   conservatively sized and rejected before destination resolution, connection,
   or session initialization, so those guaranteed size denials cannot produce
   upstream traffic.
+
+### Added
+
+- Expanded the Docker development stack to three controllable weighted
+  upstreams and added CI smoke scenarios for incremental upload/download,
+  forwarding and credential boundaries, healthy distribution, safe GET retry,
+  POST non-retry, threshold-based endpoint removal/recovery, all-down readiness,
+  and sanitized failures.
+- Added image/Compose lifecycle probes, an example Kubernetes deployment with a
+  45-second termination budget, production migration and rollback guidance,
+  metrics/alert recommendations, and reproducible quick/load/30-minute-soak
+  scripts plus flapping/all-down resilience load scenarios with machine-readable
+  latency, throughput, retry, and cache evidence.
+- Cloudflare container supervision now uses `/livez`, and an automated parity
+  test keeps every supported non-empty runtime environment setting forwarded
+  except the forced listen address and unsupported split admin listener.
+- Recorded the issue #239 development before/after proxy baseline. Connection
+  reuse reduced accepted upstream sockets in the controlled check, but the
+  low-concurrency Python HTTP/1.1 comparison regressed in throughput and
+  latency; Linux release-runner investigation remains a manual gate and this
+  release makes no performance-improvement claim.
 
 ## [1.0.1] - 2026-07-16
 
