@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 pub mod control_plane;
+pub mod local_secret;
 pub mod model;
 pub mod permissions;
 pub mod projection;

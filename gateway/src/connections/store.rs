@@ -141,6 +141,52 @@ CREATE INDEX idx_connection_status_latest
 ON connection_status_history(connection_id, status_revision DESC);
 "#;
 
+const MIGRATION_3_SQL: &str = r#"
+CREATE TABLE connection_local_secrets (
+    id TEXT PRIMARY KEY CHECK (length(CAST(id AS BLOB)) BETWEEN 1 AND 128),
+    schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
+    label TEXT NOT NULL CHECK (
+        length(label) BETWEEN 1 AND 128
+        AND instr(label, char(0)) = 0
+    ),
+    purpose TEXT NOT NULL CHECK (
+        purpose IN (
+            'header_api_key', 'static_bearer', 'oauth_client_secret',
+            'tls_private_key', 'tls_certificate', 'tls_ca_bundle'
+        )
+    ),
+    secret_version INTEGER NOT NULL CHECK (secret_version >= 1),
+    algorithm TEXT NOT NULL CHECK (
+        length(CAST(algorithm AS BLOB)) BETWEEN 1 AND 64
+        AND instr(algorithm, char(0)) = 0
+    ),
+    key_id TEXT NOT NULL CHECK (
+        length(CAST(key_id AS BLOB)) BETWEEN 1 AND 128
+        AND instr(key_id, char(0)) = 0
+    ),
+    nonce BLOB NOT NULL CHECK (length(nonce) = 24),
+    ciphertext BLOB NOT NULL CHECK (length(ciphertext) BETWEEN 17 AND 1048592),
+    created_at TEXT NOT NULL CHECK (
+        length(CAST(created_at AS BLOB)) BETWEEN 1 AND 64
+        AND instr(created_at, char(0)) = 0
+    ),
+    rotated_at TEXT CHECK (
+        rotated_at IS NULL
+        OR (
+            length(CAST(rotated_at AS BLOB)) BETWEEN 1 AND 64
+            AND instr(rotated_at, char(0)) = 0
+        )
+    ),
+    updated_at TEXT NOT NULL CHECK (
+        length(CAST(updated_at AS BLOB)) BETWEEN 1 AND 64
+        AND instr(updated_at, char(0)) = 0
+    )
+);
+
+CREATE INDEX idx_connection_local_secrets_key
+ON connection_local_secrets(key_id, id);
+"#;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -149,6 +195,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         sql: MIGRATION_2_SQL,
+    },
+    Migration {
+        version: 3,
+        sql: MIGRATION_3_SQL,
     },
 ];
 
@@ -447,6 +497,20 @@ impl SqliteConnectionStore {
 
     pub fn maximum_connections(&self) -> usize {
         self.maximum_connections
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn local_secret_count(&self) -> Result<usize, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        count_rows(
+            &connection,
+            &self.path,
+            "encrypted local secrets",
+            "SELECT COUNT(*) FROM connection_local_secrets",
+        )
     }
 
     pub fn add_dependency(
@@ -1043,6 +1107,7 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
         "SELECT connection_id, consumer_kind, consumer_id, created_at FROM connection_dependencies LIMIT 0",
         "SELECT connection_id, status_revision, observed_connection_revision, observed_credential_revision, observed_tls_revision, observed_discovery_revision, state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count FROM connection_current_status LIMIT 0",
         "SELECT sequence, connection_id, status_revision, observed_connection_revision, observed_credential_revision, observed_tls_revision, observed_discovery_revision, state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count FROM connection_status_history LIMIT 0",
+        "SELECT id, schema_version, label, purpose, secret_version, algorithm, key_id, nonce, ciphertext, created_at, rotated_at, updated_at FROM connection_local_secrets LIMIT 0",
     ] {
         connection
             .prepare(query)
@@ -1090,6 +1155,18 @@ fn validate_persisted_state(
     if binding_count > MAX_CREDENTIALS {
         return Err(ConnectionStoreError::LimitExceeded {
             resource: "connection credential bindings",
+            maximum: MAX_CREDENTIALS,
+        });
+    }
+    let local_secret_count = count_rows(
+        &transaction,
+        path,
+        "encrypted local secrets",
+        "SELECT COUNT(*) FROM connection_local_secrets",
+    )?;
+    if local_secret_count > MAX_CREDENTIALS {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "encrypted local secrets",
             maximum: MAX_CREDENTIALS,
         });
     }
@@ -1976,7 +2053,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(versions, vec![1, 2, 3]);
     }
 
     #[test]

@@ -15,9 +15,15 @@ use serde::Deserialize;
 
 use crate::{
     auth::principal::{canonical_issuer, provider_issuer, PROVIDER_ISSUER_PREFIX},
-    connections::secret::{
-        validate_operator_secret_alias_config, OperatorSecretAliasConfig, SecretRootConfig,
-        MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES,
+    connections::{
+        local_secret::{
+            validate_local_secret_keyring_config, LocalSecretKeyConfig,
+            MAX_LOCAL_SECRET_KEYRING_CONFIG_BYTES,
+        },
+        secret::{
+            validate_operator_secret_alias_config, OperatorSecretAliasConfig, SecretRootConfig,
+            MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES,
+        },
     },
     discovery::{
         signals::{
@@ -121,6 +127,7 @@ const CSRF_ENABLED: &str = "CSRF_ENABLED";
 const CSRF_EXEMPT_PATHS: &str = "CSRF_EXEMPT_PATHS";
 const CSRF_HEADER_NAME: &str = "CSRF_HEADER_NAME";
 const CONNECTIONS_SQLITE_PATH: &str = "CONNECTIONS_SQLITE_PATH";
+const CONNECTION_LOCAL_SECRET_KEYRING: &str = "CONNECTION_LOCAL_SECRET_KEYRING";
 const CONNECTION_SECRET_ALIASES: &str = "CONNECTION_SECRET_ALIASES";
 const CONNECTION_SECRETS_ROOT: &str = "CONNECTION_SECRETS_ROOT";
 const DISCOVERY_SQLITE_PATH: &str = "DISCOVERY_SQLITE_PATH";
@@ -198,6 +205,7 @@ pub struct Config {
     pub discovery_endpoint_limit: usize,
     pub principal_sqlite_path: Option<String>,
     pub connections_sqlite_path: Option<String>,
+    pub connection_local_secret_keyring: Vec<LocalSecretKeyConfig>,
     pub connection_secret_aliases: Vec<OperatorSecretAliasConfig>,
     pub connection_secrets_root: Option<SecretRootConfig>,
     pub payload_capture_enabled: bool,
@@ -874,6 +882,18 @@ impl Config {
         ) {
             problems.push(format!("{CONNECTION_SECRET_ALIASES}: {error}"));
         }
+        let connection_local_secret_keyring = parse_local_secret_keyring(
+            CONNECTION_LOCAL_SECRET_KEYRING,
+            get_var(CONNECTION_LOCAL_SECRET_KEYRING),
+            &mut problems,
+        );
+        if let Err(error) = validate_local_secret_keyring_config(
+            &connection_local_secret_keyring,
+            connection_secrets_root.is_some(),
+            connections_sqlite_path.is_some(),
+        ) {
+            problems.push(format!("{CONNECTION_LOCAL_SECRET_KEYRING}: {error}"));
+        }
         let payload_capture_enabled = parse_var(
             PAYLOAD_CAPTURE_ENABLED,
             get_var(PAYLOAD_CAPTURE_ENABLED),
@@ -1330,6 +1350,7 @@ impl Config {
                 discovery_endpoint_limit,
                 principal_sqlite_path,
                 connections_sqlite_path,
+                connection_local_secret_keyring,
                 connection_secret_aliases,
                 connection_secrets_root,
                 payload_capture_enabled,
@@ -2399,6 +2420,39 @@ fn parse_operator_secret_aliases(
     serde_json::from_str(value).unwrap_or_else(|error| {
         problems.push(format!(
             "{name} must be a JSON array of operator alias objects with id, label, and a typed environment/file source (invalid shape at line {} column {})",
+            error.line(),
+            error.column()
+        ));
+        Vec::new()
+    })
+}
+
+fn parse_local_secret_keyring(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Vec<LocalSecretKeyConfig> {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return Vec::new(),
+        Err(VarError::NotUnicode(_)) => {
+            problems.push(format!("{name} must be valid Unicode"));
+            return Vec::new();
+        }
+    };
+    if value.len() > MAX_LOCAL_SECRET_KEYRING_CONFIG_BYTES {
+        problems.push(format!(
+            "{name} must contain at most {MAX_LOCAL_SECRET_KEYRING_CONFIG_BYTES} bytes"
+        ));
+        return Vec::new();
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str(value).unwrap_or_else(|error| {
+        problems.push(format!(
+            "{name} must be a JSON array of local key objects with id, file, and role (invalid shape at line {} column {})",
             error.line(),
             error.column()
         ));
@@ -4138,6 +4192,91 @@ mod tests {
 
         assert!(error.to_string().contains(&format!(
             "CONNECTION_SECRET_ALIASES must contain at most {MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES} bytes"
+        )));
+    }
+
+    #[test]
+    fn local_secret_keyring_parses_and_redacts_key_ids_and_locators() {
+        let primary_id = "primary-key-id-canary";
+        let file_locator = "primary-key-file-canary";
+        let root_locator = "/var/run/local-secret-root-canary";
+        let database_locator = "/var/lib/local-secret-database-canary.sqlite";
+        let keyring =
+            format!(r#"[{{"id":"{primary_id}","file":"{file_locator}","role":"primary"}}]"#);
+        let config = Config::from_env_vars(|name| match name {
+            "CONNECTION_LOCAL_SECRET_KEYRING" => Ok(keyring.clone()),
+            "CONNECTION_SECRETS_ROOT" => Ok(root_locator.to_owned()),
+            "CONNECTIONS_SQLITE_PATH" => Ok(database_locator.to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("local keyring should parse");
+
+        assert_eq!(config.connection_local_secret_keyring.len(), 1);
+        assert_eq!(
+            config.connection_local_secret_keyring[0].role,
+            crate::connections::local_secret::LocalSecretKeyRole::Primary
+        );
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(primary_id));
+        assert!(!debug.contains(file_locator));
+        assert!(!debug.contains(root_locator));
+        assert!(debug.contains("<redacted-key-id>"));
+        assert!(debug.contains("<redacted-locator>"));
+    }
+
+    #[test]
+    fn local_secret_keyring_requires_store_root_and_exactly_one_primary() {
+        let primary = r#"[{"id":"primary","file":"primary.key","role":"primary"}]"#.to_owned();
+        let without_dependencies = Config::from_env_vars(|name| match name {
+            "CONNECTION_LOCAL_SECRET_KEYRING" => Ok(primary.clone()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("local keyring without store/root must fail");
+        let message = without_dependencies.to_string();
+        assert!(message.contains("requires CONNECTION_SECRETS_ROOT"));
+        assert!(!message.contains("primary.key"));
+
+        let no_primary = r#"[{"id":"old","file":"old.key","role":"decrypt_only"}]"#.to_owned();
+        let error = Config::from_env_vars(|name| match name {
+            "CONNECTION_LOCAL_SECRET_KEYRING" => Ok(no_primary.clone()),
+            "CONNECTION_SECRETS_ROOT" => Ok("/safe/root".to_owned()),
+            "CONNECTIONS_SQLITE_PATH" => Ok("/safe/connections.sqlite".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("keyring without primary must fail");
+        assert!(error.to_string().contains("exactly one primary key"));
+
+        let multiple = r#"[
+            {"id":"one","file":"one.key","role":"primary"},
+            {"id":"two","file":"two.key","role":"primary"}
+        ]"#
+        .to_owned();
+        let error = Config::from_env_vars(|name| match name {
+            "CONNECTION_LOCAL_SECRET_KEYRING" => Ok(multiple.clone()),
+            "CONNECTION_SECRETS_ROOT" => Ok("/safe/root".to_owned()),
+            "CONNECTIONS_SQLITE_PATH" => Ok("/safe/connections.sqlite".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("multiple primary keys must fail");
+        assert!(error
+            .to_string()
+            .contains("must contain only one primary key"));
+    }
+
+    #[test]
+    fn local_secret_keyring_json_is_bounded_before_trimming_or_parsing() {
+        let raw = format!(
+            "{}[]{}",
+            " ".repeat(MAX_LOCAL_SECRET_KEYRING_CONFIG_BYTES),
+            " "
+        );
+        let error = Config::from_env_vars(|name| match name {
+            "CONNECTION_LOCAL_SECRET_KEYRING" => Ok(raw.clone()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("oversized keyring JSON must fail before trimming");
+        assert!(error.to_string().contains(&format!(
+            "CONNECTION_LOCAL_SECRET_KEYRING must contain at most {MAX_LOCAL_SECRET_KEYRING_CONFIG_BYTES} bytes"
         )));
     }
 

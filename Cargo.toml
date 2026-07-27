@@ -13,6 +13,7 @@ axum = "0.8.9"
 bytes = "1.11.0"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 hex = "0.4.3"
 futures-util = "0.3.31"
 getrandom = "0.3.4"
