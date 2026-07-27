@@ -18,6 +18,7 @@ http = "1.4.2"
 ipnet = "2.11.0"
 jsonschema = { version = "0.46.9", default-features = false }
 jsonwebtoken = "9"
+libc = "0.2.186"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 mime_guess = "2"

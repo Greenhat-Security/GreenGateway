@@ -5,6 +5,7 @@ use crate::config::Config;
 use super::{
     model::MAX_CONNECTIONS,
     projection::{project_legacy_connections, LegacyConnectionProjection, LegacyProjectionError},
+    secret::{OperatorAliasResolver, SecretProviderConfigError, SecretResolver},
     store::{ConnectionStore, ConnectionStoreError, SqliteConnectionStore},
 };
 
@@ -13,10 +14,15 @@ pub struct ConnectionControlPlane {
     managed: Option<SqliteConnectionStore>,
     legacy: Arc<[LegacyConnectionProjection]>,
     omitted_legacy_projection_count: usize,
+    secret_resolver: Arc<OperatorAliasResolver>,
 }
 
 impl ConnectionControlPlane {
     pub fn from_config(config: &Config) -> Result<Self, ConnectionControlPlaneError> {
+        let secret_resolver = Arc::new(OperatorAliasResolver::from_config(
+            &config.connection_secret_aliases,
+            config.connection_secrets_root.as_ref(),
+        )?);
         let projection = project_legacy_connections(config)?;
         if config.connections_sqlite_path.is_some() && projection.omitted_count > 0 {
             return Err(ConnectionControlPlaneError::LimitExceeded {
@@ -82,6 +88,7 @@ impl ConnectionControlPlane {
             managed,
             legacy: legacy.into(),
             omitted_legacy_projection_count,
+            secret_resolver,
         })
     }
 
@@ -104,12 +111,17 @@ impl ConnectionControlPlane {
     pub fn is_managed_store_configured(&self) -> bool {
         self.managed.is_some()
     }
+
+    pub fn secret_resolver(&self) -> &(dyn SecretResolver + Send + Sync) {
+        self.secret_resolver.as_ref()
+    }
 }
 
 #[derive(Debug)]
 pub enum ConnectionControlPlaneError {
     Store(ConnectionStoreError),
     Projection(LegacyProjectionError),
+    SecretProvider(SecretProviderConfigError),
     LimitExceeded { count: usize, maximum: usize },
     IdCollision { id: String },
 }
@@ -119,6 +131,7 @@ impl fmt::Display for ConnectionControlPlaneError {
         match self {
             Self::Store(error) => error.fmt(formatter),
             Self::Projection(error) => error.fmt(formatter),
+            Self::SecretProvider(error) => error.fmt(formatter),
             Self::LimitExceeded { count, maximum } => write!(
                 formatter,
                 "managed and projected connections total {count}, exceeding the maximum of {maximum}"
@@ -136,6 +149,7 @@ impl Error for ConnectionControlPlaneError {
         match self {
             Self::Store(error) => Some(error),
             Self::Projection(error) => Some(error),
+            Self::SecretProvider(error) => Some(error),
             _ => None,
         }
     }
@@ -150,6 +164,12 @@ impl From<ConnectionStoreError> for ConnectionControlPlaneError {
 impl From<LegacyProjectionError> for ConnectionControlPlaneError {
     fn from(error: LegacyProjectionError) -> Self {
         Self::Projection(error)
+    }
+}
+
+impl From<SecretProviderConfigError> for ConnectionControlPlaneError {
+    fn from(error: SecretProviderConfigError) -> Self {
+        Self::SecretProvider(error)
     }
 }
 
@@ -242,6 +262,64 @@ mod tests {
         assert!(
             !path.exists(),
             "capacity failure must happen before store open"
+        );
+    }
+
+    #[test]
+    fn operator_alias_metadata_is_held_without_exposing_locators() {
+        let locator_canary = "CONTROL_PLANE_SECRET_LOCATOR_CANARY";
+        let mut config = config();
+        config.connection_secret_aliases =
+            vec![crate::connections::secret::OperatorSecretAliasConfig {
+                id: "billing-token".to_owned(),
+                label: "Billing token".to_owned(),
+                source: crate::connections::secret::OperatorSecretAliasSource::Environment {
+                    key: locator_canary.to_owned(),
+                },
+            }];
+
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let metadata = control_plane.secret_resolver().aliases();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].id, "billing-token");
+        let serialized = serde_json::to_string(&metadata).expect("metadata should serialize");
+        assert!(!serialized.contains(locator_canary));
+    }
+
+    #[test]
+    fn unsafe_secret_provider_startup_fails_before_database_creation() {
+        let database_path = std::env::temp_dir().join(format!(
+            "greengateway-control-plane-secret-order-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let missing_root = std::env::temp_dir().join(format!(
+            "greengateway-control-plane-missing-root-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = config();
+        config.connections_sqlite_path = Some(database_path.display().to_string());
+        config.connection_secrets_root = Some(crate::connections::secret::SecretRootConfig::new(
+            missing_root,
+        ));
+        config.connection_secret_aliases =
+            vec![crate::connections::secret::OperatorSecretAliasConfig {
+                id: "billing-token".to_owned(),
+                label: "Billing token".to_owned(),
+                source: crate::connections::secret::OperatorSecretAliasSource::File {
+                    key: "billing-token".to_owned(),
+                },
+            }];
+
+        assert!(matches!(
+            ConnectionControlPlane::from_config(&config),
+            Err(ConnectionControlPlaneError::SecretProvider(
+                SecretProviderConfigError::SecretsRootUnavailable
+            ))
+        ));
+        assert!(
+            !database_path.exists(),
+            "secret-provider validation must precede store creation"
         );
     }
 

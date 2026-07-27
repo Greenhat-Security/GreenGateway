@@ -642,6 +642,7 @@ dependencies = [
  "ipnet",
  "jsonschema",
  "jsonwebtoken",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "mime_guess",

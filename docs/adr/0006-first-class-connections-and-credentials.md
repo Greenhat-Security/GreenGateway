@@ -214,6 +214,16 @@ aliases, never admin-controlled input. An optional local provider may accept a
 secret value exactly once at its dedicated write/rotate endpoint and has no
 reveal operation.
 
+Operator aliases are bounded startup JSON. Environment locators use validated
+ASCII variable names. File locators are one validated filename segment below a
+canonical configured root; traversal, absolute/drive/alternate-stream forms,
+symbolic links, Windows reparse points, non-regular files, and unsafe
+platform-supported permissions fail closed. The leaf is opened without
+following links and read through a purpose-specific byte cap. Values are
+resolved on every authorized use rather than cached, so atomic mounted-file
+replacement affects the next resolution without changing an already in-flight
+redacted value.
+
 Internal resolved secret wrappers do not implement `Serialize` or `Clone`.
 Their manual `Debug` output is exactly `<redacted>`, their bytes are bounded by
 purpose, borrowed rather than copied for use, and zeroized on replacement and
@@ -241,6 +251,9 @@ the ceiling.
 |---|---:|
 | Managed and projected connections | 256 |
 | Credential records | 512 |
+| Operator secret aliases | 512 entries / 256 KiB startup JSON |
+| Concurrent operator alias reads | 16 |
+| Environment locator / file key | 128 / 255 bytes |
 | Retained connection dependency rows | 4,096 |
 | Managed OpenAPI document | 2 MiB |
 | Published catalog entries | 4,096 |
