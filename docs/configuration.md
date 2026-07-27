@@ -189,6 +189,18 @@ Each upsert preserves the earliest `first_seen`, refreshes `last_seen`, incremen
 
 Issuer note: configure `issuer` for JWT providers when tokens carry a stable issuer claim that GreenGateway should validate. A deployment with more than one JWT provider must configure an explicit issuer on every JWT provider so provider order cannot relabel a token that validates against shared keys. A single JWT provider configured only with `jwks_url` receives a stable `provider:<percent-encoded-name>` identity-boundary label; use that same provider label in policy issuer constraints when no token issuer is configured.
 
+### CONNECTIONS_SQLITE_PATH
+
+Optional SQLite control-plane store path for managed Connections.
+
+Default: empty. When unset, GreenGateway creates no implicit database, keeps the existing `UPSTREAM_URL`, `UPSTREAM_ROUTES`, and `MCP_UPSTREAM_SERVERS` runtime unchanged, and exposes those settings internally as immutable legacy projections. Managed connection mutations remain unavailable until an explicit path is configured.
+
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. GreenGateway opens the configured database, applies ordered connection-schema migrations in one immediate transaction, validates the resulting schema and foreign keys, and fails startup before either listener is built if opening, migration, or validation fails. Reopening an already migrated store is idempotent.
+
+The store contains connection metadata, opaque credential-binding IDs, dependency records, monotonic revisions, and bounded safe status history. It does not store resolved secret values, OAuth access tokens, or private-key material. Connection changes use transactions and canonical ETags; dependent records prevent deletion rather than being silently cascaded. The combined managed and projected connection count is capped at `256`, and safe status history is capped at `4096` rows.
+
+Use a durable filesystem location and include the SQLite database, WAL, and SHM files in the same operational backup boundary. An ephemeral container path does not make managed configuration durable.
+
 ### SCHEMA_MISMATCH_SIGNAL_THRESHOLD
 
 Cumulative schema mismatch count that opens a `schema_mismatch` discovery signal for an endpoint.

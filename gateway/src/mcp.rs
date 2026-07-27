@@ -758,6 +758,7 @@ mod tests {
             discovery_sqlite_path: None,
             discovery_endpoint_limit: config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
             principal_sqlite_path: None,
+            connections_sqlite_path: None,
             payload_capture_enabled: false,
             payload_capture_sample_rate: config::DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
             schema_mismatch_signal_threshold:
