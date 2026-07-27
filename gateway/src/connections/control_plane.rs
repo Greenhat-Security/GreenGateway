@@ -12,11 +12,28 @@ use super::{
 pub struct ConnectionControlPlane {
     managed: Option<SqliteConnectionStore>,
     legacy: Arc<[LegacyConnectionProjection]>,
+    omitted_legacy_projection_count: usize,
 }
 
 impl ConnectionControlPlane {
     pub fn from_config(config: &Config) -> Result<Self, ConnectionControlPlaneError> {
-        let legacy = project_legacy_connections(config)?;
+        let projection = project_legacy_connections(config)?;
+        if config.connections_sqlite_path.is_some() && projection.omitted_count > 0 {
+            return Err(ConnectionControlPlaneError::LimitExceeded {
+                count: projection.connections.len() + projection.omitted_count,
+                maximum: MAX_CONNECTIONS,
+            });
+        }
+        if projection.omitted_count > 0 {
+            tracing::warn!(
+                projected_count = projection.connections.len(),
+                omitted_count = projection.omitted_count,
+                maximum = MAX_CONNECTIONS,
+                "legacy runtime configuration exceeds the bounded Connection projection; preserving legacy runtime and omitting excess read-only projections"
+            );
+        }
+        let omitted_legacy_projection_count = projection.omitted_count;
+        let legacy = projection.connections;
         let managed = config
             .connections_sqlite_path
             .as_deref()
@@ -64,6 +81,7 @@ impl ConnectionControlPlane {
         Ok(Self {
             managed,
             legacy: legacy.into(),
+            omitted_legacy_projection_count,
         })
     }
 
@@ -77,6 +95,10 @@ impl ConnectionControlPlane {
 
     pub fn legacy(&self) -> &[LegacyConnectionProjection] {
         &self.legacy
+    }
+
+    pub fn omitted_legacy_projection_count(&self) -> usize {
+        self.omitted_legacy_projection_count
     }
 
     pub fn is_managed_store_configured(&self) -> bool {
@@ -146,6 +168,8 @@ impl Error for ManagedConnectionMutationUnavailable {}
 
 #[cfg(test)]
 mod tests {
+    use crate::config::McpUpstreamServerConfig;
+
     use super::*;
 
     fn config() -> Config {
@@ -159,6 +183,7 @@ mod tests {
             ConnectionControlPlane::from_config(&config).expect("control plane should build");
         assert!(!control_plane.is_managed_store_configured());
         assert!(control_plane.legacy().is_empty());
+        assert_eq!(control_plane.omitted_legacy_projection_count(), 0);
         let error = match control_plane.managed_store() {
             Ok(_) => panic!("managed mutations must be unavailable"),
             Err(error) => error,
@@ -166,6 +191,57 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "managed connection storage is unavailable; set CONNECTIONS_SQLITE_PATH to enable managed mutations, or use the read-only legacy projections"
+        );
+    }
+
+    #[test]
+    fn oversized_legacy_only_config_preserves_runtime_and_bounds_projection() {
+        let mut config = config();
+        config.mcp_upstream_servers = (0..=MAX_CONNECTIONS)
+            .map(|index| McpUpstreamServerConfig {
+                name: format!("server-{index}"),
+                url: format!("https://mcp-{index}.example.test"),
+                timeout_ms: None,
+                response_idle_timeout_ms: None,
+                connect_timeout_ms: None,
+            })
+            .collect();
+
+        let control_plane = ConnectionControlPlane::from_config(&config)
+            .expect("unset managed storage must preserve legacy startup");
+        assert_eq!(control_plane.legacy().len(), MAX_CONNECTIONS);
+        assert_eq!(control_plane.omitted_legacy_projection_count(), 1);
+        assert!(!control_plane.is_managed_store_configured());
+    }
+
+    #[test]
+    fn oversized_legacy_config_with_managed_store_fails_before_creating_database() {
+        let path = std::env::temp_dir().join(format!(
+            "greengateway-control-plane-overflow-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = config();
+        config.connections_sqlite_path = Some(path.display().to_string());
+        config.mcp_upstream_servers = (0..=MAX_CONNECTIONS)
+            .map(|index| McpUpstreamServerConfig {
+                name: format!("server-{index}"),
+                url: format!("https://mcp-{index}.example.test"),
+                timeout_ms: None,
+                response_idle_timeout_ms: None,
+                connect_timeout_ms: None,
+            })
+            .collect();
+
+        assert!(matches!(
+            ConnectionControlPlane::from_config(&config),
+            Err(ConnectionControlPlaneError::LimitExceeded {
+                count,
+                maximum: MAX_CONNECTIONS,
+            }) if count == MAX_CONNECTIONS + 1
+        ));
+        assert!(
+            !path.exists(),
+            "capacity failure must happen before store open"
         );
     }
 

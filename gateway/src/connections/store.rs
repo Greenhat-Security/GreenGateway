@@ -15,7 +15,7 @@ use super::{
     model::{
         ConnectionAuthentication, ConnectionId, ConnectionManagementSource, ConnectionWrite,
         DiscoveryConfig, CONNECTION_SCHEMA_VERSION, MAX_CATALOG_ENTRIES, MAX_CONNECTIONS,
-        MAX_CREDENTIALS, MAX_STATUS_HISTORY_ROWS,
+        MAX_CREDENTIALS, MAX_MANAGED_SPEC_BYTES, MAX_STATUS_HISTORY_ROWS,
     },
     status::{
         ConnectionOperationalState, ConnectionRevisions, ConnectionStatusReason,
@@ -41,7 +41,7 @@ CREATE TABLE connection_records (
     id TEXT PRIMARY KEY,
     schema_version TEXT NOT NULL,
     source TEXT NOT NULL CHECK (source = 'managed'),
-    spec_json TEXT NOT NULL,
+    spec_json TEXT NOT NULL CHECK (length(CAST(spec_json AS BLOB)) BETWEEN 2 AND 2097152),
     connection_revision INTEGER NOT NULL CHECK (connection_revision >= 1),
     credential_revision INTEGER NOT NULL CHECK (credential_revision >= 0),
     tls_revision INTEGER NOT NULL CHECK (tls_revision >= 0),
@@ -64,8 +64,13 @@ CREATE TABLE connection_credential_bindings (
 
 CREATE TABLE connection_dependencies (
     connection_id TEXT NOT NULL,
-    consumer_kind TEXT NOT NULL,
-    consumer_id TEXT NOT NULL,
+    consumer_kind TEXT NOT NULL CHECK (
+        consumer_kind IN ('proxy_route', 'manual_tool', 'managed_tool', 'control_plane')
+    ),
+    consumer_id TEXT NOT NULL CHECK (
+        length(CAST(consumer_id AS BLOB)) BETWEEN 1 AND 256
+        AND instr(consumer_id, char(0)) = 0
+    ),
     created_at TEXT NOT NULL,
     PRIMARY KEY (connection_id, consumer_kind, consumer_id),
     FOREIGN KEY (connection_id) REFERENCES connection_records(id) ON DELETE RESTRICT
@@ -76,16 +81,56 @@ ON connection_dependencies(connection_id, consumer_kind, consumer_id);
 "#;
 
 const MIGRATION_2_SQL: &str = r#"
+CREATE TABLE connection_current_status (
+    connection_id TEXT PRIMARY KEY,
+    status_revision INTEGER NOT NULL CHECK (status_revision >= 1),
+    observed_connection_revision INTEGER NOT NULL CHECK (observed_connection_revision >= 1),
+    observed_credential_revision INTEGER NOT NULL CHECK (observed_credential_revision >= 0),
+    observed_tls_revision INTEGER NOT NULL CHECK (observed_tls_revision >= 0),
+    observed_discovery_revision INTEGER NOT NULL CHECK (observed_discovery_revision >= 0),
+    state TEXT NOT NULL CHECK (
+        state IN ('unknown', 'configured', 'healthy', 'degraded', 'unavailable', 'disabled')
+    ),
+    reason TEXT NOT NULL CHECK (
+        reason IN (
+            'not_tested', 'legacy_configured', 'disabled', 'test_succeeded',
+            'request_failed', 'egress_denied', 'secret_unavailable',
+            'invalid_response', 'catalog_stale'
+        )
+    ),
+    observed_at TEXT NOT NULL CHECK (length(CAST(observed_at AS BLOB)) BETWEEN 1 AND 64),
+    latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0),
+    catalog_age_secs INTEGER CHECK (catalog_age_secs IS NULL OR catalog_age_secs >= 0),
+    catalog_entry_count INTEGER CHECK (
+        catalog_entry_count IS NULL OR catalog_entry_count BETWEEN 0 AND 4096
+    ),
+    FOREIGN KEY (connection_id) REFERENCES connection_records(id) ON DELETE CASCADE
+);
+
 CREATE TABLE connection_status_history (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     connection_id TEXT NOT NULL,
     status_revision INTEGER NOT NULL CHECK (status_revision >= 1),
-    state TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    observed_at TEXT NOT NULL,
-    latency_ms INTEGER,
-    catalog_age_secs INTEGER,
-    catalog_entry_count INTEGER,
+    observed_connection_revision INTEGER NOT NULL CHECK (observed_connection_revision >= 1),
+    observed_credential_revision INTEGER NOT NULL CHECK (observed_credential_revision >= 0),
+    observed_tls_revision INTEGER NOT NULL CHECK (observed_tls_revision >= 0),
+    observed_discovery_revision INTEGER NOT NULL CHECK (observed_discovery_revision >= 0),
+    state TEXT NOT NULL CHECK (
+        state IN ('unknown', 'configured', 'healthy', 'degraded', 'unavailable', 'disabled')
+    ),
+    reason TEXT NOT NULL CHECK (
+        reason IN (
+            'not_tested', 'legacy_configured', 'disabled', 'test_succeeded',
+            'request_failed', 'egress_denied', 'secret_unavailable',
+            'invalid_response', 'catalog_stale'
+        )
+    ),
+    observed_at TEXT NOT NULL CHECK (length(CAST(observed_at AS BLOB)) BETWEEN 1 AND 64),
+    latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0),
+    catalog_age_secs INTEGER CHECK (catalog_age_secs IS NULL OR catalog_age_secs >= 0),
+    catalog_entry_count INTEGER CHECK (
+        catalog_entry_count IS NULL OR catalog_entry_count BETWEEN 0 AND 4096
+    ),
     FOREIGN KEY (connection_id) REFERENCES connection_records(id) ON DELETE CASCADE
 );
 
@@ -109,6 +154,7 @@ const MIGRATIONS: &[Migration] = &[
 
 const SOURCE_MANAGED: &str = "managed";
 const MAX_DEPENDENCY_FIELD_BYTES: usize = 256;
+pub const MAX_CONNECTION_DEPENDENCIES: usize = 4_096;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -390,7 +436,7 @@ impl SqliteConnectionStore {
             .execute_batch(CONFIGURE_SQL)
             .map_err(|source| sqlite_error(&path, "configuration", source))?;
         run_migrations(&mut connection, &path, MIGRATIONS)?;
-        validate_schema(&connection, &path)?;
+        validate_persisted_state(&mut connection, &path, maximum_connections)?;
 
         Ok(Self {
             path,
@@ -411,18 +457,54 @@ impl SqliteConnectionStore {
     ) -> Result<(), ConnectionStoreError> {
         validate_dependency_id(consumer_id)?;
         let now = utc_timestamp()?;
-        let connection = self.connection_guard();
-        connection
+        let mut connection = self.connection_guard();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&self.path, "dependency transaction", source))?;
+        let exists: bool = transaction
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM connection_dependencies
+                    WHERE connection_id = ?1 AND consumer_kind = ?2 AND consumer_id = ?3
+                )
+                "#,
+                params![id.as_str(), kind.as_str(), consumer_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.path, "dependency lookup", source))?;
+        if exists {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&self.path, "dependency no-op commit", source))?;
+            return Ok(());
+        }
+        let dependency_count = count_rows(
+            &transaction,
+            &self.path,
+            "connection dependencies",
+            "SELECT COUNT(*) FROM connection_dependencies",
+        )?;
+        if dependency_count >= MAX_CONNECTION_DEPENDENCIES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection dependencies",
+                maximum: MAX_CONNECTION_DEPENDENCIES,
+            });
+        }
+        transaction
             .execute(
                 r#"
                 INSERT INTO connection_dependencies (
                     connection_id, consumer_kind, consumer_id, created_at
                 ) VALUES (?1, ?2, ?3, ?4)
-                ON CONFLICT(connection_id, consumer_kind, consumer_id) DO NOTHING
                 "#,
                 params![id.as_str(), kind.as_str(), consumer_id, now],
             )
             .map_err(|source| sqlite_error(&self.path, "dependency insert", source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, "dependency commit", source))?;
         Ok(())
     }
 
@@ -449,6 +531,7 @@ impl SqliteConnectionStore {
     pub fn append_status(
         &self,
         id: &ConnectionId,
+        expected: &ConnectionEtag,
         update: ConnectionStatusUpdate,
     ) -> Result<SafeConnectionStatus, ConnectionStoreError> {
         if update
@@ -465,8 +548,12 @@ impl SqliteConnectionStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&self.path, "status transaction", source))?;
-        let current_revision = load_status_revision(&transaction, &self.path, id)?;
-        let status_revision = increment_revision(id, current_revision)?;
+        let current = load_raw_by_id(&transaction, &self.path, id)?
+            .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?
+            .into_stored()?;
+        validate_record_bindings(&transaction, &self.path, &current)?;
+        ensure_etag(id, expected, &current)?;
+        let status_revision = increment_revision(id, current.revisions.status)?;
         let latency_ms = optional_u64_to_i64(update.latency_ms, "latency_ms")?;
         let catalog_age_secs = optional_u64_to_i64(update.catalog_age_secs, "catalog_age_secs")?;
         let catalog_entry_count = update
@@ -482,13 +569,19 @@ impl SqliteConnectionStore {
             .execute(
                 r#"
                 INSERT INTO connection_status_history (
-                    connection_id, status_revision, state, reason, observed_at,
+                    connection_id, status_revision, observed_connection_revision,
+                    observed_credential_revision, observed_tls_revision,
+                    observed_discovery_revision, state, reason, observed_at,
                     latency_ms, catalog_age_secs, catalog_entry_count
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 "#,
                 params![
                     id.as_str(),
                     u64_to_i64(id, status_revision)?,
+                    u64_to_i64(id, current.revisions.connection)?,
+                    u64_to_i64(id, current.revisions.credential)?,
+                    u64_to_i64(id, current.revisions.tls)?,
+                    u64_to_i64(id, current.revisions.discovery)?,
                     state_as_str(update.state),
                     reason_as_str(update.reason),
                     observed_at,
@@ -498,6 +591,56 @@ impl SqliteConnectionStore {
                 ],
             )
             .map_err(|source| sqlite_error(&self.path, "status insert", source))?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO connection_current_status (
+                    connection_id, status_revision, observed_connection_revision,
+                    observed_credential_revision, observed_tls_revision,
+                    observed_discovery_revision, state, reason, observed_at,
+                    latency_ms, catalog_age_secs, catalog_entry_count
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                ON CONFLICT(connection_id) DO UPDATE SET
+                    status_revision = excluded.status_revision,
+                    observed_connection_revision = excluded.observed_connection_revision,
+                    observed_credential_revision = excluded.observed_credential_revision,
+                    observed_tls_revision = excluded.observed_tls_revision,
+                    observed_discovery_revision = excluded.observed_discovery_revision,
+                    state = excluded.state,
+                    reason = excluded.reason,
+                    observed_at = excluded.observed_at,
+                    latency_ms = excluded.latency_ms,
+                    catalog_age_secs = excluded.catalog_age_secs,
+                    catalog_entry_count = excluded.catalog_entry_count
+                "#,
+                params![
+                    id.as_str(),
+                    u64_to_i64(id, status_revision)?,
+                    u64_to_i64(id, current.revisions.connection)?,
+                    u64_to_i64(id, current.revisions.credential)?,
+                    u64_to_i64(id, current.revisions.tls)?,
+                    u64_to_i64(id, current.revisions.discovery)?,
+                    state_as_str(update.state),
+                    reason_as_str(update.reason),
+                    observed_at,
+                    latency_ms,
+                    catalog_age_secs,
+                    catalog_entry_count,
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.path, "current status upsert", source))?;
+        let current_status_count = count_rows(
+            &transaction,
+            &self.path,
+            "current connection statuses",
+            "SELECT COUNT(*) FROM connection_current_status",
+        )?;
+        let retained_history = MAX_STATUS_HISTORY_ROWS
+            .checked_sub(current_status_count)
+            .ok_or(ConnectionStoreError::LimitExceeded {
+                resource: "safe connection status rows",
+                maximum: MAX_STATUS_HISTORY_ROWS,
+            })?;
         transaction
             .execute(
                 "UPDATE connection_records SET status_revision = ?1 WHERE id = ?2",
@@ -515,7 +658,7 @@ impl SqliteConnectionStore {
                     LIMIT -1 OFFSET ?1
                 )
                 "#,
-                params![i64::try_from(MAX_STATUS_HISTORY_ROWS).unwrap_or(i64::MAX)],
+                params![i64::try_from(retained_history).unwrap_or(i64::MAX)],
             )
             .map_err(|source| sqlite_error(&self.path, "status history pruning", source))?;
         transaction
@@ -542,10 +685,8 @@ impl SqliteConnectionStore {
                 r#"
                 SELECT state, reason, observed_at, latency_ms, catalog_age_secs,
                        catalog_entry_count
-                FROM connection_status_history
+                FROM connection_current_status
                 WHERE connection_id = ?1
-                ORDER BY status_revision DESC
-                LIMIT 1
                 "#,
                 params![id.as_str()],
                 raw_status_from_row,
@@ -617,41 +758,34 @@ impl ConnectionStore for SqliteConnectionStore {
     }
 
     fn list(&self) -> Result<Vec<StoredConnection>, ConnectionStoreError> {
-        let connection = self.connection_guard();
-        let mut statement = connection
-            .prepare(
-                r#"
-                SELECT id, schema_version, source, spec_json, connection_revision,
-                       credential_revision, tls_revision, discovery_revision,
-                       status_revision, created_at, updated_at
-                FROM connection_records
-                ORDER BY id ASC
-                "#,
-            )
-            .map_err(|source| sqlite_error(&self.path, "list prepare", source))?;
-        let rows = statement
-            .query_map([], RawStoredConnection::from_row)
-            .map_err(|source| sqlite_error(&self.path, "list query", source))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| sqlite_error(&self.path, "list read", source))?;
-        let records = rows
-            .into_iter()
-            .map(|raw| raw.into_stored())
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut connection = self.connection_guard();
+        let transaction = connection
+            .transaction()
+            .map_err(|source| sqlite_error(&self.path, "list transaction", source))?;
+        let records = load_all_records(&transaction, &self.path)?;
         for record in &records {
-            validate_record_bindings(&connection, &self.path, record)?;
+            validate_record_bindings(&transaction, &self.path, record)?;
         }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, "list commit", source))?;
         Ok(records)
     }
 
     fn get(&self, id: &ConnectionId) -> Result<Option<StoredConnection>, ConnectionStoreError> {
-        let connection = self.connection_guard();
-        let record = load_raw_by_id(&connection, &self.path, id)?
+        let mut connection = self.connection_guard();
+        let transaction = connection
+            .transaction()
+            .map_err(|source| sqlite_error(&self.path, "get transaction", source))?;
+        let record = load_raw_by_id(&transaction, &self.path, id)?
             .map(RawStoredConnection::into_stored)
             .transpose()?;
         if let Some(record) = record.as_ref() {
-            validate_record_bindings(&connection, &self.path, record)?;
+            validate_record_bindings(&transaction, &self.path, record)?;
         }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, "get commit", source))?;
         Ok(record)
     }
 
@@ -780,6 +914,14 @@ impl ConnectionStore for SqliteConnectionStore {
                 ],
             )
             .map_err(|source| sqlite_error(&self.path, "replace update", source))?;
+        transaction
+            .execute(
+                "DELETE FROM connection_current_status WHERE connection_id = ?1",
+                params![id.as_str()],
+            )
+            .map_err(|source| {
+                sqlite_error(&self.path, "stale current status invalidation", source)
+            })?;
         replace_bindings(&transaction, &self.path, id, &candidate, &revisions, &now)?;
         transaction
             .commit()
@@ -888,6 +1030,7 @@ fn run_migrations(
             )
             .map_err(|source| sqlite_error(path, "migration record", source))?;
     }
+    validate_schema(&transaction, path)?;
     transaction
         .commit()
         .map_err(|source| sqlite_error(path, "migration commit", source))
@@ -898,7 +1041,8 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
         "SELECT id, schema_version, source, spec_json, connection_revision, credential_revision, tls_revision, discovery_revision, status_revision, created_at, updated_at FROM connection_records LIMIT 0",
         "SELECT connection_id, purpose, secret_id, binding_version, updated_at FROM connection_credential_bindings LIMIT 0",
         "SELECT connection_id, consumer_kind, consumer_id, created_at FROM connection_dependencies LIMIT 0",
-        "SELECT sequence, connection_id, status_revision, state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count FROM connection_status_history LIMIT 0",
+        "SELECT connection_id, status_revision, observed_connection_revision, observed_credential_revision, observed_tls_revision, observed_discovery_revision, state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count FROM connection_current_status LIMIT 0",
+        "SELECT sequence, connection_id, status_revision, observed_connection_revision, observed_credential_revision, observed_tls_revision, observed_discovery_revision, state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count FROM connection_status_history LIMIT 0",
     ] {
         connection
             .prepare(query)
@@ -913,6 +1057,232 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
             id: "<schema>".to_owned(),
             reason: "foreign-key validation failed",
         });
+    }
+    Ok(())
+}
+
+fn validate_persisted_state(
+    connection: &mut Connection,
+    path: &Path,
+    maximum_connections: usize,
+) -> Result<(), ConnectionStoreError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| sqlite_error(path, "startup validation transaction", source))?;
+    let connection_count = count_rows(
+        &transaction,
+        path,
+        "managed connections",
+        "SELECT COUNT(*) FROM connection_records",
+    )?;
+    if connection_count > maximum_connections {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "managed connections",
+            maximum: maximum_connections,
+        });
+    }
+    let binding_count = count_rows(
+        &transaction,
+        path,
+        "connection credential bindings",
+        "SELECT COUNT(*) FROM connection_credential_bindings",
+    )?;
+    if binding_count > MAX_CREDENTIALS {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection credential bindings",
+            maximum: MAX_CREDENTIALS,
+        });
+    }
+    let dependency_count = count_rows(
+        &transaction,
+        path,
+        "connection dependencies",
+        "SELECT COUNT(*) FROM connection_dependencies",
+    )?;
+    if dependency_count > MAX_CONNECTION_DEPENDENCIES {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection dependencies",
+            maximum: MAX_CONNECTION_DEPENDENCIES,
+        });
+    }
+    let current_status_count = count_rows(
+        &transaction,
+        path,
+        "current connection statuses",
+        "SELECT COUNT(*) FROM connection_current_status",
+    )?;
+    let history_count = count_rows(
+        &transaction,
+        path,
+        "connection status history",
+        "SELECT COUNT(*) FROM connection_status_history",
+    )?;
+    if current_status_count
+        .checked_add(history_count)
+        .is_none_or(|count| count > MAX_STATUS_HISTORY_ROWS)
+    {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "safe connection status rows",
+            maximum: MAX_STATUS_HISTORY_ROWS,
+        });
+    }
+
+    ensure_no_invalid_rows(
+        &transaction,
+        path,
+        "current status integrity",
+        r#"
+        SELECT COUNT(*)
+        FROM connection_current_status AS status
+        JOIN connection_records AS record ON record.id = status.connection_id
+        WHERE status.status_revision != record.status_revision
+           OR status.observed_connection_revision != record.connection_revision
+           OR status.observed_credential_revision != record.credential_revision
+           OR status.observed_tls_revision != record.tls_revision
+           OR status.observed_discovery_revision != record.discovery_revision
+           OR status.catalog_entry_count < 0
+           OR status.catalog_entry_count > 4096
+        "#,
+        "current connection status is stale or invalid",
+    )?;
+    ensure_no_invalid_rows(
+        &transaction,
+        path,
+        "status history integrity",
+        r#"
+        SELECT COUNT(*)
+        FROM connection_status_history AS status
+        JOIN connection_records AS record ON record.id = status.connection_id
+        WHERE status.status_revision > record.status_revision
+           OR status.observed_connection_revision > record.connection_revision
+           OR status.observed_credential_revision > record.credential_revision
+           OR status.observed_tls_revision > record.tls_revision
+           OR status.observed_discovery_revision > record.discovery_revision
+           OR status.catalog_entry_count < 0
+           OR status.catalog_entry_count > 4096
+        "#,
+        "connection status history contains an impossible revision or count",
+    )?;
+
+    let records = load_all_records(&transaction, path)?;
+    for record in &records {
+        validate_record_bindings(&transaction, path, record)?;
+    }
+    validate_safe_status_rows(
+        &transaction,
+        path,
+        "connection_current_status",
+        "current status startup validation",
+    )?;
+    validate_safe_status_rows(
+        &transaction,
+        path,
+        "connection_status_history",
+        "status history startup validation",
+    )?;
+    transaction
+        .commit()
+        .map_err(|source| sqlite_error(path, "startup validation commit", source))
+}
+
+fn load_all_records(
+    connection: &Connection,
+    path: &Path,
+) -> Result<Vec<StoredConnection>, ConnectionStoreError> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT id, schema_version, source, spec_json, connection_revision,
+                   credential_revision, tls_revision, discovery_revision,
+                   status_revision, created_at, updated_at
+            FROM connection_records
+            ORDER BY id ASC
+            "#,
+        )
+        .map_err(|source| sqlite_error(path, "list prepare", source))?;
+    let rows = statement
+        .query_map([], RawStoredConnection::from_row)
+        .map_err(|source| sqlite_error(path, "list query", source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error(path, "list read", source))?;
+    rows.into_iter()
+        .map(RawStoredConnection::into_stored)
+        .collect()
+}
+
+fn count_rows(
+    connection: &Connection,
+    path: &Path,
+    resource: &'static str,
+    query: &'static str,
+) -> Result<usize, ConnectionStoreError> {
+    let count: i64 = connection
+        .query_row(query, [], |row| row.get(0))
+        .map_err(|source| sqlite_error(path, "persisted bound validation", source))?;
+    usize::try_from(count).map_err(|_| ConnectionStoreError::CorruptRecord {
+        id: format!("<{resource}>"),
+        reason: "negative or oversized persisted row count",
+    })
+}
+
+fn ensure_no_invalid_rows(
+    connection: &Connection,
+    path: &Path,
+    operation: &'static str,
+    query: &'static str,
+    reason: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    let count: i64 = connection
+        .query_row(query, [], |row| row.get(0))
+        .map_err(|source| sqlite_error(path, operation, source))?;
+    if count == 0 {
+        Ok(())
+    } else {
+        Err(ConnectionStoreError::CorruptRecord {
+            id: "<status>".to_owned(),
+            reason,
+        })
+    }
+}
+
+fn validate_safe_status_rows(
+    connection: &Connection,
+    path: &Path,
+    table: &'static str,
+    operation: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    let query = format!(
+        "SELECT connection_id, state, reason, observed_at, latency_ms, \
+         catalog_age_secs, catalog_entry_count FROM {table}"
+    );
+    let mut statement = connection
+        .prepare(&query)
+        .map_err(|source| sqlite_error(path, operation, source))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                RawStatus {
+                    state: row.get(1)?,
+                    reason: row.get(2)?,
+                    observed_at: row.get(3)?,
+                    latency_ms: row.get(4)?,
+                    catalog_age_secs: row.get(5)?,
+                    catalog_entry_count: row.get(6)?,
+                },
+            ))
+        })
+        .map_err(|source| sqlite_error(path, operation, source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error(path, operation, source))?;
+    for (raw_id, status) in rows {
+        let id = ConnectionId::parse(raw_id.clone()).map_err(|_| {
+            ConnectionStoreError::CorruptRecord {
+                id: raw_id,
+                reason: "status row has an invalid connection ID",
+            }
+        })?;
+        status.into_safe_status(&id)?;
     }
     Ok(())
 }
@@ -992,6 +1362,12 @@ impl RawStoredConnection {
             return Err(ConnectionStoreError::CorruptRecord {
                 id: id.to_string(),
                 reason: "managed store row has a non-managed source",
+            });
+        }
+        if self.spec_json.len() > MAX_MANAGED_SPEC_BYTES {
+            return Err(ConnectionStoreError::CorruptRecord {
+                id: id.to_string(),
+                reason: "connection document exceeds the managed specification limit",
             });
         }
         let write: ConnectionWrite = serde_json::from_str(&self.spec_json).map_err(|_| {
@@ -1384,23 +1760,6 @@ fn ensure_etag(
     }
 }
 
-fn load_status_revision(
-    transaction: &Transaction<'_>,
-    path: &Path,
-    id: &ConnectionId,
-) -> Result<u64, ConnectionStoreError> {
-    let revision = transaction
-        .query_row(
-            "SELECT status_revision FROM connection_records WHERE id = ?1",
-            params![id.as_str()],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(|source| sqlite_error(path, "status revision query", source))?
-        .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?;
-    revision_from_i64(id, revision, true)
-}
-
 fn validate_dependency_id(value: &str) -> Result<(), ConnectionStoreError> {
     if value.is_empty() || value.len() > MAX_DEPENDENCY_FIELD_BYTES || value.contains('\0') {
         Err(ConnectionStoreError::Validation {
@@ -1647,6 +2006,49 @@ mod tests {
     }
 
     #[test]
+    fn final_schema_validation_rolls_back_migration_from_damaged_applied_prefix() {
+        let mut connection = Connection::open_in_memory().expect("memory database should open");
+        connection
+            .execute_batch(CREATE_MIGRATIONS_TABLE_SQL)
+            .expect("migration table should create");
+        connection
+            .execute_batch("CREATE TABLE connection_records (id TEXT PRIMARY KEY);")
+            .expect("damaged applied schema should create");
+        connection
+            .execute(
+                "INSERT INTO connection_schema_migrations (version, applied_at) VALUES (1, ?1)",
+                params![utc_timestamp().expect("timestamp should format")],
+            )
+            .expect("applied marker should insert");
+
+        assert!(run_migrations(&mut connection, Path::new(":memory:"), MIGRATIONS).is_err());
+        let version_two_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM connection_schema_migrations WHERE version = 2",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration marker query should work");
+        let status_table_count: i64 = connection
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN ('connection_current_status', 'connection_status_history')
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema catalog query should work");
+        assert_eq!(version_two_count, 0);
+        assert_eq!(
+            status_table_count, 0,
+            "schema validation failure must roll back migration DDL"
+        );
+    }
+
+    #[test]
     fn non_contiguous_migration_history_fails_closed() {
         let mut connection = Connection::open_in_memory().expect("memory database should open");
         connection
@@ -1793,8 +2195,82 @@ mod tests {
     }
 
     #[test]
+    fn dependencies_are_transactionally_bounded_and_idempotent() {
+        let (_directory, path, store) = temporary_store("dependency-limit");
+        let created = store.create(candidate()).expect("create should succeed");
+        {
+            let mut connection = store.connection_guard();
+            let transaction = connection
+                .transaction()
+                .expect("seed transaction should begin");
+            for index in 0..MAX_CONNECTION_DEPENDENCIES {
+                transaction
+                    .execute(
+                        r#"
+                        INSERT INTO connection_dependencies (
+                            connection_id, consumer_kind, consumer_id, created_at
+                        ) VALUES (?1, 'manual_tool', ?2, ?3)
+                        "#,
+                        params![
+                            created.id.as_str(),
+                            format!("consumer-{index}"),
+                            utc_timestamp().expect("timestamp should format")
+                        ],
+                    )
+                    .expect("bounded dependency should insert");
+            }
+            transaction
+                .commit()
+                .expect("seed transaction should commit");
+        }
+
+        store
+            .add_dependency(
+                &created.id,
+                ConnectionDependencyKind::ManualTool,
+                "consumer-0",
+            )
+            .expect("existing dependency should remain an idempotent success");
+        assert!(matches!(
+            store.add_dependency(
+                &created.id,
+                ConnectionDependencyKind::ManualTool,
+                "one-too-many"
+            ),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection dependencies",
+                maximum: MAX_CONNECTION_DEPENDENCIES,
+            })
+        ));
+        {
+            let connection = store.connection_guard();
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_dependencies (
+                        connection_id, consumer_kind, consumer_id, created_at
+                    ) VALUES (?1, 'manual_tool', 'one-too-many', ?2)
+                    "#,
+                    params![
+                        created.id.as_str(),
+                        utc_timestamp().expect("timestamp should format")
+                    ],
+                )
+                .expect("direct corruption should bypass the application bound");
+        }
+        drop(store);
+        assert!(matches!(
+            SqliteConnectionStore::open(path),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection dependencies",
+                maximum: MAX_CONNECTION_DEPENDENCIES,
+            })
+        ));
+    }
+
+    #[test]
     fn credential_binding_rows_are_hard_bounded() {
-        let (_directory, _path, store) = temporary_store("binding-limit");
+        let (_directory, path, store) = temporary_store("binding-limit");
         let created = store.create(candidate()).expect("create should succeed");
         {
             let mut connection = store.connection_guard();
@@ -1831,6 +2307,75 @@ mod tests {
             })
         ));
         assert_eq!(store.count().expect("count should work"), 1);
+
+        {
+            let connection = store.connection_guard();
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_credential_bindings (
+                        connection_id, purpose, secret_id, binding_version, updated_at
+                    ) VALUES (?1, 'one-too-many', 'one-too-many', 1, ?2)
+                    "#,
+                    params![
+                        created.id.as_str(),
+                        utc_timestamp().expect("timestamp should format")
+                    ],
+                )
+                .expect("direct corruption should bypass the application bound");
+        }
+        drop(store);
+        assert!(matches!(
+            SqliteConnectionStore::open(path),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection credential bindings",
+                maximum: MAX_CREDENTIALS,
+            })
+        ));
+    }
+
+    #[test]
+    fn status_observations_are_bound_to_the_tested_config_revision() {
+        let (_directory, _path, store) = temporary_store("status-etag");
+        let created = store.create(candidate()).expect("create should succeed");
+        let stale_etag = created.etag();
+        let healthy = ConnectionStatusUpdate {
+            state: ConnectionOperationalState::Healthy,
+            reason: ConnectionStatusReason::TestSucceeded,
+            latency_ms: Some(5),
+            catalog_age_secs: None,
+            catalog_entry_count: None,
+        };
+        store
+            .append_status(&created.id, &stale_etag, healthy.clone())
+            .expect("initial observation should append");
+
+        let mut replacement = created.write.clone();
+        replacement.display_name = "Billing API v2".to_owned();
+        let replaced = store
+            .replace(&created.id, &stale_etag, replacement)
+            .expect("replacement should succeed");
+        assert!(
+            store
+                .latest_status(&created.id)
+                .expect("latest status query should succeed")
+                .is_none(),
+            "reconfiguration must invalidate the prior current observation"
+        );
+        assert!(matches!(
+            store.append_status(&created.id, &stale_etag, healthy.clone()),
+            Err(ConnectionStoreError::Conflict { .. })
+        ));
+        assert!(
+            store
+                .latest_status(&created.id)
+                .expect("latest status query should succeed")
+                .is_none(),
+            "a late stale test must not mark the replacement healthy"
+        );
+        store
+            .append_status(&created.id, &replaced.etag(), healthy)
+            .expect("observation for the replacement should append");
     }
 
     #[test]
@@ -1845,7 +2390,7 @@ mod tests {
             catalog_entry_count: Some(3),
         };
         let status = store
-            .append_status(&created.id, update)
+            .append_status(&created.id, &created.etag(), update)
             .expect("status should append");
         assert_eq!(status.latency_ms, Some(12));
         let loaded = store
@@ -1870,8 +2415,12 @@ mod tests {
                     .execute(
                         r#"
                         INSERT INTO connection_status_history (
-                            connection_id, status_revision, state, reason, observed_at
-                        ) VALUES (?1, ?2, 'degraded', 'request_failed', ?3)
+                            connection_id, status_revision, observed_connection_revision,
+                            observed_credential_revision, observed_tls_revision,
+                            observed_discovery_revision, state, reason, observed_at
+                        ) VALUES (
+                            ?1, ?2, 1, 1, 0, 1, 'degraded', 'request_failed', ?3
+                        )
                         "#,
                         params![
                             created.id.as_str(),
@@ -1899,6 +2448,7 @@ mod tests {
         store
             .append_status(
                 &created.id,
+                &created.etag(),
                 ConnectionStatusUpdate {
                     state: ConnectionOperationalState::Healthy,
                     reason: ConnectionStatusReason::TestSucceeded,
@@ -1910,7 +2460,7 @@ mod tests {
             .expect("bounded append should succeed");
 
         let connection = Connection::open(path).expect("database should open");
-        let row_count: i64 = connection
+        let history_count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM connection_status_history",
                 [],
@@ -1918,8 +2468,321 @@ mod tests {
             )
             .expect("status count should query");
         assert_eq!(
-            row_count,
-            i64::try_from(MAX_STATUS_HISTORY_ROWS).expect("history limit should fit SQLite")
+            history_count,
+            i64::try_from(MAX_STATUS_HISTORY_ROWS - 1).expect("history limit should fit SQLite")
+        );
+        let current_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM connection_current_status",
+                [],
+                |row| row.get(0),
+            )
+            .expect("current status count should query");
+        assert_eq!(current_count, 1);
+    }
+
+    #[test]
+    fn global_history_pruning_preserves_every_connections_current_status() {
+        let (_directory, _path, store) = temporary_store("status-fairness");
+        let quiet = store
+            .create(candidate())
+            .expect("quiet connection should create");
+        let mut noisy_candidate = candidate();
+        noisy_candidate.display_name = "Noisy API".to_owned();
+        let noisy = store
+            .create(noisy_candidate)
+            .expect("noisy connection should create");
+        let quiet_status = ConnectionStatusUpdate {
+            state: ConnectionOperationalState::Healthy,
+            reason: ConnectionStatusReason::TestSucceeded,
+            latency_ms: Some(3),
+            catalog_age_secs: None,
+            catalog_entry_count: None,
+        };
+        store
+            .append_status(&quiet.id, &quiet.etag(), quiet_status)
+            .expect("quiet status should append");
+        store
+            .append_status(
+                &noisy.id,
+                &noisy.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Degraded,
+                    reason: ConnectionStatusReason::RequestFailed,
+                    latency_ms: None,
+                    catalog_age_secs: None,
+                    catalog_entry_count: None,
+                },
+            )
+            .expect("initial noisy status should append");
+
+        {
+            let mut connection = store.connection_guard();
+            let transaction = connection
+                .transaction()
+                .expect("history seed transaction should begin");
+            for revision in
+                2..=u64::try_from(MAX_STATUS_HISTORY_ROWS).expect("history limit should fit u64")
+            {
+                transaction
+                    .execute(
+                        r#"
+                        INSERT INTO connection_status_history (
+                            connection_id, status_revision, observed_connection_revision,
+                            observed_credential_revision, observed_tls_revision,
+                            observed_discovery_revision, state, reason, observed_at
+                        ) VALUES (
+                            ?1, ?2, 1, 1, 0, 1, 'degraded', 'request_failed', ?3
+                        )
+                        "#,
+                        params![
+                            noisy.id.as_str(),
+                            u64_to_i64(&noisy.id, revision)
+                                .expect("test revision should fit SQLite"),
+                            utc_timestamp().expect("timestamp should format")
+                        ],
+                    )
+                    .expect("noisy history row should insert");
+            }
+            let seeded_revision =
+                i64::try_from(MAX_STATUS_HISTORY_ROWS).expect("history limit should fit SQLite");
+            transaction
+                .execute(
+                    "UPDATE connection_records SET status_revision = ?1 WHERE id = ?2",
+                    params![seeded_revision, noisy.id.as_str()],
+                )
+                .expect("noisy record revision should update");
+            transaction
+                .execute(
+                    r#"
+                    UPDATE connection_current_status
+                    SET status_revision = ?1
+                    WHERE connection_id = ?2
+                    "#,
+                    params![seeded_revision, noisy.id.as_str()],
+                )
+                .expect("noisy current revision should update");
+            transaction
+                .commit()
+                .expect("history seed transaction should commit");
+        }
+        store
+            .append_status(
+                &noisy.id,
+                &noisy.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::TestSucceeded,
+                    latency_ms: Some(4),
+                    catalog_age_secs: None,
+                    catalog_entry_count: None,
+                },
+            )
+            .expect("bounded noisy append should succeed");
+
+        let quiet_latest = store
+            .latest_status(&quiet.id)
+            .expect("quiet latest query should succeed")
+            .expect("quiet current status must be retained");
+        assert_eq!(quiet_latest.state, ConnectionOperationalState::Healthy);
+        let connection = store.connection_guard();
+        let total_status_rows: i64 = connection
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM connection_current_status)
+                    + (SELECT COUNT(*) FROM connection_status_history)
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .expect("total status rows should query");
+        assert_eq!(
+            total_status_rows,
+            i64::try_from(MAX_STATUS_HISTORY_ROWS).expect("status limit should fit SQLite")
+        );
+    }
+
+    #[test]
+    fn persisted_status_row_bound_is_enforced_on_restart() {
+        let (_directory, path, store) = temporary_store("status-restart-limit");
+        let created = store.create(candidate()).expect("create should succeed");
+        store
+            .append_status(
+                &created.id,
+                &created.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::TestSucceeded,
+                    latency_ms: None,
+                    catalog_age_secs: None,
+                    catalog_entry_count: None,
+                },
+            )
+            .expect("initial status should append");
+        {
+            let mut connection = store.connection_guard();
+            let transaction = connection
+                .transaction()
+                .expect("status corruption transaction should begin");
+            for revision in
+                2..=u64::try_from(MAX_STATUS_HISTORY_ROWS).expect("status limit should fit u64")
+            {
+                transaction
+                    .execute(
+                        r#"
+                        INSERT INTO connection_status_history (
+                            connection_id, status_revision, observed_connection_revision,
+                            observed_credential_revision, observed_tls_revision,
+                            observed_discovery_revision, state, reason, observed_at
+                        ) VALUES (
+                            ?1, ?2, 1, 1, 0, 1, 'healthy', 'test_succeeded', ?3
+                        )
+                        "#,
+                        params![
+                            created.id.as_str(),
+                            u64_to_i64(&created.id, revision)
+                                .expect("test revision should fit SQLite"),
+                            utc_timestamp().expect("timestamp should format")
+                        ],
+                    )
+                    .expect("over-limit status row should insert");
+            }
+            let latest_revision =
+                i64::try_from(MAX_STATUS_HISTORY_ROWS).expect("status limit should fit SQLite");
+            transaction
+                .execute(
+                    "UPDATE connection_records SET status_revision = ?1 WHERE id = ?2",
+                    params![latest_revision, created.id.as_str()],
+                )
+                .expect("record status revision should update");
+            transaction
+                .execute(
+                    "UPDATE connection_current_status SET status_revision = ?1 WHERE connection_id = ?2",
+                    params![latest_revision, created.id.as_str()],
+                )
+                .expect("current status revision should update");
+            transaction
+                .commit()
+                .expect("status corruption transaction should commit");
+        }
+        drop(store);
+
+        assert!(matches!(
+            SqliteConnectionStore::open(path),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "safe connection status rows",
+                maximum: MAX_STATUS_HISTORY_ROWS,
+            })
+        ));
+    }
+
+    #[test]
+    fn persisted_catalog_count_bound_is_enforced_on_restart() {
+        let (_directory, path, store) = temporary_store("catalog-restart-limit");
+        let created = store.create(candidate()).expect("create should succeed");
+        store
+            .append_status(
+                &created.id,
+                &created.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::TestSucceeded,
+                    latency_ms: None,
+                    catalog_age_secs: None,
+                    catalog_entry_count: Some(1),
+                },
+            )
+            .expect("initial status should append");
+        drop(store);
+
+        let connection = Connection::open(&path).expect("database should open");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("test corruption pragma should enable");
+        connection
+            .execute(
+                "UPDATE connection_current_status SET catalog_entry_count = ?1 WHERE connection_id = ?2",
+                params![
+                    i64::try_from(MAX_CATALOG_ENTRIES + 1)
+                        .expect("catalog test count should fit SQLite"),
+                    created.id.as_str()
+                ],
+            )
+            .expect("invalid catalog count should be written for the corruption test");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .expect("test corruption pragma should disable");
+        drop(connection);
+
+        assert!(matches!(
+            SqliteConnectionStore::open(path),
+            Err(ConnectionStoreError::CorruptRecord {
+                reason: "current connection status is stale or invalid",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn configured_managed_connection_bound_is_enforced_on_restart() {
+        let (_directory, path, store) = temporary_store("record-restart-limit");
+        store
+            .create(candidate())
+            .expect("first record should create");
+        let mut second = candidate();
+        second.display_name = "Second API".to_owned();
+        store.create(second).expect("second record should create");
+        drop(store);
+
+        assert!(matches!(
+            SqliteConnectionStore::open_with_maximum(path, 1),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "managed connections",
+                maximum: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn record_and_bindings_are_read_from_one_wal_snapshot() {
+        let (_directory, path, first_store) = temporary_store("read-snapshot");
+        let created = first_store
+            .create(candidate())
+            .expect("connection should create");
+        let second_store =
+            SqliteConnectionStore::open(&path).expect("second store handle should open");
+
+        let mut first_connection = first_store.connection_guard();
+        let read_transaction = first_connection
+            .transaction()
+            .expect("deferred read transaction should begin");
+        let old_record = load_raw_by_id(&read_transaction, &path, &created.id)
+            .expect("old record should load")
+            .expect("old record should exist")
+            .into_stored()
+            .expect("old record should validate");
+
+        let mut replacement = created.write.clone();
+        replacement.authentication = ConnectionAuthentication::StaticBearer {
+            secret_id: Some("billing-token-v2".to_owned()),
+        };
+        let replaced = second_store
+            .replace(&created.id, &created.etag(), replacement)
+            .expect("concurrent replacement should commit in WAL mode");
+        validate_record_bindings(&read_transaction, &path, &old_record)
+            .expect("binding validation must use the original read snapshot");
+        read_transaction
+            .commit()
+            .expect("read transaction should commit");
+        drop(first_connection);
+
+        assert_eq!(
+            first_store
+                .get(&created.id)
+                .expect("subsequent get should succeed")
+                .expect("record should remain"),
+            replaced
         );
     }
 
@@ -1955,9 +2818,8 @@ mod tests {
             .expect("test corruption should write");
         drop(connection);
 
-        let reopened = SqliteConnectionStore::open(&path).expect("schema remains valid");
         assert!(matches!(
-            reopened.get(&created.id),
+            SqliteConnectionStore::open(&path),
             Err(ConnectionStoreError::CorruptRecord { .. })
         ));
         assert!(fs::metadata(path).is_ok());
@@ -1965,7 +2827,7 @@ mod tests {
 
     #[test]
     fn mismatched_persisted_binding_fails_closed() {
-        let (_directory, _path, store) = temporary_store("corrupt-binding");
+        let (_directory, path, store) = temporary_store("corrupt-binding");
         let created = store.create(candidate()).expect("create should succeed");
         {
             let connection = store.connection_guard();
@@ -1981,8 +2843,9 @@ mod tests {
                 .expect("test corruption should write");
         }
 
+        drop(store);
         assert!(matches!(
-            store.get(&created.id),
+            SqliteConnectionStore::open(path),
             Err(ConnectionStoreError::CorruptRecord {
                 reason: "credential binding rows do not match the stored connection document",
                 ..
