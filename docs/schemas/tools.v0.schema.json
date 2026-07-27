@@ -86,7 +86,7 @@
               "$ref": "#/$defs/stable_connection_id"
             },
             "mapping": {
-              "$ref": "#/$defs/upstream_mapping"
+              "$ref": "#/$defs/typed_http_mapping"
             }
           }
         },
@@ -227,6 +227,23 @@
           "$ref": "#/$defs/body_mapping"
         }
       }
+    },
+    "typed_http_mapping": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/upstream_mapping"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path_template": {
+              "type": "string",
+              "pattern": "^/(?!/)[^?#\\\\]*$",
+              "description": "Origin-relative path template. Semantic validation additionally rejects dot segments and encoded separators."
+            }
+          }
+        }
+      ]
     },
     "query_param_mapping": {
       "type": "object",

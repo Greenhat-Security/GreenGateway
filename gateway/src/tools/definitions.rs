@@ -991,6 +991,15 @@ fn typed_tool_metadata_problems(index: usize, definition: &ToolDefinition) -> Ve
                 mapping,
             } => {
                 validate_connection_id("target.connection_id", connection_id, &mut problems);
+                if let Err(error) = crate::connections::model::normalize_origin_relative_path(
+                    "target.mapping.path_template",
+                    &mapping.path_template,
+                ) {
+                    problems.push(format!(
+                        "tools[{index}].target.mapping.path_template {}",
+                        error.message
+                    ));
+                }
                 if mapping != &definition.upstream {
                     problems.push(format!(
                         "tools[{index}].target.mapping must equal the legacy upstream mapping during migration"
@@ -2374,6 +2383,41 @@ mod tests {
         assert!(error
             .to_string()
             .contains("target.mapping must equal the legacy upstream mapping"));
+    }
+
+    #[test]
+    fn typed_http_target_rejects_authority_and_path_confusion_without_tightening_legacy() {
+        for path_template in [
+            "//attacker.example.test/resource",
+            "/v1\\admin",
+            "/v1/../admin",
+            "/v1/%2e%2e/admin",
+            "/v1/%2fadmin",
+        ] {
+            let mut typed = echo_tool("echo", "POST", path_template);
+            typed["target"] = json!({
+                "type": "http",
+                "connection_id": "billing-api",
+                "mapping": typed["upstream"].clone()
+            });
+            let error = ToolRegistry::from_json_value(json!({
+                "schema_version": "0.1.0",
+                "tools": [typed]
+            }))
+            .expect_err("typed unsafe mapping must fail");
+            let message = error.to_string();
+            assert!(
+                message.contains("target.mapping.path_template")
+                    || message.contains("tools file schema validation failed"),
+                "unexpected error for {path_template}: {error}"
+            );
+
+            ToolRegistry::from_json_value(json!({
+                "schema_version": "0.1.0",
+                "tools": [echo_tool("echo", "POST", path_template)]
+            }))
+            .expect("legacy-only mapping behavior must remain unchanged");
+        }
     }
 
     #[test]

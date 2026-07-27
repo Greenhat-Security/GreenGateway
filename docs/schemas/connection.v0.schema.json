@@ -50,6 +50,83 @@
       "$ref": "#/$defs/test_profile"
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "enabled": {
+            "const": true
+          }
+        },
+        "required": [
+          "enabled"
+        ]
+      },
+      "then": {
+        "properties": {
+          "authentication": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/authentication"
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "header_api_key"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "secret_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "static_bearer"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "secret_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "oauth2_client_credentials"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "client_secret_id"
+                  ]
+                }
+              }
+            ]
+          },
+          "tls": {
+            "dependentRequired": {
+              "client_certificate_id": [
+                "client_private_key_id"
+              ],
+              "client_private_key_id": [
+                "client_certificate_id"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "stable_id": {
       "type": "string",
@@ -103,8 +180,7 @@
           "additionalProperties": false,
           "required": [
             "type",
-            "header_name",
-            "secret_id"
+            "header_name"
           ],
           "properties": {
             "type": {
@@ -124,8 +200,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "type",
-            "secret_id"
+            "type"
           ],
           "properties": {
             "type": {
@@ -142,7 +217,6 @@
           "required": [
             "type",
             "client_id",
-            "client_secret_id",
             "token_url",
             "client_auth_method"
           ],
@@ -206,14 +280,6 @@
         "client_private_key_id": {
           "$ref": "#/$defs/stable_id"
         }
-      },
-      "dependentRequired": {
-        "client_certificate_id": [
-          "client_private_key_id"
-        ],
-        "client_private_key_id": [
-          "client_certificate_id"
-        ]
       }
     },
     "timeouts": {

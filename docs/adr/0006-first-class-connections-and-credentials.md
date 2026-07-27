@@ -184,6 +184,13 @@ TLS is separate so custom trust and mTLS can accompany any HTTP authentication
 mode. Client certificate and private-key IDs are configured together. No
 `skip_verify` option exists.
 
+Disabled drafts may omit an opaque HTTP secret binding or retain only one side
+of a pending mTLS identity selection. Every supplied field is still validated.
+Before `enabled` can become true, the selected authentication mode must have
+its required secret ID and a client certificate/private-key selection must be
+complete and resolvable. This conditional completeness is part of the v0.1
+write schema, not an API-specific exception.
+
 Header API-key names reject `Authorization`, `Cookie`, `Host`,
 `Content-Length`, proxy authentication, forwarding headers, hop-by-hop and
 connection-nominated headers, framing headers, the gateway request ID,
@@ -259,6 +266,10 @@ resolution, or network work. OAuth response/cache, test concurrency, provider
 reads, request/response bodies, status, metrics cardinality, and retained
 catalog generations receive separate lower bounds in the PR that implements
 them.
+
+Stored test profiles use exact uppercase `GET`, `HEAD`, or `OPTIONS` methods
+and 1–16 unique status codes from 100 through 599. Case and duplicates are
+rejected rather than silently normalized.
 
 ### Permissions and mutation authority
 

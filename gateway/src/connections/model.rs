@@ -141,15 +141,18 @@ pub enum ConnectionAuthentication {
     None,
     HeaderApiKey {
         header_name: String,
-        secret_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_id: Option<String>,
     },
     StaticBearer {
-        secret_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_id: Option<String>,
     },
     #[serde(rename = "oauth2_client_credentials")]
     OAuth2ClientCredentials {
         client_id: String,
-        client_secret_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_secret_id: Option<String>,
         token_url: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         scopes: Vec<String>,
@@ -289,8 +292,8 @@ impl ConnectionWrite {
             Err(error) => errors.push(error),
         }
 
-        validate_authentication(&mut self.authentication, &mut errors);
-        validate_tls(&self.tls, &mut errors);
+        validate_authentication(&mut self.authentication, self.enabled, &mut errors);
+        validate_tls(&self.tls, self.enabled, &mut errors);
         validate_timeouts(self.timeouts.as_ref(), &mut errors);
         validate_discovery(self.kind, self.discovery.as_mut(), &mut errors);
         validate_test_profile(self.test_profile.as_mut(), &mut errors);
@@ -319,6 +322,7 @@ pub fn is_valid_connection_id(value: &str) -> bool {
 
 fn validate_authentication(
     authentication: &mut ConnectionAuthentication,
+    enabled: bool,
     errors: &mut Vec<ConnectionValidationError>,
 ) {
     match authentication {
@@ -327,7 +331,12 @@ fn validate_authentication(
             header_name,
             secret_id,
         } => {
-            validate_secret_id("authentication.secret_id", secret_id, errors);
+            validate_optional_secret_id(
+                "authentication.secret_id",
+                secret_id.as_deref(),
+                enabled,
+                errors,
+            );
             if header_name.is_empty()
                 || header_name.len() > MAX_HEADER_NAME_BYTES
                 || HeaderName::from_str(header_name).is_err()
@@ -343,7 +352,12 @@ fn validate_authentication(
             }
         }
         ConnectionAuthentication::StaticBearer { secret_id } => {
-            validate_secret_id("authentication.secret_id", secret_id, errors);
+            validate_optional_secret_id(
+                "authentication.secret_id",
+                secret_id.as_deref(),
+                enabled,
+                errors,
+            );
         }
         ConnectionAuthentication::OAuth2ClientCredentials {
             client_id,
@@ -361,7 +375,12 @@ fn validate_authentication(
                 false,
                 errors,
             );
-            validate_secret_id("authentication.client_secret_id", client_secret_id, errors);
+            validate_optional_secret_id(
+                "authentication.client_secret_id",
+                client_secret_id.as_deref(),
+                enabled,
+                errors,
+            );
             match normalize_token_url(token_url) {
                 Ok(normalized) => *token_url = normalized,
                 Err(error) => errors.push(error),
@@ -415,8 +434,8 @@ fn validate_authentication(
     }
 }
 
-fn validate_tls(tls: &TlsProfile, errors: &mut Vec<ConnectionValidationError>) {
-    if tls.client_certificate_id.is_some() != tls.client_private_key_id.is_some() {
+fn validate_tls(tls: &TlsProfile, enabled: bool, errors: &mut Vec<ConnectionValidationError>) {
+    if enabled && tls.client_certificate_id.is_some() != tls.client_private_key_id.is_some() {
         errors.push(ConnectionValidationError::new(
             "tls",
             "incomplete_client_identity",
@@ -508,7 +527,6 @@ fn validate_test_profile(
     let Some(profile) = profile else {
         return;
     };
-    profile.method = profile.method.to_ascii_uppercase();
     if !matches!(profile.method.as_str(), "GET" | "HEAD" | "OPTIONS") {
         errors.push(ConnectionValidationError::new(
             "test_profile.method",
@@ -520,12 +538,18 @@ fn validate_test_profile(
         Ok(path) => profile.path = path,
         Err(error) => errors.push(error),
     }
+    let unique_statuses = profile
+        .expected_statuses
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
     if profile.expected_statuses.is_empty()
         || profile.expected_statuses.len() > MAX_EXPECTED_STATUSES
         || profile
             .expected_statuses
             .iter()
             .any(|status| !(100..=599).contains(status))
+        || unique_statuses.len() != profile.expected_statuses.len()
     {
         errors.push(ConnectionValidationError::new(
             "test_profile.expected_statuses",
@@ -533,8 +557,6 @@ fn validate_test_profile(
             format!("must contain 1-{MAX_EXPECTED_STATUSES} HTTP status codes between 100 and 599"),
         ));
     }
-    profile.expected_statuses.sort_unstable();
-    profile.expected_statuses.dedup();
 }
 
 fn normalize_base_url(value: &str) -> Result<String, ConnectionValidationError> {
@@ -616,7 +638,7 @@ fn raw_url_path(value: &str) -> Option<&str> {
     suffix.get(..path_end)
 }
 
-fn normalize_origin_relative_path(
+pub(crate) fn normalize_origin_relative_path(
     field: &'static str,
     value: &str,
 ) -> Result<String, ConnectionValidationError> {
@@ -698,6 +720,23 @@ fn validate_secret_id(
                 "must be an opaque URL-safe ID of 1-{MAX_SECRET_ID_BYTES} bytes and must not be an environment or file locator"
             ),
         ));
+    }
+}
+
+fn validate_optional_secret_id(
+    field: &'static str,
+    value: Option<&str>,
+    required: bool,
+    errors: &mut Vec<ConnectionValidationError>,
+) {
+    match value {
+        Some(value) => validate_secret_id(field, value, errors),
+        None if required => errors.push(ConnectionValidationError::new(
+            field,
+            "missing_binding",
+            "must be configured before the connection can be enabled",
+        )),
+        None => {}
     }
 }
 
@@ -796,6 +835,12 @@ mod tests {
     const CONNECTION_SCHEMA_JSON: &str =
         include_str!("../../../docs/schemas/connection.v0.schema.json");
 
+    fn connection_schema_validator() -> jsonschema::Validator {
+        let schema: Value =
+            serde_json::from_str(CONNECTION_SCHEMA_JSON).expect("schema should be valid JSON");
+        jsonschema::validator_for(&schema).expect("schema should compile")
+    }
+
     fn example() -> Value {
         json!({
             "display_name": "Billing API",
@@ -832,10 +877,7 @@ mod tests {
 
     #[test]
     fn issue_example_matches_schema_and_rust_model() {
-        let schema: Value =
-            serde_json::from_str(CONNECTION_SCHEMA_JSON).expect("schema should be valid JSON");
-        let validator = jsonschema::validator_for(&schema).expect("schema should compile");
-        validator
+        connection_schema_validator()
             .validate(&example())
             .expect("issue example should match published schema");
 
@@ -925,9 +967,10 @@ mod tests {
         let mut candidate: ConnectionWrite =
             serde_json::from_value(example()).expect("example should deserialize");
         candidate.authentication = ConnectionAuthentication::StaticBearer {
-            secret_id: "env://BILLING_TOKEN".to_owned(),
+            secret_id: Some("env://BILLING_TOKEN".to_owned()),
         };
         candidate.tls.client_private_key_id = None;
+        candidate.enabled = true;
 
         let errors = candidate.validated().expect_err("candidate must fail");
         assert!(errors.iter().any(|error| error.code == "invalid_secret_id"));
@@ -942,7 +985,7 @@ mod tests {
             serde_json::from_value(example()).expect("example should deserialize");
         candidate.authentication = ConnectionAuthentication::HeaderApiKey {
             header_name: "X-Forwarded-Credential".to_owned(),
-            secret_id: "billing-api-key".to_owned(),
+            secret_id: Some("billing-api-key".to_owned()),
         };
         let errors = candidate
             .validated()
@@ -971,5 +1014,66 @@ mod tests {
         assert!(ConnectionId::parse("legacy-default-http").is_ok());
         assert!(ConnectionId::parse("../secret").is_err());
         assert!(ConnectionId::parse("mcp/server").is_err());
+    }
+
+    #[test]
+    fn incomplete_bindings_are_allowed_only_while_disabled() {
+        let mut disabled: ConnectionWrite =
+            serde_json::from_value(example()).expect("example should deserialize");
+        disabled.authentication = ConnectionAuthentication::StaticBearer { secret_id: None };
+        disabled.tls.client_private_key_id = None;
+        disabled.enabled = false;
+        disabled
+            .clone()
+            .validated()
+            .expect("disabled draft may retain incomplete bindings");
+
+        disabled.enabled = true;
+        let errors = disabled
+            .validated()
+            .expect_err("enabled connection must have complete bindings");
+        assert!(errors.iter().any(|error| error.code == "missing_binding"));
+        assert!(errors
+            .iter()
+            .any(|error| error.code == "incomplete_client_identity"));
+
+        let mut disabled_json = example();
+        disabled_json["authentication"] = json!({
+            "type": "static_bearer"
+        });
+        disabled_json["tls"] = json!({
+            "client_certificate_id": "billing-client-cert"
+        });
+        disabled_json["enabled"] = json!(false);
+        let validator = connection_schema_validator();
+        validator
+            .validate(&disabled_json)
+            .expect("schema must allow incomplete disabled draft bindings");
+
+        disabled_json["enabled"] = json!(true);
+        assert!(
+            validator.validate(&disabled_json).is_err(),
+            "schema must reject incomplete enabled bindings"
+        );
+    }
+
+    #[test]
+    fn test_profile_case_and_duplicate_statuses_match_schema_rules() {
+        let mut candidate: ConnectionWrite =
+            serde_json::from_value(example()).expect("example should deserialize");
+        let profile = candidate
+            .test_profile
+            .as_mut()
+            .expect("example should include a test profile");
+        profile.method = "head".to_owned();
+        profile.expected_statuses = vec![200, 200];
+
+        let errors = candidate.validated().expect_err("profile must fail");
+        assert!(errors
+            .iter()
+            .any(|error| error.field == "test_profile.method"));
+        assert!(errors
+            .iter()
+            .any(|error| error.field == "test_profile.expected_statuses"));
     }
 }
