@@ -6,6 +6,10 @@
   "scripts": {
     "cf:dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "load:quick": "node scripts/run-load-suite.mjs --quick",
+    "load:soak": "node scripts/run-load-suite.mjs",
+    "load:resilience": "node scripts/run-resilience-load.mjs",
+    "load:resilience:quick": "node scripts/run-resilience-load.mjs --quick",
     "test": "vitest run cloudflare/src/config.test.ts",
     "typecheck": "tsc --noEmit"
   },

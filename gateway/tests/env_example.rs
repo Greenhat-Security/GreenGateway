@@ -85,6 +85,31 @@ fn configuration_doc_matches_gateway_env_reads() {
     );
 }
 
+#[test]
+fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
+    let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = gateway_root
+        .parent()
+        .expect("gateway crate should live directly under the repo root");
+
+    let mut expected = code_env_vars(&gateway_root.join("src"));
+    expected.remove("LISTEN_ADDR");
+    expected.remove("ADMIN_LISTEN_ADDR");
+    let forwarded = cloudflare_forwarded_env_vars(&repo_root.join("cloudflare/src/config.ts"));
+
+    let missing_from_cloudflare: Vec<_> = expected.difference(&forwarded).cloned().collect();
+    let unsupported_in_cloudflare: Vec<_> = forwarded.difference(&expected).cloned().collect();
+
+    assert!(
+        missing_from_cloudflare.is_empty() && unsupported_in_cloudflare.is_empty(),
+        "Cloudflare environment forwarding drift detected.\n\
+         Gateway variables missing from Cloudflare: {}\n\
+         Unsupported variables forwarded by Cloudflare: {}",
+        format_vars(&missing_from_cloudflare),
+        format_vars(&unsupported_in_cloudflare)
+    );
+}
+
 fn documented_env_vars(path: &Path) -> BTreeSet<String> {
     let contents = fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
@@ -119,6 +144,34 @@ fn configuration_doc_env_vars(path: &Path) -> BTreeSet<String> {
             let heading = line.strip_prefix("### ")?;
 
             is_env_key(heading).then(|| heading.to_owned())
+        })
+        .collect()
+}
+
+fn cloudflare_forwarded_env_vars(path: &Path) -> BTreeSet<String> {
+    let contents = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let start_marker = "export const GREEN_GATEWAY_ENV_KEYS = [";
+    let start = contents
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("{} is missing {start_marker}", path.display()))
+        + start_marker.len();
+    let remaining = &contents[start..];
+    let end = remaining.find("] as const;").unwrap_or_else(|| {
+        panic!(
+            "{} has an unterminated environment key list",
+            path.display()
+        )
+    });
+
+    remaining[..end]
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_suffix(',')
+                .and_then(|line| line.strip_prefix('"'))
+                .and_then(|line| line.strip_suffix('"'))
+                .map(str::to_owned)
         })
         .collect()
 }

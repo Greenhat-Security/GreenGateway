@@ -72,9 +72,19 @@
       "permission": "admin:traffic:write"
     },
     {
-      "methods": ["POST"],
+      "methods": ["GET", "POST"],
       "path_prefix": "/__dev-echo",
       "permission": "dev:proxy:echo"
+    },
+    {
+      "methods": ["GET", "POST"],
+      "path_prefix": "/__dev-load",
+      "permission": "dev:proxy:load"
+    },
+    {
+      "methods": ["GET", "POST"],
+      "path_prefix": "/__dev-stream",
+      "permission": "dev:proxy:stream"
     },
     {
       "methods": ["POST"],

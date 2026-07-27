@@ -21,7 +21,7 @@ Wrangler uses `wrangler.jsonc` as the deployment source of truth. It defines:
 - Container image: `./Dockerfile`.
 - Preview URLs enabled for PR/version previews.
 
-The Worker sends every request to a singleton GreenGateway container on port `8080`. GreenGateway's `LISTEN_ADDR` is forced to `0.0.0.0:8080` so the Cloudflare container supervisor can reach it.
+The Worker sends every request to a singleton GreenGateway container on port `8080`. GreenGateway's `LISTEN_ADDR` is forced to `0.0.0.0:8080` so the Cloudflare container supervisor can reach it. Container supervision pings `/livez`; application traffic should use `/readyz` when deciding whether required upstream capacity is available.
 
 ## Runtime Configuration
 
@@ -35,12 +35,14 @@ The default deploy is intentionally conservative:
 - `EGRESS_DENY_PRIVATE_IPS=true`
 - `UPSTREAM_URL=` left blank
 
-Set `UPSTREAM_URL` during deploy, or later in the Cloudflare dashboard, when you want GreenGateway to proxy to an origin API. After the first deploy, set `GATEWAY_PUBLIC_URL` to the deployed Worker URL if you use MCP OAuth protected-resource metadata.
+Set `UPSTREAM_URL` or `UPSTREAM_ROUTES` during deploy, or later in the Cloudflare dashboard, when you want GreenGateway to proxy to origin APIs. Pool JSON is forwarded unchanged after the normal GreenGateway startup validation. After the first deploy, set `GATEWAY_PUBLIC_URL` to the deployed Worker URL if you use MCP OAuth protected-resource metadata.
 
 The wrapper forwards non-empty string Worker variables and secrets whose names match GreenGateway configuration keys from `.env.example`, except:
 
 - `LISTEN_ADDR`, because Cloudflare must reach the container on port `8080`.
 - `ADMIN_LISTEN_ADDR`, because this one-click Worker exposes a single container port. Leave the admin surface on `ADMIN_PREFIX` for Cloudflare deploys.
+
+An automated parity test compares this forwarding allowlist to GreenGateway's runtime environment reads, so a newly supported key cannot silently be omitted. `SHUTDOWN_DRAIN_DELAY_MS`, `SHUTDOWN_TIMEOUT_MS`, and `AUDIT_DRAIN_TIMEOUT_MS` are forwarded; keep their sum within the Cloudflare container termination budget used by the selected platform plan.
 
 Secrets such as OIDC client secrets should be configured as Worker secrets or embedded inside a secret-backed `AUTH_PROVIDERS` value, not committed to the repository.
 
@@ -49,8 +51,9 @@ These values are passed to the container when it starts. If you change a Worker 
 ## Important Limitations
 
 - Cloudflare Containers use an ephemeral container filesystem by default. GreenGateway settings such as `AUDIT_SQLITE_PATH`, `DISCOVERY_SQLITE_PATH`, `PRINCIPAL_SQLITE_PATH`, and `SERVICE_TOKEN_SQLITE_PATH` can work for evaluation, but they are not durable storage across container replacement.
-- File-backed settings such as `POLICY_FILE`, `TOOLS_FILE`, and `OPENAPI_SPEC_PATH` must point at files that exist inside the image or are otherwise created at runtime.
-- This project is still pre-alpha. Treat the one-click deploy path as a fast evaluation path, not a production hardening guide.
+- File-backed settings such as `POLICY_FILE`, `TOOLS_FILE`, `OPENAPI_SPEC_PATH`, CA bundles, and mTLS client identities must point at files that exist inside the image or are otherwise created at runtime. A plain Worker variable is not a secure mounted private-key file; do not put PEM key material inline in `UPSTREAM_ROUTES`.
+- The one-click wrapper does not expose `ADMIN_LISTEN_ADDR`; use the shared `ADMIN_PREFIX` surface with normal authentication/RBAC.
+- This project is still alpha software. Treat the one-click deploy path as a fast evaluation path, not a production hardening guide.
 - The first container deploy may return Worker errors for several minutes while Cloudflare finishes provisioning container capacity.
 
 ## Manual Deploy
@@ -64,13 +67,15 @@ npm run deploy
 Check the deployed gateway:
 
 ```sh
-curl https://<worker-name>.<your-workers-subdomain>.workers.dev/health
+curl https://<worker-name>.<your-workers-subdomain>.workers.dev/startupz
+curl https://<worker-name>.<your-workers-subdomain>.workers.dev/readyz
 ```
 
 Expected response:
 
 ```json
-{"status":"ok"}
+{"status":"started"}
+{"status":"ready"}
 ```
 
 The embedded admin UI is available at:

@@ -1,0 +1,8 @@
+f2329f79be2dc4623b697108e9f67570c599d87f:gateway/src/auth/jwt.rs:private-key:438
+ed0fcd5b22b2e31120c7db7fa30e1d935f887aaf:gateway/src/auth/jwt.rs:private-key:487
+ed0fcd5b22b2e31120c7db7fa30e1d935f887aaf:gateway/src/auth/jwt.rs:private-key:494
+d9ebee5ff9a3ce4a47a7311926bbc45291461180:gateway/src/egress.rs:private-key:1281
+691070877114920cf5f50f47b8b0fcaf7e5ac28e:gateway/src/egress.rs:private-key:1308
+c0cc40e2c6dae574d10561e096a39ddfdbdf9d30:admin-ui/src/lib/tokens.test.ts:generic-api-key:136
+c0cc40e2c6dae574d10561e096a39ddfdbdf9d30:admin-ui/src/views/TokensView.test.tsx:generic-api-key:414
+6db945e4c076277afeae2ab662925e77fb3337fd:gateway/src/auth/service_token_validator.rs:generic-api-key:456

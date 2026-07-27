@@ -22,11 +22,14 @@ services:
       timeout: 3s
       retries: 12
 
-  dev-echo:
+  dev-echo-a:
     image: python:3-slim
     command:
       - python
       - /srv/echo/echo-server.py
+    environment:
+      UPSTREAM_ID: dev-echo-a
+      FAIL_RETRY_PROBE: "true"
     volumes:
       - ./dev/echo-server.py:/srv/echo/echo-server.py:ro
     healthcheck:
@@ -34,7 +37,45 @@ services:
         - CMD
         - python
         - -c
-        - "import urllib.request; request = urllib.request.Request('http://127.0.0.1:8080/', method='HEAD'); urllib.request.urlopen(request, timeout=2).read()"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  dev-echo-b:
+    image: python:3-slim
+    command:
+      - python
+      - /srv/echo/echo-server.py
+    environment:
+      UPSTREAM_ID: dev-echo-b
+    volumes:
+      - ./dev/echo-server.py:/srv/echo/echo-server.py:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  dev-echo-c:
+    image: python:3-slim
+    command:
+      - python
+      - /srv/echo/echo-server.py
+    environment:
+      UPSTREAM_ID: dev-echo-c
+    volumes:
+      - ./dev/echo-server.py:/srv/echo/echo-server.py:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=2).read()"
       interval: 5s
       timeout: 3s
       retries: 12
@@ -43,11 +84,15 @@ services:
     depends_on:
       dev-jwks:
         condition: service_healthy
-      dev-echo:
+      dev-echo-a:
+        condition: service_healthy
+      dev-echo-b:
+        condition: service_healthy
+      dev-echo-c:
         condition: service_healthy
     environment:
       LISTEN_ADDR: 0.0.0.0:8080
-      UPSTREAM_URL: http://dev-echo:8080
+      UPSTREAM_ROUTES: '[{"id":"dev-echo","path_prefix":"/__dev-echo","upstreams":[{"id":"dev-echo-a","url":"http://dev-echo-a:8080","weight":3},{"id":"dev-echo-b","url":"http://dev-echo-b:8080","weight":2},{"id":"dev-echo-c","url":"http://dev-echo-c:8080","weight":1}],"load_balancing":{"strategy":"weighted_round_robin"},"request_body":{"mode":"buffered"},"limits":{"max_in_flight":128,"queue_depth":256,"queue_timeout_ms":100},"health_check":{"method":"GET","path":"/ready","interval_ms":500,"jitter_ms":0,"timeout_ms":200,"healthy_threshold":2,"unhealthy_threshold":2,"expected_statuses":[200],"passive_failure_statuses":[500,502,504],"required_for_readiness":true,"minimum_healthy":2},"retry":{"max_attempts":2,"methods":["GET","HEAD","OPTIONS"],"statuses":[502,503,504]}},{"id":"dev-load","path_prefix":"/__dev-load","upstreams":[{"id":"dev-echo-a","url":"http://dev-echo-a:8080","weight":3},{"id":"dev-echo-b","url":"http://dev-echo-b:8080","weight":2},{"id":"dev-echo-c","url":"http://dev-echo-c:8080","weight":1}],"load_balancing":{"strategy":"weighted_round_robin"},"request_body":{"mode":"buffered"},"limits":{"max_in_flight":256,"queue_depth":512,"queue_timeout_ms":100},"timeout_ms":1500,"response_idle_timeout_ms":1000,"connect_timeout_ms":500,"retry":{"max_attempts":2,"methods":["GET","HEAD","OPTIONS"],"statuses":[502,503,504]}},{"id":"dev-stream","path_prefix":"/__dev-stream","upstreams":[{"id":"dev-echo-a","url":"http://dev-echo-a:8080","weight":3},{"id":"dev-echo-b","url":"http://dev-echo-b:8080","weight":2},{"id":"dev-echo-c","url":"http://dev-echo-c:8080","weight":1}],"load_balancing":{"strategy":"weighted_round_robin"},"request_body":{"mode":"stream"},"limits":{"max_in_flight":128,"queue_depth":256,"queue_timeout_ms":100},"timeout_ms":5000,"response_idle_timeout_ms":1000,"connect_timeout_ms":500}]'
       AUTH_ENABLED: "true"
       JWT_JWKS_URL: http://dev-jwks:8080/jwks.json
       JWT_ISSUER: https://greengateway.dev.local

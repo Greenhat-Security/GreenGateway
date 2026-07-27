@@ -2,11 +2,16 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildGreenGatewayContainerEnv,
+  CONTAINER_PING_ENDPOINT,
   CONTAINER_PORT,
   GREEN_GATEWAY_ENV_KEYS,
 } from "./config";
 
 describe("buildGreenGatewayContainerEnv", () => {
+  it("uses the process-only liveness probe for container supervision", () => {
+    expect(CONTAINER_PING_ENDPOINT).toBe("localhost/livez");
+  });
+
   it("forces the container to listen on the Cloudflare-routed port", () => {
     const env = buildGreenGatewayContainerEnv({
       LISTEN_ADDR: "127.0.0.1:9999",
@@ -62,6 +67,24 @@ describe("buildGreenGatewayContainerEnv", () => {
       SHUTDOWN_DRAIN_DELAY_MS: "5000",
       SHUTDOWN_TIMEOUT_MS: "30000",
       AUDIT_DRAIN_TIMEOUT_MS: "5000",
+    });
+  });
+
+  it("forwards bounded login, discovery, and NAT64 settings", () => {
+    const env = buildGreenGatewayContainerEnv({
+      ADMIN_LOGIN_PENDING_TTL_SECS: "600",
+      ADMIN_LOGIN_PENDING_MAX_ENTRIES: "1024",
+      ADMIN_LOGIN_PENDING_MAX_PER_IP: "8",
+      DISCOVERY_ENDPOINT_LIMIT: "10000",
+      EGRESS_NAT64_PREFIXES: "64:ff9b::/96",
+    });
+
+    expect(env).toMatchObject({
+      ADMIN_LOGIN_PENDING_TTL_SECS: "600",
+      ADMIN_LOGIN_PENDING_MAX_ENTRIES: "1024",
+      ADMIN_LOGIN_PENDING_MAX_PER_IP: "8",
+      DISCOVERY_ENDPOINT_LIMIT: "10000",
+      EGRESS_NAT64_PREFIXES: "64:ff9b::/96",
     });
   });
 });

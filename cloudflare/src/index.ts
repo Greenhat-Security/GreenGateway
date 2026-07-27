@@ -3,6 +3,7 @@ import type { StopParams } from "@cloudflare/containers";
 
 import {
   buildGreenGatewayContainerEnv,
+  CONTAINER_PING_ENDPOINT,
   CONTAINER_PORT,
   type GreenGatewayWorkerEnv,
 } from "./config";
@@ -14,7 +15,7 @@ export interface Env extends GreenGatewayWorkerEnv {
 export class GreenGatewayContainer extends Container<Env> {
   defaultPort = CONTAINER_PORT;
   sleepAfter = "10m";
-  pingEndpoint = "localhost/health";
+  pingEndpoint = CONTAINER_PING_ENDPOINT;
 
   constructor(ctx: DurableObjectState<{}>, env: Env) {
     super(ctx, env, {

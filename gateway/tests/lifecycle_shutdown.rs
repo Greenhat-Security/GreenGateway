@@ -322,7 +322,8 @@ fn hard_shutdown_cancels_sse_before_persisted_audit_drain() {
     let upstream_addr = upstream_listener
         .local_addr()
         .expect("test upstream address should be available");
-    let upstream = thread::spawn(move || {
+    let (sse_started_tx, sse_started_rx) = mpsc::channel();
+    let upstream = thread::spawn(move || loop {
         let (mut stream, _) = upstream_listener
             .accept()
             .expect("test SSE upstream should accept");
@@ -343,6 +344,15 @@ fn hard_shutdown_cancels_sse_before_persisted_audit_drain() {
                 break;
             }
         }
+        if !request.starts_with(b"GET /events ") {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("test SSE upstream health response should write");
+            continue;
+        }
+        sse_started_tx
+            .send(())
+            .expect("SSE request start should be observed");
         stream
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
@@ -363,6 +373,7 @@ fn hard_shutdown_cancels_sse_before_persisted_audit_drain() {
                 Err(error) => panic!("test SSE upstream close should read: {error}"),
             }
         }
+        break;
     });
     let upstream_routes = format!(
         r#"[{{"path_prefix":"/events","upstream_url":"http://{upstream_addr}","sse":{{"max_duration_ms":0,"max_response_bytes":0}}}}]"#
@@ -417,6 +428,9 @@ fn hard_shutdown_cancels_sse_before_persisted_audit_drain() {
             b"GET /events HTTP/1.1\r\nHost: localhost\r\nx-request-id: sse-hard-shutdown\r\nConnection: keep-alive\r\n\r\n",
         )
         .expect("SSE gateway request should write");
+    sse_started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("gateway should start the intended SSE upstream request");
     let mut response_headers = Vec::new();
     let mut buffer = [0_u8; 1024];
     while !response_headers

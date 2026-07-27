@@ -251,6 +251,12 @@ impl EgressError {
             Self::ResponseIdleTimeout { .. } => true,
             Self::Http(error) if error.is_timeout() => true,
             Self::Http(error) if error.is_connect() => error_chain_has_retryable_io(error),
+            // A reused HTTP/1.1 connection can disappear after selection but before
+            // response headers arrive. Reqwest reports that as a request error rather
+            // than a connect error. The proxy still applies its independently
+            // configured safe-method and replayable-body gates before consulting this
+            // transport classification.
+            Self::Http(error) if error.is_request() && !error.is_body() => true,
             Self::HostNotAllowed(_)
             | Self::PortNotAllowed(_)
             | Self::NonGlobalIpBlocked(_)
@@ -1579,6 +1585,35 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+
+    #[tokio::test]
+    async fn request_phase_disconnect_is_a_retryable_transport_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("test connection");
+            let mut request = vec![0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            // Close without response headers, modelling a pooled upstream that
+            // disappears while an otherwise replay-safe request is in flight.
+        });
+
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client")
+            .get(format!("http://{address}/disconnect"))
+            .send()
+            .await
+            .expect_err("closed upstream should fail before response headers");
+        server.await.expect("test server should finish");
+
+        assert!(error.is_request());
+        assert!(!error.is_connect());
+        assert!(EgressError::Http(error).is_retryable_transport_failure());
+    }
 
     #[tokio::test]
     async fn counted_stream_allows_exact_limit_with_backpressure() {

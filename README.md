@@ -194,7 +194,7 @@ This gives security, engineering, platform, and compliance teams a clearer view 
 | Area | What GreenGateway provides |
 | --- | --- |
 | Gateway server | Rust/axum gateway with health, version, metrics, proxy, admin, and MCP surfaces |
-| Reverse proxy | HTTP proxying with upstream routing, header handling, request IDs, streamed responses, and latency tracking |
+| Reverse proxy | Bounded weighted endpoint pools, health-aware selection, safe retries/circuits, request/SSE streaming, mTLS isolation, and graceful draining |
 | Authentication | JWT/OIDC-style authentication, service tokens, cookie-session validation, and observe mode |
 | Authorization | RBAC policy engine, direct firewall rules, deny-by-default support, hot reload, and shadow enforcement |
 | Admin UI | Embedded React/TypeScript admin dashboard served from the gateway |
@@ -209,7 +209,7 @@ This gives security, engineering, platform, and compliance teams a clearer view 
 | Anomaly signals | Deterministic signals for new endpoints, schema mismatches, error spikes, new principal activity, and volume outliers |
 | Policy history | Versioned policy changes, rollback, and audit trail |
 | Cloudflare deployment | Worker plus Container deployment path for guided self-hosting on Cloudflare |
-| Local dev harness | Checked-in JWKS/RBAC fixtures, Docker Compose stack, and sample traffic generator |
+| Local dev harness | Checked-in JWKS/RBAC fixtures, three controllable Compose upstreams, correctness smoke scenarios, and load/soak scripts |
 
 ## MCP Support
 
@@ -353,6 +353,7 @@ Current status:
 | --- | --- |
 | Core gateway | Implemented |
 | HTTP reverse proxy | Implemented |
+| Bounded production data plane | Implemented; deployment-specific performance thresholds remain an operator release gate |
 | Admin UI | Implemented |
 | JWT/OIDC-style auth | Implemented |
 | Service tokens | Implemented |
@@ -454,7 +455,47 @@ Seeded local development stack:
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
-The development stack includes JWT auth, RBAC, a JWKS sidecar, the embedded admin UI, an internal-only echo upstream, and queryable SQLite audit storage.
+The development stack includes JWT auth, RBAC, a JWKS sidecar, the embedded
+admin UI, three weighted internal-only echo upstreams, active health/readiness,
+safe GET retry probes, and queryable SQLite audit storage.
+
+Run the multi-upstream correctness scenario:
+
+```sh
+node scripts/verify-dev-pool.mjs healthy
+```
+
+Add the load overlay before running the short load harness so the measurement
+is not dominated by the intentional default ingress limiter:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.load.yml up -d
+npm run load:quick
+```
+
+Deployment probes, migration, rollback, Kubernetes, metrics, and load/soak
+guidance live in
+[docs/deployment/production-data-plane.md](docs/deployment/production-data-plane.md).
+
+Pool migration is additive. An existing route can keep
+`"upstream_url":"https://payments.example.test"` unchanged, or opt in one route
+at a time by assigning stable IDs:
+
+```json
+{
+  "id": "payments",
+  "path_prefix": "/payments",
+  "upstreams": [
+    {"id": "payments-a", "url": "https://payments-a.example.test", "weight": 3},
+    {"id": "payments-b", "url": "https://payments-b.example.test", "weight": 1}
+  ],
+  "load_balancing": {"strategy": "weighted_round_robin"}
+}
+```
+
+Buffered bodies and one total attempt remain the defaults. Health, retries,
+circuits, streamed uploads, SSE, and mTLS require explicit route/endpoint
+configuration.
 
 ## Cloudflare Deploy
 
@@ -499,7 +540,8 @@ The default Cloudflare deploy is intentionally conservative.
 | `EGRESS_DENY_PRIVATE_IPS` | `true` |
 | `UPSTREAM_URL` | blank by default |
 
-Set `UPSTREAM_URL` during deploy, or later in the Cloudflare dashboard, when you want GreenGateway to proxy to an origin API.
+Set `UPSTREAM_URL` or `UPSTREAM_ROUTES` during deploy, or later in the
+Cloudflare dashboard, when you want GreenGateway to proxy to origin APIs.
 
 After the first deploy, set `GATEWAY_PUBLIC_URL` to the deployed Worker URL if you use MCP OAuth protected-resource metadata.
 
@@ -515,13 +557,15 @@ Keep secrets such as OIDC client secrets in Worker secrets or inside a secret-ba
 After Cloudflare finishes provisioning, check the deployed gateway:
 
 ```sh
-curl https://<worker-name>.<your-workers-subdomain>.workers.dev/health
+curl https://<worker-name>.<your-workers-subdomain>.workers.dev/startupz
+curl https://<worker-name>.<your-workers-subdomain>.workers.dev/readyz
 ```
 
 Expected response:
 
 ```json
-{"status":"ok"}
+{"status":"started"}
+{"status":"ready"}
 ```
 
 The embedded admin UI is available at:
@@ -560,7 +604,7 @@ Common configuration areas include:
 | Server | `LISTEN_ADDR`, `ADMIN_PREFIX`, `ADMIN_LISTEN_ADDR` |
 | Auth | `AUTH_PROVIDERS`, `JWT_JWKS_URL`, `JWT_ISSUER`, `JWT_AUDIENCE`, `AUTH_MODE` |
 | RBAC | `POLICY_FILE`, `RBAC_EXEMPT_PATHS` |
-| Proxy | `UPSTREAM_URL`, upstream routing settings |
+| Proxy | `UPSTREAM_URL`, `UPSTREAM_ROUTES`, pool/health/retry/circuit/SSE/mTLS settings |
 | MCP | `GATEWAY_PUBLIC_URL`, `TOOLS_FILE`, `MCP_UPSTREAM_SERVERS`, `TOOL_RUNTIME_*` |
 | Audit | `AUDIT_LOG_FILE`, `AUDIT_SQLITE_PATH`, `AUDIT_SQLITE_RETENTION_DAYS` |
 | Discovery | `DISCOVERY_SQLITE_PATH`, schema and payload capture settings |
@@ -592,6 +636,9 @@ docs/examples/policy.starter.README.md
 ```
 
 The `docs/configuration.md` file and `.env.example` are kept in sync with the code by automated tests.
+Cloudflare's supported environment forwarding list is checked against the same
+runtime reads, excluding only the forced `LISTEN_ADDR` and unsupported split
+`ADMIN_LISTEN_ADDR`.
 
 ## Repository Structure
 

@@ -1,18 +1,18 @@
 # Releasing GreenGateway
 
-As of this writing, GreenGateway has not tagged any version yet. The project is
-pre-alpha, and this process is being documented before the first release so
-maintainers have a repeatable checklist when they are ready to cut one.
+GreenGateway publishes tagged releases but remains alpha software. This
+checklist keeps release tags, container images, changelog entries, and release
+notes aligned.
 
 ## Versioning
 
 GreenGateway uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Release git tags must use the form `vMAJOR.MINOR.PATCH`, such as `v0.1.0`.
 
-While GreenGateway is in the `0.x` series, minor version bumps may include
-breaking changes. Patch bumps should be reserved for fixes and should preserve
-compatibility within the current minor release line. Call out any breaking
-changes clearly in `CHANGELOG.md` and the release notes.
+Patch bumps are reserved for backward-compatible fixes, minor bumps add
+backward-compatible functionality, and breaking changes require a major bump.
+Call out every operator-visible compatibility change clearly in `CHANGELOG.md`
+and the release notes.
 
 Version-tagged container images are published to GHCR with both the git tag and
 the bare version tag. For example, pushing `v0.1.0` publishes:
