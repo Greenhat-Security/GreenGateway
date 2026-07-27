@@ -328,7 +328,11 @@ impl ConnectionWrite {
             || self.tls != candidate.tls
             || ((self.configures_credential_authority()
                 || candidate.configures_credential_authority())
-                && self.endpoint != candidate.endpoint)
+                && (self.endpoint != candidate.endpoint
+                    || test_profile_target_changed(
+                        self.test_profile.as_ref(),
+                        candidate.test_profile.as_ref(),
+                    )))
             || (discovery_uses_authentication(self.discovery.as_ref())
                 || discovery_uses_authentication(candidate.discovery.as_ref()))
                 && self.discovery != candidate.discovery
@@ -611,6 +615,19 @@ fn discovery_uses_authentication(discovery: Option<&DiscoveryConfig>) -> bool {
             use_connection_authentication,
         }) => *use_connection_authentication,
         None => false,
+    }
+}
+
+fn test_profile_target_changed(
+    current: Option<&ConnectionTestProfile>,
+    candidate: Option<&ConnectionTestProfile>,
+) -> bool {
+    match (current, candidate) {
+        (None, None) => false,
+        (Some(current), Some(candidate)) => {
+            current.method != candidate.method || current.path != candidate.path
+        }
+        (Some(_), None) | (None, Some(_)) => true,
     }
 }
 
@@ -1217,6 +1234,43 @@ mod tests {
         let mut credential_redirect = credentialed.clone();
         credential_redirect.endpoint.base_url = "https://replacement.example.test".to_owned();
         assert!(credentialed.requires_secrets_write_to_replace(&credential_redirect));
+
+        let mut plain_test_target = plain.clone();
+        plain_test_target
+            .test_profile
+            .as_mut()
+            .expect("example should include a test profile")
+            .path = "/alternate-health".to_owned();
+        assert!(!plain.requires_secrets_write_to_replace(&plain_test_target));
+
+        let mut credentialed_test_expectations = credentialed.clone();
+        credentialed_test_expectations
+            .test_profile
+            .as_mut()
+            .expect("example should include a test profile")
+            .expected_statuses = vec![200];
+        assert!(!credentialed.requires_secrets_write_to_replace(&credentialed_test_expectations));
+
+        let mut credentialed_test_method = credentialed.clone();
+        credentialed_test_method
+            .test_profile
+            .as_mut()
+            .expect("example should include a test profile")
+            .method = "OPTIONS".to_owned();
+        assert!(credentialed.requires_secrets_write_to_replace(&credentialed_test_method));
+
+        let mut credentialed_test_path = credentialed.clone();
+        credentialed_test_path
+            .test_profile
+            .as_mut()
+            .expect("example should include a test profile")
+            .path = "/alternate-health".to_owned();
+        assert!(credentialed.requires_secrets_write_to_replace(&credentialed_test_path));
+
+        let mut credentialed_without_test = credentialed.clone();
+        credentialed_without_test.test_profile = None;
+        assert!(credentialed.requires_secrets_write_to_replace(&credentialed_without_test));
+        assert!(credentialed_without_test.requires_secrets_write_to_replace(&credentialed));
 
         let mut credentialed_discovery = credentialed.clone();
         credentialed_discovery.discovery = Some(DiscoveryConfig::ManagedOpenapi {

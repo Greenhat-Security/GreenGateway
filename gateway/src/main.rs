@@ -18410,6 +18410,9 @@ mod tests {
             .as_str()
             .expect("credentialed connection should include an ID")
             .to_owned();
+        let initial_credential_revision = credentialed_body["revisions"]["credential"]
+            .as_u64()
+            .expect("credentialed connection should include a credential revision");
 
         let credentialed_detail = router
             .clone()
@@ -18461,6 +18464,65 @@ mod tests {
         let presentation_updated_body = body_string(presentation_updated).await;
         assert!(!presentation_updated_body.contains("credential-secret-id-canary"));
         assert!(!presentation_updated_body.contains("credential-material-value-canary"));
+        let presentation_updated_body: Value = serde_json::from_str(&presentation_updated_body)
+            .expect("presentation update should return JSON");
+        assert_eq!(
+            presentation_updated_body["revisions"]["credential"],
+            json!(initial_credential_revision)
+        );
+
+        let test_target_update = json!({
+            "display_name": presentation_updated_body["display_name"].clone(),
+            "enabled": presentation_updated_body["enabled"].clone(),
+            "kind": presentation_updated_body["kind"].clone(),
+            "endpoint": presentation_updated_body["configuration"]["endpoint"].clone(),
+            "authentication": presentation_updated_body["configuration"]["authentication"].clone(),
+            "tls": presentation_updated_body["configuration"]["tls"].clone(),
+            "test_profile": {
+                "method": "GET",
+                "path": "/credentialed-health",
+                "expected_statuses": [200]
+            }
+        })
+        .to_string();
+        let forbidden_test_target_update = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{credentialed_id}"),
+                Some(editor.clone()),
+                Some(test_target_update.clone()),
+                Some(&credentialed_etag),
+                true,
+            ))
+            .await
+            .expect("credentialed test-target denial should complete");
+        assert_eq!(forbidden_test_target_update.status(), StatusCode::FORBIDDEN);
+
+        let allowed_test_target_update = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{credentialed_id}"),
+                Some(secrets_editor.clone()),
+                Some(test_target_update),
+                Some(&credentialed_etag),
+                true,
+            ))
+            .await
+            .expect("credentialed test-target update should complete");
+        assert_eq!(allowed_test_target_update.status(), StatusCode::OK);
+        credentialed_etag = allowed_test_target_update
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("test-target update should include an ETag")
+            .to_owned();
+        let allowed_test_target_update = json_body(allowed_test_target_update).await;
+        assert_eq!(
+            allowed_test_target_update["revisions"]["credential"],
+            json!(initial_credential_revision + 1)
+        );
 
         let first_page = router
             .clone()
@@ -18614,12 +18676,12 @@ mod tests {
                 .iter()
                 .filter(|event| event.event_type == audit::event::CONNECTION_CHANGED)
                 .count()
-                == 6
+                == 7
                 && events
                     .iter()
                     .filter(|event| event.event_type == audit::event::CONNECTION_CREDENTIAL_CHANGED)
                     .count()
-                    == 2
+                    == 3
         });
         let events = capture.events();
         assert_eq!(
@@ -18627,15 +18689,22 @@ mod tests {
                 .iter()
                 .filter(|event| event.event_type == audit::event::CONNECTION_CHANGED)
                 .count(),
-            6
+            7
         );
         assert_eq!(
             events
                 .iter()
                 .filter(|event| { event.event_type == audit::event::CONNECTION_CREDENTIAL_CHANGED })
                 .count(),
-            2
+            3
         );
+        assert!(events.iter().any(|event| {
+            event.event_type == audit::event::CONNECTION_CREDENTIAL_CHANGED
+                && event.payload["action"] == json!("updated")
+                && event.payload["changed_fields"]
+                    .as_array()
+                    .is_some_and(|fields| fields.contains(&json!("test_profile")))
+        }));
         let serialized_events =
             serde_json::to_string(&events).expect("audit events should serialize");
         assert!(!serialized_events.contains("credential-secret-id-canary"));

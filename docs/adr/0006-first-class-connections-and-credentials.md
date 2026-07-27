@@ -323,10 +323,12 @@ The permission vocabulary is:
 Changing where an existing credential may be sent is a secret-use mutation.
 `admin:connections:secrets:write` is required to change a credentialed origin,
 OAuth token URL, scopes/audience/resource, auth mode/header, mTLS identity, or
-credentialed discovery target, and to attach, replace, rotate, clear, delete,
-or clone a binding. A plain connection writer cannot perform those operations.
-Every sensitive change atomically increments the credential revision and emits
-a separate credential-change audit event.
+credentialed discovery or stored test target, and to attach, replace, rotate,
+clear, delete, or clone a binding. Adding, removing, or changing the method or
+path of a stored test profile is a target change whenever either revision has
+credential or TLS authority. A plain connection writer cannot perform those
+operations. Every sensitive change atomically increments the credential
+revision and emits a separate credential-change audit event.
 
 All admin routes remain below dynamic `/v1{ADMIN_PREFIX}`. Writes require CSRF
 under existing cookie-auth rules and an exact `If-Match`; missing preconditions
