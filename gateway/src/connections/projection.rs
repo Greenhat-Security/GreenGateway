@@ -29,6 +29,15 @@ pub struct LegacyConnectionProjection {
     summary: SafeConnectionSummary,
 }
 
+struct LegacyProjectionSpec {
+    id: String,
+    display_name: String,
+    kind: ConnectionKind,
+    source: ConnectionManagementSource,
+    authentication: SafeAuthenticationKind,
+    endpoint_count: usize,
+}
+
 impl LegacyConnectionProjection {
     pub fn id(&self) -> &ConnectionId {
         &self.summary.id
@@ -86,12 +95,14 @@ pub fn project_legacy_connections(
         push_projection(
             &mut projected,
             &mut ids,
-            DEFAULT_HTTP_ID.to_owned(),
-            "Legacy default HTTP".to_owned(),
-            ConnectionKind::HttpApi,
-            ConnectionManagementSource::LegacyDefaultHttp,
-            SafeAuthenticationKind::None,
-            1,
+            LegacyProjectionSpec {
+                id: DEFAULT_HTTP_ID.to_owned(),
+                display_name: "Legacy default HTTP".to_owned(),
+                kind: ConnectionKind::HttpApi,
+                source: ConnectionManagementSource::LegacyDefaultHttp,
+                authentication: SafeAuthenticationKind::None,
+                endpoint_count: 1,
+            },
         )?;
     }
 
@@ -110,12 +121,14 @@ pub fn project_legacy_connections(
         push_projection(
             &mut projected,
             &mut ids,
-            id,
-            display_name,
-            ConnectionKind::HttpApi,
-            ConnectionManagementSource::LegacyRoute,
-            authentication,
-            endpoint_count,
+            LegacyProjectionSpec {
+                id,
+                display_name,
+                kind: ConnectionKind::HttpApi,
+                source: ConnectionManagementSource::LegacyRoute,
+                authentication,
+                endpoint_count,
+            },
         )?;
     }
 
@@ -124,12 +137,14 @@ pub fn project_legacy_connections(
         push_projection(
             &mut projected,
             &mut ids,
-            format!("{MCP_ID_PREFIX}{normalized_name}"),
-            bounded_display_name(server.name.clone()),
-            ConnectionKind::McpStreamableHttp,
-            ConnectionManagementSource::LegacyMcp,
-            SafeAuthenticationKind::None,
-            1,
+            LegacyProjectionSpec {
+                id: format!("{MCP_ID_PREFIX}{normalized_name}"),
+                display_name: bounded_display_name(server.name.clone()),
+                kind: ConnectionKind::McpStreamableHttp,
+                source: ConnectionManagementSource::LegacyMcp,
+                authentication: SafeAuthenticationKind::None,
+                endpoint_count: 1,
+            },
         )?;
     }
 
@@ -139,13 +154,16 @@ pub fn project_legacy_connections(
 fn push_projection(
     projected: &mut Vec<LegacyConnectionProjection>,
     ids: &mut BTreeSet<String>,
-    id: String,
-    display_name: String,
-    kind: ConnectionKind,
-    source: ConnectionManagementSource,
-    authentication: SafeAuthenticationKind,
-    endpoint_count: usize,
+    spec: LegacyProjectionSpec,
 ) -> Result<(), LegacyProjectionError> {
+    let LegacyProjectionSpec {
+        id,
+        display_name,
+        kind,
+        source,
+        authentication,
+        endpoint_count,
+    } = spec;
     if !ids.insert(id.clone()) {
         return Err(LegacyProjectionError::IdCollision { id });
     }
@@ -179,18 +197,7 @@ fn projected_route_id(route: &UpstreamRouteConfig) -> String {
     match route.id.as_deref() {
         Some(id) => format!("{ROUTE_ID_PREFIX}{id}"),
         None => {
-            let identity = format!(
-                "host={:?}\npath={:?}\nupstream={}\nendpoints={}",
-                route.host,
-                route.path_prefix,
-                route.upstream_url,
-                route
-                    .upstreams
-                    .iter()
-                    .map(|endpoint| endpoint.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
+            let identity = format!("host={:?}\npath={:?}", route.host, route.path_prefix);
             format!("{ROUTE_ID_PREFIX}{}", short_digest(&identity))
         }
     }
@@ -338,6 +345,21 @@ mod tests {
         left_ids.sort();
         right_ids.sort();
         assert_eq!(left_ids, right_ids);
+    }
+
+    #[test]
+    fn route_projection_id_is_logical_and_survives_destination_change() {
+        let first = route(serde_json::json!({
+            "host": "api.example.test",
+            "path_prefix": "/v1",
+            "upstream_url": "https://one.example.test"
+        }));
+        let second = route(serde_json::json!({
+            "host": "api.example.test",
+            "path_prefix": "/v1",
+            "upstream_url": "https://two.example.test"
+        }));
+        assert_eq!(projected_route_id(&first), projected_route_id(&second));
     }
 
     #[test]

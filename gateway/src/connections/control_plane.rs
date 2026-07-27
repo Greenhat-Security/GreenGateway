@@ -20,7 +20,12 @@ impl ConnectionControlPlane {
         let managed = config
             .connections_sqlite_path
             .as_deref()
-            .map(SqliteConnectionStore::open)
+            .map(|path| {
+                SqliteConnectionStore::open_with_maximum(
+                    path,
+                    MAX_CONNECTIONS.saturating_sub(legacy.len()),
+                )
+            })
             .transpose()?;
         let managed_count = managed
             .as_ref()
@@ -172,10 +177,12 @@ mod tests {
         ));
         let mut config = config();
         config.connections_sqlite_path = Some(path.display().to_string());
+        config.upstream_url = Some("https://legacy.example.test".to_owned());
 
         let control_plane =
             ConnectionControlPlane::from_config(&config).expect("control plane should build");
         assert!(control_plane.is_managed_store_configured());
+        assert_eq!(control_plane.legacy().len(), 1);
         assert!(path.is_file());
         assert_eq!(
             control_plane
@@ -184,6 +191,13 @@ mod tests {
                 .count()
                 .expect("count should work"),
             0
+        );
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .maximum_connections(),
+            MAX_CONNECTIONS - 1
         );
         drop(control_plane);
         let _ = std::fs::remove_file(&path);

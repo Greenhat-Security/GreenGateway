@@ -15,7 +15,7 @@ use super::{
     model::{
         ConnectionAuthentication, ConnectionId, ConnectionManagementSource, ConnectionWrite,
         DiscoveryConfig, CONNECTION_SCHEMA_VERSION, MAX_CATALOG_ENTRIES, MAX_CONNECTIONS,
-        MAX_STATUS_HISTORY_ROWS,
+        MAX_CREDENTIALS, MAX_STATUS_HISTORY_ROWS,
     },
     status::{
         ConnectionOperationalState, ConnectionRevisions, ConnectionStatusReason,
@@ -120,6 +120,7 @@ struct Migration {
 pub struct SqliteConnectionStore {
     path: PathBuf,
     connection: Arc<Mutex<Connection>>,
+    maximum_connections: usize,
 }
 
 pub trait ConnectionStore: Send + Sync {
@@ -181,7 +182,7 @@ impl StoredConnection {
     }
 
     pub fn safe_summary(&self, status: Option<SafeConnectionStatus>) -> SafeConnectionSummary {
-        let status = status.unwrap_or_else(|| {
+        let status = status.unwrap_or({
             if self.write.enabled {
                 SafeConnectionStatus {
                     state: ConnectionOperationalState::Unknown,
@@ -270,6 +271,7 @@ pub enum ConnectionStoreError {
     UnsupportedSchema {
         version: u32,
     },
+    InvalidMigrationHistory,
     LimitExceeded {
         resource: &'static str,
         maximum: usize,
@@ -325,6 +327,9 @@ impl fmt::Display for ConnectionStoreError {
                 formatter,
                 "connection SQLite schema version {version} is newer or unknown"
             ),
+            Self::InvalidMigrationHistory => formatter.write_str(
+                "connection SQLite migration history is not a contiguous ordered prefix",
+            ),
             Self::LimitExceeded { resource, maximum } => {
                 write!(formatter, "{resource} limit of {maximum} has been reached")
             }
@@ -359,6 +364,19 @@ impl Error for ConnectionStoreError {
 
 impl SqliteConnectionStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ConnectionStoreError> {
+        Self::open_with_maximum(path, MAX_CONNECTIONS)
+    }
+
+    pub fn open_with_maximum(
+        path: impl AsRef<Path>,
+        maximum_connections: usize,
+    ) -> Result<Self, ConnectionStoreError> {
+        if maximum_connections > MAX_CONNECTIONS {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "managed connections",
+                maximum: MAX_CONNECTIONS,
+            });
+        }
         let path = path.as_ref().to_path_buf();
         let mut connection =
             Connection::open(&path).map_err(|source| ConnectionStoreError::Open {
@@ -377,7 +395,12 @@ impl SqliteConnectionStore {
         Ok(Self {
             path,
             connection: Arc::new(Mutex::new(connection)),
+            maximum_connections,
         })
+    }
+
+    pub fn maximum_connections(&self) -> usize {
+        self.maximum_connections
     }
 
     pub fn add_dependency(
@@ -611,16 +634,25 @@ impl ConnectionStore for SqliteConnectionStore {
             .map_err(|source| sqlite_error(&self.path, "list query", source))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|source| sqlite_error(&self.path, "list read", source))?;
-        rows.into_iter()
+        let records = rows
+            .into_iter()
             .map(|raw| raw.into_stored())
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<Vec<_>, _>>()?;
+        for record in &records {
+            validate_record_bindings(&connection, &self.path, record)?;
+        }
+        Ok(records)
     }
 
     fn get(&self, id: &ConnectionId) -> Result<Option<StoredConnection>, ConnectionStoreError> {
         let connection = self.connection_guard();
-        load_raw_by_id(&connection, &self.path, id)?
+        let record = load_raw_by_id(&connection, &self.path, id)?
             .map(RawStoredConnection::into_stored)
-            .transpose()
+            .transpose()?;
+        if let Some(record) = record.as_ref() {
+            validate_record_bindings(&connection, &self.path, record)?;
+        }
+        Ok(record)
     }
 
     fn create(&self, candidate: ConnectionWrite) -> Result<StoredConnection, ConnectionStoreError> {
@@ -643,12 +675,13 @@ impl ConnectionStore for SqliteConnectionStore {
                 row.get(0)
             })
             .map_err(|source| sqlite_error(&self.path, "create count", source))?;
-        if usize::try_from(count).unwrap_or(usize::MAX) >= MAX_CONNECTIONS {
+        if usize::try_from(count).unwrap_or(usize::MAX) >= self.maximum_connections {
             return Err(ConnectionStoreError::LimitExceeded {
                 resource: "managed connections",
-                maximum: MAX_CONNECTIONS,
+                maximum: self.maximum_connections,
             });
         }
+        ensure_binding_capacity(&transaction, &self.path, None, 0, binding_count(&candidate))?;
         transaction
             .execute(
                 r#"
@@ -707,6 +740,7 @@ impl ConnectionStore for SqliteConnectionStore {
         let current = load_raw_by_id(&transaction, &self.path, id)?
             .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?
             .into_stored()?;
+        validate_record_bindings(&transaction, &self.path, &current)?;
         ensure_etag(id, expected, &current)?;
         if current.write == candidate {
             transaction
@@ -715,6 +749,13 @@ impl ConnectionStore for SqliteConnectionStore {
             return Ok(current);
         }
 
+        ensure_binding_capacity(
+            &transaction,
+            &self.path,
+            Some(id),
+            binding_count(&current.write),
+            binding_count(&candidate),
+        )?;
         let revisions = replacement_revisions(id, &current, &candidate)?;
         transaction
             .execute(
@@ -765,6 +806,7 @@ impl ConnectionStore for SqliteConnectionStore {
         let current = load_raw_by_id(&transaction, &self.path, id)?
             .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?
             .into_stored()?;
+        validate_record_bindings(&transaction, &self.path, &current)?;
         ensure_etag(id, expected, &current)?;
         let dependency_count: i64 = transaction
             .query_row(
@@ -819,6 +861,17 @@ fn run_migrations(
         .collect::<BTreeSet<_>>();
     if let Some(version) = applied.iter().find(|version| !known.contains(version)) {
         return Err(ConnectionStoreError::UnsupportedSchema { version: *version });
+    }
+    if migrations
+        .iter()
+        .enumerate()
+        .any(|(index, migration)| migration.version != u32::try_from(index + 1).unwrap_or(u32::MAX))
+        || applied
+            .iter()
+            .copied()
+            .ne(1..=u32::try_from(applied.len()).unwrap_or(u32::MAX))
+    {
+        return Err(ConnectionStoreError::InvalidMigrationHistory);
     }
 
     for migration in migrations {
@@ -1036,6 +1089,77 @@ fn replace_bindings(
         )
         .map_err(|source| sqlite_error(path, "binding replacement", source))?;
 
+    for (purpose, secret_id, version) in expected_bindings(write, revisions) {
+        transaction
+            .execute(
+                r#"
+                INSERT INTO connection_credential_bindings (
+                    connection_id, purpose, secret_id, binding_version, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![
+                    id.as_str(),
+                    purpose,
+                    secret_id,
+                    u64_to_i64(id, version.max(1))?,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(path, "binding insert", source))?;
+    }
+    Ok(())
+}
+
+fn validate_record_bindings(
+    connection: &Connection,
+    path: &Path,
+    record: &StoredConnection,
+) -> Result<(), ConnectionStoreError> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT purpose, secret_id, binding_version
+            FROM connection_credential_bindings
+            WHERE connection_id = ?1
+            ORDER BY purpose ASC
+            "#,
+        )
+        .map_err(|source| sqlite_error(path, "binding validation prepare", source))?;
+    let actual = statement
+        .query_map(params![record.id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|source| sqlite_error(path, "binding validation query", source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error(path, "binding validation read", source))?;
+    let mut expected = expected_bindings(&record.write, &record.revisions)
+        .into_iter()
+        .map(|(purpose, secret_id, version)| {
+            Ok((
+                purpose.to_owned(),
+                secret_id.to_owned(),
+                u64_to_i64(&record.id, version.max(1))?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ConnectionStoreError>>()?;
+    expected.sort();
+    if actual != expected {
+        return Err(ConnectionStoreError::CorruptRecord {
+            id: record.id.to_string(),
+            reason: "credential binding rows do not match the stored connection document",
+        });
+    }
+    Ok(())
+}
+
+fn expected_bindings<'a>(
+    write: &'a ConnectionWrite,
+    revisions: &ConnectionRevisions,
+) -> Vec<(&'static str, &'a str, u64)> {
     let mut bindings = Vec::new();
     match &write.authentication {
         ConnectionAuthentication::None => {}
@@ -1076,24 +1200,81 @@ fn replace_bindings(
     if let Some(secret_id) = write.tls.client_private_key_id.as_deref() {
         bindings.push(("tls_client_private_key", secret_id, revisions.tls));
     }
+    bindings
+}
 
-    for (purpose, secret_id, version) in bindings {
-        transaction
-            .execute(
-                r#"
-                INSERT INTO connection_credential_bindings (
-                    connection_id, purpose, secret_id, binding_version, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
-                "#,
-                params![
-                    id.as_str(),
-                    purpose,
-                    secret_id,
-                    u64_to_i64(id, version.max(1))?,
-                    now
-                ],
+fn binding_count(write: &ConnectionWrite) -> usize {
+    let authentication = match &write.authentication {
+        ConnectionAuthentication::None
+        | ConnectionAuthentication::HeaderApiKey {
+            secret_id: None, ..
+        }
+        | ConnectionAuthentication::StaticBearer { secret_id: None }
+        | ConnectionAuthentication::OAuth2ClientCredentials {
+            client_secret_id: None,
+            ..
+        } => 0,
+        ConnectionAuthentication::HeaderApiKey {
+            secret_id: Some(_), ..
+        }
+        | ConnectionAuthentication::StaticBearer { secret_id: Some(_) }
+        | ConnectionAuthentication::OAuth2ClientCredentials {
+            client_secret_id: Some(_),
+            ..
+        } => 1,
+    };
+    authentication
+        + usize::from(write.tls.ca_bundle_alias.is_some())
+        + usize::from(write.tls.client_certificate_id.is_some())
+        + usize::from(write.tls.client_private_key_id.is_some())
+}
+
+fn ensure_binding_capacity(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    replaced_id: Option<&ConnectionId>,
+    replaced_binding_count: usize,
+    candidate_binding_count: usize,
+) -> Result<(), ConnectionStoreError> {
+    let persisted: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM connection_credential_bindings",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(path, "binding count", source))?;
+    let persisted =
+        usize::try_from(persisted).map_err(|_| ConnectionStoreError::CorruptRecord {
+            id: "<bindings>".to_owned(),
+            reason: "negative or oversized binding count",
+        })?;
+    if let Some(id) = replaced_id {
+        let record_bindings: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM connection_credential_bindings WHERE connection_id = ?1",
+                params![id.as_str()],
+                |row| row.get(0),
             )
-            .map_err(|source| sqlite_error(path, "binding insert", source))?;
+            .map_err(|source| sqlite_error(path, "record binding count", source))?;
+        if usize::try_from(record_bindings).ok() != Some(replaced_binding_count) {
+            return Err(ConnectionStoreError::CorruptRecord {
+                id: id.to_string(),
+                reason: "credential binding rows do not match the stored connection document",
+            });
+        }
+    }
+    let total = persisted
+        .checked_sub(replaced_binding_count)
+        .and_then(|count| count.checked_add(candidate_binding_count))
+        .ok_or_else(|| ConnectionStoreError::CorruptRecord {
+            id: "<bindings>".to_owned(),
+            reason: "binding count is inconsistent with its connection record",
+        })?;
+    if total > MAX_CREDENTIALS {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection credential bindings",
+            maximum: MAX_CREDENTIALS,
+        });
     }
     Ok(())
 }
@@ -1466,6 +1647,33 @@ mod tests {
     }
 
     #[test]
+    fn non_contiguous_migration_history_fails_closed() {
+        let mut connection = Connection::open_in_memory().expect("memory database should open");
+        connection
+            .execute_batch(CREATE_MIGRATIONS_TABLE_SQL)
+            .expect("migration table should create");
+        connection
+            .execute(
+                "INSERT INTO connection_schema_migrations (version, applied_at) VALUES (2, ?1)",
+                params![utc_timestamp().expect("timestamp should format")],
+            )
+            .expect("test migration marker should insert");
+
+        assert!(matches!(
+            run_migrations(&mut connection, Path::new(":memory:"), MIGRATIONS),
+            Err(ConnectionStoreError::InvalidMigrationHistory)
+        ));
+        let versions: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM connection_schema_migrations",
+                [],
+                |row| row.get(0),
+            )
+            .expect("existing migration history should remain");
+        assert_eq!(versions, 1);
+    }
+
+    #[test]
     fn create_replace_restart_and_etag_conflict_are_transactional() {
         let (_directory, path, store) = temporary_store("crud");
         let created = store.create(candidate()).expect("create should succeed");
@@ -1585,6 +1793,47 @@ mod tests {
     }
 
     #[test]
+    fn credential_binding_rows_are_hard_bounded() {
+        let (_directory, _path, store) = temporary_store("binding-limit");
+        let created = store.create(candidate()).expect("create should succeed");
+        {
+            let mut connection = store.connection_guard();
+            let transaction = connection
+                .transaction()
+                .expect("seed transaction should begin");
+            for index in 1..MAX_CREDENTIALS {
+                transaction
+                    .execute(
+                        r#"
+                        INSERT INTO connection_credential_bindings (
+                            connection_id, purpose, secret_id, binding_version, updated_at
+                        ) VALUES (?1, ?2, ?3, 1, ?4)
+                        "#,
+                        params![
+                            created.id.as_str(),
+                            format!("test-purpose-{index}"),
+                            format!("test-secret-{index}"),
+                            utc_timestamp().expect("timestamp should format")
+                        ],
+                    )
+                    .expect("bounded test binding should insert");
+            }
+            transaction
+                .commit()
+                .expect("seed transaction should commit");
+        }
+
+        assert!(matches!(
+            store.create(candidate()),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection credential bindings",
+                maximum: MAX_CREDENTIALS,
+            })
+        ));
+        assert_eq!(store.count().expect("count should work"), 1);
+    }
+
+    #[test]
     fn status_history_is_safe_revisioned_and_globally_bounded() {
         let (_directory, path, store) = temporary_store("status");
         let created = store.create(candidate()).expect("create should succeed");
@@ -1609,6 +1858,57 @@ mod tests {
         assert!(!serialized.contains("billing-token"));
         assert!(!serialized.contains("billing.example.test"));
 
+        {
+            let mut connection = store.connection_guard();
+            let transaction = connection
+                .transaction()
+                .expect("history seed transaction should begin");
+            for revision in 2..=u64::try_from(MAX_STATUS_HISTORY_ROWS + 1)
+                .expect("history limit should fit u64")
+            {
+                transaction
+                    .execute(
+                        r#"
+                        INSERT INTO connection_status_history (
+                            connection_id, status_revision, state, reason, observed_at
+                        ) VALUES (?1, ?2, 'degraded', 'request_failed', ?3)
+                        "#,
+                        params![
+                            created.id.as_str(),
+                            u64_to_i64(&created.id, revision)
+                                .expect("test revision should fit SQLite"),
+                            utc_timestamp().expect("timestamp should format")
+                        ],
+                    )
+                    .expect("history seed row should insert");
+            }
+            transaction
+                .execute(
+                    "UPDATE connection_records SET status_revision = ?1 WHERE id = ?2",
+                    params![
+                        i64::try_from(MAX_STATUS_HISTORY_ROWS + 1)
+                            .expect("history limit should fit SQLite"),
+                        created.id.as_str()
+                    ],
+                )
+                .expect("history revision should update");
+            transaction
+                .commit()
+                .expect("history seed transaction should commit");
+        }
+        store
+            .append_status(
+                &created.id,
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::TestSucceeded,
+                    latency_ms: Some(8),
+                    catalog_age_secs: None,
+                    catalog_entry_count: None,
+                },
+            )
+            .expect("bounded append should succeed");
+
         let connection = Connection::open(path).expect("database should open");
         let row_count: i64 = connection
             .query_row(
@@ -1617,7 +1917,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("status count should query");
-        assert_eq!(row_count, 1);
+        assert_eq!(
+            row_count,
+            i64::try_from(MAX_STATUS_HISTORY_ROWS).expect("history limit should fit SQLite")
+        );
     }
 
     #[test]
@@ -1658,5 +1961,32 @@ mod tests {
             Err(ConnectionStoreError::CorruptRecord { .. })
         ));
         assert!(fs::metadata(path).is_ok());
+    }
+
+    #[test]
+    fn mismatched_persisted_binding_fails_closed() {
+        let (_directory, _path, store) = temporary_store("corrupt-binding");
+        let created = store.create(candidate()).expect("create should succeed");
+        {
+            let connection = store.connection_guard();
+            connection
+                .execute(
+                    r#"
+                    UPDATE connection_credential_bindings
+                    SET secret_id = 'different-secret'
+                    WHERE connection_id = ?1
+                    "#,
+                    params![created.id.as_str()],
+                )
+                .expect("test corruption should write");
+        }
+
+        assert!(matches!(
+            store.get(&created.id),
+            Err(ConnectionStoreError::CorruptRecord {
+                reason: "credential binding rows do not match the stored connection document",
+                ..
+            })
+        ));
     }
 }
