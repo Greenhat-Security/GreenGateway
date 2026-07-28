@@ -47,7 +47,13 @@ impl ConnectionActions {
             can_update: permissions.write,
             can_bind_secret: permissions.write && permissions.secrets_write,
             can_test: permissions.test && record.write.test_profile.is_some(),
-            can_refresh: permissions.refresh && record.write.discovery.is_some(),
+            can_refresh: permissions.refresh
+                && record.write.enabled
+                && record.write.kind == ConnectionKind::McpStreamableHttp
+                && matches!(
+                    &record.write.discovery,
+                    Some(DiscoveryConfig::ManagedMcp { .. })
+                ),
             can_delete: permissions.write
                 && dependency_count == 0
                 && (!record.write.requires_secrets_write_to_delete() || permissions.secrets_write),

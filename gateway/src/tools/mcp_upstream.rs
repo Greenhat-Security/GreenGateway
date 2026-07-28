@@ -38,6 +38,10 @@ use sse_stream::{Sse, SseStream};
 
 use crate::{
     config::{Config, McpUpstreamServerConfig},
+    connections::http::{
+        ConnectionHttpError, ConnectionHttpRuntime, ConnectionHttpTarget,
+        ResolvedConnectionCredential,
+    },
     egress::{CheckedEgressDestination, EgressClient, EgressError},
     tools::definitions::ToolDefinition,
 };
@@ -111,6 +115,8 @@ pub enum McpUpstreamCallError {
     ClientBuild,
     Connect,
     Call,
+    Connection { reason: &'static str },
+    AuthenticationRejected,
     DiscoveryPageLimitExceeded { max: usize },
     DiscoveryToolLimitExceeded { max: usize },
     RequestBodyTooLarge { size: usize, max: usize },
@@ -124,6 +130,8 @@ impl McpUpstreamCallError {
             Self::ClientBuild => "client_build_failed",
             Self::Connect => "connect_failed",
             Self::Call => "call_failed",
+            Self::Connection { reason } => reason,
+            Self::AuthenticationRejected => "auth_failed",
             Self::DiscoveryPageLimitExceeded { .. } => "discovery_page_limit_exceeded",
             Self::DiscoveryToolLimitExceeded { .. } => "discovery_tool_limit_exceeded",
             Self::RequestBodyTooLarge { .. } => "request_body_too_large",
@@ -144,6 +152,12 @@ impl fmt::Display for McpUpstreamCallError {
             Self::ClientBuild => write!(formatter, "upstream MCP client could not be built"),
             Self::Connect => write!(formatter, "upstream MCP server could not be reached"),
             Self::Call => write!(formatter, "upstream MCP tool call failed"),
+            Self::Connection { reason } => {
+                write!(formatter, "managed MCP connection is unavailable: {reason}")
+            }
+            Self::AuthenticationRejected => {
+                formatter.write_str("managed MCP authentication failed")
+            }
             Self::DiscoveryPageLimitExceeded { max } => write!(
                 formatter,
                 "upstream MCP tools/list pagination exceeded {max} pages"
@@ -184,6 +198,16 @@ impl McpUpstreamRuntimeConfig {
             connect_timeout: Duration::from_millis(config.egress_connect_timeout_ms),
             max_request_body_bytes: config.egress_max_request_body_bytes,
             max_response_bytes: config.egress_max_response_bytes,
+        }
+    }
+
+    fn from_connection_target(target: &ConnectionHttpTarget) -> Self {
+        Self {
+            timeout: target.client().request_timeout(),
+            response_idle_timeout: target.client().response_idle_timeout(),
+            connect_timeout: target.client().connect_timeout(),
+            max_request_body_bytes: target.client().max_request_body_bytes(),
+            max_response_bytes: target.client().max_response_bytes(),
         }
     }
 }
@@ -321,6 +345,90 @@ pub async fn call_tool(
     Ok(result)
 }
 
+pub async fn discover_connection_tools(
+    runtime: &ConnectionHttpRuntime,
+    connection_id: &str,
+    expected_connection_etag: &str,
+) -> Result<Vec<ToolDefinition>, McpUpstreamCallError> {
+    let target = runtime
+        .mcp_target(connection_id)
+        .map_err(connection_mcp_error)?;
+    if target.connection_etag() != expected_connection_etag {
+        return Err(McpUpstreamCallError::Connection {
+            reason: "connection_changed",
+        });
+    }
+    let runtime_config = McpUpstreamRuntimeConfig::from_connection_target(&target);
+    let destination = target
+        .client()
+        .checked_destination(target.url())
+        .await
+        .map_err(|_| McpUpstreamCallError::EgressRejected)?;
+    let credential = runtime
+        .resolve_credential(&target)
+        .await
+        .map_err(connection_mcp_error)?
+        .map(Arc::new);
+    let mut service =
+        connect_connection(&target, &runtime_config, &destination, credential).await?;
+    let tools = list_tools_with_limits(&mut service).await;
+    let _ = service.close_with_timeout(Duration::from_millis(250)).await;
+    tools.map(|tools| {
+        tools
+            .into_iter()
+            .map(|tool| connection_proxy_definition(connection_id, tool))
+            .collect()
+    })
+}
+
+pub async fn call_connection_tool(
+    runtime: &ConnectionHttpRuntime,
+    connection_id: &str,
+    expected_connection_etag: &str,
+    remote_tool_name: &str,
+    args: Value,
+) -> Result<CallToolResult, McpUpstreamCallError> {
+    let target = runtime
+        .mcp_target(connection_id)
+        .map_err(connection_mcp_error)?;
+    if target.connection_etag() != expected_connection_etag {
+        return Err(McpUpstreamCallError::Connection {
+            reason: "catalog_stale",
+        });
+    }
+    let runtime_config = McpUpstreamRuntimeConfig::from_connection_target(&target);
+    let arguments = match args {
+        Value::Object(arguments) => arguments,
+        _ => JsonObject::new(),
+    };
+    let request = CallToolRequestParams::new(remote_tool_name.to_owned()).with_arguments(arguments);
+    enforce_mcp_call_request_size_before_egress(&request, runtime_config.max_request_body_bytes)?;
+    let destination = target
+        .client()
+        .checked_destination(target.url())
+        .await
+        .map_err(|_| McpUpstreamCallError::EgressRejected)?;
+    let credential = runtime
+        .resolve_credential(&target)
+        .await
+        .map_err(connection_mcp_error)?
+        .map(Arc::new);
+    let mut service =
+        connect_connection(&target, &runtime_config, &destination, credential).await?;
+    let result = service
+        .call_tool(request)
+        .await
+        .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+    let _ = service.close_with_timeout(Duration::from_millis(250)).await;
+    Ok(result)
+}
+
+fn connection_mcp_error(error: ConnectionHttpError) -> McpUpstreamCallError {
+    McpUpstreamCallError::Connection {
+        reason: error.safe_reason(),
+    }
+}
+
 fn enforce_mcp_call_request_size_before_egress(
     request: &CallToolRequestParams,
     max_request_body_bytes: usize,
@@ -418,21 +526,68 @@ async fn connect(
     runtime_config: &McpUpstreamRuntimeConfig,
     destination: &CheckedEgressDestination,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
-    let client = mcp_http_client(server, runtime_config, destination)?;
+    connect_endpoint(
+        &server.name,
+        &server.url,
+        server_timeout(server, runtime_config),
+        server_response_idle_timeout(server, runtime_config),
+        server_connect_timeout(server, runtime_config),
+        runtime_config,
+        destination,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn connect_connection(
+    target: &ConnectionHttpTarget,
+    runtime_config: &McpUpstreamRuntimeConfig,
+    destination: &CheckedEgressDestination,
+    credential: Option<Arc<ResolvedConnectionCredential>>,
+) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
+    connect_endpoint(
+        target.connection_id().as_str(),
+        target.url(),
+        runtime_config.timeout,
+        runtime_config.response_idle_timeout,
+        runtime_config.connect_timeout,
+        runtime_config,
+        destination,
+        credential,
+        target.credential_header_name().cloned(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_endpoint(
+    server_name: &str,
+    url: &str,
+    timeout: Duration,
+    response_idle_timeout: Duration,
+    connect_timeout: Duration,
+    runtime_config: &McpUpstreamRuntimeConfig,
+    destination: &CheckedEgressDestination,
+    credential: Option<Arc<ResolvedConnectionCredential>>,
+    credential_header_name: Option<HeaderName>,
+) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
+    let client = mcp_http_client(timeout, response_idle_timeout, connect_timeout, destination)?;
     let client = LimitedMcpHttpClient::new(
         client,
         runtime_config.max_request_body_bytes,
         runtime_config.max_response_bytes,
-    );
+    )
+    .with_connection_credential(credential, credential_header_name);
     let transport = StreamableHttpClientTransport::with_client(
         client,
-        StreamableHttpClientTransportConfig::with_uri(server.url.clone()),
+        StreamableHttpClientTransportConfig::with_uri(url.to_owned()),
     );
 
     let started = Instant::now();
     let result = rmcp::serve_client((), transport).await;
     tracing::debug!(
-        server_name = %server.name,
+        server_name,
         latency_ms = duration_millis(started.elapsed()),
         "MCP upstream client initialized"
     );
@@ -440,15 +595,16 @@ async fn connect(
 }
 
 fn mcp_http_client(
-    server: &McpUpstreamServerConfig,
-    runtime_config: &McpUpstreamRuntimeConfig,
+    timeout: Duration,
+    response_idle_timeout: Duration,
+    connect_timeout: Duration,
     destination: &CheckedEgressDestination,
 ) -> Result<rmcp_reqwest::Client, McpUpstreamCallError> {
     rmcp_reqwest::Client::builder()
         .no_proxy()
-        .timeout(server_timeout(server, runtime_config))
-        .read_timeout(server_response_idle_timeout(server, runtime_config))
-        .connect_timeout(server_connect_timeout(server, runtime_config))
+        .timeout(timeout)
+        .read_timeout(response_idle_timeout)
+        .connect_timeout(connect_timeout)
         .redirect(rmcp_reqwest::redirect::Policy::none())
         .resolve(&destination.host, destination.pinned_addr)
         .build()
@@ -460,6 +616,9 @@ struct LimitedMcpHttpClient {
     inner: rmcp_reqwest::Client,
     max_request_body_bytes: usize,
     max_response_bytes: usize,
+    managed_connection: bool,
+    connection_credential: Option<Arc<ResolvedConnectionCredential>>,
+    credential_header_name: Option<HeaderName>,
 }
 
 impl LimitedMcpHttpClient {
@@ -472,13 +631,69 @@ impl LimitedMcpHttpClient {
             inner,
             max_request_body_bytes,
             max_response_bytes,
+            managed_connection: false,
+            connection_credential: None,
+            credential_header_name: None,
         }
+    }
+
+    fn with_connection_credential(
+        mut self,
+        connection_credential: Option<Arc<ResolvedConnectionCredential>>,
+        credential_header_name: Option<HeaderName>,
+    ) -> Self {
+        self.managed_connection = true;
+        self.connection_credential = connection_credential;
+        self.credential_header_name = credential_header_name;
+        self
+    }
+
+    fn apply_connection_credential(
+        &self,
+        builder: rmcp_reqwest::RequestBuilder,
+    ) -> Result<rmcp_reqwest::RequestBuilder, StreamableHttpError<LimitedMcpHttpError>> {
+        let Some(credential) = self.connection_credential.as_ref() else {
+            return Ok(builder);
+        };
+        let mut headers = http::HeaderMap::new();
+        credential
+            .inject(&mut headers)
+            .map_err(|error| StreamableHttpError::Client(LimitedMcpHttpError::Connection(error)))?;
+        Ok(builder.headers(headers))
+    }
+
+    async fn reject_connection_authentication(
+        &self,
+        response: rmcp_reqwest::Response,
+    ) -> Result<rmcp_reqwest::Response, StreamableHttpError<LimitedMcpHttpError>> {
+        if self.managed_connection
+            && matches!(
+                response.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            )
+        {
+            if response.status() == StatusCode::UNAUTHORIZED {
+                if let Some(credential) = self
+                    .connection_credential
+                    .as_ref()
+                    .filter(|credential| credential.is_oauth())
+                {
+                    credential.invalidate_after_unauthorized().await;
+                }
+            }
+            return Err(StreamableHttpError::Client(
+                LimitedMcpHttpError::AuthenticationRejected,
+            ));
+        }
+        Ok(response)
     }
 }
 
 #[derive(Debug)]
 enum LimitedMcpHttpError {
     Http(&'static str),
+    Connection(ConnectionHttpError),
+    AuthenticationRejected,
     Serialize(serde_json::Error),
     RequestBodyTooLarge { size: usize, max: usize },
     ResponseTooLarge { max: usize },
@@ -488,6 +703,10 @@ impl fmt::Display for LimitedMcpHttpError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Http(category) => write!(formatter, "MCP upstream HTTP error: {category}"),
+            Self::Connection(error) => write!(formatter, "MCP connection error: {error}"),
+            Self::AuthenticationRejected => {
+                formatter.write_str("MCP connection authentication rejected")
+            }
             Self::Serialize(error) => {
                 write!(formatter, "MCP upstream JSON serialize error: {error}")
             }
@@ -508,9 +727,11 @@ impl Error for LimitedMcpHttpError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Serialize(error) => Some(error),
-            Self::Http(_) | Self::RequestBodyTooLarge { .. } | Self::ResponseTooLarge { .. } => {
-                None
-            }
+            Self::Connection(error) => Some(error),
+            Self::Http(_)
+            | Self::AuthenticationRejected
+            | Self::RequestBodyTooLarge { .. }
+            | Self::ResponseTooLarge { .. } => None,
         }
     }
 }
@@ -546,11 +767,20 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
         if let Some(last_event_id) = last_event_id {
             request_builder = request_builder.header(HEADER_LAST_EVENT_ID, last_event_id);
         }
-        if let Some(auth_header) = auth_token {
-            request_builder = request_builder.bearer_auth(auth_header);
+        if !self.managed_connection {
+            if let Some(auth_header) = auth_token {
+                request_builder = request_builder.bearer_auth(auth_header);
+            }
         }
-        request_builder = apply_mcp_custom_headers(request_builder, custom_headers)?;
+        request_builder = apply_mcp_custom_headers(
+            request_builder,
+            custom_headers,
+            self.credential_header_name.as_ref(),
+            self.managed_connection,
+        )?;
+        request_builder = self.apply_connection_credential(request_builder)?;
         let response = request_builder.send().await.map_err(mcp_http_error)?;
+        let response = self.reject_connection_authentication(response).await?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
         }
@@ -574,12 +804,21 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
         let mut request_builder = self.inner.delete(uri.as_ref());
-        if let Some(auth_header) = auth_token {
-            request_builder = request_builder.bearer_auth(auth_header);
+        if !self.managed_connection {
+            if let Some(auth_header) = auth_token {
+                request_builder = request_builder.bearer_auth(auth_header);
+            }
         }
         request_builder = request_builder.header(HEADER_SESSION_ID, session.as_ref());
-        request_builder = apply_mcp_custom_headers(request_builder, custom_headers)?;
+        request_builder = apply_mcp_custom_headers(
+            request_builder,
+            custom_headers,
+            self.credential_header_name.as_ref(),
+            self.managed_connection,
+        )?;
+        request_builder = self.apply_connection_credential(request_builder)?;
         let response = request_builder.send().await.map_err(mcp_http_error)?;
+        let response = self.reject_connection_authentication(response).await?;
 
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             tracing::debug!("upstream MCP server does not support deleting sessions");
@@ -601,14 +840,21 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
             .inner
             .post(uri.as_ref())
             .header(ACCEPT, [EVENT_STREAM_MIME, JSON_MIME].join(", "));
-        if let Some(auth_header) = auth_token {
-            request = request.bearer_auth(auth_header);
+        if !self.managed_connection {
+            if let Some(auth_header) = auth_token {
+                request = request.bearer_auth(auth_header);
+            }
         }
 
         let custom_content_type = custom_headers
             .keys()
             .any(|name| name.as_str().eq_ignore_ascii_case(CONTENT_TYPE.as_str()));
-        request = apply_mcp_custom_headers(request, custom_headers)?;
+        request = apply_mcp_custom_headers(
+            request,
+            custom_headers,
+            self.credential_header_name.as_ref(),
+            self.managed_connection,
+        )?;
         let session_was_attached = session_id.is_some();
         if let Some(session_id) = session_id {
             request = request.header(HEADER_SESSION_ID, session_id.as_ref());
@@ -618,7 +864,9 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
         if !custom_content_type {
             request = request.header(CONTENT_TYPE, JSON_MIME);
         }
+        request = self.apply_connection_credential(request)?;
         let response = request.body(body).send().await.map_err(mcp_http_error)?;
+        let response = self.reject_connection_authentication(response).await?;
         if response.status() == StatusCode::UNAUTHORIZED
             && response.headers().contains_key(WWW_AUTHENTICATE)
         {
@@ -861,19 +1109,32 @@ fn validate_mcp_response_content_type(
 fn apply_mcp_custom_headers(
     mut builder: rmcp_reqwest::RequestBuilder,
     custom_headers: HashMap<HeaderName, HeaderValue>,
+    credential_header_name: Option<&HeaderName>,
+    managed_connection: bool,
 ) -> Result<rmcp_reqwest::RequestBuilder, StreamableHttpError<LimitedMcpHttpError>> {
     for (name, value) in custom_headers {
-        validate_mcp_custom_header(&name).map_err(StreamableHttpError::ReservedHeaderConflict)?;
+        validate_mcp_custom_header(&name, credential_header_name, managed_connection)
+            .map_err(StreamableHttpError::ReservedHeaderConflict)?;
         builder = builder.header(name, value);
     }
 
     Ok(builder)
 }
 
-fn validate_mcp_custom_header(name: &HeaderName) -> Result<(), String> {
+fn validate_mcp_custom_header(
+    name: &HeaderName,
+    credential_header_name: Option<&HeaderName>,
+    managed_connection: bool,
+) -> Result<(), String> {
     let is_reserved = name.as_str().eq_ignore_ascii_case("accept")
         || name.as_str().eq_ignore_ascii_case(HEADER_SESSION_ID)
-        || name.as_str().eq_ignore_ascii_case(HEADER_LAST_EVENT_ID);
+        || name.as_str().eq_ignore_ascii_case(HEADER_LAST_EVENT_ID)
+        || (managed_connection
+            && (name.as_str().eq_ignore_ascii_case("authorization")
+                || name.as_str().eq_ignore_ascii_case("cookie")
+                || name.as_str().eq_ignore_ascii_case("host")
+                || name.as_str().eq_ignore_ascii_case("content-length")))
+        || credential_header_name.is_some_and(|credential_header| credential_header == name);
     if is_reserved {
         return Err(name.to_string());
     }
@@ -921,13 +1182,51 @@ fn mcp_service_error<E>(error: E, fallback: McpUpstreamCallError) -> McpUpstream
 where
     E: Error + 'static,
 {
-    if let Some((size, max)) = mcp_request_body_too_large_size_max(&error) {
+    if mcp_authentication_rejected(&error) {
+        McpUpstreamCallError::AuthenticationRejected
+    } else if let Some((size, max)) = mcp_request_body_too_large_size_max(&error) {
         McpUpstreamCallError::RequestBodyTooLarge { size, max }
     } else if let Some(max) = mcp_response_too_large_max(&error) {
         McpUpstreamCallError::ResponseTooLarge { max }
     } else {
         fallback
     }
+}
+
+fn mcp_authentication_rejected(error: &(dyn Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(ServiceError::TransportSend(error)) = error.downcast_ref::<ServiceError>() {
+            if mcp_authentication_rejected(error.error.as_ref()) {
+                return true;
+            }
+        }
+        if let Some(ClientInitializeError::TransportError { error, .. }) =
+            error.downcast_ref::<ClientInitializeError>()
+        {
+            if mcp_authentication_rejected(error.error.as_ref()) {
+                return true;
+            }
+        }
+        if let Some(error) = error.downcast_ref::<DynamicTransportError>() {
+            if mcp_authentication_rejected(error.error.as_ref()) {
+                return true;
+            }
+        }
+        if matches!(
+            error.downcast_ref::<LimitedMcpHttpError>(),
+            Some(LimitedMcpHttpError::AuthenticationRejected)
+        ) || matches!(
+            error.downcast_ref::<StreamableHttpError<LimitedMcpHttpError>>(),
+            Some(StreamableHttpError::Client(
+                LimitedMcpHttpError::AuthenticationRejected
+            ))
+        ) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 fn mcp_streamable_error_response_too_large(
@@ -1027,6 +1326,21 @@ fn proxy_definition(server: &McpUpstreamServerConfig, tool: Tool) -> ToolDefinit
         description,
         Value::Object(tool.input_schema.as_ref().clone()),
         server.name.clone(),
+        remote_tool_name,
+    )
+}
+
+fn connection_proxy_definition(connection_id: &str, tool: Tool) -> ToolDefinition {
+    let remote_tool_name = tool.name.to_string();
+    let description = tool
+        .description
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| remote_tool_name.clone());
+    ToolDefinition::mcp_connection(
+        connection_id.to_owned(),
+        description,
+        Value::Object(tool.input_schema.as_ref().clone()),
         remote_tool_name,
     )
 }
@@ -1305,8 +1619,9 @@ mod tests {
             max_response_bytes: 1024,
         };
         let client = mcp_http_client(
-            &upstream,
-            &runtime,
+            server_timeout(&upstream, &runtime),
+            server_response_idle_timeout(&upstream, &runtime),
+            server_connect_timeout(&upstream, &runtime),
             &CheckedEgressDestination::for_test(host, direct_addr),
         )
         .expect("MCP client should build");
@@ -1494,6 +1809,153 @@ mod tests {
                 "MCP response error or log leaked {secret}: {output}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn managed_connection_credential_is_injected_on_post_get_and_delete() {
+        let api_key_header = HeaderName::from_static("x-managed-mcp-key");
+        let credential = Arc::new(ResolvedConnectionCredential::header_api_key_for_test(
+            api_key_header.clone(),
+            b"managed-mcp-key-canary",
+        ));
+        let request = ClientJsonRpcMessage::request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(
+                "credential_test".to_owned(),
+            ))),
+            NumberOrString::Number(1),
+        );
+
+        let (post_client, post_url, post_server) = managed_client_capture(
+            Arc::clone(&credential),
+            api_key_header.clone(),
+            b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        post_client
+            .post_message(
+                Arc::from(post_url),
+                request,
+                None,
+                Some("attacker-transport-token".to_owned()),
+                HashMap::new(),
+            )
+            .await
+            .expect("managed MCP POST should succeed");
+        assert_managed_credential_headers(post_server.await.expect("POST capture should finish"));
+
+        let (get_client, get_url, get_server) = managed_client_capture(
+            Arc::clone(&credential),
+            api_key_header.clone(),
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(matches!(
+            get_client
+                .get_stream(
+                    Arc::from(get_url),
+                    Arc::from("test-session"),
+                    None,
+                    Some("attacker-transport-token".to_owned()),
+                    HashMap::new(),
+                )
+                .await,
+            Err(StreamableHttpError::ServerDoesNotSupportSse)
+        ));
+        assert_managed_credential_headers(get_server.await.expect("GET capture should finish"));
+
+        let (delete_client, delete_url, delete_server) = managed_client_capture(
+            credential,
+            api_key_header,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        delete_client
+            .delete_session(
+                Arc::from(delete_url),
+                Arc::from("test-session"),
+                Some("attacker-transport-token".to_owned()),
+                HashMap::new(),
+            )
+            .await
+            .expect("managed MCP DELETE should succeed");
+        assert_managed_credential_headers(
+            delete_server.await.expect("DELETE capture should finish"),
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_authentication_rejection_discards_challenge_and_body() {
+        let api_key_header = HeaderName::from_static("x-managed-mcp-key");
+        let credential = Arc::new(ResolvedConnectionCredential::header_api_key_for_test(
+            api_key_header.clone(),
+            b"managed-mcp-key-canary",
+        ));
+        let (client, url, server) = managed_client_capture(
+            credential,
+            api_key_header,
+            b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"challenge-canary\"\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nConnection: close\r\n\r\ndenial-body-canary",
+        )
+        .await;
+        let request = ClientJsonRpcMessage::request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(
+                "credential_test".to_owned(),
+            ))),
+            NumberOrString::Number(1),
+        );
+        let error = client
+            .post_message(Arc::from(url), request, None, None, HashMap::new())
+            .await
+            .expect_err("managed authentication denial should fail");
+        let output = format!("{error} {error:?}");
+        assert!(output.contains("authentication rejected"));
+        assert!(!output.contains("challenge-canary"));
+        assert!(!output.contains("denial-body-canary"));
+        assert_managed_credential_headers(server.await.expect("denial capture should finish"));
+    }
+
+    async fn managed_client_capture(
+        credential: Arc<ResolvedConnectionCredential>,
+        credential_header_name: HeaderName,
+        response: &'static [u8],
+    ) -> (LimitedMcpHttpClient, String, JoinHandle<String>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("managed MCP capture listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("managed MCP capture address should be available");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("managed MCP capture server should accept a request");
+            let request = read_raw_http_request_headers(&mut stream).await;
+            stream
+                .write_all(response)
+                .await
+                .expect("managed MCP capture response should write");
+            request
+        });
+        let inner = rmcp_reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("managed MCP capture client should build");
+        (
+            LimitedMcpHttpClient::new(inner, 1024, 1024)
+                .with_connection_credential(Some(credential), Some(credential_header_name)),
+            format!("http://{address}/mcp"),
+            server,
+        )
+    }
+
+    fn assert_managed_credential_headers(request: String) {
+        let request = request.to_ascii_lowercase();
+        assert!(request.contains("\r\nx-managed-mcp-key: managed-mcp-key-canary\r\n"));
+        assert!(
+            !request.contains("authorization: bearer attacker-transport-token"),
+            "transport-provided auth must not override managed Connection authority"
+        );
     }
 
     async fn post_message_against_raw_response(

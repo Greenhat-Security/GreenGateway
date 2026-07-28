@@ -30,6 +30,7 @@ pub enum ConnectionStatusReason {
     LegacyConfigured,
     Disabled,
     TestSucceeded,
+    CatalogRefreshed,
     RequestFailed,
     EgressDenied,
     SecretUnavailable,

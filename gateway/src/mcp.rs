@@ -631,9 +631,10 @@ pub(crate) fn mcp_executor_from_config(
     runtime: crate::tools::runtime::ToolRuntime,
     egress_client: Arc<crate::egress::EgressClient>,
     connection_http: Option<crate::connections::http::ConnectionHttpRuntime>,
+    mcp_catalog_runtime: Option<crate::connections::mcp::McpConnectionCatalogRuntime>,
     audit: crate::audit::AuditLog,
 ) -> Result<Option<ToolExecutor>, ToolExecutorError> {
-    if registry.list().is_empty() {
+    if registry.list().is_empty() && mcp_catalog_runtime.is_none() {
         return Ok(None);
     }
 
@@ -643,6 +644,7 @@ pub(crate) fn mcp_executor_from_config(
         runtime,
         egress_client,
         connection_http,
+        mcp_catalog_runtime,
         audit,
     )
     .map(Some)
@@ -676,6 +678,7 @@ mod tests {
             registry,
             runtime,
             egress_client,
+            None,
             None,
             test_audit_log(),
         )

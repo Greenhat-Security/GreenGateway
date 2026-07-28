@@ -780,6 +780,18 @@ impl EgressClient {
         self.config.timeout
     }
 
+    pub(crate) fn response_idle_timeout(&self) -> Duration {
+        self.config.response_idle_timeout
+    }
+
+    pub(crate) fn connect_timeout(&self) -> Duration {
+        self.config.connect_timeout
+    }
+
+    pub(crate) fn max_request_body_bytes(&self) -> usize {
+        self.config.max_request_body_bytes
+    }
+
     pub(crate) fn max_response_bytes(&self) -> usize {
         self.config.max_response_bytes
     }
