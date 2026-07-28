@@ -1727,14 +1727,9 @@ impl SqliteConnectionStore {
         update: ConnectionStatusUpdate,
         deadline: Instant,
     ) -> Result<(SafeConnectionStatus, StoredConnection), ConnectionStoreError> {
-        let remaining = remaining_before(deadline, "connection status persistence")?;
+        remaining_before(deadline, "connection status persistence")?;
         let mut connection = self.try_connection_guard()?;
-        let remaining = remaining.min(remaining_before(deadline, "connection status persistence")?);
-        connection
-            .busy_timeout(remaining.min(DEFAULT_SQLITE_BUSY_TIMEOUT))
-            .map_err(|source| {
-                sqlite_error(&self.path, "status busy-timeout configuration", source)
-            })?;
+        refresh_status_busy_timeout(&connection, &self.path, Some(deadline))?;
 
         let result = self.append_status_with_connection(
             &mut connection,
@@ -1771,15 +1766,17 @@ impl SqliteConnectionStore {
             });
         }
         let observed_at = utc_timestamp()?;
-        ensure_before_optional_deadline(deadline, "connection status persistence")?;
+        refresh_status_busy_timeout(connection, &self.path, deadline)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| {
                 status_sqlite_error(&self.path, "status transaction", source, deadline)
             })?;
+        refresh_status_busy_timeout(&transaction, &self.path, deadline)?;
         let current = load_raw_by_id(&transaction, &self.path, id)?
             .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?
             .into_stored()?;
+        refresh_status_busy_timeout(&transaction, &self.path, deadline)?;
         validate_record_bindings(&transaction, &self.path, &current)?;
         ensure_etag(id, expected, &current)?;
         let status_revision = increment_revision(id, current.revisions.status)?;
@@ -1794,7 +1791,7 @@ impl SqliteConnectionStore {
                 })
             })
             .transpose()?;
-        ensure_before_optional_deadline(deadline, "connection status persistence")?;
+        refresh_status_busy_timeout(&transaction, &self.path, deadline)?;
         transaction
             .execute(
                 r#"
@@ -1821,7 +1818,7 @@ impl SqliteConnectionStore {
                 ],
             )
             .map_err(|source| status_sqlite_error(&self.path, "status insert", source, deadline))?;
-        ensure_before_optional_deadline(deadline, "connection status persistence")?;
+        refresh_status_busy_timeout(&transaction, &self.path, deadline)?;
         transaction
             .execute(
                 r#"
@@ -1862,7 +1859,7 @@ impl SqliteConnectionStore {
             .map_err(|source| {
                 status_sqlite_error(&self.path, "current status upsert", source, deadline)
             })?;
-        ensure_before_optional_deadline(deadline, "connection status persistence")?;
+        refresh_status_busy_timeout(&transaction, &self.path, deadline)?;
         let current_status_count = count_rows(
             &transaction,
             &self.path,
@@ -1875,7 +1872,7 @@ impl SqliteConnectionStore {
                 resource: "safe connection status rows",
                 maximum: MAX_STATUS_HISTORY_ROWS,
             })?;
-        ensure_before_optional_deadline(deadline, "connection status persistence")?;
+        refresh_status_busy_timeout(&transaction, &self.path, deadline)?;
         transaction
             .execute(
                 "UPDATE connection_records SET status_revision = ?1 WHERE id = ?2",
@@ -1884,7 +1881,7 @@ impl SqliteConnectionStore {
             .map_err(|source| {
                 status_sqlite_error(&self.path, "status revision update", source, deadline)
             })?;
-        ensure_before_optional_deadline(deadline, "connection status persistence")?;
+        refresh_status_busy_timeout(&transaction, &self.path, deadline)?;
         transaction
             .execute(
                 r#"
@@ -1901,7 +1898,7 @@ impl SqliteConnectionStore {
             .map_err(|source| {
                 status_sqlite_error(&self.path, "status history pruning", source, deadline)
             })?;
-        ensure_before_optional_deadline(deadline, "connection status persistence")?;
+        refresh_status_busy_timeout(&transaction, &self.path, deadline)?;
         transaction.commit().map_err(|source| {
             status_sqlite_error(&self.path, "status transaction commit", source, deadline)
         })?;
@@ -4733,12 +4730,18 @@ fn remaining_before(
         .ok_or(ConnectionStoreError::DeadlineExceeded { operation })
 }
 
-fn ensure_before_optional_deadline(
+fn refresh_status_busy_timeout(
+    connection: &Connection,
+    path: &Path,
     deadline: Option<Instant>,
-    operation: &'static str,
 ) -> Result<(), ConnectionStoreError> {
     if let Some(deadline) = deadline {
-        remaining_before(deadline, operation)?;
+        let remaining = remaining_before(deadline, "connection status persistence")?;
+        connection
+            .busy_timeout(remaining.min(DEFAULT_SQLITE_BUSY_TIMEOUT))
+            .map_err(|source| {
+                status_sqlite_error(path, "status busy-timeout refresh", source, Some(deadline))
+            })?;
     }
     Ok(())
 }
@@ -7030,6 +7033,78 @@ mod tests {
             updated.revisions.status,
             created.revisions.status + 1,
             "the committed record returned for runtime publication must carry the new status revision"
+        );
+    }
+
+    #[test]
+    fn status_commit_refreshes_busy_timeout_from_current_deadline_budget() {
+        let (_directory, path, store) = temporary_store("status-commit-deadline");
+        {
+            let connection = store.connection_guard();
+            connection
+                .execute_batch(
+                    "
+                    PRAGMA wal_checkpoint(TRUNCATE);
+                    PRAGMA journal_mode = DELETE;
+                    CREATE TABLE commit_deadline_probe (value INTEGER NOT NULL);
+                    ",
+                )
+                .expect("commit-deadline fixture should initialize");
+        }
+
+        let mut blocker = Connection::open(&path).expect("blocking connection should open");
+        let blocking_read = blocker
+            .transaction()
+            .expect("blocking read transaction should begin");
+        blocking_read
+            .query_row("SELECT COUNT(*) FROM commit_deadline_probe", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("blocking read should acquire a shared lock");
+
+        let mut connection = store.connection_guard();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(500);
+        refresh_status_busy_timeout(&connection, &path, Some(deadline))
+            .expect("initial timeout should configure");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("writer transaction should begin");
+        transaction
+            .execute("INSERT INTO commit_deadline_probe (value) VALUES (1)", [])
+            .expect("writer should reach commit while the reader holds its shared lock");
+
+        std::thread::sleep(Duration::from_millis(350));
+        refresh_status_busy_timeout(&transaction, &path, Some(deadline))
+            .expect("commit timeout should use only the fresh remaining budget");
+        let commit_error = transaction
+            .commit()
+            .expect_err("the blocked commit must not persist after its deadline");
+        assert!(matches!(
+            status_sqlite_error(
+                &path,
+                "status transaction commit",
+                commit_error,
+                Some(deadline),
+            ),
+            ConnectionStoreError::DeadlineExceeded { .. }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(700),
+            "commit must not reuse the stale initial 500ms busy timeout"
+        );
+
+        drop(blocking_read);
+        drop(connection);
+        let persisted: i64 = store
+            .connection_guard()
+            .query_row("SELECT COUNT(*) FROM commit_deadline_probe", [], |row| {
+                row.get(0)
+            })
+            .expect("rolled-back fixture should remain readable");
+        assert_eq!(
+            persisted, 0,
+            "the timed-out commit must roll back synchronously"
         );
     }
 

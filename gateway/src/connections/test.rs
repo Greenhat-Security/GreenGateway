@@ -18,6 +18,7 @@ use crate::{
 use super::{
     http::{ConnectionHttpError, ConnectionHttpRuntime},
     model::{ConnectionId, ConnectionKind},
+    oauth::scope_connection_test_oauth_mints,
     status::{ConnectionOperationalState, ConnectionStatusReason},
     store::{ConnectionStatusUpdate, StoredConnection},
 };
@@ -432,20 +433,26 @@ impl ConnectionTestService {
         expected_etag: &str,
         deadline: tokio::time::Instant,
     ) -> ConnectionTestExecution {
-        let started = Instant::now();
-        match record.write.kind {
-            ConnectionKind::HttpApi => {
-                match tokio::time::timeout_at(deadline, self.execute_http(record, expected_etag))
+        scope_connection_test_oauth_mints(async {
+            let started = Instant::now();
+            match record.write.kind {
+                ConnectionKind::HttpApi => {
+                    match tokio::time::timeout_at(
+                        deadline,
+                        self.execute_http(record, expected_etag),
+                    )
                     .await
-                {
-                    Ok(execution) => execution,
-                    Err(_) => deadline_execution(started),
+                    {
+                        Ok(execution) => execution,
+                        Err(_) => deadline_execution(started),
+                    }
+                }
+                ConnectionKind::McpStreamableHttp => {
+                    self.execute_mcp(record, expected_etag, deadline).await
                 }
             }
-            ConnectionKind::McpStreamableHttp => {
-                self.execute_mcp(record, expected_etag, deadline).await
-            }
-        }
+        })
+        .await
     }
 
     async fn execute_http(

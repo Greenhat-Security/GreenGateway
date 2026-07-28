@@ -1110,6 +1110,7 @@ mod tests {
     struct CapturedTokenRequest {
         head: String,
         body: String,
+        response_sent: bool,
     }
 
     async fn one_request_tls_token_server(
@@ -1187,21 +1188,29 @@ mod tests {
                 .expect("token server TLS should succeed");
             let request = read_http_request(&mut stream).await;
             let _ = request_received_tx.send(());
-            tokio::time::sleep(response_delay).await;
-            let reason = status.canonical_reason().unwrap_or("Response");
-            let response = format!(
-                "HTTP/1.1 {} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                status.as_u16(),
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .expect("token response headers should write");
-            stream
-                .write_all(&body)
-                .await
-                .expect("token response body should write");
+            let mut disconnected = [0_u8; 1];
+            let response_sent = tokio::select! {
+                () = tokio::time::sleep(response_delay) => {
+                    let reason = status.canonical_reason().unwrap_or("Response");
+                    let response = format!(
+                        "HTTP/1.1 {} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status.as_u16(),
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("token response headers should write");
+                    stream
+                        .write_all(&body)
+                        .await
+                        .expect("token response body should write");
+                    true
+                }
+                _ = stream.read(&mut disconnected) => false,
+            };
+            let mut request = request;
+            request.response_sent = response_sent;
             request
         });
         (addr, ca.pem(), handle, request_received_rx)
@@ -1247,6 +1256,7 @@ mod tests {
                 &bytes[header_end..header_end.saturating_add(content_length)],
             )
             .into_owned(),
+            response_sent: false,
         }
     }
 
@@ -2065,6 +2075,85 @@ mod tests {
         assert_eq!(
             execution.status_reason,
             ConnectionStatusReason::RequestFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_connection_test_drops_owned_oauth_mint_before_return() {
+        let token_response = serde_json::to_vec(&json!({
+            "access_token": OAUTH_ACCESS_TOKEN_CANARY,
+            "token_type": "Bearer",
+            "expires_in": 3600
+        }))
+        .expect("token response should serialize");
+        let (addr, ca_pem, token_server, request_received) = one_request_delayed_tls_token_server(
+            StatusCode::OK,
+            "application/json",
+            token_response,
+            Duration::from_secs(30),
+        )
+        .await;
+        let temporary = TemporaryOAuthRuntime::new(
+            "probe-owned-timeout",
+            format!("https://127.0.0.1:{}", addr.port()),
+            format!("https://127.0.0.1:{}/oauth/token", addr.port()),
+            HashSet::from(["127.0.0.1".to_owned()]),
+            Some(&ca_pem),
+        );
+        let original = temporary.stored_connection();
+        let mut replacement = original.write.clone();
+        replacement.test_profile = Some(ConnectionTestProfile {
+            method: "GET".to_owned(),
+            path: "/".to_owned(),
+            expected_statuses: vec![200],
+        });
+        let record = temporary
+            .runtime
+            .control_plane
+            .replace_managed(&original.id, &original.etag(), replacement)
+            .expect("OAuth test profile should replace");
+        let expected_etag = record.etag().to_string();
+
+        let execution = tokio::time::timeout(
+            Duration::from_secs(3),
+            ConnectionTestService::new(temporary.runtime.clone()).execute_before(
+                &record,
+                &expected_etag,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("the hard probe deadline should return promptly");
+        tokio::time::timeout(Duration::from_secs(1), request_received)
+            .await
+            .expect("the token request should start before the probe deadline")
+            .expect("the token endpoint should observe the owned mint");
+        let request = tokio::time::timeout(Duration::from_secs(1), token_server)
+            .await
+            .expect("no token-server I/O may survive the completed probe")
+            .expect("the token server should observe a cleanly dropped request");
+
+        assert!(
+            !request.response_sent,
+            "the cancelled mint must not complete"
+        );
+        assert_eq!(
+            execution.result.stages,
+            vec![ConnectionTestStage::failure(
+                ConnectionTestStageName::Connected,
+                ConnectionTestReason::DeadlineExceeded,
+            )]
+        );
+        let events = captured_audit_events(&temporary.capture, 1).await;
+        let refreshes = events
+            .iter()
+            .filter(|event| event.event_type == audit::event::CONNECTION_OAUTH_TOKEN_REFRESH)
+            .collect::<Vec<_>>();
+        assert_eq!(refreshes.len(), 1);
+        assert_eq!(refreshes[0].payload["outcome"], json!("failure"));
+        assert_eq!(
+            refreshes[0].payload["reason"],
+            json!("oauth_token_cancelled")
         );
     }
 
