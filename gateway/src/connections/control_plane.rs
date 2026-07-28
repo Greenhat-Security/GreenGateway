@@ -24,8 +24,8 @@ use super::{
         SecretPurpose, SecretResolveError, SecretResolveErrorKind, SecretResolver,
     },
     store::{
-        ConnectionEtag, ConnectionStore, ConnectionStoreError, SqliteConnectionStore,
-        StoredConnection,
+        ConnectionDependencyKind, ConnectionEtag, ConnectionStore, ConnectionStoreError,
+        SqliteConnectionStore, StoredConnection,
     },
 };
 
@@ -282,6 +282,20 @@ impl ConnectionControlPlane {
 
     pub fn runtime_snapshot(&self) -> Arc<ConnectionRuntimeSnapshot> {
         self.runtime.load_full()
+    }
+
+    pub fn replace_runtime_dependencies(
+        &self,
+        kind: ConnectionDependencyKind,
+        desired: &[(ConnectionId, String)],
+    ) -> Result<(), ConnectionMutationError> {
+        let _guard = self.mutation_guard();
+        if desired.is_empty() && self.managed.is_none() {
+            return Ok(());
+        }
+        self.managed_store()?
+            .replace_dependencies_for_kind(kind, desired)?;
+        Ok(())
     }
 
     pub fn create_managed(

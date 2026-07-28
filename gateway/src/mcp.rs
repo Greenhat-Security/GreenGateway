@@ -630,13 +630,22 @@ pub(crate) fn mcp_executor_from_config(
     registry: ToolRegistry,
     runtime: crate::tools::runtime::ToolRuntime,
     egress_client: Arc<crate::egress::EgressClient>,
+    connection_http: Option<crate::connections::http::ConnectionHttpRuntime>,
     audit: crate::audit::AuditLog,
 ) -> Result<Option<ToolExecutor>, ToolExecutorError> {
     if registry.list().is_empty() {
         return Ok(None);
     }
 
-    ToolExecutor::from_config(config, registry, runtime, egress_client, audit).map(Some)
+    ToolExecutor::from_config(
+        config,
+        registry,
+        runtime,
+        egress_client,
+        connection_http,
+        audit,
+    )
+    .map(Some)
 }
 
 #[cfg(test)]
@@ -662,9 +671,15 @@ mod tests {
                 .expect("test egress client should build"),
         );
 
-        let executor =
-            mcp_executor_from_config(&config, registry, runtime, egress_client, test_audit_log())
-                .expect("empty registry should be a valid no-executor configuration");
+        let executor = mcp_executor_from_config(
+            &config,
+            registry,
+            runtime,
+            egress_client,
+            None,
+            test_audit_log(),
+        )
+        .expect("empty registry should be a valid no-executor configuration");
 
         assert!(
             executor.is_none(),

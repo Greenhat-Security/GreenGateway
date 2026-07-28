@@ -20,9 +20,10 @@ use url::Url;
 use crate::{
     audit::{self, AuditEvent, AuditLog},
     config::{Config, McpUpstreamServerConfig},
+    connections::http::{ConnectionHttpError, ConnectionHttpRuntime, ConnectionHttpTarget},
     egress::{EgressClient, EgressError, EgressResponse},
     tools::{
-        definitions::{BodyMappingMode, McpProxyMapping, ToolDefinition, ToolRegistry},
+        definitions::{BodyMappingMode, McpProxyMapping, ToolDefinition, ToolRegistry, ToolTarget},
         mcp_upstream::{self, McpUpstreamRuntimeConfig},
         runtime::{ToolInvocationContext, ToolRuntime, ToolRuntimeError, ToolWorkErrorDisposition},
     },
@@ -77,6 +78,13 @@ const MAX_STRICT_SCHEMA_INJECTION_DEPTH: usize = 64;
 
 type ValidatorCache = HashMap<ValidatorCacheKey, Arc<jsonschema::Validator>>;
 
+struct ToolExecutorBackends {
+    upstream_url: Option<String>,
+    connection_http: Option<ConnectionHttpRuntime>,
+    mcp_upstream_servers: HashMap<String, McpUpstreamServerConfig>,
+    mcp_upstream_runtime_config: McpUpstreamRuntimeConfig,
+}
+
 #[allow(dead_code)] // Issue #33 will call this from the MCP endpoint.
 #[derive(Clone)]
 pub struct ToolExecutor {
@@ -85,6 +93,7 @@ pub struct ToolExecutor {
     egress_client: Arc<EgressClient>,
     audit: AuditLog,
     upstream_origin: Option<String>,
+    connection_http: Option<ConnectionHttpRuntime>,
     mcp_upstream_servers: Arc<HashMap<String, McpUpstreamServerConfig>>,
     mcp_upstream_runtime_config: Arc<McpUpstreamRuntimeConfig>,
     validator_cache: Arc<Mutex<ValidatorCache>>,
@@ -155,6 +164,10 @@ pub enum ToolExecutorError {
     },
     HttpRuleDenied {
         tool_name: String,
+    },
+    Connection {
+        tool_name: String,
+        reason: &'static str,
     },
 }
 
@@ -247,6 +260,12 @@ impl fmt::Display for ToolExecutorError {
             Self::HttpRuleDenied { tool_name } => {
                 write!(formatter, "tool '{tool_name}' HTTP operation is denied by policy")
             }
+            Self::Connection { tool_name, reason } => {
+                write!(
+                    formatter,
+                    "tool '{tool_name}' connection-bound request failed: {reason}"
+                )
+            }
         }
     }
 }
@@ -264,6 +283,7 @@ impl Error for ToolExecutorError {
 struct ToolUpstreamRequest {
     method: Method,
     path: String,
+    path_and_query: String,
     url: String,
     headers: HeaderMap,
     body: Option<Vec<u8>>,
@@ -304,9 +324,10 @@ impl ToolExecutor {
         registry: ToolRegistry,
         runtime: ToolRuntime,
         egress_client: Arc<EgressClient>,
+        connection_http: Option<ConnectionHttpRuntime>,
         audit: AuditLog,
     ) -> Result<Self, ToolExecutorError> {
-        let upstream_url = if registry.has_http_tools() {
+        let upstream_url = if registry.has_legacy_http_tools() {
             Some(
                 config
                     .upstream_url
@@ -327,9 +348,12 @@ impl ToolExecutor {
             runtime,
             egress_client,
             audit,
-            upstream_url,
-            mcp_upstream_servers,
-            McpUpstreamRuntimeConfig::from_config(config),
+            ToolExecutorBackends {
+                upstream_url: upstream_url.map(str::to_owned),
+                connection_http,
+                mcp_upstream_servers,
+                mcp_upstream_runtime_config: McpUpstreamRuntimeConfig::from_config(config),
+            },
         )
     }
 
@@ -346,14 +370,17 @@ impl ToolExecutor {
             runtime,
             egress_client,
             audit,
-            Some(upstream_url),
-            HashMap::new(),
-            McpUpstreamRuntimeConfig {
-                timeout: Duration::from_secs(30),
-                response_idle_timeout: Duration::from_secs(30),
-                connect_timeout: Duration::from_secs(10),
-                max_request_body_bytes: 1_048_576,
-                max_response_bytes: 5_242_880,
+            ToolExecutorBackends {
+                upstream_url: Some(upstream_url.to_owned()),
+                connection_http: None,
+                mcp_upstream_servers: HashMap::new(),
+                mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
+                    timeout: Duration::from_secs(30),
+                    response_idle_timeout: Duration::from_secs(30),
+                    connect_timeout: Duration::from_secs(10),
+                    max_request_body_bytes: 1_048_576,
+                    max_response_bytes: 5_242_880,
+                },
             },
         )
     }
@@ -363,18 +390,21 @@ impl ToolExecutor {
         runtime: ToolRuntime,
         egress_client: Arc<EgressClient>,
         audit: AuditLog,
-        upstream_url: Option<&str>,
-        mcp_upstream_servers: HashMap<String, McpUpstreamServerConfig>,
-        mcp_upstream_runtime_config: McpUpstreamRuntimeConfig,
+        backends: ToolExecutorBackends,
     ) -> Result<Self, ToolExecutorError> {
         Ok(Self {
             registry,
             runtime,
             egress_client,
             audit,
-            upstream_origin: upstream_url.map(upstream_origin_from_url).transpose()?,
-            mcp_upstream_servers: Arc::new(mcp_upstream_servers),
-            mcp_upstream_runtime_config: Arc::new(mcp_upstream_runtime_config),
+            upstream_origin: backends
+                .upstream_url
+                .as_deref()
+                .map(upstream_origin_from_url)
+                .transpose()?,
+            connection_http: backends.connection_http,
+            mcp_upstream_servers: Arc::new(backends.mcp_upstream_servers),
+            mcp_upstream_runtime_config: Arc::new(backends.mcp_upstream_runtime_config),
             validator_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -561,15 +591,59 @@ impl ToolExecutor {
             });
         }
         let started = Instant::now();
-        let result = self
-            .egress_client
-            .request_with_headers(
-                request.method.clone(),
-                &request.url,
-                request.headers,
-                request.body,
-            )
-            .await;
+        let request_method = request.method.clone();
+        let (result, connection_id) = match &tool.target {
+            Some(ToolTarget::Http { .. })
+                if !matches!(tool.source, crate::tools::definitions::ToolSource::Manual) =>
+            {
+                let error = ToolExecutorError::Connection {
+                    tool_name: tool.name.clone(),
+                    reason: "target_source_unsupported",
+                };
+                self.emit_executor_failure_observation(
+                    context,
+                    &tool,
+                    duration_millis(started.elapsed()),
+                    &error,
+                );
+                return Err(error);
+            }
+            Some(ToolTarget::Http { connection_id, .. }) => {
+                let result = self
+                    .execute_connection_http(context, &tool, connection_id, request)
+                    .await;
+                (result, Some(connection_id.as_str()))
+            }
+            Some(ToolTarget::Mcp { .. }) => {
+                let error = ToolExecutorError::Connection {
+                    tool_name: tool.name.clone(),
+                    reason: "target_kind_mismatch",
+                };
+                self.emit_executor_failure_observation(
+                    context,
+                    &tool,
+                    duration_millis(started.elapsed()),
+                    &error,
+                );
+                return Err(error);
+            }
+            None => {
+                let result = self
+                    .egress_client
+                    .request_with_headers(
+                        request.method.clone(),
+                        &request.url,
+                        request.headers,
+                        request.body,
+                    )
+                    .await
+                    .map_err(|source| ToolExecutorError::Egress {
+                        tool_name: tool.name.clone(),
+                        source,
+                    });
+                (result, None)
+            }
+        };
         let latency_ms = duration_millis(started.elapsed());
 
         match result {
@@ -578,7 +652,8 @@ impl ToolExecutor {
                 self.emit_upstream_audit(
                     context,
                     &tool,
-                    &request.method,
+                    &request_method,
+                    connection_id,
                     UpstreamAuditOutcome {
                         outcome: "success",
                         status: Some(status),
@@ -598,36 +673,84 @@ impl ToolExecutor {
                 );
                 Ok(ToolExecutionResult::Http(response))
             }
-            Err(source) => {
-                let reason = egress_error_reason(&source);
-                let status = egress_error_observation_status(&source);
+            Err(error) => {
+                let outcome = executor_failure_observation_outcome(latency_ms, &error);
                 self.emit_upstream_audit(
                     context,
                     &tool,
-                    &request.method,
+                    &request_method,
+                    connection_id,
                     UpstreamAuditOutcome {
                         outcome: "failure",
                         status: None,
                         latency_ms,
-                        reason: Some(reason),
+                        reason: outcome.reason,
                     },
                 );
-                self.emit_tool_observation(
-                    context,
-                    &tool,
-                    ToolObservationOutcome {
-                        status,
-                        latency_ms,
-                        schema_mismatch: false,
-                        reason: Some(reason),
-                    },
-                );
-                Err(ToolExecutorError::Egress {
-                    tool_name: tool.name.clone(),
-                    source,
-                })
+                self.emit_tool_observation(context, &tool, outcome);
+                Err(error)
             }
         }
+    }
+
+    async fn execute_connection_http(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        connection_id: &str,
+        mut request: ToolUpstreamRequest,
+    ) -> Result<EgressResponse, ToolExecutorError> {
+        let runtime =
+            self.connection_http
+                .as_ref()
+                .ok_or_else(|| ToolExecutorError::Connection {
+                    tool_name: tool.name.clone(),
+                    reason: "connection_runtime_unavailable",
+                })?;
+        let target = runtime
+            .target(connection_id, &request.path_and_query)
+            .map_err(|error| connection_tool_error(tool, error))?;
+        if let Some(header_name) = target.credential_header_name() {
+            request.headers.remove(header_name);
+        }
+
+        let destination = target
+            .client()
+            .checked_destination(target.url())
+            .await
+            .map_err(|source| connection_egress_tool_error(tool, &source))?;
+        let credential = runtime.resolve_credential(&target).await.map_err(|error| {
+            self.emit_connection_secret_resolution_failed(
+                context,
+                tool,
+                &target,
+                error.safe_reason(),
+            );
+            connection_tool_error(tool, error)
+        })?;
+        if let Some(credential) = credential {
+            credential.inject(&mut request.headers).map_err(|error| {
+                self.emit_connection_secret_resolution_failed(
+                    context,
+                    tool,
+                    &target,
+                    error.safe_reason(),
+                );
+                connection_tool_error(tool, error)
+            })?;
+        }
+
+        target
+            .client()
+            .request_with_headers_at_checked_destination(
+                &destination,
+                request.method,
+                target.url(),
+                request.headers,
+                request.body,
+            )
+            .await
+            .map_err(|source| connection_egress_tool_error(tool, &source))
     }
 
     async fn execute_mcp_proxy(
@@ -765,8 +888,13 @@ impl ToolExecutor {
             }
         })?;
         let path = render_path_template(tool, args)?;
-        let Some(upstream_origin) = self.upstream_origin.as_ref() else {
-            return Err(ToolExecutorError::MissingUpstreamUrl);
+        let connection_target = matches!(tool.target, Some(ToolTarget::Http { .. }));
+        let upstream_origin = if connection_target {
+            "http://connection.invalid"
+        } else {
+            self.upstream_origin
+                .as_deref()
+                .ok_or(ToolExecutorError::MissingUpstreamUrl)?
         };
         let mut url = Url::parse(&format!("{}{}", upstream_origin, path)).map_err(|err| {
             ToolExecutorError::UrlBuild {
@@ -831,6 +959,7 @@ impl ToolExecutor {
         Ok(ToolUpstreamRequest {
             method,
             path: url.path().to_owned(),
+            path_and_query: url[::url::Position::BeforePath..].to_owned(),
             url: url.to_string(),
             headers,
             body,
@@ -842,6 +971,7 @@ impl ToolExecutor {
         context: &ToolInvocationContext,
         tool: &ToolDefinition,
         method: &Method,
+        connection_id: Option<&str>,
         outcome: UpstreamAuditOutcome,
     ) {
         let mut payload = json!({
@@ -858,6 +988,9 @@ impl ToolExecutor {
         if let Some(reason) = outcome.reason {
             payload["reason"] = json!(reason);
         }
+        if let Some(connection_id) = connection_id {
+            payload["connection_id"] = json!(connection_id);
+        }
 
         self.audit.emit(AuditEvent::new(
             audit::event::TOOL_UPSTREAM_REQUEST,
@@ -865,6 +998,29 @@ impl ToolExecutor {
             &context.source_ip,
             context.actor.clone(),
             payload,
+        ));
+    }
+
+    fn emit_connection_secret_resolution_failed(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        target: &ConnectionHttpTarget,
+        reason: &'static str,
+    ) {
+        self.audit.emit(AuditEvent::new(
+            audit::event::CONNECTION_SECRET_RESOLUTION_FAILED,
+            &context.request_id,
+            &context.source_ip,
+            context.actor.clone(),
+            json!({
+                "connection_id": target.connection_id(),
+                "auth_type": target.authentication_kind(),
+                "consumer_kind": "manual_tool",
+                "consumer_id": tool.name,
+                "outcome": "failure",
+                "reason": reason,
+            }),
         ));
     }
 
@@ -1358,6 +1514,20 @@ fn mcp_upstream_error_observation_status(_error: &mcp_upstream::McpUpstreamCallE
     StatusCode::BAD_GATEWAY.as_u16()
 }
 
+fn connection_tool_error(tool: &ToolDefinition, error: ConnectionHttpError) -> ToolExecutorError {
+    ToolExecutorError::Connection {
+        tool_name: tool.name.clone(),
+        reason: error.safe_reason(),
+    }
+}
+
+fn connection_egress_tool_error(tool: &ToolDefinition, error: &EgressError) -> ToolExecutorError {
+    ToolExecutorError::Connection {
+        tool_name: tool.name.clone(),
+        reason: egress_error_reason(error),
+    }
+}
+
 fn executor_failure_observation_outcome(
     latency_ms: u64,
     error: &ToolExecutorError,
@@ -1386,6 +1556,19 @@ fn executor_failure_observation_outcome(
         },
         ToolExecutorError::McpUpstream { reason, .. } => ToolObservationOutcome {
             status: StatusCode::BAD_GATEWAY.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(reason),
+        },
+        ToolExecutorError::Connection { reason, .. } => ToolObservationOutcome {
+            status: match *reason {
+                "connection_disabled"
+                | "credential_unavailable"
+                | "transport_unavailable"
+                | "connection_runtime_unavailable" => StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                "timeout" | "response_idle_timeout" => StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                _ => StatusCode::BAD_GATEWAY.as_u16(),
+            },
             latency_ms,
             schema_mismatch: false,
             reason: Some(reason),
@@ -1493,6 +1676,7 @@ fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDi
             | ToolExecutorError::PathSegmentIsDotSegment { .. } => TOOL_INVALID_PARAMS_REASON,
             ToolExecutorError::Egress { source, .. } => egress_error_reason(source),
             ToolExecutorError::McpUpstream { reason, .. } => reason,
+            ToolExecutorError::Connection { reason, .. } => reason,
             ToolExecutorError::MissingUpstreamUrl
             | ToolExecutorError::InvalidUpstreamUrl { .. }
             | ToolExecutorError::SchemaCacheKey { .. }
@@ -1519,7 +1703,9 @@ fn tool_observation_path(tool_name: &str) -> String {
 mod tests {
     use std::{
         collections::HashMap,
+        fs,
         net::SocketAddr,
+        net::{IpAddr, Ipv4Addr},
         path::{Path, PathBuf},
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -1532,9 +1718,16 @@ mod tests {
     use rusqlite::{params, Connection};
     use serde_json::json;
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, TcpStream},
+        io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+        net::TcpListener,
         sync::Notify,
+    };
+    use tokio_rustls::{
+        rustls::{
+            pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+            ServerConfig,
+        },
+        TlsAcceptor,
     };
 
     use super::*;
@@ -1542,6 +1735,15 @@ mod tests {
         audit::{
             sink::{tests::CaptureSink, AuditSink, CompositeSink},
             Actor, AuditLog,
+        },
+        connections::{
+            control_plane::ConnectionControlPlane,
+            http::ConnectionHttpRuntime,
+            model::{
+                ConnectionAuthentication, ConnectionEndpoint, ConnectionKind, ConnectionWrite,
+                TlsProfile,
+            },
+            secret::{OperatorSecretAliasConfig, OperatorSecretAliasSource, SecretRootConfig},
         },
         discovery::{
             aggregator::{EndpointAggregatorSink, EndpointAggregatorSinkConfig},
@@ -1622,6 +1824,200 @@ mod tests {
             "tool observation event should include latency_ms"
         );
         assert_eq!(executor.validator_cache_guard().len(), 1);
+    }
+
+    #[test]
+    fn connection_only_registry_does_not_require_the_legacy_upstream_url() {
+        let registry = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [connection_charge_tool("billing-api")]
+        }))
+        .expect("connection-bound registry should load");
+        let config = Config::test_defaults();
+        assert!(config.upstream_url.is_none());
+        let audit = AuditLog::new(Arc::new(CaptureSink::new()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new(
+            runtime_config([("get_charge", enabled_tool(500, 1))], 2, 1, 100),
+            audit.clone(),
+        );
+        let egress = Arc::new(
+            EgressClient::new(EgressConfig::default()).expect("egress client should build"),
+        );
+
+        ToolExecutor::from_config(&config, registry, runtime, egress, None, audit)
+            .expect("a connection-only registry must not require UPSTREAM_URL");
+    }
+
+    #[tokio::test]
+    async fn connection_bound_manual_tool_injects_operator_api_key_after_destination_check() {
+        let (addr, ca_pem, server) = one_request_tls_server().await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"operator-owned-key");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new(
+            runtime_config([("get_charge", enabled_tool(2_000, 1))], 2, 1, 100),
+            audit.clone(),
+        );
+        let executor = executor_for_connection_tool(
+            connection_charge_tool(&connection.connection_id),
+            &connection,
+            runtime,
+            audit,
+        );
+
+        let response = http_response(
+            executor
+                .execute(
+                    "get_charge",
+                    json!({ "charge_id": "ch_123" }),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("connection-bound tool invocation should succeed"),
+        );
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, b"secure");
+        let request = server.await.expect("TLS server task should join");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/v1/charges/ch_123");
+        assert_eq!(request.header("x-api-key"), Some("operator-owned-key"));
+        assert_eq!(request.header("authorization"), None);
+        assert_eq!(request.header("cookie"), None);
+
+        let events = audit_events(&capture, 4).await;
+        let upstream = events
+            .iter()
+            .find(|event| event.event_type == audit::event::TOOL_UPSTREAM_REQUEST)
+            .expect("tool upstream event should exist");
+        assert_eq!(
+            upstream.payload["connection_id"],
+            json!(connection.connection_id)
+        );
+        assert!(
+            !format!("{events:?}").contains("operator-owned-key"),
+            "audit events must never contain resolved credential material"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_tool_checks_egress_before_reading_the_secret_provider() {
+        let (addr, ca_pem, server) = one_request_tls_server().await;
+        let mut connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"unread-secret");
+        fs::remove_file(&connection.secret_path)
+            .expect("provider file should disappear after Connection activation");
+        let blocked_config = EgressConfig::default();
+        let blocked_client = Arc::new(
+            EgressClient::new(blocked_config.clone()).expect("blocked egress should build"),
+        );
+        connection.runtime = ConnectionHttpRuntime::new(
+            connection.control_plane.clone(),
+            blocked_config,
+            Arc::clone(&blocked_client),
+        );
+        connection.egress_client = blocked_client;
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new(
+            runtime_config([("get_charge", enabled_tool(500, 1))], 2, 1, 100),
+            audit.clone(),
+        );
+        let executor = executor_for_connection_tool(
+            connection_charge_tool(&connection.connection_id),
+            &connection,
+            runtime,
+            audit,
+        );
+
+        let error = executor
+            .execute(
+                "get_charge",
+                json!({ "charge_id": "ch_egress_first" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("non-allowlisted Connection destination must fail closed");
+        let message = work_failed_message(error);
+        assert!(message.contains("host_not_allowed"));
+        assert!(!message.contains("127.0.0.1"));
+        let events = audit_events(&capture, 3).await;
+        assert!(
+            events.iter().all(|event| {
+                event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
+            }),
+            "the provider must not be touched after an egress denial"
+        );
+        assert!(
+            !format!("{events:?}").contains("unread-secret"),
+            "failure telemetry must not contain secret material"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "egress denial must happen before the TLS upstream receives a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_tool_secret_failure_is_safe_and_audited_without_upstream_bytes() {
+        let (addr, ca_pem, server) = one_request_tls_server().await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"never-log-this");
+        fs::remove_file(&connection.secret_path)
+            .expect("provider file should disappear after Connection activation");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new(
+            runtime_config([("get_charge", enabled_tool(500, 1))], 2, 1, 100),
+            audit.clone(),
+        );
+        let executor = executor_for_connection_tool(
+            connection_charge_tool(&connection.connection_id),
+            &connection,
+            runtime,
+            audit,
+        );
+
+        let error = executor
+            .execute(
+                "get_charge",
+                json!({ "charge_id": "ch_secret_failure" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("missing provider material must fail closed");
+        let message = work_failed_message(error);
+        assert!(message.contains("credential_unavailable"));
+        assert!(!message.contains("never-log-this"));
+        assert!(!message.contains("api-key"));
+
+        let events = audit_events(&capture, 4).await;
+        let failure = events
+            .iter()
+            .find(|event| event.event_type == audit::event::CONNECTION_SECRET_RESOLUTION_FAILED)
+            .expect("secret resolution failure should emit a dedicated audit event");
+        assert_eq!(
+            failure.payload["connection_id"],
+            json!(connection.connection_id)
+        );
+        assert_eq!(failure.payload["consumer_kind"], json!("manual_tool"));
+        assert_eq!(failure.payload["consumer_id"], json!("get_charge"));
+        assert_eq!(failure.payload["auth_type"], json!("header_api_key"));
+        assert_eq!(failure.payload["reason"], json!("credential_unavailable"));
+        let rendered_events = format!("{events:?}");
+        assert!(!rendered_events.contains("never-log-this"));
+        assert!(!rendered_events.contains(&format!("https://127.0.0.1:{}", addr.port())));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "credential resolution failure must happen before upstream bytes"
+        );
     }
 
     #[tokio::test]
@@ -2382,6 +2778,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_http_deny_rule_runs_before_connection_lookup() {
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = live_policy_runtime(
+            json!({
+                "schema_version": "0.1.0",
+                "tools": {
+                    "get_charge": {
+                        "timeout_ms": 500,
+                        "max_concurrent": 1
+                    }
+                },
+                "rules": [
+                    {
+                        "id": "deny-charge-http-path",
+                        "methods": ["GET"],
+                        "path": "/charges/{charge_id}",
+                        "action": "deny"
+                    }
+                ]
+            }),
+            audit.clone(),
+            runtime_config([("get_charge", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let registry = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [connection_charge_tool("missing-connection")]
+        }))
+        .expect("connection-bound tool should load");
+        let executor = executor_for_registry_with_runtime(registry, runtime, audit, None);
+
+        let error = executor
+            .execute(
+                "get_charge",
+                json!({ "charge_id": "private" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("matching deny rule should reject before Connection lookup");
+        assert!(matches!(
+            error,
+            ToolRuntimeError::Rejected { ref reason, .. } if reason == TOOL_MATCHED_RULE_REASON
+        ));
+        let events = audit_events(&capture, 3).await;
+        assert!(events.iter().any(|event| {
+            event.event_type == "authz.denied"
+                && event.payload["matched_rule_id"] == json!("deny-charge-http-path")
+        }));
+        assert!(events.iter().all(|event| {
+            event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
+        }));
+    }
+
+    #[tokio::test]
     async fn direct_http_shadow_rule_audits_rendered_tool_path_and_allows_egress() {
         let (addr, server) = one_request_server(StatusCode::OK, b"ok").await;
         let capture = CaptureSink::new();
@@ -2973,19 +3424,54 @@ mod tests {
             runtime,
             egress_client,
             audit,
-            upstream_url.as_deref(),
-            HashMap::new(),
-            McpUpstreamRuntimeConfig {
-                timeout: Duration::from_secs(30),
-                response_idle_timeout: Duration::from_secs(30),
-                connect_timeout: Duration::from_secs(10),
-                max_request_body_bytes: 1_048_576,
-                max_response_bytes: 5_242_880,
+            ToolExecutorBackends {
+                upstream_url,
+                connection_http: None,
+                mcp_upstream_servers: HashMap::new(),
+                mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
+                    timeout: Duration::from_secs(30),
+                    response_idle_timeout: Duration::from_secs(30),
+                    connect_timeout: Duration::from_secs(10),
+                    max_request_body_bytes: 1_048_576,
+                    max_response_bytes: 5_242_880,
+                },
             },
         )
         .expect("tool executor should build");
 
         executor
+    }
+
+    fn executor_for_connection_tool(
+        tool: Value,
+        connection: &TemporaryStaticAuthRuntime,
+        runtime: ToolRuntime,
+        audit: AuditLog,
+    ) -> ToolExecutor {
+        let registry = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect("connection-bound tool should load");
+        ToolExecutor::new_inner(
+            registry,
+            runtime,
+            Arc::clone(&connection.egress_client),
+            audit,
+            ToolExecutorBackends {
+                upstream_url: None,
+                connection_http: Some(connection.runtime.clone()),
+                mcp_upstream_servers: HashMap::new(),
+                mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
+                    timeout: Duration::from_secs(30),
+                    response_idle_timeout: Duration::from_secs(30),
+                    connect_timeout: Duration::from_secs(10),
+                    max_request_body_bytes: 1_048_576,
+                    max_response_bytes: 5_242_880,
+                },
+            },
+        )
+        .expect("connection-bound tool executor should build without UPSTREAM_URL")
     }
 
     fn live_policy_runtime(
@@ -3083,6 +3569,34 @@ mod tests {
                     "mode": "whole_args_json"
                 }
             }
+        })
+    }
+
+    fn connection_charge_tool(connection_id: &str) -> Value {
+        let mapping = json!({
+            "method": "GET",
+            "path_template": "/charges/{charge_id}"
+        });
+        json!({
+            "name": "get_charge",
+            "description": "Looks up a charge through an operator-managed Connection.",
+            "input_json_schema": {
+                "type": "object",
+                "required": ["charge_id"],
+                "properties": {
+                    "charge_id": { "type": "string" }
+                },
+                "additionalProperties": false
+            },
+            "target": {
+                "type": "http",
+                "connection_id": connection_id,
+                "mapping": mapping
+            },
+            "source": {
+                "type": "manual"
+            },
+            "upstream": mapping
         })
     }
 
@@ -3437,6 +3951,174 @@ mod tests {
         (addr, handle)
     }
 
+    async fn one_request_tls_server(
+    ) -> (SocketAddr, String, tokio::task::JoinHandle<CapturedRequest>) {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "GreenGateway Tool Test CA");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().expect("test CA key should generate");
+        let ca = ca_params
+            .self_signed(&ca_key)
+            .expect("test CA certificate should build");
+        let mut server_params = rcgen::CertificateParams::default();
+        server_params.distinguished_name = rcgen::DistinguishedName::new();
+        server_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "127.0.0.1");
+        server_params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let server_key = rcgen::KeyPair::generate().expect("test server key should generate");
+        let server_certificate = server_params
+            .signed_by(&server_key, &ca, &ca_key)
+            .expect("test server certificate should build");
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(
+                    server_certificate.der().as_ref().to_vec(),
+                )],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+            )
+            .expect("test TLS server config should build");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test TLS listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test TLS listener address should be available");
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test TLS server should accept one request");
+            let mut stream = acceptor
+                .accept(stream)
+                .await
+                .expect("test TLS handshake should succeed");
+            let request = read_http_request(&mut stream).await;
+            write_response(&mut stream, StatusCode::OK, b"secure").await;
+            request
+        });
+
+        (addr, ca.pem(), handle)
+    }
+
+    struct TemporaryStaticAuthRuntime {
+        root: PathBuf,
+        secret_path: PathBuf,
+        connection_id: String,
+        control_plane: ConnectionControlPlane,
+        runtime: ConnectionHttpRuntime,
+        egress_client: Arc<EgressClient>,
+    }
+
+    impl TemporaryStaticAuthRuntime {
+        fn header_api_key(addr: SocketAddr, ca_pem: &str, secret: &[u8]) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "greengateway-tool-static-auth-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir(&root).expect("temporary Connection root should create");
+            let secret_path = root.join("api-key");
+            fs::write(&secret_path, secret).expect("temporary API key should write");
+            let ca_path = root.join("test-ca.pem");
+            fs::write(&ca_path, ca_pem).expect("test CA should write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                    .expect("temporary Connection root permissions should set");
+                fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600))
+                    .expect("temporary API-key permissions should set");
+                fs::set_permissions(&ca_path, fs::Permissions::from_mode(0o600))
+                    .expect("temporary CA permissions should set");
+            }
+
+            let mut config = Config::test_defaults();
+            config.connections_sqlite_path =
+                Some(root.join("connections.sqlite").display().to_string());
+            config.connection_secrets_root = Some(SecretRootConfig::new(root.clone()));
+            config.connection_secret_aliases = vec![OperatorSecretAliasConfig {
+                id: "billing-api-key".to_owned(),
+                label: "Billing API key".to_owned(),
+                source: OperatorSecretAliasSource::File {
+                    key: "api-key".to_owned(),
+                },
+            }];
+            let control_plane =
+                ConnectionControlPlane::from_config(&config).expect("control plane should build");
+            let initial = control_plane.runtime_snapshot();
+            let created = control_plane
+                .create_managed(
+                    initial.collection_etag(),
+                    ConnectionWrite {
+                        display_name: "Billing API".to_owned(),
+                        description: None,
+                        enabled: true,
+                        kind: ConnectionKind::HttpApi,
+                        endpoint: ConnectionEndpoint {
+                            base_url: format!("https://127.0.0.1:{}", addr.port()),
+                            base_path: "/v1".to_owned(),
+                        },
+                        authentication: ConnectionAuthentication::HeaderApiKey {
+                            header_name: "x-api-key".to_owned(),
+                            secret_id: Some("billing-api-key".to_owned()),
+                        },
+                        tls: TlsProfile::default(),
+                        timeouts: None,
+                        discovery: None,
+                        test_profile: None,
+                    },
+                )
+                .expect("test Connection should create");
+            let mut egress_config = EgressConfig {
+                allowed_hosts: ["127.0.0.1".to_owned()].into_iter().collect(),
+                deny_private_ips: false,
+                ..EgressConfig::default()
+            };
+            egress_config
+                .apply_tls_ca_bundle_path(ca_path)
+                .expect("test CA should configure");
+            let egress_client = Arc::new(
+                EgressClient::new(egress_config.clone()).expect("test egress client should build"),
+            );
+            let runtime = ConnectionHttpRuntime::new(
+                control_plane.clone(),
+                egress_config,
+                Arc::clone(&egress_client),
+            );
+
+            Self {
+                root,
+                secret_path,
+                connection_id: created.id.to_string(),
+                control_plane,
+                runtime,
+                egress_client,
+            }
+        }
+    }
+
+    impl Drop for TemporaryStaticAuthRuntime {
+        fn drop(&mut self) {
+            if self
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("greengateway-tool-static-auth-"))
+                && self.root.starts_with(std::env::temp_dir())
+            {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
     async fn delayed_response_server(
         delay: Duration,
     ) -> (SocketAddr, tokio::task::JoinHandle<CapturedRequest>) {
@@ -3503,7 +4185,10 @@ mod tests {
         }
     }
 
-    async fn read_http_request(stream: &mut TcpStream) -> CapturedRequest {
+    async fn read_http_request<S>(stream: &mut S) -> CapturedRequest
+    where
+        S: AsyncRead + Unpin,
+    {
         let mut bytes = Vec::new();
         let mut buffer = [0; 1024];
 
@@ -3554,7 +4239,10 @@ mod tests {
         }
     }
 
-    async fn write_response(stream: &mut TcpStream, status: StatusCode, body: &[u8]) {
+    async fn write_response<S>(stream: &mut S, status: StatusCode, body: &[u8])
+    where
+        S: AsyncWrite + Unpin,
+    {
         let reason = status.canonical_reason().unwrap_or("OK");
         let response = format!(
             "HTTP/1.1 {} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

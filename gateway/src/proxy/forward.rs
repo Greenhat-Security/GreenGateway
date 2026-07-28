@@ -20,7 +20,11 @@ use http::{
 use serde_json::json;
 
 use super::{retry, MatchedUpstream, ProxyState, RequestBodyMode, RouteRequestHeaderPolicy};
-use crate::{audit, egress, middleware};
+use crate::{
+    audit, auth,
+    connections::http::{ConnectionHttpError, ConnectionHttpTarget},
+    egress, middleware,
+};
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const STREAMING_DISCOVERY_CAPTURE_MAX_BYTES: usize = 64 * 1024;
@@ -330,12 +334,178 @@ async fn forward_to_upstream(
             )))
         }
     };
+    let connection_target = match upstream.connection_id.as_deref() {
+        Some(connection_id) => {
+            let Some(runtime) = proxy.connection_http.as_ref() else {
+                return connection_failure_response(
+                    ConnectionHttpError::TransportUnavailable,
+                    &upstream.pool.id,
+                    request_id,
+                    Vec::new(),
+                    Duration::ZERO,
+                );
+            };
+            let path_and_query = parts
+                .uri
+                .path_and_query()
+                .map_or("/", http::uri::PathAndQuery::as_str);
+            match runtime.target(connection_id, path_and_query) {
+                Ok(target) => {
+                    if super::validate_connection_header_policy(
+                        &upstream.request_header_policy,
+                        &target,
+                    )
+                    .is_err()
+                    {
+                        return connection_failure_response(
+                            ConnectionHttpError::CredentialHeaderConflict,
+                            &upstream.pool.id,
+                            request_id,
+                            Vec::new(),
+                            Duration::ZERO,
+                        );
+                    }
+                    Some(target)
+                }
+                Err(error) => {
+                    return connection_failure_response(
+                        error,
+                        &upstream.pool.id,
+                        request_id,
+                        Vec::new(),
+                        Duration::ZERO,
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+    let request_started = Instant::now();
+    let request_timeout = connection_target.as_ref().map_or_else(
+        || upstream.pool.request_timeout(),
+        |target| target.client().request_timeout(),
+    );
+    let deadline = tokio::time::Instant::now() + request_timeout;
+    let (checked_connection_destination, connection_headers) =
+        if let Some(target) = connection_target.as_ref() {
+            let checked = tokio::select! {
+                biased;
+                () = forced_shutdown.cancelled() => {
+                    return admission_unavailable_response(&upstream.pool.id, request_id);
+                }
+                checked = tokio::time::timeout_at(
+                    deadline,
+                    target.client().checked_destination(target.url()),
+                ) => checked,
+            };
+            let checked = match checked {
+                Err(_) => {
+                    return connection_failure_response(
+                        ConnectionHttpError::TransportUnavailable,
+                        &upstream.pool.id,
+                        request_id,
+                        Vec::new(),
+                        request_started.elapsed(),
+                    );
+                }
+                Ok(Err(error)) => {
+                    return error_response_with_outcome(
+                        &error,
+                        request_started.elapsed(),
+                        request_id,
+                        &upstream.pool.id,
+                        "primary",
+                        Vec::new(),
+                        false,
+                    );
+                }
+                Ok(Ok(checked)) => checked,
+            };
+
+            let runtime = proxy
+                .connection_http
+                .as_ref()
+                .expect("connection target requires a Connection HTTP runtime");
+            let credential = tokio::select! {
+                biased;
+                () = forced_shutdown.cancelled() => {
+                    return admission_unavailable_response(&upstream.pool.id, request_id);
+                }
+                credential = tokio::time::timeout_at(
+                    deadline,
+                    runtime.resolve_credential(target),
+                ) => credential,
+            };
+            let credential = match credential {
+                Err(_) => {
+                    emit_connection_secret_resolution_failed(
+                        proxy,
+                        &parts,
+                        source_ip,
+                        &upstream.pool.id,
+                        target,
+                        ConnectionHttpError::CredentialUnavailable.safe_reason(),
+                    );
+                    return connection_failure_response(
+                        ConnectionHttpError::CredentialUnavailable,
+                        &upstream.pool.id,
+                        request_id,
+                        Vec::new(),
+                        request_started.elapsed(),
+                    );
+                }
+                Ok(Err(error)) => {
+                    emit_connection_secret_resolution_failed(
+                        proxy,
+                        &parts,
+                        source_ip,
+                        &upstream.pool.id,
+                        target,
+                        error.safe_reason(),
+                    );
+                    return connection_failure_response(
+                        error,
+                        &upstream.pool.id,
+                        request_id,
+                        Vec::new(),
+                        request_started.elapsed(),
+                    );
+                }
+                Ok(Ok(credential)) => credential,
+            };
+            let mut headers = attempt_headers(
+                &parts.headers,
+                source_ip,
+                &upstream.request_header_policy,
+                target.credential_header_name(),
+            );
+            if let Some(credential) = credential.as_ref() {
+                if let Err(error) = credential.inject(&mut headers) {
+                    emit_connection_secret_resolution_failed(
+                        proxy,
+                        &parts,
+                        source_ip,
+                        &upstream.pool.id,
+                        target,
+                        error.safe_reason(),
+                    );
+                    return connection_failure_response(
+                        error,
+                        &upstream.pool.id,
+                        request_id,
+                        Vec::new(),
+                        request_started.elapsed(),
+                    );
+                }
+            }
+            (Some(checked), Some((headers, credential)))
+        } else {
+            (None, None)
+        };
     let max_attempts = upstream
         .pool
         .retry_policy
         .max_attempts_for(&parts.method, body.is_replayable());
-    let request_started = Instant::now();
-    let deadline = tokio::time::Instant::now() + upstream.pool.request_timeout();
     let mut attempted_endpoint_ids = HashSet::new();
     let mut attempts = Vec::with_capacity(usize::from(max_attempts));
     let mut active_retry_permit = None;
@@ -399,34 +569,79 @@ async fn forward_to_upstream(
                 request_started.elapsed(),
             );
         };
-        let target_url = proxy_target_url(&endpoint.upstream_origin, &parts.uri);
-        let headers = attempt_headers(&parts.headers, source_ip, &upstream.request_header_policy);
+        let target_url = connection_target.as_ref().map_or_else(
+            || proxy_target_url(&endpoint.upstream_origin, &parts.uri),
+            |target| target.url().to_owned(),
+        );
+        let headers = connection_headers.as_ref().map_or_else(
+            || {
+                attempt_headers(
+                    &parts.headers,
+                    source_ip,
+                    &upstream.request_header_policy,
+                    None,
+                )
+            },
+            |(headers, _credential)| headers.clone(),
+        );
+        let egress_client = connection_target
+            .as_ref()
+            .map_or(&endpoint.egress_client, ConnectionHttpTarget::client);
         let attempt_started = Instant::now();
         let send = async {
             if let Some(sse) = upstream.sse {
                 let max_response_bytes = sse
                     .max_response_bytes
-                    .unwrap_or_else(|| Some(endpoint.egress_client.max_response_bytes()));
-                endpoint
-                    .egress_client
-                    .stream_request_with_body_for_sse(
-                        parts.method.clone(),
-                        &target_url,
-                        headers,
-                        attempt_body,
-                        max_response_bytes,
-                    )
-                    .await
+                    .unwrap_or_else(|| Some(egress_client.max_response_bytes()));
+                match checked_connection_destination.as_ref() {
+                    Some(destination) => {
+                        egress_client
+                            .stream_request_with_body_for_sse_at_checked_destination(
+                                destination,
+                                parts.method.clone(),
+                                &target_url,
+                                headers,
+                                attempt_body,
+                                max_response_bytes,
+                            )
+                            .await
+                    }
+                    None => {
+                        egress_client
+                            .stream_request_with_body_for_sse(
+                                parts.method.clone(),
+                                &target_url,
+                                headers,
+                                attempt_body,
+                                max_response_bytes,
+                            )
+                            .await
+                    }
+                }
             } else {
-                endpoint
-                    .egress_client
-                    .stream_request_with_body(
-                        parts.method.clone(),
-                        &target_url,
-                        headers,
-                        attempt_body,
-                    )
-                    .await
+                match checked_connection_destination.as_ref() {
+                    Some(destination) => {
+                        egress_client
+                            .stream_request_with_body_at_checked_destination(
+                                destination,
+                                parts.method.clone(),
+                                &target_url,
+                                headers,
+                                attempt_body,
+                            )
+                            .await
+                    }
+                    None => {
+                        egress_client
+                            .stream_request_with_body(
+                                parts.method.clone(),
+                                &target_url,
+                                headers,
+                                attempt_body,
+                            )
+                            .await
+                    }
+                }
             }
         };
         let sent = tokio::select! {
@@ -855,9 +1070,13 @@ fn attempt_headers(
     inbound: &HeaderMap,
     source_ip: &str,
     policy: &RouteRequestHeaderPolicy,
+    credential_header: Option<&HeaderName>,
 ) -> HeaderMap {
     let mut headers = strip_hop_by_hop_headers(inbound);
     strip_gateway_credentials(&mut headers);
+    if let Some(credential_header) = credential_header {
+        headers.remove(credential_header);
+    }
     if let Some(request_id) = inbound.get(REQUEST_ID_HEADER) {
         headers.insert(request_id_header(), request_id.clone());
     }
@@ -1403,6 +1622,89 @@ fn error_response_with_outcome(
     response
 }
 
+fn connection_failure_response(
+    error: ConnectionHttpError,
+    pool_id: &str,
+    request_id: Option<HeaderValue>,
+    attempts: Vec<middleware::decision::UpstreamAttemptOutcome>,
+    latency: Duration,
+) -> Response {
+    let status = match error {
+        ConnectionHttpError::ConnectionDisabled
+        | ConnectionHttpError::CredentialUnavailable
+        | ConnectionHttpError::TransportUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ConnectionHttpError::InvalidConnectionId
+        | ConnectionHttpError::ConnectionNotFound
+        | ConnectionHttpError::WrongConnectionKind
+        | ConnectionHttpError::UnsupportedAuthentication
+        | ConnectionHttpError::UnsupportedTls
+        | ConnectionHttpError::InvalidTargetPath
+        | ConnectionHttpError::CredentialHeaderConflict
+        | ConnectionHttpError::CredentialInvalid => StatusCode::BAD_GATEWAY,
+    };
+    let code = if status == StatusCode::SERVICE_UNAVAILABLE {
+        "service_unavailable"
+    } else {
+        "bad_gateway"
+    };
+    tracing::warn!(
+        pool_id,
+        error_category = error.safe_reason(),
+        "connection-bound proxied request failed closed"
+    );
+    let mut response = (status, Json(json!({ "error": code }))).into_response();
+    response
+        .extensions_mut()
+        .insert(middleware::decision::UpstreamOutcome {
+            latency_ms: crate::duration_millis(latency),
+            status: None,
+            pool_id: Some(pool_id.to_owned()),
+            endpoint_id: None,
+            attempts,
+            retry_exhausted: false,
+            stream_terminal_pending: false,
+        });
+    if let Some(request_id) = request_id {
+        response
+            .headers_mut()
+            .insert(request_id_header(), request_id);
+    }
+    response
+}
+
+fn emit_connection_secret_resolution_failed(
+    proxy: &ProxyState,
+    parts: &http::request::Parts,
+    source_ip: &str,
+    route_id: &str,
+    target: &ConnectionHttpTarget,
+    reason: &'static str,
+) {
+    let request_id = parts
+        .headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown");
+    let actor = parts
+        .extensions
+        .get::<auth::Principal>()
+        .map(auth::actor_from_principal);
+    proxy.audit.emit(audit::AuditEvent::new(
+        audit::event::CONNECTION_SECRET_RESOLUTION_FAILED,
+        request_id,
+        source_ip,
+        actor,
+        json!({
+            "connection_id": target.connection_id(),
+            "auth_type": target.authentication_kind(),
+            "consumer_kind": "proxy_route",
+            "consumer_id": route_id,
+            "outcome": "failure",
+            "reason": reason,
+        }),
+    ));
+}
+
 fn gateway_timeout_response(
     request_id: Option<HeaderValue>,
     pool_id: &str,
@@ -1790,6 +2092,41 @@ mod tests {
         assert_eq!(
             forwarded.get("x-keep"),
             Some(&HeaderValue::from_static("public"))
+        );
+    }
+
+    #[test]
+    fn connection_attempt_headers_strip_caller_credentials_before_route_transforms() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer caller-token"),
+        );
+        inbound.insert(header::COOKIE, HeaderValue::from_static("session=caller"));
+        inbound.insert("x-api-key", HeaderValue::from_static("caller-api-key"));
+        inbound.insert("x-end-to-end", HeaderValue::from_static("caller-value"));
+        let policy = RouteRequestHeaderPolicy {
+            add_request_headers: vec![(
+                HeaderName::from_static("x-route-label"),
+                HeaderValue::from_static("billing"),
+            )],
+            strip_request_headers: vec![HeaderName::from_static("x-end-to-end")],
+        };
+
+        let forwarded = attempt_headers(
+            &inbound,
+            "203.0.113.8",
+            &policy,
+            Some(&HeaderName::from_static("x-api-key")),
+        );
+
+        assert!(!forwarded.contains_key(header::AUTHORIZATION));
+        assert!(!forwarded.contains_key(header::COOKIE));
+        assert!(!forwarded.contains_key("x-api-key"));
+        assert!(!forwarded.contains_key("x-end-to-end"));
+        assert_eq!(
+            forwarded.get("x-route-label"),
+            Some(&HeaderValue::from_static("billing"))
         );
     }
 
@@ -3978,12 +4315,14 @@ mod tests {
                         path_prefix: Some("/".to_owned()),
                         host: None,
                         authorization_origin: "pool:payments".to_owned(),
+                        connection_id: None,
                         request_header_policy: RouteRequestHeaderPolicy::default(),
                         pool,
                         request_body_mode: options.request_body_mode,
                         sse,
                     }],
                 },
+                connection_http: None,
                 upstream_health: Vec::new(),
                 max_request_body_bytes: 1024,
                 health_runtime: health::UpstreamHealthRuntime::default(),

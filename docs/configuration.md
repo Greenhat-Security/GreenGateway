@@ -631,6 +631,45 @@ This is deliberately separate from `POLICY_FILE`. `TOOLS_FILE` defines what a to
 
 `allowed_roles` matching is exact-string and case-sensitive, consistent with role matching elsewhere in the RBAC system. If your identity provider's role claims don't match your policy file's casing exactly (e.g. an IdP emitting `Admin` against a policy file expecting `admin`), the mismatch will silently deny access rather than error — double-check casing when a tool call is unexpectedly rejected by role policy.
 
+Manually authored HTTP tools can bind to one managed Connection instead of the legacy global `UPSTREAM_URL`. Set `source` to `{"type":"manual"}` and set `target` to an HTTP target containing the stable `connection_id` and the same mapping currently retained in `upstream` for migration compatibility. A registry containing only connection-bound tools does not require `UPSTREAM_URL`.
+
+```json
+{
+  "schema_version": "0.1.0",
+  "tools": [
+    {
+      "name": "get_charge",
+      "description": "Looks up a charge through the billing Connection.",
+      "input_json_schema": {
+        "type": "object",
+        "required": ["charge_id"],
+        "properties": {
+          "charge_id": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "target": {
+        "type": "http",
+        "connection_id": "billing-api",
+        "mapping": {
+          "method": "GET",
+          "path_template": "/charges/{charge_id}"
+        }
+      },
+      "source": {"type":"manual"},
+      "upstream": {
+        "method": "GET",
+        "path_template": "/charges/{charge_id}"
+      }
+    }
+  ]
+}
+```
+
+The connection ID is definition-owned: arguments, headers, query values, and bodies cannot select or replace it. The rendered path must remain origin-relative and is appended beneath the Connection's stored `base_path`; absolute URLs, scheme-relative paths, userinfo, authority changes, dot segments, fragments, and encoded path-confusion forms fail closed. Tool admission, caller identity rules, and direct HTTP policy run before Connection lookup. GreenGateway then validates the complete destination through egress policy and pinned DNS before resolving any static credential.
+
+This phase executes only `manual` HTTP targets whose Connection authentication is `none`, `header_api_key`, or `static_bearer`. OAuth, Connection-specific TLS, OpenAPI-generated targets, and MCP targets fail closed until their dedicated runtime phases land. A referenced Connection cannot be deleted while the manual tool remains published. Binding-validation or dependency-reconciliation failure rejects the registry reload and keeps the previous live registry.
+
 ### MCP_UPSTREAM_SERVERS
 
 Optional JSON array of upstream MCP streamable-HTTP servers whose tools should be discovered and proxied through GreenGateway's MCP endpoint.
@@ -1000,9 +1039,13 @@ Optional ordered routing table for the reverse proxy fallback, encoded as a JSON
 
 Default: empty, which disables route-table proxying. `UPSTREAM_URL` continues to provide the legacy catch-all proxy when this value is unset or an empty array.
 
-Format and validation: unset, empty, or whitespace-only values become an empty route table. Non-empty values must be a JSON array of at most 128 objects. Unknown fields are rejected. Each object has optional `path_prefix` and optional `host`, and must set exactly one of the legacy `upstream_url` field or a non-empty `upstreams` pool. `path_prefix`, when present, must be a URI path starting with `/`. `host`, when present, must be a hostname without a port and is normalized to lowercase. Each entry must set at least one of `path_prefix` or `host`; an entry with only `path_prefix: "/"` is rejected because it would be an unconditional catch-all. Use `UPSTREAM_URL` for the legacy catch-all behavior or add a host to make the root prefix host-specific. Duplicate host/path matchers are rejected. Any entry with `host` also requires `POLICY_FILE`; startup fails without a policy because host-qualified upstream authorization must be bound explicitly.
+Format and validation: unset, empty, or whitespace-only values become an empty route table. Non-empty values must be a JSON array of at most 128 objects. Unknown fields are rejected. Each object has optional `path_prefix` and optional `host`, and must set exactly one destination form: managed `connection_id`, legacy `upstream_url`, or a non-empty `upstreams` pool. `path_prefix`, when present, must be a URI path starting with `/`. `host`, when present, must be a hostname without a port and is normalized to lowercase. Each entry must set at least one of `path_prefix` or `host`; an entry with only `path_prefix: "/"` is rejected because it would be an unconditional catch-all. Use `UPSTREAM_URL` for the legacy catch-all behavior or add a host to make the root prefix host-specific. Duplicate host/path matchers are rejected. Any entry with `host` also requires `POLICY_FILE`; startup fails without a policy because host-qualified upstream authorization must be bound explicitly.
 
-Legacy `upstream_url` uses the same validation as `UPSTREAM_URL` and maps internally to one endpoint named `primary` with weight 1. An existing route without `id` receives a deterministic bounded ID derived from its normalized logical host/path matcher, not its endpoint URL or declaration order. A route using `upstreams` must set a unique explicit `id`. It may contain at most 32 endpoints, each with a unique `id`, required `url`, optional `weight` from 1 through 1000 (default 1), optional `tls_ca_bundle_path`, and optional `client_identity_pem_path`. Route and endpoint IDs are 1-64 ASCII letters, digits, `.`, `_`, or `-`, must start with a letter or digit, and are the only pool/endpoint values used as audit and metric dimensions. A pooled endpoint URL must be an `http` or `https` origin without userinfo, a base path, query, or fragment. Configure CA bundles and client identities on the endpoint; route-level TLS fields are rejected for a multi-endpoint pool.
+Legacy `upstream_url` uses the same validation as `UPSTREAM_URL` and maps internally to one endpoint named `primary` with weight 1. An existing route without `id` receives a deterministic bounded ID derived from its normalized logical host/path matcher, not its endpoint URL or declaration order. A route using `connection_id` or `upstreams` must set a unique explicit `id`. A pool may contain at most 32 endpoints, each with a unique `id`, required `url`, optional `weight` from 1 through 1000 (default 1), optional `tls_ca_bundle_path`, and optional `client_identity_pem_path`. Route and endpoint IDs are 1-64 ASCII letters, digits, `.`, `_`, or `-`, must start with a letter or digit, and are the only pool/endpoint values used as audit and metric dimensions. A pooled endpoint URL must be an `http` or `https` origin without userinfo, a base path, query, or fragment. Configure CA bundles and client identities on the endpoint; route-level TLS fields are rejected for a multi-endpoint pool.
+
+A `connection_id` route reads its destination, base path, timeouts, and static authentication binding from the current immutable managed Connection snapshot. The request host, path, query, headers, and body cannot choose a different Connection or authority. Authentication, rate limiting, classification, and RBAC/direct-policy enforcement happen before Connection lookup. The complete final URL then passes egress allowlist, port, DNS, and non-global-address validation before GreenGateway resolves a credential. The validated address is pinned through the send, so credential resolution does not introduce a second DNS decision.
+
+Connection routes currently support enabled `http_api` Connections using `none`, `header_api_key`, or `static_bearer` authentication and no Connection TLS profile. OAuth and Connection-specific CA/client-identity support land in later phases and fail startup closed here. A connection route cannot also set `upstream_url` or `upstreams`, and it cannot set route `tls_ca_bundle_path`, `timeout_ms`, `response_idle_timeout_ms`, `connect_timeout_ms`, `health_check`, `retry`, or `circuit_breaker` during this static-authentication phase. The stored Connection timeouts apply. A referenced Connection cannot be deleted until the route is removed; startup atomically reconciles these dependency records.
 
 `load_balancing.strategy` currently accepts only `weighted_round_robin`. Selection is a deterministic weighted sequence over the endpoints in the already-authorized logical route. Endpoint selection happens after authentication, rate limiting, RBAC/direct-policy evaluation, body preflight, and bounded pool admission. No request header, query value, path capture, or body field can select an endpoint, and selection never falls through to another route.
 
@@ -1085,7 +1128,7 @@ Route entries may also set these optional per-upstream fields:
 
 Per-route header validation rejects invalid header names or values, rejects adding hop-by-hop or gateway-managed headers such as `connection`, `host`, and `content-length`, and rejects adding or stripping `x-request-id`. The gateway owns request-id propagation so audit and tracing correlation cannot be disabled by route configuration. A route also cannot add and strip the same header.
 
-GreenGateway always removes inbound `Authorization` and `Cookie` headers before proxying because those credentials belong to the gateway authentication boundary. An upstream credential must be configured explicitly with `add_request_headers`; configured headers are applied only after inbound credentials are removed, so a client credential is never reused as an upstream credential.
+GreenGateway always removes inbound `Authorization` and `Cookie` headers before proxying because those credentials belong to the gateway authentication boundary. Legacy routes may still configure an upstream credential with `add_request_headers`, but this should be treated as a migration-only compatibility path because the literal value lives in environment configuration. Connection routes instead resolve the stored static binding only after authorization and egress validation, remove any caller-supplied value for the configured API-key header, apply safe route transforms, and inject the operator credential last. Adding or stripping that credential header in route configuration is rejected at startup and rechecked against live Connection changes at request time.
 
 `tls_ca_bundle_path` is the supported mechanism for upstreams served by private or internal certificate authorities. Certificate verification remains strict by default, and no route inherits a custom CA unless it explicitly configures one. GreenGateway does not expose a per-route skip-verify option; use a local test CA bundle for development instead of disabling verification.
 
@@ -1099,12 +1142,20 @@ Matching semantics: a route with both `host` and `path_prefix` requires both to 
 
 The proxy and RBAC middleware use the same route-selection implementation. For a selected host-qualified entry, the policy must contain a `routes` rule with the same request host in `hosts`. This prevents a permission granted for a shared path from being reused to reach a different virtual upstream selected by `Host`.
 
-Every configured route endpoint is health-checked independently and auto-seeded into the egress allowlist. Health checks use the same strict DNS/IP and TLS controls as proxy traffic.
+Every legacy or pooled route endpoint is health-checked independently where configured and auto-seeded into the egress allowlist. Managed Connection destinations are deliberately not auto-seeded: explicitly allow each Connection host through `EGRESS_ALLOWED_HOSTS` or policy `egress.hosts`. This keeps destination administration separate from network authorization.
 
 Example:
 
 ```json
 [
+  {
+    "id": "billing-route",
+    "path_prefix": "/billing",
+    "connection_id": "billing-api",
+    "add_request_headers": {
+      "x-gateway-route": "billing"
+    }
+  },
   {
     "path_prefix": "/api",
     "upstream_url": "https://api.internal.example",
@@ -1241,7 +1292,7 @@ Default: empty list, which denies all egress requests.
 
 Format and validation: split on commas, trim whitespace, ignore empty entries, lowercase entries, and require each entry to be an ASCII hostname without a port. Configure only hostnames, not URLs. The egress client still blocks non-global resolved IP ranges by default even when a hostname is allowlisted.
 
-Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, every `UPSTREAM_ROUTES[].upstream_url`, configured `AUTH_PROVIDERS[].jwks_url` values, URL-shaped `AUTH_PROVIDERS[].issuer` values, OIDC-discovered `jwks_uri` hosts, the discovered admin-login `token_endpoint` host, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to configured upstreams, fetch OIDC discovery documents, validate tokens, or exchange admin-login authorization codes without duplicating those hosts here.
+Infrastructure endpoint hosts configured elsewhere, including `UPSTREAM_URL`, every legacy `UPSTREAM_ROUTES[].upstream_url`, configured `AUTH_PROVIDERS[].jwks_url` values, URL-shaped `AUTH_PROVIDERS[].issuer` values, OIDC-discovered `jwks_uri` hosts, the discovered admin-login `token_endpoint` host, `JWT_JWKS_URL`, and URL-shaped `JWT_ISSUER` values, are auto-seeded into the effective egress allowlist. This allows deployments to proxy to legacy configured upstreams, fetch OIDC discovery documents, validate tokens, or exchange admin-login authorization codes without duplicating those hosts here. Managed Connection endpoints are intentionally excluded: add their hosts explicitly here or to policy `egress.hosts` so editing a Connection cannot grant itself network reachability.
 
 The effective egress allowlist is constructed at startup. Hot reload and the policy administration API reject changes to the policy `egress` section rather than leaving long-lived egress clients stale. To change policy hosts, CIDRs, or ports, edit `POLICY_FILE` and restart the gateway. Changes to egress environment variables likewise require a restart.
 
@@ -1315,6 +1366,15 @@ single-attempt, buffered compatibility routes. A pool migration assigns stable
 route/endpoint IDs, moves endpoint-specific CA and client-identity paths into
 the selected endpoint object, and opts into health, retry, circuit, streaming,
 or SSE behavior explicitly.
+
+For static upstream authentication, migrate a route by creating an enabled
+managed `http_api` Connection with an operator secret alias, explicitly
+allowlisting its host for egress, assigning the route a stable `id`, and
+replacing `upstream_url` plus any literal credential header with
+`connection_id`. Remove the legacy literal only after the Connection-bound
+route passes authorization, egress, and upstream smoke tests. Rollback is the
+reverse configuration change; Connection dependency protection prevents
+deleting the managed record while a route or manual tool still references it.
 
 Before rollout, validate:
 

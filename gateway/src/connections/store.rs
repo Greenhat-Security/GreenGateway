@@ -611,6 +611,89 @@ impl SqliteConnectionStore {
         Ok(())
     }
 
+    pub fn replace_dependencies_for_kind(
+        &self,
+        kind: ConnectionDependencyKind,
+        desired: &[(ConnectionId, String)],
+    ) -> Result<(), ConnectionStoreError> {
+        if desired.len() > MAX_CONNECTION_DEPENDENCIES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection dependencies",
+                maximum: MAX_CONNECTION_DEPENDENCIES,
+            });
+        }
+        let mut unique = BTreeSet::new();
+        for (connection_id, consumer_id) in desired {
+            validate_dependency_id(consumer_id)?;
+            if !unique.insert((connection_id.as_str(), consumer_id.as_str())) {
+                return Err(ConnectionStoreError::Validation {
+                    problems: vec![
+                        "connection dependency set contains duplicate consumers".to_owned()
+                    ],
+                });
+            }
+        }
+
+        let now = utc_timestamp()?;
+        let mut connection = self.connection_guard();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| {
+                sqlite_error(&self.path, "dependency replacement transaction", source)
+            })?;
+        transaction
+            .execute(
+                "DELETE FROM connection_dependencies WHERE consumer_kind = ?1",
+                params![kind.as_str()],
+            )
+            .map_err(|source| sqlite_error(&self.path, "dependency replacement delete", source))?;
+        let retained_count = count_rows(
+            &transaction,
+            &self.path,
+            "connection dependencies",
+            "SELECT COUNT(*) FROM connection_dependencies",
+        )?;
+        if retained_count.saturating_add(desired.len()) > MAX_CONNECTION_DEPENDENCIES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection dependencies",
+                maximum: MAX_CONNECTION_DEPENDENCIES,
+            });
+        }
+
+        for (connection_id, consumer_id) in desired {
+            let exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM connection_records WHERE id = ?1)",
+                    params![connection_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|source| {
+                    sqlite_error(&self.path, "dependency replacement owner lookup", source)
+                })?;
+            if !exists {
+                return Err(ConnectionStoreError::NotFound {
+                    id: connection_id.to_string(),
+                });
+            }
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO connection_dependencies (
+                        connection_id, consumer_kind, consumer_id, created_at
+                    ) VALUES (?1, ?2, ?3, ?4)
+                    "#,
+                    params![connection_id.as_str(), kind.as_str(), consumer_id, now],
+                )
+                .map_err(|source| {
+                    sqlite_error(&self.path, "dependency replacement insert", source)
+                })?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, "dependency replacement commit", source))?;
+        Ok(())
+    }
+
     pub fn dependencies(
         &self,
         id: &ConnectionId,
@@ -2368,6 +2451,80 @@ mod tests {
             .get(&created.id)
             .expect("get should succeed")
             .is_none());
+    }
+
+    #[test]
+    fn dependency_kind_replacement_is_atomic_and_tracks_current_runtime_consumers() {
+        let (_directory, _path, store) = temporary_store("dependency-replacement");
+        let first = store.create(candidate()).expect("create should succeed");
+        let mut second_candidate = candidate();
+        second_candidate.display_name = "Second API".to_owned();
+        let second = store
+            .create(second_candidate)
+            .expect("second create should succeed");
+
+        store
+            .replace_dependencies_for_kind(
+                ConnectionDependencyKind::ProxyRoute,
+                &[(first.id.clone(), "route-a".to_owned())],
+            )
+            .expect("initial dependency set should replace");
+        store
+            .add_dependency(&first.id, ConnectionDependencyKind::ManualTool, "tool-a")
+            .expect("unrelated dependency kind should insert");
+
+        let missing = ConnectionId::parse("missing-connection").expect("stable missing ID");
+        assert!(matches!(
+            store.replace_dependencies_for_kind(
+                ConnectionDependencyKind::ProxyRoute,
+                &[(missing, "route-b".to_owned())],
+            ),
+            Err(ConnectionStoreError::NotFound { .. })
+        ));
+        assert_eq!(
+            store
+                .dependencies(&first.id)
+                .expect("failed replacement must roll back"),
+            vec![
+                ConnectionDependency {
+                    kind: ConnectionDependencyKind::ManualTool,
+                    consumer_id: "tool-a".to_owned(),
+                },
+                ConnectionDependency {
+                    kind: ConnectionDependencyKind::ProxyRoute,
+                    consumer_id: "route-a".to_owned(),
+                },
+            ]
+        );
+
+        store
+            .replace_dependencies_for_kind(
+                ConnectionDependencyKind::ProxyRoute,
+                &[(second.id.clone(), "route-b".to_owned())],
+            )
+            .expect("current route dependencies should publish atomically");
+        assert_eq!(
+            store
+                .dependencies(&first.id)
+                .expect("unrelated kind should remain"),
+            vec![ConnectionDependency {
+                kind: ConnectionDependencyKind::ManualTool,
+                consumer_id: "tool-a".to_owned(),
+            }]
+        );
+        assert_eq!(
+            store
+                .dependencies(&second.id)
+                .expect("new route dependency should load"),
+            vec![ConnectionDependency {
+                kind: ConnectionDependencyKind::ProxyRoute,
+                consumer_id: "route-b".to_owned(),
+            }]
+        );
+        assert!(matches!(
+            store.delete(&second.id, &second.etag()),
+            Err(ConnectionStoreError::DependencyConflict { count: 1, .. })
+        ));
     }
 
     #[test]

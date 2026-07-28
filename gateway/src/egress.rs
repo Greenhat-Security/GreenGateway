@@ -739,8 +739,22 @@ impl DnsResolver for SystemDnsResolver {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckedEgressDestination {
+    scheme: String,
     pub host: String,
     pub pinned_addr: SocketAddr,
+    config_generation: [u8; 32],
+}
+
+impl CheckedEgressDestination {
+    #[cfg(test)]
+    pub(crate) fn for_test(host: impl Into<String>, pinned_addr: SocketAddr) -> Self {
+        Self {
+            scheme: "http".to_owned(),
+            host: host.into(),
+            pinned_addr,
+            config_generation: [0; 32],
+        }
+    }
 }
 
 impl EgressClient {
@@ -810,24 +824,12 @@ impl EgressClient {
         headers: HeaderMap,
         body: Option<Vec<u8>>,
     ) -> Result<EgressResponse, EgressError> {
-        let parsed = self.checked_url(url)?;
-        let host = checked_host(
-            &parsed,
-            &self.config.allowed_hosts,
-            &self.config.allowed_host_globs,
-        )?;
-        let port = checked_port(&parsed)?;
-        checked_policy_port(port, &self.config.allowed_ports)?;
         enforce_request_body_size(
             body.as_ref().map_or(0, Vec::len),
             self.config.max_request_body_bytes,
         )?;
-        let pinned_addr = self.resolve_and_check(&host, port).await?;
-        let client = self.pinned_client(&parsed, &host, pinned_addr)?;
-
-        tracing::debug!("egress request pinned to validated destination");
-
-        self.send_with_client(client, method, parsed, headers, body)
+        let destination = self.checked_destination(url).await?;
+        self.request_with_headers_at_checked_destination(&destination, method, url, headers, body)
             .await
     }
 
@@ -845,7 +847,32 @@ impl EgressClient {
         checked_policy_port(port, &self.config.allowed_ports)?;
         let pinned_addr = self.resolve_and_check(&host, port).await?;
 
-        Ok(CheckedEgressDestination { host, pinned_addr })
+        Ok(CheckedEgressDestination {
+            scheme: parsed.scheme().to_owned(),
+            host,
+            pinned_addr,
+            config_generation: self.config_generation,
+        })
+    }
+
+    pub(crate) async fn request_with_headers_at_checked_destination(
+        &self,
+        destination: &CheckedEgressDestination,
+        method: Method,
+        url: &str,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+    ) -> Result<EgressResponse, EgressError> {
+        enforce_request_body_size(
+            body.as_ref().map_or(0, Vec::len),
+            self.config.max_request_body_bytes,
+        )?;
+        let (parsed, client) = self.client_for_checked_destination(destination, url, false)?;
+
+        tracing::debug!("egress request using previously validated pinned destination");
+
+        self.send_with_client(client, method, parsed, headers, body)
+            .await
     }
 
     #[cfg(test)]
@@ -892,24 +919,75 @@ impl EgressClient {
         body: EgressRequestBody,
         sse_max_response_bytes: Option<Option<usize>>,
     ) -> Result<EgressStreamResponse, EgressError> {
-        let parsed = self.checked_url(url)?;
-        let host = checked_host(
-            &parsed,
-            &self.config.allowed_hosts,
-            &self.config.allowed_host_globs,
-        )?;
-        let port = checked_port(&parsed)?;
-        checked_policy_port(port, &self.config.allowed_ports)?;
         body.enforce_known_size(self.config.max_request_body_bytes)?;
-        let pinned_addr = self.resolve_and_check(&host, port).await?;
-        let client = self.pinned_client_with_profile(
-            &parsed,
-            &host,
-            pinned_addr,
+        let destination = self.checked_destination(url).await?;
+        self.stream_request_with_body_at_checked_destination_policy(
+            &destination,
+            method,
+            url,
+            headers,
+            body,
+            sse_max_response_bytes,
+        )
+        .await
+    }
+
+    pub(crate) async fn stream_request_with_body_at_checked_destination(
+        &self,
+        destination: &CheckedEgressDestination,
+        method: Method,
+        url: &str,
+        headers: HeaderMap,
+        body: EgressRequestBody,
+    ) -> Result<EgressStreamResponse, EgressError> {
+        self.stream_request_with_body_at_checked_destination_policy(
+            destination,
+            method,
+            url,
+            headers,
+            body,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn stream_request_with_body_for_sse_at_checked_destination(
+        &self,
+        destination: &CheckedEgressDestination,
+        method: Method,
+        url: &str,
+        headers: HeaderMap,
+        body: EgressRequestBody,
+        max_response_bytes: Option<usize>,
+    ) -> Result<EgressStreamResponse, EgressError> {
+        self.stream_request_with_body_at_checked_destination_policy(
+            destination,
+            method,
+            url,
+            headers,
+            body,
+            Some(max_response_bytes),
+        )
+        .await
+    }
+
+    async fn stream_request_with_body_at_checked_destination_policy(
+        &self,
+        destination: &CheckedEgressDestination,
+        method: Method,
+        url: &str,
+        headers: HeaderMap,
+        body: EgressRequestBody,
+        sse_max_response_bytes: Option<Option<usize>>,
+    ) -> Result<EgressStreamResponse, EgressError> {
+        body.enforce_known_size(self.config.max_request_body_bytes)?;
+        let (parsed, client) = self.client_for_checked_destination(
+            destination,
+            url,
             sse_max_response_bytes.is_some(),
         )?;
 
-        tracing::debug!("egress streaming request pinned to validated destination");
+        tracing::debug!("egress streaming request using previously validated pinned destination");
 
         self.send_stream_with_client(
             client,
@@ -920,6 +998,45 @@ impl EgressClient {
             sse_max_response_bytes,
         )
         .await
+    }
+
+    fn client_for_checked_destination(
+        &self,
+        destination: &CheckedEgressDestination,
+        url: &str,
+        sse: bool,
+    ) -> Result<(Url, reqwest::Client), EgressError> {
+        if destination.config_generation != self.config_generation {
+            return Err(EgressError::InvalidPolicy(
+                "checked destination belongs to a different egress configuration".to_owned(),
+            ));
+        }
+        let parsed = self.checked_url(url)?;
+        let host = checked_host(
+            &parsed,
+            &self.config.allowed_hosts,
+            &self.config.allowed_host_globs,
+        )?;
+        let port = checked_port(&parsed)?;
+        checked_policy_port(port, &self.config.allowed_ports)?;
+        if destination.scheme != parsed.scheme()
+            || destination.host != host
+            || destination.pinned_addr.port() != port
+        {
+            return Err(EgressError::InvalidPolicy(
+                "checked destination does not match the request authority".to_owned(),
+            ));
+        }
+        checked_socket_addr(
+            &host,
+            &[destination.pinned_addr],
+            self.config.deny_private_ips,
+            &self.config.nat64_prefixes,
+            &self.config.private_ip_allow_cidrs,
+        )?;
+        let client =
+            self.pinned_client_with_profile(&parsed, &host, destination.pinned_addr, sse)?;
+        Ok((parsed, client))
     }
 
     fn checked_url(&self, url: &str) -> Result<Url, EgressError> {
@@ -943,15 +1060,6 @@ impl EgressClient {
                 Err(EgressError::SchemeNotAllowed(scheme.to_owned()))
             }
         }
-    }
-
-    fn pinned_client(
-        &self,
-        url: &Url,
-        host: &str,
-        pinned_addr: SocketAddr,
-    ) -> Result<reqwest::Client, EgressError> {
-        self.pinned_client_with_profile(url, host, pinned_addr, false)
     }
 
     fn pinned_client_with_profile(
@@ -986,6 +1094,16 @@ impl EgressClient {
                 .resolve(host, pinned_addr)
                 .build()?)
         })
+    }
+
+    #[cfg(test)]
+    fn pinned_client(
+        &self,
+        url: &Url,
+        host: &str,
+        pinned_addr: SocketAddr,
+    ) -> Result<reqwest::Client, EgressError> {
+        self.pinned_client_with_profile(url, host, pinned_addr, false)
     }
 
     async fn resolve_and_check(&self, host: &str, port: u16) -> Result<SocketAddr, EgressError> {
@@ -2329,6 +2447,106 @@ mod tests {
         server.await.expect("direct server should finish");
     }
 
+    #[tokio::test]
+    async fn checked_destination_send_reuses_one_dns_decision_and_rejects_mismatches() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("checked-destination listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("checked-destination address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("checked-destination server should accept one connection");
+            read_one_request(&stream).await;
+            write_all(
+                &stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            )
+            .await;
+        });
+        let resolver = Arc::new(FakeDnsResolver::with_addresses(vec![addr]));
+        let config = EgressConfig {
+            allowed_hosts: HashSet::from([
+                "checked.example.test".to_owned(),
+                "other.example.test".to_owned(),
+            ]),
+            deny_private_ips: false,
+            timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(500),
+            ..EgressConfig::default()
+        };
+        let client = EgressClient::new_with_resolver(config.clone(), resolver.clone())
+            .expect("checked-destination client should build");
+        let url = format!("http://checked.example.test:{}/resource", addr.port());
+        let destination = client
+            .checked_destination(&url)
+            .await
+            .expect("destination should pass one DNS and policy check");
+
+        let response = client
+            .request_with_headers_at_checked_destination(
+                &destination,
+                Method::GET,
+                &url,
+                HeaderMap::new(),
+                None,
+            )
+            .await
+            .expect("checked destination should send without another DNS lookup");
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            resolver.calls(),
+            vec![("checked.example.test".to_owned(), addr.port())]
+        );
+        server
+            .await
+            .expect("checked-destination server should finish");
+
+        let authority_error = client
+            .request_with_headers_at_checked_destination(
+                &destination,
+                Method::GET,
+                &format!("http://other.example.test:{}/resource", addr.port()),
+                HeaderMap::new(),
+                None,
+            )
+            .await
+            .expect_err("a checked destination must not authorize another authority");
+        assert!(matches!(authority_error, EgressError::InvalidPolicy(_)));
+
+        let scheme_error = client
+            .request_with_headers_at_checked_destination(
+                &destination,
+                Method::GET,
+                &format!("https://checked.example.test:{}/resource", addr.port()),
+                HeaderMap::new(),
+                None,
+            )
+            .await
+            .expect_err("a checked destination must not authorize a scheme change");
+        assert!(matches!(scheme_error, EgressError::InvalidPolicy(_)));
+
+        let mut changed_config = config;
+        changed_config.timeout = Duration::from_secs(3);
+        let changed_client = client
+            .reconfigured(changed_config)
+            .expect("changed egress client should build");
+        let generation_error = changed_client
+            .request_with_headers_at_checked_destination(
+                &destination,
+                Method::GET,
+                &url,
+                HeaderMap::new(),
+                None,
+            )
+            .await
+            .expect_err("a checked destination must not cross egress configurations");
+        assert!(matches!(generation_error, EgressError::InvalidPolicy(_)));
+    }
+
     #[test]
     fn egress_client_ignores_ambient_proxy_environment() {
         let proxy_listener = std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -2868,6 +3086,7 @@ mod tests {
         config.upstream_routes = vec![
             crate::config::UpstreamRouteConfig {
                 id: None,
+                connection_id: None,
                 path_prefix: Some("/api".to_owned()),
                 host: None,
                 upstream_url: "https://api-upstream.example.test/base".to_owned(),
@@ -2889,6 +3108,7 @@ mod tests {
             },
             crate::config::UpstreamRouteConfig {
                 id: None,
+                connection_id: None,
                 path_prefix: Some("/assets".to_owned()),
                 host: None,
                 upstream_url: "http://assets-upstream.example.test".to_owned(),
@@ -2910,6 +3130,7 @@ mod tests {
             },
             crate::config::UpstreamRouteConfig {
                 id: Some("payments".to_owned()),
+                connection_id: None,
                 path_prefix: Some("/payments".to_owned()),
                 host: None,
                 upstream_url: String::new(),

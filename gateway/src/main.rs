@@ -1316,7 +1316,9 @@ fn gateway_app_with_process_started_at_and_overrides(
         .collect::<Vec<_>>();
     configured_suggestion_routes.extend(config.upstream_routes.iter().enumerate().map(
         |(index, route)| {
-            let logical_origin = if route.upstreams.is_empty() {
+            let logical_origin = if let Some(connection_id) = route.connection_id.as_deref() {
+                format!("connection:{connection_id}")
+            } else if route.upstreams.is_empty() {
                 proxy::upstream_origin_from_url(
                     &route.upstream_url,
                     &format!("UPSTREAM_ROUTES[{index}].upstream_url"),
@@ -1394,15 +1396,24 @@ fn gateway_app_with_process_started_at_and_overrides(
         proxy_egress_config.apply_upstream_timeout_overrides(&config);
         proxy_egress_config
     };
-    let egress_client = Arc::new(egress_client_for_build(egress_config, &build_overrides)?);
+    let egress_client = Arc::new(egress_client_for_build(
+        egress_config.clone(),
+        &build_overrides,
+    )?);
+    let connection_http_runtime = connections::http::ConnectionHttpRuntime::new(
+        connection_control_plane.clone(),
+        egress_config,
+        Arc::clone(&egress_client),
+    );
     let proxy_egress_client = Arc::new(egress_client_for_build(
         proxy_egress_config.clone(),
         &build_overrides,
     )?);
-    let proxy_state = ProxyState::from_config_with_lifecycle(
+    let proxy_state = ProxyState::from_config_with_connections_and_lifecycle(
         &config,
         &proxy_egress_config,
         proxy_egress_client,
+        Some(connection_http_runtime.clone()),
         audit_log.clone(),
         lifecycle.clone(),
     )?;
@@ -1498,6 +1509,10 @@ fn gateway_app_with_process_started_at_and_overrides(
     }
     let tool_registry =
         tools::definitions::ToolRegistry::from_config_with_audit(&config, audit_log.clone())?;
+    let connection_http_for_tools = connection_http_runtime.clone();
+    tool_registry.set_definition_validator(Arc::new(move |definitions| {
+        validate_connection_bound_manual_tools(&connection_http_for_tools, definitions)
+    }))?;
     let mcp_upstream_definitions =
         tools::mcp_upstream::discover_upstream_tools_blocking(&config, Arc::clone(&egress_client))?;
     tool_registry.merge_definitions(mcp_upstream_definitions)?;
@@ -1521,6 +1536,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         tool_registry.clone(),
         tool_runtime,
         Arc::clone(&egress_client),
+        Some(connection_http_runtime.clone()),
         audit_log.clone(),
     )?;
     let client_ip_policy = client_ip::ClientIpPolicy::from_config(&config);
@@ -1821,6 +1837,49 @@ fn required_admin_login_provider_field(
                 "admin login provider '{}' is missing {field_name}",
                 provider.name
             ))
+        })
+}
+
+fn validate_connection_bound_manual_tools(
+    runtime: &connections::http::ConnectionHttpRuntime,
+    definitions: &[tools::definitions::ToolDefinition],
+) -> Result<(), Vec<String>> {
+    use connections::store::ConnectionDependencyKind;
+    use tools::definitions::{ToolSource, ToolTarget};
+
+    let mut problems = Vec::new();
+    let mut dependencies = Vec::new();
+    for definition in definitions {
+        let Some(ToolTarget::Http { connection_id, .. }) = definition.target.as_ref() else {
+            continue;
+        };
+        if !matches!(definition.source, ToolSource::Manual) {
+            problems.push(format!(
+                "tool '{}' uses a Connection HTTP target but source is not manual",
+                definition.name
+            ));
+            continue;
+        }
+        if let Err(error) = runtime.validate_binding(connection_id) {
+            problems.push(format!(
+                "tool '{}' Connection target is unavailable: {}",
+                definition.name,
+                error.safe_reason()
+            ));
+            continue;
+        }
+        dependencies.push((connection_id.clone(), definition.name.clone()));
+    }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    runtime
+        .replace_dependencies(ConnectionDependencyKind::ManualTool, &dependencies)
+        .map_err(|error| {
+            vec![format!(
+                "manual tool Connection dependencies could not be reconciled: {}",
+                error.safe_reason()
+            )]
         })
 }
 
@@ -9726,6 +9785,7 @@ mod tests {
     ) -> config::UpstreamRouteConfig {
         config::UpstreamRouteConfig {
             id: None,
+            connection_id: None,
             path_prefix: path_prefix.map(str::to_owned),
             host: host.map(str::to_owned),
             upstream_url: format!("http://127.0.0.1:{}/ignored-base", upstream_addr.port()),
@@ -11532,6 +11592,83 @@ mod tests {
             upstream.headers.get(header::COOKIE),
             Some(&HeaderValue::from_static("upstream-session=configured"))
         );
+    }
+
+    #[tokio::test]
+    async fn connection_bound_proxy_uses_stored_destination_and_protects_its_dependency() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let connection_db = TempDb::new("connection-proxy-static-auth");
+        let mut config = routing_proxy_config(Vec::new());
+        config.connections_sqlite_path = Some(connection_db.path.to_string_lossy().into_owned());
+        config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
+        let control_plane =
+            connections::control_plane::ConnectionControlPlane::from_config(&config)
+                .expect("test Connection control plane should build");
+        let initial = control_plane.runtime_snapshot();
+        let created = control_plane
+            .create_managed(
+                initial.collection_etag(),
+                serde_json::from_value(json!({
+                    "display_name": "Billing API",
+                    "enabled": true,
+                    "kind": "http_api",
+                    "endpoint": {
+                        "base_url": format!("http://127.0.0.1:{}", upstream_addr.port()),
+                        "base_path": "/v1"
+                    },
+                    "authentication": {
+                        "type": "none"
+                    }
+                }))
+                .expect("test Connection should deserialize"),
+            )
+            .expect("test Connection should create");
+        let mut route = path_route("/billing", upstream_addr);
+        route.id = Some("billing-route".to_owned());
+        route.connection_id = Some(created.id.to_string());
+        route.upstream_url.clear();
+        route.add_request_headers =
+            HashMap::from([("x-route-label".to_owned(), "billing".to_owned())]);
+        config.upstream_routes = vec![route];
+        let router = proxy_router(config, test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/billing/charges?expand=customer")
+                    .header(header::AUTHORIZATION, "Bearer caller-token")
+                    .header(header::COOKIE, "session=caller")
+                    .header("x-end-to-end", "preserved")
+                    .body(Body::empty())
+                    .expect("connection-bound proxy request should build"),
+            )
+            .await
+            .expect("connection-bound proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let upstream =
+            next_proxied_request(&mut captured, "stored Connection should receive request").await;
+        assert_eq!(
+            upstream.path_and_query,
+            "/v1/billing/charges?expand=customer"
+        );
+        assert!(!upstream.headers.contains_key(header::AUTHORIZATION));
+        assert!(!upstream.headers.contains_key(header::COOKIE));
+        assert_eq!(
+            upstream.headers.get("x-route-label"),
+            Some(&HeaderValue::from_static("billing"))
+        );
+        assert_eq!(
+            upstream.headers.get("x-end-to-end"),
+            Some(&HeaderValue::from_static("preserved"))
+        );
+
+        assert!(matches!(
+            control_plane.delete_managed(&created.id, &created.etag()),
+            Err(connections::control_plane::ConnectionMutationError::Store(
+                connections::store::ConnectionStoreError::DependencyConflict { count: 1, .. }
+            ))
+        ));
     }
 
     #[tokio::test]
