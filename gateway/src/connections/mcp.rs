@@ -145,9 +145,7 @@ impl McpConnectionCatalogRuntime {
     }
 
     fn publish(&self, catalog: &StoredMcpCatalog) {
-        let current = self.state.load_full();
-        let mut next = current.as_ref().clone();
-        next.insert(
+        self.publish_active(
             catalog.connection_id.clone(),
             ActiveMcpCatalog {
                 observed_etag: catalog.observed_etag.to_string(),
@@ -156,7 +154,14 @@ impl McpConnectionCatalogRuntime {
                 entry_count: catalog.entries.len(),
             },
         );
-        self.state.store(Arc::new(next));
+    }
+
+    fn publish_active(&self, connection_id: ConnectionId, catalog: ActiveMcpCatalog) {
+        self.state.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.insert(connection_id.clone(), catalog.clone());
+            Arc::new(next)
+        });
     }
 
     pub fn catalog_status(
@@ -630,7 +635,10 @@ mod tests {
         fs,
         net::Ipv4Addr,
         path::PathBuf,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Barrier,
+        },
     };
 
     use http::StatusCode;
@@ -665,6 +673,45 @@ mod tests {
             let _ = fs::remove_file(format!("{}-wal", self.0.display()));
             let _ = fs::remove_file(format!("{}-shm", self.0.display()));
         }
+    }
+
+    #[test]
+    fn concurrent_runtime_publications_do_not_lose_connections() {
+        let runtime = McpConnectionCatalogRuntime::new(&[]);
+        let publication_count = 64_usize;
+        let barrier = Arc::new(Barrier::new(publication_count));
+        let publications = (0..publication_count)
+            .map(|index| {
+                let runtime = runtime.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let connection_id =
+                        ConnectionId::parse(format!("{index:08x}-1111-4111-8111-111111111111"))
+                            .expect("concurrent test Connection ID should validate");
+                    barrier.wait();
+                    runtime.publish_active(
+                        connection_id,
+                        ActiveMcpCatalog {
+                            observed_etag: format!("\"connection:{index}\""),
+                            catalog_revision: 1,
+                            refreshed_at: "2026-07-28T00:00:00Z".to_owned(),
+                            entry_count: 1,
+                        },
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        for publication in publications {
+            publication
+                .join()
+                .expect("concurrent runtime publication should not panic");
+        }
+
+        assert_eq!(
+            runtime.state.load().len(),
+            publication_count,
+            "atomic runtime publication must retain every concurrent Connection"
+        );
     }
 
     #[tokio::test]
