@@ -3767,15 +3767,10 @@ async fn connection_test_endpoint(
         );
     }
 
-    let execution = match tokio::time::timeout_at(
-        probe_deadline,
-        state.tests.execute(record, current_etag.as_str()),
-    )
-    .await
-    {
-        Ok(execution) => execution,
-        Err(_) => connections::test::deadline_execution(probe_started),
-    };
+    let execution = state
+        .tests
+        .execute_before(record, current_etag.as_str(), probe_deadline)
+        .await;
     drop(permit);
 
     if let Err(error) =

@@ -51,7 +51,7 @@ use crate::{
         model::MAX_CATALOG_ENTRIES,
         status::ConnectionStatusReason,
         store::{validate_mcp_resource_metadata, StoredMcpResource, StoredMcpResourceTemplate},
-        test::{ConnectionTestReason, ConnectionTestStageName, CONNECTION_TEST_DEADLINE},
+        test::{ConnectionTestReason, ConnectionTestStageName},
     },
     egress::{rmcp_http, CheckedEgressDestination, EgressClient, EgressError},
     tools::definitions::ToolDefinition,
@@ -68,6 +68,7 @@ const MAX_DISCOVERY_TOOLS_PER_UPSTREAM: usize = 1024;
 const MAX_DISCOVERY_RESOURCES_PER_UPSTREAM: usize = 1024;
 const MAX_DISCOVERY_RESOURCE_TEMPLATES_PER_UPSTREAM: usize = 1024;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const PROTOCOL_PROBE_CLEANUP_RESERVE: Duration = Duration::from_millis(500);
 const REDACTED_MCP_UPSTREAM_VALUE: &str = "<redacted>";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -511,10 +512,11 @@ pub async fn discover_connection_catalog(
 /// metadata page, and closes the session. Tools take precedence over resources;
 /// pagination cursors are deliberately ignored. The probe never publishes
 /// metadata, calls a tool, or reads a resource.
-pub async fn probe_connection_protocol(
+pub async fn probe_connection_protocol_before(
     runtime: &ConnectionHttpRuntime,
     connection_id: &str,
     expected_connection_etag: &str,
+    hard_deadline: tokio::time::Instant,
 ) -> Result<(), ConnectionProtocolProbeError> {
     let target = runtime
         .mcp_test_target(connection_id, expected_connection_etag)
@@ -530,12 +532,8 @@ pub async fn probe_connection_protocol(
     };
 
     let runtime_config = McpUpstreamRuntimeConfig::from_connection_target(&target);
-    let started = tokio::time::Instant::now();
-    let hard_deadline = started + CONNECTION_TEST_DEADLINE;
-    let operation_timeout = runtime_config
-        .timeout
-        .min(CONNECTION_TEST_DEADLINE.saturating_sub(Duration::from_millis(500)));
-    let operation_deadline = started + operation_timeout;
+    let operation_deadline =
+        protocol_probe_operation_deadline(runtime_config.timeout, hard_deadline)?;
     let checked = tokio::time::timeout_at(
         operation_deadline,
         target.preflight_client().checked_destination(target.url()),
@@ -577,6 +575,21 @@ pub async fn probe_connection_protocol(
         hard_deadline,
     )
     .await
+}
+
+fn protocol_probe_operation_deadline(
+    configured_timeout: Duration,
+    hard_deadline: tokio::time::Instant,
+) -> Result<tokio::time::Instant, ConnectionProtocolProbeError> {
+    let now = tokio::time::Instant::now();
+    let remaining = hard_deadline.saturating_duration_since(now);
+    let Some(operation_budget) = remaining.checked_sub(PROTOCOL_PROBE_CLEANUP_RESERVE) else {
+        return Err(protocol_probe_timeout(ConnectionTestStageName::Connected));
+    };
+    if operation_budget.is_zero() {
+        return Err(protocol_probe_timeout(ConnectionTestStageName::Connected));
+    }
+    Ok(now + configured_timeout.min(operation_budget))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3165,6 +3178,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protocol_probe_consumes_prior_endpoint_time_and_finishes_io_before_return() {
+        let upstream =
+            RawProtocolProbeUpstream::spawn(RawProtocolProbeScenario::StallInitialize).await;
+        let endpoint_started = tokio::time::Instant::now();
+        let endpoint_deadline = endpoint_started + Duration::from_millis(900);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let error = run_raw_protocol_probe_before(&upstream.url, endpoint_deadline)
+            .await
+            .expect_err("remaining endpoint budget must bound the delayed MCP probe");
+        assert_eq!(error.safe_reason(), ConnectionTestReason::DeadlineExceeded);
+        assert!(
+            tokio::time::Instant::now() < endpoint_deadline,
+            "cleanup reserve should join the timed-out worker before the endpoint deadline"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            upstream.stalled_disconnect.notified(),
+        )
+        .await
+        .expect("the stalled initialize request must be closed before probe return");
+        assert_eq!(upstream.counts.initialize.load(Ordering::SeqCst), 1);
+        let requests_after_return = upstream.counts.total();
+        tokio::time::sleep_until(endpoint_deadline + Duration::from_millis(75)).await;
+        assert_eq!(
+            upstream.counts.total(),
+            requests_after_return,
+            "no request or credential-bearing I/O may survive the shared endpoint deadline"
+        );
+
+        upstream.join().await;
+    }
+
+    #[tokio::test]
     async fn protocol_probe_fails_get_delete_auth_and_allows_method_not_allowed() {
         for scenario in [
             RawProtocolProbeScenario::GetUnauthorized,
@@ -4120,6 +4167,17 @@ mod tests {
         url: &str,
         operation_timeout: Duration,
     ) -> Result<(), ConnectionProtocolProbeError> {
+        run_raw_protocol_probe_before(
+            url,
+            tokio::time::Instant::now() + operation_timeout + PROTOCOL_PROBE_CLEANUP_RESERVE,
+        )
+        .await
+    }
+
+    async fn run_raw_protocol_probe_before(
+        url: &str,
+        hard_deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectionProtocolProbeError> {
         let runtime_config = McpUpstreamRuntimeConfig {
             timeout: Duration::from_secs(5),
             response_idle_timeout: Duration::from_secs(5),
@@ -4134,7 +4192,8 @@ mod tests {
             .connect_timeout(Duration::from_secs(1))
             .build()
             .expect("raw protocol-probe client should build");
-        let started = tokio::time::Instant::now();
+        let operation_deadline =
+            protocol_probe_operation_deadline(runtime_config.timeout, hard_deadline)?;
         run_bounded_protocol_probe(
             "raw-protocol-probe".to_owned(),
             url.to_owned(),
@@ -4144,8 +4203,8 @@ mod tests {
                 credential: None,
                 credential_header_name: None,
             },
-            started + operation_timeout,
-            started + operation_timeout + Duration::from_millis(500),
+            operation_deadline,
+            hard_deadline,
         )
         .await
     }

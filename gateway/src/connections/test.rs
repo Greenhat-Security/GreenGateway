@@ -418,9 +418,33 @@ impl ConnectionTestService {
         record: &StoredConnection,
         expected_etag: &str,
     ) -> ConnectionTestExecution {
+        self.execute_before(
+            record,
+            expected_etag,
+            tokio::time::Instant::now() + self.deadline(),
+        )
+        .await
+    }
+
+    pub async fn execute_before(
+        &self,
+        record: &StoredConnection,
+        expected_etag: &str,
+        deadline: tokio::time::Instant,
+    ) -> ConnectionTestExecution {
+        let started = Instant::now();
         match record.write.kind {
-            ConnectionKind::HttpApi => self.execute_http(record, expected_etag).await,
-            ConnectionKind::McpStreamableHttp => self.execute_mcp(record, expected_etag).await,
+            ConnectionKind::HttpApi => {
+                match tokio::time::timeout_at(deadline, self.execute_http(record, expected_etag))
+                    .await
+                {
+                    Ok(execution) => execution,
+                    Err(_) => deadline_execution(started),
+                }
+            }
+            ConnectionKind::McpStreamableHttp => {
+                self.execute_mcp(record, expected_etag, deadline).await
+            }
         }
     }
 
@@ -640,6 +664,7 @@ impl ConnectionTestService {
         &self,
         record: &StoredConnection,
         expected_etag: &str,
+        deadline: tokio::time::Instant,
     ) -> ConnectionTestExecution {
         let started = Instant::now();
         let uses_authentication = matches!(
@@ -652,10 +677,11 @@ impl ConnectionTestService {
             super::model::ConnectionAuthentication::None
         );
         let uses_tls = !record.write.tls.is_empty();
-        match crate::tools::mcp_upstream::probe_connection_protocol(
+        match crate::tools::mcp_upstream::probe_connection_protocol_before(
             &self.runtime,
             record.id.as_str(),
             expected_etag,
+            deadline,
         )
         .await
         {
