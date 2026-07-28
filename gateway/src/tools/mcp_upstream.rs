@@ -535,7 +535,6 @@ async fn connect(
         runtime_config,
         destination,
         None,
-        None,
     )
     .await
 }
@@ -554,10 +553,17 @@ async fn connect_connection(
         runtime_config.connect_timeout,
         runtime_config,
         destination,
-        credential,
-        target.credential_header_name().cloned(),
+        Some(ManagedMcpAuthentication {
+            credential,
+            credential_header_name: target.credential_header_name().cloned(),
+        }),
     )
     .await
+}
+
+struct ManagedMcpAuthentication {
+    credential: Option<Arc<ResolvedConnectionCredential>>,
+    credential_header_name: Option<HeaderName>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -569,16 +575,22 @@ async fn connect_endpoint(
     connect_timeout: Duration,
     runtime_config: &McpUpstreamRuntimeConfig,
     destination: &CheckedEgressDestination,
-    credential: Option<Arc<ResolvedConnectionCredential>>,
-    credential_header_name: Option<HeaderName>,
+    managed_authentication: Option<ManagedMcpAuthentication>,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
     let client = mcp_http_client(timeout, response_idle_timeout, connect_timeout, destination)?;
     let client = LimitedMcpHttpClient::new(
         client,
         runtime_config.max_request_body_bytes,
         runtime_config.max_response_bytes,
-    )
-    .with_connection_credential(credential, credential_header_name);
+    );
+    let client = if let Some(authentication) = managed_authentication {
+        client.with_connection_credential(
+            authentication.credential,
+            authentication.credential_header_name,
+        )
+    } else {
+        client
+    };
     let transport = StreamableHttpClientTransport::with_client(
         client,
         StreamableHttpClientTransportConfig::with_uri(url.to_owned()),
@@ -1637,6 +1649,57 @@ mod tests {
 
         assert_eq!(body, "direct");
         server.await.expect("direct MCP server should finish");
+    }
+
+    #[tokio::test]
+    async fn legacy_connect_keeps_rmcp_auth_required_behavior() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("legacy MCP auth listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("legacy MCP auth address should be available");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("legacy MCP auth server should accept initialization");
+            let _request = read_raw_http_request_headers(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"legacy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("legacy MCP auth challenge should write");
+        });
+        let upstream = McpUpstreamServerConfig {
+            name: "legacy-auth".to_owned(),
+            url: format!("http://{address}/mcp"),
+            timeout_ms: Some(1_000),
+            response_idle_timeout_ms: Some(1_000),
+            connect_timeout_ms: Some(1_000),
+        };
+        let runtime = McpUpstreamRuntimeConfig {
+            timeout: Duration::from_secs(1),
+            response_idle_timeout: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1_024,
+            max_response_bytes: 1_024,
+        };
+        let destination =
+            CheckedEgressDestination::for_test(Ipv4Addr::LOCALHOST.to_string(), address);
+
+        let error = match connect(&upstream, &runtime, &destination).await {
+            Ok(_) => panic!("legacy authentication challenge should stop initialization"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, McpUpstreamCallError::Connect),
+            "legacy challenge handling must not be replaced by managed auth rejection: {error:?}"
+        );
+        server
+            .await
+            .expect("legacy MCP auth server should finish cleanly");
     }
 
     #[test]

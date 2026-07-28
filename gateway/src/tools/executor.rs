@@ -79,6 +79,7 @@ const STRICT_SCHEMA_INJECTION_SKIP_KEYWORDS: &[&str] =
 // child-schema edges is far deeper than realistic tool input shapes, while
 // still bounding strict-default injection well below stack-overflow territory.
 const MAX_STRICT_SCHEMA_INJECTION_DEPTH: usize = 64;
+const MAX_VALIDATOR_CACHE_ENTRIES: usize = 4_096;
 
 type ValidatorCache = HashMap<ValidatorCacheKey, Arc<jsonschema::Validator>>;
 
@@ -969,7 +970,12 @@ impl ToolExecutor {
             }
         })?);
         let mut cache = self.validator_cache_guard();
-        Ok(cache.entry(key).or_insert(validator).clone())
+        Ok(insert_bounded_validator(
+            &mut cache,
+            key,
+            validator,
+            MAX_VALIDATOR_CACHE_ENTRIES,
+        ))
     }
 
     fn validator_cache_guard(&self) -> MutexGuard<'_, ValidatorCache> {
@@ -1277,6 +1283,25 @@ impl ToolExecutor {
             None => self.emit_named_tool_observation(context, tool_name, outcome),
         }
     }
+}
+
+fn insert_bounded_validator(
+    cache: &mut ValidatorCache,
+    key: ValidatorCacheKey,
+    validator: Arc<jsonschema::Validator>,
+    maximum: usize,
+) -> Arc<jsonschema::Validator> {
+    if let Some(existing) = cache.get(&key) {
+        return Arc::clone(existing);
+    }
+    if maximum == 0 {
+        return validator;
+    }
+    if cache.len() >= maximum {
+        cache.clear();
+    }
+    cache.insert(key, Arc::clone(&validator));
+    validator
 }
 
 impl ValidatorCacheKey {
@@ -1941,6 +1966,50 @@ mod tests {
             "tool observation event should include latency_ms"
         );
         assert_eq!(executor.validator_cache_guard().len(), 1);
+    }
+
+    #[test]
+    fn compiled_validator_cache_stays_bounded_across_schema_revisions() {
+        let mut cache = ValidatorCache::new();
+        let validator = || {
+            Arc::new(
+                jsonschema::validator_for(&json!({"type": "object"}))
+                    .expect("test schema should compile"),
+            )
+        };
+        for revision in 1_u8..=2 {
+            insert_bounded_validator(
+                &mut cache,
+                ValidatorCacheKey {
+                    tool_name: "managed-tool".to_owned(),
+                    schema_sha256: [revision; 32],
+                },
+                validator(),
+                2,
+            );
+        }
+        assert_eq!(cache.len(), 2);
+
+        let latest_key = ValidatorCacheKey {
+            tool_name: "managed-tool".to_owned(),
+            schema_sha256: [3; 32],
+        };
+        insert_bounded_validator(&mut cache, latest_key.clone(), validator(), 2);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&latest_key));
+
+        let uncached = validator();
+        let returned = insert_bounded_validator(
+            &mut cache,
+            ValidatorCacheKey {
+                tool_name: "uncached".to_owned(),
+                schema_sha256: [4; 32],
+            },
+            Arc::clone(&uncached),
+            0,
+        );
+        assert!(Arc::ptr_eq(&returned, &uncached));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

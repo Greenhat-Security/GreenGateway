@@ -15,9 +15,9 @@ use uuid::Uuid;
 
 use super::{
     model::{
-        ConnectionAuthentication, ConnectionId, ConnectionManagementSource, ConnectionWrite,
-        CONNECTION_SCHEMA_VERSION, MAX_CATALOG_ENTRIES, MAX_CONNECTIONS, MAX_CREDENTIALS,
-        MAX_MANAGED_SPEC_BYTES, MAX_STATUS_HISTORY_ROWS,
+        ConnectionAuthentication, ConnectionId, ConnectionKind, ConnectionManagementSource,
+        ConnectionWrite, DiscoveryConfig, CONNECTION_SCHEMA_VERSION, MAX_CATALOG_ENTRIES,
+        MAX_CONNECTIONS, MAX_CREDENTIALS, MAX_MANAGED_SPEC_BYTES, MAX_STATUS_HISTORY_ROWS,
     },
     status::{
         ConnectionOperationalState, ConnectionRevisions, ConnectionStatusReason,
@@ -1450,6 +1450,27 @@ impl ConnectionStore for SqliteConnectionStore {
                 .map_err(|source| sqlite_error(&self.path, "replace no-op commit", source))?;
             return Ok(current);
         }
+        if !supports_managed_mcp_catalog(&candidate) {
+            let managed_tool_count: i64 = transaction
+                .query_row(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM connection_dependencies
+                    WHERE connection_id = ?1 AND consumer_kind = ?2
+                    "#,
+                    params![id.as_str(), ConnectionDependencyKind::ManagedTool.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|source| {
+                    sqlite_error(&self.path, "managed MCP dependency count", source)
+                })?;
+            if managed_tool_count > 0 {
+                return Err(ConnectionStoreError::DependencyConflict {
+                    id: id.to_string(),
+                    count: usize::try_from(managed_tool_count).unwrap_or(usize::MAX),
+                });
+            }
+        }
 
         ensure_binding_capacity(
             &transaction,
@@ -2432,6 +2453,11 @@ fn binding_count(write: &ConnectionWrite) -> usize {
         + usize::from(write.tls.client_private_key_id.is_some())
 }
 
+fn supports_managed_mcp_catalog(write: &ConnectionWrite) -> bool {
+    write.kind == ConnectionKind::McpStreamableHttp
+        && matches!(&write.discovery, Some(DiscoveryConfig::ManagedMcp { .. }))
+}
+
 fn ensure_binding_capacity(
     transaction: &Transaction<'_>,
     path: &Path,
@@ -2815,6 +2841,146 @@ mod tests {
     }
 
     #[test]
+    fn migration_four_preserves_populated_v3_status_state_and_indexes() {
+        let database = TemporaryDatabase::new("migration-v3-populated");
+        let path = database.path.clone();
+        let connection_id = ConnectionId::new_managed();
+        let write = mcp_candidate();
+        let spec_json =
+            serde_json::to_string(&write).expect("v3 fixture candidate should serialize");
+        let timestamp = "2026-07-28T00:00:00Z";
+        {
+            let connection =
+                Connection::open(&path).expect("v3 fixture database should open directly");
+            connection
+                .execute_batch(CONFIGURE_SQL)
+                .expect("v3 fixture pragmas should apply");
+            connection
+                .execute_batch(CREATE_MIGRATIONS_TABLE_SQL)
+                .expect("v3 fixture migration table should create");
+            for migration in MIGRATIONS.iter().take(3) {
+                connection
+                    .execute_batch(migration.sql)
+                    .expect("v3 fixture migration should apply");
+                connection
+                    .execute(
+                        "INSERT INTO connection_schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        params![migration.version, timestamp],
+                    )
+                    .expect("v3 fixture migration should record");
+            }
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_records (
+                        id, schema_version, source, spec_json, connection_revision,
+                        credential_revision, tls_revision, discovery_revision,
+                        status_revision, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, 1, 0, 0, 1, 1, ?5, ?5)
+                    "#,
+                    params![
+                        connection_id.as_str(),
+                        CONNECTION_SCHEMA_VERSION,
+                        SOURCE_MANAGED,
+                        spec_json,
+                        timestamp,
+                    ],
+                )
+                .expect("v3 fixture Connection should insert");
+            for table in ["connection_current_status", "connection_status_history"] {
+                connection
+                    .execute(
+                        &format!(
+                            r#"
+                            INSERT INTO {table} (
+                                connection_id, status_revision, observed_connection_revision,
+                                observed_credential_revision, observed_tls_revision,
+                                observed_discovery_revision, state, reason, observed_at,
+                                latency_ms, catalog_age_secs, catalog_entry_count
+                            ) VALUES (?1, 1, 1, 0, 0, 1, 'healthy', 'test_succeeded', ?2, 12, NULL, NULL)
+                            "#
+                        ),
+                        params![connection_id.as_str(), timestamp],
+                    )
+                    .expect("populated v3 status row should insert");
+            }
+        }
+
+        let store = SqliteConnectionStore::open(&path)
+            .expect("migration 4 should upgrade populated v3 state");
+        let preserved = store
+            .latest_status(&connection_id)
+            .expect("migrated current status should load")
+            .expect("migrated current status should remain");
+        assert_eq!(preserved.state, ConnectionOperationalState::Healthy);
+        assert_eq!(preserved.reason, ConnectionStatusReason::TestSucceeded);
+        assert_eq!(preserved.latency_ms, Some(12));
+        let history = store
+            .status_history(&connection_id, 10)
+            .expect("migrated status history should load");
+        assert_eq!(history, vec![preserved]);
+        {
+            let connection = store.connection_guard();
+            let indexes = connection
+                .prepare(
+                    r#"
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'index'
+                      AND name IN (
+                        'idx_connection_status_revision',
+                        'idx_connection_status_latest',
+                        'idx_connection_mcp_catalog_ordinal'
+                      )
+                    ORDER BY name ASC
+                    "#,
+                )
+                .expect("migrated index query should prepare")
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("migrated index query should run")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("migrated indexes should read");
+            assert_eq!(
+                indexes,
+                vec![
+                    "idx_connection_mcp_catalog_ordinal".to_owned(),
+                    "idx_connection_status_latest".to_owned(),
+                    "idx_connection_status_revision".to_owned(),
+                ]
+            );
+        }
+        let record = store
+            .get(&connection_id)
+            .expect("migrated Connection should load")
+            .expect("migrated Connection should remain");
+        let refreshed = store
+            .append_status(
+                &connection_id,
+                &record.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::CatalogRefreshed,
+                    latency_ms: Some(8),
+                    catalog_age_secs: Some(0),
+                    catalog_entry_count: Some(1),
+                },
+            )
+            .expect("migration 4 status constraint should accept catalog_refreshed");
+        assert_eq!(refreshed.reason, ConnectionStatusReason::CatalogRefreshed);
+        drop(store);
+
+        let reopened = SqliteConnectionStore::open(&path)
+            .expect("populated migration 4 database should pass restart validation");
+        assert_eq!(
+            reopened
+                .status_history(&connection_id, 10)
+                .expect("restarted history should load")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn mcp_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
         let (_directory, path, store) = temporary_store("mcp-catalog");
         let created = store
@@ -2863,6 +3029,26 @@ mod tests {
                 .map(|entry| entry.remote_tool_name.as_str())
                 .collect::<Vec<_>>(),
             vec!["beta", "gamma"]
+        );
+
+        let mut discovery_removed = created.write.clone();
+        discovery_removed.discovery = None;
+        assert!(matches!(
+            store.replace(&created.id, &created.etag(), discovery_removed),
+            Err(ConnectionStoreError::DependencyConflict { count: 2, .. })
+        ));
+        assert!(matches!(
+            store.replace(&created.id, &created.etag(), candidate()),
+            Err(ConnectionStoreError::DependencyConflict { count: 2, .. })
+        ));
+        assert_eq!(
+            store
+                .get(&created.id)
+                .expect("catalog-bearing Connection should still load")
+                .expect("catalog-bearing Connection should remain")
+                .write,
+            created.write,
+            "an incompatible update must not strand the managed catalog"
         );
 
         let duplicate = [
