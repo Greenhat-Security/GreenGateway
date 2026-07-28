@@ -4,7 +4,10 @@ use std::{
     error::Error,
     fmt,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -22,7 +25,8 @@ use rmcp::{
     model::{
         CallToolRequest, CallToolRequestParams, CallToolResult, ClientJsonRpcMessage,
         ClientRequest, JsonObject, Meta, NumberOrString, PaginatedRequestParams, ProgressToken,
-        ServerJsonRpcMessage, Tool,
+        Resource as McpResource, ResourceTemplate as McpResourceTemplate, ServerJsonRpcMessage,
+        Tool,
     },
     service::{ClientInitializeError, ServiceError},
     transport::{
@@ -38,9 +42,13 @@ use sse_stream::{Sse, SseStream};
 
 use crate::{
     config::{Config, McpUpstreamServerConfig},
-    connections::http::{
-        ConnectionHttpError, ConnectionHttpRuntime, ConnectionHttpTarget,
-        ResolvedConnectionCredential,
+    connections::{
+        http::{
+            ConnectionHttpError, ConnectionHttpRuntime, ConnectionHttpTarget,
+            ResolvedConnectionCredential,
+        },
+        model::MAX_CATALOG_ENTRIES,
+        store::{validate_mcp_resource_metadata, StoredMcpResource, StoredMcpResourceTemplate},
     },
     egress::{CheckedEgressDestination, EgressClient, EgressError},
     tools::definitions::ToolDefinition,
@@ -54,7 +62,26 @@ const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
 const JSON_MIME: &str = "application/json";
 const MAX_DISCOVERY_PAGES_PER_UPSTREAM: usize = 32;
 const MAX_DISCOVERY_TOOLS_PER_UPSTREAM: usize = 1024;
+const MAX_DISCOVERY_RESOURCES_PER_UPSTREAM: usize = 1024;
+const MAX_DISCOVERY_RESOURCE_TEMPLATES_PER_UPSTREAM: usize = 1024;
+const MAX_DISCOVERY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const REDACTED_MCP_UPSTREAM_VALUE: &str = "<redacted>";
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpDiscoveredCatalog {
+    pub tools: Vec<ToolDefinition>,
+    pub resources: Vec<StoredMcpResource>,
+    pub resource_templates: Vec<StoredMcpResourceTemplate>,
+}
+
+impl McpDiscoveredCatalog {
+    pub fn total_count(&self) -> usize {
+        self.tools
+            .len()
+            .saturating_add(self.resources.len())
+            .saturating_add(self.resource_templates.len())
+    }
+}
 
 #[derive(Debug)]
 pub enum McpUpstreamDiscoveryError {
@@ -119,6 +146,11 @@ pub enum McpUpstreamCallError {
     AuthenticationRejected,
     DiscoveryPageLimitExceeded { max: usize },
     DiscoveryToolLimitExceeded { max: usize },
+    DiscoveryResourceLimitExceeded { max: usize },
+    DiscoveryResourceTemplateLimitExceeded { max: usize },
+    DiscoveryCapabilityLimitExceeded { max: usize },
+    DiscoveryResponseLimitExceeded { max: usize },
+    InvalidDiscoveryMetadata,
     RequestBodyTooLarge { size: usize, max: usize },
     ResponseTooLarge { max: usize },
 }
@@ -134,6 +166,13 @@ impl McpUpstreamCallError {
             Self::AuthenticationRejected => "auth_failed",
             Self::DiscoveryPageLimitExceeded { .. } => "discovery_page_limit_exceeded",
             Self::DiscoveryToolLimitExceeded { .. } => "discovery_tool_limit_exceeded",
+            Self::DiscoveryResourceLimitExceeded { .. } => "discovery_resource_limit_exceeded",
+            Self::DiscoveryResourceTemplateLimitExceeded { .. } => {
+                "discovery_resource_template_limit_exceeded"
+            }
+            Self::DiscoveryCapabilityLimitExceeded { .. } => "discovery_capability_limit_exceeded",
+            Self::DiscoveryResponseLimitExceeded { .. } => "discovery_response_limit_exceeded",
+            Self::InvalidDiscoveryMetadata => "invalid_discovery_metadata",
             Self::RequestBodyTooLarge { .. } => "request_body_too_large",
             Self::ResponseTooLarge { .. } => "response_too_large",
         }
@@ -166,6 +205,25 @@ impl fmt::Display for McpUpstreamCallError {
                 formatter,
                 "upstream MCP tools/list discovery exceeded {max} tools"
             ),
+            Self::DiscoveryResourceLimitExceeded { max } => write!(
+                formatter,
+                "upstream MCP resources/list discovery exceeded {max} resources"
+            ),
+            Self::DiscoveryResourceTemplateLimitExceeded { max } => write!(
+                formatter,
+                "upstream MCP resources/templates/list discovery exceeded {max} templates"
+            ),
+            Self::DiscoveryCapabilityLimitExceeded { max } => write!(
+                formatter,
+                "upstream MCP discovery exceeded {max} aggregate capabilities"
+            ),
+            Self::DiscoveryResponseLimitExceeded { max } => write!(
+                formatter,
+                "upstream MCP discovery exceeded {max} aggregate response bytes"
+            ),
+            Self::InvalidDiscoveryMetadata => {
+                formatter.write_str("upstream MCP discovery returned invalid metadata")
+            }
             Self::RequestBodyTooLarge { size, max } => {
                 write!(
                     formatter,
@@ -345,11 +403,11 @@ pub async fn call_tool(
     Ok(result)
 }
 
-pub async fn discover_connection_tools(
+pub async fn discover_connection_catalog(
     runtime: &ConnectionHttpRuntime,
     connection_id: &str,
     expected_connection_etag: &str,
-) -> Result<Vec<ToolDefinition>, McpUpstreamCallError> {
+) -> Result<McpDiscoveredCatalog, McpUpstreamCallError> {
     let target = runtime
         .mcp_target(connection_id)
         .map_err(connection_mcp_error)?;
@@ -369,16 +427,33 @@ pub async fn discover_connection_tools(
         .await
         .map_err(connection_mcp_error)?
         .map(Arc::new);
-    let mut service =
-        connect_connection(&target, &runtime_config, &destination, credential).await?;
-    let tools = list_tools_with_limits(&mut service).await;
+    let response_budget = DiscoveryResponseByteBudget::new(MAX_DISCOVERY_RESPONSE_BYTES);
+    let mut service = connect_connection(
+        &target,
+        &runtime_config,
+        &destination,
+        credential,
+        Some(response_budget),
+    )
+    .await?;
+    let discovered = discover_catalog_with_limits(&mut service).await;
     let _ = service.close_with_timeout(Duration::from_millis(250)).await;
-    tools.map(|tools| {
-        tools
+    let discovered = discovered?;
+    let catalog = McpDiscoveredCatalog {
+        tools: discovered
+            .tools
             .into_iter()
             .map(|tool| connection_proxy_definition(connection_id, tool))
-            .collect()
-    })
+            .collect(),
+        resources: discovered.resources,
+        resource_templates: discovered.resource_templates,
+    };
+    if catalog.total_count() > MAX_CATALOG_ENTRIES {
+        return Err(McpUpstreamCallError::DiscoveryCapabilityLimitExceeded {
+            max: MAX_CATALOG_ENTRIES,
+        });
+    }
+    Ok(catalog)
 }
 
 pub async fn call_connection_tool(
@@ -414,7 +489,7 @@ pub async fn call_connection_tool(
         .map_err(connection_mcp_error)?
         .map(Arc::new);
     let mut service =
-        connect_connection(&target, &runtime_config, &destination, credential).await?;
+        connect_connection(&target, &runtime_config, &destination, credential, None).await?;
     let result = service
         .call_tool(request)
         .await
@@ -486,10 +561,94 @@ async fn list_tools(
 async fn list_tools_with_limits(
     service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
 ) -> Result<Vec<Tool>, McpUpstreamCallError> {
+    let mut budget = DiscoveryPageBudget::new();
+    list_tools_with_limits_and_budget(service, &mut budget).await
+}
+
+struct RawMcpDiscoveredCatalog {
+    tools: Vec<Tool>,
+    resources: Vec<StoredMcpResource>,
+    resource_templates: Vec<StoredMcpResourceTemplate>,
+}
+
+struct DiscoveryPageBudget {
+    consumed: usize,
+}
+
+impl DiscoveryPageBudget {
+    fn new() -> Self {
+        Self { consumed: 0 }
+    }
+
+    fn consume(&mut self) -> Result<(), McpUpstreamCallError> {
+        if self.consumed >= MAX_DISCOVERY_PAGES_PER_UPSTREAM {
+            tracing::warn!(
+                max_pages = MAX_DISCOVERY_PAGES_PER_UPSTREAM,
+                "MCP upstream discovery exceeded aggregate page limit"
+            );
+            return Err(McpUpstreamCallError::DiscoveryPageLimitExceeded {
+                max: MAX_DISCOVERY_PAGES_PER_UPSTREAM,
+            });
+        }
+        self.consumed += 1;
+        Ok(())
+    }
+}
+
+async fn discover_catalog_with_limits(
+    service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> Result<RawMcpDiscoveredCatalog, McpUpstreamCallError> {
+    let mut budget = DiscoveryPageBudget::new();
+    let (supports_tools, supports_resources) = service
+        .peer_info()
+        .map(|info| {
+            (
+                info.capabilities.tools.is_some(),
+                info.capabilities.resources.is_some(),
+            )
+        })
+        .unwrap_or((false, false));
+    let tools = if supports_tools {
+        list_tools_with_limits_and_budget(service, &mut budget).await?
+    } else {
+        Vec::new()
+    };
+    let (resources, resource_templates) = if supports_resources {
+        (
+            list_resources_with_limits(service, &mut budget).await?,
+            list_resource_templates_with_limits(service, &mut budget).await?,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    if tools
+        .len()
+        .saturating_add(resources.len())
+        .saturating_add(resource_templates.len())
+        > MAX_CATALOG_ENTRIES
+    {
+        return Err(McpUpstreamCallError::DiscoveryCapabilityLimitExceeded {
+            max: MAX_CATALOG_ENTRIES,
+        });
+    }
+    validate_mcp_resource_metadata(&resources, &resource_templates)
+        .map_err(|_| McpUpstreamCallError::InvalidDiscoveryMetadata)?;
+    Ok(RawMcpDiscoveredCatalog {
+        tools,
+        resources,
+        resource_templates,
+    })
+}
+
+async fn list_tools_with_limits_and_budget(
+    service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    budget: &mut DiscoveryPageBudget,
+) -> Result<Vec<Tool>, McpUpstreamCallError> {
     let mut tools = Vec::new();
     let mut cursor = None;
 
-    for _ in 0..MAX_DISCOVERY_PAGES_PER_UPSTREAM {
+    loop {
+        budget.consume()?;
         let result = service
             .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor)))
             .await
@@ -511,14 +670,92 @@ async fn list_tools_with_limits(
             return Ok(tools);
         }
     }
+}
 
-    tracing::warn!(
-        max_pages = MAX_DISCOVERY_PAGES_PER_UPSTREAM,
-        "MCP upstream discovery exceeded aggregate page limit"
-    );
-    Err(McpUpstreamCallError::DiscoveryPageLimitExceeded {
-        max: MAX_DISCOVERY_PAGES_PER_UPSTREAM,
-    })
+async fn list_resources_with_limits(
+    service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    budget: &mut DiscoveryPageBudget,
+) -> Result<Vec<StoredMcpResource>, McpUpstreamCallError> {
+    let mut resources = Vec::new();
+    let mut cursor = None;
+    loop {
+        budget.consume()?;
+        let result = service
+            .list_resources(Some(PaginatedRequestParams::default().with_cursor(cursor)))
+            .await
+            .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+        if resources.len().saturating_add(result.resources.len())
+            > MAX_DISCOVERY_RESOURCES_PER_UPSTREAM
+        {
+            return Err(McpUpstreamCallError::DiscoveryResourceLimitExceeded {
+                max: MAX_DISCOVERY_RESOURCES_PER_UPSTREAM,
+            });
+        }
+        resources.extend(result.resources.into_iter().map(stored_mcp_resource));
+        cursor = result.next_cursor;
+        if cursor.is_none() {
+            return Ok(resources);
+        }
+    }
+}
+
+async fn list_resource_templates_with_limits(
+    service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    budget: &mut DiscoveryPageBudget,
+) -> Result<Vec<StoredMcpResourceTemplate>, McpUpstreamCallError> {
+    let mut resource_templates = Vec::new();
+    let mut cursor = None;
+    loop {
+        budget.consume()?;
+        let result = service
+            .list_resource_templates(Some(PaginatedRequestParams::default().with_cursor(cursor)))
+            .await
+            .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+        if resource_templates
+            .len()
+            .saturating_add(result.resource_templates.len())
+            > MAX_DISCOVERY_RESOURCE_TEMPLATES_PER_UPSTREAM
+        {
+            return Err(
+                McpUpstreamCallError::DiscoveryResourceTemplateLimitExceeded {
+                    max: MAX_DISCOVERY_RESOURCE_TEMPLATES_PER_UPSTREAM,
+                },
+            );
+        }
+        resource_templates.extend(
+            result
+                .resource_templates
+                .into_iter()
+                .map(stored_mcp_resource_template),
+        );
+        cursor = result.next_cursor;
+        if cursor.is_none() {
+            return Ok(resource_templates);
+        }
+    }
+}
+
+fn stored_mcp_resource(resource: McpResource) -> StoredMcpResource {
+    StoredMcpResource {
+        uri: resource.uri,
+        name: resource.name,
+        title: resource.title,
+        description: resource.description,
+        mime_type: resource.mime_type,
+        size: resource.size,
+    }
+}
+
+fn stored_mcp_resource_template(
+    resource_template: McpResourceTemplate,
+) -> StoredMcpResourceTemplate {
+    StoredMcpResourceTemplate {
+        uri_template: resource_template.uri_template,
+        name: resource_template.name,
+        title: resource_template.title,
+        description: resource_template.description,
+        mime_type: resource_template.mime_type,
+    }
 }
 
 async fn connect(
@@ -535,6 +772,7 @@ async fn connect(
         runtime_config,
         destination,
         None,
+        None,
     )
     .await
 }
@@ -544,6 +782,7 @@ async fn connect_connection(
     runtime_config: &McpUpstreamRuntimeConfig,
     destination: &CheckedEgressDestination,
     credential: Option<Arc<ResolvedConnectionCredential>>,
+    discovery_response_budget: Option<DiscoveryResponseByteBudget>,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
     connect_endpoint(
         target.connection_id().as_str(),
@@ -557,6 +796,7 @@ async fn connect_connection(
             credential,
             credential_header_name: target.credential_header_name().cloned(),
         }),
+        discovery_response_budget,
     )
     .await
 }
@@ -576,13 +816,17 @@ async fn connect_endpoint(
     runtime_config: &McpUpstreamRuntimeConfig,
     destination: &CheckedEgressDestination,
     managed_authentication: Option<ManagedMcpAuthentication>,
+    discovery_response_budget: Option<DiscoveryResponseByteBudget>,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
     let client = mcp_http_client(timeout, response_idle_timeout, connect_timeout, destination)?;
-    let client = LimitedMcpHttpClient::new(
+    let mut client = LimitedMcpHttpClient::new(
         client,
         runtime_config.max_request_body_bytes,
         runtime_config.max_response_bytes,
     );
+    if let Some(discovery_response_budget) = discovery_response_budget {
+        client = client.with_discovery_response_budget(discovery_response_budget);
+    }
     let client = if let Some(authentication) = managed_authentication {
         client.with_connection_credential(
             authentication.credential,
@@ -624,10 +868,37 @@ fn mcp_http_client(
 }
 
 #[derive(Clone)]
+struct DiscoveryResponseByteBudget {
+    consumed: Arc<AtomicUsize>,
+    maximum: usize,
+}
+
+impl DiscoveryResponseByteBudget {
+    fn new(maximum: usize) -> Self {
+        Self {
+            consumed: Arc::new(AtomicUsize::new(0)),
+            maximum,
+        }
+    }
+
+    fn charge(&self, bytes: usize) -> Result<(), LimitedMcpHttpError> {
+        self.consumed
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |consumed| {
+                consumed
+                    .checked_add(bytes)
+                    .filter(|next| *next <= self.maximum)
+            })
+            .map(|_| ())
+            .map_err(|_| LimitedMcpHttpError::DiscoveryResponseTooLarge { max: self.maximum })
+    }
+}
+
+#[derive(Clone)]
 struct LimitedMcpHttpClient {
     inner: rmcp_reqwest::Client,
     max_request_body_bytes: usize,
     max_response_bytes: usize,
+    discovery_response_budget: Option<DiscoveryResponseByteBudget>,
     managed_connection: bool,
     connection_credential: Option<Arc<ResolvedConnectionCredential>>,
     credential_header_name: Option<HeaderName>,
@@ -643,10 +914,19 @@ impl LimitedMcpHttpClient {
             inner,
             max_request_body_bytes,
             max_response_bytes,
+            discovery_response_budget: None,
             managed_connection: false,
             connection_credential: None,
             credential_header_name: None,
         }
+    }
+
+    fn with_discovery_response_budget(
+        mut self,
+        discovery_response_budget: DiscoveryResponseByteBudget,
+    ) -> Self {
+        self.discovery_response_budget = Some(discovery_response_budget);
+        self
     }
 
     fn with_connection_credential(
@@ -709,6 +989,7 @@ enum LimitedMcpHttpError {
     Serialize(serde_json::Error),
     RequestBodyTooLarge { size: usize, max: usize },
     ResponseTooLarge { max: usize },
+    DiscoveryResponseTooLarge { max: usize },
 }
 
 impl fmt::Display for LimitedMcpHttpError {
@@ -731,6 +1012,12 @@ impl fmt::Display for LimitedMcpHttpError {
             Self::ResponseTooLarge { max } => {
                 write!(formatter, "egress response body exceeded {max} bytes")
             }
+            Self::DiscoveryResponseTooLarge { max } => {
+                write!(
+                    formatter,
+                    "MCP discovery response bodies exceeded {max} bytes"
+                )
+            }
         }
     }
 }
@@ -743,7 +1030,8 @@ impl Error for LimitedMcpHttpError {
             Self::Http(_)
             | Self::AuthenticationRejected
             | Self::RequestBodyTooLarge { .. }
-            | Self::ResponseTooLarge { .. } => None,
+            | Self::ResponseTooLarge { .. }
+            | Self::DiscoveryResponseTooLarge { .. } => None,
         }
     }
 }
@@ -803,6 +1091,7 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
         let event_stream = SseStream::from_byte_stream(limited_mcp_response_stream(
             response,
             self.max_response_bytes,
+            self.discovery_response_budget.clone(),
         ))
         .boxed();
         Ok(event_stream)
@@ -926,7 +1215,13 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
         }
 
         if !status.is_success() {
-            match read_limited_mcp_response_body(response, self.max_response_bytes).await {
+            match read_limited_mcp_response_body(
+                response,
+                self.max_response_bytes,
+                self.discovery_response_budget.clone(),
+            )
+            .await
+            {
                 Ok(_) => {}
                 Err(error) if mcp_streamable_error_response_too_large(&error).is_some() => {
                     return Err(error);
@@ -942,6 +1237,7 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
                 let event_stream = SseStream::from_byte_stream(limited_mcp_response_stream(
                     response,
                     self.max_response_bytes,
+                    self.discovery_response_budget.clone(),
                 ))
                 .boxed();
                 Ok(StreamableHttpPostResponse::Sse(event_stream, session_id))
@@ -950,6 +1246,7 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
                 match read_limited_mcp_response_json::<ServerJsonRpcMessage>(
                     response,
                     self.max_response_bytes,
+                    self.discovery_response_budget.clone(),
                 )
                 .await
                 {
@@ -979,19 +1276,21 @@ type LimitedMcpByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, LimitedMcpHt
 fn limited_mcp_response_stream(
     response: rmcp_reqwest::Response,
     max_response_bytes: usize,
+    discovery_response_budget: Option<DiscoveryResponseByteBudget>,
 ) -> LimitedMcpByteStream {
     let body = Box::pin(response.bytes_stream());
-    limited_mcp_body_stream(body, max_response_bytes)
+    limited_mcp_body_stream(body, max_response_bytes, discovery_response_budget)
 }
 
 fn limited_mcp_body_stream(
     body: Pin<Box<dyn Stream<Item = Result<Bytes, rmcp_reqwest::Error>> + Send>>,
     max_response_bytes: usize,
+    discovery_response_budget: Option<DiscoveryResponseByteBudget>,
 ) -> LimitedMcpByteStream {
     Box::pin(stream::unfold(
-        (body, 0usize, false),
+        (body, 0usize, false, discovery_response_budget),
         move |state| async move {
-            let (mut body, mut streamed_bytes, done) = state;
+            let (mut body, mut streamed_bytes, done, discovery_response_budget) = state;
             if done {
                 return None;
             }
@@ -1007,16 +1306,31 @@ fn limited_mcp_body_stream(
                             Err(LimitedMcpHttpError::ResponseTooLarge {
                                 max: max_response_bytes,
                             }),
-                            (body, streamed_bytes, true),
+                            (body, streamed_bytes, true, discovery_response_budget),
                         ));
                     }
 
+                    if let Some(budget) = discovery_response_budget.as_ref() {
+                        if let Err(error) = budget.charge(chunk.len()) {
+                            tracing::warn!(
+                                max = budget.maximum,
+                                "MCP discovery exceeded aggregate raw response byte limit"
+                            );
+                            return Some((
+                                Err(error),
+                                (body, streamed_bytes, true, discovery_response_budget),
+                            ));
+                        }
+                    }
                     streamed_bytes += chunk.len();
-                    Some((Ok(chunk), (body, streamed_bytes, false)))
+                    Some((
+                        Ok(chunk),
+                        (body, streamed_bytes, false, discovery_response_budget),
+                    ))
                 }
                 Some(Err(error)) => Some((
                     Err(LimitedMcpHttpError::from(error)),
-                    (body, streamed_bytes, true),
+                    (body, streamed_bytes, true, discovery_response_budget),
                 )),
                 None => None,
             }
@@ -1027,9 +1341,11 @@ fn limited_mcp_body_stream(
 async fn read_limited_mcp_response_body(
     response: rmcp_reqwest::Response,
     max_response_bytes: usize,
+    discovery_response_budget: Option<DiscoveryResponseByteBudget>,
 ) -> Result<Bytes, StreamableHttpError<LimitedMcpHttpError>> {
     enforce_mcp_response_content_length(&response, max_response_bytes)?;
-    let mut stream = limited_mcp_response_stream(response, max_response_bytes);
+    let mut stream =
+        limited_mcp_response_stream(response, max_response_bytes, discovery_response_budget);
     let mut body = Vec::new();
 
     while let Some(chunk) = stream.next().await {
@@ -1043,8 +1359,11 @@ async fn read_limited_mcp_response_body(
 async fn read_limited_mcp_response_json<T: serde::de::DeserializeOwned>(
     response: rmcp_reqwest::Response,
     max_response_bytes: usize,
+    discovery_response_budget: Option<DiscoveryResponseByteBudget>,
 ) -> Result<T, StreamableHttpError<LimitedMcpHttpError>> {
-    let body = read_limited_mcp_response_body(response, max_response_bytes).await?;
+    let body =
+        read_limited_mcp_response_body(response, max_response_bytes, discovery_response_budget)
+            .await?;
     serde_json::from_slice(&body).map_err(StreamableHttpError::Deserialize)
 }
 
@@ -1198,6 +1517,8 @@ where
         McpUpstreamCallError::AuthenticationRejected
     } else if let Some((size, max)) = mcp_request_body_too_large_size_max(&error) {
         McpUpstreamCallError::RequestBodyTooLarge { size, max }
+    } else if let Some(max) = mcp_discovery_response_too_large_max(&error) {
+        McpUpstreamCallError::DiscoveryResponseLimitExceeded { max }
     } else if let Some(max) = mcp_response_too_large_max(&error) {
         McpUpstreamCallError::ResponseTooLarge { max }
     } else {
@@ -1244,7 +1565,7 @@ fn mcp_authentication_rejected(error: &(dyn Error + 'static)) -> bool {
 fn mcp_streamable_error_response_too_large(
     error: &StreamableHttpError<LimitedMcpHttpError>,
 ) -> Option<usize> {
-    mcp_response_too_large_max(error)
+    mcp_response_too_large_max(error).or_else(|| mcp_discovery_response_too_large_max(error))
 }
 
 fn mcp_request_body_too_large_size_max(error: &(dyn Error + 'static)) -> Option<(usize, usize)> {
@@ -1315,6 +1636,45 @@ fn mcp_response_too_large_max(error: &(dyn Error + 'static)) -> Option<usize> {
         }
         if let Some(StreamableHttpError::Client(LimitedMcpHttpError::ResponseTooLarge { max })) =
             error.downcast_ref::<StreamableHttpError<LimitedMcpHttpError>>()
+        {
+            return Some(*max);
+        }
+
+        current = error.source();
+    }
+
+    None
+}
+
+fn mcp_discovery_response_too_large_max(error: &(dyn Error + 'static)) -> Option<usize> {
+    let mut current = Some(error);
+
+    while let Some(error) = current {
+        if let Some(ServiceError::TransportSend(error)) = error.downcast_ref::<ServiceError>() {
+            if let Some(max) = mcp_discovery_response_too_large_max(error.error.as_ref()) {
+                return Some(max);
+            }
+        }
+        if let Some(ClientInitializeError::TransportError { error, .. }) =
+            error.downcast_ref::<ClientInitializeError>()
+        {
+            if let Some(max) = mcp_discovery_response_too_large_max(error.error.as_ref()) {
+                return Some(max);
+            }
+        }
+        if let Some(error) = error.downcast_ref::<DynamicTransportError>() {
+            if let Some(max) = mcp_discovery_response_too_large_max(error.error.as_ref()) {
+                return Some(max);
+            }
+        }
+        if let Some(LimitedMcpHttpError::DiscoveryResponseTooLarge { max }) =
+            error.downcast_ref::<LimitedMcpHttpError>()
+        {
+            return Some(*max);
+        }
+        if let Some(StreamableHttpError::Client(LimitedMcpHttpError::DiscoveryResponseTooLarge {
+            max,
+        })) = error.downcast_ref::<StreamableHttpError<LimitedMcpHttpError>>()
         {
             return Some(*max);
         }
@@ -1414,6 +1774,71 @@ mod tests {
     use tracing_subscriber::{fmt::MakeWriter, prelude::*};
 
     const TEST_RESPONSE_LIMIT: usize = 64;
+
+    #[test]
+    fn managed_discovery_page_budget_is_shared_across_all_collections() {
+        let mut budget = DiscoveryPageBudget::new();
+
+        for _ in 0..10 {
+            budget.consume().expect("tool page should fit");
+        }
+        for _ in 0..10 {
+            budget.consume().expect("resource page should fit");
+        }
+        for _ in 0..12 {
+            budget.consume().expect("resource-template page should fit");
+        }
+
+        assert!(matches!(
+            budget.consume(),
+            Err(McpUpstreamCallError::DiscoveryPageLimitExceeded {
+                max: MAX_DISCOVERY_PAGES_PER_UPSTREAM
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn discovery_raw_response_budget_counts_unknown_json_and_sse_across_responses() {
+        let unknown_json = Bytes::from(format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"tools":[],"unknown":"{}"}}}}"#,
+            "x".repeat(48)
+        ));
+        let unknown_sse = Bytes::from(format!(
+            "event: message\ndata: {{\"unknown\":\"{}\"}}\n\n",
+            "y".repeat(48)
+        ));
+        let maximum = unknown_json
+            .len()
+            .saturating_add(unknown_sse.len())
+            .saturating_sub(1);
+        let budget = DiscoveryResponseByteBudget::new(maximum);
+
+        let first_body = stream::iter([Ok::<_, rmcp_reqwest::Error>(unknown_json.clone())]);
+        let mut first =
+            limited_mcp_body_stream(Box::pin(first_body), usize::MAX, Some(budget.clone()));
+        assert_eq!(
+            first
+                .next()
+                .await
+                .expect("JSON response should yield")
+                .expect("first raw response should fit"),
+            unknown_json
+        );
+        assert!(first.next().await.is_none());
+
+        let second_body = stream::iter([Ok::<_, rmcp_reqwest::Error>(unknown_sse)]);
+        let mut second = limited_mcp_body_stream(Box::pin(second_body), usize::MAX, Some(budget));
+        let error = second
+            .next()
+            .await
+            .expect("SSE response should yield a bounded error")
+            .expect_err("raw bytes across responses must share one budget");
+        assert!(matches!(
+            mcp_service_error(error, McpUpstreamCallError::Call),
+            McpUpstreamCallError::DiscoveryResponseLimitExceeded { max }
+                if max == maximum
+        ));
+    }
 
     struct CountingDnsResolver {
         calls: AtomicUsize,
@@ -2186,6 +2611,7 @@ mod tests {
             Box::pin(SseStream::from_byte_stream(limited_mcp_body_stream(
                 Box::pin(body),
                 TEST_RESPONSE_LIMIT,
+                None,
             )));
 
         assert_first_sse_event(&mut stream).await;

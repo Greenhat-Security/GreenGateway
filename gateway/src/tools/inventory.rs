@@ -1,0 +1,1685 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::{
+    auth::Principal,
+    connections::{
+        control_plane::{ConnectionControlPlane, ConnectionRuntimeSnapshot},
+        model::{ConnectionId, ConnectionKind, ConnectionManagementSource},
+        status::{ConnectionOperationalState, ConnectionStatusReason, SafeConnectionStatus},
+        store::{
+            ConnectionStoreError, StoredMcpCatalog, StoredOpenApiCatalogEntry,
+            StoredOpenApiInventoryCatalog,
+        },
+    },
+    middleware::rbac::RbacState,
+};
+
+use super::definitions::{
+    BodyMapping, HttpToolMapping, QueryParamMapping, ToolDefinition, ToolRegistry, ToolSource,
+    ToolTarget,
+};
+
+pub const DEFAULT_CAPABILITY_LIST_LIMIT: usize = 50;
+pub const MAX_CAPABILITY_LIST_LIMIT: usize = 100;
+pub const MAX_CAPABILITY_INVENTORY_ENTRIES: usize = 8_192;
+pub const MAX_CAPABILITY_LIST_RESPONSE_BYTES: usize = 1_048_576;
+pub const MAX_CAPABILITY_DETAIL_RESPONSE_BYTES: usize = 2 * 1_048_576;
+
+const MAX_CURSOR_BYTES: usize = 4_096;
+const MAX_TEXT_FILTER_CHARS: usize = 128;
+const MAX_TEXT_FILTER_BYTES: usize = 512;
+const MAX_PUBLIC_DESCRIPTION_CHARS: usize = 1_024;
+const CAPABILITY_ID_PREFIX: &str = "cap_";
+const CAPABILITY_ID_HEX_BYTES: usize = 64;
+
+#[derive(Clone)]
+pub struct CapabilityInventory {
+    registry: ToolRegistry,
+    control_plane: ConnectionControlPlane,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityKind {
+    Tool,
+    Resource,
+    ResourceTemplate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySourceFilter {
+    #[serde(alias = "local_file")]
+    ManualFile,
+    Openapi,
+    McpDiscovery,
+    #[serde(alias = "legacy_config")]
+    ProjectedLegacyConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityAvailabilityFilter {
+    Available,
+    Unavailable,
+    Stale,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityListParams {
+    pub kind: Option<CapabilityKind>,
+    #[serde(alias = "connection")]
+    pub connection_id: Option<String>,
+    pub source: Option<CapabilitySourceFilter>,
+    pub available: Option<bool>,
+    pub availability: Option<CapabilityAvailabilityFilter>,
+    pub text: Option<String>,
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CapabilitySource {
+    ManualFile,
+    Openapi {
+        connection_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        catalog_revision: u64,
+        spec_revision: u64,
+        spec_digest: String,
+    },
+    McpDiscovery {
+        connection_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        remote_tool_name: Option<String>,
+    },
+    ProjectedLegacyConfig {
+        connection_id: String,
+        remote_tool_name: String,
+    },
+}
+
+impl CapabilitySource {
+    fn filter(&self) -> CapabilitySourceFilter {
+        match self {
+            Self::ManualFile => CapabilitySourceFilter::ManualFile,
+            Self::Openapi { .. } => CapabilitySourceFilter::Openapi,
+            Self::McpDiscovery { .. } => CapabilitySourceFilter::McpDiscovery,
+            Self::ProjectedLegacyConfig { .. } => CapabilitySourceFilter::ProjectedLegacyConfig,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityConnection {
+    pub id: ConnectionId,
+    pub kind: ConnectionKind,
+    pub management_source: ConnectionManagementSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityState {
+    pub enabled: bool,
+    pub available: bool,
+    pub stale: bool,
+    pub reason: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityPolicyEligibility {
+    pub eligible: bool,
+    pub reason: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilitySummary {
+    pub id: String,
+    pub kind: CapabilityKind,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri_template: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub description_truncated: bool,
+    pub source: CapabilitySource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<CapabilityConnection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovered_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<String>,
+    pub state: CapabilityState,
+    pub policy: CapabilityPolicyEligibility,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CapabilityMapping {
+    Http {
+        method: String,
+        path_template: String,
+        query_params: Vec<QueryParamMapping>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body: Option<BodyMapping>,
+    },
+    Mcp {
+        remote_tool_name: String,
+    },
+    Resource {
+        uri: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
+    },
+    ResourceTemplate {
+        uri_template: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityDetail {
+    #[serde(flatten)]
+    pub summary: CapabilitySummary,
+    #[serde(rename = "input_json_schema", skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mapping: Option<CapabilityMapping>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityListPage {
+    pub capabilities: Vec<CapabilitySummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub total_count: usize,
+    #[serde(skip)]
+    collection_etag: String,
+}
+
+impl CapabilityListPage {
+    pub fn collection_etag(&self) -> &str {
+        &self.collection_etag
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapabilityInventoryError {
+    InvalidLimit,
+    InvalidFilter,
+    InvalidCursor,
+    StaleCursor { current_etag: String },
+    StoreUnavailable,
+    CardinalityExceeded,
+    ResponseTooLarge,
+    IdentityCollision,
+    CorruptState,
+}
+
+#[derive(Clone)]
+struct BuiltCapability {
+    summary: CapabilitySummary,
+    input_schema: Option<Value>,
+    mapping: Option<CapabilityMapping>,
+}
+
+#[derive(Clone)]
+struct ConnectionContext {
+    reference: CapabilityConnection,
+    enabled: bool,
+    etag: Option<String>,
+    status: Option<SafeConnectionStatus>,
+}
+
+#[derive(Clone)]
+enum DurableToolCatalog {
+    Openapi {
+        catalog: StoredOpenApiInventoryCatalog,
+        entry: StoredOpenApiCatalogEntry,
+    },
+    Mcp {
+        catalog: StoredMcpCatalog,
+        definition: Box<ToolDefinition>,
+    },
+}
+
+type ManagedInventory = (
+    Vec<StoredMcpCatalog>,
+    Vec<StoredOpenApiInventoryCatalog>,
+    BTreeMap<ConnectionId, SafeConnectionStatus>,
+);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityCursor {
+    after_id: String,
+    collection_etag: String,
+    filters: NormalizedFilters,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NormalizedFilters {
+    kind: Option<CapabilityKind>,
+    connection_id: Option<String>,
+    source: Option<CapabilitySourceFilter>,
+    available: Option<bool>,
+    availability: Option<CapabilityAvailabilityFilter>,
+    text: Option<String>,
+}
+
+impl CapabilityInventory {
+    pub fn new(registry: ToolRegistry, control_plane: ConnectionControlPlane) -> Self {
+        Self {
+            registry,
+            control_plane,
+        }
+    }
+
+    pub fn list(
+        &self,
+        rbac_state: &RbacState,
+        principal: &Principal,
+        params: &CapabilityListParams,
+    ) -> Result<CapabilityListPage, CapabilityInventoryError> {
+        let limit = params.limit.unwrap_or(DEFAULT_CAPABILITY_LIST_LIMIT);
+        if limit == 0 || limit > MAX_CAPABILITY_LIST_LIMIT {
+            return Err(CapabilityInventoryError::InvalidLimit);
+        }
+        let filters = normalize_filters(params)?;
+        let cursor = params.cursor.as_deref().map(decode_cursor).transpose()?;
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.filters != filters)
+        {
+            return Err(CapabilityInventoryError::InvalidCursor);
+        }
+
+        let mut capabilities = self.build(rbac_state, principal)?;
+        capabilities.sort_by(|left, right| left.summary.id.cmp(&right.summary.id));
+        let collection_etag = collection_etag(&capabilities)?;
+        if let Some(cursor) = cursor.as_ref() {
+            if cursor.collection_etag != collection_etag {
+                return Err(CapabilityInventoryError::StaleCursor {
+                    current_etag: collection_etag,
+                });
+            }
+        }
+
+        let filtered = capabilities
+            .into_iter()
+            .filter(|capability| matches_filters(&capability.summary, &filters))
+            .collect::<Vec<_>>();
+        let total_count = filtered.len();
+        let mut remaining = filtered
+            .into_iter()
+            .filter(|capability| {
+                cursor
+                    .as_ref()
+                    .is_none_or(|cursor| capability.summary.id > cursor.after_id)
+            })
+            .collect::<Vec<_>>();
+        let remaining_count = remaining.len();
+        if remaining.len() > limit {
+            remaining.truncate(limit);
+        }
+
+        let mut summaries = remaining
+            .into_iter()
+            .map(|capability| capability.summary)
+            .collect::<Vec<_>>();
+        loop {
+            let consumed = summaries.len();
+            let has_more = remaining_count > consumed;
+            let next_cursor = if has_more {
+                summaries
+                    .last()
+                    .map(|summary| {
+                        encode_cursor(&CapabilityCursor {
+                            after_id: summary.id.clone(),
+                            collection_etag: collection_etag.clone(),
+                            filters: filters.clone(),
+                        })
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            let page = CapabilityListPage {
+                capabilities: summaries.clone(),
+                next_cursor,
+                total_count,
+                collection_etag: collection_etag.clone(),
+            };
+            if serialized_len(&page)? <= MAX_CAPABILITY_LIST_RESPONSE_BYTES {
+                return Ok(page);
+            }
+            if summaries.pop().is_none() {
+                return Err(CapabilityInventoryError::ResponseTooLarge);
+            }
+        }
+    }
+
+    pub fn detail(
+        &self,
+        rbac_state: &RbacState,
+        principal: &Principal,
+        raw_id: &str,
+    ) -> Result<Option<CapabilityDetail>, CapabilityInventoryError> {
+        if !valid_capability_id(raw_id) {
+            return Ok(None);
+        }
+        let Some(capability) = self
+            .build(rbac_state, principal)?
+            .into_iter()
+            .find(|capability| capability.summary.id == raw_id)
+        else {
+            return Ok(None);
+        };
+        let detail = CapabilityDetail {
+            summary: capability.summary,
+            input_schema: capability.input_schema,
+            mapping: capability.mapping,
+        };
+        if serialized_len(&detail)? > MAX_CAPABILITY_DETAIL_RESPONSE_BYTES {
+            return Err(CapabilityInventoryError::ResponseTooLarge);
+        }
+        Ok(Some(detail))
+    }
+
+    fn build(
+        &self,
+        rbac_state: &RbacState,
+        principal: &Principal,
+    ) -> Result<Vec<BuiltCapability>, CapabilityInventoryError> {
+        let snapshot = self.control_plane.runtime_snapshot();
+        let (mcp_catalogs, openapi_catalogs, statuses) = self.load_managed_inventory(&snapshot)?;
+        let connections = connection_contexts(&snapshot, &statuses);
+        let registry = self
+            .registry
+            .list()
+            .into_iter()
+            .map(|definition| (definition.name.clone(), definition))
+            .collect::<BTreeMap<_, _>>();
+        let durable_tools = durable_tool_catalogs(&mcp_catalogs, &openapi_catalogs)?;
+        let mut built = BTreeMap::new();
+        let mut handled_names = BTreeSet::new();
+
+        for (name, durable) in durable_tools {
+            let (definition, source, refreshed_at, connection_id, state) =
+                durable_tool_parts(&durable, &connections)?;
+            if let Some(active) = registry.get(&name) {
+                if active.as_ref() != &definition {
+                    return Err(CapabilityInventoryError::CorruptState);
+                }
+            } else if state.enabled && !state.stale {
+                return Err(CapabilityInventoryError::CorruptState);
+            }
+            handled_names.insert(name);
+            let connection = connections
+                .get(&connection_id)
+                .map(|context| context.reference.clone());
+            let policy = tool_policy(rbac_state, principal, &definition.name);
+            let capability = tool_capability(
+                definition,
+                source,
+                connection,
+                Some(refreshed_at),
+                state,
+                policy,
+            )?;
+            insert_capability(&mut built, capability)?;
+        }
+
+        for (name, definition) in registry {
+            if handled_names.contains(&name) {
+                continue;
+            }
+            if matches!(
+                definition.source,
+                ToolSource::OpenApi { .. } | ToolSource::Mcp { .. }
+            ) {
+                return Err(CapabilityInventoryError::CorruptState);
+            }
+            let (source, connection, state) =
+                local_tool_context(&definition, &snapshot, &connections);
+            let policy = tool_policy(rbac_state, principal, &definition.name);
+            let capability = tool_capability(
+                definition.as_ref().clone(),
+                source,
+                connection,
+                None,
+                state,
+                policy,
+            )?;
+            insert_capability(&mut built, capability)?;
+        }
+
+        for catalog in mcp_catalogs {
+            let Some(connection) = connections.get(&catalog.connection_id) else {
+                return Err(CapabilityInventoryError::CorruptState);
+            };
+            let state = managed_catalog_state(
+                connection,
+                catalog.observed_etag.as_str(),
+                ConnectionKind::McpStreamableHttp,
+            );
+            for resource in catalog.resources {
+                let (description, description_truncated) =
+                    bounded_description(resource.description.as_deref());
+                let summary = CapabilitySummary {
+                    id: capability_id(&[
+                        "resource",
+                        catalog.connection_id.as_str(),
+                        resource.uri.as_str(),
+                    ]),
+                    kind: CapabilityKind::Resource,
+                    name: resource.name,
+                    title: resource.title,
+                    uri: Some(resource.uri.clone()),
+                    uri_template: None,
+                    description,
+                    description_truncated,
+                    source: CapabilitySource::McpDiscovery {
+                        connection_id: catalog.connection_id.to_string(),
+                        remote_tool_name: None,
+                    },
+                    connection: Some(connection.reference.clone()),
+                    schema_digest: None,
+                    discovered_at: Some(catalog.refreshed_at.clone()),
+                    last_success_at: Some(catalog.refreshed_at.clone()),
+                    state: state.clone(),
+                    policy: metadata_only_policy(),
+                };
+                insert_capability(
+                    &mut built,
+                    BuiltCapability {
+                        mapping: Some(CapabilityMapping::Resource {
+                            uri: resource.uri,
+                            mime_type: resource.mime_type,
+                            size: resource.size,
+                        }),
+                        summary,
+                        input_schema: None,
+                    },
+                )?;
+            }
+            for template in catalog.resource_templates {
+                let (description, description_truncated) =
+                    bounded_description(template.description.as_deref());
+                let summary = CapabilitySummary {
+                    id: capability_id(&[
+                        "resource_template",
+                        catalog.connection_id.as_str(),
+                        template.uri_template.as_str(),
+                    ]),
+                    kind: CapabilityKind::ResourceTemplate,
+                    name: template.name,
+                    title: template.title,
+                    uri: None,
+                    uri_template: Some(template.uri_template.clone()),
+                    description,
+                    description_truncated,
+                    source: CapabilitySource::McpDiscovery {
+                        connection_id: catalog.connection_id.to_string(),
+                        remote_tool_name: None,
+                    },
+                    connection: Some(connection.reference.clone()),
+                    schema_digest: None,
+                    discovered_at: Some(catalog.refreshed_at.clone()),
+                    last_success_at: Some(catalog.refreshed_at.clone()),
+                    state: state.clone(),
+                    policy: metadata_only_policy(),
+                };
+                insert_capability(
+                    &mut built,
+                    BuiltCapability {
+                        mapping: Some(CapabilityMapping::ResourceTemplate {
+                            uri_template: template.uri_template,
+                            mime_type: template.mime_type,
+                        }),
+                        summary,
+                        input_schema: None,
+                    },
+                )?;
+            }
+        }
+
+        Ok(built.into_values().collect())
+    }
+
+    fn load_managed_inventory(
+        &self,
+        snapshot: &ConnectionRuntimeSnapshot,
+    ) -> Result<ManagedInventory, CapabilityInventoryError> {
+        if !self.control_plane.is_managed_store_configured() {
+            return Ok((Vec::new(), Vec::new(), BTreeMap::new()));
+        }
+        let store = self
+            .control_plane
+            .managed_store()
+            .map_err(|_| CapabilityInventoryError::StoreUnavailable)?;
+        let mcp = store.mcp_catalogs().map_err(store_inventory_error)?;
+        let openapi = store
+            .openapi_inventory_catalogs()
+            .map_err(store_inventory_error)?;
+        let mut statuses = BTreeMap::new();
+        for id in snapshot.managed().keys() {
+            if let Some(status) = store.latest_status(id).map_err(store_inventory_error)? {
+                statuses.insert(id.clone(), status);
+            }
+        }
+        Ok((mcp, openapi, statuses))
+    }
+}
+
+fn durable_tool_catalogs(
+    mcp_catalogs: &[StoredMcpCatalog],
+    openapi_catalogs: &[StoredOpenApiInventoryCatalog],
+) -> Result<BTreeMap<String, DurableToolCatalog>, CapabilityInventoryError> {
+    let mut tools = BTreeMap::new();
+    for catalog in openapi_catalogs {
+        for entry in &catalog.entries {
+            let definition = serde_json::from_value::<ToolDefinition>(entry.definition.clone())
+                .map_err(|_| CapabilityInventoryError::CorruptState)?;
+            if definition.name != entry.tool_name {
+                return Err(CapabilityInventoryError::CorruptState);
+            }
+            if tools
+                .insert(
+                    entry.tool_name.clone(),
+                    DurableToolCatalog::Openapi {
+                        catalog: catalog.clone(),
+                        entry: entry.clone(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(CapabilityInventoryError::CorruptState);
+            }
+        }
+    }
+    for catalog in mcp_catalogs {
+        for entry in &catalog.entries {
+            let definition = ToolDefinition::mcp_connection(
+                catalog.connection_id.to_string(),
+                entry.description.clone(),
+                entry.input_schema.clone(),
+                entry.remote_tool_name.clone(),
+            );
+            if tools
+                .insert(
+                    definition.name.clone(),
+                    DurableToolCatalog::Mcp {
+                        catalog: catalog.clone(),
+                        definition: Box::new(definition),
+                    },
+                )
+                .is_some()
+            {
+                return Err(CapabilityInventoryError::CorruptState);
+            }
+        }
+    }
+    Ok(tools)
+}
+
+fn durable_tool_parts(
+    durable: &DurableToolCatalog,
+    connections: &BTreeMap<ConnectionId, ConnectionContext>,
+) -> Result<
+    (
+        ToolDefinition,
+        CapabilitySource,
+        String,
+        ConnectionId,
+        CapabilityState,
+    ),
+    CapabilityInventoryError,
+> {
+    match durable {
+        DurableToolCatalog::Openapi { catalog, entry } => {
+            let definition = serde_json::from_value::<ToolDefinition>(entry.definition.clone())
+                .map_err(|_| CapabilityInventoryError::CorruptState)?;
+            let (source_connection_id, operation_id, source_revision) = match &definition.source {
+                ToolSource::OpenApi {
+                    connection_id,
+                    operation_id,
+                    catalog_revision,
+                } => (connection_id, operation_id.clone(), *catalog_revision),
+                _ => return Err(CapabilityInventoryError::CorruptState),
+            };
+            if source_connection_id != catalog.connection_id.as_str()
+                || source_revision != Some(catalog.catalog_revision)
+                || !matches!(
+                    &definition.target,
+                    Some(ToolTarget::Http { connection_id, .. })
+                        if connection_id == source_connection_id
+                )
+            {
+                return Err(CapabilityInventoryError::CorruptState);
+            }
+            let connection = connections
+                .get(&catalog.connection_id)
+                .ok_or(CapabilityInventoryError::CorruptState)?;
+            Ok((
+                definition,
+                CapabilitySource::Openapi {
+                    connection_id: catalog.connection_id.to_string(),
+                    operation_id,
+                    catalog_revision: catalog.catalog_revision,
+                    spec_revision: catalog.spec_revision,
+                    spec_digest: catalog.spec_digest.clone(),
+                },
+                catalog.refreshed_at.clone(),
+                catalog.connection_id.clone(),
+                managed_catalog_state(
+                    connection,
+                    catalog.observed_etag.as_str(),
+                    ConnectionKind::HttpApi,
+                ),
+            ))
+        }
+        DurableToolCatalog::Mcp {
+            catalog,
+            definition,
+        } => {
+            let connection = connections
+                .get(&catalog.connection_id)
+                .ok_or(CapabilityInventoryError::CorruptState)?;
+            let remote_tool_name = match &definition.source {
+                ToolSource::Mcp {
+                    connection_id,
+                    remote_tool_name,
+                } if connection_id == catalog.connection_id.as_str() => remote_tool_name.clone(),
+                _ => return Err(CapabilityInventoryError::CorruptState),
+            };
+            if !matches!(
+                &definition.target,
+                Some(ToolTarget::Mcp {
+                    connection_id,
+                    remote_tool_name: target_name,
+                }) if connection_id == catalog.connection_id.as_str()
+                    && target_name == &remote_tool_name
+            ) {
+                return Err(CapabilityInventoryError::CorruptState);
+            }
+            Ok((
+                definition.as_ref().clone(),
+                CapabilitySource::McpDiscovery {
+                    connection_id: catalog.connection_id.to_string(),
+                    remote_tool_name: Some(remote_tool_name),
+                },
+                catalog.refreshed_at.clone(),
+                catalog.connection_id.clone(),
+                managed_catalog_state(
+                    connection,
+                    catalog.observed_etag.as_str(),
+                    ConnectionKind::McpStreamableHttp,
+                ),
+            ))
+        }
+    }
+}
+
+fn connection_contexts(
+    snapshot: &ConnectionRuntimeSnapshot,
+    statuses: &BTreeMap<ConnectionId, SafeConnectionStatus>,
+) -> BTreeMap<ConnectionId, ConnectionContext> {
+    let mut contexts = BTreeMap::new();
+    for projection in snapshot.legacy() {
+        let summary = projection.safe_summary();
+        contexts.insert(
+            summary.id.clone(),
+            ConnectionContext {
+                reference: CapabilityConnection {
+                    id: summary.id,
+                    kind: summary.kind,
+                    management_source: summary.source,
+                },
+                enabled: summary.enabled,
+                etag: None,
+                status: Some(summary.status),
+            },
+        );
+    }
+    for (id, record) in snapshot.managed() {
+        contexts.insert(
+            id.clone(),
+            ConnectionContext {
+                reference: CapabilityConnection {
+                    id: id.clone(),
+                    kind: record.write.kind,
+                    management_source: ConnectionManagementSource::Managed,
+                },
+                enabled: record.write.enabled,
+                etag: Some(record.etag().to_string()),
+                status: statuses.get(id).cloned(),
+            },
+        );
+    }
+    contexts
+}
+
+fn managed_catalog_state(
+    connection: &ConnectionContext,
+    observed_etag: &str,
+    required_kind: ConnectionKind,
+) -> CapabilityState {
+    if !connection.enabled {
+        return CapabilityState {
+            enabled: false,
+            available: false,
+            stale: connection.etag.as_deref() != Some(observed_etag),
+            reason: "connection_disabled",
+        };
+    }
+    if connection.reference.kind != required_kind {
+        return CapabilityState {
+            enabled: true,
+            available: false,
+            stale: true,
+            reason: "connection_kind_mismatch",
+        };
+    }
+    let etag_current = connection.etag.as_deref() == Some(observed_etag);
+    if !etag_current {
+        return CapabilityState {
+            enabled: true,
+            available: false,
+            stale: true,
+            reason: "catalog_stale",
+        };
+    }
+    let status_stale = connection
+        .status
+        .as_ref()
+        .is_some_and(|status| status.reason == ConnectionStatusReason::CatalogStale);
+    let unavailable = connection.status.as_ref().is_some_and(|status| {
+        matches!(
+            status.state,
+            ConnectionOperationalState::Unavailable | ConnectionOperationalState::Disabled
+        )
+    });
+    CapabilityState {
+        enabled: true,
+        available: !unavailable,
+        stale: status_stale,
+        reason: if unavailable {
+            connection
+                .status
+                .as_ref()
+                .map(|status| status_reason(status.reason))
+                .unwrap_or("connection_unavailable")
+        } else if status_stale {
+            "catalog_stale"
+        } else {
+            "available"
+        },
+    }
+}
+
+fn local_tool_context(
+    definition: &ToolDefinition,
+    snapshot: &ConnectionRuntimeSnapshot,
+    connections: &BTreeMap<ConnectionId, ConnectionContext>,
+) -> (
+    CapabilitySource,
+    Option<CapabilityConnection>,
+    CapabilityState,
+) {
+    if let Some(proxy) = definition.upstream.mcp_proxy_mapping() {
+        let projection = snapshot.legacy().iter().find(|projection| {
+            projection.legacy_mcp_server_name() == Some(proxy.server_name.as_str())
+        });
+        if let Some(projection) = projection {
+            let id = projection.id();
+            let connection = connections.get(id).map(|context| context.reference.clone());
+            return (
+                CapabilitySource::ProjectedLegacyConfig {
+                    connection_id: id.to_string(),
+                    remote_tool_name: proxy.tool_name,
+                },
+                connection,
+                CapabilityState {
+                    enabled: true,
+                    available: true,
+                    stale: false,
+                    reason: "available",
+                },
+            );
+        }
+        return (
+            CapabilitySource::ManualFile,
+            None,
+            CapabilityState {
+                enabled: true,
+                available: false,
+                stale: false,
+                reason: "connection_not_found",
+            },
+        );
+    }
+
+    let context = match &definition.target {
+        Some(ToolTarget::Http { connection_id, .. })
+        | Some(ToolTarget::Mcp { connection_id, .. }) => ConnectionId::parse(connection_id.clone())
+            .ok()
+            .and_then(|id| connections.get(&id)),
+        None => connections.values().find(|context| {
+            context.reference.kind == ConnectionKind::HttpApi
+                && context.reference.management_source
+                    == ConnectionManagementSource::LegacyDefaultHttp
+        }),
+    };
+    let state = match context {
+        Some(context) if !context.enabled => CapabilityState {
+            enabled: false,
+            available: false,
+            stale: false,
+            reason: "connection_disabled",
+        },
+        Some(context)
+            if context.status.as_ref().is_some_and(|status| {
+                matches!(
+                    status.state,
+                    ConnectionOperationalState::Unavailable | ConnectionOperationalState::Disabled
+                )
+            }) =>
+        {
+            CapabilityState {
+                enabled: true,
+                available: false,
+                stale: false,
+                reason: "connection_unavailable",
+            }
+        }
+        Some(_) => CapabilityState {
+            enabled: true,
+            available: true,
+            stale: false,
+            reason: "available",
+        },
+        None => CapabilityState {
+            enabled: true,
+            available: false,
+            stale: false,
+            reason: "connection_not_found",
+        },
+    };
+    (
+        CapabilitySource::ManualFile,
+        context.map(|context| context.reference.clone()),
+        state,
+    )
+}
+
+fn tool_capability(
+    definition: ToolDefinition,
+    source: CapabilitySource,
+    connection: Option<CapabilityConnection>,
+    refreshed_at: Option<String>,
+    state: CapabilityState,
+    policy: CapabilityPolicyEligibility,
+) -> Result<BuiltCapability, CapabilityInventoryError> {
+    let schema_digest = schema_digest(&definition.input_schema)?;
+    let (description, description_truncated) =
+        bounded_description(Some(definition.description.as_str()));
+    let mapping = match &definition.target {
+        Some(ToolTarget::Http { mapping, .. }) => Some(http_mapping(mapping)),
+        Some(ToolTarget::Mcp {
+            remote_tool_name, ..
+        }) => Some(CapabilityMapping::Mcp {
+            remote_tool_name: remote_tool_name.clone(),
+        }),
+        None => definition
+            .upstream
+            .mcp_proxy_mapping()
+            .map(|mapping| CapabilityMapping::Mcp {
+                remote_tool_name: mapping.tool_name,
+            })
+            .or_else(|| Some(http_mapping(&definition.upstream))),
+    };
+    Ok(BuiltCapability {
+        summary: CapabilitySummary {
+            id: capability_id(&["tool", definition.name.as_str()]),
+            kind: CapabilityKind::Tool,
+            name: definition.name,
+            title: None,
+            uri: None,
+            uri_template: None,
+            description,
+            description_truncated,
+            source,
+            connection,
+            schema_digest: Some(schema_digest),
+            discovered_at: refreshed_at.clone(),
+            last_success_at: refreshed_at,
+            state,
+            policy,
+        },
+        input_schema: Some(definition.input_schema),
+        mapping,
+    })
+}
+
+fn http_mapping(mapping: &HttpToolMapping) -> CapabilityMapping {
+    CapabilityMapping::Http {
+        method: mapping.method.clone(),
+        path_template: mapping.path_template.clone(),
+        query_params: mapping.query_params.clone(),
+        body: mapping.body.clone(),
+    }
+}
+
+fn tool_policy(
+    rbac_state: &RbacState,
+    principal: &Principal,
+    tool_name: &str,
+) -> CapabilityPolicyEligibility {
+    let eligibility = rbac_state.tool_policy_eligibility(tool_name, principal);
+    CapabilityPolicyEligibility {
+        eligible: eligibility.eligible,
+        reason: eligibility.reason,
+    }
+}
+
+fn metadata_only_policy() -> CapabilityPolicyEligibility {
+    CapabilityPolicyEligibility {
+        eligible: false,
+        reason: "metadata_only",
+    }
+}
+
+fn insert_capability(
+    capabilities: &mut BTreeMap<String, BuiltCapability>,
+    capability: BuiltCapability,
+) -> Result<(), CapabilityInventoryError> {
+    if capabilities.len() >= MAX_CAPABILITY_INVENTORY_ENTRIES {
+        return Err(CapabilityInventoryError::CardinalityExceeded);
+    }
+    if capabilities
+        .insert(capability.summary.id.clone(), capability)
+        .is_some()
+    {
+        return Err(CapabilityInventoryError::IdentityCollision);
+    }
+    Ok(())
+}
+
+fn normalize_filters(
+    params: &CapabilityListParams,
+) -> Result<NormalizedFilters, CapabilityInventoryError> {
+    let connection_id = params
+        .connection_id
+        .as_ref()
+        .map(|value| {
+            ConnectionId::parse(value.clone())
+                .map(|id| id.to_string())
+                .map_err(|_| CapabilityInventoryError::InvalidFilter)
+        })
+        .transpose()?;
+    let text = params
+        .text
+        .as_ref()
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty()
+                || value.chars().count() > MAX_TEXT_FILTER_CHARS
+                || value.len() > MAX_TEXT_FILTER_BYTES
+                || value.contains('\0')
+            {
+                return Err(CapabilityInventoryError::InvalidFilter);
+            }
+            Ok(value.to_lowercase())
+        })
+        .transpose()?;
+    if let (Some(available), Some(availability)) = (params.available, params.availability) {
+        let compatible = matches!(
+            (available, availability),
+            (true, CapabilityAvailabilityFilter::Available)
+                | (false, CapabilityAvailabilityFilter::Unavailable)
+                | (false, CapabilityAvailabilityFilter::Stale)
+        );
+        if !compatible {
+            return Err(CapabilityInventoryError::InvalidFilter);
+        }
+    }
+    Ok(NormalizedFilters {
+        kind: params.kind,
+        connection_id,
+        source: params.source,
+        available: params.available,
+        availability: params.availability,
+        text,
+    })
+}
+
+fn matches_filters(summary: &CapabilitySummary, filters: &NormalizedFilters) -> bool {
+    filters.kind.is_none_or(|kind| kind == summary.kind)
+        && filters.connection_id.as_ref().is_none_or(|connection_id| {
+            summary
+                .connection
+                .as_ref()
+                .is_some_and(|connection| connection.id.as_str() == connection_id)
+        })
+        && filters
+            .source
+            .is_none_or(|source| source == summary.source.filter())
+        && filters
+            .available
+            .is_none_or(|available| available == summary.state.available)
+        && filters
+            .availability
+            .is_none_or(|availability| match availability {
+                CapabilityAvailabilityFilter::Available => summary.state.available,
+                CapabilityAvailabilityFilter::Unavailable => {
+                    !summary.state.available && !summary.state.stale
+                }
+                CapabilityAvailabilityFilter::Stale => summary.state.stale,
+            })
+        && filters.text.as_ref().is_none_or(|text| {
+            [
+                Some(summary.name.as_str()),
+                summary.title.as_deref(),
+                summary.uri.as_deref(),
+                summary.uri_template.as_deref(),
+                summary.description.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|value| value.to_lowercase().contains(text))
+        })
+}
+
+fn collection_etag(capabilities: &[BuiltCapability]) -> Result<String, CapabilityInventoryError> {
+    let summaries = capabilities
+        .iter()
+        .map(|capability| &capability.summary)
+        .collect::<Vec<_>>();
+    let bytes =
+        serde_json::to_vec(&summaries).map_err(|_| CapabilityInventoryError::CorruptState)?;
+    Ok(format!(
+        "\"capabilities:sha256:{}\"",
+        hex::encode(Sha256::digest(bytes))
+    ))
+}
+
+fn capability_id(parts: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"greengateway-capability-id-v1");
+    for part in parts {
+        digest.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("{CAPABILITY_ID_PREFIX}{}", hex::encode(digest.finalize()))
+}
+
+fn valid_capability_id(value: &str) -> bool {
+    value.len() == CAPABILITY_ID_PREFIX.len() + CAPABILITY_ID_HEX_BYTES
+        && value.starts_with(CAPABILITY_ID_PREFIX)
+        && value[CAPABILITY_ID_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn schema_digest(schema: &Value) -> Result<String, CapabilityInventoryError> {
+    let bytes = serde_json::to_vec(schema).map_err(|_| CapabilityInventoryError::CorruptState)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn bounded_description(value: Option<&str>) -> (Option<String>, bool) {
+    let Some(value) = value else {
+        return (None, false);
+    };
+    let mut chars = value.chars();
+    let bounded = chars
+        .by_ref()
+        .take(MAX_PUBLIC_DESCRIPTION_CHARS)
+        .collect::<String>();
+    (Some(bounded), chars.next().is_some())
+}
+
+fn encode_cursor(cursor: &CapabilityCursor) -> Result<String, CapabilityInventoryError> {
+    serde_json::to_vec(cursor)
+        .map(hex::encode)
+        .map_err(|_| CapabilityInventoryError::InvalidCursor)
+}
+
+fn decode_cursor(value: &str) -> Result<CapabilityCursor, CapabilityInventoryError> {
+    if value.is_empty() || value.len() > MAX_CURSOR_BYTES {
+        return Err(CapabilityInventoryError::InvalidCursor);
+    }
+    let bytes = hex::decode(value).map_err(|_| CapabilityInventoryError::InvalidCursor)?;
+    if bytes.len() > MAX_CURSOR_BYTES {
+        return Err(CapabilityInventoryError::InvalidCursor);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| CapabilityInventoryError::InvalidCursor)
+}
+
+fn serialized_len<T: Serialize>(value: &T) -> Result<usize, CapabilityInventoryError> {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .map_err(|_| CapabilityInventoryError::CorruptState)
+}
+
+fn store_inventory_error(error: ConnectionStoreError) -> CapabilityInventoryError {
+    match error {
+        ConnectionStoreError::LimitExceeded { .. } => CapabilityInventoryError::CardinalityExceeded,
+        ConnectionStoreError::CorruptRecord { .. }
+        | ConnectionStoreError::Validation { .. }
+        | ConnectionStoreError::UnsupportedSchema { .. }
+        | ConnectionStoreError::InvalidMigrationHistory => CapabilityInventoryError::CorruptState,
+        _ => CapabilityInventoryError::StoreUnavailable,
+    }
+}
+
+fn status_reason(reason: ConnectionStatusReason) -> &'static str {
+    match reason {
+        ConnectionStatusReason::NotTested => "not_tested",
+        ConnectionStatusReason::LegacyConfigured => "legacy_configured",
+        ConnectionStatusReason::Disabled => "connection_disabled",
+        ConnectionStatusReason::TestSucceeded => "test_succeeded",
+        ConnectionStatusReason::CatalogRefreshed => "catalog_refreshed",
+        ConnectionStatusReason::RequestFailed => "request_failed",
+        ConnectionStatusReason::EgressDenied => "egress_denied",
+        ConnectionStatusReason::SecretUnavailable => "secret_unavailable",
+        ConnectionStatusReason::InvalidResponse => "invalid_response",
+        ConnectionStatusReason::CatalogStale => "catalog_stale",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf, sync::Arc};
+
+    use serde_json::json;
+
+    use crate::{
+        audit::{sink::tests::CaptureSink, AuditLog, AuditSink},
+        auth::AuthMethod,
+        config::Config,
+        connections::{
+            model::ConnectionWrite,
+            store::{
+                StoredConnection, StoredMcpCatalogEntry, StoredMcpResource,
+                StoredMcpResourceTemplate, StoredOpenApiCatalogEntry,
+            },
+        },
+        rbac::policy::Policy,
+    };
+
+    use super::*;
+
+    struct TemporaryInventoryDatabase {
+        path: PathBuf,
+    }
+
+    impl TemporaryInventoryDatabase {
+        fn new(test_name: &str) -> Self {
+            Self {
+                path: std::env::temp_dir().join(format!(
+                    "greengateway-capability-inventory-{test_name}-{}.sqlite",
+                    uuid::Uuid::new_v4()
+                )),
+            }
+        }
+
+        fn config(&self) -> Config {
+            let mut config = Config::test_defaults();
+            config.connections_sqlite_path = Some(self.path.to_string_lossy().into_owned());
+            config
+        }
+    }
+
+    impl Drop for TemporaryInventoryDatabase {
+        fn drop(&mut self) {
+            if self
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("greengateway-capability-inventory-")
+                        && name.ends_with(".sqlite")
+                })
+                && self.path.starts_with(std::env::temp_dir())
+            {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+
+    struct ManagedInventoryFixture {
+        inventory: CapabilityInventory,
+        control_plane: ConnectionControlPlane,
+        rbac_state: RbacState,
+        principal: Principal,
+        mcp_record: StoredConnection,
+        mcp_tool_name: String,
+        openapi_tool_name: String,
+        _database: TemporaryInventoryDatabase,
+    }
+
+    impl ManagedInventoryFixture {
+        fn new(test_name: &str) -> Self {
+            let database = TemporaryInventoryDatabase::new(test_name);
+            let control_plane = ConnectionControlPlane::from_config(&database.config())
+                .expect("managed inventory control plane should open");
+
+            let mcp_record = create_managed_connection(&control_plane, managed_mcp_candidate());
+            let openapi_record =
+                create_managed_connection(&control_plane, managed_openapi_candidate());
+            let mcp_tool_name = format!("{}:lookup", mcp_record.id);
+            let openapi_tool_name = "inventory_openapi_lookup".to_owned();
+            let mcp_definition = ToolDefinition::mcp_connection(
+                mcp_record.id.to_string(),
+                "Look up an MCP item".to_owned(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }),
+                "lookup".to_owned(),
+            );
+            let openapi_mapping = HttpToolMapping {
+                method: "GET".to_owned(),
+                path_template: "/inventory/{id}".to_owned(),
+                query_params: Vec::new(),
+                body: None,
+            };
+            let openapi_definition = ToolDefinition {
+                name: openapi_tool_name.clone(),
+                description: "Look up an OpenAPI item".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }),
+                target: Some(ToolTarget::Http {
+                    connection_id: openapi_record.id.to_string(),
+                    mapping: openapi_mapping.clone(),
+                }),
+                source: ToolSource::OpenApi {
+                    connection_id: openapi_record.id.to_string(),
+                    operation_id: Some("inventoryLookup".to_owned()),
+                    catalog_revision: Some(1),
+                },
+                upstream: openapi_mapping,
+            };
+
+            let store = control_plane
+                .managed_store()
+                .expect("managed inventory store should be configured");
+            store
+                .replace_mcp_catalog(
+                    &mcp_record.id,
+                    &mcp_record.etag(),
+                    &[StoredMcpCatalogEntry {
+                        remote_tool_name: "lookup".to_owned(),
+                        description: "Look up an MCP item".to_owned(),
+                        input_schema: mcp_definition.input_schema.clone(),
+                    }],
+                    &[StoredMcpResource {
+                        uri: "urn:inventory:resource".to_owned(),
+                        name: "inventory-resource".to_owned(),
+                        title: Some("Inventory resource".to_owned()),
+                        description: Some("Safe metadata only".to_owned()),
+                        mime_type: Some("application/json".to_owned()),
+                        size: Some(42),
+                    }],
+                    &[StoredMcpResourceTemplate {
+                        uri_template: "urn:inventory:item:{id}".to_owned(),
+                        name: "inventory-template".to_owned(),
+                        title: Some("Inventory template".to_owned()),
+                        description: Some("Safe template metadata only".to_owned()),
+                        mime_type: Some("application/json".to_owned()),
+                    }],
+                )
+                .expect("managed MCP inventory catalog should persist");
+
+            let spec =
+                r#"{"openapi":"3.0.3","info":{"title":"Inventory","version":"1"},"paths":{}}"#;
+            let spec_digest = hex::encode(Sha256::digest(spec.as_bytes()));
+            store
+                .replace_openapi_catalog(
+                    &openapi_record.id,
+                    &openapi_record.etag(),
+                    0,
+                    0,
+                    spec,
+                    &spec_digest,
+                    &[StoredOpenApiCatalogEntry {
+                        tool_name: openapi_tool_name.clone(),
+                        operation_id: Some("inventoryLookup".to_owned()),
+                        selected_scheme_names: Vec::new(),
+                        definition: serde_json::to_value(&openapi_definition)
+                            .expect("OpenAPI definition should serialize"),
+                    }],
+                )
+                .expect("managed OpenAPI inventory catalog should persist");
+
+            let registry = ToolRegistry::from_json_value(json!({
+                "schema_version": "0.1.0",
+                "tools": []
+            }))
+            .expect("empty registry should build");
+            registry
+                .merge_definitions(vec![mcp_definition, openapi_definition])
+                .expect("managed inventory definitions should publish");
+
+            let policy = Policy::validate_json_value(json!({
+                "schema_version": "0.1.0",
+                "id": "inventory-policy",
+                "default_action": "deny",
+                "enforcement_mode": "enforce",
+                "roles": {
+                    "admin": {
+                        "permissions": []
+                    }
+                },
+                "routes": [],
+                "tools": {
+                    mcp_tool_name.clone(): {
+                        "allowed_roles": ["admin"],
+                        "timeout_ms": 5_000,
+                        "max_concurrent": 2
+                    },
+                    openapi_tool_name.clone(): {
+                        "allowed_roles": ["admin"],
+                        "timeout_ms": 5_000,
+                        "max_concurrent": 2
+                    }
+                }
+            }))
+            .expect("inventory policy should validate");
+            let audit = AuditLog::new(Arc::new(CaptureSink::new()) as Arc<dyn AuditSink>);
+            let rbac_state = RbacState::new(policy, Vec::new(), false, audit);
+            let principal = Principal {
+                user_id: "inventory-admin".to_owned(),
+                issuer: None,
+                email: Some("inventory-admin@example.test".to_owned()),
+                org_id: None,
+                roles: vec!["admin".to_owned()],
+                session_id: "inventory-session".to_owned(),
+                auth_method: AuthMethod::Bearer,
+            };
+            let inventory = CapabilityInventory::new(registry, control_plane.clone());
+
+            Self {
+                inventory,
+                control_plane,
+                rbac_state,
+                principal,
+                mcp_record,
+                mcp_tool_name,
+                openapi_tool_name,
+                _database: database,
+            }
+        }
+
+        fn list(&self, params: CapabilityListParams) -> CapabilityListPage {
+            self.inventory
+                .list(&self.rbac_state, &self.principal, &params)
+                .expect("managed capability inventory should list")
+        }
+    }
+
+    fn create_managed_connection(
+        control_plane: &ConnectionControlPlane,
+        candidate: ConnectionWrite,
+    ) -> StoredConnection {
+        let collection_etag = control_plane
+            .runtime_snapshot()
+            .collection_etag()
+            .to_owned();
+        control_plane
+            .create_managed(&collection_etag, candidate)
+            .expect("managed inventory Connection should create")
+    }
+
+    fn managed_mcp_candidate() -> ConnectionWrite {
+        serde_json::from_value(json!({
+            "display_name": "Inventory MCP",
+            "enabled": true,
+            "kind": "mcp_streamable_http",
+            "endpoint": {
+                "base_url": "https://mcp.inventory.example.test",
+                "base_path": "/mcp"
+            },
+            "authentication": {
+                "type": "none"
+            },
+            "tls": {},
+            "discovery": {
+                "type": "managed_mcp",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed MCP candidate should deserialize")
+    }
+
+    fn managed_openapi_candidate() -> ConnectionWrite {
+        serde_json::from_value(json!({
+            "display_name": "Inventory OpenAPI",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://api.inventory.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {
+                "type": "none"
+            },
+            "tls": {},
+            "discovery": {
+                "type": "managed_openapi",
+                "path": "/openapi.json",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed OpenAPI candidate should deserialize")
+    }
+
+    #[test]
+    fn opaque_ids_are_stable_and_do_not_embed_identity() {
+        let first = capability_id(&["tool", "billing.get"]);
+        let second = capability_id(&["tool", "billing.get"]);
+        assert_eq!(first, second);
+        assert!(valid_capability_id(&first));
+        assert!(!first.contains("billing"));
+        assert_ne!(first, capability_id(&["tool", "billing.put"]));
+        assert_ne!(
+            capability_id(&["resource", "alpha", "file:///same"]),
+            capability_id(&["resource", "beta", "file:///same"])
+        );
+    }
+
+    #[test]
+    fn cursor_is_bounded_and_bound_to_normalized_filters() {
+        let filters = NormalizedFilters {
+            kind: Some(CapabilityKind::Tool),
+            connection_id: Some("billing".to_owned()),
+            source: Some(CapabilitySourceFilter::ManualFile),
+            available: Some(true),
+            availability: None,
+            text: Some("invoice".to_owned()),
+        };
+        let cursor = CapabilityCursor {
+            after_id: capability_id(&["tool", "billing.get"]),
+            collection_etag: "\"capabilities:sha256:test\"".to_owned(),
+            filters,
+        };
+        let encoded = encode_cursor(&cursor).expect("cursor should encode");
+        assert_eq!(decode_cursor(&encoded), Ok(cursor));
+        assert_eq!(
+            decode_cursor(&"f".repeat(MAX_CURSOR_BYTES + 1)),
+            Err(CapabilityInventoryError::InvalidCursor)
+        );
+    }
+
+    #[test]
+    fn descriptions_are_bounded_without_exposing_hidden_text() {
+        let input = format!("{}secret-tail", "x".repeat(MAX_PUBLIC_DESCRIPTION_CHARS));
+        let (description, truncated) = bounded_description(Some(&input));
+        assert!(truncated);
+        let description = description.expect("description should be present");
+        assert_eq!(description.chars().count(), MAX_PUBLIC_DESCRIPTION_CHARS);
+        assert!(!description.contains("secret-tail"));
+    }
+
+    #[test]
+    fn managed_catalog_inventory_has_typed_provenance_and_metadata_only_resources() {
+        let fixture = ManagedInventoryFixture::new("typed-provenance");
+        let mcp_tools = fixture.list(CapabilityListParams {
+            kind: Some(CapabilityKind::Tool),
+            connection_id: Some(fixture.mcp_record.id.to_string()),
+            source: Some(CapabilitySourceFilter::McpDiscovery),
+            available: Some(true),
+            ..CapabilityListParams::default()
+        });
+        assert_eq!(mcp_tools.total_count, 1);
+        let mcp_tool = &mcp_tools.capabilities[0];
+        assert_eq!(mcp_tool.name, fixture.mcp_tool_name);
+        assert!(matches!(
+            &mcp_tool.source,
+            CapabilitySource::McpDiscovery {
+                connection_id,
+                remote_tool_name: Some(remote_tool_name),
+            } if connection_id == fixture.mcp_record.id.as_str()
+                && remote_tool_name == "lookup"
+        ));
+        assert_eq!(
+            mcp_tool
+                .connection
+                .as_ref()
+                .map(|connection| &connection.id),
+            Some(&fixture.mcp_record.id)
+        );
+        assert!(mcp_tool.policy.eligible);
+        assert_eq!(mcp_tool.policy.reason, "eligible");
+
+        let resources = fixture.list(CapabilityListParams {
+            kind: Some(CapabilityKind::Resource),
+            connection_id: Some(fixture.mcp_record.id.to_string()),
+            source: Some(CapabilitySourceFilter::McpDiscovery),
+            availability: Some(CapabilityAvailabilityFilter::Available),
+            text: Some("inventory-resource".to_owned()),
+            ..CapabilityListParams::default()
+        });
+        assert_eq!(resources.total_count, 1);
+        let resource = &resources.capabilities[0];
+        assert_eq!(resource.uri.as_deref(), Some("urn:inventory:resource"));
+        assert!(!resource.policy.eligible);
+        assert_eq!(resource.policy.reason, "metadata_only");
+        let detail = fixture
+            .inventory
+            .detail(&fixture.rbac_state, &fixture.principal, &resource.id)
+            .expect("resource detail should build")
+            .expect("resource detail should exist");
+        assert!(detail.input_schema.is_none());
+        assert!(matches!(
+            detail.mapping,
+            Some(CapabilityMapping::Resource {
+                ref uri,
+                ref mime_type,
+                size: Some(42),
+            }) if uri == "urn:inventory:resource"
+                && mime_type.as_deref() == Some("application/json")
+        ));
+        let encoded = serde_json::to_string(&detail).expect("resource detail should serialize");
+        assert!(!encoded.contains("contents"));
+        assert!(!encoded.contains("resource-content-canary"));
+
+        let templates = fixture.list(CapabilityListParams {
+            kind: Some(CapabilityKind::ResourceTemplate),
+            connection_id: Some(fixture.mcp_record.id.to_string()),
+            source: Some(CapabilitySourceFilter::McpDiscovery),
+            ..CapabilityListParams::default()
+        });
+        assert_eq!(templates.total_count, 1);
+        assert_eq!(
+            templates.capabilities[0].uri_template.as_deref(),
+            Some("urn:inventory:item:{id}")
+        );
+        assert_eq!(templates.capabilities[0].policy.reason, "metadata_only");
+
+        let openapi_tools = fixture.list(CapabilityListParams {
+            kind: Some(CapabilityKind::Tool),
+            source: Some(CapabilitySourceFilter::Openapi),
+            ..CapabilityListParams::default()
+        });
+        assert_eq!(openapi_tools.total_count, 1);
+        let openapi_tool = &openapi_tools.capabilities[0];
+        assert_eq!(openapi_tool.name, fixture.openapi_tool_name);
+        assert!(matches!(
+            &openapi_tool.source,
+            CapabilitySource::Openapi {
+                operation_id: Some(operation_id),
+                catalog_revision: 1,
+                spec_revision: 1,
+                ..
+            } if operation_id == "inventoryLookup"
+        ));
+        assert!(openapi_tool.policy.eligible);
+    }
+
+    #[test]
+    fn disabled_connection_retains_catalog_as_stale_unavailable_metadata() {
+        let fixture = ManagedInventoryFixture::new("disabled-stale");
+        let mut disabled = fixture.mcp_record.write.clone();
+        disabled.enabled = false;
+        fixture
+            .control_plane
+            .replace_managed(&fixture.mcp_record.id, &fixture.mcp_record.etag(), disabled)
+            .expect("managed MCP Connection should disable");
+
+        let stale = fixture.list(CapabilityListParams {
+            connection_id: Some(fixture.mcp_record.id.to_string()),
+            availability: Some(CapabilityAvailabilityFilter::Stale),
+            ..CapabilityListParams::default()
+        });
+        assert_eq!(
+            stale.total_count, 3,
+            "tool, resource, and template should remain visible as last-known-good metadata"
+        );
+        assert!(stale.capabilities.iter().all(|capability| {
+            !capability.state.enabled
+                && !capability.state.available
+                && capability.state.stale
+                && capability.state.reason == "connection_disabled"
+        }));
+        assert!(stale
+            .capabilities
+            .iter()
+            .filter(|capability| capability.kind != CapabilityKind::Tool)
+            .all(|capability| {
+                !capability.policy.eligible && capability.policy.reason == "metadata_only"
+            }));
+    }
+}

@@ -23,6 +23,7 @@ const MAX_NORMALIZED_MCP_NAME_BYTES: usize = 80;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LegacyConnectionProjection {
     summary: SafeConnectionSummary,
+    legacy_mcp_server_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +39,7 @@ struct LegacyProjectionSpec {
     source: ConnectionManagementSource,
     authentication: SafeAuthenticationKind,
     endpoint_count: usize,
+    legacy_mcp_server_name: Option<String>,
 }
 
 impl LegacyConnectionProjection {
@@ -47,6 +49,10 @@ impl LegacyConnectionProjection {
 
     pub fn safe_summary(&self) -> SafeConnectionSummary {
         self.summary.clone()
+    }
+
+    pub fn legacy_mcp_server_name(&self) -> Option<&str> {
+        self.legacy_mcp_server_name.as_deref()
     }
 }
 
@@ -100,6 +106,7 @@ pub fn project_legacy_connections(
                 source: ConnectionManagementSource::LegacyDefaultHttp,
                 authentication: SafeAuthenticationKind::None,
                 endpoint_count: 1,
+                legacy_mcp_server_name: None,
             },
         )?;
     }
@@ -129,6 +136,7 @@ pub fn project_legacy_connections(
                 source: ConnectionManagementSource::LegacyRoute,
                 authentication,
                 endpoint_count,
+                legacy_mcp_server_name: None,
             },
         )?;
     }
@@ -148,6 +156,7 @@ pub fn project_legacy_connections(
                 source: ConnectionManagementSource::LegacyMcp,
                 authentication: SafeAuthenticationKind::None,
                 endpoint_count: 1,
+                legacy_mcp_server_name: Some(server.name.clone()),
             },
         )?;
     }
@@ -173,6 +182,7 @@ fn push_projection(
         source,
         authentication,
         endpoint_count,
+        legacy_mcp_server_name,
     } = spec;
     if !ids.insert(id.clone()) {
         return Err(LegacyProjectionError::IdCollision { id });
@@ -199,6 +209,7 @@ fn push_projection(
                 catalog_entry_count: None,
             },
         },
+        legacy_mcp_server_name,
     });
     Ok(())
 }
@@ -292,9 +303,48 @@ mod tests {
         assert_eq!(ids[0], "legacy-default-http");
         assert_eq!(ids[1], "legacy-route-payments");
         assert!(ids[2].starts_with("legacy-mcp-issue-tracker-"));
+        assert_eq!(projected.connections[0].legacy_mcp_server_name(), None);
+        assert_eq!(projected.connections[1].legacy_mcp_server_name(), None);
+        assert_eq!(
+            projected.connections[2].legacy_mcp_server_name(),
+            Some("Issue Tracker")
+        );
         let serialized = serde_json::to_string(&summaries).expect("summaries should serialize");
         assert!(!serialized.contains("example.test"));
         assert!(!serialized.contains("/payments"));
+        assert!(!serialized.contains("legacy_mcp_server_name"));
+        assert!(!serialized.contains("server_name"));
+    }
+
+    #[test]
+    fn mcp_projection_preserves_exact_server_name_beyond_display_bound() {
+        let original_name = format!(
+            "Case Sensitive MCP {}",
+            "x".repeat(MAX_DISPLAY_NAME_CHARS + 16)
+        );
+        let mut config = config();
+        config.mcp_upstream_servers = vec![McpUpstreamServerConfig {
+            name: original_name.clone(),
+            url: "https://mcp.example.test".to_owned(),
+            timeout_ms: None,
+            response_idle_timeout_ms: None,
+            connect_timeout_ms: None,
+        }];
+
+        let projected = project_legacy_connections(&config).expect("projection should succeed");
+        let projection = projected
+            .connections
+            .first()
+            .expect("MCP projection should be present");
+
+        assert_eq!(
+            projection.legacy_mcp_server_name(),
+            Some(original_name.as_str())
+        );
+        assert_eq!(
+            projection.safe_summary().display_name.chars().count(),
+            MAX_DISPLAY_NAME_CHARS
+        );
     }
 
     #[test]

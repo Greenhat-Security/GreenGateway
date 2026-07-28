@@ -77,6 +77,11 @@
       "permission": "admin:tools:write"
     },
     {
+      "methods": ["GET"],
+      "path_prefix": "/v1/admin/tools",
+      "permission": "admin:tools:read"
+    },
+    {
       "methods": ["POST"],
       "path_prefix": "/v1/admin/traffic/endpoints/review",
       "permission": "admin:traffic:write"
