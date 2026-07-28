@@ -1404,7 +1404,8 @@ fn gateway_app_with_process_started_at_and_overrides(
         connection_control_plane.clone(),
         egress_config,
         Arc::clone(&egress_client),
-    );
+    )
+    .with_audit(audit_log.clone());
     let proxy_egress_client = Arc::new(egress_client_for_build(
         proxy_egress_config.clone(),
         &build_overrides,

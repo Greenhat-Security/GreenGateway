@@ -764,6 +764,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
+ "base64",
  "bytes",
  "cap-fs-ext",
  "cap-std",

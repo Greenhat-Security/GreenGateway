@@ -37,6 +37,7 @@ pub struct ConnectionControlPlane {
     runtime: Arc<ArcSwap<ConnectionRuntimeSnapshot>>,
     mutation_lock: Arc<Mutex<()>>,
     secret_resolver: Arc<ConnectionSecretResolver>,
+    local_secret_versions: Arc<ArcSwap<BTreeMap<String, u64>>>,
     local_secret_manager: Option<Arc<CoordinatedLocalSecretManager>>,
 }
 
@@ -227,12 +228,27 @@ impl ConnectionControlPlane {
             omitted_legacy_projection_count,
         )));
         let mutation_lock = Arc::new(Mutex::new(()));
+        let local_secret_versions = Arc::new(ArcSwap::from_pointee(
+            local_secret_provider
+                .as_ref()
+                .map(|provider| {
+                    provider
+                        .metadata()
+                        .into_iter()
+                        .filter_map(|metadata| {
+                            metadata.version.map(|version| (metadata.id, version))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ));
         let local_secret_manager = local_secret_provider.map(|provider| {
             Arc::new(CoordinatedLocalSecretManager {
                 provider,
                 mutation_lock: Arc::clone(&mutation_lock),
                 runtime: Arc::clone(&runtime),
                 secret_resolver: Arc::clone(&secret_resolver),
+                local_secret_versions: Arc::clone(&local_secret_versions),
             })
         });
 
@@ -243,6 +259,7 @@ impl ConnectionControlPlane {
             runtime,
             mutation_lock,
             secret_resolver,
+            local_secret_versions,
             local_secret_manager,
         })
     }
@@ -269,6 +286,10 @@ impl ConnectionControlPlane {
 
     pub fn secret_resolver(&self) -> &(dyn SecretResolver + Send + Sync) {
         self.secret_resolver.as_ref()
+    }
+
+    pub(crate) fn local_secret_version(&self, id: &str) -> Option<u64> {
+        self.local_secret_versions.load().get(id).copied()
     }
 
     pub fn local_secret_manager(
@@ -767,6 +788,7 @@ struct CoordinatedLocalSecretManager {
     mutation_lock: Arc<Mutex<()>>,
     runtime: Arc<ArcSwap<ConnectionRuntimeSnapshot>>,
     secret_resolver: Arc<ConnectionSecretResolver>,
+    local_secret_versions: Arc<ArcSwap<BTreeMap<String, u64>>>,
 }
 
 impl CoordinatedLocalSecretManager {
@@ -781,6 +803,21 @@ impl CoordinatedLocalSecretManager {
             }
         }
     }
+
+    fn publish_version(&self, metadata: &SecretAliasMetadata) {
+        let Some(version) = metadata.version else {
+            return;
+        };
+        let mut versions = self.local_secret_versions.load_full().as_ref().clone();
+        versions.insert(metadata.id.clone(), version);
+        self.local_secret_versions.store(Arc::new(versions));
+    }
+
+    fn remove_version(&self, id: &str) {
+        let mut versions = self.local_secret_versions.load_full().as_ref().clone();
+        versions.remove(id);
+        self.local_secret_versions.store(Arc::new(versions));
+    }
 }
 
 impl LocalSecretManager for CoordinatedLocalSecretManager {
@@ -790,7 +827,9 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
         secret: ResolvedSecret,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
         let _guard = self.mutation_guard();
-        self.provider.create(label, secret)
+        let metadata = self.provider.create(label, secret)?;
+        self.publish_version(&metadata);
+        Ok(metadata)
     }
 
     fn rotate(
@@ -808,12 +847,16 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
                     BindingActivationError::Unavailable => LocalSecretError::StorageFailure,
                 })?;
         }
-        self.provider.rotate(id, replacement)
+        let metadata = self.provider.rotate(id, replacement)?;
+        self.publish_version(&metadata);
+        Ok(metadata)
     }
 
     fn delete(&self, id: &str) -> Result<(), LocalSecretError> {
         let _guard = self.mutation_guard();
-        self.provider.delete(id)
+        self.provider.delete(id)?;
+        self.remove_version(id);
+        Ok(())
     }
 
     fn metadata(&self) -> Vec<SecretAliasMetadata> {
@@ -1239,6 +1282,63 @@ mod tests {
         assert!(!metadata_json.contains("primary.key"));
         assert!(!metadata_json
             .contains(std::str::from_utf8(canary).expect("control-plane canary should be utf8")));
+    }
+
+    #[test]
+    fn local_secret_version_snapshot_tracks_restart_rotation_and_deletion() {
+        let temporary = TemporaryLocalControlPlane::new("version-snapshot");
+        let config = temporary.config();
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let created = control_plane
+            .local_secret_manager()
+            .expect("local secret manager should be enabled")
+            .create(
+                "OAuth client secret",
+                ResolvedSecret::new(
+                    SecretPurpose::OAuthClientSecret,
+                    b"oauth-client-secret-v1".to_vec(),
+                )
+                .expect("test secret should validate"),
+            )
+            .expect("local secret should create");
+        assert_eq!(
+            control_plane.local_secret_version(&created.id),
+            created.version
+        );
+
+        drop(control_plane);
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should restart");
+        assert_eq!(
+            control_plane.local_secret_version(&created.id),
+            created.version,
+            "the lock-free snapshot must initialize from persisted local metadata"
+        );
+
+        let rotated = control_plane
+            .local_secret_manager()
+            .expect("local secret manager should be enabled")
+            .rotate(
+                &created.id,
+                ResolvedSecret::new(
+                    SecretPurpose::OAuthClientSecret,
+                    b"oauth-client-secret-v2".to_vec(),
+                )
+                .expect("replacement secret should validate"),
+            )
+            .expect("local secret should rotate");
+        assert_eq!(
+            control_plane.local_secret_version(&created.id),
+            rotated.version
+        );
+
+        control_plane
+            .local_secret_manager()
+            .expect("local secret manager should be enabled")
+            .delete(&created.id)
+            .expect("unused local secret should delete");
+        assert_eq!(control_plane.local_secret_version(&created.id), None);
     }
 
     #[test]

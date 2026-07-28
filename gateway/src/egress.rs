@@ -766,6 +766,10 @@ impl EgressClient {
         self.config.max_response_bytes
     }
 
+    pub(crate) fn configuration_generation(&self) -> [u8; 32] {
+        self.config_generation
+    }
+
     #[cfg(test)]
     pub(crate) fn client_identity_fingerprint(&self) -> Option<[u8; 32]> {
         self.config.client_identity_fingerprint

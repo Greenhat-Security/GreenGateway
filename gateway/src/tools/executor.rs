@@ -720,27 +720,31 @@ impl ToolExecutor {
             .await
             .map_err(|source| connection_egress_tool_error(tool, &source))?;
         let credential = runtime.resolve_credential(&target).await.map_err(|error| {
-            self.emit_connection_secret_resolution_failed(
-                context,
-                tool,
-                &target,
-                error.safe_reason(),
-            );
-            connection_tool_error(tool, error)
-        })?;
-        if let Some(credential) = credential {
-            credential.inject(&mut request.headers).map_err(|error| {
+            if error.is_secret_resolution_failure() {
                 self.emit_connection_secret_resolution_failed(
                     context,
                     tool,
                     &target,
                     error.safe_reason(),
                 );
+            }
+            connection_tool_error(tool, error)
+        })?;
+        if let Some(credential) = credential.as_ref() {
+            credential.inject(&mut request.headers).map_err(|error| {
+                if error.is_secret_resolution_failure() {
+                    self.emit_connection_secret_resolution_failed(
+                        context,
+                        tool,
+                        &target,
+                        error.safe_reason(),
+                    );
+                }
                 connection_tool_error(tool, error)
             })?;
         }
 
-        target
+        let response = target
             .client()
             .request_with_headers_at_checked_destination(
                 &destination,
@@ -750,7 +754,16 @@ impl ToolExecutor {
                 request.body,
             )
             .await
-            .map_err(|source| connection_egress_tool_error(tool, &source))
+            .map_err(|source| connection_egress_tool_error(tool, &source))?;
+        if response.status == StatusCode::UNAUTHORIZED {
+            if let Some(credential) = credential
+                .as_ref()
+                .filter(|credential| credential.is_oauth())
+            {
+                credential.invalidate_after_unauthorized().await;
+            }
+        }
+        Ok(response)
     }
 
     async fn execute_mcp_proxy(
