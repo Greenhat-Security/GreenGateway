@@ -15,7 +15,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   strictly bounded, parsed, and best-effort zeroized on failure; access tokens
   use a bounded revision-keyed single-flight memory cache whose success or
   failure survives caller cancellation; and authenticated upstream rejection
-  is sanitized while OAuth `401` invalidates only the used generation without
+  is recognized from response headers before body buffering, sanitized, and
+  discarded while OAuth `401` invalidates only the used generation without
   replaying the current request.
 
 - Added per-endpoint mutual TLS for pooled upstreams through mounted
