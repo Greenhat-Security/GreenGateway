@@ -504,16 +504,12 @@ impl ConnectionTestService {
         let prepared = match self.runtime.prepare_transport(target, &checked).await {
             Ok(prepared) => prepared,
             Err(error) => {
+                let (stage, state, status_reason) = connection_failure_classification(error);
                 stages.push(ConnectionTestStage::failure(
-                    ConnectionTestStageName::SecretAvailable,
+                    stage,
                     test_reason_from_connection(error),
                 ));
-                return failed_execution(
-                    started,
-                    ConnectionOperationalState::Unavailable,
-                    ConnectionStatusReason::SecretUnavailable,
-                    stages,
-                );
+                return failed_execution(started, state, status_reason, stages);
             }
         };
 
@@ -527,16 +523,12 @@ impl ConnectionTestService {
                 credential
             }
             Err(error) => {
+                let (stage, state, status_reason) = connection_failure_classification(error);
                 stages.push(ConnectionTestStage::failure(
-                    ConnectionTestStageName::SecretAvailable,
+                    stage,
                     test_reason_from_connection(error),
                 ));
-                return failed_execution(
-                    started,
-                    ConnectionOperationalState::Unavailable,
-                    ConnectionStatusReason::SecretUnavailable,
-                    stages,
-                );
+                return failed_execution(started, state, status_reason, stages);
             }
         };
 
@@ -820,7 +812,26 @@ fn failed_connection_execution(
     started: Instant,
     error: ConnectionHttpError,
 ) -> ConnectionTestExecution {
-    let (stage, state, status_reason) = match error {
+    let (stage, state, status_reason) = connection_failure_classification(error);
+    failed_execution(
+        started,
+        state,
+        status_reason,
+        vec![ConnectionTestStage::failure(
+            stage,
+            test_reason_from_connection(error),
+        )],
+    )
+}
+
+fn connection_failure_classification(
+    error: ConnectionHttpError,
+) -> (
+    ConnectionTestStageName,
+    ConnectionOperationalState,
+    ConnectionStatusReason,
+) {
+    match error {
         ConnectionHttpError::TlsInvalid | ConnectionHttpError::TlsUnavailable => (
             ConnectionTestStageName::SecretAvailable,
             ConnectionOperationalState::Unavailable,
@@ -861,16 +872,7 @@ fn failed_connection_execution(
             ConnectionOperationalState::Unavailable,
             ConnectionStatusReason::RequestFailed,
         ),
-    };
-    failed_execution(
-        started,
-        state,
-        status_reason,
-        vec![ConnectionTestStage::failure(
-            stage,
-            test_reason_from_connection(error),
-        )],
-    )
+    }
 }
 
 fn failed_execution(
@@ -1125,5 +1127,40 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn connection_failures_preserve_operational_stage_and_status_reason() {
+        for (error, expected_stage, expected_state, expected_status_reason) in [
+            (
+                ConnectionHttpError::OAuthTokenEgressDenied,
+                ConnectionTestStageName::EgressPolicy,
+                ConnectionOperationalState::Unavailable,
+                ConnectionStatusReason::EgressDenied,
+            ),
+            (
+                ConnectionHttpError::OAuthTokenRejected,
+                ConnectionTestStageName::Authenticated,
+                ConnectionOperationalState::Degraded,
+                ConnectionStatusReason::InvalidResponse,
+            ),
+            (
+                ConnectionHttpError::TransportUnavailable,
+                ConnectionTestStageName::Connected,
+                ConnectionOperationalState::Unavailable,
+                ConnectionStatusReason::RequestFailed,
+            ),
+            (
+                ConnectionHttpError::CredentialUnavailable,
+                ConnectionTestStageName::SecretAvailable,
+                ConnectionOperationalState::Unavailable,
+                ConnectionStatusReason::SecretUnavailable,
+            ),
+        ] {
+            assert_eq!(
+                connection_failure_classification(error),
+                (expected_stage, expected_state, expected_status_reason)
+            );
+        }
     }
 }

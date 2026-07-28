@@ -3771,13 +3771,15 @@ async fn connection_test_endpoint(
         .tests
         .execute_before(record, current_etag.as_str(), probe_deadline)
         .await;
+    let persistence = state.control_plane.append_status_before(
+        &id,
+        &current_etag,
+        execution.status_update(),
+        probe_deadline.into_std(),
+    );
     drop(permit);
 
-    if let Err(error) =
-        state
-            .control_plane
-            .append_status(&id, &current_etag, execution.status_update())
-    {
+    if let Err(error) = persistence {
         let reason = connection_test_status_persistence_reason(&error);
         emit_connection_tested(
             &state,
@@ -3789,6 +3791,20 @@ async fn connection_test_endpoint(
             execution.result.latency_ms,
             Some(&execution.result),
         );
+        if connection_test_status_persistence_deadline_exceeded(&error) {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                [
+                    (header::ETAG, etag_header_value(current_etag.as_str())),
+                    (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                ],
+                Json(json!({
+                    "error": "connection test request timed out",
+                    "reason": connections::test::ConnectionTestReason::DeadlineExceeded,
+                })),
+            )
+                .into_response();
+        }
         return connection_mutation_error_response(error);
     }
 
@@ -7365,6 +7381,16 @@ fn connection_mutation_error_response(
         connections::control_plane::ConnectionMutationError::BindingUnavailable => {
             service_unavailable("connection binding validation is unavailable")
         }
+        connections::control_plane::ConnectionMutationError::Busy => {
+            service_unavailable("managed connection state is busy")
+        }
+        connections::control_plane::ConnectionMutationError::DeadlineExceeded => (
+            StatusCode::REQUEST_TIMEOUT,
+            Json(json!({
+                "error": "managed connection mutation timed out",
+            })),
+        )
+            .into_response(),
         connections::control_plane::ConnectionMutationError::Store(error) => {
             connection_store_error_response(error)
         }
@@ -9160,12 +9186,28 @@ fn connection_test_status_persistence_reason(
     error: &connections::control_plane::ConnectionMutationError,
 ) -> connections::test::ConnectionTestReason {
     match error {
+        connections::control_plane::ConnectionMutationError::DeadlineExceeded
+        | connections::control_plane::ConnectionMutationError::Store(
+            connections::store::ConnectionStoreError::DeadlineExceeded { .. },
+        ) => connections::test::ConnectionTestReason::DeadlineExceeded,
         connections::control_plane::ConnectionMutationError::Store(
             connections::store::ConnectionStoreError::NotFound { .. }
             | connections::store::ConnectionStoreError::Conflict { .. },
         ) => connections::test::ConnectionTestReason::ConnectionChanged,
         _ => connections::test::ConnectionTestReason::InternalError,
     }
+}
+
+fn connection_test_status_persistence_deadline_exceeded(
+    error: &connections::control_plane::ConnectionMutationError,
+) -> bool {
+    matches!(
+        error,
+        connections::control_plane::ConnectionMutationError::DeadlineExceeded
+            | connections::control_plane::ConnectionMutationError::Store(
+                connections::store::ConnectionStoreError::DeadlineExceeded { .. }
+            )
+    )
 }
 
 fn emit_service_token_delegation_rejected(
@@ -20514,6 +20556,22 @@ mod tests {
             connection_test_status_persistence_reason(&unavailable),
             connections::test::ConnectionTestReason::InternalError
         );
+
+        let deadline = connections::control_plane::ConnectionMutationError::Store(
+            connections::store::ConnectionStoreError::DeadlineExceeded {
+                operation: "connection status persistence",
+            },
+        );
+        assert_eq!(
+            connection_test_status_persistence_reason(&deadline),
+            connections::test::ConnectionTestReason::DeadlineExceeded
+        );
+        assert!(connection_test_status_persistence_deadline_exceeded(
+            &deadline
+        ));
+        assert!(!connection_test_status_persistence_deadline_exceeded(
+            &unavailable
+        ));
     }
 
     #[tokio::test]

@@ -3,8 +3,8 @@ use std::{
     error::Error,
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    time::{Duration, Instant},
 };
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
@@ -34,6 +34,7 @@ PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = FULL;
 "#;
+const DEFAULT_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const CREATE_MIGRATIONS_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS connection_schema_migrations (
@@ -768,6 +769,12 @@ pub enum ConnectionStoreError {
     RevisionOverflow {
         id: String,
     },
+    Busy {
+        resource: &'static str,
+    },
+    DeadlineExceeded {
+        operation: &'static str,
+    },
 }
 
 impl fmt::Display for ConnectionStoreError {
@@ -826,6 +833,12 @@ impl fmt::Display for ConnectionStoreError {
                     "connection '{id}' revision cannot be incremented"
                 )
             }
+            Self::Busy { resource } => {
+                write!(formatter, "{resource} is busy")
+            }
+            Self::DeadlineExceeded { operation } => {
+                write!(formatter, "{operation} exceeded its deadline")
+            }
         }
     }
 }
@@ -862,7 +875,7 @@ impl SqliteConnectionStore {
                 source,
             })?;
         connection
-            .busy_timeout(Duration::from_secs(5))
+            .busy_timeout(DEFAULT_SQLITE_BUSY_TIMEOUT)
             .map_err(|source| sqlite_error(&path, "configuration", source))?;
         connection
             .execute_batch(CONFIGURE_SQL)
@@ -1702,6 +1715,52 @@ impl SqliteConnectionStore {
         expected: &ConnectionEtag,
         update: ConnectionStatusUpdate,
     ) -> Result<SafeConnectionStatus, ConnectionStoreError> {
+        let mut connection = self.connection_guard();
+        self.append_status_with_connection(&mut connection, id, expected, update, None)
+            .map(|(status, _)| status)
+    }
+
+    pub(crate) fn append_status_before(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        update: ConnectionStatusUpdate,
+        deadline: Instant,
+    ) -> Result<(SafeConnectionStatus, StoredConnection), ConnectionStoreError> {
+        let remaining = remaining_before(deadline, "connection status persistence")?;
+        let mut connection = self.try_connection_guard()?;
+        let remaining = remaining.min(remaining_before(deadline, "connection status persistence")?);
+        connection
+            .busy_timeout(remaining.min(DEFAULT_SQLITE_BUSY_TIMEOUT))
+            .map_err(|source| {
+                sqlite_error(&self.path, "status busy-timeout configuration", source)
+            })?;
+
+        let result = self.append_status_with_connection(
+            &mut connection,
+            id,
+            expected,
+            update,
+            Some(deadline),
+        );
+        if let Err(source) = connection.busy_timeout(DEFAULT_SQLITE_BUSY_TIMEOUT) {
+            tracing::error!(
+                path = %self.path.display(),
+                error = %source,
+                "failed to restore the connection-store SQLite busy timeout after a bounded status append"
+            );
+        }
+        result
+    }
+
+    fn append_status_with_connection(
+        &self,
+        connection: &mut Connection,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        update: ConnectionStatusUpdate,
+        deadline: Option<Instant>,
+    ) -> Result<(SafeConnectionStatus, StoredConnection), ConnectionStoreError> {
         if update
             .catalog_entry_count
             .is_some_and(|count| count > MAX_CATALOG_ENTRIES)
@@ -1712,10 +1771,12 @@ impl SqliteConnectionStore {
             });
         }
         let observed_at = utc_timestamp()?;
-        let mut connection = self.connection_guard();
+        ensure_before_optional_deadline(deadline, "connection status persistence")?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|source| sqlite_error(&self.path, "status transaction", source))?;
+            .map_err(|source| {
+                status_sqlite_error(&self.path, "status transaction", source, deadline)
+            })?;
         let current = load_raw_by_id(&transaction, &self.path, id)?
             .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?
             .into_stored()?;
@@ -1733,6 +1794,7 @@ impl SqliteConnectionStore {
                 })
             })
             .transpose()?;
+        ensure_before_optional_deadline(deadline, "connection status persistence")?;
         transaction
             .execute(
                 r#"
@@ -1758,7 +1820,8 @@ impl SqliteConnectionStore {
                     catalog_entry_count,
                 ],
             )
-            .map_err(|source| sqlite_error(&self.path, "status insert", source))?;
+            .map_err(|source| status_sqlite_error(&self.path, "status insert", source, deadline))?;
+        ensure_before_optional_deadline(deadline, "connection status persistence")?;
         transaction
             .execute(
                 r#"
@@ -1796,7 +1859,10 @@ impl SqliteConnectionStore {
                     catalog_entry_count,
                 ],
             )
-            .map_err(|source| sqlite_error(&self.path, "current status upsert", source))?;
+            .map_err(|source| {
+                status_sqlite_error(&self.path, "current status upsert", source, deadline)
+            })?;
+        ensure_before_optional_deadline(deadline, "connection status persistence")?;
         let current_status_count = count_rows(
             &transaction,
             &self.path,
@@ -1809,12 +1875,16 @@ impl SqliteConnectionStore {
                 resource: "safe connection status rows",
                 maximum: MAX_STATUS_HISTORY_ROWS,
             })?;
+        ensure_before_optional_deadline(deadline, "connection status persistence")?;
         transaction
             .execute(
                 "UPDATE connection_records SET status_revision = ?1 WHERE id = ?2",
                 params![u64_to_i64(id, status_revision)?, id.as_str()],
             )
-            .map_err(|source| sqlite_error(&self.path, "status revision update", source))?;
+            .map_err(|source| {
+                status_sqlite_error(&self.path, "status revision update", source, deadline)
+            })?;
+        ensure_before_optional_deadline(deadline, "connection status persistence")?;
         transaction
             .execute(
                 r#"
@@ -1828,19 +1898,25 @@ impl SqliteConnectionStore {
                 "#,
                 params![i64::try_from(retained_history).unwrap_or(i64::MAX)],
             )
-            .map_err(|source| sqlite_error(&self.path, "status history pruning", source))?;
-        transaction
-            .commit()
-            .map_err(|source| sqlite_error(&self.path, "status transaction commit", source))?;
+            .map_err(|source| {
+                status_sqlite_error(&self.path, "status history pruning", source, deadline)
+            })?;
+        ensure_before_optional_deadline(deadline, "connection status persistence")?;
+        transaction.commit().map_err(|source| {
+            status_sqlite_error(&self.path, "status transaction commit", source, deadline)
+        })?;
 
-        Ok(SafeConnectionStatus {
+        let status = SafeConnectionStatus {
             state: update.state,
             reason: update.reason,
             observed_at: Some(observed_at),
             latency_ms: update.latency_ms,
             catalog_age_secs: update.catalog_age_secs,
             catalog_entry_count: update.catalog_entry_count,
-        })
+        };
+        let mut updated = current;
+        updated.revisions.status = status_revision;
+        Ok((status, updated))
     }
 
     pub fn latest_status(
@@ -1906,6 +1982,22 @@ impl SqliteConnectionStore {
                     "SQLite connection-store lock poisoned; recovering"
                 );
                 poisoned.into_inner()
+            }
+        }
+    }
+
+    fn try_connection_guard(&self) -> Result<MutexGuard<'_, Connection>, ConnectionStoreError> {
+        match self.connection.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(TryLockError::WouldBlock) => Err(ConnectionStoreError::Busy {
+                resource: "connection SQLite store",
+            }),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                tracing::error!(
+                    path = %self.path.display(),
+                    "SQLite connection-store lock poisoned; recovering for bounded status persistence"
+                );
+                Ok(poisoned.into_inner())
             }
         }
     }
@@ -4631,6 +4723,48 @@ fn utc_timestamp() -> Result<String, ConnectionStoreError> {
         })
 }
 
+fn remaining_before(
+    deadline: Instant,
+    operation: &'static str,
+) -> Result<Duration, ConnectionStoreError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(ConnectionStoreError::DeadlineExceeded { operation })
+}
+
+fn ensure_before_optional_deadline(
+    deadline: Option<Instant>,
+    operation: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    if let Some(deadline) = deadline {
+        remaining_before(deadline, operation)?;
+    }
+    Ok(())
+}
+
+fn status_sqlite_error(
+    path: &Path,
+    operation: &'static str,
+    source: rusqlite::Error,
+    deadline: Option<Instant>,
+) -> ConnectionStoreError {
+    if matches!(
+        source.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    ) {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return ConnectionStoreError::DeadlineExceeded {
+                operation: "connection status persistence",
+            };
+        }
+        return ConnectionStoreError::Busy {
+            resource: "connection SQLite status persistence",
+        };
+    }
+    sqlite_error(path, operation, source)
+}
+
 fn sqlite_error(
     path: &Path,
     operation: &'static str,
@@ -6835,6 +6969,68 @@ mod tests {
         store
             .append_status(&created.id, &replaced.etag(), healthy)
             .expect("observation for the replacement should append");
+    }
+
+    #[test]
+    fn bounded_status_append_rejects_expired_and_contended_locks_without_writing() {
+        let (_directory, _path, store) = temporary_store("status-bounded-lock");
+        let created = store.create(candidate()).expect("create should succeed");
+        let update = ConnectionStatusUpdate {
+            state: ConnectionOperationalState::Healthy,
+            reason: ConnectionStatusReason::TestSucceeded,
+            latency_ms: Some(5),
+            catalog_age_secs: None,
+            catalog_entry_count: None,
+        };
+
+        assert!(matches!(
+            store.append_status_before(
+                &created.id,
+                &created.etag(),
+                update.clone(),
+                Instant::now(),
+            ),
+            Err(ConnectionStoreError::DeadlineExceeded { .. })
+        ));
+
+        let _connection_guard = store.connection_guard();
+        let started = Instant::now();
+        assert!(matches!(
+            store.append_status_before(
+                &created.id,
+                &created.etag(),
+                update.clone(),
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(ConnectionStoreError::Busy { .. })
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "in-process lock contention must fail fast"
+        );
+        drop(_connection_guard);
+        assert!(
+            store
+                .latest_status(&created.id)
+                .expect("latest status query should succeed")
+                .is_none(),
+            "rejected bounded appends must not persist a status"
+        );
+
+        let (status, updated) = store
+            .append_status_before(
+                &created.id,
+                &created.etag(),
+                update,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("bounded append should succeed once contention clears");
+        assert_eq!(status.state, ConnectionOperationalState::Healthy);
+        assert_eq!(
+            updated.revisions.status,
+            created.revisions.status + 1,
+            "the committed record returned for runtime publication must carry the new status revision"
+        );
     }
 
     #[test]

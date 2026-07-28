@@ -44,7 +44,11 @@ impl ConnectionActions {
         dependency_count: usize,
     ) -> Self {
         let has_test_target = match record.write.kind {
-            ConnectionKind::HttpApi => record.write.test_profile.is_some(),
+            ConnectionKind::HttpApi => record
+                .write
+                .test_profile
+                .as_ref()
+                .is_some_and(|profile| matches!(profile.method.as_str(), "GET" | "HEAD")),
             ConnectionKind::McpStreamableHttp => matches!(
                 &record.write.discovery,
                 Some(DiscoveryConfig::ManagedMcp { .. })
@@ -525,6 +529,15 @@ mod tests {
         assert!(
             !ConnectionActions::managed(ordinary_writer, &record, 0).can_test,
             "HTTP connections require a stored test profile"
+        );
+        record.write.test_profile = Some(ConnectionTestProfile {
+            method: "OPTIONS".to_owned(),
+            path: "/ready".to_owned(),
+            expected_statuses: vec![200],
+        });
+        assert!(
+            !ConnectionActions::managed(ordinary_writer, &record, 0).can_test,
+            "legacy OPTIONS profiles remain readable but are not executable"
         );
 
         record.write.kind = ConnectionKind::McpStreamableHttp;
