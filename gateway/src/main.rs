@@ -96,7 +96,10 @@ const TOKEN_ROTATE_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}/rotate";
 const CONNECTIONS_ADMIN_ROUTE: &str = "/v1/admin/connections";
 const CONNECTION_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}";
 const CONNECTION_REFRESH_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/refresh";
+const CONNECTION_OPENAPI_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/openapi/preview";
+const CONNECTION_OPENAPI_REGISTER_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/openapi/register";
 const CONNECTION_COLLECTION_ETAG_HEADER: &str = "x-greengateway-connections-etag";
+const MANAGED_OPENAPI_JSON_ENVELOPE_OVERHEAD_BYTES: usize = 64 * 1024;
 const TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/preview";
 const TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/register";
 const OPENAPI_TOOLS_UNSUPPORTED_AUTH_REQUIREMENTS_ERROR: &str = "cannot register selected OpenAPI tools: upstream API-key header injection is not yet supported; see issue #36's known limitation";
@@ -218,6 +221,8 @@ struct AdminRoutes {
     connections_route: String,
     connection_route: String,
     connection_refresh_route: String,
+    connection_openapi_preview_route: String,
+    connection_openapi_register_route: String,
     tools_openapi_preview_route: String,
     tools_openapi_register_route: String,
     schema_coverage_route: String,
@@ -342,6 +347,12 @@ impl AdminRoutes {
             connections_route: format!("{api_prefix}/connections"),
             connection_route: format!("{api_prefix}/connections/{{id}}"),
             connection_refresh_route: format!("{api_prefix}/connections/{{id}}/refresh"),
+            connection_openapi_preview_route: format!(
+                "{api_prefix}/connections/{{id}}/openapi/preview"
+            ),
+            connection_openapi_register_route: format!(
+                "{api_prefix}/connections/{{id}}/openapi/register"
+            ),
             tools_openapi_preview_route: format!("{api_prefix}/tools/openapi/preview"),
             tools_openapi_register_route: format!("{api_prefix}/tools/openapi/register"),
             schema_coverage_route: format!("{api_prefix}/schema/coverage"),
@@ -406,6 +417,7 @@ struct TokenAdminState {
 struct ConnectionAdminState {
     control_plane: connections::control_plane::ConnectionControlPlane,
     mcp_catalogs: connections::mcp::McpConnectionCatalogService,
+    openapi_catalogs: connections::openapi::OpenApiConnectionCatalogService,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
     client_ip_policy: client_ip::ClientIpPolicy,
@@ -416,7 +428,6 @@ struct ConnectionAdminState {
 struct ToolAdminState {
     tools_file: Option<PathBuf>,
     registry: tools::definitions::ToolRegistry,
-    mcp_proxy_definitions_provider: Option<tools::definitions::McpProxyDefinitionsProvider>,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
     client_ip_policy: client_ip::ClientIpPolicy,
@@ -887,6 +898,96 @@ struct OpenApiToolsRegisterRequest {
 struct OpenApiToolsRegisterResponse {
     registered_tool_names: Vec<String>,
     tool_count: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedOpenApiPreviewRequest {
+    spec: String,
+}
+
+#[derive(Serialize)]
+struct ManagedOpenApiPreviewResponse {
+    connection_id: connections::model::ConnectionId,
+    connection_etag: String,
+    spec_digest: String,
+    spec_revision: u64,
+    catalog_revision: u64,
+    tools: Vec<tools::definitions::ToolDefinition>,
+    security_confirmations: Vec<ManagedOpenApiSecuritySelectionResponse>,
+    incompatibilities: Vec<ManagedOpenApiIncompatibilityResponse>,
+    operation_id_fallbacks: Vec<OpenApiToolNameFallbackResponse>,
+    skipped_operations: Vec<OpenApiSkippedOperationResponse>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedOpenApiRegisterRequest {
+    spec: String,
+    spec_digest: String,
+    expected_spec_revision: u64,
+    expected_catalog_revision: u64,
+    selected_tool_names: Vec<String>,
+    security_confirmations: Vec<ManagedOpenApiSecuritySelectionRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedOpenApiSecuritySelectionRequest {
+    tool_name: String,
+    selected_scheme_names: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ManagedOpenApiSecuritySelectionResponse {
+    tool_name: String,
+    selected_scheme_names: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ManagedOpenApiIncompatibilityResponse {
+    tool_name: String,
+    reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_template: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ConnectionCatalogRefreshResponse {
+    Mcp(connections::mcp::McpCatalogRefreshResult),
+    OpenApi(connections::openapi::OpenApiCatalogPublishResult),
+}
+
+impl ConnectionCatalogRefreshResponse {
+    fn audit_summary(&self) -> ConnectionRefreshAuditSummary {
+        match self {
+            Self::Mcp(result) => ConnectionRefreshAuditSummary {
+                catalog_revision: result.catalog_revision,
+                total_count: result.total_count,
+                added_count: result.added_count,
+                changed_count: result.changed_count,
+                removed_count: result.removed_count,
+            },
+            Self::OpenApi(result) => ConnectionRefreshAuditSummary {
+                catalog_revision: result.catalog_revision,
+                total_count: result.total_count,
+                added_count: result.added_count,
+                changed_count: result.changed_count,
+                removed_count: result.removed_count,
+            },
+        }
+    }
+}
+
+struct ConnectionRefreshAuditSummary {
+    catalog_revision: u64,
+    total_count: usize,
+    added_count: usize,
+    changed_count: usize,
+    removed_count: usize,
 }
 
 #[derive(Serialize)]
@@ -1516,7 +1617,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         tools::definitions::ToolRegistry::from_config_with_audit(&config, audit_log.clone())?;
     let connection_http_for_tools = connection_http_runtime.clone();
     tool_registry.set_definition_validator(Arc::new(move |definitions| {
-        validate_connection_bound_manual_tools(&connection_http_for_tools, definitions)
+        validate_connection_bound_tools(&connection_http_for_tools, definitions)
     }))?;
     let mcp_upstream_definitions =
         tools::mcp_upstream::discover_upstream_tools_blocking(&config, Arc::clone(&egress_client))?;
@@ -1526,9 +1627,17 @@ fn gateway_app_with_process_started_at_and_overrides(
         connection_http_runtime.clone(),
         tool_registry.clone(),
     )?;
+    let openapi_catalog_service = connections::openapi::OpenApiConnectionCatalogService::load(
+        connection_control_plane.clone(),
+        connection_http_runtime.clone(),
+        tool_registry.clone(),
+    )?;
     let mcp_catalog_runtime = connection_control_plane
         .is_managed_store_configured()
         .then(|| mcp_catalog_service.runtime());
+    let openapi_catalog_runtime = connection_control_plane
+        .is_managed_store_configured()
+        .then(|| openapi_catalog_service.runtime());
     let mcp_proxy_definitions_provider =
         mcp_proxy_definitions_provider(&config, Arc::clone(&egress_client));
     if let Some(tools_file) = config.tools_file.as_ref() {
@@ -1549,8 +1658,11 @@ fn gateway_app_with_process_started_at_and_overrides(
         tool_registry.clone(),
         tool_runtime,
         Arc::clone(&egress_client),
-        Some(connection_http_runtime.clone()),
-        mcp_catalog_runtime,
+        tools::executor::ToolConnectionRuntimes {
+            http: Some(connection_http_runtime.clone()),
+            mcp_catalog: mcp_catalog_runtime,
+            openapi_catalog: openapi_catalog_runtime,
+        },
         audit_log.clone(),
     )?;
     let client_ip_policy = client_ip::ClientIpPolicy::from_config(&config);
@@ -1590,6 +1702,7 @@ fn gateway_app_with_process_started_at_and_overrides(
     let connection_admin_state = ConnectionAdminState {
         control_plane: connection_control_plane.clone(),
         mcp_catalogs: mcp_catalog_service,
+        openapi_catalogs: openapi_catalog_service,
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
@@ -1598,7 +1711,6 @@ fn gateway_app_with_process_started_at_and_overrides(
     let tool_admin_state = ToolAdminState {
         tools_file: config.tools_file.as_ref().map(PathBuf::from),
         registry: tool_registry,
-        mcp_proxy_definitions_provider,
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
@@ -1855,7 +1967,7 @@ fn required_admin_login_provider_field(
         })
 }
 
-fn validate_connection_bound_manual_tools(
+fn validate_connection_bound_tools(
     runtime: &connections::http::ConnectionHttpRuntime,
     definitions: &[tools::definitions::ToolDefinition],
 ) -> Result<(), Vec<String>> {
@@ -1865,25 +1977,65 @@ fn validate_connection_bound_manual_tools(
     let mut problems = Vec::new();
     let mut dependencies = Vec::new();
     for definition in definitions {
-        let Some(ToolTarget::Http { connection_id, .. }) = definition.target.as_ref() else {
-            continue;
-        };
-        if !matches!(definition.source, ToolSource::Manual) {
-            problems.push(format!(
-                "tool '{}' uses a Connection HTTP target but source is not manual",
-                definition.name
-            ));
-            continue;
+        match (&definition.source, definition.target.as_ref()) {
+            (ToolSource::Manual, Some(ToolTarget::Http { connection_id, .. })) => {
+                if let Err(error) = runtime.validate_binding(connection_id) {
+                    problems.push(format!(
+                        "tool '{}' Connection target is unavailable: {}",
+                        definition.name,
+                        error.safe_reason()
+                    ));
+                    continue;
+                }
+                dependencies.push((connection_id.clone(), definition.name.clone()));
+            }
+            (
+                ToolSource::OpenApi {
+                    connection_id: source_connection_id,
+                    catalog_revision,
+                    ..
+                },
+                Some(ToolTarget::Http {
+                    connection_id: target_connection_id,
+                    ..
+                }),
+            ) => {
+                if source_connection_id != target_connection_id {
+                    problems.push(format!(
+                        "OpenAPI tool '{}' source and target Connection IDs do not match",
+                        definition.name
+                    ));
+                    continue;
+                }
+                if catalog_revision.is_none() {
+                    problems.push(format!(
+                        "managed OpenAPI tool '{}' is missing its catalog revision",
+                        definition.name
+                    ));
+                    continue;
+                }
+                if let Err(error) = runtime.validate_binding(target_connection_id) {
+                    problems.push(format!(
+                        "OpenAPI tool '{}' Connection target is unavailable: {}",
+                        definition.name,
+                        error.safe_reason()
+                    ));
+                }
+            }
+            (ToolSource::OpenApi { .. }, _) => {
+                problems.push(format!(
+                    "managed OpenAPI tool '{}' must use a Connection HTTP target",
+                    definition.name
+                ));
+            }
+            (_, Some(ToolTarget::Http { .. })) => {
+                problems.push(format!(
+                    "tool '{}' uses a Connection HTTP target with an unsupported source",
+                    definition.name
+                ));
+            }
+            _ => {}
         }
-        if let Err(error) = runtime.validate_binding(connection_id) {
-            problems.push(format!(
-                "tool '{}' Connection target is unavailable: {}",
-                definition.name,
-                error.safe_reason()
-            ));
-            continue;
-        }
-        dependencies.push((connection_id.clone(), definition.name.clone()));
     }
     if !problems.is_empty() {
         return Err(problems);
@@ -2289,6 +2441,14 @@ fn add_admin_api_routes(
                 .route(
                     routes.admin.connection_refresh_route.as_str(),
                     post(connection_refresh_endpoint),
+                )
+                .route(
+                    routes.admin.connection_openapi_preview_route.as_str(),
+                    post(connection_openapi_preview_endpoint),
+                )
+                .route(
+                    routes.admin.connection_openapi_register_route.as_str(),
+                    post(connection_openapi_register_endpoint),
                 )
                 .with_state(admin_api_states.connections),
         )
@@ -3109,9 +3269,9 @@ async fn connection_put_endpoint(
         }
         Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
     }
-    let _catalog_lifecycle = match state.mcp_catalogs.begin_connection_mutation(&id) {
+    let _catalog_lifecycle = match state.control_plane.begin_catalog_mutation(&id) {
         Ok(guard) => guard,
-        Err(error) => return connection_refresh_error_response(error),
+        Err(error) => return connection_catalog_lifecycle_error_response(error),
     };
 
     let changed_fields =
@@ -3128,6 +3288,7 @@ async fn connection_put_endpoint(
         Err(error) => return connection_mutation_error_response(error),
     };
     state.mcp_catalogs.reconcile_connection(&updated);
+    state.openapi_catalogs.reconcile_connection(&updated);
     if !changed_fields.is_empty() {
         emit_connection_changed(
             &state,
@@ -3231,15 +3392,16 @@ async fn connection_delete_endpoint(
         }
         Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
     }
-    let _catalog_lifecycle = match state.mcp_catalogs.begin_connection_mutation(&id) {
+    let _catalog_lifecycle = match state.control_plane.begin_catalog_mutation(&id) {
         Ok(guard) => guard,
-        Err(error) => return connection_refresh_error_response(error),
+        Err(error) => return connection_catalog_lifecycle_error_response(error),
     };
 
     if let Err(error) = state.control_plane.delete_managed(&id, &current_etag) {
         return connection_mutation_error_response(error);
     }
     state.mcp_catalogs.remove_connection(&id);
+    state.openapi_catalogs.remove_connection(&id);
     let changed_fields = connections::admin::changed_connection_fields(Some(&current.write), None);
     emit_connection_changed(
         &state,
@@ -3317,12 +3479,45 @@ async fn connection_refresh_endpoint(
         Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
     }
 
-    match state
-        .mcp_catalogs
-        .refresh(id.as_str(), current_etag.as_str())
-        .await
-    {
+    let refreshed = match &record.write.discovery {
+        Some(connections::model::DiscoveryConfig::ManagedMcp { .. }) => state
+            .mcp_catalogs
+            .refresh(id.as_str(), current_etag.as_str())
+            .await
+            .map(ConnectionCatalogRefreshResponse::Mcp)
+            .map_err(|error| {
+                (
+                    error.safe_reason(),
+                    connection_refresh_error_response(error),
+                )
+            }),
+        Some(connections::model::DiscoveryConfig::ManagedOpenapi { .. }) => state
+            .openapi_catalogs
+            .refresh(id.as_str(), current_etag.as_str())
+            .await
+            .map(ConnectionCatalogRefreshResponse::OpenApi)
+            .map_err(|error| {
+                (
+                    error.safe_reason(),
+                    openapi_catalog_error_response(error, "refresh"),
+                )
+            }),
+        None => Err((
+            "discovery_not_configured",
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "connection discovery is not configured",
+                    "reason": "discovery_not_configured",
+                })),
+            )
+                .into_response(),
+        )),
+    };
+
+    match refreshed {
         Ok(result) => {
+            let audit_summary = result.audit_summary();
             emit_connection_refreshed(
                 &state,
                 &parts,
@@ -3331,7 +3526,7 @@ async fn connection_refresh_endpoint(
                 "success",
                 None,
                 started.elapsed(),
-                Some(&result),
+                Some(&audit_summary),
             );
             (
                 StatusCode::OK,
@@ -3343,19 +3538,167 @@ async fn connection_refresh_endpoint(
             )
                 .into_response()
         }
-        Err(error) => {
+        Err((reason, response)) => {
             emit_connection_refreshed(
                 &state,
                 &parts,
                 &principal,
                 record,
                 "failure",
-                Some(error.safe_reason()),
+                Some(reason),
                 started.elapsed(),
                 None,
             );
+            with_etag(response, current_etag.as_str())
+        }
+    }
+}
+
+async fn connection_openapi_preview_endpoint(
+    State(state): State<ConnectionAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_OPENAPI_PREVIEW_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_connection_state(&state, principal, ADMIN_TOOLS_READ_PERMISSION)
+    {
+        return connection_admin_authz_error_response(error);
+    }
+    if !state.control_plane.is_managed_store_configured() {
+        return connection_store_not_configured();
+    }
+    let body = match read_request_body(body, managed_openapi_admin_body_limit(&state)).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let requested = match serde_json::from_slice::<ManagedOpenApiPreviewRequest>(&body) {
+        Ok(requested) => requested,
+        Err(error) => {
+            return bad_request(&format!("invalid managed OpenAPI preview JSON: {error}"));
+        }
+    };
+    if requested.spec.is_empty() {
+        return bad_request("spec must not be empty");
+    }
+
+    match state.openapi_catalogs.preview(&raw_id, &requested.spec) {
+        Ok(preview) => {
+            let connection_etag = preview.connection_etag.as_str().to_owned();
+            (
+                StatusCode::OK,
+                [
+                    (header::ETAG, etag_header_value(&connection_etag)),
+                    (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                ],
+                Json(managed_openapi_preview_response(preview)),
+            )
+                .into_response()
+        }
+        Err(error) => openapi_catalog_error_response(error, "preview"),
+    }
+}
+
+async fn connection_openapi_register_endpoint(
+    State(state): State<ConnectionAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_OPENAPI_REGISTER_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) =
+        authorized_connection_state(&state, &principal, ADMIN_TOOLS_WRITE_PERMISSION)
+    {
+        return connection_admin_authz_error_response(error);
+    }
+    if !state.control_plane.is_managed_store_configured() {
+        return connection_store_not_configured();
+    }
+    let id = match connections::model::ConnectionId::parse(raw_id.clone()) {
+        Ok(id) => id,
+        Err(_) => return not_found("connection was not found"),
+    };
+    let snapshot = state.control_plane.runtime_snapshot();
+    let Some(record) = snapshot.managed().get(&id) else {
+        if snapshot
+            .legacy()
+            .iter()
+            .any(|projection| projection.id() == &id)
+        {
+            return conflict("legacy connection projections are read-only");
+        }
+        return not_found("connection was not found");
+    };
+    let current_etag = record.etag();
+    match if_match_matches(&parts.headers, current_etag.as_str()) {
+        Ok(true) => {}
+        Ok(false) => {
+            return with_etag(
+                precondition_failed("If-Match does not match the current connection ETag"),
+                current_etag.as_str(),
+            );
+        }
+        Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
+    }
+    let body = match read_request_body(body, managed_openapi_admin_body_limit(&state)).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let requested = match serde_json::from_slice::<ManagedOpenApiRegisterRequest>(&body) {
+        Ok(requested) => requested,
+        Err(error) => {
+            return bad_request(&format!("invalid managed OpenAPI register JSON: {error}"));
+        }
+    };
+    let confirmations = requested
+        .security_confirmations
+        .into_iter()
+        .map(|selection| tools::openapi::OpenApiToolSecuritySelection {
+            tool_name: selection.tool_name,
+            selected_scheme_names: selection.selected_scheme_names,
+        })
+        .collect::<Vec<_>>();
+
+    match state.openapi_catalogs.register(
+        id.as_str(),
+        current_etag.as_str(),
+        requested.expected_spec_revision,
+        requested.expected_catalog_revision,
+        &requested.spec_digest,
+        &requested.spec,
+        &requested.selected_tool_names,
+        &confirmations,
+    ) {
+        Ok(result) => {
+            emit_managed_openapi_catalog_changed(&state, &parts, &principal, &result);
+            (
+                StatusCode::CREATED,
+                [
+                    (header::ETAG, etag_header_value(current_etag.as_str())),
+                    (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                ],
+                Json(result),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            emit_managed_openapi_catalog_rejected(
+                &state,
+                &parts,
+                &principal,
+                &id,
+                error.safe_reason(),
+            );
             with_etag(
-                connection_refresh_error_response(error),
+                openapi_catalog_error_response(error, "register"),
                 current_etag.as_str(),
             )
         }
@@ -4231,6 +4574,7 @@ async fn tools_openapi_register_endpoint(
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
+    let previous_local_tools = current_document.tools.clone();
     current_document.tools.extend(selected);
     let candidate_value = match serde_json::to_value(&current_document) {
         Ok(value) => value,
@@ -4239,10 +4583,6 @@ async fn tools_openapi_register_endpoint(
             return internal_server_error("tools file merge failed");
         }
     };
-    if let Err(err) = tools::definitions::ToolRegistry::from_json_value(candidate_value.clone()) {
-        tracing::error!(tools_file = %tools_file.display(), error = %err, "merged OpenAPI tools file failed validation");
-        return internal_server_error("tools file validation failed");
-    }
     let candidate_contents = match serde_json::to_string_pretty(&candidate_value) {
         Ok(contents) => contents,
         Err(err) => {
@@ -4250,19 +4590,43 @@ async fn tools_openapi_register_endpoint(
             return internal_server_error("tools file merge failed");
         }
     };
-    if let Err(err) = fs::write(tools_file, candidate_contents) {
-        tracing::error!(tools_file = %tools_file.display(), error = %err, "failed to persist merged tools file");
-        return internal_server_error("tools file persist failed");
-    }
-    if let Err(err) =
-        tools::definitions::reload_tool_registry_from_file_with_mcp_proxy_definitions_provider(
-            &state.registry,
-            tools_file,
-            state.mcp_proxy_definitions_provider.as_ref(),
-        )
+    let candidate_local_tools = current_document.tools.clone();
+    if let Err(error) = state
+        .registry
+        .replace_local_definitions_with_persist(candidate_local_tools, || {
+            fs::write(tools_file, &candidate_contents)
+        })
     {
-        tracing::error!(tools_file = %tools_file.display(), error = %err, "failed to reload persisted tools file");
-        return internal_server_error("tools registry reload failed");
+        if let Err(restore_error) = state
+            .registry
+            .replace_local_definitions_with_persist(previous_local_tools, || {
+                Ok::<(), Infallible>(())
+            })
+        {
+            tracing::error!(
+                tools_file = %tools_file.display(),
+                error = ?restore_error,
+                "failed to restore Connection dependency validation after rejected tools update"
+            );
+        }
+        return match error {
+            tools::definitions::McpCatalogPublishError::Registry(error) => {
+                tracing::warn!(
+                    tools_file = %tools_file.display(),
+                    error = %error,
+                    "merged OpenAPI tools conflicted with the active tool registry"
+                );
+                conflict("OpenAPI tools conflict with the active tool registry")
+            }
+            tools::definitions::McpCatalogPublishError::Persist(error) => {
+                tracing::error!(
+                    tools_file = %tools_file.display(),
+                    error = %error,
+                    "failed to persist merged tools file"
+                );
+                internal_server_error("tools file persist failed")
+            }
+        };
     }
 
     emit_tool_registry_changed(
@@ -6203,6 +6567,14 @@ fn connection_admin_body_limit(state: &ConnectionAdminState) -> usize {
         .min(connections::admin::MAX_CONNECTION_ADMIN_BODY_BYTES)
 }
 
+fn managed_openapi_admin_body_limit(state: &ConnectionAdminState) -> usize {
+    state.max_body_size.min(
+        connections::model::MAX_MANAGED_SPEC_BYTES
+            .saturating_mul(6)
+            .saturating_add(MANAGED_OPENAPI_JSON_ENVELOPE_OVERHEAD_BYTES),
+    )
+}
+
 fn parse_connection_write_body(
     body: &Bytes,
     current: &connections::model::ConnectionWrite,
@@ -6465,9 +6837,12 @@ fn connection_collection_runtime_data(
                 "managed connection state is unavailable",
             ))
         })?;
-        if let Some(status) = state
+        let status = state
             .mcp_catalogs
-            .status_fallback(id, &record.etag(), stored_status)
+            .status_fallback(id, &record.etag(), stored_status);
+        if let Some(status) = state
+            .openapi_catalogs
+            .status_fallback(id, &record.etag(), status)
         {
             statuses.insert(id.clone(), status);
         }
@@ -6495,9 +6870,12 @@ fn connection_detail_runtime_data(
     })?;
     let snapshot = state.control_plane.runtime_snapshot();
     let status = snapshot.managed().get(id).and_then(|record| {
-        state
+        let status = state
             .mcp_catalogs
-            .status_fallback(id, &record.etag(), stored_status)
+            .status_fallback(id, &record.etag(), stored_status);
+        state
+            .openapi_catalogs
+            .status_fallback(id, &record.etag(), status)
     });
     let dependencies = store.dependencies(id).map_err(|error| {
         tracing::error!(connection_id = %id, error = %error, "failed to load connection dependencies");
@@ -7322,6 +7700,74 @@ fn openapi_tools_preview_response(
     }
 }
 
+fn managed_openapi_preview_response(
+    preview: connections::openapi::OpenApiCatalogPreview,
+) -> ManagedOpenApiPreviewResponse {
+    let connection_etag = preview.connection_etag.as_str().to_owned();
+    let security_confirmations = preview
+        .binding
+        .security_selections
+        .into_iter()
+        .map(|selection| ManagedOpenApiSecuritySelectionResponse {
+            tool_name: selection.tool_name,
+            selected_scheme_names: selection.selected_scheme_names,
+        })
+        .collect();
+    let incompatibilities = preview
+        .binding
+        .incompatibilities
+        .into_iter()
+        .map(managed_openapi_incompatibility_response)
+        .collect();
+    ManagedOpenApiPreviewResponse {
+        connection_id: preview.connection_id,
+        connection_etag,
+        spec_digest: preview.spec_digest,
+        spec_revision: preview.spec_revision,
+        catalog_revision: preview.catalog_revision,
+        tools: preview.binding.definitions,
+        security_confirmations,
+        incompatibilities,
+        operation_id_fallbacks: preview
+            .generation
+            .operation_id_fallbacks
+            .into_iter()
+            .map(openapi_tool_name_fallback_response)
+            .collect(),
+        skipped_operations: preview
+            .generation
+            .skipped_operations
+            .into_iter()
+            .map(openapi_skipped_operation_response)
+            .collect(),
+    }
+}
+
+fn managed_openapi_incompatibility_response(
+    incompatibility: tools::openapi::OpenApiToolIncompatibility,
+) -> ManagedOpenApiIncompatibilityResponse {
+    use tools::openapi::OpenApiToolIncompatibilityReason;
+
+    let (reason, path_template, detail) = match incompatibility.reason {
+        OpenApiToolIncompatibilityReason::MissingSecurityMetadata => {
+            ("missing_security_metadata", None, None)
+        }
+        OpenApiToolIncompatibilityReason::NoCompatibleSecurityAlternative => {
+            ("no_compatible_security_alternative", None, None)
+        }
+        OpenApiToolIncompatibilityReason::InvalidMappingPath {
+            path_template,
+            message,
+        } => ("invalid_mapping_path", Some(path_template), Some(message)),
+    };
+    ManagedOpenApiIncompatibilityResponse {
+        tool_name: incompatibility.tool_name,
+        reason,
+        path_template,
+        detail,
+    }
+}
+
 fn openapi_tool_name_fallback_response(
     fallback: tools::openapi::OpenApiToolNameFallback,
 ) -> OpenApiToolNameFallbackResponse {
@@ -7357,6 +7803,15 @@ fn openapi_skipped_operation_response(
             reason: "body_property_parameter_name_collision",
             property_name: Some(property_name),
         },
+        tools::openapi::OpenApiSkippedOperationReason::UnsafeTraceMethod => {
+            OpenApiSkippedOperationResponse {
+                method: skipped.method,
+                path_template: skipped.path_template,
+                original_operation_id: skipped.original_operation_id,
+                reason: "unsafe_trace_method",
+                property_name: None,
+            }
+        }
     }
 }
 
@@ -8115,7 +8570,7 @@ fn emit_connection_refreshed(
     outcome: &'static str,
     reason: Option<&'static str>,
     elapsed: Duration,
-    result: Option<&connections::mcp::McpCatalogRefreshResult>,
+    result: Option<&ConnectionRefreshAuditSummary>,
 ) {
     let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
     let source_ip =
@@ -8226,6 +8681,62 @@ fn emit_tool_registry_changed(
         source_ip,
         actor,
         payload,
+    ));
+}
+
+fn emit_managed_openapi_catalog_changed(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    result: &connections::openapi::OpenApiCatalogPublishResult,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::TOOL_REGISTRY_CHANGED,
+        request_id,
+        source_ip,
+        Some(auth::actor_from_principal(principal)),
+        json!({
+            "action": "managed_openapi_catalog_registered",
+            "connection_id": &result.connection_id,
+            "source": "managed",
+            "spec_digest": &result.spec_digest,
+            "spec_revision": result.spec_revision,
+            "catalog_revision": result.catalog_revision,
+            "registered_tool_names": &result.registered_tool_names,
+            "registered_tool_count": result.registered_tool_names.len(),
+            "tool_count": result.total_count,
+            "added_count": result.added_count,
+            "changed_count": result.changed_count,
+            "removed_count": result.removed_count,
+        }),
+    ));
+}
+
+fn emit_managed_openapi_catalog_rejected(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    connection_id: &connections::model::ConnectionId,
+    reason: &'static str,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::TOOL_REGISTRY_CHANGED,
+        request_id,
+        source_ip,
+        Some(auth::actor_from_principal(principal)),
+        json!({
+            "action": "managed_openapi_catalog_registration_rejected",
+            "connection_id": connection_id,
+            "source": "managed",
+            "outcome": "failure",
+            "reason": reason,
+        }),
     ));
 }
 
@@ -8687,6 +9198,19 @@ fn conflict(error: &str) -> Response {
         .into_response()
 }
 
+fn connection_catalog_lifecycle_error_response(
+    error: connections::control_plane::CatalogLifecycleError,
+) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "connection catalog operation is already in progress",
+            "reason": error.safe_reason(),
+        })),
+    )
+        .into_response()
+}
+
 fn connection_refresh_error_response(error: connections::mcp::McpCatalogRefreshError) -> Response {
     let status = match error {
         connections::mcp::McpCatalogRefreshError::InvalidConnectionId
@@ -8712,6 +9236,47 @@ fn connection_refresh_error_response(error: connections::mcp::McpCatalogRefreshE
         status,
         Json(json!({
             "error": "MCP connection refresh failed",
+            "reason": error.safe_reason(),
+        })),
+    )
+        .into_response()
+}
+
+fn openapi_catalog_error_response(
+    error: connections::openapi::OpenApiCatalogError,
+    operation: &'static str,
+) -> Response {
+    use connections::openapi::OpenApiCatalogError;
+
+    let status = match error {
+        OpenApiCatalogError::InvalidConnectionId | OpenApiCatalogError::ConnectionNotFound => {
+            StatusCode::NOT_FOUND
+        }
+        OpenApiCatalogError::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
+        OpenApiCatalogError::StalePreview
+        | OpenApiCatalogError::CatalogNotRegistered
+        | OpenApiCatalogError::OperationInProgress
+        | OpenApiCatalogError::ConnectionDisabled
+        | OpenApiCatalogError::ConnectionKindMismatch
+        | OpenApiCatalogError::DiscoveryNotConfigured
+        | OpenApiCatalogError::ToolConflict => StatusCode::CONFLICT,
+        OpenApiCatalogError::SpecTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        OpenApiCatalogError::InvalidSpec
+        | OpenApiCatalogError::InvalidSelection
+        | OpenApiCatalogError::AuthenticationMismatch => StatusCode::BAD_REQUEST,
+        OpenApiCatalogError::StoreUnavailable | OpenApiCatalogError::StorageUnavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        OpenApiCatalogError::EgressDenied
+        | OpenApiCatalogError::SecretUnavailable
+        | OpenApiCatalogError::AuthenticationFailed
+        | OpenApiCatalogError::RequestFailed
+        | OpenApiCatalogError::InvalidResponse => StatusCode::BAD_GATEWAY,
+    };
+    (
+        status,
+        Json(json!({
+            "error": format!("managed OpenAPI {operation} failed"),
             "reason": error.safe_reason(),
         })),
     )
@@ -10429,6 +10994,14 @@ mod tests {
             CONNECTION_REFRESH_ADMIN_ROUTE
         );
         assert_eq!(
+            default_routes.connection_openapi_preview_route,
+            CONNECTION_OPENAPI_PREVIEW_ADMIN_ROUTE
+        );
+        assert_eq!(
+            default_routes.connection_openapi_register_route,
+            CONNECTION_OPENAPI_REGISTER_ADMIN_ROUTE
+        );
+        assert_eq!(
             default_routes.tools_openapi_preview_route,
             TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE
         );
@@ -10517,6 +11090,14 @@ mod tests {
         assert_eq!(
             custom_routes.connection_refresh_route,
             "/v1/ops/connections/{id}/refresh"
+        );
+        assert_eq!(
+            custom_routes.connection_openapi_preview_route,
+            "/v1/ops/connections/{id}/openapi/preview"
+        );
+        assert_eq!(
+            custom_routes.connection_openapi_register_route,
+            "/v1/ops/connections/{id}/openapi/register"
         );
         assert_eq!(
             custom_routes.tools_openapi_preview_route,
@@ -18551,6 +19132,26 @@ mod tests {
         .to_string()
     }
 
+    fn managed_openapi_connection_body(display_name: &str) -> String {
+        json!({
+            "display_name": display_name,
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://openapi.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {
+                "type": "none"
+            },
+            "discovery": {
+                "type": "managed_openapi",
+                "use_connection_authentication": false
+            }
+        })
+        .to_string()
+    }
+
     fn credentialed_connection_body() -> String {
         json!({
             "display_name": "Credentialed billing API",
@@ -18668,6 +19269,246 @@ mod tests {
             Some("private-key-only-binding-canary")
         );
         assert!(!private_key_only.requires_secrets_write_to_replace(&private_key_candidate));
+    }
+
+    #[tokio::test]
+    async fn managed_openapi_preview_and_register_enforce_permissions_and_revisions() {
+        let connection_db = TempDb::new("connection-openapi-admin-guards");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let router = connection_admin_router(&connection_db, &policy, test_audit_log());
+
+        let list = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-reader"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("connection list should complete");
+        let collection_etag = list
+            .headers()
+            .get(CONNECTION_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("connection list should include collection ETag")
+            .to_owned();
+        let created = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-editor"])),
+                Some(managed_openapi_connection_body("Managed OpenAPI")),
+                Some(&collection_etag),
+                true,
+            ))
+            .await
+            .expect("managed OpenAPI connection create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let connection_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("created connection should include ETag")
+            .to_owned();
+        let connection_id = json_body(created).await["id"]
+            .as_str()
+            .expect("created connection should include ID")
+            .to_owned();
+        let preview_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/preview");
+        let register_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/register");
+        let preview_request_body = json!({ "spec": widget_openapi_spec() }).to_string();
+
+        let forbidden_preview = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &preview_uri,
+                Some(test_principal(&["connections-editor"])),
+                Some(preview_request_body.clone()),
+                None,
+                true,
+            ))
+            .await
+            .expect("preview permission denial should complete");
+        assert_eq!(forbidden_preview.status(), StatusCode::FORBIDDEN);
+
+        let large_spec = json!({
+            "openapi": "3.0.3",
+            "info": {
+                "title": "Large managed preview",
+                "version": "1.0.0",
+                "description": "x".repeat(70 * 1024)
+            },
+            "paths": {
+                "/widgets": {
+                    "get": {
+                        "operationId": "listWidgets",
+                        "responses": {
+                            "200": { "description": "ok" }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let large_preview_body = json!({ "spec": large_spec }).to_string();
+        assert!(
+            large_preview_body.len() > connections::admin::MAX_CONNECTION_ADMIN_BODY_BYTES,
+            "regression body must exceed the normal Connection admin limit"
+        );
+        let large_preview = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &preview_uri,
+                Some(test_principal(&["openapi-tools-reader"])),
+                Some(large_preview_body),
+                None,
+                true,
+            ))
+            .await
+            .expect("large managed OpenAPI preview should complete");
+        assert_eq!(large_preview.status(), StatusCode::OK);
+
+        let preview = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &preview_uri,
+                Some(test_principal(&["openapi-tools-reader"])),
+                Some(preview_request_body),
+                None,
+                true,
+            ))
+            .await
+            .expect("managed OpenAPI preview should complete");
+        assert_eq!(preview.status(), StatusCode::OK);
+        assert_eq!(
+            preview
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(connection_etag.as_str())
+        );
+        let preview = json_body(preview).await;
+        assert_eq!(preview["connection_id"], json!(connection_id));
+        assert_eq!(preview["connection_etag"], json!(connection_etag));
+        assert_eq!(preview["spec_revision"], json!(0));
+        assert_eq!(preview["catalog_revision"], json!(0));
+        assert!(preview["spec_digest"].as_str().is_some_and(
+            |digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        ));
+        let selected_tool_name = preview["tools"][0]["name"]
+            .as_str()
+            .expect("preview should include a generated tool")
+            .to_owned();
+        let selected_security_confirmation = preview["security_confirmations"]
+            .as_array()
+            .and_then(|confirmations| {
+                confirmations.iter().find(|confirmation| {
+                    confirmation["tool_name"].as_str() == Some(selected_tool_name.as_str())
+                })
+            })
+            .cloned()
+            .expect("selected tool should include an exact security confirmation");
+        let register_body = json!({
+            "spec": widget_openapi_spec(),
+            "spec_digest": preview["spec_digest"],
+            "expected_spec_revision": preview["spec_revision"],
+            "expected_catalog_revision": preview["catalog_revision"],
+            "selected_tool_names": [selected_tool_name],
+            "security_confirmations": [selected_security_confirmation],
+        })
+        .to_string();
+
+        let forbidden_register = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &register_uri,
+                Some(test_principal(&["openapi-tools-reader"])),
+                Some(register_body.clone()),
+                Some(&connection_etag),
+                true,
+            ))
+            .await
+            .expect("register permission denial should complete");
+        assert_eq!(forbidden_register.status(), StatusCode::FORBIDDEN);
+
+        let missing_if_match = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &register_uri,
+                Some(test_principal(&["openapi-tools-writer"])),
+                Some(register_body.clone()),
+                None,
+                true,
+            ))
+            .await
+            .expect("missing register precondition should complete");
+        assert_eq!(missing_if_match.status(), StatusCode::PRECONDITION_REQUIRED);
+
+        let stale_if_match = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &register_uri,
+                Some(test_principal(&["openapi-tools-writer"])),
+                Some(register_body.clone()),
+                Some("\"connection:stale\""),
+                true,
+            ))
+            .await
+            .expect("stale register precondition should complete");
+        assert_eq!(stale_if_match.status(), StatusCode::PRECONDITION_FAILED);
+
+        let registered = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &register_uri,
+                Some(test_principal(&["openapi-tools-writer"])),
+                Some(register_body),
+                Some(&connection_etag),
+                true,
+            ))
+            .await
+            .expect("one-tool managed OpenAPI registration should complete");
+        assert_eq!(registered.status(), StatusCode::CREATED);
+        let registered = json_body(registered).await;
+        assert_eq!(registered["total_count"], json!(1));
+        assert_eq!(registered["added_count"], json!(1));
+
+        let clear_body = json!({
+            "spec": widget_openapi_spec(),
+            "spec_digest": registered["spec_digest"],
+            "expected_spec_revision": registered["spec_revision"],
+            "expected_catalog_revision": registered["catalog_revision"],
+            "selected_tool_names": [],
+            "security_confirmations": [],
+        })
+        .to_string();
+        let cleared = router
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &register_uri,
+                Some(test_principal(&["openapi-tools-writer"])),
+                Some(clear_body),
+                Some(&connection_etag),
+                true,
+            ))
+            .await
+            .expect("empty managed OpenAPI catalog registration should complete");
+        assert_eq!(cleared.status(), StatusCode::CREATED);
+        let cleared = json_body(cleared).await;
+        assert_eq!(cleared["registered_tool_names"], json!([]));
+        assert_eq!(cleared["total_count"], json!(0));
+        assert_eq!(cleared["removed_count"], json!(1));
     }
 
     #[tokio::test]
@@ -18792,13 +19633,13 @@ mod tests {
         assert_eq!(wrong_kind.status(), StatusCode::CONFLICT);
         assert_eq!(
             json_body(wrong_kind).await["reason"],
-            json!("connection_kind_mismatch")
+            json!("discovery_not_configured")
         );
         assert_eventually(Duration::from_secs(1), || {
             capture.events().iter().any(|event| {
                 event.event_type == audit::event::CONNECTION_REFRESHED
                     && event.payload["outcome"] == json!("failure")
-                    && event.payload["reason"] == json!("connection_kind_mismatch")
+                    && event.payload["reason"] == json!("discovery_not_configured")
             })
         });
     }
@@ -28023,6 +28864,15 @@ paths:
                     "permissions": [
                         ADMIN_CONNECTIONS_READ_PERMISSION,
                         ADMIN_CONNECTIONS_REFRESH_PERMISSION
+                    ]
+                },
+                "openapi-tools-reader": {
+                    "permissions": [ADMIN_TOOLS_READ_PERMISSION]
+                },
+                "openapi-tools-writer": {
+                    "permissions": [
+                        ADMIN_TOOLS_READ_PERMISSION,
+                        ADMIN_TOOLS_WRITE_PERMISSION
                     ]
                 },
                 "connections-observer": {

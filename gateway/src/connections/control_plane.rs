@@ -8,6 +8,7 @@ use std::{
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
 use crate::config::Config;
@@ -17,7 +18,10 @@ use super::{
         LocalSecretError, LocalSecretKeyring, LocalSecretKeyringConfigError, LocalSecretManager,
         LocalSecretProvider, MasterKeyRotationProgress,
     },
-    model::{ConnectionAuthentication, ConnectionId, ConnectionWrite, MAX_CONNECTIONS},
+    model::{
+        ConnectionAuthentication, ConnectionId, ConnectionWrite, MAX_CONCURRENT_REFRESHES,
+        MAX_CONNECTIONS,
+    },
     projection::{project_legacy_connections, LegacyConnectionProjection, LegacyProjectionError},
     secret::{
         OperatorAliasResolver, ResolvedSecret, SecretAliasMetadata, SecretProviderConfigError,
@@ -37,6 +41,7 @@ pub struct ConnectionControlPlane {
     omitted_legacy_projection_count: usize,
     runtime: Arc<ArcSwap<ConnectionRuntimeSnapshot>>,
     mutation_lock: Arc<Mutex<()>>,
+    catalog_lifecycle: Arc<CatalogLifecycleCoordinator>,
     secret_resolver: Arc<ConnectionSecretResolver>,
     local_secret_versions: Arc<ArcSwap<BTreeMap<String, u64>>>,
     local_secret_manager: Option<Arc<CoordinatedLocalSecretManager>>,
@@ -48,6 +53,52 @@ pub struct ConnectionRuntimeSnapshot {
     legacy: Arc<[LegacyConnectionProjection]>,
     omitted_legacy_projection_count: usize,
     collection_etag: Arc<str>,
+}
+
+struct CatalogLifecycleCoordinator {
+    active_connections: Mutex<BTreeSet<ConnectionId>>,
+    refresh_permits: Arc<Semaphore>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CatalogLifecycleError {
+    Busy,
+}
+
+impl CatalogLifecycleError {
+    pub(crate) const fn safe_reason(self) -> &'static str {
+        match self {
+            Self::Busy => "catalog_operation_in_progress",
+        }
+    }
+}
+
+impl fmt::Display for CatalogLifecycleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Connection catalog operation failed: {}",
+            self.safe_reason()
+        )
+    }
+}
+
+impl Error for CatalogLifecycleError {}
+
+pub(crate) struct CatalogMutationGuard {
+    lifecycle: Arc<CatalogLifecycleCoordinator>,
+    connection_id: ConnectionId,
+}
+
+impl Drop for CatalogMutationGuard {
+    fn drop(&mut self) {
+        catalog_active_guard(&self.lifecycle.active_connections).remove(&self.connection_id);
+    }
+}
+
+pub(crate) struct CatalogRefreshGuard {
+    _mutation: CatalogMutationGuard,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl fmt::Debug for ConnectionRuntimeSnapshot {
@@ -229,6 +280,10 @@ impl ConnectionControlPlane {
             omitted_legacy_projection_count,
         )));
         let mutation_lock = Arc::new(Mutex::new(()));
+        let catalog_lifecycle = Arc::new(CatalogLifecycleCoordinator {
+            active_connections: Mutex::new(BTreeSet::new()),
+            refresh_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_REFRESHES)),
+        });
         let local_secret_versions = Arc::new(ArcSwap::from_pointee(
             local_secret_provider
                 .as_ref()
@@ -259,6 +314,7 @@ impl ConnectionControlPlane {
             omitted_legacy_projection_count,
             runtime,
             mutation_lock,
+            catalog_lifecycle,
             secret_resolver,
             local_secret_versions,
             local_secret_manager,
@@ -304,6 +360,35 @@ impl ConnectionControlPlane {
 
     pub fn runtime_snapshot(&self) -> Arc<ConnectionRuntimeSnapshot> {
         self.runtime.load_full()
+    }
+
+    pub(crate) fn begin_catalog_mutation(
+        &self,
+        connection_id: &ConnectionId,
+    ) -> Result<CatalogMutationGuard, CatalogLifecycleError> {
+        let inserted = catalog_active_guard(&self.catalog_lifecycle.active_connections)
+            .insert(connection_id.clone());
+        if !inserted {
+            return Err(CatalogLifecycleError::Busy);
+        }
+        Ok(CatalogMutationGuard {
+            lifecycle: Arc::clone(&self.catalog_lifecycle),
+            connection_id: connection_id.clone(),
+        })
+    }
+
+    pub(crate) fn begin_catalog_refresh(
+        &self,
+        connection_id: &ConnectionId,
+    ) -> Result<CatalogRefreshGuard, CatalogLifecycleError> {
+        let mutation = self.begin_catalog_mutation(connection_id)?;
+        let permit = Arc::clone(&self.catalog_lifecycle.refresh_permits)
+            .try_acquire_owned()
+            .map_err(|_| CatalogLifecycleError::Busy)?;
+        Ok(CatalogRefreshGuard {
+            _mutation: mutation,
+            _permit: permit,
+        })
     }
 
     pub fn replace_runtime_dependencies(
@@ -421,6 +506,20 @@ impl ConnectionControlPlane {
                 );
                 poisoned.into_inner()
             }
+        }
+    }
+}
+
+fn catalog_active_guard(
+    active_connections: &Mutex<BTreeSet<ConnectionId>>,
+) -> MutexGuard<'_, BTreeSet<ConnectionId>> {
+    match active_connections.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!(
+                "Connection catalog lifecycle lock poisoned; recovering bounded fail-closed state"
+            );
+            poisoned.into_inner()
         }
     }
 }
@@ -1068,6 +1167,111 @@ mod tests {
                 let _ = fs::remove_dir_all(&self.root);
             }
         }
+    }
+
+    fn catalog_connection_id(suffix: usize) -> ConnectionId {
+        ConnectionId::parse(format!("{suffix:08}-1111-4111-8111-111111111111"))
+            .expect("test catalog Connection ID should validate")
+    }
+
+    #[test]
+    fn catalog_lifecycle_is_shared_by_control_plane_clones_and_recovers_after_panic() {
+        let control_plane =
+            ConnectionControlPlane::from_config(&config()).expect("control plane should build");
+        let clone = control_plane.clone();
+        let connection_id = catalog_connection_id(1);
+        let mutation = control_plane
+            .begin_catalog_mutation(&connection_id)
+            .expect("first catalog mutation should acquire");
+        assert_eq!(
+            clone.begin_catalog_mutation(&connection_id).err(),
+            Some(CatalogLifecycleError::Busy),
+            "a clone must observe the same active Connection set"
+        );
+        drop(mutation);
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let clone = clone.clone();
+            let connection_id = connection_id.clone();
+            move || {
+                let _guard = clone
+                    .begin_catalog_mutation(&connection_id)
+                    .expect("catalog mutation should acquire before panic");
+                panic!("exercise catalog lifecycle RAII");
+            }
+        }));
+        assert!(panic_result.is_err());
+        let recovered = control_plane
+            .begin_catalog_mutation(&connection_id)
+            .expect("panic unwinding must release the active Connection ID");
+        drop(recovered);
+    }
+
+    #[test]
+    fn catalog_lifecycle_rejects_same_connection_refresh_and_mutation() {
+        let control_plane =
+            ConnectionControlPlane::from_config(&config()).expect("control plane should build");
+        let connection_id = catalog_connection_id(1);
+        let refresh = control_plane
+            .begin_catalog_refresh(&connection_id)
+            .expect("first catalog refresh should acquire");
+        assert_eq!(
+            control_plane.begin_catalog_refresh(&connection_id).err(),
+            Some(CatalogLifecycleError::Busy)
+        );
+        assert_eq!(
+            control_plane.begin_catalog_mutation(&connection_id).err(),
+            Some(CatalogLifecycleError::Busy)
+        );
+        drop(refresh);
+
+        let mutation = control_plane
+            .begin_catalog_mutation(&connection_id)
+            .expect("catalog mutation should acquire after refresh completion");
+        assert_eq!(
+            control_plane.begin_catalog_refresh(&connection_id).err(),
+            Some(CatalogLifecycleError::Busy)
+        );
+        drop(mutation);
+    }
+
+    #[test]
+    fn catalog_refreshes_share_four_permit_bound_and_release_permits() {
+        let control_plane =
+            ConnectionControlPlane::from_config(&config()).expect("control plane should build");
+        let mut refreshes = (1..=MAX_CONCURRENT_REFRESHES)
+            .map(|suffix| {
+                control_plane
+                    .begin_catalog_refresh(&catalog_connection_id(suffix))
+                    .expect("each of the four distinct refreshes should acquire")
+            })
+            .collect::<Vec<_>>();
+        let overflow_id = catalog_connection_id(MAX_CONCURRENT_REFRESHES + 1);
+        assert_eq!(
+            control_plane.begin_catalog_refresh(&overflow_id).err(),
+            Some(CatalogLifecycleError::Busy),
+            "the fifth global catalog refresh must fail safely"
+        );
+
+        refreshes.pop();
+        let replacement = control_plane
+            .begin_catalog_refresh(&overflow_id)
+            .expect("dropping a refresh guard must release its global permit");
+        drop(replacement);
+        drop(refreshes);
+    }
+
+    #[test]
+    fn catalog_mutations_for_different_connections_can_proceed() {
+        let control_plane =
+            ConnectionControlPlane::from_config(&config()).expect("control plane should build");
+        let first = control_plane
+            .begin_catalog_mutation(&catalog_connection_id(1))
+            .expect("first Connection mutation should acquire");
+        let second = control_plane
+            .begin_catalog_mutation(&catalog_connection_id(2))
+            .expect("different Connection mutation should proceed independently");
+        drop((first, second));
     }
 
     #[test]

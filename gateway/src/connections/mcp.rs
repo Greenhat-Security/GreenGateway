@@ -1,14 +1,13 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fmt,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
 use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::tools::{
     definitions::{
@@ -19,9 +18,9 @@ use crate::tools::{
 };
 
 use super::{
-    control_plane::ConnectionControlPlane,
+    control_plane::{CatalogMutationGuard, CatalogRefreshGuard, ConnectionControlPlane},
     http::ConnectionHttpRuntime,
-    model::{ConnectionId, ConnectionKind, DiscoveryConfig, MAX_CONCURRENT_REFRESHES},
+    model::{ConnectionId, ConnectionKind, DiscoveryConfig},
     status::{ConnectionOperationalState, ConnectionStatusReason, SafeConnectionStatus},
     store::{
         ConnectionEtag, ConnectionStatusUpdate, ConnectionStoreError, StoredConnection,
@@ -48,8 +47,6 @@ pub struct McpConnectionCatalogService {
     http: ConnectionHttpRuntime,
     registry: ToolRegistry,
     runtime: McpConnectionCatalogRuntime,
-    permits: Arc<Semaphore>,
-    active_connections: Arc<Mutex<BTreeSet<ConnectionId>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -231,8 +228,6 @@ impl McpConnectionCatalogService {
             http,
             registry,
             runtime,
-            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_REFRESHES)),
-            active_connections: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
@@ -243,11 +238,19 @@ impl McpConnectionCatalogService {
     pub(crate) fn begin_connection_mutation(
         &self,
         connection_id: &ConnectionId,
-    ) -> Result<McpConnectionLifecycleGuard, McpCatalogRefreshError> {
-        McpConnectionLifecycleGuard::acquire(
-            Arc::clone(&self.active_connections),
-            connection_id.clone(),
-        )
+    ) -> Result<CatalogMutationGuard, McpCatalogRefreshError> {
+        self.control_plane
+            .begin_catalog_mutation(connection_id)
+            .map_err(|_| McpCatalogRefreshError::RefreshInProgress)
+    }
+
+    fn begin_connection_refresh(
+        &self,
+        connection_id: &ConnectionId,
+    ) -> Result<CatalogRefreshGuard, McpCatalogRefreshError> {
+        self.control_plane
+            .begin_catalog_refresh(connection_id)
+            .map_err(|_| McpCatalogRefreshError::RefreshInProgress)
     }
 
     pub fn reconcile_connection(&self, record: &StoredConnection) {
@@ -310,14 +313,7 @@ impl McpConnectionCatalogService {
             });
         }
 
-        let permit = Arc::clone(&self.permits)
-            .try_acquire_owned()
-            .map_err(|_| McpCatalogRefreshError::RefreshInProgress)?;
-        let active = ActiveRefreshGuard::acquire(
-            Arc::clone(&self.active_connections),
-            connection_id.clone(),
-            permit,
-        )?;
+        let active = self.begin_connection_refresh(&connection_id)?;
         let started = Instant::now();
         let store = self
             .control_plane
@@ -490,64 +486,6 @@ impl McpConnectionCatalogService {
     }
 }
 
-pub(crate) struct McpConnectionLifecycleGuard {
-    active_connections: Arc<Mutex<BTreeSet<ConnectionId>>>,
-    connection_id: ConnectionId,
-}
-
-impl McpConnectionLifecycleGuard {
-    fn acquire(
-        active_connections: Arc<Mutex<BTreeSet<ConnectionId>>>,
-        connection_id: ConnectionId,
-    ) -> Result<Self, McpCatalogRefreshError> {
-        let inserted = active_guard(&active_connections).insert(connection_id.clone());
-        if !inserted {
-            return Err(McpCatalogRefreshError::RefreshInProgress);
-        }
-        Ok(Self {
-            active_connections,
-            connection_id,
-        })
-    }
-}
-
-impl Drop for McpConnectionLifecycleGuard {
-    fn drop(&mut self) {
-        active_guard(&self.active_connections).remove(&self.connection_id);
-    }
-}
-
-struct ActiveRefreshGuard {
-    _lifecycle: McpConnectionLifecycleGuard,
-    _permit: OwnedSemaphorePermit,
-}
-
-impl ActiveRefreshGuard {
-    fn acquire(
-        active_connections: Arc<Mutex<BTreeSet<ConnectionId>>>,
-        connection_id: ConnectionId,
-        permit: OwnedSemaphorePermit,
-    ) -> Result<Self, McpCatalogRefreshError> {
-        let lifecycle = McpConnectionLifecycleGuard::acquire(active_connections, connection_id)?;
-        Ok(Self {
-            _lifecycle: lifecycle,
-            _permit: permit,
-        })
-    }
-}
-
-fn active_guard(
-    active_connections: &Mutex<BTreeSet<ConnectionId>>,
-) -> MutexGuard<'_, BTreeSet<ConnectionId>> {
-    match active_connections.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            tracing::error!("MCP refresh coordination lock poisoned; recovering bounded state");
-            poisoned.into_inner()
-        }
-    }
-}
-
 fn supports_managed_mcp_catalog(record: &StoredConnection) -> bool {
     record.write.kind == ConnectionKind::McpStreamableHttp
         && matches!(
@@ -707,7 +645,7 @@ mod tests {
     use super::*;
     use crate::{
         config::Config,
-        connections::model::ConnectionWrite,
+        connections::model::{ConnectionWrite, MAX_CONCURRENT_REFRESHES},
         egress::{EgressClient, EgressConfig},
     };
 
@@ -928,30 +866,34 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_coordination_rejects_same_connection_and_global_overflow() {
-        let active_connections = Arc::new(Mutex::new(BTreeSet::new()));
-        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_REFRESHES));
+        let config = Config::test_defaults();
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let egress_client = Arc::new(
+            EgressClient::new(EgressConfig::from_config(&config))
+                .expect("test egress client should build"),
+        );
+        let service = McpConnectionCatalogService::load(
+            control_plane.clone(),
+            ConnectionHttpRuntime::new(
+                control_plane,
+                EgressConfig::from_config(&config),
+                egress_client,
+            ),
+            ToolRegistry::disabled(),
+        )
+        .expect("managed MCP catalog service should load");
         let first_id = ConnectionId::parse("11111111-1111-4111-8111-111111111111".to_owned())
             .expect("test Connection ID should validate");
-        let first = ActiveRefreshGuard::acquire(
-            Arc::clone(&active_connections),
-            first_id.clone(),
-            Arc::clone(&permits)
-                .try_acquire_owned()
-                .expect("first permit should be available"),
-        )
-        .expect("first refresh should acquire");
+        let first = service
+            .begin_connection_refresh(&first_id)
+            .expect("first refresh should acquire");
         assert!(matches!(
-            ActiveRefreshGuard::acquire(
-                Arc::clone(&active_connections),
-                first_id.clone(),
-                Arc::clone(&permits)
-                    .try_acquire_owned()
-                    .expect("duplicate attempt can reserve before ID coordination"),
-            ),
+            service.begin_connection_refresh(&first_id),
             Err(McpCatalogRefreshError::RefreshInProgress)
         ));
         assert!(matches!(
-            McpConnectionLifecycleGuard::acquire(Arc::clone(&active_connections), first_id.clone(),),
+            service.begin_connection_mutation(&first_id),
             Err(McpCatalogRefreshError::RefreshInProgress)
         ));
 
@@ -960,29 +902,22 @@ mod tests {
             let id = ConnectionId::parse(format!("{suffix:08}-1111-4111-8111-111111111111"))
                 .expect("test Connection ID should validate");
             guards.push(
-                ActiveRefreshGuard::acquire(
-                    Arc::clone(&active_connections),
-                    id,
-                    Arc::clone(&permits)
-                        .try_acquire_owned()
-                        .expect("bounded permit should be available"),
-                )
-                .expect("distinct refresh should acquire"),
+                service
+                    .begin_connection_refresh(&id)
+                    .expect("distinct refresh should acquire"),
             );
         }
-        assert!(
-            Arc::clone(&permits).try_acquire_owned().is_err(),
-            "the fifth concurrent refresh must be rejected"
+        let overflow_id = ConnectionId::parse("00000005-1111-4111-8111-111111111111".to_owned())
+            .expect("overflow test Connection ID should validate");
+        assert_eq!(
+            service.begin_connection_refresh(&overflow_id).err(),
+            Some(McpCatalogRefreshError::RefreshInProgress),
+            "the fifth concurrent MCP refresh must preserve the safe error mapping"
         );
         drop(guards);
-        assert_eq!(
-            permits.available_permits(),
-            MAX_CONCURRENT_REFRESHES,
-            "dropping refresh guards must release every permit"
-        );
-        let mutation =
-            McpConnectionLifecycleGuard::acquire(Arc::clone(&active_connections), first_id)
-                .expect("same-Connection mutation should acquire after refresh completion");
+        let mutation = service
+            .begin_connection_mutation(&first_id)
+            .expect("same-Connection mutation should acquire after refresh completion");
         drop(mutation);
     }
 

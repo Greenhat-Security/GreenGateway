@@ -3,9 +3,9 @@
 //! The control-plane store, legacy projections, and permission-separated
 //! metadata CRUD are active. Static and OAuth client-credentials HTTP
 //! authentication are available through explicitly connection-bound proxy
-//! routes, manual tools, and refreshed streamable-HTTP MCP catalogs; the
-//! remaining protocol migrations stay isolated to their named issue #240
-//! slices.
+//! routes, manual tools, refreshed streamable-HTTP MCP catalogs, and
+//! revision-bound managed OpenAPI catalogs; the remaining protocol migrations
+//! stay isolated to their named issue #240 slices.
 
 #![allow(dead_code)]
 
@@ -16,6 +16,7 @@ pub mod local_secret;
 pub mod mcp;
 pub mod model;
 pub mod oauth;
+pub mod openapi;
 pub mod permissions;
 pub mod projection;
 pub mod secret;

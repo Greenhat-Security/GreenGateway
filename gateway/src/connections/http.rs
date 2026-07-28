@@ -191,6 +191,35 @@ impl ConnectionHttpRuntime {
         })
     }
 
+    pub fn openapi_discovery_target(
+        &self,
+        connection_id: &str,
+    ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
+        let connection_id = ConnectionId::parse(connection_id.to_owned())
+            .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
+        let snapshot = self.control_plane.runtime_snapshot();
+        let record = snapshot
+            .managed()
+            .get(&connection_id)
+            .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        let (path, use_connection_authentication) = validate_openapi_connection(record)?;
+        let url = connection_target_url(record, path)?;
+        let client = self.client_for(record)?;
+        let authentication = if use_connection_authentication {
+            self.authentication_binding(record)?
+        } else {
+            HttpAuthenticationBinding::None
+        };
+
+        Ok(ConnectionHttpTarget {
+            connection_id,
+            connection_etag: record.etag().to_string(),
+            url,
+            client,
+            authentication,
+        })
+    }
+
     pub fn validate_binding(&self, connection_id: &str) -> Result<(), ConnectionHttpError> {
         self.target(connection_id, "/").map(|_| ())
     }
@@ -586,6 +615,22 @@ fn validate_mcp_connection(record: &StoredConnection) -> Result<bool, Connection
             client_secret_id: None,
             ..
         } => Err(ConnectionHttpError::UnsupportedAuthentication),
+    }
+}
+
+fn validate_openapi_connection(
+    record: &StoredConnection,
+) -> Result<(&str, bool), ConnectionHttpError> {
+    validate_http_connection(record)?;
+    match &record.write.discovery {
+        Some(DiscoveryConfig::ManagedOpenapi {
+            path: Some(path),
+            use_connection_authentication,
+        }) => Ok((path.as_str(), *use_connection_authentication)),
+        Some(DiscoveryConfig::ManagedOpenapi { path: None, .. }) | None => {
+            Err(ConnectionHttpError::InvalidTargetPath)
+        }
+        Some(DiscoveryConfig::ManagedMcp { .. }) => Err(ConnectionHttpError::WrongConnectionKind),
     }
 }
 

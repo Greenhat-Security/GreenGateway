@@ -87,6 +87,8 @@ pub enum ToolSource {
         connection_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         operation_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        catalog_revision: Option<u64>,
     },
     Mcp {
         connection_id: String,
@@ -242,6 +244,9 @@ pub enum McpCatalogPublishError<E> {
     Persist(E),
 }
 
+pub type OpenApiCatalogPublishError<E> = McpCatalogPublishError<E>;
+pub type LocalDefinitionsPublishError<E> = McpCatalogPublishError<E>;
+
 impl ToolRegistryError {
     fn invalid(problems: Vec<String>) -> Self {
         Self::Invalid { problems }
@@ -312,6 +317,7 @@ impl fmt::Debug for ToolRegistry {
 struct ToolRegistryState {
     tools: BTreeMap<String, Arc<ToolDefinition>>,
     local_definitions: Vec<ToolDefinition>,
+    managed_openapi_definitions: Vec<ToolDefinition>,
     mcp_proxy_definitions: Vec<ToolDefinition>,
 }
 
@@ -403,15 +409,21 @@ impl ToolRegistry {
 
         let state = self.state.load();
         let mut local_definitions = state.local_definitions.clone();
+        let mut managed_openapi_definitions = state.managed_openapi_definitions.clone();
         let mut mcp_proxy_definitions = state.mcp_proxy_definitions.clone();
         drop(state);
 
-        let (new_local_definitions, new_mcp_proxy_definitions) =
+        let (new_local_definitions, new_managed_openapi_definitions, new_mcp_proxy_definitions) =
             split_definitions_by_source(definitions);
         local_definitions.extend(new_local_definitions);
+        managed_openapi_definitions.extend(new_managed_openapi_definitions);
         mcp_proxy_definitions.extend(new_mcp_proxy_definitions);
 
-        let merged = combined_definitions(&local_definitions, &mcp_proxy_definitions);
+        let merged = combined_definitions(
+            &local_definitions,
+            &managed_openapi_definitions,
+            &mcp_proxy_definitions,
+        );
         let semantic_problems = tool_definition_problems(&merged);
         if !semantic_problems.is_empty() {
             return Err(ToolRegistryError::invalid(semantic_problems));
@@ -421,6 +433,7 @@ impl ToolRegistry {
         self.state
             .store(Arc::new(ToolRegistryState::from_definition_sources(
                 local_definitions,
+                managed_openapi_definitions,
                 mcp_proxy_definitions,
             )));
         Ok(())
@@ -461,6 +474,7 @@ impl ToolRegistry {
         };
         let state = self.state.load();
         let local_definitions = state.local_definitions.clone();
+        let managed_openapi_definitions = state.managed_openapi_definitions.clone();
         let mut mcp_proxy_definitions = state
             .mcp_proxy_definitions
             .iter()
@@ -478,7 +492,11 @@ impl ToolRegistry {
         drop(state);
         mcp_proxy_definitions.extend(definitions);
 
-        let merged = combined_definitions(&local_definitions, &mcp_proxy_definitions);
+        let merged = combined_definitions(
+            &local_definitions,
+            &managed_openapi_definitions,
+            &mcp_proxy_definitions,
+        );
         let semantic_problems = tool_definition_problems(&merged);
         if !semantic_problems.is_empty() {
             return Err(McpCatalogPublishError::Registry(
@@ -491,6 +509,127 @@ impl ToolRegistry {
         self.state
             .store(Arc::new(ToolRegistryState::from_definition_sources(
                 local_definitions,
+                managed_openapi_definitions,
+                mcp_proxy_definitions,
+            )));
+        Ok(())
+    }
+
+    pub fn replace_openapi_connection_catalog<E>(
+        &self,
+        connection_id: &str,
+        definitions: Vec<ToolDefinition>,
+        persist: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), OpenApiCatalogPublishError<E>> {
+        if definitions.iter().any(|definition| {
+            !matches!(
+                &definition.source,
+                ToolSource::OpenApi {
+                    connection_id: source_connection_id,
+                    catalog_revision: Some(_),
+                    ..
+                } if source_connection_id == connection_id
+            ) || !matches!(
+                &definition.target,
+                Some(ToolTarget::Http {
+                    connection_id: target_connection_id,
+                    ..
+                }) if target_connection_id == connection_id
+            )
+        }) {
+            return Err(McpCatalogPublishError::Registry(
+                ToolRegistryError::invalid(vec![
+                    "managed OpenAPI catalog contains a definition for a different connection or without a catalog revision".to_owned(),
+                ]),
+            ));
+        }
+
+        let _guard = match self.write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let state = self.state.load();
+        let local_definitions = state.local_definitions.clone();
+        let mut managed_openapi_definitions = state
+            .managed_openapi_definitions
+            .iter()
+            .filter(|definition| {
+                !matches!(
+                    &definition.source,
+                    ToolSource::OpenApi {
+                        connection_id: source_connection_id,
+                        ..
+                    } if source_connection_id == connection_id
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mcp_proxy_definitions = state.mcp_proxy_definitions.clone();
+        drop(state);
+        managed_openapi_definitions.extend(definitions);
+
+        let merged = combined_definitions(
+            &local_definitions,
+            &managed_openapi_definitions,
+            &mcp_proxy_definitions,
+        );
+        let semantic_problems = tool_definition_problems(&merged);
+        if !semantic_problems.is_empty() {
+            return Err(McpCatalogPublishError::Registry(
+                ToolRegistryError::invalid(semantic_problems),
+            ));
+        }
+        self.validate_definitions(&merged)
+            .map_err(McpCatalogPublishError::Registry)?;
+        persist().map_err(McpCatalogPublishError::Persist)?;
+        self.state
+            .store(Arc::new(ToolRegistryState::from_definition_sources(
+                local_definitions,
+                managed_openapi_definitions,
+                mcp_proxy_definitions,
+            )));
+        Ok(())
+    }
+
+    pub fn replace_local_definitions_with_persist<E>(
+        &self,
+        local_definitions: Vec<ToolDefinition>,
+        persist: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), LocalDefinitionsPublishError<E>> {
+        let provenance_problems = local_definition_provenance_problems(&local_definitions);
+        if !provenance_problems.is_empty() {
+            return Err(McpCatalogPublishError::Registry(
+                ToolRegistryError::invalid(provenance_problems),
+            ));
+        }
+
+        let _guard = match self.write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let state = self.state.load();
+        let managed_openapi_definitions = state.managed_openapi_definitions.clone();
+        let mcp_proxy_definitions = state.mcp_proxy_definitions.clone();
+        drop(state);
+
+        let merged = combined_definitions(
+            &local_definitions,
+            &managed_openapi_definitions,
+            &mcp_proxy_definitions,
+        );
+        let semantic_problems = tool_definition_problems(&merged);
+        if !semantic_problems.is_empty() {
+            return Err(McpCatalogPublishError::Registry(
+                ToolRegistryError::invalid(semantic_problems),
+            ));
+        }
+        self.validate_definitions(&merged)
+            .map_err(McpCatalogPublishError::Registry)?;
+        persist().map_err(McpCatalogPublishError::Persist)?;
+        self.state
+            .store(Arc::new(ToolRegistryState::from_definition_sources(
+                local_definitions,
+                managed_openapi_definitions,
                 mcp_proxy_definitions,
             )));
         Ok(())
@@ -519,8 +658,11 @@ impl ToolRegistry {
             Err(poisoned) => poisoned.into_inner(),
         };
         let state = self.state.load();
-        let definitions =
-            combined_definitions(&state.local_definitions, &state.mcp_proxy_definitions);
+        let definitions = combined_definitions(
+            &state.local_definitions,
+            &state.managed_openapi_definitions,
+            &state.mcp_proxy_definitions,
+        );
         drop(state);
         validator(&definitions).map_err(ToolRegistryError::invalid)?;
         match self.definition_validator.lock() {
@@ -540,10 +682,15 @@ impl ToolRegistry {
         };
 
         let state = self.state.load();
+        let managed_openapi_definitions = state.managed_openapi_definitions.clone();
         let mcp_proxy_definitions = state.mcp_proxy_definitions.clone();
         drop(state);
 
-        self.replace_definition_sources_locked(local_definitions, mcp_proxy_definitions)
+        self.replace_definition_sources_locked(
+            local_definitions,
+            managed_openapi_definitions,
+            mcp_proxy_definitions,
+        )
     }
 
     fn replace_local_and_legacy_mcp_definitions(
@@ -556,6 +703,7 @@ impl ToolRegistry {
             Err(poisoned) => poisoned.into_inner(),
         };
         let state = self.state.load();
+        let managed_openapi_definitions = state.managed_openapi_definitions.clone();
         let managed_mcp_proxy_definitions = state
             .mcp_proxy_definitions
             .iter()
@@ -565,15 +713,28 @@ impl ToolRegistry {
         drop(state);
         let mut mcp_proxy_definitions = legacy_mcp_proxy_definitions;
         mcp_proxy_definitions.extend(managed_mcp_proxy_definitions);
-        self.replace_definition_sources_locked(local_definitions, mcp_proxy_definitions)
+        self.replace_definition_sources_locked(
+            local_definitions,
+            managed_openapi_definitions,
+            mcp_proxy_definitions,
+        )
     }
 
     fn replace_definition_sources_locked(
         &self,
         local_definitions: Vec<ToolDefinition>,
+        managed_openapi_definitions: Vec<ToolDefinition>,
         mcp_proxy_definitions: Vec<ToolDefinition>,
     ) -> Result<(), ToolRegistryError> {
-        let merged = combined_definitions(&local_definitions, &mcp_proxy_definitions);
+        let provenance_problems = local_definition_provenance_problems(&local_definitions);
+        if !provenance_problems.is_empty() {
+            return Err(ToolRegistryError::invalid(provenance_problems));
+        }
+        let merged = combined_definitions(
+            &local_definitions,
+            &managed_openapi_definitions,
+            &mcp_proxy_definitions,
+        );
         let semantic_problems = tool_definition_problems(&merged);
         if !semantic_problems.is_empty() {
             return Err(ToolRegistryError::invalid(semantic_problems));
@@ -583,6 +744,7 @@ impl ToolRegistry {
         self.state
             .store(Arc::new(ToolRegistryState::from_definition_sources(
                 local_definitions,
+                managed_openapi_definitions,
                 mcp_proxy_definitions,
             )));
         Ok(())
@@ -625,16 +787,23 @@ impl ToolRegistry {
 
 impl ToolRegistryState {
     fn from_definitions(definitions: Vec<ToolDefinition>) -> Self {
-        let (local_definitions, mcp_proxy_definitions) = split_definitions_by_source(definitions);
-        Self::from_definition_sources(local_definitions, mcp_proxy_definitions)
+        let (local_definitions, managed_openapi_definitions, mcp_proxy_definitions) =
+            split_definitions_by_source(definitions);
+        Self::from_definition_sources(
+            local_definitions,
+            managed_openapi_definitions,
+            mcp_proxy_definitions,
+        )
     }
 
     fn from_definition_sources(
         local_definitions: Vec<ToolDefinition>,
+        managed_openapi_definitions: Vec<ToolDefinition>,
         mcp_proxy_definitions: Vec<ToolDefinition>,
     ) -> Self {
         let tools = local_definitions
             .iter()
+            .chain(managed_openapi_definitions.iter())
             .chain(mcp_proxy_definitions.iter())
             .map(|definition| (definition.name.clone(), Arc::new(definition.clone())))
             .collect();
@@ -642,6 +811,7 @@ impl ToolRegistryState {
         Self {
             tools,
             local_definitions,
+            managed_openapi_definitions,
             mcp_proxy_definitions,
         }
     }
@@ -649,29 +819,58 @@ impl ToolRegistryState {
 
 fn split_definitions_by_source(
     definitions: Vec<ToolDefinition>,
-) -> (Vec<ToolDefinition>, Vec<ToolDefinition>) {
+) -> (
+    Vec<ToolDefinition>,
+    Vec<ToolDefinition>,
+    Vec<ToolDefinition>,
+) {
     let mut local_definitions = Vec::new();
+    let mut managed_openapi_definitions = Vec::new();
     let mut mcp_proxy_definitions = Vec::new();
 
     for definition in definitions {
-        if definition.upstream.is_mcp_proxy() {
+        if matches!(&definition.source, ToolSource::OpenApi { .. }) {
+            managed_openapi_definitions.push(definition);
+        } else if definition.upstream.is_mcp_proxy() {
             mcp_proxy_definitions.push(definition);
         } else {
             local_definitions.push(definition);
         }
     }
 
-    (local_definitions, mcp_proxy_definitions)
+    (
+        local_definitions,
+        managed_openapi_definitions,
+        mcp_proxy_definitions,
+    )
 }
 
 fn combined_definitions(
     local_definitions: &[ToolDefinition],
+    managed_openapi_definitions: &[ToolDefinition],
     mcp_proxy_definitions: &[ToolDefinition],
 ) -> Vec<ToolDefinition> {
     local_definitions
         .iter()
+        .chain(managed_openapi_definitions.iter())
         .chain(mcp_proxy_definitions.iter())
         .cloned()
+        .collect()
+}
+
+fn local_definition_provenance_problems(definitions: &[ToolDefinition]) -> Vec<String> {
+    definitions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, definition)| match &definition.source {
+            ToolSource::OpenApi { .. } => Some(format!(
+                "tools[{index}].source must not claim managed OpenAPI provenance in local definitions"
+            )),
+            ToolSource::Mcp { .. } => Some(format!(
+                "tools[{index}].source must not claim managed MCP provenance in local definitions"
+            )),
+            ToolSource::Manual | ToolSource::Legacy => None,
+        })
         .collect()
 }
 
@@ -1026,6 +1225,10 @@ fn definitions_from_json_value(
     if !semantic_problems.is_empty() {
         return Err(ToolRegistryError::invalid(semantic_problems));
     }
+    let provenance_problems = local_definition_provenance_problems(&tools_file.tools);
+    if !provenance_problems.is_empty() {
+        return Err(ToolRegistryError::invalid(provenance_problems));
+    }
 
     Ok(tools_file.tools)
 }
@@ -1182,8 +1385,20 @@ fn typed_tool_metadata_problems(index: usize, definition: &ToolDefinition) -> Ve
         ToolSource::OpenApi {
             connection_id,
             operation_id,
+            ..
         } => {
             validate_connection_id("source.connection_id", connection_id, &mut problems);
+            if !matches!(
+                &definition.target,
+                Some(ToolTarget::Http {
+                    connection_id: target_connection_id,
+                    ..
+                }) if target_connection_id == connection_id
+            ) {
+                problems.push(format!(
+                    "tools[{index}].source OpenAPI connection must equal an HTTP target connection"
+                ));
+            }
             if operation_id.as_ref().is_some_and(|operation_id| {
                 operation_id.is_empty() || operation_id.chars().count() > MAX_OPERATION_ID_CHARS
             }) {
@@ -1198,6 +1413,18 @@ fn typed_tool_metadata_problems(index: usize, definition: &ToolDefinition) -> Ve
         } => {
             validate_connection_id("source.connection_id", connection_id, &mut problems);
             validate_remote_name("source.remote_tool_name", remote_tool_name, &mut problems);
+            if !matches!(
+                &definition.target,
+                Some(ToolTarget::Mcp {
+                    connection_id: target_connection_id,
+                    remote_tool_name: target_remote_tool_name,
+                }) if target_connection_id == connection_id
+                    && target_remote_tool_name == remote_tool_name
+            ) {
+                problems.push(format!(
+                    "tools[{index}].source MCP metadata must equal the MCP target metadata"
+                ));
+            }
         }
     }
 
@@ -1522,7 +1749,11 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Barrier,
+        },
+        thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -2168,6 +2399,17 @@ mod tests {
         assert!(registry.get(&format!("{connection_id}:beta")).is_none());
 
         registry
+            .replace_openapi_connection_catalog(
+                "billing-api",
+                vec![openapi_connection_tool(
+                    "billing-api",
+                    "billing_get",
+                    "/v1/billing",
+                )],
+                || Ok::<(), ()>(()),
+            )
+            .expect("managed OpenAPI catalog should publish");
+        registry
             .replace_local_and_legacy_mcp_definitions(
                 Vec::new(),
                 vec![mcp_proxy_tool(
@@ -2182,6 +2424,328 @@ mod tests {
             registry.get(&format!("{connection_id}:alpha")).is_some(),
             "legacy rediscovery must retain managed MCP catalogs"
         );
+        assert!(
+            registry.get("billing_get").is_some(),
+            "legacy MCP rediscovery must retain managed OpenAPI catalogs"
+        );
+    }
+
+    #[test]
+    fn managed_openapi_catalog_collision_rejects_before_persist() {
+        let connection_id = "billing-api";
+        let registry = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [echo_tool("shared_name", "POST", "/v1/echo")]
+        }))
+        .expect("local registry should load");
+        let persisted = Arc::new(AtomicBool::new(false));
+        let persisted_in_callback = Arc::clone(&persisted);
+
+        let result = registry.replace_openapi_connection_catalog(
+            connection_id,
+            vec![openapi_connection_tool(
+                connection_id,
+                "shared_name",
+                "/v1/shared",
+            )],
+            move || {
+                persisted_in_callback.store(true, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            },
+        );
+
+        assert!(matches!(result, Err(McpCatalogPublishError::Registry(_))));
+        assert!(
+            !persisted.load(Ordering::SeqCst),
+            "a colliding catalog must not reach persistence"
+        );
+        assert_eq!(
+            registry
+                .get("shared_name")
+                .expect("local tool must remain active")
+                .source,
+            ToolSource::Legacy
+        );
+    }
+
+    #[test]
+    fn managed_openapi_catalog_requires_matching_connection_and_revision() {
+        let registry = ToolRegistry::disabled();
+        let persisted = Arc::new(AtomicBool::new(false));
+
+        let mut missing_revision =
+            openapi_connection_tool("billing-api", "billing_get", "/v1/billing");
+        let ToolSource::OpenApi {
+            catalog_revision, ..
+        } = &mut missing_revision.source
+        else {
+            panic!("test helper must create an OpenAPI source");
+        };
+        *catalog_revision = None;
+        let persisted_in_callback = Arc::clone(&persisted);
+        let result = registry.replace_openapi_connection_catalog(
+            "billing-api",
+            vec![missing_revision],
+            move || {
+                persisted_in_callback.store(true, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            },
+        );
+        assert!(matches!(result, Err(McpCatalogPublishError::Registry(_))));
+
+        let wrong_connection =
+            openapi_connection_tool("inventory-api", "inventory_get", "/v1/inventory");
+        let persisted_in_callback = Arc::clone(&persisted);
+        let result = registry.replace_openapi_connection_catalog(
+            "billing-api",
+            vec![wrong_connection],
+            move || {
+                persisted_in_callback.store(true, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            },
+        );
+        assert!(matches!(result, Err(McpCatalogPublishError::Registry(_))));
+        assert!(
+            !persisted.load(Ordering::SeqCst),
+            "invalid managed provenance must reject before persistence"
+        );
+        assert!(registry.list().is_empty());
+    }
+
+    #[test]
+    fn managed_openapi_catalog_persist_failure_keeps_last_known_good_state() {
+        let connection_id = "billing-api";
+        let registry = ToolRegistry::disabled();
+        registry
+            .replace_openapi_connection_catalog(
+                connection_id,
+                vec![openapi_connection_tool(
+                    connection_id,
+                    "billing_old",
+                    "/v1/old",
+                )],
+                || Ok::<(), ()>(()),
+            )
+            .expect("initial managed OpenAPI catalog should publish");
+
+        let result = registry.replace_openapi_connection_catalog(
+            connection_id,
+            vec![openapi_connection_tool(
+                connection_id,
+                "billing_new",
+                "/v1/new",
+            )],
+            || Err::<(), _>("disk unavailable"),
+        );
+
+        assert!(matches!(result, Err(McpCatalogPublishError::Persist(_))));
+        assert!(registry.get("billing_old").is_some());
+        assert!(registry.get("billing_new").is_none());
+    }
+
+    #[test]
+    fn managed_openapi_catalog_replacement_prunes_only_same_connection() {
+        let registry = ToolRegistry::disabled();
+        registry
+            .replace_openapi_connection_catalog(
+                "billing-api",
+                vec![
+                    openapi_connection_tool("billing-api", "billing_old", "/v1/old"),
+                    openapi_connection_tool("billing-api", "billing_other", "/v1/other"),
+                ],
+                || Ok::<(), ()>(()),
+            )
+            .expect("billing catalog should publish");
+        registry
+            .replace_openapi_connection_catalog(
+                "inventory-api",
+                vec![openapi_connection_tool(
+                    "inventory-api",
+                    "inventory_get",
+                    "/v1/inventory",
+                )],
+                || Ok::<(), ()>(()),
+            )
+            .expect("inventory catalog should publish");
+
+        registry
+            .replace_openapi_connection_catalog(
+                "billing-api",
+                vec![openapi_connection_tool(
+                    "billing-api",
+                    "billing_new",
+                    "/v2/new",
+                )],
+                || Ok::<(), ()>(()),
+            )
+            .expect("billing replacement should publish");
+
+        assert!(registry.get("billing_old").is_none());
+        assert!(registry.get("billing_other").is_none());
+        assert!(registry.get("billing_new").is_some());
+        assert!(
+            registry.get("inventory_get").is_some(),
+            "replacing billing must preserve the inventory catalog"
+        );
+    }
+
+    #[test]
+    fn concurrent_openapi_catalog_replacements_for_different_connections_lose_nothing() {
+        const CONNECTION_COUNT: usize = 32;
+
+        let registry = Arc::new(ToolRegistry::disabled());
+        let barrier = Arc::new(Barrier::new(CONNECTION_COUNT));
+        let handles = (0..CONNECTION_COUNT)
+            .map(|index| {
+                let registry = Arc::clone(&registry);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let connection_id = format!("api-{index}");
+                    let tool_name = format!("api_{index}_get");
+                    barrier.wait();
+                    registry
+                        .replace_openapi_connection_catalog(
+                            &connection_id,
+                            vec![openapi_connection_tool(
+                                &connection_id,
+                                &tool_name,
+                                &format!("/v1/{index}"),
+                            )],
+                            || Ok::<(), ()>(()),
+                        )
+                        .expect("concurrent catalog should publish");
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().expect("catalog publisher should not panic");
+        }
+        for index in 0..CONNECTION_COUNT {
+            assert!(
+                registry.get(&format!("api_{index}_get")).is_some(),
+                "catalog for api-{index} was lost"
+            );
+        }
+        assert_eq!(registry.list().len(), CONNECTION_COUNT);
+    }
+
+    #[test]
+    fn file_reload_preserves_managed_openapi_catalog() {
+        let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
+        let registry = ToolRegistry::from_file(file.path()).expect("initial registry should load");
+        registry
+            .replace_openapi_connection_catalog(
+                "billing-api",
+                vec![openapi_connection_tool(
+                    "billing-api",
+                    "billing_get",
+                    "/v1/billing",
+                )],
+                || Ok::<(), ()>(()),
+            )
+            .expect("managed catalog should publish");
+        file.write(&tools_document(&[echo_tool(
+            "get_widget",
+            "GET",
+            "/v1/widgets/{widget_id}",
+        )]));
+
+        reload_tool_registry_from_file(&registry, file.path())
+            .expect("local tools-file reload should publish");
+
+        assert!(registry.get("echo").is_none());
+        assert!(registry.get("get_widget").is_some());
+        assert!(
+            registry.get("billing_get").is_some(),
+            "local reload must preserve managed OpenAPI tools"
+        );
+    }
+
+    #[test]
+    fn local_atomic_replace_validates_managed_collisions_before_persist() {
+        let registry = ToolRegistry::disabled();
+        registry
+            .replace_openapi_connection_catalog(
+                "billing-api",
+                vec![openapi_connection_tool(
+                    "billing-api",
+                    "reserved_name",
+                    "/v1/billing",
+                )],
+                || Ok::<(), ()>(()),
+            )
+            .expect("managed catalog should publish");
+        let persisted = Arc::new(AtomicBool::new(false));
+        let persisted_in_callback = Arc::clone(&persisted);
+
+        let result = registry.replace_local_definitions_with_persist(
+            vec![local_http_tool("reserved_name", "/v1/local")],
+            move || {
+                persisted_in_callback.store(true, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            },
+        );
+
+        assert!(matches!(result, Err(McpCatalogPublishError::Registry(_))));
+        assert!(
+            !persisted.load(Ordering::SeqCst),
+            "a local collision must reject before writing TOOLS_FILE"
+        );
+        assert!(matches!(
+            registry
+                .get("reserved_name")
+                .expect("managed tool must remain active")
+                .source,
+            ToolSource::OpenApi { .. }
+        ));
+    }
+
+    #[test]
+    fn local_atomic_replace_preserves_managed_lanes_and_rejects_spoofed_provenance() {
+        let registry = ToolRegistry::disabled();
+        registry
+            .replace_openapi_connection_catalog(
+                "billing-api",
+                vec![openapi_connection_tool(
+                    "billing-api",
+                    "billing_get",
+                    "/v1/billing",
+                )],
+                || Ok::<(), ()>(()),
+            )
+            .expect("managed OpenAPI catalog should publish");
+        registry
+            .replace_mcp_connection_catalog(
+                "11111111-1111-4111-8111-111111111111",
+                vec![ToolDefinition::mcp_connection(
+                    "11111111-1111-4111-8111-111111111111".to_owned(),
+                    "Managed MCP tool".to_owned(),
+                    json!({"type": "object", "properties": {}}),
+                    "alpha".to_owned(),
+                )],
+                || Ok::<(), ()>(()),
+            )
+            .expect("managed MCP catalog should publish");
+
+        registry
+            .replace_local_definitions_with_persist(
+                vec![local_http_tool("legacy_registered", "/v1/legacy")],
+                || Ok::<(), ()>(()),
+            )
+            .expect("legacy OpenAPI registration should publish local tools");
+        assert!(registry.get("legacy_registered").is_some());
+        assert!(registry.get("billing_get").is_some());
+        assert!(registry
+            .get("11111111-1111-4111-8111-111111111111:alpha")
+            .is_some());
+
+        let spoof = openapi_connection_tool("attacker-api", "spoofed", "/v1/spoofed");
+        let result =
+            registry.replace_local_definitions_with_persist(vec![spoof], || Ok::<(), ()>(()));
+        assert!(matches!(result, Err(McpCatalogPublishError::Registry(_))));
+        assert!(registry.get("spoofed").is_none());
+        assert!(registry.get("legacy_registered").is_some());
     }
 
     #[test]
@@ -2489,7 +3053,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_target_and_source_are_schema_valid_and_round_trip() {
+    fn tools_file_rejects_spoofed_managed_openapi_provenance() {
         let mapping = json!({
             "method": "POST",
             "path_template": "/v1/echo",
@@ -2524,23 +3088,14 @@ mod tests {
         });
 
         assert_schema_accepts(&tools_schema_validator(), &document);
-        let registry =
-            ToolRegistry::from_json_value(document).expect("typed metadata should parse");
-        let tool = registry.get("echo").expect("tool should be registered");
-        assert!(matches!(
-            tool.target,
-            Some(ToolTarget::Http {
-                ref connection_id,
-                ..
-            }) if connection_id == "billing-api"
-        ));
-        assert!(matches!(
-            tool.source,
-            ToolSource::OpenApi {
-                ref connection_id,
-                operation_id: Some(ref operation_id),
-            } if connection_id == "billing-api" && operation_id == "echoMessage"
-        ));
+        let error = ToolRegistry::from_json_value(document)
+            .expect_err("TOOLS_FILE must not claim managed OpenAPI provenance");
+        assert!(
+            error
+                .to_string()
+                .contains("must not claim managed OpenAPI provenance"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -2696,6 +3251,59 @@ mod tests {
         }
 
         tool
+    }
+
+    fn local_http_tool(name: &str, path_template: &str) -> ToolDefinition {
+        let mapping = HttpToolMapping {
+            method: "GET".to_owned(),
+            path_template: path_template.to_owned(),
+            query_params: Vec::new(),
+            body: None,
+        };
+        ToolDefinition {
+            name: name.to_owned(),
+            description: format!("Local tool {name}"),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            target: None,
+            source: ToolSource::Legacy,
+            upstream: mapping,
+        }
+    }
+
+    fn openapi_connection_tool(
+        connection_id: &str,
+        name: &str,
+        path_template: &str,
+    ) -> ToolDefinition {
+        let mapping = HttpToolMapping {
+            method: "GET".to_owned(),
+            path_template: path_template.to_owned(),
+            query_params: Vec::new(),
+            body: None,
+        };
+        ToolDefinition {
+            name: name.to_owned(),
+            description: format!("Managed OpenAPI tool {name}"),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            target: Some(ToolTarget::Http {
+                connection_id: connection_id.to_owned(),
+                mapping: mapping.clone(),
+            }),
+            source: ToolSource::OpenApi {
+                connection_id: connection_id.to_owned(),
+                operation_id: Some(name.to_owned()),
+                catalog_revision: Some(1),
+            },
+            upstream: mapping,
+        }
     }
 
     fn malformed_input_schema_tool(name: &str, method: &str, path_template: &str) -> Value {
