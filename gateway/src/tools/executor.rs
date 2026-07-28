@@ -24,10 +24,13 @@ use crate::{
     connections::{
         http::{ConnectionHttpError, ConnectionHttpRuntime, ConnectionHttpTarget},
         mcp::McpConnectionCatalogRuntime,
+        openapi::OpenApiConnectionCatalogRuntime,
     },
     egress::{EgressClient, EgressError, EgressRequestBody, EgressResponse},
     tools::{
-        definitions::{BodyMappingMode, McpProxyMapping, ToolDefinition, ToolRegistry, ToolTarget},
+        definitions::{
+            BodyMappingMode, McpProxyMapping, ToolDefinition, ToolRegistry, ToolSource, ToolTarget,
+        },
         mcp_upstream::{self, McpUpstreamRuntimeConfig},
         runtime::{ToolInvocationContext, ToolRuntime, ToolRuntimeError, ToolWorkErrorDisposition},
     },
@@ -87,8 +90,16 @@ struct ToolExecutorBackends {
     upstream_url: Option<String>,
     connection_http: Option<ConnectionHttpRuntime>,
     mcp_catalog_runtime: Option<McpConnectionCatalogRuntime>,
+    openapi_catalog_runtime: Option<OpenApiConnectionCatalogRuntime>,
     mcp_upstream_servers: HashMap<String, McpUpstreamServerConfig>,
     mcp_upstream_runtime_config: McpUpstreamRuntimeConfig,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ToolConnectionRuntimes {
+    pub(crate) http: Option<ConnectionHttpRuntime>,
+    pub(crate) mcp_catalog: Option<McpConnectionCatalogRuntime>,
+    pub(crate) openapi_catalog: Option<OpenApiConnectionCatalogRuntime>,
 }
 
 #[allow(dead_code)] // Issue #33 will call this from the MCP endpoint.
@@ -101,6 +112,7 @@ pub struct ToolExecutor {
     upstream_origin: Option<String>,
     connection_http: Option<ConnectionHttpRuntime>,
     mcp_catalog_runtime: Option<McpConnectionCatalogRuntime>,
+    openapi_catalog_runtime: Option<OpenApiConnectionCatalogRuntime>,
     mcp_upstream_servers: Arc<HashMap<String, McpUpstreamServerConfig>>,
     mcp_upstream_runtime_config: Arc<McpUpstreamRuntimeConfig>,
     validator_cache: Arc<Mutex<ValidatorCache>>,
@@ -331,8 +343,7 @@ impl ToolExecutor {
         registry: ToolRegistry,
         runtime: ToolRuntime,
         egress_client: Arc<EgressClient>,
-        connection_http: Option<ConnectionHttpRuntime>,
-        mcp_catalog_runtime: Option<McpConnectionCatalogRuntime>,
+        connection_runtimes: ToolConnectionRuntimes,
         audit: AuditLog,
     ) -> Result<Self, ToolExecutorError> {
         let upstream_url = if registry.has_legacy_http_tools() {
@@ -358,8 +369,9 @@ impl ToolExecutor {
             audit,
             ToolExecutorBackends {
                 upstream_url: upstream_url.map(str::to_owned),
-                connection_http,
-                mcp_catalog_runtime,
+                connection_http: connection_runtimes.http,
+                mcp_catalog_runtime: connection_runtimes.mcp_catalog,
+                openapi_catalog_runtime: connection_runtimes.openapi_catalog,
                 mcp_upstream_servers,
                 mcp_upstream_runtime_config: McpUpstreamRuntimeConfig::from_config(config),
             },
@@ -383,6 +395,7 @@ impl ToolExecutor {
                 upstream_url: Some(upstream_url.to_owned()),
                 connection_http: None,
                 mcp_catalog_runtime: None,
+                openapi_catalog_runtime: None,
                 mcp_upstream_servers: HashMap::new(),
                 mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
                     timeout: Duration::from_secs(30),
@@ -414,6 +427,7 @@ impl ToolExecutor {
                 .transpose()?,
             connection_http: backends.connection_http,
             mcp_catalog_runtime: backends.mcp_catalog_runtime,
+            openapi_catalog_runtime: backends.openapi_catalog_runtime,
             mcp_upstream_servers: Arc::new(backends.mcp_upstream_servers),
             mcp_upstream_runtime_config: Arc::new(backends.mcp_upstream_runtime_config),
             validator_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -574,6 +588,31 @@ impl ToolExecutor {
             return Err(error);
         }
 
+        if let ToolSource::OpenApi {
+            connection_id: source_connection_id,
+            ..
+        } = &tool.source
+        {
+            let binding_matches = matches!(
+                &tool.target,
+                Some(ToolTarget::Http { connection_id, .. })
+                    if connection_id == source_connection_id
+            );
+            if !binding_matches {
+                let error = ToolExecutorError::Connection {
+                    tool_name: tool.name.clone(),
+                    reason: "catalog_stale",
+                };
+                self.emit_executor_failure_observation(
+                    context,
+                    &tool,
+                    duration_millis(validation_started.elapsed()),
+                    &error,
+                );
+                return Err(error);
+            }
+        }
+
         if let Some(mapping) = tool.upstream.mcp_proxy_mapping() {
             return self.execute_mcp_proxy(context, &tool, mapping, args).await;
         }
@@ -603,9 +642,28 @@ impl ToolExecutor {
         }
         let started = Instant::now();
         let request_method = request.method.clone();
-        let (result, connection_id) = match &tool.target {
-            Some(ToolTarget::Http { .. })
-                if !matches!(tool.source, crate::tools::definitions::ToolSource::Manual) =>
+        let (result, connection_id) = match (&tool.target, &tool.source) {
+            (
+                Some(ToolTarget::Http { connection_id, .. }),
+                ToolSource::OpenApi {
+                    connection_id: source_connection_id,
+                    ..
+                },
+            ) if source_connection_id != connection_id => {
+                let error = ToolExecutorError::Connection {
+                    tool_name: tool.name.clone(),
+                    reason: "catalog_stale",
+                };
+                self.emit_executor_failure_observation(
+                    context,
+                    &tool,
+                    duration_millis(started.elapsed()),
+                    &error,
+                );
+                return Err(error);
+            }
+            (Some(ToolTarget::Http { .. }), source)
+                if !matches!(source, ToolSource::Manual | ToolSource::OpenApi { .. }) =>
             {
                 let error = ToolExecutorError::Connection {
                     tool_name: tool.name.clone(),
@@ -619,13 +677,13 @@ impl ToolExecutor {
                 );
                 return Err(error);
             }
-            Some(ToolTarget::Http { connection_id, .. }) => {
+            (Some(ToolTarget::Http { connection_id, .. }), _) => {
                 let result = self
                     .execute_connection_http(context, &tool, connection_id, request)
                     .await;
                 (result, Some(connection_id.as_str()))
             }
-            Some(ToolTarget::Mcp { .. }) => {
+            (Some(ToolTarget::Mcp { .. }), _) => {
                 let error = ToolExecutorError::Connection {
                     tool_name: tool.name.clone(),
                     reason: "target_kind_mismatch",
@@ -638,7 +696,7 @@ impl ToolExecutor {
                 );
                 return Err(error);
             }
-            None => {
+            (None, _) => {
                 let result = self
                     .egress_client
                     .request_with_headers(
@@ -721,6 +779,25 @@ impl ToolExecutor {
         let target = runtime
             .target(connection_id, &request.path_and_query)
             .map_err(|error| connection_tool_error(tool, error))?;
+        if matches!(tool.source, ToolSource::OpenApi { .. })
+            && !self
+                .openapi_catalog_runtime
+                .as_ref()
+                .is_some_and(|catalog| {
+                    catalog.definition_is_current(tool, target.connection_etag())
+                })
+        {
+            return Err(ToolExecutorError::Connection {
+                tool_name: tool.name.clone(),
+                reason: "catalog_stale",
+            });
+        }
+        if request.method == Method::TRACE && target.authentication_kind() != "none" {
+            return Err(ToolExecutorError::Connection {
+                tool_name: tool.name.clone(),
+                reason: "unsafe_trace_method",
+            });
+        }
         if let Some(header_name) = target.credential_header_name() {
             request.headers.remove(header_name);
         }
@@ -1126,7 +1203,10 @@ impl ToolExecutor {
             json!({
                 "connection_id": target.connection_id(),
                 "auth_type": target.authentication_kind(),
-                "consumer_kind": "manual_tool",
+                "consumer_kind": match tool.source {
+                    ToolSource::OpenApi { .. } => "openapi_tool",
+                    _ => "manual_tool",
+                },
                 "consumer_id": tool.name,
                 "outcome": "failure",
                 "reason": reason,
@@ -1882,6 +1962,7 @@ mod tests {
                 OAuthClientAuthMethod, TlsProfile,
             },
             secret::{OperatorSecretAliasConfig, OperatorSecretAliasSource, SecretRootConfig},
+            store::{StoredOpenApiCatalog, StoredOpenApiCatalogEntry},
         },
         discovery::{
             aggregator::{EndpointAggregatorSink, EndpointAggregatorSinkConfig},
@@ -2030,8 +2111,15 @@ mod tests {
             EgressClient::new(EgressConfig::default()).expect("egress client should build"),
         );
 
-        ToolExecutor::from_config(&config, registry, runtime, egress, None, None, audit)
-            .expect("a connection-only registry must not require UPSTREAM_URL");
+        ToolExecutor::from_config(
+            &config,
+            registry,
+            runtime,
+            egress,
+            ToolConnectionRuntimes::default(),
+            audit,
+        )
+        .expect("a connection-only registry must not require UPSTREAM_URL");
     }
 
     #[tokio::test]
@@ -2084,6 +2172,200 @@ mod tests {
         assert!(
             !format!("{events:?}").contains("operator-owned-key"),
             "audit events must never contain resolved credential material"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_openapi_tool_without_current_catalog_fails_before_upstream_io() {
+        let (addr, ca_pem, server) = one_request_tls_server().await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"must-not-be-read");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new(
+            runtime_config([("get_charge", enabled_tool(500, 1))], 2, 1, 100),
+            audit.clone(),
+        );
+        let mut definition = serde_json::from_value::<ToolDefinition>(connection_charge_tool(
+            &connection.connection_id,
+        ))
+        .expect("connection tool definition should deserialize");
+        definition.source = ToolSource::OpenApi {
+            connection_id: connection.connection_id.clone(),
+            operation_id: Some("getCharge".to_owned()),
+            catalog_revision: Some(1),
+        };
+        let registry = ToolRegistry::disabled();
+        registry
+            .replace_openapi_connection_catalog(&connection.connection_id, vec![definition], || {
+                Ok::<(), ()>(())
+            })
+            .expect("managed OpenAPI definition should publish for the test");
+        let executor = ToolExecutor::new_inner(
+            registry,
+            runtime,
+            Arc::clone(&connection.egress_client),
+            audit,
+            ToolExecutorBackends {
+                upstream_url: None,
+                connection_http: Some(connection.runtime.clone()),
+                mcp_catalog_runtime: None,
+                openapi_catalog_runtime: None,
+                mcp_upstream_servers: HashMap::new(),
+                mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
+                    timeout: Duration::from_secs(30),
+                    response_idle_timeout: Duration::from_secs(30),
+                    connect_timeout: Duration::from_secs(10),
+                    max_request_body_bytes: 1_048_576,
+                    max_response_bytes: 5_242_880,
+                },
+            },
+        )
+        .expect("connection-bound executor should build");
+
+        let error = executor
+            .execute(
+                "get_charge",
+                json!({ "charge_id": "ch_stale" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("missing active catalog must fail closed");
+        assert!(work_failed_message(error).contains("catalog_stale"));
+
+        let events = audit_events(&capture, 4).await;
+        let upstream = events
+            .iter()
+            .find(|event| event.event_type == audit::event::TOOL_UPSTREAM_REQUEST)
+            .expect("catalog rejection should be audited as an upstream failure");
+        assert_eq!(upstream.payload["reason"], json!("catalog_stale"));
+        assert_eq!(
+            upstream.payload["connection_id"],
+            json!(connection.connection_id)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "catalog validation must reject before any upstream socket is opened"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_old_openapi_definition_fails_before_secret_or_upstream_io() {
+        let (addr, ca_pem, server) = one_request_tls_server().await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"must-not-be-read");
+        let record = connection
+            .control_plane
+            .runtime_snapshot()
+            .managed()
+            .values()
+            .find(|record| record.id.as_str() == connection.connection_id)
+            .cloned()
+            .expect("test connection should be present");
+
+        let mut held_definition = serde_json::from_value::<ToolDefinition>(connection_charge_tool(
+            &connection.connection_id,
+        ))
+        .expect("connection tool definition should deserialize");
+        held_definition.source = ToolSource::OpenApi {
+            connection_id: connection.connection_id.clone(),
+            operation_id: Some("getCharge".to_owned()),
+            catalog_revision: Some(1),
+        };
+        let mut current_definition = held_definition.clone();
+        current_definition.description =
+            "Current catalog definition with a changed fingerprint.".to_owned();
+        current_definition.source = ToolSource::OpenApi {
+            connection_id: connection.connection_id.clone(),
+            operation_id: Some("getCharge".to_owned()),
+            catalog_revision: Some(2),
+        };
+        let current_catalog = StoredOpenApiCatalog {
+            connection_id: record.id.clone(),
+            spec_revision: 2,
+            catalog_revision: 2,
+            observed_etag: record.etag(),
+            spec_digest: "current-spec-digest".to_owned(),
+            spec: r#"{"openapi":"3.0.0"}"#.to_owned(),
+            refreshed_at: "2026-07-28T00:00:00Z".to_owned(),
+            entries: vec![StoredOpenApiCatalogEntry {
+                tool_name: current_definition.name.clone(),
+                operation_id: Some("getCharge".to_owned()),
+                selected_scheme_names: vec!["ApiKey".to_owned()],
+                definition: serde_json::to_value(&current_definition)
+                    .expect("current definition should serialize"),
+            }],
+        };
+        let openapi_catalog_runtime =
+            OpenApiConnectionCatalogRuntime::from_catalogs_for_test(&[current_catalog])
+                .expect("current catalog runtime should build");
+
+        let registry = ToolRegistry::disabled();
+        registry
+            .replace_openapi_connection_catalog(
+                &connection.connection_id,
+                vec![held_definition],
+                || Ok::<(), ()>(()),
+            )
+            .expect("held OpenAPI definition should publish for the test");
+        fs::remove_file(&connection.secret_path)
+            .expect("provider file should disappear before invocation");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new(
+            runtime_config([("get_charge", enabled_tool(500, 1))], 2, 1, 100),
+            audit.clone(),
+        );
+        let executor = ToolExecutor::new_inner(
+            registry,
+            runtime,
+            Arc::clone(&connection.egress_client),
+            audit,
+            ToolExecutorBackends {
+                upstream_url: None,
+                connection_http: Some(connection.runtime.clone()),
+                mcp_catalog_runtime: None,
+                openapi_catalog_runtime: Some(openapi_catalog_runtime),
+                mcp_upstream_servers: HashMap::new(),
+                mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
+                    timeout: Duration::from_secs(30),
+                    response_idle_timeout: Duration::from_secs(30),
+                    connect_timeout: Duration::from_secs(10),
+                    max_request_body_bytes: 1_048_576,
+                    max_response_bytes: 5_242_880,
+                },
+            },
+        )
+        .expect("connection-bound executor should build");
+
+        let error = executor
+            .execute(
+                "get_charge",
+                json!({ "charge_id": "ch_old_generation" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a held definition from an old catalog generation must fail closed");
+        assert!(work_failed_message(error).contains("catalog_stale"));
+
+        let events = audit_events(&capture, 4).await;
+        let upstream = events
+            .iter()
+            .find(|event| event.event_type == audit::event::TOOL_UPSTREAM_REQUEST)
+            .expect("old catalog rejection should be audited");
+        assert_eq!(upstream.payload["reason"], json!("catalog_stale"));
+        assert!(events.iter().all(|event| {
+            event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "catalog generation validation must reject before upstream I/O"
         );
     }
 
@@ -2284,6 +2566,52 @@ mod tests {
                 .await
                 .is_err(),
             "egress denial must happen before the TLS upstream receives a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn credentialed_connection_trace_fails_before_secret_or_upstream_io() {
+        let (addr, ca_pem, server) = one_request_tls_server().await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"must-not-be-read");
+        fs::remove_file(&connection.secret_path)
+            .expect("provider file should disappear before invocation");
+        let mut tool = connection_charge_tool(&connection.connection_id);
+        tool["target"]["mapping"]["method"] = json!("TRACE");
+        tool["upstream"]["method"] = json!("TRACE");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new(
+            runtime_config([("get_charge", enabled_tool(500, 1))], 2, 1, 100),
+            audit.clone(),
+        );
+        let executor = executor_for_connection_tool(tool, &connection, runtime, audit);
+
+        let error = executor
+            .execute(
+                "get_charge",
+                json!({ "charge_id": "ch_trace" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("credentialed Connection TRACE must fail closed");
+        assert!(work_failed_message(error).contains("unsafe_trace_method"));
+
+        let events = audit_events(&capture, 4).await;
+        let upstream = events
+            .iter()
+            .find(|event| event.event_type == audit::event::TOOL_UPSTREAM_REQUEST)
+            .expect("TRACE rejection should be audited");
+        assert_eq!(upstream.payload["reason"], json!("unsafe_trace_method"));
+        assert!(events.iter().all(|event| {
+            event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "TRACE rejection must happen before opening an upstream socket"
         );
     }
 
@@ -3753,6 +4081,7 @@ mod tests {
                 upstream_url,
                 connection_http: None,
                 mcp_catalog_runtime: None,
+                openapi_catalog_runtime: None,
                 mcp_upstream_servers: HashMap::new(),
                 mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
                     timeout: Duration::from_secs(30),
@@ -3788,6 +4117,7 @@ mod tests {
                 upstream_url: None,
                 connection_http: Some(connection.runtime.clone()),
                 mcp_catalog_runtime: None,
+                openapi_catalog_runtime: None,
                 mcp_upstream_servers: HashMap::new(),
                 mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
                     timeout: Duration::from_secs(30),

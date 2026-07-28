@@ -10,14 +10,18 @@ use std::{
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
+
+use crate::tools::definitions::ToolDefinition;
 
 use super::{
     model::{
         ConnectionAuthentication, ConnectionId, ConnectionKind, ConnectionManagementSource,
         ConnectionWrite, DiscoveryConfig, CONNECTION_SCHEMA_VERSION, MAX_CATALOG_ENTRIES,
-        MAX_CONNECTIONS, MAX_CREDENTIALS, MAX_MANAGED_SPEC_BYTES, MAX_STATUS_HISTORY_ROWS,
+        MAX_CONNECTIONS, MAX_CREDENTIALS, MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+        MAX_MANAGED_SPEC_BYTES, MAX_STATUS_HISTORY_ROWS,
     },
     status::{
         ConnectionOperationalState, ConnectionRevisions, ConnectionStatusReason,
@@ -293,6 +297,59 @@ CREATE INDEX idx_connection_status_latest
 ON connection_status_history(connection_id, status_revision DESC);
 "#;
 
+const MIGRATION_5_SQL: &str = r#"
+CREATE TABLE connection_openapi_catalogs (
+    connection_id TEXT PRIMARY KEY,
+    spec_revision INTEGER NOT NULL CHECK (spec_revision >= 1),
+    catalog_revision INTEGER NOT NULL CHECK (catalog_revision >= 1),
+    observed_etag TEXT NOT NULL CHECK (
+        length(CAST(observed_etag AS BLOB)) BETWEEN 1 AND 512
+        AND instr(observed_etag, char(0)) = 0
+    ),
+    spec_digest TEXT NOT NULL CHECK (
+        length(spec_digest) = 64
+        AND spec_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    spec TEXT NOT NULL CHECK (
+        length(CAST(spec AS BLOB)) BETWEEN 1 AND 2097152
+    ),
+    refreshed_at TEXT NOT NULL CHECK (
+        length(CAST(refreshed_at AS BLOB)) BETWEEN 1 AND 64
+        AND instr(refreshed_at, char(0)) = 0
+    ),
+    entry_count INTEGER NOT NULL CHECK (entry_count BETWEEN 0 AND 4096),
+    FOREIGN KEY (connection_id) REFERENCES connection_records(id) ON DELETE CASCADE
+);
+
+CREATE TABLE connection_openapi_catalog_entries (
+    connection_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL CHECK (
+        length(tool_name) BETWEEN 1 AND 128
+        AND instr(tool_name, char(0)) = 0
+    ),
+    operation_id TEXT CHECK (
+        operation_id IS NULL
+        OR (
+            length(operation_id) BETWEEN 1 AND 256
+            AND instr(operation_id, char(0)) = 0
+        )
+    ),
+    selected_scheme_names_json TEXT NOT NULL CHECK (
+        length(CAST(selected_scheme_names_json AS BLOB)) BETWEEN 2 AND 16384
+    ),
+    definition_json TEXT NOT NULL CHECK (
+        length(CAST(definition_json AS BLOB)) BETWEEN 2 AND 262144
+    ),
+    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 4095),
+    PRIMARY KEY (connection_id, tool_name),
+    FOREIGN KEY (connection_id)
+        REFERENCES connection_openapi_catalogs(connection_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX idx_connection_openapi_catalog_ordinal
+ON connection_openapi_catalog_entries(connection_id, ordinal);
+"#;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -310,6 +367,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         sql: MIGRATION_4_SQL,
     },
+    Migration {
+        version: 5,
+        sql: MIGRATION_5_SQL,
+    },
 ];
 
 const SOURCE_MANAGED: &str = "managed";
@@ -318,6 +379,13 @@ pub const MAX_CONNECTION_DEPENDENCIES: usize = 4_096;
 const MAX_MCP_CATALOG_ENTRY_BYTES: usize = 262_144;
 const MAX_MCP_TOOL_NAME_CHARS: usize = 128;
 const MAX_MCP_TOOL_DESCRIPTION_CHARS: usize = 1_024;
+const MAX_OPENAPI_CATALOG_ENTRY_BYTES: usize = 262_144;
+const MAX_OPENAPI_TOOL_NAME_CHARS: usize = 128;
+const MAX_OPENAPI_OPERATION_ID_CHARS: usize = 256;
+const MAX_OPENAPI_SECURITY_SCHEMES: usize = 64;
+const MAX_OPENAPI_SECURITY_SCHEME_NAME_CHARS: usize = 128;
+const MAX_OPENAPI_SECURITY_SCHEMES_JSON_BYTES: usize = 16_384;
+const SHA256_HEX_CHARS: usize = 64;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -487,6 +555,26 @@ pub struct StoredMcpCatalog {
     pub observed_etag: ConnectionEtag,
     pub refreshed_at: String,
     pub entries: Vec<StoredMcpCatalogEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredOpenApiCatalogEntry {
+    pub tool_name: String,
+    pub operation_id: Option<String>,
+    pub selected_scheme_names: Vec<String>,
+    pub definition: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredOpenApiCatalog {
+    pub connection_id: ConnectionId,
+    pub spec_revision: u64,
+    pub catalog_revision: u64,
+    pub observed_etag: ConnectionEtag,
+    pub spec_digest: String,
+    pub spec: String,
+    pub refreshed_at: String,
+    pub entries: Vec<StoredOpenApiCatalogEntry>,
 }
 
 #[derive(Debug)]
@@ -960,14 +1048,27 @@ impl SqliteConnectionStore {
             .into_stored()?;
         validate_record_bindings(&transaction, &self.path, &current)?;
         ensure_etag(id, expected, &current)?;
+        if !supports_managed_mcp_catalog(&current.write) {
+            return Err(ConnectionStoreError::Validation {
+                problems: vec![
+                    "MCP catalogs require a managed MCP streamable HTTP Connection".to_owned(),
+                ],
+            });
+        }
 
         let retained_catalog_entry_count: i64 = transaction
             .query_row(
-                "SELECT COUNT(*) FROM connection_mcp_catalog_entries WHERE connection_id != ?1",
+                r#"
+                SELECT
+                    (SELECT COUNT(*)
+                     FROM connection_mcp_catalog_entries
+                     WHERE connection_id != ?1)
+                  + (SELECT COUNT(*) FROM connection_openapi_catalog_entries)
+                "#,
                 params![id.as_str()],
                 |row| row.get(0),
             )
-            .map_err(|source| sqlite_error(&self.path, "MCP catalog retained count", source))?;
+            .map_err(|source| sqlite_error(&self.path, "catalog retained count", source))?;
         let retained_catalog_entries =
             usize::try_from(retained_catalog_entry_count).map_err(|_| {
                 ConnectionStoreError::CorruptRecord {
@@ -977,7 +1078,7 @@ impl SqliteConnectionStore {
             })?;
         if retained_catalog_entries.saturating_add(entries.len()) > MAX_CATALOG_ENTRIES {
             return Err(ConnectionStoreError::LimitExceeded {
-                resource: "connection MCP catalog entries",
+                resource: "connection catalog entries",
                 maximum: MAX_CATALOG_ENTRIES,
             });
         }
@@ -1093,6 +1194,258 @@ impl SqliteConnectionStore {
             observed_etag: expected.clone(),
             refreshed_at: now,
             entries: entries.to_vec(),
+        })
+    }
+
+    pub fn openapi_catalogs(&self) -> Result<Vec<StoredOpenApiCatalog>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        load_openapi_catalogs(&connection, &self.path, None)
+    }
+
+    pub fn openapi_catalog(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<Option<StoredOpenApiCatalog>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        Ok(load_openapi_catalogs(&connection, &self.path, Some(id))?
+            .into_iter()
+            .next())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_openapi_catalog(
+        &self,
+        id: &ConnectionId,
+        expected_connection_etag: &ConnectionEtag,
+        expected_spec_revision: u64,
+        expected_catalog_revision: u64,
+        spec: &str,
+        spec_digest: &str,
+        entries: &[StoredOpenApiCatalogEntry],
+    ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        validate_openapi_spec(spec, spec_digest)?;
+        let encoded_entries = validate_openapi_catalog_entries(entries)?;
+        let normalized_entries = encoded_entries
+            .iter()
+            .map(|entry| entry.entry.clone())
+            .collect::<Vec<_>>();
+        let now = utc_timestamp()?;
+        let mut connection = self.connection_guard();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&self.path, "OpenAPI catalog transaction", source))?;
+        let current = load_raw_by_id(&transaction, &self.path, id)?
+            .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?
+            .into_stored()?;
+        validate_record_bindings(&transaction, &self.path, &current)?;
+        ensure_etag(id, expected_connection_etag, &current)?;
+        if !supports_managed_openapi_catalog(&current.write) {
+            return Err(ConnectionStoreError::Validation {
+                problems: vec![
+                    "OpenAPI catalogs require a managed HTTP API OpenAPI Connection".to_owned(),
+                ],
+            });
+        }
+
+        let previous = transaction
+            .query_row(
+                r#"
+                SELECT spec_revision, catalog_revision, spec_digest
+                FROM connection_openapi_catalogs
+                WHERE connection_id = ?1
+                "#,
+                params![id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, "OpenAPI revision lookup", source))?;
+        let (previous_spec_revision, previous_catalog_revision, previous_digest) =
+            if let Some((spec_revision, catalog_revision, digest)) = previous {
+                (
+                    persisted_revision(id, spec_revision, "invalid OpenAPI spec revision")?,
+                    persisted_revision(id, catalog_revision, "invalid OpenAPI catalog revision")?,
+                    Some(digest),
+                )
+            } else {
+                (0, 0, None)
+            };
+        if expected_spec_revision != previous_spec_revision
+            || expected_catalog_revision != previous_catalog_revision
+        {
+            return Err(ConnectionStoreError::Conflict {
+                id: id.to_string(),
+                current: current.etag(),
+            });
+        }
+
+        let retained_catalog_entry_count: i64 = transaction
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM connection_mcp_catalog_entries)
+                  + (SELECT COUNT(*)
+                     FROM connection_openapi_catalog_entries
+                     WHERE connection_id != ?1)
+                "#,
+                params![id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.path, "catalog retained count", source))?;
+        let retained_catalog_entries =
+            usize::try_from(retained_catalog_entry_count).map_err(|_| {
+                ConnectionStoreError::CorruptRecord {
+                    id: id.to_string(),
+                    reason: "invalid catalog entry count",
+                }
+            })?;
+        if retained_catalog_entries.saturating_add(entries.len()) > MAX_CATALOG_ENTRIES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection catalog entries",
+                maximum: MAX_CATALOG_ENTRIES,
+            });
+        }
+        let retained_definition_bytes = openapi_definition_bytes(
+            &transaction,
+            &self.path,
+            Some(id),
+            "OpenAPI retained definition byte count",
+        )?;
+        let candidate_definition_bytes = encoded_entries.iter().fold(0_usize, |total, entry| {
+            total.saturating_add(entry.definition_json.len())
+        });
+        if retained_definition_bytes
+            .checked_add(candidate_definition_bytes)
+            .is_none_or(|total| total > MAX_MANAGED_OPENAPI_CATALOG_BYTES)
+        {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection OpenAPI catalog definition bytes",
+                maximum: MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+            });
+        }
+
+        let spec_revision = if previous_digest.as_deref() == Some(spec_digest) {
+            previous_spec_revision
+        } else {
+            increment_revision(id, previous_spec_revision)?
+        };
+        let catalog_revision = increment_revision(id, previous_catalog_revision)?;
+
+        transaction
+            .execute(
+                "DELETE FROM connection_dependencies WHERE connection_id = ?1 AND consumer_kind = ?2",
+                params![
+                    id.as_str(),
+                    ConnectionDependencyKind::ManagedTool.as_str()
+                ],
+            )
+            .map_err(|source| {
+                sqlite_error(
+                    &self.path,
+                    "OpenAPI catalog dependency replacement delete",
+                    source,
+                )
+            })?;
+        let retained_dependencies = count_rows(
+            &transaction,
+            &self.path,
+            "connection dependencies",
+            "SELECT COUNT(*) FROM connection_dependencies",
+        )?;
+        if retained_dependencies.saturating_add(entries.len()) > MAX_CONNECTION_DEPENDENCIES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection dependencies",
+                maximum: MAX_CONNECTION_DEPENDENCIES,
+            });
+        }
+
+        transaction
+            .execute(
+                "DELETE FROM connection_openapi_catalogs WHERE connection_id = ?1",
+                params![id.as_str()],
+            )
+            .map_err(|source| {
+                sqlite_error(&self.path, "OpenAPI catalog replacement delete", source)
+            })?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO connection_openapi_catalogs (
+                    connection_id, spec_revision, catalog_revision, observed_etag,
+                    spec_digest, spec, refreshed_at, entry_count
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    id.as_str(),
+                    u64_to_i64(id, spec_revision)?,
+                    u64_to_i64(id, catalog_revision)?,
+                    expected_connection_etag.as_str(),
+                    spec_digest,
+                    spec,
+                    now,
+                    i64::try_from(entries.len()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.path, "OpenAPI catalog insert", source))?;
+
+        for (ordinal, encoded) in encoded_entries.iter().enumerate() {
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO connection_openapi_catalog_entries (
+                        connection_id, tool_name, operation_id,
+                        selected_scheme_names_json, definition_json, ordinal
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#,
+                    params![
+                        id.as_str(),
+                        encoded.entry.tool_name,
+                        encoded.entry.operation_id,
+                        encoded.selected_scheme_names_json,
+                        encoded.definition_json,
+                        i64::try_from(ordinal).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(|source| {
+                    sqlite_error(&self.path, "OpenAPI catalog entry insert", source)
+                })?;
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO connection_dependencies (
+                        connection_id, consumer_kind, consumer_id, created_at
+                    ) VALUES (?1, ?2, ?3, ?4)
+                    "#,
+                    params![
+                        id.as_str(),
+                        ConnectionDependencyKind::ManagedTool.as_str(),
+                        encoded.entry.tool_name,
+                        now,
+                    ],
+                )
+                .map_err(|source| {
+                    sqlite_error(&self.path, "OpenAPI catalog dependency insert", source)
+                })?;
+        }
+
+        transaction.commit().map_err(|source| {
+            sqlite_error(&self.path, "OpenAPI catalog transaction commit", source)
+        })?;
+
+        Ok(StoredOpenApiCatalog {
+            connection_id: id.clone(),
+            spec_revision,
+            catalog_revision,
+            observed_etag: expected_connection_etag.clone(),
+            spec_digest: spec_digest.to_owned(),
+            spec: spec.to_owned(),
+            refreshed_at: now,
+            entries: normalized_entries,
         })
     }
 
@@ -1450,7 +1803,7 @@ impl ConnectionStore for SqliteConnectionStore {
                 .map_err(|source| sqlite_error(&self.path, "replace no-op commit", source))?;
             return Ok(current);
         }
-        if !supports_managed_mcp_catalog(&candidate) {
+        if managed_catalog_kind(&current.write) != managed_catalog_kind(&candidate) {
             let managed_tool_count: i64 = transaction
                 .query_row(
                     r#"
@@ -1461,9 +1814,7 @@ impl ConnectionStore for SqliteConnectionStore {
                     params![id.as_str(), ConnectionDependencyKind::ManagedTool.as_str()],
                     |row| row.get(0),
                 )
-                .map_err(|source| {
-                    sqlite_error(&self.path, "managed MCP dependency count", source)
-                })?;
+                .map_err(|source| sqlite_error(&self.path, "managed dependency count", source))?;
             if managed_tool_count > 0 {
                 return Err(ConnectionStoreError::DependencyConflict {
                     id: id.to_string(),
@@ -1477,6 +1828,18 @@ impl ConnectionStore for SqliteConnectionStore {
                 )
                 .map_err(|source| {
                     sqlite_error(&self.path, "obsolete managed MCP catalog removal", source)
+                })?;
+            transaction
+                .execute(
+                    "DELETE FROM connection_openapi_catalogs WHERE connection_id = ?1",
+                    params![id.as_str()],
+                )
+                .map_err(|source| {
+                    sqlite_error(
+                        &self.path,
+                        "obsolete managed OpenAPI catalog removal",
+                        source,
+                    )
                 })?;
         }
 
@@ -1643,6 +2006,8 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
         "SELECT id, schema_version, label, purpose, secret_version, algorithm, key_id, nonce, ciphertext, created_at, rotated_at, updated_at FROM connection_local_secrets LIMIT 0",
         "SELECT connection_id, catalog_revision, observed_etag, refreshed_at, entry_count FROM connection_mcp_catalogs LIMIT 0",
         "SELECT connection_id, remote_tool_name, description, input_schema_json, ordinal FROM connection_mcp_catalog_entries LIMIT 0",
+        "SELECT connection_id, spec_revision, catalog_revision, observed_etag, spec_digest, spec, refreshed_at, entry_count FROM connection_openapi_catalogs LIMIT 0",
+        "SELECT connection_id, tool_name, operation_id, selected_scheme_names_json, definition_json, ordinal FROM connection_openapi_catalog_entries LIMIT 0",
     ] {
         connection
             .prepare(query)
@@ -1720,13 +2085,29 @@ fn validate_persisted_state(
     let catalog_entry_count = count_rows(
         &transaction,
         path,
-        "connection MCP catalog entries",
-        "SELECT COUNT(*) FROM connection_mcp_catalog_entries",
+        "connection catalog entries",
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM connection_mcp_catalog_entries)
+          + (SELECT COUNT(*) FROM connection_openapi_catalog_entries)
+        "#,
     )?;
     if catalog_entry_count > MAX_CATALOG_ENTRIES {
         return Err(ConnectionStoreError::LimitExceeded {
-            resource: "connection MCP catalog entries",
+            resource: "connection catalog entries",
             maximum: MAX_CATALOG_ENTRIES,
+        });
+    }
+    if openapi_definition_bytes(
+        &transaction,
+        path,
+        None,
+        "OpenAPI catalog definition byte validation",
+    )? > MAX_MANAGED_OPENAPI_CATALOG_BYTES
+    {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection OpenAPI catalog definition bytes",
+            maximum: MAX_MANAGED_OPENAPI_CATALOG_BYTES,
         });
     }
     let current_status_count = count_rows(
@@ -1791,6 +2172,42 @@ fn validate_persisted_state(
     ensure_no_invalid_rows(
         &transaction,
         path,
+        "OpenAPI catalog integrity",
+        r#"
+        SELECT COUNT(*)
+        FROM connection_openapi_catalogs AS catalog
+        JOIN connection_records AS record ON record.id = catalog.connection_id
+        WHERE catalog.entry_count != (
+                SELECT COUNT(*)
+                FROM connection_openapi_catalog_entries AS entry
+                WHERE entry.connection_id = catalog.connection_id
+              )
+           OR catalog.spec_revision < 1
+           OR catalog.catalog_revision < 1
+           OR catalog.entry_count < 0
+           OR catalog.entry_count > 4096
+           OR length(CAST(catalog.spec AS BLOB)) < 1
+           OR length(CAST(catalog.spec AS BLOB)) > 2097152
+           OR length(catalog.spec_digest) != 64
+           OR catalog.spec_digest GLOB '*[^0-9a-f]*'
+        "#,
+        "stored OpenAPI catalog metadata is inconsistent",
+    )?;
+    ensure_no_invalid_rows(
+        &transaction,
+        path,
+        "managed catalog ownership integrity",
+        r#"
+        SELECT COUNT(*)
+        FROM connection_mcp_catalogs AS mcp
+        JOIN connection_openapi_catalogs AS openapi
+          ON openapi.connection_id = mcp.connection_id
+        "#,
+        "a Connection owns more than one managed catalog kind",
+    )?;
+    ensure_no_invalid_rows(
+        &transaction,
+        path,
         "status history integrity",
         r#"
         SELECT COUNT(*)
@@ -1823,7 +2240,35 @@ fn validate_persisted_state(
         "connection_status_history",
         "status history startup validation",
     )?;
-    let _ = load_mcp_catalogs(&transaction, path, None)?;
+    let mcp_catalogs = load_mcp_catalogs(&transaction, path, None)?;
+    let openapi_catalogs = load_openapi_catalogs(&transaction, path, None)?;
+    let record_by_id = records
+        .iter()
+        .map(|record| (record.id.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    for catalog in &mcp_catalogs {
+        if record_by_id
+            .get(&catalog.connection_id)
+            .is_none_or(|record| !supports_managed_mcp_catalog(&record.write))
+        {
+            return Err(ConnectionStoreError::CorruptRecord {
+                id: catalog.connection_id.to_string(),
+                reason: "MCP catalog owner is not a compatible managed MCP Connection",
+            });
+        }
+    }
+    for catalog in &openapi_catalogs {
+        if record_by_id
+            .get(&catalog.connection_id)
+            .is_none_or(|record| !supports_managed_openapi_catalog(&record.write))
+        {
+            return Err(ConnectionStoreError::CorruptRecord {
+                id: catalog.connection_id.to_string(),
+                reason: "OpenAPI catalog owner is not a compatible managed OpenAPI Connection",
+            });
+        }
+    }
+    validate_managed_catalog_dependencies(&transaction, path, &mcp_catalogs, &openapi_catalogs)?;
     transaction
         .commit()
         .map_err(|source| sqlite_error(path, "startup validation commit", source))
@@ -1885,6 +2330,155 @@ fn validate_mcp_catalog_entries(
     } else {
         Err(ConnectionStoreError::Validation { problems })
     }
+}
+
+#[derive(Clone)]
+struct EncodedOpenApiCatalogEntry {
+    entry: StoredOpenApiCatalogEntry,
+    selected_scheme_names_json: String,
+    definition_json: String,
+}
+
+fn validate_openapi_spec(spec: &str, spec_digest: &str) -> Result<(), ConnectionStoreError> {
+    let mut problems = Vec::new();
+    if spec.is_empty() || spec.len() > MAX_MANAGED_SPEC_BYTES {
+        problems.push(format!(
+            "OpenAPI spec must contain 1-{MAX_MANAGED_SPEC_BYTES} UTF-8 bytes"
+        ));
+    }
+    if spec_digest.len() != SHA256_HEX_CHARS
+        || !spec_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        problems.push("OpenAPI spec digest must be 64 lowercase hexadecimal characters".to_owned());
+    } else {
+        let calculated = hex::encode(Sha256::digest(spec.as_bytes()));
+        if calculated != spec_digest {
+            problems.push("OpenAPI spec digest does not match the exact spec bytes".to_owned());
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(ConnectionStoreError::Validation { problems })
+    }
+}
+
+fn validate_openapi_catalog_entries(
+    entries: &[StoredOpenApiCatalogEntry],
+) -> Result<Vec<EncodedOpenApiCatalogEntry>, ConnectionStoreError> {
+    if entries.len() > MAX_CATALOG_ENTRIES {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection OpenAPI catalog entries",
+            maximum: MAX_CATALOG_ENTRIES,
+        });
+    }
+    let mut seen = BTreeSet::new();
+    let mut encoded = Vec::with_capacity(entries.len());
+    let mut problems = Vec::new();
+    let mut aggregate_definition_bytes = 0_usize;
+    for (index, entry) in entries.iter().enumerate() {
+        let name_chars = entry.tool_name.chars().count();
+        if name_chars == 0
+            || name_chars > MAX_OPENAPI_TOOL_NAME_CHARS
+            || entry.tool_name.len() > MAX_OPENAPI_TOOL_NAME_CHARS
+            || entry.tool_name.contains('\0')
+        {
+            problems.push(format!(
+                "OpenAPI catalog entry {index} tool name must contain 1-{MAX_OPENAPI_TOOL_NAME_CHARS} UTF-8 bytes without NUL"
+            ));
+        }
+        if !seen.insert(entry.tool_name.as_str()) {
+            problems.push(format!(
+                "OpenAPI catalog entry {index} duplicates an earlier tool name"
+            ));
+        }
+        if entry.operation_id.as_ref().is_some_and(|operation_id| {
+            let chars = operation_id.chars().count();
+            chars == 0 || chars > MAX_OPENAPI_OPERATION_ID_CHARS || operation_id.contains('\0')
+        }) {
+            problems.push(format!(
+                "OpenAPI catalog entry {index} operation ID must contain 1-{MAX_OPENAPI_OPERATION_ID_CHARS} characters without NUL when present"
+            ));
+        }
+        if entry.selected_scheme_names.len() > MAX_OPENAPI_SECURITY_SCHEMES {
+            problems.push(format!(
+                "OpenAPI catalog entry {index} selects more than {MAX_OPENAPI_SECURITY_SCHEMES} security schemes"
+            ));
+        }
+        let selected_scheme_names = entry
+            .selected_scheme_names
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for scheme_name in &selected_scheme_names {
+            let chars = scheme_name.chars().count();
+            if chars == 0
+                || chars > MAX_OPENAPI_SECURITY_SCHEME_NAME_CHARS
+                || scheme_name.contains('\0')
+            {
+                problems.push(format!(
+                    "OpenAPI catalog entry {index} security scheme names must contain 1-{MAX_OPENAPI_SECURITY_SCHEME_NAME_CHARS} characters without NUL"
+                ));
+            }
+        }
+        let selected_scheme_names_json =
+            serde_json::to_string(&selected_scheme_names).map_err(|source| {
+                ConnectionStoreError::Json {
+                    operation: "OpenAPI selected security schemes",
+                    source,
+                }
+            })?;
+        if selected_scheme_names_json.len() > MAX_OPENAPI_SECURITY_SCHEMES_JSON_BYTES {
+            problems.push(format!(
+                "OpenAPI catalog entry {index} selected security schemes exceed the bounded stored size"
+            ));
+        }
+
+        let definition_json = serde_json::to_string(&entry.definition).map_err(|source| {
+            ConnectionStoreError::Json {
+                operation: "OpenAPI catalog tool definition",
+                source,
+            }
+        })?;
+        if definition_json.len() < 2 || definition_json.len() > MAX_OPENAPI_CATALOG_ENTRY_BYTES {
+            problems.push(format!(
+                "OpenAPI catalog entry {index} tool definition exceeds the bounded stored size"
+            ));
+        }
+        aggregate_definition_bytes =
+            aggregate_definition_bytes.saturating_add(definition_json.len());
+        match serde_json::from_value::<ToolDefinition>(entry.definition.clone()) {
+            Ok(definition) if definition.name == entry.tool_name => {}
+            Ok(_) => problems.push(format!(
+                "OpenAPI catalog entry {index} tool name does not match its definition"
+            )),
+            Err(error) => problems.push(format!(
+                "OpenAPI catalog entry {index} does not contain a complete ToolDefinition: {error}"
+            )),
+        }
+
+        let mut normalized = entry.clone();
+        normalized.selected_scheme_names = selected_scheme_names;
+        encoded.push(EncodedOpenApiCatalogEntry {
+            entry: normalized,
+            selected_scheme_names_json,
+            definition_json,
+        });
+    }
+    if !problems.is_empty() {
+        return Err(ConnectionStoreError::Validation { problems });
+    }
+    if aggregate_definition_bytes > MAX_MANAGED_OPENAPI_CATALOG_BYTES {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection OpenAPI catalog definition bytes",
+            maximum: MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+        });
+    }
+    Ok(encoded)
 }
 
 fn load_mcp_catalogs(
@@ -2033,6 +2627,257 @@ fn load_mcp_catalogs(
         .collect()
 }
 
+fn load_openapi_catalogs(
+    connection: &Connection,
+    path: &Path,
+    requested_id: Option<&ConnectionId>,
+) -> Result<Vec<StoredOpenApiCatalog>, ConnectionStoreError> {
+    if openapi_definition_bytes(
+        connection,
+        path,
+        None,
+        "OpenAPI catalog definition byte load validation",
+    )? > MAX_MANAGED_OPENAPI_CATALOG_BYTES
+    {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection OpenAPI catalog definition bytes",
+            maximum: MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+        });
+    }
+    let query = if requested_id.is_some() {
+        r#"
+        SELECT connection_id, spec_revision, catalog_revision, observed_etag,
+               spec_digest, spec, refreshed_at, entry_count
+        FROM connection_openapi_catalogs
+        WHERE connection_id = ?1
+        ORDER BY connection_id ASC
+        "#
+    } else {
+        r#"
+        SELECT connection_id, spec_revision, catalog_revision, observed_etag,
+               spec_digest, spec, refreshed_at, entry_count
+        FROM connection_openapi_catalogs
+        ORDER BY connection_id ASC
+        "#
+    };
+    let mut statement = connection
+        .prepare(query)
+        .map_err(|source| sqlite_error(path, "OpenAPI catalog query prepare", source))?;
+    let map_row = |row: &Row<'_>| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
+        ))
+    };
+    let raw = if let Some(id) = requested_id {
+        statement
+            .query_map(params![id.as_str()], map_row)
+            .map_err(|source| sqlite_error(path, "OpenAPI catalog query", source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| sqlite_error(path, "OpenAPI catalog read", source))?
+    } else {
+        statement
+            .query_map([], map_row)
+            .map_err(|source| sqlite_error(path, "OpenAPI catalog query", source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| sqlite_error(path, "OpenAPI catalog read", source))?
+    };
+    drop(statement);
+
+    raw.into_iter()
+        .map(
+            |(
+                raw_id,
+                raw_spec_revision,
+                raw_catalog_revision,
+                observed_etag,
+                spec_digest,
+                spec,
+                refreshed_at,
+                raw_entry_count,
+            )| {
+                let connection_id = ConnectionId::parse(raw_id.clone()).map_err(|_| {
+                    ConnectionStoreError::CorruptRecord {
+                        id: raw_id.clone(),
+                        reason: "invalid OpenAPI catalog connection ID",
+                    }
+                })?;
+                let spec_revision = persisted_revision(
+                    &connection_id,
+                    raw_spec_revision,
+                    "invalid OpenAPI spec revision",
+                )?;
+                let catalog_revision = persisted_revision(
+                    &connection_id,
+                    raw_catalog_revision,
+                    "invalid OpenAPI catalog revision",
+                )?;
+                validate_openapi_spec(&spec, &spec_digest).map_err(|_| {
+                    ConnectionStoreError::CorruptRecord {
+                        id: connection_id.to_string(),
+                        reason: "invalid stored OpenAPI spec or digest",
+                    }
+                })?;
+                let expected_entry_count = usize::try_from(raw_entry_count).map_err(|_| {
+                    ConnectionStoreError::CorruptRecord {
+                        id: connection_id.to_string(),
+                        reason: "invalid OpenAPI catalog entry count",
+                    }
+                })?;
+                if expected_entry_count > MAX_CATALOG_ENTRIES {
+                    return Err(ConnectionStoreError::LimitExceeded {
+                        resource: "connection OpenAPI catalog entries",
+                        maximum: MAX_CATALOG_ENTRIES,
+                    });
+                }
+
+                let mut entry_statement = connection
+                    .prepare(
+                        r#"
+                        SELECT tool_name, operation_id, selected_scheme_names_json,
+                               definition_json, ordinal
+                        FROM connection_openapi_catalog_entries
+                        WHERE connection_id = ?1
+                        ORDER BY ordinal ASC
+                        "#,
+                    )
+                    .map_err(|source| {
+                        sqlite_error(path, "OpenAPI catalog entry query prepare", source)
+                    })?;
+                let raw_entries = entry_statement
+                    .query_map(params![connection_id.as_str()], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    })
+                    .map_err(|source| sqlite_error(path, "OpenAPI catalog entry query", source))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|source| sqlite_error(path, "OpenAPI catalog entry read", source))?;
+                if raw_entries.len() != expected_entry_count {
+                    return Err(ConnectionStoreError::CorruptRecord {
+                        id: connection_id.to_string(),
+                        reason: "OpenAPI catalog entry count mismatch",
+                    });
+                }
+                let mut entries = Vec::with_capacity(raw_entries.len());
+                for (
+                    index,
+                    (tool_name, operation_id, selected_scheme_names_json, definition_json, ordinal),
+                ) in raw_entries.into_iter().enumerate()
+                {
+                    if usize::try_from(ordinal).ok() != Some(index) {
+                        return Err(ConnectionStoreError::CorruptRecord {
+                            id: connection_id.to_string(),
+                            reason: "OpenAPI catalog entry ordinals are not contiguous",
+                        });
+                    }
+                    let selected_scheme_names = serde_json::from_str::<Vec<String>>(
+                        &selected_scheme_names_json,
+                    )
+                    .map_err(|source| ConnectionStoreError::Json {
+                        operation: "stored OpenAPI selected security schemes",
+                        source,
+                    })?;
+                    let definition =
+                        serde_json::from_str::<Value>(&definition_json).map_err(|source| {
+                            ConnectionStoreError::Json {
+                                operation: "stored OpenAPI catalog tool definition",
+                                source,
+                            }
+                        })?;
+                    entries.push(StoredOpenApiCatalogEntry {
+                        tool_name,
+                        operation_id,
+                        selected_scheme_names,
+                        definition,
+                    });
+                }
+                let normalized = validate_openapi_catalog_entries(&entries)?;
+                if normalized
+                    .iter()
+                    .map(|entry| &entry.entry)
+                    .ne(entries.iter())
+                {
+                    return Err(ConnectionStoreError::CorruptRecord {
+                        id: connection_id.to_string(),
+                        reason: "OpenAPI catalog security scheme selections are not canonical",
+                    });
+                }
+                Ok(StoredOpenApiCatalog {
+                    connection_id,
+                    spec_revision,
+                    catalog_revision,
+                    observed_etag: ConnectionEtag(observed_etag),
+                    spec_digest,
+                    spec,
+                    refreshed_at,
+                    entries,
+                })
+            },
+        )
+        .collect()
+}
+
+fn validate_managed_catalog_dependencies(
+    connection: &Connection,
+    path: &Path,
+    mcp_catalogs: &[StoredMcpCatalog],
+    openapi_catalogs: &[StoredOpenApiCatalog],
+) -> Result<(), ConnectionStoreError> {
+    let mut expected = BTreeSet::new();
+    for catalog in mcp_catalogs {
+        for entry in &catalog.entries {
+            expected.insert((
+                catalog.connection_id.to_string(),
+                format!(
+                    "{}:{}",
+                    catalog.connection_id.as_str(),
+                    entry.remote_tool_name
+                ),
+            ));
+        }
+    }
+    for catalog in openapi_catalogs {
+        for entry in &catalog.entries {
+            expected.insert((catalog.connection_id.to_string(), entry.tool_name.clone()));
+        }
+    }
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT connection_id, consumer_id
+            FROM connection_dependencies
+            WHERE consumer_kind = 'managed_tool'
+            ORDER BY connection_id ASC, consumer_id ASC
+            "#,
+        )
+        .map_err(|source| sqlite_error(path, "managed catalog dependency validation", source))?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| sqlite_error(path, "managed catalog dependency query", source))?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|source| sqlite_error(path, "managed catalog dependency read", source))?;
+    if actual != expected {
+        return Err(ConnectionStoreError::CorruptRecord {
+            id: "<catalog-dependencies>".to_owned(),
+            reason: "managed tool dependencies do not match durable catalog entries",
+        });
+    }
+    Ok(())
+}
+
 fn load_all_records(
     connection: &Connection,
     path: &Path,
@@ -2070,6 +2915,39 @@ fn count_rows(
     usize::try_from(count).map_err(|_| ConnectionStoreError::CorruptRecord {
         id: format!("<{resource}>"),
         reason: "negative or oversized persisted row count",
+    })
+}
+
+fn openapi_definition_bytes(
+    connection: &Connection,
+    path: &Path,
+    excluded_id: Option<&ConnectionId>,
+    operation: &'static str,
+) -> Result<usize, ConnectionStoreError> {
+    let bytes: i64 = if let Some(id) = excluded_id {
+        connection.query_row(
+            r#"
+            SELECT COALESCE(SUM(length(CAST(definition_json AS BLOB))), 0)
+            FROM connection_openapi_catalog_entries
+            WHERE connection_id != ?1
+            "#,
+            params![id.as_str()],
+            |row| row.get(0),
+        )
+    } else {
+        connection.query_row(
+            r#"
+            SELECT COALESCE(SUM(length(CAST(definition_json AS BLOB))), 0)
+            FROM connection_openapi_catalog_entries
+            "#,
+            [],
+            |row| row.get(0),
+        )
+    }
+    .map_err(|source| sqlite_error(path, operation, source))?;
+    usize::try_from(bytes).map_err(|_| ConnectionStoreError::CorruptRecord {
+        id: "<openapi-catalogs>".to_owned(),
+        reason: "invalid OpenAPI catalog definition byte count",
     })
 }
 
@@ -2466,6 +3344,31 @@ fn supports_managed_mcp_catalog(write: &ConnectionWrite) -> bool {
         && matches!(&write.discovery, Some(DiscoveryConfig::ManagedMcp { .. }))
 }
 
+fn supports_managed_openapi_catalog(write: &ConnectionWrite) -> bool {
+    write.kind == ConnectionKind::HttpApi
+        && matches!(
+            &write.discovery,
+            Some(DiscoveryConfig::ManagedOpenapi { .. })
+        )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManagedCatalogKind {
+    Mcp,
+    OpenApi,
+    None,
+}
+
+fn managed_catalog_kind(write: &ConnectionWrite) -> ManagedCatalogKind {
+    if supports_managed_mcp_catalog(write) {
+        ManagedCatalogKind::Mcp
+    } else if supports_managed_openapi_catalog(write) {
+        ManagedCatalogKind::OpenApi
+    } else {
+        ManagedCatalogKind::None
+    }
+}
+
 fn ensure_binding_capacity(
     transaction: &Transaction<'_>,
     path: &Path,
@@ -2626,6 +3529,24 @@ fn revision_from_i64(
         return Err(ConnectionStoreError::CorruptRecord {
             id: id.to_string(),
             reason: "zero connection revision",
+        });
+    }
+    Ok(value)
+}
+
+fn persisted_revision(
+    id: &ConnectionId,
+    value: i64,
+    reason: &'static str,
+) -> Result<u64, ConnectionStoreError> {
+    let value = u64::try_from(value).map_err(|_| ConnectionStoreError::CorruptRecord {
+        id: id.to_string(),
+        reason,
+    })?;
+    if value == 0 {
+        return Err(ConnectionStoreError::CorruptRecord {
+            id: id.to_string(),
+            reason,
         });
     }
     Ok(value)
@@ -2800,6 +3721,55 @@ mod tests {
         }
     }
 
+    fn openapi_catalog_entry(name: &str) -> StoredOpenApiCatalogEntry {
+        StoredOpenApiCatalogEntry {
+            tool_name: name.to_owned(),
+            operation_id: Some(format!("{name}Operation")),
+            selected_scheme_names: vec![
+                "oauth".to_owned(),
+                "api_key".to_owned(),
+                "oauth".to_owned(),
+            ],
+            definition: json!({
+                "name": name,
+                "description": format!("{name} operation"),
+                "input_json_schema": {
+                    "type": "object",
+                    "properties": {}
+                },
+                "upstream": {
+                    "method": "GET",
+                    "path_template": format!("/{name}"),
+                    "query_params": []
+                }
+            }),
+        }
+    }
+
+    fn spec_digest(spec: &str) -> String {
+        hex::encode(Sha256::digest(spec.as_bytes()))
+    }
+
+    fn openapi_catalog_entries_with_minimum_bytes(
+        prefix: &str,
+        minimum_bytes: usize,
+    ) -> Vec<StoredOpenApiCatalogEntry> {
+        const FILLER_BYTES: usize = 240_000;
+        let filler = "x".repeat(FILLER_BYTES);
+        let mut entries = Vec::new();
+        let mut aggregate_bytes = 0_usize;
+        while aggregate_bytes < minimum_bytes {
+            let mut entry = openapi_catalog_entry(&format!("{prefix}-{:03}", entries.len()));
+            entry.definition["input_json_schema"]["description"] = Value::String(filler.clone());
+            let encoded =
+                serde_json::to_vec(&entry.definition).expect("large definition should serialize");
+            assert!(encoded.len() <= MAX_OPENAPI_CATALOG_ENTRY_BYTES);
+            aggregate_bytes = aggregate_bytes.saturating_add(encoded.len());
+            entries.push(entry);
+        }
+        entries
+    }
+
     struct TemporaryDatabase {
         path: PathBuf,
     }
@@ -2845,7 +3815,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -2986,6 +3956,115 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn migration_five_preserves_populated_v4_catalog_state() {
+        let database = TemporaryDatabase::new("migration-v4-populated");
+        let path = database.path.clone();
+        let connection_id = ConnectionId::new_managed();
+        let write = mcp_candidate();
+        let spec_json =
+            serde_json::to_string(&write).expect("v4 fixture candidate should serialize");
+        let timestamp = "2026-07-28T00:00:00Z";
+        {
+            let connection =
+                Connection::open(&path).expect("v4 fixture database should open directly");
+            connection
+                .execute_batch(CONFIGURE_SQL)
+                .expect("v4 fixture pragmas should apply");
+            connection
+                .execute_batch(CREATE_MIGRATIONS_TABLE_SQL)
+                .expect("v4 fixture migration table should create");
+            for migration in MIGRATIONS.iter().take(4) {
+                connection
+                    .execute_batch(migration.sql)
+                    .expect("v4 fixture migration should apply");
+                connection
+                    .execute(
+                        "INSERT INTO connection_schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        params![migration.version, timestamp],
+                    )
+                    .expect("v4 fixture migration should record");
+            }
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_records (
+                        id, schema_version, source, spec_json, connection_revision,
+                        credential_revision, tls_revision, discovery_revision,
+                        status_revision, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, 1, 0, 0, 1, 0, ?5, ?5)
+                    "#,
+                    params![
+                        connection_id.as_str(),
+                        CONNECTION_SCHEMA_VERSION,
+                        SOURCE_MANAGED,
+                        spec_json,
+                        timestamp,
+                    ],
+                )
+                .expect("v4 fixture Connection should insert");
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_mcp_catalogs (
+                        connection_id, catalog_revision, observed_etag, refreshed_at, entry_count
+                    ) VALUES (?1, 1, '"fixture-etag"', ?2, 1)
+                    "#,
+                    params![connection_id.as_str(), timestamp],
+                )
+                .expect("v4 fixture catalog should insert");
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_mcp_catalog_entries (
+                        connection_id, remote_tool_name, description, input_schema_json, ordinal
+                    ) VALUES (?1, 'alpha', 'Alpha', '{}', 0)
+                    "#,
+                    params![connection_id.as_str()],
+                )
+                .expect("v4 fixture catalog entry should insert");
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_dependencies (
+                        connection_id, consumer_kind, consumer_id, created_at
+                    ) VALUES (?1, 'managed_tool', ?2, ?3)
+                    "#,
+                    params![
+                        connection_id.as_str(),
+                        format!("{}:alpha", connection_id.as_str()),
+                        timestamp
+                    ],
+                )
+                .expect("v4 fixture dependency should insert");
+        }
+
+        let store =
+            SqliteConnectionStore::open(&path).expect("migration 5 should upgrade populated v4");
+        assert_eq!(
+            store
+                .mcp_catalog(&connection_id)
+                .expect("migrated MCP catalog should load")
+                .expect("migrated MCP catalog should remain")
+                .entries
+                .len(),
+            1
+        );
+        assert!(store
+            .openapi_catalogs()
+            .expect("new OpenAPI catalog table should load")
+            .is_empty());
+        let connection = store.connection_guard();
+        let versions = connection
+            .prepare("SELECT version FROM connection_schema_migrations ORDER BY version")
+            .expect("migration query should prepare")
+            .query_map([], |row| row.get::<_, u32>(0))
+            .expect("migration query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("migration rows should read");
+        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -3134,6 +4213,495 @@ mod tests {
                 .is_empty(),
             "converted and deleted Connections must leave no durable catalog rows"
         );
+    }
+
+    #[test]
+    fn openapi_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
+        let (_directory, path, store) = temporary_store("openapi-catalog");
+        let created = store
+            .create(candidate())
+            .expect("OpenAPI Connection should create");
+        let first_spec = r#"{"openapi":"3.1.0","info":{"title":"First","version":"1"}}"#;
+        let first_digest = spec_digest(first_spec);
+        let first = store
+            .replace_openapi_catalog(
+                &created.id,
+                &created.etag(),
+                0,
+                0,
+                first_spec,
+                &first_digest,
+                &[
+                    openapi_catalog_entry("alpha"),
+                    openapi_catalog_entry("beta"),
+                ],
+            )
+            .expect("first OpenAPI catalog should publish");
+        assert_eq!(first.spec_revision, 1);
+        assert_eq!(first.catalog_revision, 1);
+        assert_eq!(
+            first.entries[0].selected_scheme_names,
+            vec!["api_key".to_owned(), "oauth".to_owned()]
+        );
+        assert_eq!(
+            store
+                .dependencies(&created.id)
+                .expect("OpenAPI dependencies should load")
+                .into_iter()
+                .filter(|dependency| dependency.kind == ConnectionDependencyKind::ManagedTool)
+                .map(|dependency| dependency.consumer_id)
+                .collect::<Vec<_>>(),
+            vec!["alpha".to_owned(), "beta".to_owned()]
+        );
+
+        assert!(matches!(
+            store.replace_openapi_catalog(
+                &created.id,
+                &created.etag(),
+                0,
+                1,
+                first_spec,
+                &first_digest,
+                &[openapi_catalog_entry("stale")],
+            ),
+            Err(ConnectionStoreError::Conflict { .. })
+        ));
+        assert!(matches!(
+            store.replace_openapi_catalog(
+                &created.id,
+                &created.etag(),
+                1,
+                1,
+                first_spec,
+                &"0".repeat(SHA256_HEX_CHARS),
+                &[openapi_catalog_entry("invalid-digest")],
+            ),
+            Err(ConnectionStoreError::Validation { .. })
+        ));
+        assert_eq!(
+            store
+                .openapi_catalog(&created.id)
+                .expect("retained OpenAPI catalog should load")
+                .expect("retained OpenAPI catalog should remain"),
+            first
+        );
+
+        let second = store
+            .replace_openapi_catalog(
+                &created.id,
+                &created.etag(),
+                1,
+                1,
+                first_spec,
+                &first_digest,
+                &[openapi_catalog_entry("gamma")],
+            )
+            .expect("same-spec OpenAPI catalog should publish");
+        assert_eq!(second.spec_revision, 1);
+        assert_eq!(second.catalog_revision, 2);
+
+        let second_spec = r#"{"openapi":"3.1.0","info":{"title":"Second","version":"2"}}"#;
+        let second_digest = spec_digest(second_spec);
+        let third = store
+            .replace_openapi_catalog(
+                &created.id,
+                &created.etag(),
+                1,
+                2,
+                second_spec,
+                &second_digest,
+                &[openapi_catalog_entry("delta")],
+            )
+            .expect("changed-spec OpenAPI catalog should publish");
+        assert_eq!(third.spec_revision, 2);
+        assert_eq!(third.catalog_revision, 3);
+
+        let mut duplicate = openapi_catalog_entry("duplicate");
+        duplicate.operation_id = None;
+        assert!(matches!(
+            store.replace_openapi_catalog(
+                &created.id,
+                &created.etag(),
+                2,
+                3,
+                second_spec,
+                &second_digest,
+                &[duplicate.clone(), duplicate],
+            ),
+            Err(ConnectionStoreError::Validation { .. })
+        ));
+        assert_eq!(
+            store
+                .openapi_catalog(&created.id)
+                .expect("catalog should load after failed replacement")
+                .expect("catalog should survive failed replacement"),
+            third
+        );
+
+        let mut compatible = created.write.clone();
+        compatible.display_name = "Renamed OpenAPI".to_owned();
+        let replaced = store
+            .replace(&created.id, &created.etag(), compatible)
+            .expect("compatible OpenAPI update should retain catalog");
+        assert_eq!(
+            store
+                .openapi_catalog(&created.id)
+                .expect("retained catalog should load")
+                .expect("compatible update should retain catalog"),
+            third
+        );
+
+        let mut incompatible = replaced.write.clone();
+        incompatible.discovery = None;
+        assert!(matches!(
+            store.replace(&replaced.id, &replaced.etag(), incompatible),
+            Err(ConnectionStoreError::DependencyConflict { count: 1, .. })
+        ));
+        drop(store);
+
+        let reopened =
+            SqliteConnectionStore::open(&path).expect("OpenAPI catalog store should reopen");
+        assert_eq!(
+            reopened
+                .openapi_catalog(&created.id)
+                .expect("reopened OpenAPI catalog should load"),
+            Some(third)
+        );
+    }
+
+    #[test]
+    fn empty_openapi_catalog_is_removed_on_incompatible_update_and_delete_cascades() {
+        let (_directory, path, store) = temporary_store("empty-openapi-catalog-cleanup");
+        let source = store
+            .create(candidate())
+            .expect("convertible OpenAPI Connection should create");
+        let spec = r#"{"openapi":"3.1.0","info":{"title":"Empty","version":"1"}}"#;
+        let digest = spec_digest(spec);
+        store
+            .replace_openapi_catalog(&source.id, &source.etag(), 0, 0, spec, &digest, &[])
+            .expect("empty OpenAPI catalog should publish");
+        let converted = store
+            .replace(&source.id, &source.etag(), mcp_candidate())
+            .expect("empty OpenAPI catalog should permit cross-kind update");
+        assert!(store
+            .openapi_catalog(&converted.id)
+            .expect("converted catalog lookup should work")
+            .is_none());
+        store
+            .delete(&converted.id, &converted.etag())
+            .expect("converted Connection should delete");
+
+        let deleted = store
+            .create(candidate())
+            .expect("deletable OpenAPI Connection should create");
+        store
+            .replace_openapi_catalog(&deleted.id, &deleted.etag(), 0, 0, spec, &digest, &[])
+            .expect("deletable empty OpenAPI catalog should publish");
+        store
+            .delete(&deleted.id, &deleted.etag())
+            .expect("empty OpenAPI catalog should cascade on delete");
+        drop(store);
+
+        let reopened =
+            SqliteConnectionStore::open(&path).expect("cleaned OpenAPI store should reopen");
+        assert!(reopened
+            .openapi_catalogs()
+            .expect("OpenAPI catalogs should load")
+            .is_empty());
+    }
+
+    #[test]
+    fn combined_mcp_and_openapi_catalog_bound_is_enforced_in_both_replacements() {
+        let (_directory, _path, store) = temporary_store("combined-catalog-bound");
+        let mcp = store
+            .create(mcp_candidate())
+            .expect("MCP Connection should create");
+        let openapi = store
+            .create(candidate())
+            .expect("OpenAPI Connection should create");
+        let spec = r#"{"openapi":"3.1.0","info":{"title":"Bound","version":"1"}}"#;
+        let digest = spec_digest(spec);
+        store
+            .replace_openapi_catalog(
+                &openapi.id,
+                &openapi.etag(),
+                0,
+                0,
+                spec,
+                &digest,
+                &[
+                    openapi_catalog_entry("openapi-a"),
+                    openapi_catalog_entry("openapi-b"),
+                ],
+            )
+            .expect("small OpenAPI catalog should publish");
+        let oversized_mcp = (0..(MAX_CATALOG_ENTRIES - 1))
+            .map(|index| mcp_catalog_entry(&format!("m{index:04}"), "Bounded"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            store.replace_mcp_catalog(&mcp.id, &mcp.etag(), &oversized_mcp),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection catalog entries",
+                ..
+            })
+        ));
+
+        let bounded_mcp = oversized_mcp
+            .into_iter()
+            .take(MAX_CATALOG_ENTRIES - 2)
+            .collect::<Vec<_>>();
+        store
+            .replace_mcp_catalog(&mcp.id, &mcp.etag(), &bounded_mcp)
+            .expect("combined catalog at the exact limit should publish");
+        assert!(matches!(
+            store.replace_openapi_catalog(
+                &openapi.id,
+                &openapi.etag(),
+                1,
+                1,
+                spec,
+                &digest,
+                &[
+                    openapi_catalog_entry("openapi-a"),
+                    openapi_catalog_entry("openapi-b"),
+                    openapi_catalog_entry("openapi-c"),
+                ],
+            ),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection catalog entries",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn aggregate_openapi_definition_byte_bound_preserves_prior_catalogs() {
+        let (_directory, _path, store) = temporary_store("openapi-aggregate-byte-bound");
+        let first = store
+            .create(candidate())
+            .expect("first OpenAPI Connection should create");
+        let mut second_candidate = candidate();
+        second_candidate.display_name = "Second OpenAPI".to_owned();
+        let second = store
+            .create(second_candidate)
+            .expect("second OpenAPI Connection should create");
+        let spec = r#"{"openapi":"3.1.0","info":{"title":"Bytes","version":"1"}}"#;
+        let digest = spec_digest(spec);
+
+        let first_entries = openapi_catalog_entries_with_minimum_bytes(
+            "first",
+            MAX_MANAGED_OPENAPI_CATALOG_BYTES / 2 + 1,
+        );
+        let first_catalog = store
+            .replace_openapi_catalog(
+                &first.id,
+                &first.etag(),
+                0,
+                0,
+                spec,
+                &digest,
+                &first_entries,
+            )
+            .expect("first catalog below the aggregate bound should publish");
+        drop(first_entries);
+
+        let second_entries = openapi_catalog_entries_with_minimum_bytes(
+            "second",
+            MAX_MANAGED_OPENAPI_CATALOG_BYTES / 2 + 1,
+        );
+        assert!(matches!(
+            store.replace_openapi_catalog(
+                &second.id,
+                &second.etag(),
+                0,
+                0,
+                spec,
+                &digest,
+                &second_entries,
+            ),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection OpenAPI catalog definition bytes",
+                maximum: MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+            })
+        ));
+        drop(second_entries);
+        assert_eq!(
+            store
+                .openapi_catalog(&first.id)
+                .expect("first catalog should load"),
+            Some(first_catalog)
+        );
+        assert!(store
+            .openapi_catalog(&second.id)
+            .expect("second catalog lookup should work")
+            .is_none());
+        assert!(store
+            .dependencies(&second.id)
+            .expect("second dependencies should load")
+            .is_empty());
+
+        let oversized = openapi_catalog_entries_with_minimum_bytes(
+            "oversized",
+            MAX_MANAGED_OPENAPI_CATALOG_BYTES + 1,
+        );
+        assert!(matches!(
+            store.replace_openapi_catalog(
+                &second.id,
+                &second.etag(),
+                0,
+                0,
+                spec,
+                &digest,
+                &oversized,
+            ),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection OpenAPI catalog definition bytes",
+                maximum: MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+            })
+        ));
+        assert!(store
+            .openapi_catalog(&second.id)
+            .expect("pre-transaction rejection should leave no catalog")
+            .is_none());
+    }
+
+    #[test]
+    fn aggregate_openapi_definition_byte_corruption_is_rejected_on_restart() {
+        let (_directory, path, store) = temporary_store("openapi-byte-corrupt-restart");
+        let created = store
+            .create(candidate())
+            .expect("OpenAPI Connection should create");
+        let spec = r#"{"openapi":"3.1.0","info":{"title":"Bytes","version":"1"}}"#;
+        let digest = spec_digest(spec);
+        store
+            .replace_openapi_catalog(&created.id, &created.etag(), 0, 0, spec, &digest, &[])
+            .expect("empty OpenAPI catalog should publish");
+        drop(store);
+
+        let entries = openapi_catalog_entries_with_minimum_bytes(
+            "corrupt",
+            MAX_MANAGED_OPENAPI_CATALOG_BYTES + 1,
+        );
+        let mut connection =
+            Connection::open(&path).expect("catalog database should open directly");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("corruption fixture transaction should begin");
+        for (ordinal, entry) in entries.iter().enumerate() {
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO connection_openapi_catalog_entries (
+                        connection_id, tool_name, operation_id,
+                        selected_scheme_names_json, definition_json, ordinal
+                    ) VALUES (?1, ?2, ?3, '[]', ?4, ?5)
+                    "#,
+                    params![
+                        created.id.as_str(),
+                        entry.tool_name,
+                        entry.operation_id,
+                        serde_json::to_string(&entry.definition)
+                            .expect("corrupt fixture definition should serialize"),
+                        i64::try_from(ordinal).expect("fixture ordinal should fit SQLite"),
+                    ],
+                )
+                .expect("oversized aggregate fixture entry should insert");
+        }
+        transaction
+            .execute(
+                r#"
+                UPDATE connection_openapi_catalogs
+                SET entry_count = ?1
+                WHERE connection_id = ?2
+                "#,
+                params![
+                    i64::try_from(entries.len()).expect("fixture count should fit SQLite"),
+                    created.id.as_str()
+                ],
+            )
+            .expect("oversized aggregate fixture count should update");
+        transaction
+            .commit()
+            .expect("corruption fixture transaction should commit");
+        drop(connection);
+
+        assert!(matches!(
+            SqliteConnectionStore::open(&path),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection OpenAPI catalog definition bytes",
+                maximum: MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+            })
+        ));
+    }
+
+    #[test]
+    fn orphan_managed_tool_dependency_is_rejected_on_restart() {
+        let (_directory, path, store) = temporary_store("orphan-managed-tool-restart");
+        let created = store.create(candidate()).expect("Connection should create");
+        drop(store);
+
+        let connection = Connection::open(&path).expect("database should open directly");
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("foreign keys should enable");
+        connection
+            .execute(
+                r#"
+                INSERT INTO connection_dependencies (
+                    connection_id, consumer_kind, consumer_id, created_at
+                ) VALUES (?1, 'managed_tool', 'orphan-tool', ?2)
+                "#,
+                params![
+                    created.id.as_str(),
+                    utc_timestamp().expect("fixture timestamp should format")
+                ],
+            )
+            .expect("orphan dependency fixture should insert");
+        drop(connection);
+
+        assert!(matches!(
+            SqliteConnectionStore::open(&path),
+            Err(ConnectionStoreError::CorruptRecord {
+                id,
+                reason: "managed tool dependencies do not match durable catalog entries",
+            }) if id == "<catalog-dependencies>"
+        ));
+    }
+
+    #[test]
+    fn corrupt_openapi_catalog_definition_is_rejected_on_restart() {
+        let (_directory, path, store) = temporary_store("openapi-corrupt-restart");
+        let created = store
+            .create(candidate())
+            .expect("OpenAPI Connection should create");
+        let spec = r#"{"openapi":"3.1.0","info":{"title":"Corrupt","version":"1"}}"#;
+        let digest = spec_digest(spec);
+        store
+            .replace_openapi_catalog(
+                &created.id,
+                &created.etag(),
+                0,
+                0,
+                spec,
+                &digest,
+                &[openapi_catalog_entry("alpha")],
+            )
+            .expect("OpenAPI catalog should publish");
+        drop(store);
+
+        let connection = Connection::open(&path).expect("catalog database should open directly");
+        connection
+            .execute(
+                r#"
+                UPDATE connection_openapi_catalog_entries
+                SET definition_json = '{}'
+                WHERE connection_id = ?1
+                "#,
+                params![created.id.as_str()],
+            )
+            .expect("corrupt definition fixture should write");
+        drop(connection);
+        assert!(SqliteConnectionStore::open(&path).is_err());
     }
 
     #[test]

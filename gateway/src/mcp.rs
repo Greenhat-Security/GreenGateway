@@ -27,7 +27,7 @@ use crate::{
     egress::EgressResponse,
     tools::{
         definitions::{ToolDefinition, ToolRegistry},
-        executor::{ToolExecutionResult, ToolExecutor, ToolExecutorError},
+        executor::{ToolConnectionRuntimes, ToolExecutionResult, ToolExecutor, ToolExecutorError},
         runtime::{ToolInvocationContext, ToolRuntimeError},
     },
 };
@@ -630,11 +630,13 @@ pub(crate) fn mcp_executor_from_config(
     registry: ToolRegistry,
     runtime: crate::tools::runtime::ToolRuntime,
     egress_client: Arc<crate::egress::EgressClient>,
-    connection_http: Option<crate::connections::http::ConnectionHttpRuntime>,
-    mcp_catalog_runtime: Option<crate::connections::mcp::McpConnectionCatalogRuntime>,
+    connection_runtimes: ToolConnectionRuntimes,
     audit: crate::audit::AuditLog,
 ) -> Result<Option<ToolExecutor>, ToolExecutorError> {
-    if registry.list().is_empty() && mcp_catalog_runtime.is_none() {
+    if registry.list().is_empty()
+        && connection_runtimes.mcp_catalog.is_none()
+        && connection_runtimes.openapi_catalog.is_none()
+    {
         return Ok(None);
     }
 
@@ -643,8 +645,7 @@ pub(crate) fn mcp_executor_from_config(
         registry,
         runtime,
         egress_client,
-        connection_http,
-        mcp_catalog_runtime,
+        connection_runtimes,
         audit,
     )
     .map(Some)
@@ -678,8 +679,7 @@ mod tests {
             registry,
             runtime,
             egress_client,
-            None,
-            None,
+            ToolConnectionRuntimes::default(),
             test_audit_log(),
         )
         .expect("empty registry should be a valid no-executor configuration");

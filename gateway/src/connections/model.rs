@@ -11,6 +11,7 @@ pub const MAX_CONNECTIONS: usize = 256;
 pub const MAX_CREDENTIALS: usize = 512;
 pub const MAX_MANAGED_SPEC_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CATALOG_ENTRIES: usize = 4_096;
+pub const MAX_MANAGED_OPENAPI_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_STATUS_HISTORY_ROWS: usize = 4_096;
 pub const MAX_CONCURRENT_REFRESHES: usize = 4;
 pub const MAX_CONNECTION_ID_BYTES: usize = 128;
