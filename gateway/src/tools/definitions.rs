@@ -131,6 +131,30 @@ impl ToolDefinition {
             upstream: UpstreamMapping::mcp_proxy(server_name, tool_name),
         }
     }
+
+    pub fn mcp_connection(
+        connection_id: String,
+        description: String,
+        input_schema: Value,
+        remote_tool_name: String,
+    ) -> Self {
+        let mut definition = Self::mcp_proxy(
+            format!("{connection_id}:{remote_tool_name}"),
+            description,
+            input_schema,
+            connection_id.clone(),
+            remote_tool_name.clone(),
+        );
+        definition.target = Some(ToolTarget::Mcp {
+            connection_id: connection_id.clone(),
+            remote_tool_name: remote_tool_name.clone(),
+        });
+        definition.source = ToolSource::Mcp {
+            connection_id,
+            remote_tool_name,
+        };
+        definition
+    }
 }
 
 impl HttpToolMapping {
@@ -210,6 +234,12 @@ pub enum ToolRegistryError {
     Invalid {
         problems: Vec<String>,
     },
+}
+
+#[derive(Debug)]
+pub enum McpCatalogPublishError<E> {
+    Registry(ToolRegistryError),
+    Persist(E),
 }
 
 impl ToolRegistryError {
@@ -396,6 +426,76 @@ impl ToolRegistry {
         Ok(())
     }
 
+    pub fn replace_mcp_connection_catalog<E>(
+        &self,
+        connection_id: &str,
+        definitions: Vec<ToolDefinition>,
+        persist: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), McpCatalogPublishError<E>> {
+        if definitions.iter().any(|definition| {
+            !matches!(
+                &definition.source,
+                ToolSource::Mcp {
+                    connection_id: source_connection_id,
+                    ..
+                } if source_connection_id == connection_id
+            ) || !matches!(
+                &definition.target,
+                Some(ToolTarget::Mcp {
+                    connection_id: target_connection_id,
+                    ..
+                }) if target_connection_id == connection_id
+            )
+        }) {
+            return Err(McpCatalogPublishError::Registry(
+                ToolRegistryError::invalid(vec![
+                    "managed MCP catalog contains a definition for a different connection"
+                        .to_owned(),
+                ]),
+            ));
+        }
+
+        let _guard = match self.write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let state = self.state.load();
+        let local_definitions = state.local_definitions.clone();
+        let mut mcp_proxy_definitions = state
+            .mcp_proxy_definitions
+            .iter()
+            .filter(|definition| {
+                !matches!(
+                    &definition.source,
+                    ToolSource::Mcp {
+                        connection_id: source_connection_id,
+                        ..
+                    } if source_connection_id == connection_id
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(state);
+        mcp_proxy_definitions.extend(definitions);
+
+        let merged = combined_definitions(&local_definitions, &mcp_proxy_definitions);
+        let semantic_problems = tool_definition_problems(&merged);
+        if !semantic_problems.is_empty() {
+            return Err(McpCatalogPublishError::Registry(
+                ToolRegistryError::invalid(semantic_problems),
+            ));
+        }
+        self.validate_definitions(&merged)
+            .map_err(McpCatalogPublishError::Registry)?;
+        persist().map_err(McpCatalogPublishError::Persist)?;
+        self.state
+            .store(Arc::new(ToolRegistryState::from_definition_sources(
+                local_definitions,
+                mcp_proxy_definitions,
+            )));
+        Ok(())
+    }
+
     fn from_definitions_with_audit(
         definitions: Vec<ToolDefinition>,
         audit: Option<AuditLog>,
@@ -446,16 +546,25 @@ impl ToolRegistry {
         self.replace_definition_sources_locked(local_definitions, mcp_proxy_definitions)
     }
 
-    fn replace_definition_sources(
+    fn replace_local_and_legacy_mcp_definitions(
         &self,
         local_definitions: Vec<ToolDefinition>,
-        mcp_proxy_definitions: Vec<ToolDefinition>,
+        legacy_mcp_proxy_definitions: Vec<ToolDefinition>,
     ) -> Result<(), ToolRegistryError> {
         let _guard = match self.write_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-
+        let state = self.state.load();
+        let managed_mcp_proxy_definitions = state
+            .mcp_proxy_definitions
+            .iter()
+            .filter(|definition| matches!(definition.source, ToolSource::Mcp { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(state);
+        let mut mcp_proxy_definitions = legacy_mcp_proxy_definitions;
+        mcp_proxy_definitions.extend(managed_mcp_proxy_definitions);
         self.replace_definition_sources_locked(local_definitions, mcp_proxy_definitions)
     }
 
@@ -611,9 +720,8 @@ fn reload_tool_registry_from_file_with_optional_mcp_proxy_definitions(
         Ok(definitions) => {
             let tool_count = definitions.len();
             let replace_result = match mcp_proxy_definitions {
-                Some(mcp_proxy_definitions) => {
-                    registry.replace_definition_sources(definitions, mcp_proxy_definitions)
-                }
+                Some(mcp_proxy_definitions) => registry
+                    .replace_local_and_legacy_mcp_definitions(definitions, mcp_proxy_definitions),
                 None => registry.replace_local_definitions(definitions),
             };
             if let Err(err) = replace_result {
@@ -2025,6 +2133,55 @@ mod tests {
             "refreshed MCP proxy set should prune missing proxy tools"
         );
         assert_eq!(registry.list().len(), 3);
+    }
+
+    #[test]
+    fn managed_mcp_catalog_publish_is_atomic_and_legacy_reload_preserves_it() {
+        let connection_id = "11111111-1111-4111-8111-111111111111";
+        let registry = ToolRegistry::disabled();
+        registry
+            .merge_definitions(vec![ToolDefinition::mcp_connection(
+                connection_id.to_owned(),
+                "Original managed tool".to_owned(),
+                json!({"type": "object", "properties": {}}),
+                "alpha".to_owned(),
+            )])
+            .expect("managed MCP tool should merge");
+
+        let mut persisted = false;
+        let result = registry.replace_mcp_connection_catalog(
+            connection_id,
+            vec![ToolDefinition::mcp_connection(
+                connection_id.to_owned(),
+                "Invalid replacement".to_owned(),
+                json!({"type": 7}),
+                "beta".to_owned(),
+            )],
+            || {
+                persisted = true;
+                Ok::<(), ()>(())
+            },
+        );
+        assert!(matches!(result, Err(McpCatalogPublishError::Registry(_))));
+        assert!(!persisted, "invalid candidate must not reach persistence");
+        assert!(registry.get(&format!("{connection_id}:alpha")).is_some());
+        assert!(registry.get(&format!("{connection_id}:beta")).is_none());
+
+        registry
+            .replace_local_and_legacy_mcp_definitions(
+                Vec::new(),
+                vec![mcp_proxy_tool(
+                    "weather:get_forecast",
+                    "weather",
+                    "get_forecast",
+                )],
+            )
+            .expect("legacy MCP refresh should publish");
+        assert!(registry.get("weather:get_forecast").is_some());
+        assert!(
+            registry.get(&format!("{connection_id}:alpha")).is_some(),
+            "legacy rediscovery must retain managed MCP catalogs"
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ use super::{
     control_plane::ConnectionControlPlane,
     model::{
         normalize_origin_relative_path, ConnectionAuthentication, ConnectionId, ConnectionKind,
-        OAuthClientAuthMethod, MAX_CONNECTIONS, MAX_URL_BYTES,
+        DiscoveryConfig, OAuthClientAuthMethod, MAX_CONNECTIONS, MAX_URL_BYTES,
     },
     oauth::{
         OAuthBinding, OAuthClientCredentialsRuntime, OAuthError, OAuthTokenLease,
@@ -47,6 +47,7 @@ impl fmt::Debug for ConnectionHttpRuntime {
 
 pub struct ConnectionHttpTarget {
     connection_id: ConnectionId,
+    connection_etag: String,
     url: String,
     client: Arc<EgressClient>,
     authentication: HttpAuthenticationBinding,
@@ -154,6 +155,36 @@ impl ConnectionHttpRuntime {
 
         Ok(ConnectionHttpTarget {
             connection_id,
+            connection_etag: record.etag().to_string(),
+            url,
+            client,
+            authentication,
+        })
+    }
+
+    pub fn mcp_target(
+        &self,
+        connection_id: &str,
+    ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
+        let connection_id = ConnectionId::parse(connection_id.to_owned())
+            .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
+        let snapshot = self.control_plane.runtime_snapshot();
+        let record = snapshot
+            .managed()
+            .get(&connection_id)
+            .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        let use_connection_authentication = validate_mcp_connection(record)?;
+        let url = connection_target_url(record, "/")?;
+        let client = self.client_for(record)?;
+        let authentication = if use_connection_authentication {
+            self.authentication_binding(record)?
+        } else {
+            HttpAuthenticationBinding::None
+        };
+
+        Ok(ConnectionHttpTarget {
+            connection_id,
+            connection_etag: record.etag().to_string(),
             url,
             client,
             authentication,
@@ -359,6 +390,10 @@ impl ConnectionHttpTarget {
         &self.connection_id
     }
 
+    pub fn connection_etag(&self) -> &str {
+        &self.connection_etag
+    }
+
     pub fn url(&self) -> &str {
         &self.url
     }
@@ -426,6 +461,20 @@ impl ResolvedConnectionCredential {
     pub fn is_oauth(&self) -> bool {
         matches!(self.material, ResolvedCredentialMaterial::OAuthBearer(_))
     }
+
+    #[cfg(test)]
+    pub(crate) fn header_api_key_for_test(
+        header_name: HeaderName,
+        value: &[u8],
+    ) -> ResolvedConnectionCredential {
+        ResolvedConnectionCredential {
+            material: ResolvedCredentialMaterial::HeaderApiKey {
+                header_name,
+                secret: ResolvedSecret::new(SecretPurpose::HeaderApiKey, value.to_vec())
+                    .expect("test API-key material should be valid"),
+            },
+        }
+    }
 }
 
 impl ConnectionHttpError {
@@ -488,6 +537,47 @@ fn validate_http_connection(record: &StoredConnection) -> Result<(), ConnectionH
             client_auth_method: OAuthClientAuthMethod::ClientSecretBasic,
             ..
         } => Ok(()),
+        ConnectionAuthentication::HeaderApiKey {
+            secret_id: None, ..
+        }
+        | ConnectionAuthentication::StaticBearer { secret_id: None }
+        | ConnectionAuthentication::OAuth2ClientCredentials {
+            client_secret_id: None,
+            ..
+        } => Err(ConnectionHttpError::UnsupportedAuthentication),
+    }
+}
+
+fn validate_mcp_connection(record: &StoredConnection) -> Result<bool, ConnectionHttpError> {
+    if !record.write.enabled {
+        return Err(ConnectionHttpError::ConnectionDisabled);
+    }
+    if record.write.kind != ConnectionKind::McpStreamableHttp {
+        return Err(ConnectionHttpError::WrongConnectionKind);
+    }
+    if !record.write.tls.is_empty() {
+        return Err(ConnectionHttpError::UnsupportedTls);
+    }
+    let use_connection_authentication = match &record.write.discovery {
+        Some(DiscoveryConfig::ManagedMcp {
+            use_connection_authentication,
+        }) => *use_connection_authentication,
+        _ => return Err(ConnectionHttpError::WrongConnectionKind),
+    };
+    if !use_connection_authentication {
+        return Ok(false);
+    }
+    match &record.write.authentication {
+        ConnectionAuthentication::None
+        | ConnectionAuthentication::HeaderApiKey {
+            secret_id: Some(_), ..
+        }
+        | ConnectionAuthentication::StaticBearer { secret_id: Some(_) }
+        | ConnectionAuthentication::OAuth2ClientCredentials {
+            client_secret_id: Some(_),
+            client_auth_method: OAuthClientAuthMethod::ClientSecretBasic,
+            ..
+        } => Ok(true),
         ConnectionAuthentication::HeaderApiKey {
             secret_id: None, ..
         }

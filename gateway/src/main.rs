@@ -95,6 +95,7 @@ const TOKEN_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}";
 const TOKEN_ROTATE_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}/rotate";
 const CONNECTIONS_ADMIN_ROUTE: &str = "/v1/admin/connections";
 const CONNECTION_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}";
+const CONNECTION_REFRESH_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/refresh";
 const CONNECTION_COLLECTION_ETAG_HEADER: &str = "x-greengateway-connections-etag";
 const TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/preview";
 const TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/register";
@@ -216,6 +217,7 @@ struct AdminRoutes {
     token_rotate_route: String,
     connections_route: String,
     connection_route: String,
+    connection_refresh_route: String,
     tools_openapi_preview_route: String,
     tools_openapi_register_route: String,
     schema_coverage_route: String,
@@ -339,6 +341,7 @@ impl AdminRoutes {
             token_rotate_route: format!("{api_prefix}/tokens/{{id}}/rotate"),
             connections_route: format!("{api_prefix}/connections"),
             connection_route: format!("{api_prefix}/connections/{{id}}"),
+            connection_refresh_route: format!("{api_prefix}/connections/{{id}}/refresh"),
             tools_openapi_preview_route: format!("{api_prefix}/tools/openapi/preview"),
             tools_openapi_register_route: format!("{api_prefix}/tools/openapi/register"),
             schema_coverage_route: format!("{api_prefix}/schema/coverage"),
@@ -402,6 +405,7 @@ struct TokenAdminState {
 #[derive(Clone)]
 struct ConnectionAdminState {
     control_plane: connections::control_plane::ConnectionControlPlane,
+    mcp_catalogs: connections::mcp::McpConnectionCatalogService,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
     client_ip_policy: client_ip::ClientIpPolicy,
@@ -1517,6 +1521,14 @@ fn gateway_app_with_process_started_at_and_overrides(
     let mcp_upstream_definitions =
         tools::mcp_upstream::discover_upstream_tools_blocking(&config, Arc::clone(&egress_client))?;
     tool_registry.merge_definitions(mcp_upstream_definitions)?;
+    let mcp_catalog_service = connections::mcp::McpConnectionCatalogService::load(
+        connection_control_plane.clone(),
+        connection_http_runtime.clone(),
+        tool_registry.clone(),
+    )?;
+    let mcp_catalog_runtime = connection_control_plane
+        .is_managed_store_configured()
+        .then(|| mcp_catalog_service.runtime());
     let mcp_proxy_definitions_provider =
         mcp_proxy_definitions_provider(&config, Arc::clone(&egress_client));
     if let Some(tools_file) = config.tools_file.as_ref() {
@@ -1538,6 +1550,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         tool_runtime,
         Arc::clone(&egress_client),
         Some(connection_http_runtime.clone()),
+        mcp_catalog_runtime,
         audit_log.clone(),
     )?;
     let client_ip_policy = client_ip::ClientIpPolicy::from_config(&config);
@@ -1576,6 +1589,7 @@ fn gateway_app_with_process_started_at_and_overrides(
     };
     let connection_admin_state = ConnectionAdminState {
         control_plane: connection_control_plane.clone(),
+        mcp_catalogs: mcp_catalog_service,
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
@@ -2271,6 +2285,10 @@ fn add_admin_api_routes(
                     get(connection_get_endpoint)
                         .put(connection_put_endpoint)
                         .delete(connection_delete_endpoint),
+                )
+                .route(
+                    routes.admin.connection_refresh_route.as_str(),
+                    post(connection_refresh_endpoint),
                 )
                 .with_state(admin_api_states.connections),
         )
@@ -3091,6 +3109,10 @@ async fn connection_put_endpoint(
         }
         Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
     }
+    let _catalog_lifecycle = match state.mcp_catalogs.begin_connection_mutation(&id) {
+        Ok(guard) => guard,
+        Err(error) => return connection_refresh_error_response(error),
+    };
 
     let changed_fields =
         connections::admin::changed_connection_fields(Some(&current.write), Some(&candidate));
@@ -3105,6 +3127,7 @@ async fn connection_put_endpoint(
         Ok(updated) => updated,
         Err(error) => return connection_mutation_error_response(error),
     };
+    state.mcp_catalogs.reconcile_connection(&updated);
     if !changed_fields.is_empty() {
         emit_connection_changed(
             &state,
@@ -3208,10 +3231,15 @@ async fn connection_delete_endpoint(
         }
         Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
     }
+    let _catalog_lifecycle = match state.mcp_catalogs.begin_connection_mutation(&id) {
+        Ok(guard) => guard,
+        Err(error) => return connection_refresh_error_response(error),
+    };
 
     if let Err(error) = state.control_plane.delete_managed(&id, &current_etag) {
         return connection_mutation_error_response(error);
     }
+    state.mcp_catalogs.remove_connection(&id);
     let changed_fields = connections::admin::changed_connection_fields(Some(&current.write), None);
     emit_connection_changed(
         &state,
@@ -3233,6 +3261,105 @@ async fn connection_delete_endpoint(
             .into_response(),
         new_snapshot.collection_etag(),
     )
+}
+
+async fn connection_refresh_endpoint(
+    State(state): State<ConnectionAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_REFRESH_ADMIN_ROUTE);
+
+    let started = Instant::now();
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) =
+        authorized_connection_state(&state, &principal, ADMIN_CONNECTIONS_REFRESH_PERMISSION)
+    {
+        return connection_admin_authz_error_response(error);
+    }
+    if !state.control_plane.is_managed_store_configured() {
+        return connection_store_not_configured();
+    }
+    let body = match read_request_body(body, connection_admin_body_limit(&state)).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if !body.is_empty() {
+        return bad_request("connection refresh does not accept a request body");
+    }
+    let id = match connections::model::ConnectionId::parse(raw_id) {
+        Ok(id) => id,
+        Err(_) => return not_found("connection was not found"),
+    };
+    let snapshot = state.control_plane.runtime_snapshot();
+    let Some(record) = snapshot.managed().get(&id) else {
+        if snapshot
+            .legacy()
+            .iter()
+            .any(|projection| projection.id() == &id)
+        {
+            return conflict("legacy connection projections are read-only");
+        }
+        return not_found("connection was not found");
+    };
+    let current_etag = record.etag();
+    match if_match_matches(&parts.headers, current_etag.as_str()) {
+        Ok(true) => {}
+        Ok(false) => {
+            return with_etag(
+                precondition_failed("If-Match does not match the current connection ETag"),
+                current_etag.as_str(),
+            );
+        }
+        Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
+    }
+
+    match state
+        .mcp_catalogs
+        .refresh(id.as_str(), current_etag.as_str())
+        .await
+    {
+        Ok(result) => {
+            emit_connection_refreshed(
+                &state,
+                &parts,
+                &principal,
+                record,
+                "success",
+                None,
+                started.elapsed(),
+                Some(&result),
+            );
+            (
+                StatusCode::OK,
+                [
+                    (header::ETAG, etag_header_value(current_etag.as_str())),
+                    (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                ],
+                Json(result),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            emit_connection_refreshed(
+                &state,
+                &parts,
+                &principal,
+                record,
+                "failure",
+                Some(error.safe_reason()),
+                started.elapsed(),
+                None,
+            );
+            with_etag(
+                connection_refresh_error_response(error),
+                current_etag.as_str(),
+            )
+        }
+    }
 }
 
 async fn policy_get_endpoint(
@@ -6331,13 +6458,17 @@ fn connection_collection_runtime_data(
         ))
     })?;
     let mut statuses = BTreeMap::new();
-    for id in snapshot.managed().keys() {
-        if let Some(status) = store.latest_status(id).map_err(|error| {
+    for (id, record) in snapshot.managed() {
+        let stored_status = store.latest_status(id).map_err(|error| {
             tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
             Box::new(service_unavailable(
                 "managed connection state is unavailable",
             ))
-        })? {
+        })?;
+        if let Some(status) = state
+            .mcp_catalogs
+            .status_fallback(id, &record.etag(), stored_status)
+        {
             statuses.insert(id.clone(), status);
         }
     }
@@ -6356,12 +6487,18 @@ fn connection_detail_runtime_data(
             "managed connection state is unavailable",
         ))
     })?;
-    let status = store.latest_status(id).map_err(|error| {
+    let stored_status = store.latest_status(id).map_err(|error| {
         tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
         Box::new(service_unavailable(
             "managed connection state is unavailable",
         ))
     })?;
+    let snapshot = state.control_plane.runtime_snapshot();
+    let status = snapshot.managed().get(id).and_then(|record| {
+        state
+            .mcp_catalogs
+            .status_fallback(id, &record.etag(), stored_status)
+    });
     let dependencies = store.dependencies(id).map_err(|error| {
         tracing::error!(connection_id = %id, error = %error, "failed to load connection dependencies");
         Box::new(connection_store_error_response(error))
@@ -7969,6 +8106,46 @@ fn emit_connection_changed(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_connection_refreshed(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    record: &connections::store::StoredConnection,
+    outcome: &'static str,
+    reason: Option<&'static str>,
+    elapsed: Duration,
+    result: Option<&connections::mcp::McpCatalogRefreshResult>,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    let mut payload = json!({
+        "connection_id": &record.id,
+        "kind": record.write.kind,
+        "source": "managed",
+        "outcome": outcome,
+        "latency_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+    });
+    if let Some(reason) = reason {
+        payload["reason"] = json!(reason);
+    }
+    if let Some(result) = result {
+        payload["catalog_revision"] = json!(result.catalog_revision);
+        payload["total_count"] = json!(result.total_count);
+        payload["added_count"] = json!(result.added_count);
+        payload["changed_count"] = json!(result.changed_count);
+        payload["removed_count"] = json!(result.removed_count);
+    }
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::CONNECTION_REFRESHED,
+        request_id,
+        source_ip,
+        Some(auth::actor_from_principal(principal)),
+        payload,
+    ));
+}
+
 fn connection_secret_authority_forbidden(
     state: &ConnectionAdminState,
     parts: &http::request::Parts,
@@ -8506,6 +8683,37 @@ fn conflict(error: &str) -> Response {
         Json(ErrorResponse {
             error: error.to_owned(),
         }),
+    )
+        .into_response()
+}
+
+fn connection_refresh_error_response(error: connections::mcp::McpCatalogRefreshError) -> Response {
+    let status = match error {
+        connections::mcp::McpCatalogRefreshError::InvalidConnectionId
+        | connections::mcp::McpCatalogRefreshError::ConnectionNotFound => StatusCode::NOT_FOUND,
+        connections::mcp::McpCatalogRefreshError::PreconditionFailed => {
+            StatusCode::PRECONDITION_FAILED
+        }
+        connections::mcp::McpCatalogRefreshError::RefreshInProgress
+        | connections::mcp::McpCatalogRefreshError::ConnectionDisabled
+        | connections::mcp::McpCatalogRefreshError::ConnectionKindMismatch
+        | connections::mcp::McpCatalogRefreshError::DiscoveryNotConfigured => StatusCode::CONFLICT,
+        connections::mcp::McpCatalogRefreshError::StoreUnavailable
+        | connections::mcp::McpCatalogRefreshError::StorageUnavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        connections::mcp::McpCatalogRefreshError::EgressDenied
+        | connections::mcp::McpCatalogRefreshError::SecretUnavailable
+        | connections::mcp::McpCatalogRefreshError::AuthenticationFailed
+        | connections::mcp::McpCatalogRefreshError::RequestFailed
+        | connections::mcp::McpCatalogRefreshError::InvalidResponse => StatusCode::BAD_GATEWAY,
+    };
+    (
+        status,
+        Json(json!({
+            "error": "MCP connection refresh failed",
+            "reason": error.safe_reason(),
+        })),
     )
         .into_response()
 }
@@ -10217,6 +10425,10 @@ mod tests {
         assert_eq!(default_routes.connections_route, CONNECTIONS_ADMIN_ROUTE);
         assert_eq!(default_routes.connection_route, CONNECTION_ADMIN_ROUTE);
         assert_eq!(
+            default_routes.connection_refresh_route,
+            CONNECTION_REFRESH_ADMIN_ROUTE
+        );
+        assert_eq!(
             default_routes.tools_openapi_preview_route,
             TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE
         );
@@ -10302,6 +10514,10 @@ mod tests {
         );
         assert_eq!(custom_routes.connections_route, "/v1/ops/connections");
         assert_eq!(custom_routes.connection_route, "/v1/ops/connections/{id}");
+        assert_eq!(
+            custom_routes.connection_refresh_route,
+            "/v1/ops/connections/{id}/refresh"
+        );
         assert_eq!(
             custom_routes.tools_openapi_preview_route,
             "/v1/ops/tools/openapi/preview"
@@ -18452,6 +18668,139 @@ mod tests {
             Some("private-key-only-binding-canary")
         );
         assert!(!private_key_only.requires_secrets_write_to_replace(&private_key_candidate));
+    }
+
+    #[tokio::test]
+    async fn connection_refresh_requires_permission_empty_body_and_exact_etag() {
+        let connection_db = TempDb::new("connection-refresh-guards");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = connection_admin_router(&connection_db, &policy, audit_log);
+
+        let list = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-reader"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("connection list should complete");
+        let collection_etag = list
+            .headers()
+            .get(CONNECTION_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("connection list should include collection ETag")
+            .to_owned();
+        let created = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-editor"])),
+                Some(plain_connection_body("Refresh guard target")),
+                Some(&collection_etag),
+                true,
+            ))
+            .await
+            .expect("connection create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let connection_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("created connection should include ETag")
+            .to_owned();
+        let connection_id = json_body(created).await["id"]
+            .as_str()
+            .expect("created connection should include ID")
+            .to_owned();
+        let refresh_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/refresh");
+
+        let forbidden = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &refresh_uri,
+                Some(test_principal(&["connections-editor"])),
+                None,
+                Some(&connection_etag),
+                true,
+            ))
+            .await
+            .expect("refresh permission denial should complete");
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let missing = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &refresh_uri,
+                Some(test_principal(&["connections-refresher"])),
+                None,
+                None,
+                true,
+            ))
+            .await
+            .expect("missing refresh precondition should complete");
+        assert_eq!(missing.status(), StatusCode::PRECONDITION_REQUIRED);
+
+        let stale = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &refresh_uri,
+                Some(test_principal(&["connections-refresher"])),
+                None,
+                Some("\"connection:stale\""),
+                true,
+            ))
+            .await
+            .expect("stale refresh precondition should complete");
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+
+        let non_empty = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &refresh_uri,
+                Some(test_principal(&["connections-refresher"])),
+                Some("{}".to_owned()),
+                Some(&connection_etag),
+                true,
+            ))
+            .await
+            .expect("non-empty refresh request should complete");
+        assert_eq!(non_empty.status(), StatusCode::BAD_REQUEST);
+
+        let wrong_kind = router
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &refresh_uri,
+                Some(test_principal(&["connections-refresher"])),
+                None,
+                Some(&connection_etag),
+                true,
+            ))
+            .await
+            .expect("wrong-kind refresh should complete");
+        assert_eq!(wrong_kind.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(wrong_kind).await["reason"],
+            json!("connection_kind_mismatch")
+        );
+        assert_eventually(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == audit::event::CONNECTION_REFRESHED
+                    && event.payload["outcome"] == json!("failure")
+                    && event.payload["reason"] == json!("connection_kind_mismatch")
+            })
+        });
     }
 
     #[tokio::test]
@@ -27668,6 +28017,12 @@ paths:
                         ADMIN_CONNECTIONS_READ_PERMISSION,
                         ADMIN_CONNECTIONS_WRITE_PERMISSION,
                         ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION
+                    ]
+                },
+                "connections-refresher": {
+                    "permissions": [
+                        ADMIN_CONNECTIONS_READ_PERMISSION,
+                        ADMIN_CONNECTIONS_REFRESH_PERMISSION
                     ]
                 },
                 "connections-observer": {

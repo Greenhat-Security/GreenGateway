@@ -21,7 +21,10 @@ use url::Url;
 use crate::{
     audit::{self, AuditEvent, AuditLog},
     config::{Config, McpUpstreamServerConfig},
-    connections::http::{ConnectionHttpError, ConnectionHttpRuntime, ConnectionHttpTarget},
+    connections::{
+        http::{ConnectionHttpError, ConnectionHttpRuntime, ConnectionHttpTarget},
+        mcp::McpConnectionCatalogRuntime,
+    },
     egress::{EgressClient, EgressError, EgressRequestBody, EgressResponse},
     tools::{
         definitions::{BodyMappingMode, McpProxyMapping, ToolDefinition, ToolRegistry, ToolTarget},
@@ -76,12 +79,14 @@ const STRICT_SCHEMA_INJECTION_SKIP_KEYWORDS: &[&str] =
 // child-schema edges is far deeper than realistic tool input shapes, while
 // still bounding strict-default injection well below stack-overflow territory.
 const MAX_STRICT_SCHEMA_INJECTION_DEPTH: usize = 64;
+const MAX_VALIDATOR_CACHE_ENTRIES: usize = 4_096;
 
 type ValidatorCache = HashMap<ValidatorCacheKey, Arc<jsonschema::Validator>>;
 
 struct ToolExecutorBackends {
     upstream_url: Option<String>,
     connection_http: Option<ConnectionHttpRuntime>,
+    mcp_catalog_runtime: Option<McpConnectionCatalogRuntime>,
     mcp_upstream_servers: HashMap<String, McpUpstreamServerConfig>,
     mcp_upstream_runtime_config: McpUpstreamRuntimeConfig,
 }
@@ -95,6 +100,7 @@ pub struct ToolExecutor {
     audit: AuditLog,
     upstream_origin: Option<String>,
     connection_http: Option<ConnectionHttpRuntime>,
+    mcp_catalog_runtime: Option<McpConnectionCatalogRuntime>,
     mcp_upstream_servers: Arc<HashMap<String, McpUpstreamServerConfig>>,
     mcp_upstream_runtime_config: Arc<McpUpstreamRuntimeConfig>,
     validator_cache: Arc<Mutex<ValidatorCache>>,
@@ -326,6 +332,7 @@ impl ToolExecutor {
         runtime: ToolRuntime,
         egress_client: Arc<EgressClient>,
         connection_http: Option<ConnectionHttpRuntime>,
+        mcp_catalog_runtime: Option<McpConnectionCatalogRuntime>,
         audit: AuditLog,
     ) -> Result<Self, ToolExecutorError> {
         let upstream_url = if registry.has_legacy_http_tools() {
@@ -352,6 +359,7 @@ impl ToolExecutor {
             ToolExecutorBackends {
                 upstream_url: upstream_url.map(str::to_owned),
                 connection_http,
+                mcp_catalog_runtime,
                 mcp_upstream_servers,
                 mcp_upstream_runtime_config: McpUpstreamRuntimeConfig::from_config(config),
             },
@@ -374,6 +382,7 @@ impl ToolExecutor {
             ToolExecutorBackends {
                 upstream_url: Some(upstream_url.to_owned()),
                 connection_http: None,
+                mcp_catalog_runtime: None,
                 mcp_upstream_servers: HashMap::new(),
                 mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
                     timeout: Duration::from_secs(30),
@@ -404,6 +413,7 @@ impl ToolExecutor {
                 .map(upstream_origin_from_url)
                 .transpose()?,
             connection_http: backends.connection_http,
+            mcp_catalog_runtime: backends.mcp_catalog_runtime,
             mcp_upstream_servers: Arc::new(backends.mcp_upstream_servers),
             mcp_upstream_runtime_config: Arc::new(backends.mcp_upstream_runtime_config),
             validator_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -793,33 +803,60 @@ impl ToolExecutor {
         mapping: McpProxyMapping,
         args: Value,
     ) -> Result<ToolExecutionResult, ToolExecutorError> {
-        let Some(server) = self.mcp_upstream_servers.get(&mapping.server_name) else {
-            self.emit_tool_observation(
-                context,
-                tool,
-                ToolObservationOutcome {
-                    status: StatusCode::BAD_GATEWAY.as_u16(),
-                    latency_ms: 0,
-                    schema_mismatch: false,
-                    reason: Some("unknown_mcp_upstream_server"),
-                },
-            );
-            return Err(ToolExecutorError::McpUpstream {
-                tool_name: tool.name.clone(),
-                server_name: mapping.server_name,
-                reason: "unknown_mcp_upstream_server",
-            });
-        };
-
         let started = Instant::now();
-        let result = mcp_upstream::call_tool(
-            server,
-            &self.mcp_upstream_runtime_config,
-            Arc::clone(&self.egress_client),
-            &mapping.tool_name,
-            args,
-        )
-        .await;
+        let managed_connection_id = match &tool.target {
+            Some(ToolTarget::Mcp {
+                connection_id,
+                remote_tool_name,
+            }) if connection_id == &mapping.server_name
+                && remote_tool_name == &mapping.tool_name =>
+            {
+                Some(connection_id.as_str())
+            }
+            _ => None,
+        };
+        let result = if let Some(connection_id) = managed_connection_id {
+            let Some(connection_http) = self.connection_http.as_ref() else {
+                return self.mcp_proxy_preflight_error(
+                    context,
+                    tool,
+                    &mapping,
+                    "connection_runtime_unavailable",
+                );
+            };
+            let Some(expected_etag) = self
+                .mcp_catalog_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.expected_connection_etag(connection_id))
+            else {
+                return self.mcp_proxy_preflight_error(context, tool, &mapping, "catalog_stale");
+            };
+            mcp_upstream::call_connection_tool(
+                connection_http,
+                connection_id,
+                &expected_etag,
+                &mapping.tool_name,
+                args,
+            )
+            .await
+        } else {
+            let Some(server) = self.mcp_upstream_servers.get(&mapping.server_name) else {
+                return self.mcp_proxy_preflight_error(
+                    context,
+                    tool,
+                    &mapping,
+                    "unknown_mcp_upstream_server",
+                );
+            };
+            mcp_upstream::call_tool(
+                server,
+                &self.mcp_upstream_runtime_config,
+                Arc::clone(&self.egress_client),
+                &mapping.tool_name,
+                args,
+            )
+            .await
+        };
         let latency_ms = duration_millis(started.elapsed());
 
         match result {
@@ -880,6 +917,41 @@ impl ToolExecutor {
         }
     }
 
+    fn mcp_proxy_preflight_error(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        mapping: &McpProxyMapping,
+        reason: &'static str,
+    ) -> Result<ToolExecutionResult, ToolExecutorError> {
+        self.emit_mcp_upstream_audit(
+            context,
+            tool,
+            mapping,
+            UpstreamAuditOutcome {
+                outcome: "failure",
+                status: None,
+                latency_ms: 0,
+                reason: Some(reason),
+            },
+        );
+        self.emit_tool_observation(
+            context,
+            tool,
+            ToolObservationOutcome {
+                status: StatusCode::BAD_GATEWAY.as_u16(),
+                latency_ms: 0,
+                schema_mismatch: false,
+                reason: Some(reason),
+            },
+        );
+        Err(ToolExecutorError::McpUpstream {
+            tool_name: tool.name.clone(),
+            server_name: mapping.server_name.clone(),
+            reason,
+        })
+    }
+
     fn validator_for(
         &self,
         tool: &ToolDefinition,
@@ -898,7 +970,12 @@ impl ToolExecutor {
             }
         })?);
         let mut cache = self.validator_cache_guard();
-        Ok(cache.entry(key).or_insert(validator).clone())
+        Ok(insert_bounded_validator(
+            &mut cache,
+            key,
+            validator,
+            MAX_VALIDATOR_CACHE_ENTRIES,
+        ))
     }
 
     fn validator_cache_guard(&self) -> MutexGuard<'_, ValidatorCache> {
@@ -1068,11 +1145,15 @@ impl ToolExecutor {
             "tool_name": tool.name,
             "method": MCP_TOOL_OBSERVATION_METHOD,
             "upstream_type": "mcp",
-            "mcp_server_name": mapping.server_name,
             "mcp_tool_name": mapping.tool_name,
             "outcome": outcome.outcome,
             "latency_ms": outcome.latency_ms,
         });
+        if matches!(&tool.target, Some(ToolTarget::Mcp { .. })) {
+            payload["connection_id"] = json!(mapping.server_name);
+        } else {
+            payload["mcp_server_name"] = json!(mapping.server_name);
+        }
 
         if let Some(status) = outcome.status {
             payload["upstream_status"] = json!(status);
@@ -1202,6 +1283,25 @@ impl ToolExecutor {
             None => self.emit_named_tool_observation(context, tool_name, outcome),
         }
     }
+}
+
+fn insert_bounded_validator(
+    cache: &mut ValidatorCache,
+    key: ValidatorCacheKey,
+    validator: Arc<jsonschema::Validator>,
+    maximum: usize,
+) -> Arc<jsonschema::Validator> {
+    if let Some(existing) = cache.get(&key) {
+        return Arc::clone(existing);
+    }
+    if maximum == 0 {
+        return validator;
+    }
+    if cache.len() >= maximum {
+        cache.clear();
+    }
+    cache.insert(key, Arc::clone(&validator));
+    validator
 }
 
 impl ValidatorCacheKey {
@@ -1869,6 +1969,50 @@ mod tests {
     }
 
     #[test]
+    fn compiled_validator_cache_stays_bounded_across_schema_revisions() {
+        let mut cache = ValidatorCache::new();
+        let validator = || {
+            Arc::new(
+                jsonschema::validator_for(&json!({"type": "object"}))
+                    .expect("test schema should compile"),
+            )
+        };
+        for revision in 1_u8..=2 {
+            insert_bounded_validator(
+                &mut cache,
+                ValidatorCacheKey {
+                    tool_name: "managed-tool".to_owned(),
+                    schema_sha256: [revision; 32],
+                },
+                validator(),
+                2,
+            );
+        }
+        assert_eq!(cache.len(), 2);
+
+        let latest_key = ValidatorCacheKey {
+            tool_name: "managed-tool".to_owned(),
+            schema_sha256: [3; 32],
+        };
+        insert_bounded_validator(&mut cache, latest_key.clone(), validator(), 2);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&latest_key));
+
+        let uncached = validator();
+        let returned = insert_bounded_validator(
+            &mut cache,
+            ValidatorCacheKey {
+                tool_name: "uncached".to_owned(),
+                schema_sha256: [4; 32],
+            },
+            Arc::clone(&uncached),
+            0,
+        );
+        assert!(Arc::ptr_eq(&returned, &uncached));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
     fn connection_only_registry_does_not_require_the_legacy_upstream_url() {
         let registry = ToolRegistry::from_json_value(json!({
             "schema_version": "0.1.0",
@@ -1886,7 +2030,7 @@ mod tests {
             EgressClient::new(EgressConfig::default()).expect("egress client should build"),
         );
 
-        ToolExecutor::from_config(&config, registry, runtime, egress, None, audit)
+        ToolExecutor::from_config(&config, registry, runtime, egress, None, None, audit)
             .expect("a connection-only registry must not require UPSTREAM_URL");
     }
 
@@ -3608,6 +3752,7 @@ mod tests {
             ToolExecutorBackends {
                 upstream_url,
                 connection_http: None,
+                mcp_catalog_runtime: None,
                 mcp_upstream_servers: HashMap::new(),
                 mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
                     timeout: Duration::from_secs(30),
@@ -3642,6 +3787,7 @@ mod tests {
             ToolExecutorBackends {
                 upstream_url: None,
                 connection_http: Some(connection.runtime.clone()),
+                mcp_catalog_runtime: None,
                 mcp_upstream_servers: HashMap::new(),
                 mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
                     timeout: Duration::from_secs(30),

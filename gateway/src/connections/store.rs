@@ -9,14 +9,15 @@ use std::{
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::Serialize;
+use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
 use super::{
     model::{
-        ConnectionAuthentication, ConnectionId, ConnectionManagementSource, ConnectionWrite,
-        CONNECTION_SCHEMA_VERSION, MAX_CATALOG_ENTRIES, MAX_CONNECTIONS, MAX_CREDENTIALS,
-        MAX_MANAGED_SPEC_BYTES, MAX_STATUS_HISTORY_ROWS,
+        ConnectionAuthentication, ConnectionId, ConnectionKind, ConnectionManagementSource,
+        ConnectionWrite, DiscoveryConfig, CONNECTION_SCHEMA_VERSION, MAX_CATALOG_ENTRIES,
+        MAX_CONNECTIONS, MAX_CREDENTIALS, MAX_MANAGED_SPEC_BYTES, MAX_STATUS_HISTORY_ROWS,
     },
     status::{
         ConnectionOperationalState, ConnectionRevisions, ConnectionStatusReason,
@@ -188,6 +189,110 @@ CREATE INDEX idx_connection_local_secrets_key
 ON connection_local_secrets(key_id, id);
 "#;
 
+const MIGRATION_4_SQL: &str = r#"
+CREATE TABLE connection_mcp_catalogs (
+    connection_id TEXT PRIMARY KEY,
+    catalog_revision INTEGER NOT NULL CHECK (catalog_revision >= 1),
+    observed_etag TEXT NOT NULL CHECK (
+        length(CAST(observed_etag AS BLOB)) BETWEEN 1 AND 512
+        AND instr(observed_etag, char(0)) = 0
+    ),
+    refreshed_at TEXT NOT NULL CHECK (
+        length(CAST(refreshed_at AS BLOB)) BETWEEN 1 AND 64
+        AND instr(refreshed_at, char(0)) = 0
+    ),
+    entry_count INTEGER NOT NULL CHECK (entry_count BETWEEN 0 AND 4096),
+    FOREIGN KEY (connection_id) REFERENCES connection_records(id) ON DELETE CASCADE
+);
+
+CREATE TABLE connection_mcp_catalog_entries (
+    connection_id TEXT NOT NULL,
+    remote_tool_name TEXT NOT NULL CHECK (
+        length(remote_tool_name) BETWEEN 1 AND 128
+        AND instr(remote_tool_name, char(0)) = 0
+    ),
+    description TEXT NOT NULL CHECK (
+        length(description) BETWEEN 1 AND 1024
+        AND instr(description, char(0)) = 0
+    ),
+    input_schema_json TEXT NOT NULL CHECK (
+        length(CAST(input_schema_json AS BLOB)) BETWEEN 2 AND 262144
+    ),
+    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 4095),
+    PRIMARY KEY (connection_id, remote_tool_name),
+    FOREIGN KEY (connection_id)
+        REFERENCES connection_mcp_catalogs(connection_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX idx_connection_mcp_catalog_ordinal
+ON connection_mcp_catalog_entries(connection_id, ordinal);
+
+ALTER TABLE connection_current_status RENAME TO connection_current_status_v1;
+CREATE TABLE connection_current_status (
+    connection_id TEXT PRIMARY KEY,
+    status_revision INTEGER NOT NULL CHECK (status_revision >= 1),
+    observed_connection_revision INTEGER NOT NULL CHECK (observed_connection_revision >= 1),
+    observed_credential_revision INTEGER NOT NULL CHECK (observed_credential_revision >= 0),
+    observed_tls_revision INTEGER NOT NULL CHECK (observed_tls_revision >= 0),
+    observed_discovery_revision INTEGER NOT NULL CHECK (observed_discovery_revision >= 0),
+    state TEXT NOT NULL CHECK (
+        state IN ('unknown', 'configured', 'healthy', 'degraded', 'unavailable', 'disabled')
+    ),
+    reason TEXT NOT NULL CHECK (
+        reason IN (
+            'not_tested', 'legacy_configured', 'disabled', 'test_succeeded',
+            'catalog_refreshed', 'request_failed', 'egress_denied', 'secret_unavailable',
+            'invalid_response', 'catalog_stale'
+        )
+    ),
+    observed_at TEXT NOT NULL CHECK (length(CAST(observed_at AS BLOB)) BETWEEN 1 AND 64),
+    latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0),
+    catalog_age_secs INTEGER CHECK (catalog_age_secs IS NULL OR catalog_age_secs >= 0),
+    catalog_entry_count INTEGER CHECK (
+        catalog_entry_count IS NULL OR catalog_entry_count BETWEEN 0 AND 4096
+    ),
+    FOREIGN KEY (connection_id) REFERENCES connection_records(id) ON DELETE CASCADE
+);
+INSERT INTO connection_current_status
+SELECT * FROM connection_current_status_v1;
+DROP TABLE connection_current_status_v1;
+
+ALTER TABLE connection_status_history RENAME TO connection_status_history_v1;
+CREATE TABLE connection_status_history (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    connection_id TEXT NOT NULL,
+    status_revision INTEGER NOT NULL CHECK (status_revision >= 1),
+    observed_connection_revision INTEGER NOT NULL CHECK (observed_connection_revision >= 1),
+    observed_credential_revision INTEGER NOT NULL CHECK (observed_credential_revision >= 0),
+    observed_tls_revision INTEGER NOT NULL CHECK (observed_tls_revision >= 0),
+    observed_discovery_revision INTEGER NOT NULL CHECK (observed_discovery_revision >= 0),
+    state TEXT NOT NULL CHECK (
+        state IN ('unknown', 'configured', 'healthy', 'degraded', 'unavailable', 'disabled')
+    ),
+    reason TEXT NOT NULL CHECK (
+        reason IN (
+            'not_tested', 'legacy_configured', 'disabled', 'test_succeeded',
+            'catalog_refreshed', 'request_failed', 'egress_denied', 'secret_unavailable',
+            'invalid_response', 'catalog_stale'
+        )
+    ),
+    observed_at TEXT NOT NULL CHECK (length(CAST(observed_at AS BLOB)) BETWEEN 1 AND 64),
+    latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0),
+    catalog_age_secs INTEGER CHECK (catalog_age_secs IS NULL OR catalog_age_secs >= 0),
+    catalog_entry_count INTEGER CHECK (
+        catalog_entry_count IS NULL OR catalog_entry_count BETWEEN 0 AND 4096
+    ),
+    FOREIGN KEY (connection_id) REFERENCES connection_records(id) ON DELETE CASCADE
+);
+INSERT INTO connection_status_history
+SELECT * FROM connection_status_history_v1;
+DROP TABLE connection_status_history_v1;
+CREATE UNIQUE INDEX idx_connection_status_revision
+ON connection_status_history(connection_id, status_revision);
+CREATE INDEX idx_connection_status_latest
+ON connection_status_history(connection_id, status_revision DESC);
+"#;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -201,11 +306,18 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         sql: MIGRATION_3_SQL,
     },
+    Migration {
+        version: 4,
+        sql: MIGRATION_4_SQL,
+    },
 ];
 
 const SOURCE_MANAGED: &str = "managed";
 const MAX_DEPENDENCY_FIELD_BYTES: usize = 256;
 pub const MAX_CONNECTION_DEPENDENCIES: usize = 4_096;
+const MAX_MCP_CATALOG_ENTRY_BYTES: usize = 262_144;
+const MAX_MCP_TOOL_NAME_CHARS: usize = 128;
+const MAX_MCP_TOOL_DESCRIPTION_CHARS: usize = 1_024;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -359,6 +471,22 @@ pub struct ConnectionStatusUpdate {
     pub latency_ms: Option<u64>,
     pub catalog_age_secs: Option<u64>,
     pub catalog_entry_count: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredMcpCatalogEntry {
+    pub remote_tool_name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredMcpCatalog {
+    pub connection_id: ConnectionId,
+    pub catalog_revision: u64,
+    pub observed_etag: ConnectionEtag,
+    pub refreshed_at: String,
+    pub entries: Vec<StoredMcpCatalogEntry>,
 }
 
 #[derive(Debug)]
@@ -800,6 +928,174 @@ impl SqliteConnectionStore {
             .collect()
     }
 
+    pub fn mcp_catalogs(&self) -> Result<Vec<StoredMcpCatalog>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        load_mcp_catalogs(&connection, &self.path, None)
+    }
+
+    pub fn mcp_catalog(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<Option<StoredMcpCatalog>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        Ok(load_mcp_catalogs(&connection, &self.path, Some(id))?
+            .into_iter()
+            .next())
+    }
+
+    pub fn replace_mcp_catalog(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        entries: &[StoredMcpCatalogEntry],
+    ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
+        let encoded_entries = validate_mcp_catalog_entries(entries)?;
+        let now = utc_timestamp()?;
+        let mut connection = self.connection_guard();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&self.path, "MCP catalog transaction", source))?;
+        let current = load_raw_by_id(&transaction, &self.path, id)?
+            .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?
+            .into_stored()?;
+        validate_record_bindings(&transaction, &self.path, &current)?;
+        ensure_etag(id, expected, &current)?;
+
+        let retained_catalog_entry_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM connection_mcp_catalog_entries WHERE connection_id != ?1",
+                params![id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.path, "MCP catalog retained count", source))?;
+        let retained_catalog_entries =
+            usize::try_from(retained_catalog_entry_count).map_err(|_| {
+                ConnectionStoreError::CorruptRecord {
+                    id: id.to_string(),
+                    reason: "invalid MCP catalog entry count",
+                }
+            })?;
+        if retained_catalog_entries.saturating_add(entries.len()) > MAX_CATALOG_ENTRIES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog entries",
+                maximum: MAX_CATALOG_ENTRIES,
+            });
+        }
+
+        let previous_revision = transaction
+            .query_row(
+                "SELECT catalog_revision FROM connection_mcp_catalogs WHERE connection_id = ?1",
+                params![id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, "MCP catalog revision lookup", source))?
+            .map(|revision| {
+                u64::try_from(revision).map_err(|_| ConnectionStoreError::CorruptRecord {
+                    id: id.to_string(),
+                    reason: "invalid MCP catalog revision",
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let catalog_revision = increment_revision(id, previous_revision)?;
+
+        transaction
+            .execute(
+                "DELETE FROM connection_dependencies WHERE connection_id = ?1 AND consumer_kind = ?2",
+                params![id.as_str(), ConnectionDependencyKind::ManagedTool.as_str()],
+            )
+            .map_err(|source| {
+                sqlite_error(&self.path, "MCP catalog dependency replacement delete", source)
+            })?;
+        let retained_dependencies = count_rows(
+            &transaction,
+            &self.path,
+            "connection dependencies",
+            "SELECT COUNT(*) FROM connection_dependencies",
+        )?;
+        if retained_dependencies.saturating_add(entries.len()) > MAX_CONNECTION_DEPENDENCIES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection dependencies",
+                maximum: MAX_CONNECTION_DEPENDENCIES,
+            });
+        }
+
+        transaction
+            .execute(
+                "DELETE FROM connection_mcp_catalogs WHERE connection_id = ?1",
+                params![id.as_str()],
+            )
+            .map_err(|source| sqlite_error(&self.path, "MCP catalog replacement delete", source))?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO connection_mcp_catalogs (
+                    connection_id, catalog_revision, observed_etag, refreshed_at, entry_count
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![
+                    id.as_str(),
+                    u64_to_i64(id, catalog_revision)?,
+                    expected.as_str(),
+                    now,
+                    i64::try_from(entries.len()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.path, "MCP catalog insert", source))?;
+
+        for (ordinal, (entry, input_schema_json)) in
+            entries.iter().zip(encoded_entries.iter()).enumerate()
+        {
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO connection_mcp_catalog_entries (
+                        connection_id, remote_tool_name, description, input_schema_json, ordinal
+                    ) VALUES (?1, ?2, ?3, ?4, ?5)
+                    "#,
+                    params![
+                        id.as_str(),
+                        entry.remote_tool_name,
+                        entry.description,
+                        input_schema_json,
+                        i64::try_from(ordinal).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(|source| sqlite_error(&self.path, "MCP catalog entry insert", source))?;
+            let public_name = format!("{}:{}", id.as_str(), entry.remote_tool_name);
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO connection_dependencies (
+                        connection_id, consumer_kind, consumer_id, created_at
+                    ) VALUES (?1, ?2, ?3, ?4)
+                    "#,
+                    params![
+                        id.as_str(),
+                        ConnectionDependencyKind::ManagedTool.as_str(),
+                        public_name,
+                        now,
+                    ],
+                )
+                .map_err(|source| {
+                    sqlite_error(&self.path, "MCP catalog dependency insert", source)
+                })?;
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, "MCP catalog transaction commit", source))?;
+
+        Ok(StoredMcpCatalog {
+            connection_id: id.clone(),
+            catalog_revision,
+            observed_etag: expected.clone(),
+            refreshed_at: now,
+            entries: entries.to_vec(),
+        })
+    }
+
     pub fn append_status(
         &self,
         id: &ConnectionId,
@@ -1154,6 +1450,35 @@ impl ConnectionStore for SqliteConnectionStore {
                 .map_err(|source| sqlite_error(&self.path, "replace no-op commit", source))?;
             return Ok(current);
         }
+        if !supports_managed_mcp_catalog(&candidate) {
+            let managed_tool_count: i64 = transaction
+                .query_row(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM connection_dependencies
+                    WHERE connection_id = ?1 AND consumer_kind = ?2
+                    "#,
+                    params![id.as_str(), ConnectionDependencyKind::ManagedTool.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|source| {
+                    sqlite_error(&self.path, "managed MCP dependency count", source)
+                })?;
+            if managed_tool_count > 0 {
+                return Err(ConnectionStoreError::DependencyConflict {
+                    id: id.to_string(),
+                    count: usize::try_from(managed_tool_count).unwrap_or(usize::MAX),
+                });
+            }
+            transaction
+                .execute(
+                    "DELETE FROM connection_mcp_catalogs WHERE connection_id = ?1",
+                    params![id.as_str()],
+                )
+                .map_err(|source| {
+                    sqlite_error(&self.path, "obsolete managed MCP catalog removal", source)
+                })?;
+        }
 
         ensure_binding_capacity(
             &transaction,
@@ -1316,6 +1641,8 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
         "SELECT connection_id, status_revision, observed_connection_revision, observed_credential_revision, observed_tls_revision, observed_discovery_revision, state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count FROM connection_current_status LIMIT 0",
         "SELECT sequence, connection_id, status_revision, observed_connection_revision, observed_credential_revision, observed_tls_revision, observed_discovery_revision, state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count FROM connection_status_history LIMIT 0",
         "SELECT id, schema_version, label, purpose, secret_version, algorithm, key_id, nonce, ciphertext, created_at, rotated_at, updated_at FROM connection_local_secrets LIMIT 0",
+        "SELECT connection_id, catalog_revision, observed_etag, refreshed_at, entry_count FROM connection_mcp_catalogs LIMIT 0",
+        "SELECT connection_id, remote_tool_name, description, input_schema_json, ordinal FROM connection_mcp_catalog_entries LIMIT 0",
     ] {
         connection
             .prepare(query)
@@ -1390,6 +1717,18 @@ fn validate_persisted_state(
             maximum: MAX_CONNECTION_DEPENDENCIES,
         });
     }
+    let catalog_entry_count = count_rows(
+        &transaction,
+        path,
+        "connection MCP catalog entries",
+        "SELECT COUNT(*) FROM connection_mcp_catalog_entries",
+    )?;
+    if catalog_entry_count > MAX_CATALOG_ENTRIES {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection MCP catalog entries",
+            maximum: MAX_CATALOG_ENTRIES,
+        });
+    }
     let current_status_count = count_rows(
         &transaction,
         path,
@@ -1433,6 +1772,25 @@ fn validate_persisted_state(
     ensure_no_invalid_rows(
         &transaction,
         path,
+        "MCP catalog integrity",
+        r#"
+        SELECT COUNT(*)
+        FROM connection_mcp_catalogs AS catalog
+        JOIN connection_records AS record ON record.id = catalog.connection_id
+        WHERE catalog.entry_count != (
+                SELECT COUNT(*)
+                FROM connection_mcp_catalog_entries AS entry
+                WHERE entry.connection_id = catalog.connection_id
+              )
+           OR catalog.catalog_revision < 1
+           OR catalog.entry_count < 0
+           OR catalog.entry_count > 4096
+        "#,
+        "stored MCP catalog metadata is inconsistent",
+    )?;
+    ensure_no_invalid_rows(
+        &transaction,
+        path,
         "status history integrity",
         r#"
         SELECT COUNT(*)
@@ -1465,9 +1823,214 @@ fn validate_persisted_state(
         "connection_status_history",
         "status history startup validation",
     )?;
+    let _ = load_mcp_catalogs(&transaction, path, None)?;
     transaction
         .commit()
         .map_err(|source| sqlite_error(path, "startup validation commit", source))
+}
+
+fn validate_mcp_catalog_entries(
+    entries: &[StoredMcpCatalogEntry],
+) -> Result<Vec<String>, ConnectionStoreError> {
+    if entries.len() > MAX_CATALOG_ENTRIES {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection MCP catalog entries",
+            maximum: MAX_CATALOG_ENTRIES,
+        });
+    }
+    let mut seen = BTreeSet::new();
+    let mut encoded = Vec::with_capacity(entries.len());
+    let mut problems = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let remote_name_chars = entry.remote_tool_name.chars().count();
+        if remote_name_chars == 0
+            || remote_name_chars > MAX_MCP_TOOL_NAME_CHARS
+            || entry.remote_tool_name.contains('\0')
+        {
+            problems.push(format!(
+                "MCP catalog entry {index} remote tool name must contain 1-{MAX_MCP_TOOL_NAME_CHARS} characters without NUL"
+            ));
+        }
+        if !seen.insert(entry.remote_tool_name.as_str()) {
+            problems.push(format!(
+                "MCP catalog entry {index} duplicates an earlier remote tool name"
+            ));
+        }
+        let description_chars = entry.description.chars().count();
+        if description_chars == 0
+            || description_chars > MAX_MCP_TOOL_DESCRIPTION_CHARS
+            || entry.description.contains('\0')
+        {
+            problems.push(format!(
+                "MCP catalog entry {index} description must contain 1-{MAX_MCP_TOOL_DESCRIPTION_CHARS} characters without NUL"
+            ));
+        }
+        match serde_json::to_string(&entry.input_schema) {
+            Ok(value) if value.len() >= 2 && value.len() <= MAX_MCP_CATALOG_ENTRY_BYTES => {
+                encoded.push(value);
+            }
+            Ok(_) => problems.push(format!(
+                "MCP catalog entry {index} input schema exceeds the bounded stored size"
+            )),
+            Err(error) => {
+                return Err(ConnectionStoreError::Json {
+                    operation: "MCP catalog input schema",
+                    source: error,
+                });
+            }
+        }
+    }
+    if problems.is_empty() {
+        Ok(encoded)
+    } else {
+        Err(ConnectionStoreError::Validation { problems })
+    }
+}
+
+fn load_mcp_catalogs(
+    connection: &Connection,
+    path: &Path,
+    requested_id: Option<&ConnectionId>,
+) -> Result<Vec<StoredMcpCatalog>, ConnectionStoreError> {
+    let query = if requested_id.is_some() {
+        r#"
+        SELECT connection_id, catalog_revision, observed_etag, refreshed_at, entry_count
+        FROM connection_mcp_catalogs
+        WHERE connection_id = ?1
+        ORDER BY connection_id ASC
+        "#
+    } else {
+        r#"
+        SELECT connection_id, catalog_revision, observed_etag, refreshed_at, entry_count
+        FROM connection_mcp_catalogs
+        ORDER BY connection_id ASC
+        "#
+    };
+    let mut statement = connection
+        .prepare(query)
+        .map_err(|source| sqlite_error(path, "MCP catalog query prepare", source))?;
+    let raw = if let Some(id) = requested_id {
+        statement
+            .query_map(params![id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|source| sqlite_error(path, "MCP catalog query", source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| sqlite_error(path, "MCP catalog read", source))?
+    } else {
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|source| sqlite_error(path, "MCP catalog query", source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| sqlite_error(path, "MCP catalog read", source))?
+    };
+    drop(statement);
+
+    raw.into_iter()
+        .map(
+            |(raw_id, raw_revision, observed_etag, refreshed_at, raw_entry_count)| {
+                let connection_id = ConnectionId::parse(raw_id.clone()).map_err(|_| {
+                    ConnectionStoreError::CorruptRecord {
+                        id: raw_id.clone(),
+                        reason: "invalid MCP catalog connection ID",
+                    }
+                })?;
+                let catalog_revision = u64::try_from(raw_revision).map_err(|_| {
+                    ConnectionStoreError::CorruptRecord {
+                        id: raw_id.clone(),
+                        reason: "invalid MCP catalog revision",
+                    }
+                })?;
+                if catalog_revision == 0 {
+                    return Err(ConnectionStoreError::CorruptRecord {
+                        id: raw_id,
+                        reason: "invalid MCP catalog revision",
+                    });
+                }
+                let expected_entry_count = usize::try_from(raw_entry_count).map_err(|_| {
+                    ConnectionStoreError::CorruptRecord {
+                        id: connection_id.to_string(),
+                        reason: "invalid MCP catalog entry count",
+                    }
+                })?;
+                if expected_entry_count > MAX_CATALOG_ENTRIES {
+                    return Err(ConnectionStoreError::LimitExceeded {
+                        resource: "connection MCP catalog entries",
+                        maximum: MAX_CATALOG_ENTRIES,
+                    });
+                }
+
+                let mut entry_statement = connection
+                    .prepare(
+                        r#"
+                        SELECT remote_tool_name, description, input_schema_json
+                        FROM connection_mcp_catalog_entries
+                        WHERE connection_id = ?1
+                        ORDER BY ordinal ASC
+                        "#,
+                    )
+                    .map_err(|source| {
+                        sqlite_error(path, "MCP catalog entry query prepare", source)
+                    })?;
+                let raw_entries = entry_statement
+                    .query_map(params![connection_id.as_str()], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .map_err(|source| sqlite_error(path, "MCP catalog entry query", source))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|source| sqlite_error(path, "MCP catalog entry read", source))?;
+                if raw_entries.len() != expected_entry_count {
+                    return Err(ConnectionStoreError::CorruptRecord {
+                        id: connection_id.to_string(),
+                        reason: "MCP catalog entry count mismatch",
+                    });
+                }
+                let entries = raw_entries
+                    .into_iter()
+                    .map(|(remote_tool_name, description, input_schema_json)| {
+                        let input_schema =
+                            serde_json::from_str(&input_schema_json).map_err(|source| {
+                                ConnectionStoreError::Json {
+                                    operation: "stored MCP catalog input schema",
+                                    source,
+                                }
+                            })?;
+                        Ok(StoredMcpCatalogEntry {
+                            remote_tool_name,
+                            description,
+                            input_schema,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ConnectionStoreError>>()?;
+                let _ = validate_mcp_catalog_entries(&entries)?;
+                Ok(StoredMcpCatalog {
+                    connection_id,
+                    catalog_revision,
+                    observed_etag: ConnectionEtag(observed_etag),
+                    refreshed_at,
+                    entries,
+                })
+            },
+        )
+        .collect()
 }
 
 fn load_all_records(
@@ -1697,6 +2260,14 @@ impl RawStatus {
         self,
         id: &ConnectionId,
     ) -> Result<SafeConnectionStatus, ConnectionStoreError> {
+        let catalog_age_secs = optional_i64_to_u64(id, self.catalog_age_secs)?.map(|age| {
+            let elapsed = OffsetDateTime::parse(&self.observed_at, &Rfc3339)
+                .ok()
+                .map(|observed_at| (OffsetDateTime::now_utc() - observed_at).whole_seconds())
+                .unwrap_or_default()
+                .max(0);
+            age.saturating_add(u64::try_from(elapsed).unwrap_or(u64::MAX))
+        });
         Ok(SafeConnectionStatus {
             state: parse_state(&self.state).ok_or_else(|| ConnectionStoreError::CorruptRecord {
                 id: id.to_string(),
@@ -1710,7 +2281,7 @@ impl RawStatus {
             })?,
             observed_at: Some(self.observed_at),
             latency_ms: optional_i64_to_u64(id, self.latency_ms)?,
-            catalog_age_secs: optional_i64_to_u64(id, self.catalog_age_secs)?,
+            catalog_age_secs,
             catalog_entry_count: self
                 .catalog_entry_count
                 .map(|value| {
@@ -1888,6 +2459,11 @@ fn binding_count(write: &ConnectionWrite) -> usize {
         + usize::from(write.tls.ca_bundle_alias.is_some())
         + usize::from(write.tls.client_certificate_id.is_some())
         + usize::from(write.tls.client_private_key_id.is_some())
+}
+
+fn supports_managed_mcp_catalog(write: &ConnectionWrite) -> bool {
+    write.kind == ConnectionKind::McpStreamableHttp
+        && matches!(&write.discovery, Some(DiscoveryConfig::ManagedMcp { .. }))
 }
 
 fn ensure_binding_capacity(
@@ -2115,6 +2691,7 @@ fn reason_as_str(reason: ConnectionStatusReason) -> &'static str {
         ConnectionStatusReason::LegacyConfigured => "legacy_configured",
         ConnectionStatusReason::Disabled => "disabled",
         ConnectionStatusReason::TestSucceeded => "test_succeeded",
+        ConnectionStatusReason::CatalogRefreshed => "catalog_refreshed",
         ConnectionStatusReason::RequestFailed => "request_failed",
         ConnectionStatusReason::EgressDenied => "egress_denied",
         ConnectionStatusReason::SecretUnavailable => "secret_unavailable",
@@ -2129,6 +2706,7 @@ fn parse_reason(value: &str) -> Option<ConnectionStatusReason> {
         "legacy_configured" => Some(ConnectionStatusReason::LegacyConfigured),
         "disabled" => Some(ConnectionStatusReason::Disabled),
         "test_succeeded" => Some(ConnectionStatusReason::TestSucceeded),
+        "catalog_refreshed" => Some(ConnectionStatusReason::CatalogRefreshed),
         "request_failed" => Some(ConnectionStatusReason::RequestFailed),
         "egress_denied" => Some(ConnectionStatusReason::EgressDenied),
         "secret_unavailable" => Some(ConnectionStatusReason::SecretUnavailable),
@@ -2190,6 +2768,38 @@ mod tests {
         .expect("candidate should deserialize")
     }
 
+    fn mcp_candidate() -> ConnectionWrite {
+        serde_json::from_value(json!({
+            "display_name": "Managed MCP",
+            "enabled": true,
+            "kind": "mcp_streamable_http",
+            "endpoint": {
+                "base_url": "https://mcp.example.test",
+                "base_path": "/mcp"
+            },
+            "authentication": {
+                "type": "none"
+            },
+            "tls": {},
+            "discovery": {
+                "type": "managed_mcp",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("MCP candidate should deserialize")
+    }
+
+    fn mcp_catalog_entry(name: &str, description: &str) -> StoredMcpCatalogEntry {
+        StoredMcpCatalogEntry {
+            remote_tool_name: name.to_owned(),
+            description: description.to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        }
+    }
+
     struct TemporaryDatabase {
         path: PathBuf,
     }
@@ -2235,7 +2845,295 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(versions, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn migration_four_preserves_populated_v3_status_state_and_indexes() {
+        let database = TemporaryDatabase::new("migration-v3-populated");
+        let path = database.path.clone();
+        let connection_id = ConnectionId::new_managed();
+        let write = mcp_candidate();
+        let spec_json =
+            serde_json::to_string(&write).expect("v3 fixture candidate should serialize");
+        let timestamp = "2026-07-28T00:00:00Z";
+        {
+            let connection =
+                Connection::open(&path).expect("v3 fixture database should open directly");
+            connection
+                .execute_batch(CONFIGURE_SQL)
+                .expect("v3 fixture pragmas should apply");
+            connection
+                .execute_batch(CREATE_MIGRATIONS_TABLE_SQL)
+                .expect("v3 fixture migration table should create");
+            for migration in MIGRATIONS.iter().take(3) {
+                connection
+                    .execute_batch(migration.sql)
+                    .expect("v3 fixture migration should apply");
+                connection
+                    .execute(
+                        "INSERT INTO connection_schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        params![migration.version, timestamp],
+                    )
+                    .expect("v3 fixture migration should record");
+            }
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_records (
+                        id, schema_version, source, spec_json, connection_revision,
+                        credential_revision, tls_revision, discovery_revision,
+                        status_revision, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, 1, 0, 0, 1, 1, ?5, ?5)
+                    "#,
+                    params![
+                        connection_id.as_str(),
+                        CONNECTION_SCHEMA_VERSION,
+                        SOURCE_MANAGED,
+                        spec_json,
+                        timestamp,
+                    ],
+                )
+                .expect("v3 fixture Connection should insert");
+            for table in ["connection_current_status", "connection_status_history"] {
+                connection
+                    .execute(
+                        &format!(
+                            r#"
+                            INSERT INTO {table} (
+                                connection_id, status_revision, observed_connection_revision,
+                                observed_credential_revision, observed_tls_revision,
+                                observed_discovery_revision, state, reason, observed_at,
+                                latency_ms, catalog_age_secs, catalog_entry_count
+                            ) VALUES (?1, 1, 1, 0, 0, 1, 'healthy', 'test_succeeded', ?2, 12, NULL, NULL)
+                            "#
+                        ),
+                        params![connection_id.as_str(), timestamp],
+                    )
+                    .expect("populated v3 status row should insert");
+            }
+        }
+
+        let store = SqliteConnectionStore::open(&path)
+            .expect("migration 4 should upgrade populated v3 state");
+        let preserved = store
+            .latest_status(&connection_id)
+            .expect("migrated current status should load")
+            .expect("migrated current status should remain");
+        assert_eq!(preserved.state, ConnectionOperationalState::Healthy);
+        assert_eq!(preserved.reason, ConnectionStatusReason::TestSucceeded);
+        assert_eq!(preserved.latency_ms, Some(12));
+        let history = store
+            .status_history(&connection_id, 10)
+            .expect("migrated status history should load");
+        assert_eq!(history, vec![preserved]);
+        {
+            let connection = store.connection_guard();
+            let indexes = connection
+                .prepare(
+                    r#"
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'index'
+                      AND name IN (
+                        'idx_connection_status_revision',
+                        'idx_connection_status_latest',
+                        'idx_connection_mcp_catalog_ordinal'
+                      )
+                    ORDER BY name ASC
+                    "#,
+                )
+                .expect("migrated index query should prepare")
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("migrated index query should run")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("migrated indexes should read");
+            assert_eq!(
+                indexes,
+                vec![
+                    "idx_connection_mcp_catalog_ordinal".to_owned(),
+                    "idx_connection_status_latest".to_owned(),
+                    "idx_connection_status_revision".to_owned(),
+                ]
+            );
+        }
+        let record = store
+            .get(&connection_id)
+            .expect("migrated Connection should load")
+            .expect("migrated Connection should remain");
+        let refreshed = store
+            .append_status(
+                &connection_id,
+                &record.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::CatalogRefreshed,
+                    latency_ms: Some(8),
+                    catalog_age_secs: Some(0),
+                    catalog_entry_count: Some(1),
+                },
+            )
+            .expect("migration 4 status constraint should accept catalog_refreshed");
+        assert_eq!(refreshed.reason, ConnectionStatusReason::CatalogRefreshed);
+        drop(store);
+
+        let reopened = SqliteConnectionStore::open(&path)
+            .expect("populated migration 4 database should pass restart validation");
+        assert_eq!(
+            reopened
+                .status_history(&connection_id, 10)
+                .expect("restarted history should load")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn mcp_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
+        let (_directory, path, store) = temporary_store("mcp-catalog");
+        let created = store
+            .create(mcp_candidate())
+            .expect("MCP connection should create");
+        let first = store
+            .replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                &[
+                    mcp_catalog_entry("alpha", "Alpha"),
+                    mcp_catalog_entry("beta", "Beta"),
+                ],
+            )
+            .expect("first MCP catalog should publish");
+        assert_eq!(first.catalog_revision, 1);
+        assert_eq!(
+            store
+                .dependencies(&created.id)
+                .expect("dependencies should load")
+                .into_iter()
+                .filter(|dependency| dependency.kind == ConnectionDependencyKind::ManagedTool)
+                .map(|dependency| dependency.consumer_id)
+                .collect::<Vec<_>>(),
+            vec![
+                format!("{}:alpha", created.id),
+                format!("{}:beta", created.id),
+            ]
+        );
+
+        let second = store
+            .replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                &[
+                    mcp_catalog_entry("beta", "Beta changed"),
+                    mcp_catalog_entry("gamma", "Gamma"),
+                ],
+            )
+            .expect("second MCP catalog should publish");
+        assert_eq!(second.catalog_revision, 2);
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| entry.remote_tool_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta", "gamma"]
+        );
+
+        let mut discovery_removed = created.write.clone();
+        discovery_removed.discovery = None;
+        assert!(matches!(
+            store.replace(&created.id, &created.etag(), discovery_removed),
+            Err(ConnectionStoreError::DependencyConflict { count: 2, .. })
+        ));
+        assert!(matches!(
+            store.replace(&created.id, &created.etag(), candidate()),
+            Err(ConnectionStoreError::DependencyConflict { count: 2, .. })
+        ));
+        assert_eq!(
+            store
+                .get(&created.id)
+                .expect("catalog-bearing Connection should still load")
+                .expect("catalog-bearing Connection should remain")
+                .write,
+            created.write,
+            "an incompatible update must not strand the managed catalog"
+        );
+
+        let duplicate = [
+            mcp_catalog_entry("duplicate", "First"),
+            mcp_catalog_entry("duplicate", "Second"),
+        ];
+        assert!(matches!(
+            store.replace_mcp_catalog(&created.id, &created.etag(), &duplicate),
+            Err(ConnectionStoreError::Validation { .. })
+        ));
+        let retained = store
+            .mcp_catalog(&created.id)
+            .expect("catalog should load")
+            .expect("catalog should remain");
+        assert_eq!(retained.catalog_revision, 2);
+        assert_eq!(
+            retained
+                .entries
+                .iter()
+                .map(|entry| entry.remote_tool_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta", "gamma"]
+        );
+
+        drop(store);
+        let reopened = SqliteConnectionStore::open(&path).expect("catalog store should reopen");
+        assert_eq!(
+            reopened
+                .mcp_catalog(&created.id)
+                .expect("reopened catalog should load"),
+            Some(retained)
+        );
+    }
+
+    #[test]
+    fn empty_mcp_catalog_is_removed_on_incompatible_update_or_delete() {
+        let (_directory, path, store) = temporary_store("empty-mcp-catalog-cleanup");
+        let converted_source = store
+            .create(mcp_candidate())
+            .expect("convertible MCP Connection should create");
+        store
+            .replace_mcp_catalog(&converted_source.id, &converted_source.etag(), &[])
+            .expect("empty MCP catalog should publish");
+        let converted = store
+            .replace(&converted_source.id, &converted_source.etag(), candidate())
+            .expect("empty catalog should permit an incompatible update");
+        assert!(
+            store
+                .mcp_catalog(&converted.id)
+                .expect("converted catalog lookup should work")
+                .is_none(),
+            "incompatible update must remove the obsolete durable catalog"
+        );
+        store
+            .delete(&converted.id, &converted.etag())
+            .expect("converted Connection should delete");
+
+        let deleted = store
+            .create(mcp_candidate())
+            .expect("deletable MCP Connection should create");
+        store
+            .replace_mcp_catalog(&deleted.id, &deleted.etag(), &[])
+            .expect("deletable empty MCP catalog should publish");
+        store
+            .delete(&deleted.id, &deleted.etag())
+            .expect("empty managed MCP Connection should delete");
+        drop(store);
+
+        let reopened =
+            SqliteConnectionStore::open(&path).expect("cleaned catalog store should reopen");
+        assert!(
+            reopened
+                .mcp_catalogs()
+                .expect("reopened catalogs should load")
+                .is_empty(),
+            "converted and deleted Connections must leave no durable catalog rows"
+        );
     }
 
     #[test]

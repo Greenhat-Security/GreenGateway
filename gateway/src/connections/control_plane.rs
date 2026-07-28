@@ -23,9 +23,10 @@ use super::{
         OperatorAliasResolver, ResolvedSecret, SecretAliasMetadata, SecretProviderConfigError,
         SecretPurpose, SecretResolveError, SecretResolveErrorKind, SecretResolver,
     },
+    status::SafeConnectionStatus,
     store::{
-        ConnectionDependencyKind, ConnectionEtag, ConnectionStore, ConnectionStoreError,
-        SqliteConnectionStore, StoredConnection,
+        ConnectionDependencyKind, ConnectionEtag, ConnectionStatusUpdate, ConnectionStore,
+        ConnectionStoreError, SqliteConnectionStore, StoredConnection,
     },
 };
 
@@ -317,6 +318,25 @@ impl ConnectionControlPlane {
         self.managed_store()?
             .replace_dependencies_for_kind(kind, desired)?;
         Ok(())
+    }
+
+    pub fn append_status(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        update: ConnectionStatusUpdate,
+    ) -> Result<SafeConnectionStatus, ConnectionMutationError> {
+        let _guard = self.mutation_guard();
+        let store = self.managed_store()?;
+        let status = store.append_status(id, expected, update)?;
+        let updated = store
+            .get(id)?
+            .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?;
+        let current = self.runtime.load_full();
+        let mut managed = current.managed().clone();
+        managed.insert(id.clone(), updated);
+        self.publish_runtime(managed);
+        Ok(status)
     }
 
     pub fn create_managed(
