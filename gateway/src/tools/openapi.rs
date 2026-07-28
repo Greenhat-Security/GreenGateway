@@ -1331,7 +1331,7 @@ fn generated_parameter(
 
     let schema = match object.get("schema") {
         Some(schema) => {
-            dereference_schema(document, schema, &mut BTreeSet::new(), expansion_budget)?
+            dereference_schema(document, schema, &mut BTreeSet::new(), 0, expansion_budget)?
         }
         None => json!({}),
     };
@@ -1468,6 +1468,7 @@ fn json_request_body_schema(
         document,
         schema,
         &mut BTreeSet::new(),
+        0,
         expansion_budget,
     )?))
 }
@@ -1475,32 +1476,71 @@ fn json_request_body_schema(
 fn dereference_schema(
     document: &Value,
     schema: &Value,
-    seen_references: &mut BTreeSet<String>,
+    reference_ancestry: &mut BTreeSet<usize>,
+    reference_depth: usize,
     expansion_budget: &mut OpenApiSchemaExpansionBudget,
 ) -> Result<Value, OpenApiToolGenerationError> {
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         expansion_budget.consume_reference(reference)?;
-        let resolved = resolve_reference(document, schema, seen_references)?;
-        return dereference_schema(document, resolved, seen_references, expansion_budget);
+        if reference_depth >= MAX_OPENAPI_REFERENCE_DEPTH {
+            return Err(OpenApiToolGenerationError::Reference {
+                reference: reference.to_owned(),
+                message: format!("reference depth exceeds {MAX_OPENAPI_REFERENCE_DEPTH}"),
+            });
+        }
+        let Some(pointer) = reference.strip_prefix('#') else {
+            return Err(OpenApiToolGenerationError::Reference {
+                reference: reference.to_owned(),
+                message: "only local OpenAPI references are supported".to_owned(),
+            });
+        };
+        let Some(resolved) = document.pointer(pointer) else {
+            return Err(OpenApiToolGenerationError::Reference {
+                reference: reference.to_owned(),
+                message: "target does not exist".to_owned(),
+            });
+        };
+        let target_identity = value_identity(resolved);
+        if !reference_ancestry.insert(target_identity) {
+            return Err(OpenApiToolGenerationError::Reference {
+                reference: reference.to_owned(),
+                message: "circular local reference".to_owned(),
+            });
+        }
+
+        let result = dereference_schema(
+            document,
+            resolved,
+            reference_ancestry,
+            reference_depth + 1,
+            expansion_budget,
+        );
+        let removed = reference_ancestry.remove(&target_identity);
+        debug_assert!(removed);
+        return result;
     }
 
     expansion_budget.consume_node(schema)?;
     match schema {
-        Value::Array(values) => values
-            .iter()
-            .map(|value| {
-                let mut branch_references = seen_references.clone();
-                dereference_schema(document, value, &mut branch_references, expansion_budget)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array),
+        Value::Array(values) => {
+            let mut dereferenced = Vec::with_capacity(values.len());
+            for value in values {
+                dereferenced.push(dereference_schema(
+                    document,
+                    value,
+                    reference_ancestry,
+                    0,
+                    expansion_budget,
+                )?);
+            }
+            Ok(Value::Array(dereferenced))
+        }
         Value::Object(object) => {
             let mut dereferenced = Map::new();
             for (key, value) in object {
-                let mut branch_references = seen_references.clone();
                 dereferenced.insert(
                     key.clone(),
-                    dereference_schema(document, value, &mut branch_references, expansion_budget)?,
+                    dereference_schema(document, value, reference_ancestry, 0, expansion_budget)?,
                 );
             }
             Ok(Value::Object(dereferenced))
@@ -2447,6 +2487,73 @@ paths:
                 maximum: MAX_OPENAPI_SCHEMA_EXPANSION_NODES,
             }
         ));
+    }
+
+    #[test]
+    fn rejects_wide_schema_without_cloning_long_reference_ancestry_per_child() {
+        let name_suffix = "x".repeat(11 * 1024);
+        let names = (0..MAX_OPENAPI_REFERENCE_DEPTH)
+            .map(|index| format!("S{index}_{name_suffix}"))
+            .collect::<Vec<_>>();
+        let mut schemas = serde_json::Map::new();
+        for (index, name) in names.iter().enumerate() {
+            let schema = match names.get(index + 1) {
+                Some(next) => {
+                    json!({ "$ref": format!("#/components/schemas/{next}") })
+                }
+                None => json!({
+                    "enum": vec![Value::Null; MAX_OPENAPI_SCHEMA_EXPANSION_NODES]
+                }),
+            };
+            schemas.insert(name.clone(), schema);
+        }
+        let spec = json!({
+            "openapi": "3.0.3",
+            "info": {
+                "title": "Wide schema with long ancestry",
+                "version": "1.0.0"
+            },
+            "paths": {
+                "/wide": {
+                    "post": {
+                        "operationId": "wide",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": format!(
+                                            "#/components/schemas/{}",
+                                            names[0]
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": schemas
+            }
+        })
+        .to_string();
+        assert!(
+            spec.len() < 2 * 1024 * 1024,
+            "wide-schema regression must remain a bounded managed spec"
+        );
+
+        let error = generate_tools_from_openapi_str("wide-ancestry.json", &spec)
+            .expect_err("wide schemas must stop at the shared expansion-node budget");
+        assert!(
+            matches!(
+                &error,
+                OpenApiToolGenerationError::GenerationLimit {
+                    limit: OpenApiToolGenerationLimit::SchemaExpansionNodes,
+                    maximum: MAX_OPENAPI_SCHEMA_EXPANSION_NODES,
+                }
+            ),
+            "unexpected wide-schema error: {error:?}"
+        );
     }
 
     #[test]
