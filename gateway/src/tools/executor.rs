@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_util::StreamExt;
 use http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use rmcp::model::CallToolResult;
@@ -21,7 +22,7 @@ use crate::{
     audit::{self, AuditEvent, AuditLog},
     config::{Config, McpUpstreamServerConfig},
     connections::http::{ConnectionHttpError, ConnectionHttpRuntime, ConnectionHttpTarget},
-    egress::{EgressClient, EgressError, EgressResponse},
+    egress::{EgressClient, EgressError, EgressRequestBody, EgressResponse},
     tools::{
         definitions::{BodyMappingMode, McpProxyMapping, ToolDefinition, ToolRegistry, ToolTarget},
         mcp_upstream::{self, McpUpstreamRuntimeConfig},
@@ -720,37 +721,69 @@ impl ToolExecutor {
             .await
             .map_err(|source| connection_egress_tool_error(tool, &source))?;
         let credential = runtime.resolve_credential(&target).await.map_err(|error| {
-            self.emit_connection_secret_resolution_failed(
-                context,
-                tool,
-                &target,
-                error.safe_reason(),
-            );
-            connection_tool_error(tool, error)
-        })?;
-        if let Some(credential) = credential {
-            credential.inject(&mut request.headers).map_err(|error| {
+            if error.is_secret_resolution_failure() {
                 self.emit_connection_secret_resolution_failed(
                     context,
                     tool,
                     &target,
                     error.safe_reason(),
                 );
+            }
+            connection_tool_error(tool, error)
+        })?;
+        if let Some(credential) = credential.as_ref() {
+            credential.inject(&mut request.headers).map_err(|error| {
+                if error.is_secret_resolution_failure() {
+                    self.emit_connection_secret_resolution_failed(
+                        context,
+                        tool,
+                        &target,
+                        error.safe_reason(),
+                    );
+                }
                 connection_tool_error(tool, error)
             })?;
         }
 
-        target
+        let response = target
             .client()
-            .request_with_headers_at_checked_destination(
+            .stream_request_with_body_at_checked_destination(
                 &destination,
                 request.method,
                 target.url(),
                 request.headers,
-                request.body,
+                request
+                    .body
+                    .map_or(EgressRequestBody::Empty, EgressRequestBody::Buffered),
             )
             .await
-            .map_err(|source| connection_egress_tool_error(tool, &source))
+            .map_err(|source| connection_egress_tool_error(tool, &source))?;
+        if connection_authentication_rejected(response.status, target.authentication_kind()) {
+            if response.status == StatusCode::UNAUTHORIZED {
+                if let Some(credential) = credential
+                    .as_ref()
+                    .filter(|credential| credential.is_oauth())
+                {
+                    credential.invalidate_after_unauthorized().await;
+                }
+            }
+            return Err(connection_tool_error(
+                tool,
+                ConnectionHttpError::UpstreamAuthenticationRejected,
+            ));
+        }
+        let mut body = Vec::new();
+        let mut response_body = response.body;
+        while let Some(chunk) = response_body.next().await {
+            body.extend_from_slice(
+                &chunk.map_err(|source| connection_egress_tool_error(tool, &source))?,
+            );
+        }
+        Ok(EgressResponse {
+            status: response.status,
+            headers: response.headers,
+            body,
+        })
     }
 
     async fn execute_mcp_proxy(
@@ -1521,6 +1554,11 @@ fn connection_tool_error(tool: &ToolDefinition, error: ConnectionHttpError) -> T
     }
 }
 
+fn connection_authentication_rejected(status: StatusCode, authentication_kind: &str) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        && authentication_kind != "none"
+}
+
 fn connection_egress_tool_error(tool: &ToolDefinition, error: &EgressError) -> ToolExecutorError {
     ToolExecutorError::Connection {
         tool_name: tool.name.clone(),
@@ -1741,7 +1779,7 @@ mod tests {
             http::ConnectionHttpRuntime,
             model::{
                 ConnectionAuthentication, ConnectionEndpoint, ConnectionKind, ConnectionWrite,
-                TlsProfile,
+                OAuthClientAuthMethod, TlsProfile,
             },
             secret::{OperatorSecretAliasConfig, OperatorSecretAliasSource, SecretRootConfig},
         },
@@ -1755,6 +1793,10 @@ mod tests {
     };
 
     const EXPECTED_STRICT_SCHEMA_INJECTION_MAX_DEPTH: usize = 64;
+    const OVERSIZED_AUTH_BODY_CANARY: &str = "oversized-oauth-auth-body-canary";
+    const OAUTH_CHALLENGE_CANARY: &str = "Bearer realm=\"oversized-challenge-canary\"";
+    const FIRST_OAUTH_ACCESS_TOKEN: &str = "first-oauth-access-token";
+    const REPLACEMENT_OAUTH_ACCESS_TOKEN: &str = "replacement-oauth-access-token";
 
     #[test]
     fn non_global_egress_reason_preserves_machine_contract() {
@@ -1899,6 +1941,145 @@ mod tests {
             !format!("{events:?}").contains("operator-owned-key"),
             "audit events must never contain resolved credential material"
         );
+    }
+
+    #[tokio::test]
+    async fn connection_tool_auth_rejection_is_sanitized_and_recorded_as_failure() {
+        const CHALLENGE_CANARY: &str = "Bearer realm=\"challenge-canary\"";
+        const BODY_CANARY: &[u8] = b"upstream-auth-body-canary";
+        let (addr, ca_pem, server) = one_request_tls_server_response(
+            StatusCode::UNAUTHORIZED,
+            BODY_CANARY,
+            Some(CHALLENGE_CANARY),
+        )
+        .await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"operator-owned-key");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new(
+            runtime_config([("get_charge", enabled_tool(2_000, 1))], 2, 1, 100),
+            audit.clone(),
+        );
+        let executor = executor_for_connection_tool(
+            connection_charge_tool(&connection.connection_id),
+            &connection,
+            runtime,
+            audit,
+        );
+
+        let error = executor
+            .execute(
+                "get_charge",
+                json!({ "charge_id": "ch_auth_rejected" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("credentialed upstream 401 must fail closed");
+        let message = work_failed_message(error);
+        assert!(message.contains("auth_failed"));
+        assert!(!message.contains(CHALLENGE_CANARY));
+        assert!(!message
+            .contains(std::str::from_utf8(BODY_CANARY).expect("body canary should be ASCII")));
+
+        let request = server.await.expect("TLS server task should join once");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/v1/charges/ch_auth_rejected");
+        let events = audit_events(&capture, 4).await;
+        let rendered = serde_json::to_string(&events).expect("events should serialize");
+        assert!(!rendered.contains(CHALLENGE_CANARY));
+        assert!(!rendered
+            .contains(std::str::from_utf8(BODY_CANARY).expect("body canary should be ASCII")));
+        let upstream = events
+            .iter()
+            .find(|event| event.event_type == audit::event::TOOL_UPSTREAM_REQUEST)
+            .expect("tool upstream failure should be audited");
+        assert_eq!(upstream.payload["outcome"], json!("failure"));
+        assert_eq!(upstream.payload["reason"], json!("auth_failed"));
+        assert_eq!(upstream.payload["upstream_status"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn oversized_oauth_rejection_invalidates_before_body_buffering() {
+        let (addr, ca_pem, server) = oauth_rejection_then_success_tls_server().await;
+        let connection = TemporaryStaticAuthRuntime::oauth_client_credentials(addr, &ca_pem);
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new(
+            runtime_config([("get_charge", enabled_tool(2_000, 1))], 2, 1, 100),
+            audit.clone(),
+        );
+        let executor = executor_for_connection_tool(
+            connection_charge_tool(&connection.connection_id),
+            &connection,
+            runtime,
+            audit,
+        );
+
+        let error = executor
+            .execute(
+                "get_charge",
+                json!({ "charge_id": "ch_oauth_rejected" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("oversized OAuth 401 must fail as an authentication rejection");
+        let message = work_failed_message(error);
+        assert!(message.contains("auth_failed"));
+        assert!(!message.contains("response_too_large"));
+        assert!(!message.contains(OAUTH_CHALLENGE_CANARY));
+        assert!(!message.contains(OVERSIZED_AUTH_BODY_CANARY));
+
+        let response = http_response(
+            executor
+                .execute(
+                    "get_charge",
+                    json!({ "charge_id": "ch_after_invalidation" }),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("the next call should mint a replacement token and succeed"),
+        );
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, b"replacement accepted");
+
+        let requests = server.await.expect("OAuth TLS server should join");
+        let token_requests = requests
+            .iter()
+            .filter(|request| request.target == "/oauth/token")
+            .count();
+        assert_eq!(
+            token_requests, 2,
+            "the rejected cached token must be invalidated before the next invocation"
+        );
+        let api_requests = requests
+            .iter()
+            .filter(|request| request.target.starts_with("/v1/charges/"))
+            .collect::<Vec<_>>();
+        assert_eq!(api_requests.len(), 2);
+        let first_authorization = format!("Bearer {FIRST_OAUTH_ACCESS_TOKEN}");
+        let replacement_authorization = format!("Bearer {REPLACEMENT_OAUTH_ACCESS_TOKEN}");
+        assert_eq!(
+            api_requests[0].header("authorization"),
+            Some(first_authorization.as_str())
+        );
+        assert_eq!(
+            api_requests[1].header("authorization"),
+            Some(replacement_authorization.as_str())
+        );
+
+        let events = audit_events(&capture, 8).await;
+        let rendered = serde_json::to_string(&events).expect("events should serialize");
+        assert!(!rendered.contains(OAUTH_CHALLENGE_CANARY));
+        assert!(!rendered.contains(OVERSIZED_AUTH_BODY_CANARY));
+        assert!(events.iter().any(|event| {
+            event.event_type == audit::event::TOOL_UPSTREAM_REQUEST
+                && event.payload["outcome"] == json!("failure")
+                && event.payload["reason"] == json!("auth_failed")
+        }));
     }
 
     #[tokio::test]
@@ -3953,6 +4134,14 @@ mod tests {
 
     async fn one_request_tls_server(
     ) -> (SocketAddr, String, tokio::task::JoinHandle<CapturedRequest>) {
+        one_request_tls_server_response(StatusCode::OK, b"secure", None).await
+    }
+
+    async fn one_request_tls_server_response(
+        status: StatusCode,
+        body: &'static [u8],
+        www_authenticate: Option<&'static str>,
+    ) -> (SocketAddr, String, tokio::task::JoinHandle<CapturedRequest>) {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         let mut ca_params = rcgen::CertificateParams::default();
         ca_params.distinguished_name = rcgen::DistinguishedName::new();
@@ -4002,8 +4191,146 @@ mod tests {
                 .await
                 .expect("test TLS handshake should succeed");
             let request = read_http_request(&mut stream).await;
-            write_response(&mut stream, StatusCode::OK, b"secure").await;
+            let reason = status.canonical_reason().unwrap_or("Response");
+            let challenge = www_authenticate
+                .map(|value| format!("WWW-Authenticate: {value}\r\n"))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 {} {reason}\r\n{challenge}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                status.as_u16(),
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("test TLS response headers should write");
+            stream
+                .write_all(body)
+                .await
+                .expect("test TLS response body should write");
             request
+        });
+
+        (addr, ca.pem(), handle)
+    }
+
+    async fn oauth_rejection_then_success_tls_server() -> (
+        SocketAddr,
+        String,
+        tokio::task::JoinHandle<Vec<CapturedRequest>>,
+    ) {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "GreenGateway OAuth Tool Test CA");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().expect("OAuth test CA key should generate");
+        let ca = ca_params
+            .self_signed(&ca_key)
+            .expect("OAuth test CA certificate should build");
+        let mut server_params = rcgen::CertificateParams::default();
+        server_params.distinguished_name = rcgen::DistinguishedName::new();
+        server_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "127.0.0.1");
+        server_params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let server_key = rcgen::KeyPair::generate().expect("OAuth test server key should generate");
+        let server_certificate = server_params
+            .signed_by(&server_key, &ca, &ca_key)
+            .expect("OAuth test server certificate should build");
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(
+                    server_certificate.der().as_ref().to_vec(),
+                )],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+            )
+            .expect("OAuth test TLS server config should build");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("OAuth test TLS listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("OAuth test TLS listener address should be available");
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut token_request_count = 0usize;
+            let mut api_request_count = 0usize;
+
+            while api_request_count < 2 {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("OAuth test server should accept a request");
+                let mut stream = acceptor
+                    .accept(stream)
+                    .await
+                    .expect("OAuth test TLS handshake should succeed");
+                let request = read_http_request(&mut stream).await;
+
+                let (status, content_type, challenge, body) = if request.target == "/oauth/token" {
+                    token_request_count += 1;
+                    let access_token = if token_request_count == 1 {
+                        FIRST_OAUTH_ACCESS_TOKEN
+                    } else {
+                        REPLACEMENT_OAUTH_ACCESS_TOKEN
+                    };
+                    (
+                        StatusCode::OK,
+                        Some("application/json"),
+                        None,
+                        serde_json::to_vec(&json!({
+                            "access_token": access_token,
+                            "token_type": "Bearer",
+                            "expires_in": 3600
+                        }))
+                        .expect("OAuth token response should serialize"),
+                    )
+                } else {
+                    api_request_count += 1;
+                    if api_request_count == 1 {
+                        let mut body = OVERSIZED_AUTH_BODY_CANARY.as_bytes().to_vec();
+                        body.resize(256, b'x');
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Some("text/plain"),
+                            Some(OAUTH_CHALLENGE_CANARY),
+                            body,
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Some("text/plain"),
+                            None,
+                            b"replacement accepted".to_vec(),
+                        )
+                    }
+                };
+                let reason = status.canonical_reason().unwrap_or("Response");
+                let content_type = content_type
+                    .map(|value| format!("Content-Type: {value}\r\n"))
+                    .unwrap_or_default();
+                let challenge = challenge
+                    .map(|value| format!("WWW-Authenticate: {value}\r\n"))
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 {} {reason}\r\n{content_type}{challenge}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    status.as_u16(),
+                    body.len()
+                );
+                if stream.write_all(response.as_bytes()).await.is_ok() {
+                    let _ = stream.write_all(&body).await;
+                }
+                requests.push(request);
+            }
+
+            requests
         });
 
         (addr, ca.pem(), handle)
@@ -4087,6 +4414,99 @@ mod tests {
                 .expect("test CA should configure");
             let egress_client = Arc::new(
                 EgressClient::new(egress_config.clone()).expect("test egress client should build"),
+            );
+            let runtime = ConnectionHttpRuntime::new(
+                control_plane.clone(),
+                egress_config,
+                Arc::clone(&egress_client),
+            );
+
+            Self {
+                root,
+                secret_path,
+                connection_id: created.id.to_string(),
+                control_plane,
+                runtime,
+                egress_client,
+            }
+        }
+
+        fn oauth_client_credentials(addr: SocketAddr, ca_pem: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "greengateway-tool-static-auth-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir(&root).expect("temporary OAuth Connection root should create");
+            let secret_path = root.join("client-secret");
+            fs::write(&secret_path, b"oauth-client-secret")
+                .expect("temporary OAuth client secret should write");
+            let ca_path = root.join("test-ca.pem");
+            fs::write(&ca_path, ca_pem).expect("OAuth test CA should write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                    .expect("temporary OAuth Connection root permissions should set");
+                fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600))
+                    .expect("temporary OAuth client-secret permissions should set");
+                fs::set_permissions(&ca_path, fs::Permissions::from_mode(0o600))
+                    .expect("temporary OAuth CA permissions should set");
+            }
+
+            let mut config = Config::test_defaults();
+            config.connections_sqlite_path =
+                Some(root.join("connections.sqlite").display().to_string());
+            config.connection_secrets_root = Some(SecretRootConfig::new(root.clone()));
+            config.connection_secret_aliases = vec![OperatorSecretAliasConfig {
+                id: "billing-oauth-client-secret".to_owned(),
+                label: "Billing OAuth client secret".to_owned(),
+                source: OperatorSecretAliasSource::File {
+                    key: "client-secret".to_owned(),
+                },
+            }];
+            let control_plane =
+                ConnectionControlPlane::from_config(&config).expect("control plane should build");
+            let initial = control_plane.runtime_snapshot();
+            let created = control_plane
+                .create_managed(
+                    initial.collection_etag(),
+                    ConnectionWrite {
+                        display_name: "Billing OAuth API".to_owned(),
+                        description: None,
+                        enabled: true,
+                        kind: ConnectionKind::HttpApi,
+                        endpoint: ConnectionEndpoint {
+                            base_url: format!("https://127.0.0.1:{}", addr.port()),
+                            base_path: "/v1".to_owned(),
+                        },
+                        authentication: ConnectionAuthentication::OAuth2ClientCredentials {
+                            client_id: "billing-client".to_owned(),
+                            client_secret_id: Some("billing-oauth-client-secret".to_owned()),
+                            token_url: format!("https://127.0.0.1:{}/oauth/token", addr.port()),
+                            scopes: Vec::new(),
+                            audience: None,
+                            resource: None,
+                            client_auth_method: OAuthClientAuthMethod::ClientSecretBasic,
+                        },
+                        tls: TlsProfile::default(),
+                        timeouts: None,
+                        discovery: None,
+                        test_profile: None,
+                    },
+                )
+                .expect("OAuth test Connection should create");
+            let mut egress_config = EgressConfig {
+                allowed_hosts: ["127.0.0.1".to_owned()].into_iter().collect(),
+                max_response_bytes: 128,
+                deny_private_ips: false,
+                ..EgressConfig::default()
+            };
+            egress_config
+                .apply_tls_ca_bundle_path(ca_path)
+                .expect("OAuth test CA should configure");
+            let egress_client = Arc::new(
+                EgressClient::new(egress_config.clone())
+                    .expect("OAuth test egress client should build"),
             );
             let runtime = ConnectionHttpRuntime::new(
                 control_plane.clone(),

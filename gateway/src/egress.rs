@@ -20,6 +20,7 @@ use ipnet::IpNet;
 use reqwest::{header::HeaderMap, Method, StatusCode, Url};
 use sha2::{Digest, Sha256};
 use tokio::net::lookup_host;
+use zeroize::Zeroizing;
 
 use crate::{config::Config, rbac::EgressPolicy};
 
@@ -695,6 +696,23 @@ pub struct EgressResponse {
     pub body: Vec<u8>,
 }
 
+pub(crate) struct SensitiveEgressResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for SensitiveEgressResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SensitiveEgressResponse")
+            .field("status", &self.status)
+            .field("headers", &"<redacted>")
+            .field("body", &"<redacted>")
+            .finish()
+    }
+}
+
 pub type EgressBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, EgressError>> + Send>>;
 
 pub struct EgressStreamResponse {
@@ -764,6 +782,10 @@ impl EgressClient {
 
     pub(crate) fn max_response_bytes(&self) -> usize {
         self.config.max_response_bytes
+    }
+
+    pub(crate) fn configuration_generation(&self) -> [u8; 32] {
+        self.config_generation
     }
 
     #[cfg(test)]
@@ -872,6 +894,26 @@ impl EgressClient {
         tracing::debug!("egress request using previously validated pinned destination");
 
         self.send_with_client(client, method, parsed, headers, body)
+            .await
+    }
+
+    pub(crate) async fn sensitive_request_with_headers_at_checked_destination(
+        &self,
+        destination: &CheckedEgressDestination,
+        method: Method,
+        url: &str,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+    ) -> Result<SensitiveEgressResponse, EgressError> {
+        enforce_request_body_size(
+            body.as_ref().map_or(0, Vec::len),
+            self.config.max_request_body_bytes,
+        )?;
+        let (parsed, client) = self.client_for_checked_destination(destination, url, false)?;
+
+        tracing::debug!("sensitive egress request using previously validated pinned destination");
+
+        self.send_sensitive_with_client(client, method, parsed, headers, body)
             .await
     }
 
@@ -1166,6 +1208,47 @@ impl EgressClient {
         }
 
         Ok(EgressResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    async fn send_sensitive_with_client(
+        &self,
+        client: reqwest::Client,
+        method: Method,
+        url: Url,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+    ) -> Result<SensitiveEgressResponse, EgressError> {
+        let mut request = client.request(method, url).headers(headers);
+
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+
+        let mut response = request.send().await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut body = Zeroizing::new(Vec::new());
+
+        while let Some(chunk) = response.chunk().await? {
+            if body.len().saturating_add(chunk.len()) > self.config.max_response_bytes {
+                tracing::warn!(
+                    max = self.config.max_response_bytes,
+                    "egress blocked oversized sensitive response"
+                );
+                return Err(EgressError::ResponseTooLarge {
+                    size: body.len().saturating_add(chunk.len()),
+                    max: self.config.max_response_bytes,
+                });
+            }
+
+            body.extend_from_slice(&chunk);
+        }
+
+        Ok(SensitiveEgressResponse {
             status,
             headers,
             body,
@@ -2244,6 +2327,25 @@ mod tests {
                 "scheme rejection log leaked {secret}: {output}"
             );
         }
+    }
+
+    #[test]
+    fn sensitive_response_debug_redacts_headers_and_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::WWW_AUTHENTICATE,
+            reqwest::header::HeaderValue::from_static("Bearer realm=\"challenge-canary\""),
+        );
+        let response = SensitiveEgressResponse {
+            status: StatusCode::UNAUTHORIZED,
+            headers,
+            body: Zeroizing::new(b"access-token-canary".to_vec()),
+        };
+
+        let rendered = format!("{response:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("challenge-canary"));
+        assert!(!rendered.contains("access-token-canary"));
     }
 
     #[tokio::test]
