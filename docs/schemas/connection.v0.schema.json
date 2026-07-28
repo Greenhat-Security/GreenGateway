@@ -357,6 +357,7 @@
       ],
       "properties": {
         "method": {
+          "description": "New writes allow only GET or HEAD. Previously persisted v0 OPTIONS profiles remain readable for upgrade compatibility, but are not accepted by this write schema or executed by the Connection test endpoint.",
           "enum": [
             "GET",
             "HEAD"

@@ -3632,17 +3632,20 @@ async fn connection_test_endpoint(
     if let Err(error) =
         authorized_connection_state(&state, &principal, ADMIN_CONNECTIONS_TEST_PERMISSION)
     {
-        return connection_admin_authz_error_response(error);
+        return match error {
+            ConnectionAdminAuthzError::Forbidden => connection_permission_forbidden(
+                &state,
+                &parts,
+                &principal,
+                CONNECTION_TEST_ADMIN_ROUTE,
+                ADMIN_CONNECTIONS_TEST_PERMISSION,
+                "test",
+            ),
+            error => connection_admin_authz_error_response(error),
+        };
     }
     if !state.control_plane.is_managed_store_configured() {
         return connection_store_not_configured();
-    }
-    let body = match read_request_body(body, state.max_body_size.min(1024)).await {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
-    if !body.is_empty() {
-        return bad_request("connection test does not accept a request body");
     }
     let id = match connections::model::ConnectionId::parse(raw_id) {
         Ok(id) => id,
@@ -3705,8 +3708,67 @@ async fn connection_test_endpoint(
     };
 
     let probe_started = Instant::now();
-    let execution = match tokio::time::timeout(
-        state.tests.deadline(),
+    let probe_deadline = tokio::time::Instant::now() + state.tests.deadline();
+    let body =
+        match read_request_body_before(body, state.max_body_size.min(1024), probe_deadline).await {
+            Ok(body) => body,
+            Err(TimedBodyReadError::DeadlineExceeded) => {
+                emit_connection_tested(
+                    &state,
+                    &parts,
+                    &principal,
+                    record,
+                    "rejected",
+                    Some(connections::test::ConnectionTestReason::DeadlineExceeded),
+                    duration_millis(probe_started.elapsed()),
+                    None,
+                );
+                return (
+                    StatusCode::REQUEST_TIMEOUT,
+                    [
+                        (header::ETAG, etag_header_value(current_etag.as_str())),
+                        (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                    ],
+                    Json(json!({
+                        "error": "connection test request timed out",
+                        "reason": connections::test::ConnectionTestReason::DeadlineExceeded,
+                    })),
+                )
+                    .into_response();
+            }
+            Err(TimedBodyReadError::Rejected(response)) => {
+                emit_connection_tested(
+                    &state,
+                    &parts,
+                    &principal,
+                    record,
+                    "rejected",
+                    Some(connections::test::ConnectionTestReason::RequestBodyTooLarge),
+                    duration_millis(probe_started.elapsed()),
+                    None,
+                );
+                return with_etag(response, current_etag.as_str());
+            }
+        };
+    if !body.is_empty() {
+        emit_connection_tested(
+            &state,
+            &parts,
+            &principal,
+            record,
+            "rejected",
+            None,
+            duration_millis(probe_started.elapsed()),
+            None,
+        );
+        return with_etag(
+            bad_request("connection test does not accept a request body"),
+            current_etag.as_str(),
+        );
+    }
+
+    let execution = match tokio::time::timeout_at(
+        probe_deadline,
         state.tests.execute(record, current_etag.as_str()),
     )
     .await
@@ -3721,13 +3783,14 @@ async fn connection_test_endpoint(
             .control_plane
             .append_status(&id, &current_etag, execution.status_update())
     {
+        let reason = connection_test_status_persistence_reason(&error);
         emit_connection_tested(
             &state,
             &parts,
             &principal,
             record,
             "failure",
-            Some(connections::test::ConnectionTestReason::ConnectionChanged),
+            Some(reason),
             execution.result.latency_ms,
             Some(&execution.result),
         );
@@ -6937,6 +7000,23 @@ async fn read_request_body(body: Body, max_body_size: usize) -> Result<Bytes, Re
         })
 }
 
+enum TimedBodyReadError {
+    DeadlineExceeded,
+    Rejected(Response),
+}
+
+async fn read_request_body_before(
+    body: Body,
+    max_body_size: usize,
+    deadline: tokio::time::Instant,
+) -> Result<Bytes, TimedBodyReadError> {
+    match tokio::time::timeout_at(deadline, read_request_body(body, max_body_size)).await {
+        Ok(Ok(body)) => Ok(body),
+        Ok(Err(response)) => Err(TimedBodyReadError::Rejected(response)),
+        Err(_) => Err(TimedBodyReadError::DeadlineExceeded),
+    }
+}
+
 fn connection_admin_body_limit(state: &ConnectionAdminState) -> usize {
     state
         .max_body_size
@@ -9051,6 +9131,46 @@ fn connection_secret_authority_forbidden(
         }),
     ));
     forbidden()
+}
+
+fn connection_permission_forbidden(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    route_pattern: &'static str,
+    permission: &'static str,
+    operation: &'static str,
+) -> Response {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    state.audit.emit(audit::AuditEvent::new(
+        "authz.denied",
+        request_id,
+        source_ip,
+        Some(auth::actor_from_principal(principal)),
+        json!({
+            "path": route_pattern,
+            "method": parts.method.as_str(),
+            "reason": "missing_permission",
+            "permission": permission,
+            "authorization_layer": "connection_endpoint",
+            "operation": operation,
+        }),
+    ));
+    forbidden()
+}
+
+fn connection_test_status_persistence_reason(
+    error: &connections::control_plane::ConnectionMutationError,
+) -> connections::test::ConnectionTestReason {
+    match error {
+        connections::control_plane::ConnectionMutationError::Store(
+            connections::store::ConnectionStoreError::NotFound { .. }
+            | connections::store::ConnectionStoreError::Conflict { .. },
+        ) => connections::test::ConnectionTestReason::ConnectionChanged,
+        _ => connections::test::ConnectionTestReason::InternalError,
+    }
 }
 
 fn emit_service_token_delegation_rejected(
@@ -20277,6 +20397,11 @@ mod tests {
             .await
             .expect("non-empty connection test should complete");
         assert_eq!(non_empty.status(), StatusCode::BAD_REQUEST);
+        let router = connection_admin_router(
+            &connection_db,
+            &policy,
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>),
+        );
 
         let tested = router
             .clone()
@@ -20354,8 +20479,46 @@ mod tests {
                 event.event_type == audit::event::CONNECTION_TESTED
                     && event.payload["outcome"] == json!("rejected")
                     && event.payload["reason"] == json!("test_rate_limited")
+            }) && events.iter().any(|event| {
+                event.event_type == "authz.denied"
+                    && event.payload["permission"] == json!(ADMIN_CONNECTIONS_TEST_PERMISSION)
+                    && event.payload["operation"] == json!("test")
             })
         });
+    }
+
+    #[tokio::test]
+    async fn connection_test_body_reader_deadline_bounds_slow_clients() {
+        let body = Body::from_stream(stream::pending::<Result<Bytes, Infallible>>());
+        let result = read_request_body_before(
+            body,
+            1024,
+            tokio::time::Instant::now() + Duration::from_millis(10),
+        )
+        .await;
+
+        assert!(matches!(result, Err(TimedBodyReadError::DeadlineExceeded)));
+    }
+
+    #[test]
+    fn connection_test_status_persistence_errors_use_closed_accurate_reasons() {
+        let changed = connections::control_plane::ConnectionMutationError::Store(
+            connections::store::ConnectionStoreError::NotFound {
+                id: "opaque-connection".to_owned(),
+            },
+        );
+        assert_eq!(
+            connection_test_status_persistence_reason(&changed),
+            connections::test::ConnectionTestReason::ConnectionChanged
+        );
+
+        let unavailable = connections::control_plane::ConnectionMutationError::Unavailable(
+            connections::control_plane::ManagedConnectionMutationUnavailable,
+        );
+        assert_eq!(
+            connection_test_status_persistence_reason(&unavailable),
+            connections::test::ConnectionTestReason::InternalError
+        );
     }
 
     #[tokio::test]

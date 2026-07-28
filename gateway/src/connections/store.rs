@@ -4086,12 +4086,13 @@ impl RawStoredConnection {
                 reason: "connection document is not valid strict JSON",
             }
         })?;
-        let write = write
-            .validated()
-            .map_err(|_| ConnectionStoreError::CorruptRecord {
-                id: id.to_string(),
-                reason: "connection document no longer passes validation",
-            })?;
+        let write =
+            write
+                .validated_persisted_v0()
+                .map_err(|_| ConnectionStoreError::CorruptRecord {
+                    id: id.to_string(),
+                    reason: "connection document no longer passes validation",
+                })?;
         Ok(StoredConnection {
             id: id.clone(),
             write,
@@ -4648,6 +4649,8 @@ mod tests {
 
     use serde_json::json;
 
+    use crate::connections::model::ConnectionTestProfile;
+
     use super::*;
 
     fn candidate() -> ConnectionWrite {
@@ -4876,6 +4879,84 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
         assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn persisted_v0_options_profile_survives_restart_but_cannot_be_rewritten() {
+        let (_directory, path, store) = temporary_store("legacy-v0-options-restart");
+        let mut write = candidate();
+        write.test_profile = Some(ConnectionTestProfile {
+            method: "GET".to_owned(),
+            path: "/ready".to_owned(),
+            expected_statuses: vec![200, 204],
+        });
+        let created = store
+            .create(write)
+            .expect("pre-upgrade Connection fixture should create");
+        drop(store);
+
+        // Simulate a record written by an earlier v0 release, when OPTIONS was
+        // accepted in the persisted test profile.
+        let mut legacy_write = created.write.clone();
+        legacy_write
+            .test_profile
+            .as_mut()
+            .expect("fixture should retain its test profile")
+            .method = "OPTIONS".to_owned();
+        let legacy_json =
+            serde_json::to_string(&legacy_write).expect("legacy v0 fixture should serialize");
+        let connection = Connection::open(&path).expect("fixture database should open directly");
+        connection
+            .execute(
+                "UPDATE connection_records SET spec_json = ?1 WHERE id = ?2",
+                params![legacy_json, created.id.as_str()],
+            )
+            .expect("legacy v0 fixture should persist");
+        drop(connection);
+
+        let reopened = SqliteConnectionStore::open(&path)
+            .expect("legacy OPTIONS must not become a corrupt record on restart");
+        let loaded = reopened
+            .get(&created.id)
+            .expect("legacy Connection should remain readable")
+            .expect("legacy Connection should remain present");
+        assert_eq!(
+            loaded
+                .write
+                .test_profile
+                .as_ref()
+                .expect("legacy profile should remain visible")
+                .method,
+            "OPTIONS"
+        );
+
+        let create_error = reopened
+            .create(loaded.write.clone())
+            .expect_err("new writes must not accept a legacy OPTIONS profile");
+        assert!(matches!(
+            create_error,
+            ConnectionStoreError::Validation { problems }
+                if problems == vec!["test_profile.method:unsafe_method"]
+        ));
+        let replace_error = reopened
+            .replace(&loaded.id, &loaded.etag(), loaded.write.clone())
+            .expect_err("replacement writes must require GET or HEAD");
+        assert!(matches!(
+            replace_error,
+            ConnectionStoreError::Validation { problems }
+                if problems == vec!["test_profile.method:unsafe_method"]
+        ));
+        drop(reopened);
+
+        let restarted = SqliteConnectionStore::open(&path)
+            .expect("rejected rewrites must leave the legacy record restart-safe");
+        assert_eq!(
+            restarted
+                .list()
+                .expect("legacy Connection collection should remain readable")
+                .len(),
+            1
+        );
     }
 
     #[test]

@@ -259,11 +259,13 @@ impl ConnectionHttpRuntime {
 
     /// Builds the exact persisted HTTP test target, including for a disabled
     /// managed connection. Normal data-plane target constructors remain
-    /// fail-closed for disabled connections.
+    /// fail-closed for disabled connections. A missing target indicates that
+    /// the persisted connection no longer matches `expected_connection_etag`.
     pub fn test_target(
         &self,
         connection_id: &str,
-    ) -> Result<ConnectionHttpTestTarget, ConnectionHttpError> {
+        expected_connection_etag: &str,
+    ) -> Result<Option<ConnectionHttpTestTarget>, ConnectionHttpError> {
         let connection_id = ConnectionId::parse(connection_id.to_owned())
             .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
         let snapshot = self.control_plane.runtime_snapshot();
@@ -271,6 +273,10 @@ impl ConnectionHttpRuntime {
             .managed()
             .get(&connection_id)
             .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        let connection_etag = record.etag();
+        if connection_etag.as_str() != expected_connection_etag {
+            return Ok(None);
+        }
         if record.write.kind != ConnectionKind::HttpApi {
             return Err(ConnectionHttpError::WrongConnectionKind);
         }
@@ -305,10 +311,10 @@ impl ConnectionHttpRuntime {
         let client = self.client_for(record)?;
         let authentication = self.authentication_binding(record)?;
 
-        Ok(ConnectionHttpTestTarget {
+        Ok(Some(ConnectionHttpTestTarget {
             target: ConnectionHttpTarget {
                 connection_id,
-                connection_etag: record.etag().to_string(),
+                connection_etag: connection_etag.to_string(),
                 url,
                 client,
                 authentication,
@@ -316,16 +322,18 @@ impl ConnectionHttpRuntime {
             },
             method,
             expected_statuses: expected_statuses.clone(),
-        })
+        }))
     }
 
     /// Builds a managed MCP test target without requiring the persisted
     /// connection to be enabled. No caller-provided target or authentication
-    /// override is accepted.
+    /// override is accepted. A missing target indicates that the persisted
+    /// connection no longer matches `expected_connection_etag`.
     pub fn mcp_test_target(
         &self,
         connection_id: &str,
-    ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
+        expected_connection_etag: &str,
+    ) -> Result<Option<ConnectionHttpTarget>, ConnectionHttpError> {
         let connection_id = ConnectionId::parse(connection_id.to_owned())
             .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
         let snapshot = self.control_plane.runtime_snapshot();
@@ -333,6 +341,10 @@ impl ConnectionHttpRuntime {
             .managed()
             .get(&connection_id)
             .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        let connection_etag = record.etag();
+        if connection_etag.as_str() != expected_connection_etag {
+            return Ok(None);
+        }
         let use_connection_authentication = validate_mcp_connection_mode(record, false)?;
         let url = connection_target_url(record, "/")?;
         let client = self.client_for(record)?;
@@ -342,14 +354,14 @@ impl ConnectionHttpRuntime {
             HttpAuthenticationBinding::None
         };
 
-        Ok(ConnectionHttpTarget {
+        Ok(Some(ConnectionHttpTarget {
             connection_id,
-            connection_etag: record.etag().to_string(),
+            connection_etag: connection_etag.to_string(),
             url,
             client,
             authentication,
             transport: connection_transport_binding(record),
-        })
+        }))
     }
 
     pub fn validate_binding(&self, connection_id: &str) -> Result<(), ConnectionHttpError> {
@@ -1083,7 +1095,11 @@ mod tests {
                 TlsProfile,
             },
             secret::{OperatorSecretAliasConfig, OperatorSecretAliasSource, SecretRootConfig},
-            status::ConnectionRevisions,
+            status::{ConnectionOperationalState, ConnectionRevisions, ConnectionStatusReason},
+            test::{
+                ConnectionTestReason, ConnectionTestService, ConnectionTestStage,
+                ConnectionTestStageName,
+            },
         },
     };
 
@@ -1474,6 +1490,20 @@ mod tests {
                 ca_path,
             }
         }
+
+        fn stored_connection(&self) -> StoredConnection {
+            self.runtime
+                .control_plane
+                .runtime_snapshot()
+                .managed()
+                .get(&self.connection_id)
+                .expect("managed test connection should remain present")
+                .clone()
+        }
+
+        fn cached_client_count(&self) -> usize {
+            self.runtime.client_guard().len()
+        }
     }
 
     impl Drop for TemporaryManagedRuntime {
@@ -1592,6 +1622,16 @@ mod tests {
                 connection_id: created.id,
                 capture,
             }
+        }
+
+        fn stored_connection(&self) -> StoredConnection {
+            self.runtime
+                .control_plane
+                .runtime_snapshot()
+                .managed()
+                .get(&self.connection_id)
+                .expect("managed OAuth test connection should remain present")
+                .clone()
         }
     }
 
@@ -1845,10 +1885,12 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(normal_error, ConnectionHttpError::ConnectionDisabled);
+        let expected_etag = temporary.stored_connection().etag().to_string();
         let test = temporary
             .runtime
-            .test_target(temporary.connection_id.as_str())
-            .expect("persisted test mode should permit a disabled connection");
+            .test_target(temporary.connection_id.as_str(), &expected_etag)
+            .expect("persisted test mode should permit a disabled connection")
+            .expect("unchanged connection should return a test target");
         assert_eq!(test.method(), Method::HEAD);
         assert_eq!(test.target().url(), "https://billing.example.test/v1/ready");
         assert_eq!(test.expected_statuses(), &[200, 204]);
@@ -1872,12 +1914,313 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(normal_error, ConnectionHttpError::ConnectionDisabled);
+        let expected_etag = temporary.stored_connection().etag().to_string();
         let test = temporary
             .runtime
-            .mcp_test_target(temporary.connection_id.as_str())
-            .expect("persisted MCP test mode should permit a disabled managed MCP connection");
+            .mcp_test_target(temporary.connection_id.as_str(), &expected_etag)
+            .expect("persisted MCP test mode should permit a disabled managed MCP connection")
+            .expect("unchanged connection should return an MCP test target");
         assert_eq!(test.url(), "https://billing.example.test/mcp");
         assert_eq!(test.authentication_kind(), "none");
+    }
+
+    #[tokio::test]
+    async fn stale_http_test_etag_stops_before_client_tls_or_secret_preparation() {
+        let temporary =
+            TemporaryManagedRuntime::tls_identity_with_oauth("stale-http-test-etag", true);
+        let original = temporary.stored_connection();
+        let stale_etag = original.etag();
+        let mut replacement = original.write.clone();
+        replacement.test_profile = Some(ConnectionTestProfile {
+            method: "GET".to_owned(),
+            path: "/".to_owned(),
+            expected_statuses: vec![200],
+        });
+        let record = temporary
+            .runtime
+            .control_plane
+            .replace_managed(&original.id, &stale_etag, replacement)
+            .expect("current connection should gain a valid persisted test profile");
+        assert_ne!(record.etag(), stale_etag);
+        for secret in [
+            "ca.pem",
+            "client-certificate.pem",
+            "client-private-key.pem",
+            "oauth-secret",
+        ] {
+            fs::remove_file(temporary.root.join(secret))
+                .expect("test secret should be removed before the stale probe");
+        }
+        assert_eq!(temporary.cached_client_count(), 0);
+
+        let execution = ConnectionTestService::new(temporary.runtime.clone())
+            .execute(&record, stale_etag.as_str())
+            .await;
+
+        assert!(!execution.result.ok);
+        assert_eq!(
+            execution.result.stages,
+            vec![ConnectionTestStage::failure(
+                ConnectionTestStageName::ProtocolValid,
+                ConnectionTestReason::ConnectionChanged,
+            )]
+        );
+        assert_eq!(
+            execution.status_reason,
+            ConnectionStatusReason::RequestFailed
+        );
+        assert_eq!(
+            temporary.cached_client_count(),
+            0,
+            "stale tests must not prepare upstream or OAuth clients"
+        );
+    }
+
+    #[test]
+    fn stale_mcp_test_etag_stops_before_client_selection() {
+        let mut write = record("/mcp").write;
+        write.kind = ConnectionKind::McpStreamableHttp;
+        write.discovery = Some(DiscoveryConfig::ManagedMcp {
+            use_connection_authentication: false,
+        });
+        let temporary = TemporaryManagedRuntime::from_write("stale-mcp-test-etag", write);
+        assert_eq!(temporary.cached_client_count(), 0);
+
+        let target = temporary
+            .runtime
+            .mcp_test_target(
+                temporary.connection_id.as_str(),
+                "\"stale-connection-etag\"",
+            )
+            .expect("stale revision lookup should be safe");
+
+        assert!(target.is_none());
+        assert_eq!(temporary.cached_client_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn persisted_http_test_enforces_response_body_idle_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one connection");
+            let _ = read_http_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nhi\r\n",
+                )
+                .await
+                .expect("test response headers and first chunk should write");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let mut write = record("/").write;
+        write.endpoint.base_url = format!("http://127.0.0.1:{}", addr.port());
+        write.timeouts = Some(ConnectionTimeouts {
+            connect_timeout_ms: 500,
+            request_timeout_ms: 2_000,
+            response_idle_timeout_ms: 50,
+        });
+        write.test_profile = Some(ConnectionTestProfile {
+            method: "GET".to_owned(),
+            path: "/".to_owned(),
+            expected_statuses: vec![200],
+        });
+        let temporary = TemporaryManagedRuntime::from_write("http-test-response-idle", write);
+        let record = temporary.stored_connection();
+        let expected_etag = record.etag().to_string();
+
+        let execution = tokio::time::timeout(
+            Duration::from_secs(1),
+            ConnectionTestService::new(temporary.runtime.clone()).execute(&record, &expected_etag),
+        )
+        .await
+        .expect("saved response idle timeout should end the probe promptly");
+        server.abort();
+        let server_error = server
+            .await
+            .expect_err("aborted stalled server should stop promptly");
+        assert!(server_error.is_cancelled());
+
+        assert!(!execution.result.ok);
+        assert_eq!(
+            execution.result.state,
+            ConnectionOperationalState::Unavailable
+        );
+        assert_eq!(
+            execution.result.stages,
+            vec![
+                ConnectionTestStage::success(ConnectionTestStageName::EgressPolicy),
+                ConnectionTestStage::not_applicable(ConnectionTestStageName::SecretAvailable),
+                ConnectionTestStage::failure(
+                    ConnectionTestStageName::Connected,
+                    ConnectionTestReason::ResponseIdleTimeout,
+                ),
+            ]
+        );
+        assert_eq!(
+            execution.status_reason,
+            ConnectionStatusReason::RequestFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_oauth_denial_is_classified_and_invalidates_the_cached_token() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let mut upstream_ca_params = CertificateParams::default();
+        upstream_ca_params.distinguished_name = DistinguishedName::new();
+        upstream_ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "GreenGateway Upstream Test CA");
+        upstream_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let upstream_ca_key =
+            rcgen::KeyPair::generate().expect("upstream test CA key should generate");
+        let upstream_ca = upstream_ca_params
+            .self_signed(&upstream_ca_key)
+            .expect("upstream test CA certificate should build");
+        let mut upstream_server_params = CertificateParams::default();
+        upstream_server_params.distinguished_name = DistinguishedName::new();
+        upstream_server_params
+            .distinguished_name
+            .push(DnType::CommonName, "127.0.0.1");
+        upstream_server_params
+            .subject_alt_names
+            .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let upstream_server_key =
+            rcgen::KeyPair::generate().expect("upstream server key should generate");
+        let upstream_server_certificate = upstream_server_params
+            .signed_by(&upstream_server_key, &upstream_ca, &upstream_ca_key)
+            .expect("upstream server certificate should build");
+        let upstream_server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(
+                    upstream_server_certificate.der().as_ref().to_vec(),
+                )],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    upstream_server_key.serialize_der(),
+                )),
+            )
+            .expect("upstream TLS server config should build");
+        let upstream_acceptor = TlsAcceptor::from(Arc::new(upstream_server_config));
+        let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("upstream listener should bind");
+        let upstream_addr = upstream_listener
+            .local_addr()
+            .expect("upstream listener address");
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = upstream_listener
+                .accept()
+                .await
+                .expect("upstream should accept one connection");
+            let mut stream = upstream_acceptor
+                .accept(stream)
+                .await
+                .expect("upstream TLS should succeed");
+            let _ = read_http_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nno\r\n",
+                )
+                .await
+                .expect("denial headers and first chunk should write");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let token_response = serde_json::to_vec(&json!({
+            "access_token": OAUTH_ACCESS_TOKEN_CANARY,
+            "token_type": "Bearer",
+            "expires_in": 3600
+        }))
+        .expect("token response should serialize");
+        let (token_addr, ca_pem, token_request) =
+            one_request_tls_token_server(StatusCode::OK, "application/json", token_response).await;
+        let trusted_ca_pem = format!("{ca_pem}\n{}", upstream_ca.pem());
+        let temporary = TemporaryOAuthRuntime::new(
+            "stalled-denial",
+            format!("https://127.0.0.1:{}", upstream_addr.port()),
+            format!("https://127.0.0.1:{}/oauth/token", token_addr.port()),
+            HashSet::from(["127.0.0.1".to_owned()]),
+            Some(&trusted_ca_pem),
+        );
+        let original = temporary.stored_connection();
+        let mut replacement = original.write.clone();
+        replacement.timeouts = Some(ConnectionTimeouts {
+            connect_timeout_ms: 500,
+            request_timeout_ms: 2_000,
+            response_idle_timeout_ms: 50,
+        });
+        replacement.test_profile = Some(ConnectionTestProfile {
+            method: "GET".to_owned(),
+            path: "/".to_owned(),
+            expected_statuses: vec![200],
+        });
+        let record = temporary
+            .runtime
+            .control_plane
+            .replace_managed(&original.id, &original.etag(), replacement)
+            .expect("OAuth test profile should replace");
+        let expected_etag = record.etag().to_string();
+
+        let execution = tokio::time::timeout(
+            Duration::from_secs(1),
+            ConnectionTestService::new(temporary.runtime.clone()).execute(&record, &expected_etag),
+        )
+        .await
+        .expect("authenticated denial must not wait for its stalled body");
+        upstream.abort();
+        let upstream_error = upstream
+            .await
+            .expect_err("aborted stalled upstream should stop promptly");
+        assert!(upstream_error.is_cancelled());
+        token_request
+            .await
+            .expect("initial OAuth token request should complete");
+
+        assert!(!execution.result.ok);
+        assert_eq!(execution.result.state, ConnectionOperationalState::Degraded);
+        assert_eq!(
+            execution.result.stages,
+            vec![
+                ConnectionTestStage::success(ConnectionTestStageName::EgressPolicy),
+                ConnectionTestStage::success(ConnectionTestStageName::SecretAvailable),
+                ConnectionTestStage::success(ConnectionTestStageName::Connected),
+                ConnectionTestStage::not_applicable(ConnectionTestStageName::TlsValid),
+                ConnectionTestStage::failure(
+                    ConnectionTestStageName::Authenticated,
+                    ConnectionTestReason::AuthenticationFailed,
+                ),
+            ]
+        );
+        assert_eq!(
+            execution.status_reason,
+            ConnectionStatusReason::InvalidResponse
+        );
+
+        let target = temporary
+            .runtime
+            .test_target(temporary.connection_id.as_str(), &expected_etag)
+            .expect("current OAuth test target should build")
+            .expect("current OAuth test target should remain unchanged");
+        let remint_error = match tokio::time::timeout(
+            Duration::from_secs(1),
+            temporary.runtime.resolve_credential(target.target()),
+        )
+        .await
+        .expect("invalidated token should trigger a prompt replacement attempt")
+        {
+            Ok(_) => panic!("the rejected OAuth token must not remain cached"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            remint_error,
+            ConnectionHttpError::OAuthTokenUnavailable,
+            "a second mint attempt proves the rejected cached token was invalidated"
+        );
     }
 
     #[test]

@@ -5,13 +5,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     auth::{AuthMethod, Principal},
-    egress::EgressError,
+    egress::{EgressError, EgressRequestBody},
 };
 
 use super::{
@@ -429,9 +430,9 @@ impl ConnectionTestService {
         expected_etag: &str,
     ) -> ConnectionTestExecution {
         let started = Instant::now();
-        let test_target = match self.runtime.test_target(record.id.as_str()) {
-            Ok(target) if target.target().connection_etag() == expected_etag => target,
-            Ok(_) => {
+        let test_target = match self.runtime.test_target(record.id.as_str(), expected_etag) {
+            Ok(Some(target)) => target,
+            Ok(None) => {
                 return failed_execution(
                     started,
                     ConnectionOperationalState::Unavailable,
@@ -533,12 +534,12 @@ impl ConnectionTestService {
 
         let response = match prepared
             .client()
-            .request_with_headers_at_checked_destination(
+            .stream_request_with_body_at_checked_destination(
                 prepared.destination(),
                 test_target.method().clone(),
                 target.url(),
                 headers,
-                None,
+                EgressRequestBody::Empty,
             )
             .await
         {
@@ -556,22 +557,21 @@ impl ConnectionTestService {
                 );
             }
         };
-
-        stages.push(ConnectionTestStage::success(
-            ConnectionTestStageName::Connected,
-        ));
-        stages.push(if uses_tls {
-            ConnectionTestStage::success(ConnectionTestStageName::TlsValid)
-        } else {
-            ConnectionTestStage::not_applicable(ConnectionTestStageName::TlsValid)
-        });
-
+        let status = response.status;
         if uses_authentication
             && matches!(
-                response.status,
+                status,
                 http::StatusCode::UNAUTHORIZED | http::StatusCode::FORBIDDEN
             )
         {
+            stages.push(ConnectionTestStage::success(
+                ConnectionTestStageName::Connected,
+            ));
+            stages.push(if uses_tls {
+                ConnectionTestStage::success(ConnectionTestStageName::TlsValid)
+            } else {
+                ConnectionTestStage::not_applicable(ConnectionTestStageName::TlsValid)
+            });
             if let Some(credential) = credential.as_ref() {
                 credential.invalidate_after_unauthorized().await;
             }
@@ -586,16 +586,39 @@ impl ConnectionTestService {
                 stages,
             );
         }
+
+        let mut response_body = response.body;
+        while let Some(chunk) = response_body.next().await {
+            if let Err(error) = chunk {
+                stages.push(ConnectionTestStage::failure(
+                    ConnectionTestStageName::Connected,
+                    test_reason_from_egress(&error),
+                ));
+                return failed_execution(
+                    started,
+                    ConnectionOperationalState::Unavailable,
+                    ConnectionStatusReason::RequestFailed,
+                    stages,
+                );
+            }
+        }
+
+        stages.push(ConnectionTestStage::success(
+            ConnectionTestStageName::Connected,
+        ));
+        stages.push(if uses_tls {
+            ConnectionTestStage::success(ConnectionTestStageName::TlsValid)
+        } else {
+            ConnectionTestStage::not_applicable(ConnectionTestStageName::TlsValid)
+        });
+
         stages.push(if uses_authentication {
             ConnectionTestStage::success(ConnectionTestStageName::Authenticated)
         } else {
             ConnectionTestStage::not_applicable(ConnectionTestStageName::Authenticated)
         });
 
-        if !test_target
-            .expected_statuses()
-            .contains(&response.status.as_u16())
-        {
+        if !test_target.expected_statuses().contains(&status.as_u16()) {
             stages.push(ConnectionTestStage::failure(
                 ConnectionTestStageName::ProtocolValid,
                 ConnectionTestReason::UnexpectedStatus,
