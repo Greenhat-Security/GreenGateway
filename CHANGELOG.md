@@ -12,9 +12,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Added OAuth 2.0 client-credentials authentication for Connection-bound proxy
   routes and manual HTTP tools. Token endpoints are independently egress
   checked and DNS pinned before client-secret resolution, token responses are
-  strictly bounded and parsed, access tokens use a bounded revision-keyed
-  single-flight memory cache, and upstream `401` invalidates only the used
-  generation without replaying the current request.
+  strictly bounded, parsed, and best-effort zeroized on failure; access tokens
+  use a bounded revision-keyed single-flight memory cache whose success or
+  failure survives caller cancellation; and authenticated upstream rejection
+  is sanitized while OAuth `401` invalidates only the used generation without
+  replaying the current request.
 
 - Added per-endpoint mutual TLS for pooled upstreams through mounted
   `client_identity_pem_path` files. Regular-file identities are read through a

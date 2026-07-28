@@ -95,6 +95,7 @@ pub enum ConnectionHttpError {
     OAuthTokenUnavailable,
     OAuthTokenRejected,
     OAuthTokenInvalidResponse,
+    UpstreamAuthenticationRejected,
     TransportUnavailable,
 }
 
@@ -444,6 +445,7 @@ impl ConnectionHttpError {
             Self::OAuthTokenUnavailable => "oauth_token_unavailable",
             Self::OAuthTokenRejected => "oauth_token_rejected",
             Self::OAuthTokenInvalidResponse => "oauth_token_invalid_response",
+            Self::UpstreamAuthenticationRejected => "auth_failed",
             Self::TransportUnavailable => "transport_unavailable",
         }
     }
@@ -597,6 +599,22 @@ mod tests {
         String,
         tokio::task::JoinHandle<CapturedTokenRequest>,
     ) {
+        let (addr, ca_pem, handle, _received) =
+            one_request_delayed_tls_token_server(status, content_type, body, Duration::ZERO).await;
+        (addr, ca_pem, handle)
+    }
+
+    async fn one_request_delayed_tls_token_server(
+        status: StatusCode,
+        content_type: &str,
+        body: Vec<u8>,
+        response_delay: Duration,
+    ) -> (
+        SocketAddr,
+        String,
+        tokio::task::JoinHandle<CapturedTokenRequest>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         let mut ca_params = CertificateParams::default();
         ca_params.distinguished_name = DistinguishedName::new();
@@ -635,6 +653,7 @@ mod tests {
             .expect("test TLS listener should bind");
         let addr = listener.local_addr().expect("test TLS address");
         let content_type = content_type.to_owned();
+        let (request_received_tx, request_received_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             let (stream, _) = listener
                 .accept()
@@ -645,6 +664,8 @@ mod tests {
                 .await
                 .expect("token server TLS should succeed");
             let request = read_http_request(&mut stream).await;
+            let _ = request_received_tx.send(());
+            tokio::time::sleep(response_delay).await;
             let reason = status.canonical_reason().unwrap_or("Response");
             let response = format!(
                 "HTTP/1.1 {} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -661,7 +682,7 @@ mod tests {
                 .expect("token response body should write");
             request
         });
-        (addr, ca.pem(), handle)
+        (addr, ca.pem(), handle, request_received_rx)
     }
 
     async fn read_http_request<T>(stream: &mut T) -> CapturedTokenRequest
@@ -1201,6 +1222,60 @@ mod tests {
         ] {
             assert!(!audit_json.contains(canary), "audit leaked {canary}");
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_oauth_waiter_does_not_cancel_token_attempt_or_its_audit() {
+        let token_response = serde_json::to_vec(&json!({
+            "access_token": OAUTH_ACCESS_TOKEN_CANARY,
+            "token_type": "Bearer",
+            "expires_in": 3600
+        }))
+        .expect("token response should serialize");
+        let (addr, ca_pem, request_handle, request_received) =
+            one_request_delayed_tls_token_server(
+                StatusCode::OK,
+                "application/json",
+                token_response,
+                Duration::from_millis(50),
+            )
+            .await;
+        let temporary = TemporaryOAuthRuntime::new(
+            "cancelled-waiter",
+            format!("https://127.0.0.1:{}", addr.port()),
+            format!("https://127.0.0.1:{}/oauth/token", addr.port()),
+            HashSet::from(["127.0.0.1".to_owned()]),
+            Some(&ca_pem),
+        );
+        let target = temporary
+            .runtime
+            .target(temporary.connection_id.as_str(), "/charges")
+            .expect("OAuth target should resolve");
+        let runtime = temporary.runtime.clone();
+        let waiter = tokio::spawn(async move { runtime.resolve_credential(&target).await });
+
+        request_received
+            .await
+            .expect("token endpoint should observe the detached mint");
+        waiter.abort();
+        assert!(
+            matches!(waiter.await, Err(error) if error.is_cancelled()),
+            "caller waiter should be cancelled"
+        );
+        request_handle
+            .await
+            .expect("detached token request should complete");
+
+        let events = captured_audit_events(&temporary.capture, 1).await;
+        let refreshes = events
+            .iter()
+            .filter(|event| event.event_type == audit::event::CONNECTION_OAUTH_TOKEN_REFRESH)
+            .collect::<Vec<_>>();
+        assert_eq!(refreshes.len(), 1);
+        assert_eq!(refreshes[0].payload["outcome"], json!("success"));
+        let rendered = serde_json::to_string(&events).expect("audit should serialize");
+        assert!(!rendered.contains(OAUTH_ACCESS_TOKEN_CANARY));
+        assert!(!rendered.contains("/oauth/token"));
     }
 
     #[tokio::test]

@@ -2,11 +2,13 @@ use std::{
     collections::HashMap,
     fmt,
     future::Future,
+    panic::AssertUnwindSafe,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use futures_util::FutureExt;
 use http::{
     header::{self},
     HeaderMap, HeaderValue, Method, StatusCode,
@@ -14,9 +16,9 @@ use http::{
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use url::form_urlencoded;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::{
     audit::{self, AuditEvent, AuditLog},
@@ -45,6 +47,7 @@ pub(crate) struct OAuthClientCredentialsRuntime {
     audit: Option<AuditLog>,
 }
 
+#[derive(Clone)]
 pub(crate) struct OAuthBinding {
     pub connection_id: ConnectionId,
     pub connection_etag: String,
@@ -94,6 +97,7 @@ struct OAuthTokenSlot {
 struct OAuthTokenSlotState {
     cached: Option<CachedOAuthToken>,
     generation: u64,
+    in_flight: Option<Arc<OAuthMintFlight>>,
 }
 
 struct CachedOAuthToken {
@@ -105,6 +109,27 @@ struct CachedOAuthToken {
 struct MintedOAuthToken {
     access_token: Zeroizing<Vec<u8>>,
     lifetime: Duration,
+}
+
+struct OAuthRefreshAttempt {
+    audit: Option<AuditLog>,
+    connection_id: String,
+    started: Instant,
+    completed: bool,
+}
+
+struct OAuthMintFlight {
+    outcome: Mutex<Option<OAuthMintOutcome>>,
+    completed: Notify,
+}
+
+#[derive(Clone)]
+enum OAuthMintOutcome {
+    Success {
+        access_token: Zeroizing<Vec<u8>>,
+        generation: u64,
+    },
+    Failure(OAuthError),
 }
 
 trait OAuthClock: Send + Sync {
@@ -119,25 +144,37 @@ impl OAuthClock for SystemOAuthClock {
     }
 }
 
+struct SecretString(Zeroizing<String>);
+
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
+    }
+}
+
+impl SecretString {
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    fn take_bytes(&mut self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(std::mem::take(&mut *self.0).into_bytes())
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TokenResponse {
-    access_token: String,
+    access_token: SecretString,
     token_type: String,
     expires_in: u64,
     #[serde(default)]
-    refresh_token: Option<String>,
+    refresh_token: Option<SecretString>,
     #[serde(default)]
     scope: Option<String>,
-}
-
-impl Drop for TokenResponse {
-    fn drop(&mut self) {
-        self.access_token.zeroize();
-        if let Some(refresh_token) = self.refresh_token.as_mut() {
-            refresh_token.zeroize();
-        }
-    }
 }
 
 impl OAuthClientCredentialsRuntime {
@@ -173,15 +210,18 @@ impl OAuthClientCredentialsRuntime {
             secret_version,
             egress_generation: binding.token_client.configuration_generation(),
         };
+        let runtime = self.clone();
+        let binding = binding.clone();
         self.cache
-            .get_or_mint(key, || async { self.mint(binding).await })
+            .get_or_mint(key, move || async move { runtime.mint(&binding).await })
             .await
     }
 
     async fn mint(&self, binding: &OAuthBinding) -> Result<MintedOAuthToken, OAuthError> {
-        let started = Instant::now();
+        let mut attempt =
+            OAuthRefreshAttempt::new(self.audit.clone(), binding.connection_id.to_string());
         let result = self.mint_inner(binding).await;
-        self.emit_refresh_event(binding, &result, started.elapsed());
+        attempt.finish(&result);
         result
     }
 
@@ -211,7 +251,7 @@ impl OAuthClientCredentialsRuntime {
         let body = token_request_body(binding)?;
         let response = binding
             .token_client
-            .request_with_headers_at_checked_destination(
+            .sensitive_request_with_headers_at_checked_destination(
                 &destination,
                 Method::POST,
                 &binding.token_url,
@@ -223,7 +263,6 @@ impl OAuthClientCredentialsRuntime {
 
         let status = response.status;
         let content_type_is_json = is_json_content_type(response.headers.get(header::CONTENT_TYPE));
-        let response_body = Zeroizing::new(response.body);
         if status != StatusCode::OK {
             return Err(OAuthError::TokenRejected);
         }
@@ -231,26 +270,37 @@ impl OAuthClientCredentialsRuntime {
             return Err(OAuthError::InvalidTokenResponse);
         }
 
-        let mut token: TokenResponse = serde_json::from_slice(response_body.as_slice())
+        let mut token: TokenResponse = serde_json::from_slice(response.body.as_slice())
             .map_err(|_| OAuthError::InvalidTokenResponse)?;
         validate_token_response(&token)?;
-        let access_token = Zeroizing::new(std::mem::take(&mut token.access_token).into_bytes());
+        let access_token = token.access_token.take_bytes();
         Ok(MintedOAuthToken {
             access_token,
             lifetime: Duration::from_secs(token.expires_in),
         })
     }
+}
 
-    fn emit_refresh_event(
-        &self,
-        binding: &OAuthBinding,
-        result: &Result<MintedOAuthToken, OAuthError>,
-        latency: Duration,
-    ) {
+impl OAuthRefreshAttempt {
+    fn new(audit: Option<AuditLog>, connection_id: String) -> Self {
+        Self {
+            audit,
+            connection_id,
+            started: Instant::now(),
+            completed: false,
+        }
+    }
+
+    fn finish(&mut self, result: &Result<MintedOAuthToken, OAuthError>) {
         let (outcome, reason) = match result {
             Ok(_) => ("success", "refreshed"),
             Err(error) => ("failure", error.safe_reason()),
         };
+        self.completed = true;
+        self.emit(outcome, reason);
+    }
+
+    fn emit(&self, outcome: &'static str, reason: &'static str) {
         ::metrics::counter!(
             "connection_oauth_token_refresh_total",
             "result" => outcome,
@@ -266,13 +316,21 @@ impl OAuthClientCredentialsRuntime {
             "internal",
             None,
             json!({
-                "connection_id": binding.connection_id,
+                "connection_id": self.connection_id,
                 "auth_type": "oauth2_client_credentials",
                 "outcome": outcome,
                 "reason": reason,
-                "latency_ms": duration_millis(latency),
+                "latency_ms": duration_millis(self.started.elapsed()),
             }),
         ));
+    }
+}
+
+impl Drop for OAuthRefreshAttempt {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.emit("failure", "oauth_token_cancelled");
+        }
     }
 }
 
@@ -346,7 +404,7 @@ impl OAuthTokenCache {
     ) -> Result<OAuthTokenLease, OAuthError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<MintedOAuthToken, OAuthError>>,
+        Fut: Future<Output = Result<MintedOAuthToken, OAuthError>> + Send + 'static,
     {
         let slot = self.slot_for(&key)?;
         let mut state = slot.state.lock().await;
@@ -359,26 +417,36 @@ impl OAuthTokenCache {
             return lease_from_cached(Arc::clone(&slot), cached);
         }
         state.cached = None;
+        let flight = if let Some(flight) = state.in_flight.as_ref() {
+            Arc::clone(flight)
+        } else {
+            let flight = Arc::new(OAuthMintFlight {
+                outcome: Mutex::new(None),
+                completed: Notify::new(),
+            });
+            state.in_flight = Some(Arc::clone(&flight));
+            tokio::spawn(complete_oauth_mint(
+                Arc::clone(&slot),
+                key,
+                Arc::clone(&self.clock),
+                Arc::clone(&flight),
+                mint(),
+            ));
+            flight
+        };
+        drop(state);
 
-        let minted = mint().await?;
-        let now = self.clock.now();
-        state.generation = state.generation.saturating_add(1).max(1);
-        let generation = state.generation;
-        let refresh_at = now
-            .checked_add(refresh_after(&key, minted.lifetime))
-            .unwrap_or(now);
-        state.cached = Some(CachedOAuthToken {
-            access_token: minted.access_token,
-            refresh_at,
-            generation,
-        });
-        lease_from_cached(
-            Arc::clone(&slot),
-            state
-                .cached
-                .as_ref()
-                .expect("OAuth token was inserted before lease construction"),
-        )
+        match flight.wait().await {
+            OAuthMintOutcome::Success {
+                access_token,
+                generation,
+            } => Ok(OAuthTokenLease {
+                access_token,
+                slot,
+                generation,
+            }),
+            OAuthMintOutcome::Failure(error) => Err(error),
+        }
     }
 
     fn slot_for(&self, key: &OAuthTokenCacheKey) -> Result<Arc<OAuthTokenSlot>, OAuthError> {
@@ -410,6 +478,94 @@ impl OAuthTokenCache {
                 guard
             }
         }
+    }
+}
+
+impl OAuthMintFlight {
+    async fn wait(&self) -> OAuthMintOutcome {
+        loop {
+            let completed = self.completed.notified();
+            if let Some(outcome) = self.outcome_guard().clone() {
+                return outcome;
+            }
+            completed.await;
+        }
+    }
+
+    fn complete(&self, outcome: OAuthMintOutcome) {
+        let mut stored = self.outcome_guard();
+        if stored.is_none() {
+            *stored = Some(outcome);
+        }
+        drop(stored);
+        self.completed.notify_waiters();
+    }
+
+    fn outcome_guard(&self) -> MutexGuard<'_, Option<OAuthMintOutcome>> {
+        match self.outcome.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("OAuth token flight result lock poisoned; recovering fail closed");
+                poisoned.into_inner()
+            }
+        }
+    }
+}
+
+async fn complete_oauth_mint<Fut>(
+    slot: Arc<OAuthTokenSlot>,
+    key: OAuthTokenCacheKey,
+    clock: Arc<dyn OAuthClock>,
+    flight: Arc<OAuthMintFlight>,
+    mint: Fut,
+) where
+    Fut: Future<Output = Result<MintedOAuthToken, OAuthError>> + Send + 'static,
+{
+    let result = match AssertUnwindSafe(mint).catch_unwind().await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!("OAuth token flight panicked; recovering fail closed");
+            Err(OAuthError::TokenUnavailable)
+        }
+    };
+    let mut state = slot.state.lock().await;
+    let outcome = match result {
+        Ok(minted) => {
+            let now = clock.now();
+            state.generation = state.generation.saturating_add(1).max(1);
+            let generation = state.generation;
+            let refresh_at = now
+                .checked_add(refresh_after(&key, minted.lifetime))
+                .unwrap_or(now);
+            state.cached = Some(CachedOAuthToken {
+                access_token: minted.access_token,
+                refresh_at,
+                generation,
+            });
+            OAuthMintOutcome::Success {
+                access_token: Zeroizing::new(
+                    state
+                        .cached
+                        .as_ref()
+                        .expect("OAuth token was inserted before flight completion")
+                        .access_token
+                        .to_vec(),
+                ),
+                generation,
+            }
+        }
+        Err(error) => {
+            state.cached = None;
+            OAuthMintOutcome::Failure(error)
+        }
+    };
+    flight.complete(outcome);
+    if state
+        .in_flight
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &flight))
+    {
+        state.in_flight = None;
     }
 }
 
@@ -473,15 +629,15 @@ fn token_request_body(binding: &OAuthBinding) -> Result<Vec<u8>, OAuthError> {
 }
 
 fn validate_token_response(token: &TokenResponse) -> Result<(), OAuthError> {
-    if token.access_token.is_empty()
-        || token.access_token.len() > MAX_HTTP_CREDENTIAL_BYTES
-        || token.access_token.contains('\0')
+    if token.access_token.as_str().is_empty()
+        || token.access_token.as_str().len() > MAX_HTTP_CREDENTIAL_BYTES
+        || token.access_token.as_str().contains('\0')
         || token.token_type.len() > MAX_TOKEN_TYPE_BYTES
         || !token.token_type.eq_ignore_ascii_case("bearer")
         || token.expires_in == 0
         || token.expires_in > MAX_TOKEN_LIFETIME_SECS
         || token.refresh_token.as_ref().is_some_and(|refresh| {
-            refresh.len() > MAX_HTTP_CREDENTIAL_BYTES || refresh.contains('\0')
+            refresh.as_str().len() > MAX_HTTP_CREDENTIAL_BYTES || refresh.as_str().contains('\0')
         })
         || token
             .scope
@@ -490,7 +646,7 @@ fn validate_token_response(token: &TokenResponse) -> Result<(), OAuthError> {
     {
         return Err(OAuthError::InvalidTokenResponse);
     }
-    HeaderValue::from_bytes(token.access_token.as_bytes())
+    HeaderValue::from_bytes(token.access_token.as_str().as_bytes())
         .map(|_| ())
         .map_err(|_| OAuthError::InvalidTokenResponse)
 }
@@ -523,15 +679,15 @@ fn oauth_egress_error(error: &EgressError) -> OAuthError {
 }
 
 fn refresh_after(key: &OAuthTokenCacheKey, lifetime: Duration) -> Duration {
-    let lifetime_secs = lifetime.as_secs();
-    let skew = REFRESH_SKEW_SECS.min(lifetime_secs / 5);
-    let jitter_cap = MAX_REFRESH_JITTER_SECS.min(lifetime_secs / 10);
-    let jitter = if jitter_cap == 0 {
-        0
+    let skew = (lifetime / 5).min(Duration::from_secs(REFRESH_SKEW_SECS));
+    let jitter_cap = (lifetime / 10).min(Duration::from_secs(MAX_REFRESH_JITTER_SECS));
+    let jitter_cap_nanos = u64::try_from(jitter_cap.as_nanos()).unwrap_or(u64::MAX);
+    let jitter = if jitter_cap_nanos == 0 {
+        Duration::ZERO
     } else {
-        deterministic_jitter(key) % (jitter_cap + 1)
+        Duration::from_nanos(deterministic_jitter(key) % jitter_cap_nanos.saturating_add(1))
     };
-    Duration::from_secs(lifetime_secs.saturating_sub(skew.saturating_add(jitter)))
+    lifetime.saturating_sub(skew.saturating_add(jitter))
 }
 
 fn deterministic_jitter(key: &OAuthTokenCacheKey) -> u64 {
@@ -561,24 +717,26 @@ mod tests {
 
     use futures_util::future::join_all;
 
+    use crate::audit::{sink::tests::CaptureSink, AuditSink};
+
     use super::*;
 
     struct FakeClock {
         base: Instant,
-        millis: AtomicU64,
+        nanos: AtomicU64,
     }
 
     impl FakeClock {
         fn new() -> Self {
             Self {
                 base: Instant::now(),
-                millis: AtomicU64::new(0),
+                nanos: AtomicU64::new(0),
             }
         }
 
         fn advance(&self, duration: Duration) {
-            self.millis.fetch_add(
-                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            self.nanos.fetch_add(
+                u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
                 Ordering::AcqRel,
             );
         }
@@ -586,7 +744,7 @@ mod tests {
 
     impl OAuthClock for FakeClock {
         fn now(&self) -> Instant {
-            self.base + Duration::from_millis(self.millis.load(Ordering::Acquire))
+            self.base + Duration::from_nanos(self.nanos.load(Ordering::Acquire))
         }
     }
 
@@ -606,6 +764,10 @@ mod tests {
         }
     }
 
+    fn secret_string(value: &str) -> SecretString {
+        SecretString(Zeroizing::new(value.to_owned()))
+    }
+
     #[tokio::test]
     async fn one_hundred_concurrent_calls_share_one_mint_and_refresh_once() {
         let clock = Arc::new(FakeClock::new());
@@ -616,9 +778,10 @@ mod tests {
             let cache = Arc::clone(&cache);
             let mints = Arc::clone(&mints);
             async move {
+                let mint_task_count = Arc::clone(&mints);
                 cache
-                    .get_or_mint(key(1, Some(1)), || async {
-                        mints.fetch_add(1, Ordering::AcqRel);
+                    .get_or_mint(key(1, Some(1)), move || async move {
+                        mint_task_count.fetch_add(1, Ordering::AcqRel);
                         tokio::task::yield_now().await;
                         Ok(token("first-token", Duration::from_secs(3_600)))
                     })
@@ -635,9 +798,10 @@ mod tests {
             let cache = Arc::clone(&cache);
             let mints = Arc::clone(&mints);
             async move {
+                let mint_task_count = Arc::clone(&mints);
                 cache
-                    .get_or_mint(key(1, Some(1)), || async {
-                        mints.fetch_add(1, Ordering::AcqRel);
+                    .get_or_mint(key(1, Some(1)), move || async move {
+                        mint_task_count.fetch_add(1, Ordering::AcqRel);
                         tokio::task::yield_now().await;
                         Ok(token("second-token", Duration::from_secs(3_600)))
                     })
@@ -667,10 +831,11 @@ mod tests {
             .expect("secret rotation should mint a separate token");
         first.invalidate_after_unauthorized().await;
 
-        let mint_count = AtomicUsize::new(0);
+        let mint_count = Arc::new(AtomicUsize::new(0));
+        let retained_mint_count = Arc::clone(&mint_count);
         let retained = cache
-            .get_or_mint(key(1, Some(2)), || async {
-                mint_count.fetch_add(1, Ordering::AcqRel);
+            .get_or_mint(key(1, Some(2)), move || async move {
+                retained_mint_count.fetch_add(1, Ordering::AcqRel);
                 Ok(token("unexpected", Duration::from_secs(3_600)))
             })
             .await
@@ -707,10 +872,11 @@ mod tests {
             .expect("token should mint");
         rejected.invalidate_after_unauthorized().await;
 
-        let mints = AtomicUsize::new(0);
+        let mints = Arc::new(AtomicUsize::new(0));
+        let replacement_mints = Arc::clone(&mints);
         let replacement = cache
-            .get_or_mint(key(1, Some(1)), || async {
-                mints.fetch_add(1, Ordering::AcqRel);
+            .get_or_mint(key(1, Some(1)), move || async move {
+                replacement_mints.fetch_add(1, Ordering::AcqRel);
                 Ok(token("replacement", Duration::from_secs(3_600)))
             })
             .await
@@ -718,9 +884,10 @@ mod tests {
         assert_eq!(mints.load(Ordering::Acquire), 1);
         rejected.invalidate_after_unauthorized().await;
 
+        let retained_mints = Arc::clone(&mints);
         let retained = cache
-            .get_or_mint(key(1, Some(1)), || async {
-                mints.fetch_add(1, Ordering::AcqRel);
+            .get_or_mint(key(1, Some(1)), move || async move {
+                retained_mints.fetch_add(1, Ordering::AcqRel);
                 Ok(token("unexpected", Duration::from_secs(3_600)))
             })
             .await
@@ -766,10 +933,11 @@ mod tests {
         }
         assert_eq!(cache.slot_guard().len(), TOKEN_CACHE_CAPACITY);
 
-        let blocked_mints = AtomicUsize::new(0);
+        let blocked_mints = Arc::new(AtomicUsize::new(0));
+        let attempted_blocked_mints = Arc::clone(&blocked_mints);
         let unavailable = cache
-            .get_or_mint(key(u64::MAX, Some(1)), || async {
-                blocked_mints.fetch_add(1, Ordering::AcqRel);
+            .get_or_mint(key(u64::MAX, Some(1)), move || async move {
+                attempted_blocked_mints.fetch_add(1, Ordering::AcqRel);
                 Ok(token("must-not-mint", Duration::from_secs(3_600)))
             })
             .await;
@@ -787,10 +955,162 @@ mod tests {
         assert_eq!(cache.slot_guard().len(), TOKEN_CACHE_CAPACITY);
     }
 
+    #[tokio::test]
+    async fn one_hundred_concurrent_callers_share_one_failed_mint() {
+        let cache = Arc::new(OAuthTokenCache::new(Arc::new(FakeClock::new())));
+        let mints = Arc::new(AtomicUsize::new(0));
+        let calls = (0..100).map(|_| {
+            let cache = Arc::clone(&cache);
+            let mints = Arc::clone(&mints);
+            async move {
+                let mint_task_count = Arc::clone(&mints);
+                cache
+                    .get_or_mint(key(7, Some(1)), move || async move {
+                        mint_task_count.fetch_add(1, Ordering::AcqRel);
+                        tokio::task::yield_now().await;
+                        Err(OAuthError::TokenRejected)
+                    })
+                    .await
+            }
+        });
+
+        let results = join_all(calls).await;
+        assert!(results
+            .iter()
+            .all(|result| matches!(result, Err(OAuthError::TokenRejected))));
+        assert_eq!(mints.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_leading_waiter_does_not_cancel_or_duplicate_shared_mint() {
+        let cache = Arc::new(OAuthTokenCache::new(Arc::new(FakeClock::new())));
+        let mints = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let leader = {
+            let cache = Arc::clone(&cache);
+            let mints = Arc::clone(&mints);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                cache
+                    .get_or_mint(key(8, Some(1)), move || async move {
+                        mints.fetch_add(1, Ordering::AcqRel);
+                        started.notify_one();
+                        release.notified().await;
+                        Ok(token("surviving-token", Duration::from_secs(3_600)))
+                    })
+                    .await
+            })
+        };
+        started.notified().await;
+        leader.abort();
+        assert!(
+            leader
+                .await
+                .expect_err("leader should be cancelled")
+                .is_cancelled(),
+            "only the waiter should be cancelled"
+        );
+
+        let duplicate_mints = Arc::new(AtomicUsize::new(0));
+        let waiter = {
+            let cache = Arc::clone(&cache);
+            let duplicate_mints = Arc::clone(&duplicate_mints);
+            tokio::spawn(async move {
+                cache
+                    .get_or_mint(key(8, Some(1)), move || async move {
+                        duplicate_mints.fetch_add(1, Ordering::AcqRel);
+                        Ok(token("duplicate-token", Duration::from_secs(3_600)))
+                    })
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        release.notify_one();
+        waiter
+            .await
+            .expect("waiter task should complete")
+            .expect("shared mint should survive caller cancellation");
+        assert_eq!(mints.load(Ordering::Acquire), 1);
+        assert_eq!(duplicate_mints.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_refresh_attempt_emits_one_safe_cancellation_event() {
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        drop(OAuthRefreshAttempt::new(
+            Some(audit),
+            "connection-1".to_owned(),
+        ));
+        let started = Instant::now();
+        while capture.len() < 1 && started.elapsed() < Duration::from_secs(1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].event_type,
+            audit::event::CONNECTION_OAUTH_TOKEN_REFRESH
+        );
+        assert_eq!(events[0].payload["outcome"], json!("failure"));
+        assert_eq!(events[0].payload["reason"], json!("oauth_token_cancelled"));
+        let rendered = serde_json::to_string(&events).expect("audit should serialize");
+        assert!(!rendered.contains("oauth/token"));
+        assert!(!rendered.contains("access_token"));
+    }
+
+    #[tokio::test]
+    async fn short_lived_tokens_refresh_before_expiry_with_subsecond_fake_clock() {
+        for seconds in 1..=4 {
+            let lifetime = Duration::from_secs(seconds);
+            let refresh = refresh_after(&key(seconds, Some(1)), lifetime);
+            assert!(refresh > Duration::ZERO);
+            assert!(refresh < lifetime);
+        }
+
+        let clock = Arc::new(FakeClock::new());
+        let cache = OAuthTokenCache::new(clock.clone());
+        let cache_key = key(9, Some(1));
+        let first = cache
+            .get_or_mint(cache_key.clone(), || async {
+                Ok(token("short-token", Duration::from_secs(1)))
+            })
+            .await
+            .expect("short-lived token should mint");
+        let refresh = refresh_after(&cache_key, Duration::from_secs(1));
+        clock.advance(refresh.saturating_sub(Duration::from_nanos(1)));
+
+        let mints = Arc::new(AtomicUsize::new(0));
+        let before_refresh_mints = Arc::clone(&mints);
+        cache
+            .get_or_mint(cache_key.clone(), move || async move {
+                before_refresh_mints.fetch_add(1, Ordering::AcqRel);
+                Ok(token("too-early", Duration::from_secs(1)))
+            })
+            .await
+            .expect("token should remain cached immediately before refresh");
+        assert_eq!(mints.load(Ordering::Acquire), 0);
+
+        clock.advance(Duration::from_nanos(1));
+        let after_refresh_mints = Arc::clone(&mints);
+        cache
+            .get_or_mint(cache_key, move || async move {
+                after_refresh_mints.fetch_add(1, Ordering::AcqRel);
+                Ok(token("refreshed-token", Duration::from_secs(1)))
+            })
+            .await
+            .expect("token should proactively refresh");
+        assert_eq!(mints.load(Ordering::Acquire), 1);
+        drop(first);
+    }
+
     #[test]
     fn token_response_validation_is_strict_and_bounded() {
         let valid = TokenResponse {
-            access_token: "token".to_owned(),
+            access_token: secret_string("token"),
             token_type: "Bearer".to_owned(),
             expires_in: 60,
             refresh_token: None,
@@ -799,7 +1119,7 @@ mod tests {
         assert_eq!(validate_token_response(&valid), Ok(()));
 
         let wrong_type = TokenResponse {
-            access_token: "token".to_owned(),
+            access_token: secret_string("token"),
             token_type: "DPoP".to_owned(),
             expires_in: 60,
             refresh_token: None,
@@ -816,10 +1136,10 @@ mod tests {
         assert!(serde_json::from_slice::<TokenResponse>(b"{not-json").is_err());
 
         let invalid_discarded_fields = TokenResponse {
-            access_token: "token".to_owned(),
+            access_token: secret_string("token"),
             token_type: "Bearer".to_owned(),
             expires_in: 60,
-            refresh_token: Some("discarded\0refresh".to_owned()),
+            refresh_token: Some(secret_string("discarded\0refresh")),
             scope: Some("read".to_owned()),
         };
         assert_eq!(

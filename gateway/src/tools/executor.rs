@@ -16,6 +16,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use zeroize::Zeroize;
 
 use crate::{
     audit::{self, AuditEvent, AuditLog},
@@ -744,7 +745,7 @@ impl ToolExecutor {
             })?;
         }
 
-        let response = target
+        let mut response = target
             .client()
             .request_with_headers_at_checked_destination(
                 &destination,
@@ -755,13 +756,20 @@ impl ToolExecutor {
             )
             .await
             .map_err(|source| connection_egress_tool_error(tool, &source))?;
-        if response.status == StatusCode::UNAUTHORIZED {
-            if let Some(credential) = credential
-                .as_ref()
-                .filter(|credential| credential.is_oauth())
-            {
-                credential.invalidate_after_unauthorized().await;
+        if connection_authentication_rejected(response.status, target.authentication_kind()) {
+            if response.status == StatusCode::UNAUTHORIZED {
+                if let Some(credential) = credential
+                    .as_ref()
+                    .filter(|credential| credential.is_oauth())
+                {
+                    credential.invalidate_after_unauthorized().await;
+                }
             }
+            response.body.zeroize();
+            return Err(connection_tool_error(
+                tool,
+                ConnectionHttpError::UpstreamAuthenticationRejected,
+            ));
         }
         Ok(response)
     }
@@ -1534,6 +1542,11 @@ fn connection_tool_error(tool: &ToolDefinition, error: ConnectionHttpError) -> T
     }
 }
 
+fn connection_authentication_rejected(status: StatusCode, authentication_kind: &str) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        && authentication_kind != "none"
+}
+
 fn connection_egress_tool_error(tool: &ToolDefinition, error: &EgressError) -> ToolExecutorError {
     ToolExecutorError::Connection {
         tool_name: tool.name.clone(),
@@ -1912,6 +1925,63 @@ mod tests {
             !format!("{events:?}").contains("operator-owned-key"),
             "audit events must never contain resolved credential material"
         );
+    }
+
+    #[tokio::test]
+    async fn connection_tool_auth_rejection_is_sanitized_and_recorded_as_failure() {
+        const CHALLENGE_CANARY: &str = "Bearer realm=\"challenge-canary\"";
+        const BODY_CANARY: &[u8] = b"upstream-auth-body-canary";
+        let (addr, ca_pem, server) = one_request_tls_server_response(
+            StatusCode::UNAUTHORIZED,
+            BODY_CANARY,
+            Some(CHALLENGE_CANARY),
+        )
+        .await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"operator-owned-key");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new(
+            runtime_config([("get_charge", enabled_tool(2_000, 1))], 2, 1, 100),
+            audit.clone(),
+        );
+        let executor = executor_for_connection_tool(
+            connection_charge_tool(&connection.connection_id),
+            &connection,
+            runtime,
+            audit,
+        );
+
+        let error = executor
+            .execute(
+                "get_charge",
+                json!({ "charge_id": "ch_auth_rejected" }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("credentialed upstream 401 must fail closed");
+        let message = work_failed_message(error);
+        assert!(message.contains("auth_failed"));
+        assert!(!message.contains(CHALLENGE_CANARY));
+        assert!(!message
+            .contains(std::str::from_utf8(BODY_CANARY).expect("body canary should be ASCII")));
+
+        let request = server.await.expect("TLS server task should join once");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/v1/charges/ch_auth_rejected");
+        let events = audit_events(&capture, 4).await;
+        let rendered = serde_json::to_string(&events).expect("events should serialize");
+        assert!(!rendered.contains(CHALLENGE_CANARY));
+        assert!(!rendered
+            .contains(std::str::from_utf8(BODY_CANARY).expect("body canary should be ASCII")));
+        let upstream = events
+            .iter()
+            .find(|event| event.event_type == audit::event::TOOL_UPSTREAM_REQUEST)
+            .expect("tool upstream failure should be audited");
+        assert_eq!(upstream.payload["outcome"], json!("failure"));
+        assert_eq!(upstream.payload["reason"], json!("auth_failed"));
+        assert_eq!(upstream.payload["upstream_status"], Value::Null);
     }
 
     #[tokio::test]
@@ -3966,6 +4036,14 @@ mod tests {
 
     async fn one_request_tls_server(
     ) -> (SocketAddr, String, tokio::task::JoinHandle<CapturedRequest>) {
+        one_request_tls_server_response(StatusCode::OK, b"secure", None).await
+    }
+
+    async fn one_request_tls_server_response(
+        status: StatusCode,
+        body: &'static [u8],
+        www_authenticate: Option<&'static str>,
+    ) -> (SocketAddr, String, tokio::task::JoinHandle<CapturedRequest>) {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         let mut ca_params = rcgen::CertificateParams::default();
         ca_params.distinguished_name = rcgen::DistinguishedName::new();
@@ -4015,7 +4093,23 @@ mod tests {
                 .await
                 .expect("test TLS handshake should succeed");
             let request = read_http_request(&mut stream).await;
-            write_response(&mut stream, StatusCode::OK, b"secure").await;
+            let reason = status.canonical_reason().unwrap_or("Response");
+            let challenge = www_authenticate
+                .map(|value| format!("WWW-Authenticate: {value}\r\n"))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 {} {reason}\r\n{challenge}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                status.as_u16(),
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("test TLS response headers should write");
+            stream
+                .write_all(body)
+                .await
+                .expect("test TLS response body should write");
             request
         });
 

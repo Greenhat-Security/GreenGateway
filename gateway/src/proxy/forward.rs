@@ -774,12 +774,13 @@ async fn forward_to_upstream(
         };
 
         let upstream_status = upstream_response.status;
-        let oauth_unauthorized = oauth_unauthorized_forbids_retry(
-            upstream_status,
-            connection_target
-                .as_ref()
-                .map(ConnectionHttpTarget::authentication_kind),
-        );
+        let authentication_kind = connection_target
+            .as_ref()
+            .map(ConnectionHttpTarget::authentication_kind);
+        let oauth_unauthorized =
+            oauth_unauthorized_forbids_retry(upstream_status, authentication_kind);
+        let authentication_rejected =
+            connection_authentication_rejected(upstream_status, authentication_kind);
         if oauth_unauthorized {
             if let Some(credential) = connection_headers
                 .as_ref()
@@ -802,6 +803,18 @@ async fn forward_to_upstream(
                 .health
                 .record_passive_status(upstream_status.as_u16(), config)
                 .await;
+        }
+        if authentication_rejected {
+            let duration = attempt_started.elapsed();
+            record_attempt(&upstream.pool.id, &endpoint.id, "auth_failed", duration);
+            attempts.push(attempt_outcome(&endpoint.id, "auth_failed", duration));
+            return connection_failure_response(
+                ConnectionHttpError::UpstreamAuthenticationRejected,
+                &upstream.pool.id,
+                request_id,
+                attempts,
+                request_started.elapsed(),
+            );
         }
         let mut retry_stop_reason = None;
         if retryable_status && attempt_number < max_attempts {
@@ -1165,6 +1178,14 @@ fn proxy_error_category(error: &egress::EgressError) -> &'static str {
 
 fn oauth_unauthorized_forbids_retry(status: StatusCode, authentication_kind: Option<&str>) -> bool {
     status == StatusCode::UNAUTHORIZED && authentication_kind == Some("oauth2_client_credentials")
+}
+
+fn connection_authentication_rejected(
+    status: StatusCode,
+    authentication_kind: Option<&str>,
+) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        && authentication_kind.is_some_and(|kind| kind != "none")
 }
 
 fn circuit_failure_reason(error: &egress::EgressError) -> &'static str {
@@ -1672,7 +1693,8 @@ fn connection_failure_response(
         | ConnectionHttpError::CredentialInvalid
         | ConnectionHttpError::OAuthTokenEgressDenied
         | ConnectionHttpError::OAuthTokenRejected
-        | ConnectionHttpError::OAuthTokenInvalidResponse => StatusCode::BAD_GATEWAY,
+        | ConnectionHttpError::OAuthTokenInvalidResponse
+        | ConnectionHttpError::UpstreamAuthenticationRejected => StatusCode::BAD_GATEWAY,
     };
     let code = if status == StatusCode::SERVICE_UNAVAILABLE {
         "service_unavailable"
@@ -2180,6 +2202,44 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             None
         ));
+        assert!(connection_authentication_rejected(
+            StatusCode::UNAUTHORIZED,
+            Some("oauth2_client_credentials")
+        ));
+        assert!(connection_authentication_rejected(
+            StatusCode::FORBIDDEN,
+            Some("static_bearer")
+        ));
+        assert!(!connection_authentication_rejected(
+            StatusCode::UNAUTHORIZED,
+            Some("none")
+        ));
+    }
+
+    #[tokio::test]
+    async fn connection_auth_rejection_response_contains_no_upstream_challenge_or_body() {
+        let endpoint_id = Arc::<str>::from("endpoint-a");
+        let response = connection_failure_response(
+            ConnectionHttpError::UpstreamAuthenticationRejected,
+            "payments",
+            Some(HeaderValue::from_static("request-123")),
+            vec![attempt_outcome(
+                &endpoint_id,
+                "auth_failed",
+                Duration::from_millis(5),
+            )],
+            Duration::from_millis(5),
+        );
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
+        let rendered_headers = format!("{:?}", response.headers());
+        assert!(!rendered_headers.contains("challenge-canary"));
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("sanitized response body should read");
+        assert_eq!(body.as_ref(), br#"{"error":"bad_gateway"}"#);
+        assert!(!String::from_utf8_lossy(&body).contains("upstream-auth-body-canary"));
     }
 
     #[test]
