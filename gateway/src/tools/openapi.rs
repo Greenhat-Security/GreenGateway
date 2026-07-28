@@ -233,6 +233,7 @@ pub enum OpenApiToolGenerationLimit {
     CumulativeDefinitionBytes,
     SchemaExpansionNodes,
     SchemaExpansionBytes,
+    SecurityMetadataBytes,
 }
 
 #[derive(Clone)]
@@ -252,6 +253,29 @@ enum GeneratedParameterLocation {
 struct OpenApiSchemaExpansionBudget {
     remaining_nodes: usize,
     remaining_bytes: usize,
+}
+
+struct OpenApiSecurityMetadataBudget {
+    remaining_bytes: usize,
+}
+
+impl OpenApiSecurityMetadataBudget {
+    fn new() -> Self {
+        Self {
+            remaining_bytes: MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+        }
+    }
+
+    fn consume(&mut self, bytes: usize) -> Result<(), OpenApiToolGenerationError> {
+        if bytes > self.remaining_bytes {
+            return Err(OpenApiToolGenerationError::GenerationLimit {
+                limit: OpenApiToolGenerationLimit::SecurityMetadataBytes,
+                maximum: MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+            });
+        }
+        self.remaining_bytes -= bytes;
+        Ok(())
+    }
 }
 
 impl OpenApiSchemaExpansionBudget {
@@ -372,6 +396,10 @@ impl fmt::Display for OpenApiToolGenerationError {
                     formatter,
                     "expanded OpenAPI schemas exceed the cumulative byte maximum of {maximum}"
                 ),
+                OpenApiToolGenerationLimit::SecurityMetadataBytes => write!(
+                    formatter,
+                    "generated OpenAPI security metadata exceeds the cumulative byte maximum of {maximum}"
+                ),
             },
         }
     }
@@ -472,6 +500,7 @@ pub fn generate_tools_from_openapi_str(
     let mut used_names = BTreeSet::new();
     let mut cumulative_definition_bytes = 0usize;
     let mut schema_expansion_budget = OpenApiSchemaExpansionBudget::new();
+    let mut security_metadata_budget = OpenApiSecurityMetadataBudget::new();
 
     for operation in &parsed_spec.operations {
         if operation.method.eq_ignore_ascii_case("TRACE") {
@@ -505,6 +534,13 @@ pub fn generate_tools_from_openapi_str(
             operation_id_fallbacks.push(fallback);
         }
 
+        consume_operation_security_metadata_budget(
+            &document,
+            operation,
+            operation_value,
+            &tool_name,
+            &mut security_metadata_budget,
+        )?;
         api_key_header_auth_requirements.extend(api_key_header_requirements(
             &document,
             operation,
@@ -1365,16 +1401,104 @@ fn resolve_reference_with_depth<'a>(
     resolve_reference_with_depth(document, resolved, seen_references, depth + 1)
 }
 
+fn effective_security_value<'a>(
+    document: &'a Value,
+    operation_value: Option<&'a Value>,
+) -> Option<&'a Value> {
+    operation_value
+        .and_then(|value| value.as_object())
+        .and_then(|operation| operation.get("security"))
+        .or_else(|| document.get("security"))
+}
+
+fn consume_operation_security_metadata_budget(
+    document: &Value,
+    operation: &OpenApiOperation,
+    operation_value: Option<&Value>,
+    tool_name: &str,
+    budget: &mut OpenApiSecurityMetadataBudget,
+) -> Result<(), OpenApiToolGenerationError> {
+    let mut bytes = 64usize
+        .saturating_add(json_string_bytes(tool_name))
+        .saturating_add(json_string_bytes(&operation.method))
+        .saturating_add(json_string_bytes(&operation.path_template))
+        .saturating_add(
+            operation
+                .operation_id
+                .as_deref()
+                .map(json_string_bytes)
+                .unwrap_or(4),
+        );
+    if let Some(security) = effective_security_value(document, operation_value) {
+        bytes = bytes.saturating_add(json_value_bytes(security));
+        if let Some(alternatives) = security.as_array() {
+            for requirement in alternatives.iter().filter_map(Value::as_object) {
+                for scheme_name in requirement.keys() {
+                    let pointer = format!(
+                        "/components/securitySchemes/{}",
+                        json_pointer_escape(scheme_name)
+                    );
+                    if let Some(scheme) = document.pointer(&pointer) {
+                        let scheme = resolve_reference(document, scheme, &mut BTreeSet::new())?;
+                        bytes = bytes.saturating_add(json_value_bytes(scheme));
+                    }
+                }
+            }
+        }
+    } else {
+        bytes = bytes.saturating_add(16);
+    }
+
+    // The compatibility report and the typed security model both retain
+    // overlapping operation/scheme strings. Charging twice is deliberately
+    // conservative and keeps their combined retained metadata bounded.
+    budget.consume(bytes.saturating_mul(2))
+}
+
+fn json_value_bytes(value: &Value) -> usize {
+    let mut bytes = 0usize;
+    let mut remaining = vec![value];
+    while let Some(value) = remaining.pop() {
+        match value {
+            Value::Null => bytes = bytes.saturating_add(4),
+            Value::Bool(value) => {
+                bytes = bytes.saturating_add(if *value { 4 } else { 5 });
+            }
+            Value::Number(number) => {
+                bytes = bytes.saturating_add(number.to_string().len());
+            }
+            Value::String(value) => {
+                bytes = bytes.saturating_add(json_string_bytes(value));
+            }
+            Value::Array(values) => {
+                bytes = bytes
+                    .saturating_add(2)
+                    .saturating_add(values.len().saturating_sub(1));
+                remaining.extend(values);
+            }
+            Value::Object(object) => {
+                bytes = bytes
+                    .saturating_add(2)
+                    .saturating_add(object.len().saturating_sub(1));
+                for (key, value) in object {
+                    bytes = bytes
+                        .saturating_add(json_string_bytes(key))
+                        .saturating_add(1);
+                    remaining.push(value);
+                }
+            }
+        }
+    }
+    bytes
+}
+
 fn operation_security_requirements(
     document: &Value,
     operation: &OpenApiOperation,
     operation_value: Option<&Value>,
     tool_name: &str,
 ) -> Result<OpenApiOperationSecurity, OpenApiToolGenerationError> {
-    let security = operation_value
-        .and_then(|value| value.as_object())
-        .and_then(|operation| operation.get("security"))
-        .or_else(|| document.get("security"));
+    let security = effective_security_value(document, operation_value);
     let alternatives = match security {
         None => vec![anonymous_security_alternative()],
         Some(Value::Array(requirements)) if requirements.is_empty() => {
@@ -1632,9 +1756,7 @@ fn api_key_header_requirements(
     operation_value: Option<&Value>,
     tool_name: &str,
 ) -> Result<Vec<OpenApiApiKeyHeaderAuthRequirement>, OpenApiToolGenerationError> {
-    let security = operation_value
-        .and_then(|value| value.get("security"))
-        .or_else(|| document.get("security"));
+    let security = effective_security_value(document, operation_value);
     let Some(security_requirements) = security.and_then(Value::as_array) else {
         return Ok(Vec::new());
     };
@@ -2216,6 +2338,63 @@ paths:
                 maximum: MAX_OPENAPI_SCHEMA_EXPANSION_NODES,
             }
         ));
+    }
+
+    #[test]
+    fn rejects_root_security_metadata_amplification_before_retaining_it() {
+        let scheme_name = "S".repeat(256 * 1024);
+        let mut security_requirement = serde_json::Map::new();
+        security_requirement.insert(scheme_name.clone(), json!([]));
+        let mut security_schemes = serde_json::Map::new();
+        security_schemes.insert(
+            scheme_name,
+            json!({
+                "type": "apiKey",
+                "in": "header",
+                "name": "X-API-Key"
+            }),
+        );
+        let mut paths = serde_json::Map::new();
+        for index in 0..40 {
+            paths.insert(
+                format!("/secured/{index}"),
+                json!({
+                    "get": {
+                        "operationId": format!("secured_{index}")
+                    }
+                }),
+            );
+        }
+        let spec = json!({
+            "openapi": "3.0.3",
+            "info": {
+                "title": "Security metadata amplification",
+                "version": "1.0.0"
+            },
+            "security": [Value::Object(security_requirement)],
+            "components": {
+                "securitySchemes": security_schemes
+            },
+            "paths": paths
+        })
+        .to_string();
+        assert!(
+            spec.len() < 2 * 1024 * 1024,
+            "security amplification fixture must remain a bounded managed spec"
+        );
+
+        let error = generate_tools_from_openapi_str("security-amplification.json", &spec)
+            .expect_err("shared inherited security metadata must be cumulatively bounded");
+        assert!(
+            matches!(
+                &error,
+                OpenApiToolGenerationError::GenerationLimit {
+                    limit: OpenApiToolGenerationLimit::SecurityMetadataBytes,
+                    maximum: MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+                }
+            ),
+            "unexpected security amplification error: {error:?}"
+        );
     }
 
     #[test]
