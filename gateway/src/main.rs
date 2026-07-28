@@ -93,6 +93,9 @@ const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
 const TOKENS_ADMIN_ROUTE: &str = "/v1/admin/tokens";
 const TOKEN_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}";
 const TOKEN_ROTATE_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}/rotate";
+const CONNECTIONS_ADMIN_ROUTE: &str = "/v1/admin/connections";
+const CONNECTION_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}";
+const CONNECTION_COLLECTION_ETAG_HEADER: &str = "x-greengateway-connections-etag";
 const TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/preview";
 const TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/register";
 const OPENAPI_TOOLS_UNSUPPORTED_AUTH_REQUIREMENTS_ERROR: &str = "cannot register selected OpenAPI tools: upstream API-key header injection is not yet supported; see issue #36's known limitation";
@@ -117,6 +120,13 @@ const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
 const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
 const ADMIN_TOKENS_READ_PERMISSION: &str = "admin:tokens:read";
 const ADMIN_TOKENS_WRITE_PERMISSION: &str = "admin:tokens:write";
+const ADMIN_CONNECTIONS_READ_PERMISSION: &str = connections::permissions::ADMIN_CONNECTIONS_READ;
+const ADMIN_CONNECTIONS_WRITE_PERMISSION: &str = connections::permissions::ADMIN_CONNECTIONS_WRITE;
+const ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION: &str =
+    connections::permissions::ADMIN_CONNECTIONS_SECRETS_WRITE;
+const ADMIN_CONNECTIONS_TEST_PERMISSION: &str = connections::permissions::ADMIN_CONNECTIONS_TEST;
+const ADMIN_CONNECTIONS_REFRESH_PERMISSION: &str =
+    connections::permissions::ADMIN_CONNECTIONS_REFRESH;
 const ADMIN_TOOLS_READ_PERMISSION: &str = connections::permissions::ADMIN_TOOLS_READ;
 const ADMIN_TOOLS_WRITE_PERMISSION: &str = connections::permissions::ADMIN_TOOLS_WRITE;
 const ADMIN_SCHEMA_READ_PERMISSION: &str = "admin:schema:read";
@@ -204,6 +214,8 @@ struct AdminRoutes {
     tokens_route: String,
     token_route: String,
     token_rotate_route: String,
+    connections_route: String,
+    connection_route: String,
     tools_openapi_preview_route: String,
     tools_openapi_register_route: String,
     schema_coverage_route: String,
@@ -325,6 +337,8 @@ impl AdminRoutes {
             tokens_route: format!("{api_prefix}/tokens"),
             token_route: format!("{api_prefix}/tokens/{{id}}"),
             token_rotate_route: format!("{api_prefix}/tokens/{{id}}/rotate"),
+            connections_route: format!("{api_prefix}/connections"),
+            connection_route: format!("{api_prefix}/connections/{{id}}"),
             tools_openapi_preview_route: format!("{api_prefix}/tools/openapi/preview"),
             tools_openapi_register_route: format!("{api_prefix}/tools/openapi/register"),
             schema_coverage_route: format!("{api_prefix}/schema/coverage"),
@@ -379,6 +393,15 @@ struct PolicyAdminState {
 struct TokenAdminState {
     store: Option<Arc<dyn auth::TokenStore>>,
     validator: Option<Arc<auth::ServiceTokenValidator>>,
+    rbac_state: Option<middleware::rbac::RbacState>,
+    audit: audit::AuditLog,
+    client_ip_policy: client_ip::ClientIpPolicy,
+    max_body_size: usize,
+}
+
+#[derive(Clone)]
+struct ConnectionAdminState {
+    control_plane: connections::control_plane::ConnectionControlPlane,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
     client_ip_policy: client_ip::ClientIpPolicy,
@@ -451,6 +474,7 @@ struct AdminApiStates {
     status: StatusAdminState,
     policy: PolicyAdminState,
     tokens: TokenAdminState,
+    connections: ConnectionAdminState,
     tools: ToolAdminState,
     schema: SchemaAdminState,
     signals: SignalsAdminState,
@@ -979,6 +1003,11 @@ enum TokenAdminAuthzError {
     Forbidden,
 }
 
+enum ConnectionAdminAuthzError {
+    RbacNotConfigured,
+    Forbidden,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct TokenScopeAuthzError {
     disallowed: Vec<String>,
@@ -1023,6 +1052,23 @@ enum IfMatchError {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(Serialize)]
+struct ConnectionValidationProblem {
+    field: &'static str,
+    code: &'static str,
+}
+
+#[derive(Serialize)]
+struct ConnectionValidationResponse {
+    error: &'static str,
+    problems: Vec<ConnectionValidationProblem>,
+}
+
+#[derive(Serialize)]
+struct ConnectionDeletedResponse {
+    deleted_connection_id: connections::model::ConnectionId,
 }
 
 #[derive(Serialize)]
@@ -1511,6 +1557,13 @@ fn gateway_app_with_process_started_at_and_overrides(
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
     };
+    let connection_admin_state = ConnectionAdminState {
+        control_plane: connection_control_plane.clone(),
+        rbac_state: rbac_state.clone(),
+        audit: audit_log.clone(),
+        client_ip_policy: client_ip_policy.clone(),
+        max_body_size: config.max_body_size,
+    };
     let tool_admin_state = ToolAdminState {
         tools_file: config.tools_file.as_ref().map(PathBuf::from),
         registry: tool_registry,
@@ -1604,6 +1657,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         status: status_state,
         policy: policy_admin_state,
         tokens: token_admin_state,
+        connections: connection_admin_state,
         tools: tool_admin_state,
         schema: schema_admin_state,
         signals: signals_admin_state,
@@ -2149,6 +2203,20 @@ fn add_admin_api_routes(
         .merge(
             Router::new()
                 .route(
+                    routes.admin.connections_route.as_str(),
+                    get(connection_list_endpoint).post(connection_create_endpoint),
+                )
+                .route(
+                    routes.admin.connection_route.as_str(),
+                    get(connection_get_endpoint)
+                        .put(connection_put_endpoint)
+                        .delete(connection_delete_endpoint),
+                )
+                .with_state(admin_api_states.connections),
+        )
+        .merge(
+            Router::new()
+                .route(
                     routes.admin.tools_openapi_preview_route.as_str(),
                     post(tools_openapi_preview_endpoint),
                 )
@@ -2659,6 +2727,452 @@ async fn status_endpoint(
     }
 
     Json(StatusResponse::from_state(&state).await).into_response()
+}
+
+async fn connection_list_endpoint(
+    State(state): State<ConnectionAdminState>,
+    Query(params): Query<connections::admin::ConnectionListParams>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTIONS_ADMIN_ROUTE);
+
+    let Some(principal) = request.extensions().get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    let rbac_state =
+        match authorized_connection_state(&state, principal, ADMIN_CONNECTIONS_READ_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return connection_admin_authz_error_response(error),
+        };
+    let permissions = connection_permissions(rbac_state, principal);
+    let snapshot = state.control_plane.runtime_snapshot();
+    let (statuses, dependency_counts) = match connection_collection_runtime_data(&state, &snapshot)
+    {
+        Ok(data) => data,
+        Err(response) => return *response,
+    };
+    let page = match connections::admin::build_connection_list_page(
+        &snapshot,
+        &statuses,
+        &dependency_counts,
+        &params,
+        permissions,
+    ) {
+        Ok(page) => page,
+        Err(connections::admin::ConnectionListError::InvalidLimit) => {
+            return bad_request("limit must be between 1 and 100");
+        }
+        Err(connections::admin::ConnectionListError::InvalidCursor) => {
+            return bad_request("connection list cursor is invalid");
+        }
+        Err(connections::admin::ConnectionListError::StaleCursor) => {
+            return with_connection_collection_etag(
+                precondition_failed("connection list cursor does not match the current collection"),
+                snapshot.collection_etag(),
+            );
+        }
+    };
+
+    with_connection_collection_etag(
+        (
+            StatusCode::OK,
+            [
+                (header::ETAG, etag_header_value(snapshot.collection_etag())),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            ],
+            Json(page),
+        )
+            .into_response(),
+        snapshot.collection_etag(),
+    )
+}
+
+async fn connection_get_endpoint(
+    State(state): State<ConnectionAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_ADMIN_ROUTE);
+
+    let Some(principal) = request.extensions().get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    let rbac_state =
+        match authorized_connection_state(&state, principal, ADMIN_CONNECTIONS_READ_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return connection_admin_authz_error_response(error),
+        };
+    let permissions = connection_permissions(rbac_state, principal);
+    let id = match connections::model::ConnectionId::parse(raw_id) {
+        Ok(id) => id,
+        Err(_) => return not_found("connection was not found"),
+    };
+    let snapshot = state.control_plane.runtime_snapshot();
+
+    if let Some(record) = snapshot.managed().get(&id) {
+        let (status, dependencies) = match connection_detail_runtime_data(&state, &id) {
+            Ok(data) => data,
+            Err(response) => return *response,
+        };
+        let etag = record.etag();
+        return (
+            StatusCode::OK,
+            [
+                (header::ETAG, etag_header_value(etag.as_str())),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            ],
+            Json(connections::admin::managed_detail_view(
+                record,
+                status,
+                dependencies,
+                permissions,
+            )),
+        )
+            .into_response();
+    }
+
+    if let Some(projection) = snapshot
+        .legacy()
+        .iter()
+        .find(|projection| projection.id() == &id)
+    {
+        return (
+            StatusCode::OK,
+            [
+                (header::ETAG, etag_header_value(snapshot.collection_etag())),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            ],
+            Json(connections::admin::legacy_detail_view(
+                projection.safe_summary(),
+            )),
+        )
+            .into_response();
+    }
+
+    not_found("connection was not found")
+}
+
+async fn connection_create_endpoint(
+    State(state): State<ConnectionAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTIONS_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    let rbac_state =
+        match authorized_connection_state(&state, &principal, ADMIN_CONNECTIONS_WRITE_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return connection_admin_authz_error_response(error),
+        };
+    if !state.control_plane.is_managed_store_configured() {
+        return connection_store_not_configured();
+    }
+
+    let body = match read_request_body(body, connection_admin_body_limit(&state)).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let candidate = match parse_connection_create_body(&body) {
+        Ok(candidate) => candidate,
+        Err(response) => return *response,
+    };
+    let credential_changed = candidate.requires_secrets_write_to_create();
+    if credential_changed
+        && !rbac_state
+            .principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION)
+    {
+        return connection_secret_authority_forbidden(
+            &state,
+            &parts,
+            &principal,
+            CONNECTIONS_ADMIN_ROUTE,
+            "create",
+        );
+    }
+
+    let snapshot = state.control_plane.runtime_snapshot();
+    match if_match_matches(&parts.headers, snapshot.collection_etag()) {
+        Ok(true) => {}
+        Ok(false) => {
+            return with_connection_collection_etag(
+                precondition_failed(
+                    "If-Match does not match the current connection collection ETag",
+                ),
+                snapshot.collection_etag(),
+            );
+        }
+        Err(error) => {
+            return with_connection_collection_etag(
+                if_match_error_response(error),
+                snapshot.collection_etag(),
+            );
+        }
+    }
+
+    let created = match state
+        .control_plane
+        .create_managed(snapshot.collection_etag(), candidate)
+    {
+        Ok(created) => created,
+        Err(error) => return connection_mutation_error_response(error),
+    };
+    let permissions = connection_permissions(rbac_state, &principal);
+    let changed_fields = connections::admin::changed_connection_fields(None, Some(&created.write));
+    emit_connection_changed(
+        &state,
+        &parts,
+        &principal,
+        "created",
+        &created,
+        &changed_fields,
+        credential_changed,
+    );
+    let new_snapshot = state.control_plane.runtime_snapshot();
+    let etag = created.etag();
+    with_connection_collection_etag(
+        (
+            StatusCode::CREATED,
+            [
+                (header::ETAG, etag_header_value(etag.as_str())),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            ],
+            Json(connections::admin::managed_detail_view(
+                &created,
+                None,
+                Vec::new(),
+                permissions,
+            )),
+        )
+            .into_response(),
+        new_snapshot.collection_etag(),
+    )
+}
+
+async fn connection_put_endpoint(
+    State(state): State<ConnectionAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    let rbac_state =
+        match authorized_connection_state(&state, &principal, ADMIN_CONNECTIONS_WRITE_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return connection_admin_authz_error_response(error),
+        };
+    if !state.control_plane.is_managed_store_configured() {
+        return connection_store_not_configured();
+    }
+    let id = match connections::model::ConnectionId::parse(raw_id) {
+        Ok(id) => id,
+        Err(_) => return not_found("connection was not found"),
+    };
+    let snapshot = state.control_plane.runtime_snapshot();
+    let Some(current) = snapshot.managed().get(&id).cloned() else {
+        if snapshot
+            .legacy()
+            .iter()
+            .any(|projection| projection.id() == &id)
+        {
+            return conflict("legacy connection projections are read-only");
+        }
+        return not_found("connection was not found");
+    };
+
+    let body = match read_request_body(body, connection_admin_body_limit(&state)).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let has_secrets_write =
+        rbac_state.principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION);
+    let explicit_binding_intent = match explicit_connection_binding_intent_from_body(&body) {
+        Ok(intent) => intent,
+        Err(response) => return *response,
+    };
+    if explicit_binding_intent && !has_secrets_write {
+        return connection_secret_authority_forbidden(
+            &state,
+            &parts,
+            &principal,
+            CONNECTION_ADMIN_ROUTE,
+            "replace",
+        );
+    }
+    let candidate = match parse_connection_write_body(&body, &current.write) {
+        Ok(candidate) => candidate,
+        Err(response) => return *response,
+    };
+    let credential_changed = current.write.requires_secrets_write_to_replace(&candidate);
+    if credential_changed && !has_secrets_write {
+        return connection_secret_authority_forbidden(
+            &state,
+            &parts,
+            &principal,
+            CONNECTION_ADMIN_ROUTE,
+            "replace",
+        );
+    }
+
+    let current_etag = current.etag();
+    match if_match_matches(&parts.headers, current_etag.as_str()) {
+        Ok(true) => {}
+        Ok(false) => {
+            return with_etag(
+                precondition_failed("If-Match does not match the current connection ETag"),
+                current_etag.as_str(),
+            );
+        }
+        Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
+    }
+
+    let changed_fields =
+        connections::admin::changed_connection_fields(Some(&current.write), Some(&candidate));
+    let (current_status, dependencies) = match connection_detail_runtime_data(&state, &id) {
+        Ok(data) => data,
+        Err(response) => return *response,
+    };
+    let updated = match state
+        .control_plane
+        .replace_managed(&id, &current_etag, candidate)
+    {
+        Ok(updated) => updated,
+        Err(error) => return connection_mutation_error_response(error),
+    };
+    if !changed_fields.is_empty() {
+        emit_connection_changed(
+            &state,
+            &parts,
+            &principal,
+            "updated",
+            &updated,
+            &changed_fields,
+            credential_changed,
+        );
+    }
+    let status = if changed_fields.is_empty() {
+        current_status
+    } else {
+        None
+    };
+    let permissions = connection_permissions(rbac_state, &principal);
+    let etag = updated.etag();
+    let new_snapshot = state.control_plane.runtime_snapshot();
+    with_connection_collection_etag(
+        (
+            StatusCode::OK,
+            [
+                (header::ETAG, etag_header_value(etag.as_str())),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            ],
+            Json(connections::admin::managed_detail_view(
+                &updated,
+                status,
+                dependencies,
+                permissions,
+            )),
+        )
+            .into_response(),
+        new_snapshot.collection_etag(),
+    )
+}
+
+async fn connection_delete_endpoint(
+    State(state): State<ConnectionAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    let rbac_state =
+        match authorized_connection_state(&state, &principal, ADMIN_CONNECTIONS_WRITE_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return connection_admin_authz_error_response(error),
+        };
+    if !state.control_plane.is_managed_store_configured() {
+        return connection_store_not_configured();
+    }
+    let body = match read_request_body(body, connection_admin_body_limit(&state)).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if !body.is_empty() {
+        return bad_request("connection delete does not accept a request body");
+    }
+    let id = match connections::model::ConnectionId::parse(raw_id) {
+        Ok(id) => id,
+        Err(_) => return not_found("connection was not found"),
+    };
+    let snapshot = state.control_plane.runtime_snapshot();
+    let Some(current) = snapshot.managed().get(&id).cloned() else {
+        if snapshot
+            .legacy()
+            .iter()
+            .any(|projection| projection.id() == &id)
+        {
+            return conflict("legacy connection projections are read-only");
+        }
+        return not_found("connection was not found");
+    };
+    let credential_changed = current.write.requires_secrets_write_to_delete();
+    if credential_changed
+        && !rbac_state
+            .principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION)
+    {
+        return connection_secret_authority_forbidden(
+            &state,
+            &parts,
+            &principal,
+            CONNECTION_ADMIN_ROUTE,
+            "delete",
+        );
+    }
+    let current_etag = current.etag();
+    match if_match_matches(&parts.headers, current_etag.as_str()) {
+        Ok(true) => {}
+        Ok(false) => {
+            return with_etag(
+                precondition_failed("If-Match does not match the current connection ETag"),
+                current_etag.as_str(),
+            );
+        }
+        Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
+    }
+
+    if let Err(error) = state.control_plane.delete_managed(&id, &current_etag) {
+        return connection_mutation_error_response(error);
+    }
+    let changed_fields = connections::admin::changed_connection_fields(Some(&current.write), None);
+    emit_connection_changed(
+        &state,
+        &parts,
+        &principal,
+        "deleted",
+        &current,
+        &changed_fields,
+        credential_changed,
+    );
+    let new_snapshot = state.control_plane.runtime_snapshot();
+    with_connection_collection_etag(
+        (
+            StatusCode::OK,
+            Json(ConnectionDeletedResponse {
+                deleted_connection_id: id,
+            }),
+        )
+            .into_response(),
+        new_snapshot.collection_etag(),
+    )
 }
 
 async fn policy_get_endpoint(
@@ -5213,6 +5727,35 @@ fn authorized_policy_state<'a>(
     Ok(rbac_state)
 }
 
+fn authorized_connection_state<'a>(
+    state: &'a ConnectionAdminState,
+    principal: &auth::Principal,
+    permission: &str,
+) -> Result<&'a middleware::rbac::RbacState, ConnectionAdminAuthzError> {
+    let Some(rbac_state) = state.rbac_state.as_ref() else {
+        return Err(ConnectionAdminAuthzError::RbacNotConfigured);
+    };
+    if !rbac_state.principal_has_permission(principal, permission) {
+        return Err(ConnectionAdminAuthzError::Forbidden);
+    }
+    Ok(rbac_state)
+}
+
+fn connection_permissions(
+    rbac_state: &middleware::rbac::RbacState,
+    principal: &auth::Principal,
+) -> connections::admin::ConnectionPermissions {
+    connections::admin::ConnectionPermissions {
+        read: rbac_state.principal_has_permission(principal, ADMIN_CONNECTIONS_READ_PERMISSION),
+        write: rbac_state.principal_has_permission(principal, ADMIN_CONNECTIONS_WRITE_PERMISSION),
+        secrets_write: rbac_state
+            .principal_has_permission(principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION),
+        test: rbac_state.principal_has_permission(principal, ADMIN_CONNECTIONS_TEST_PERMISSION),
+        refresh: rbac_state
+            .principal_has_permission(principal, ADMIN_CONNECTIONS_REFRESH_PERMISSION),
+    }
+}
+
 fn authorized_audit_state<'a>(
     state: &'a AuditAdminState,
     principal: &auth::Principal,
@@ -5400,6 +5943,13 @@ fn token_admin_authz_error_response(error: TokenAdminAuthzError) -> Response {
     }
 }
 
+fn connection_admin_authz_error_response(error: ConnectionAdminAuthzError) -> Response {
+    match error {
+        ConnectionAdminAuthzError::RbacNotConfigured => connection_rbac_not_configured(),
+        ConnectionAdminAuthzError::Forbidden => forbidden(),
+    }
+}
+
 fn token_scope_authz_error_response(error: TokenScopeAuthzError) -> Response {
     let mut disallowed = error.disallowed;
     disallowed.sort();
@@ -5458,6 +6008,374 @@ async fn read_request_body(body: Body, max_body_size: usize) -> Result<Bytes, Re
             tracing::warn!(error = %err, "request body exceeded the configured limit or could not be read");
             payload_too_large(max_body_size)
         })
+}
+
+fn connection_admin_body_limit(state: &ConnectionAdminState) -> usize {
+    state
+        .max_body_size
+        .min(connections::admin::MAX_CONNECTION_ADMIN_BODY_BYTES)
+}
+
+fn parse_connection_write_body(
+    body: &Bytes,
+    current: &connections::model::ConnectionWrite,
+) -> ResponseResult<connections::model::ConnectionWrite> {
+    let mut candidate = serde_json::from_slice::<Value>(body)
+        .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
+    retain_hidden_connection_bindings(&mut candidate, current)?;
+    let candidate = serde_json::from_value::<connections::model::ConnectionWrite>(candidate)
+        .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
+    validate_connection_write(candidate)
+}
+
+fn explicit_connection_binding_intent_from_body(body: &Bytes) -> ResponseResult<bool> {
+    let candidate = serde_json::from_slice::<Value>(body)
+        .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
+    Ok(has_explicit_connection_binding_intent(&candidate))
+}
+
+fn has_explicit_connection_binding_intent(candidate: &Value) -> bool {
+    candidate
+        .get("authentication")
+        .and_then(Value::as_object)
+        .is_some_and(|authentication| {
+            authentication.contains_key("secret_id")
+                || authentication.contains_key("client_secret_id")
+        })
+        || candidate
+            .get("tls")
+            .and_then(Value::as_object)
+            .is_some_and(|tls| {
+                tls.contains_key("ca_bundle_alias")
+                    || tls.contains_key("client_certificate_id")
+                    || tls.contains_key("client_private_key_id")
+            })
+}
+
+fn retain_hidden_connection_bindings(
+    candidate: &mut Value,
+    current: &connections::model::ConnectionWrite,
+) -> ResponseResult<()> {
+    let object = candidate
+        .as_object_mut()
+        .ok_or_else(|| Box::new(bad_request("connection JSON must be an object")))?;
+    let authentication = object
+        .get_mut("authentication")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| Box::new(bad_request("connection authentication must be an object")))?;
+    let authentication_type = authentication
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Box::new(bad_request("connection authentication type is required")))?;
+
+    match (&current.authentication, authentication_type) {
+        (
+            connections::model::ConnectionAuthentication::HeaderApiKey { secret_id, .. },
+            "header_api_key",
+        )
+        | (
+            connections::model::ConnectionAuthentication::StaticBearer { secret_id },
+            "static_bearer",
+        ) => retain_hidden_binding(
+            authentication,
+            "secret_id",
+            "secret_configured",
+            secret_id.as_deref(),
+            true,
+        )?,
+        (
+            connections::model::ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id,
+                ..
+            },
+            "oauth2_client_credentials",
+        ) => retain_hidden_binding(
+            authentication,
+            "client_secret_id",
+            "client_secret_configured",
+            client_secret_id.as_deref(),
+            true,
+        )?,
+        _ => {
+            reject_redacted_marker(authentication, "secret_configured")?;
+            reject_redacted_marker(authentication, "client_secret_configured")?;
+        }
+    }
+
+    let tls = object
+        .entry("tls")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            Box::new(bad_request(
+                "connection TLS configuration must be an object",
+            ))
+        })?;
+    retain_hidden_binding(
+        tls,
+        "ca_bundle_alias",
+        "ca_bundle_configured",
+        current.tls.ca_bundle_alias.as_deref(),
+        true,
+    )?;
+    retain_hidden_binding(
+        tls,
+        "client_certificate_id",
+        "client_certificate_configured",
+        current.tls.client_certificate_id.as_deref(),
+        true,
+    )?;
+    retain_hidden_binding(
+        tls,
+        "client_private_key_id",
+        "client_private_key_configured",
+        current.tls.client_private_key_id.as_deref(),
+        true,
+    )
+}
+
+fn retain_hidden_binding(
+    object: &mut serde_json::Map<String, Value>,
+    binding_field: &'static str,
+    marker_field: &'static str,
+    current: Option<&str>,
+    allow_preserve: bool,
+) -> ResponseResult<()> {
+    let marker = take_redacted_marker(object, marker_field)?;
+    retain_hidden_binding_with_marker(object, binding_field, current, marker, allow_preserve)
+}
+
+fn retain_hidden_binding_with_marker(
+    object: &mut serde_json::Map<String, Value>,
+    binding_field: &'static str,
+    current: Option<&str>,
+    marker: Option<bool>,
+    allow_preserve: bool,
+) -> ResponseResult<()> {
+    if object.contains_key(binding_field) {
+        if marker.is_some() {
+            return Err(Box::new(bad_request(
+                "redacted connection binding markers cannot be combined with explicit binding IDs",
+            )));
+        }
+        return Ok(());
+    }
+    if !allow_preserve {
+        if marker.is_some() {
+            return Err(Box::new(bad_request(
+                "redacted connection binding marker cannot be used for a different authentication type",
+            )));
+        }
+        return Ok(());
+    }
+    if marker == Some(false) {
+        return Ok(());
+    }
+    if let Some(current) = current {
+        object.insert(binding_field.to_owned(), Value::String(current.to_owned()));
+        Ok(())
+    } else if marker == Some(true) {
+        Err(Box::new(bad_request(
+            "redacted connection binding marker does not match the current resource",
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn take_redacted_marker(
+    object: &mut serde_json::Map<String, Value>,
+    marker_field: &'static str,
+) -> ResponseResult<Option<bool>> {
+    object
+        .remove(marker_field)
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                Box::new(bad_request(
+                    "redacted connection binding marker must be a boolean",
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn reject_redacted_marker(
+    object: &mut serde_json::Map<String, Value>,
+    marker_field: &'static str,
+) -> ResponseResult<()> {
+    if object.contains_key(marker_field) {
+        Err(Box::new(bad_request(
+            "redacted connection binding marker cannot be used for a different authentication type",
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_connection_create_body(
+    body: &Bytes,
+) -> ResponseResult<connections::model::ConnectionWrite> {
+    let mut candidate = serde_json::from_slice::<Value>(body)
+        .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
+    let object = candidate
+        .as_object_mut()
+        .ok_or_else(|| Box::new(bad_request("connection JSON must be an object")))?;
+    object.entry("enabled").or_insert(Value::Bool(false));
+    let candidate = serde_json::from_value::<connections::model::ConnectionWrite>(candidate)
+        .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
+    validate_connection_write(candidate)
+}
+
+fn validate_connection_write(
+    candidate: connections::model::ConnectionWrite,
+) -> ResponseResult<connections::model::ConnectionWrite> {
+    candidate.validated().map_err(|problems| {
+        Box::new(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ConnectionValidationResponse {
+                    error: "connection validation failed",
+                    problems: problems
+                        .into_iter()
+                        .map(|problem| ConnectionValidationProblem {
+                            field: problem.field,
+                            code: problem.code,
+                        })
+                        .collect(),
+                }),
+            )
+                .into_response(),
+        )
+    })
+}
+
+fn connection_collection_runtime_data(
+    state: &ConnectionAdminState,
+    snapshot: &connections::control_plane::ConnectionRuntimeSnapshot,
+) -> ResponseResult<(
+    BTreeMap<connections::model::ConnectionId, connections::status::SafeConnectionStatus>,
+    BTreeMap<connections::model::ConnectionId, usize>,
+)> {
+    if snapshot.managed().is_empty() {
+        return Ok((BTreeMap::new(), BTreeMap::new()));
+    }
+    let store = state.control_plane.managed_store().map_err(|_| {
+        Box::new(service_unavailable(
+            "managed connection state is unavailable",
+        ))
+    })?;
+    let dependency_counts = store.dependency_counts().map_err(|error| {
+        tracing::error!(error = %error, "failed to load connection dependency counts");
+        Box::new(service_unavailable(
+            "managed connection state is unavailable",
+        ))
+    })?;
+    let mut statuses = BTreeMap::new();
+    for id in snapshot.managed().keys() {
+        if let Some(status) = store.latest_status(id).map_err(|error| {
+            tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
+            ))
+        })? {
+            statuses.insert(id.clone(), status);
+        }
+    }
+    Ok((statuses, dependency_counts))
+}
+
+fn connection_detail_runtime_data(
+    state: &ConnectionAdminState,
+    id: &connections::model::ConnectionId,
+) -> ResponseResult<(
+    Option<connections::status::SafeConnectionStatus>,
+    Vec<connections::store::ConnectionDependency>,
+)> {
+    let store = state.control_plane.managed_store().map_err(|_| {
+        Box::new(service_unavailable(
+            "managed connection state is unavailable",
+        ))
+    })?;
+    let status = store.latest_status(id).map_err(|error| {
+        tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
+        Box::new(service_unavailable(
+            "managed connection state is unavailable",
+        ))
+    })?;
+    let dependencies = store.dependencies(id).map_err(|error| {
+        tracing::error!(connection_id = %id, error = %error, "failed to load connection dependencies");
+        Box::new(connection_store_error_response(error))
+    })?;
+    Ok((status, dependencies))
+}
+
+fn connection_mutation_error_response(
+    error: connections::control_plane::ConnectionMutationError,
+) -> Response {
+    match error {
+        connections::control_plane::ConnectionMutationError::Unavailable(_) => {
+            connection_store_not_configured()
+        }
+        connections::control_plane::ConnectionMutationError::CollectionConflict { current } => {
+            with_connection_collection_etag(
+                precondition_failed("connection collection changed during the mutation"),
+                &current,
+            )
+        }
+        connections::control_plane::ConnectionMutationError::UnresolvableBindings { fields } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ConnectionValidationResponse {
+                error: "connection validation failed",
+                problems: fields
+                    .into_iter()
+                    .map(|field| ConnectionValidationProblem {
+                        field,
+                        code: "unresolvable_binding",
+                    })
+                    .collect(),
+            }),
+        )
+            .into_response(),
+        connections::control_plane::ConnectionMutationError::BindingUnavailable => {
+            service_unavailable("connection binding validation is unavailable")
+        }
+        connections::control_plane::ConnectionMutationError::Store(error) => {
+            connection_store_error_response(error)
+        }
+    }
+}
+
+fn connection_store_error_response(error: connections::store::ConnectionStoreError) -> Response {
+    match error {
+        connections::store::ConnectionStoreError::Validation { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ConnectionValidationResponse {
+                error: "connection validation failed",
+                problems: vec![ConnectionValidationProblem {
+                    field: "connection",
+                    code: "invalid",
+                }],
+            }),
+        )
+            .into_response(),
+        connections::store::ConnectionStoreError::NotFound { .. } => {
+            not_found("connection was not found")
+        }
+        connections::store::ConnectionStoreError::Conflict { current, .. } => with_etag(
+            precondition_failed("connection changed during the mutation"),
+            current.as_str(),
+        ),
+        connections::store::ConnectionStoreError::DependencyConflict { count, .. } => conflict(
+            &format!("connection is referenced by {count} retained control-plane records"),
+        ),
+        connections::store::ConnectionStoreError::LimitExceeded { .. } => {
+            conflict("managed connection capacity has been reached")
+        }
+        other => {
+            tracing::error!(error = %other, "managed connection operation failed");
+            service_unavailable("managed connection state is unavailable")
+        }
+    }
 }
 
 fn split_authorized_policy_mutation_request(
@@ -6809,6 +7727,21 @@ fn etag_header_value(etag: &str) -> HeaderValue {
     HeaderValue::from_str(etag).expect("policy ETag should be a valid HTTP header value")
 }
 
+fn with_etag(mut response: Response, etag: &str) -> Response {
+    response
+        .headers_mut()
+        .insert(header::ETAG, etag_header_value(etag));
+    response
+}
+
+fn with_connection_collection_etag(mut response: Response, etag: &str) -> Response {
+    response.headers_mut().insert(
+        HeaderName::from_static(CONNECTION_COLLECTION_ETAG_HEADER),
+        etag_header_value(etag),
+    );
+    response
+}
+
 fn with_policy_history_append_warning(
     mut response: Response,
     history_append_failed: bool,
@@ -6931,6 +7864,76 @@ fn emit_service_token_changed(
         actor,
         payload,
     ));
+}
+
+fn emit_connection_changed(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    action: &'static str,
+    record: &connections::store::StoredConnection,
+    changed_fields: &[&'static str],
+    credential_changed: bool,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    let actor = Some(auth::actor_from_principal(principal));
+    let summary = record.safe_summary(None);
+    let payload = json!({
+        "action": action,
+        "connection_id": &record.id,
+        "kind": record.write.kind,
+        "source": "managed",
+        "enabled": record.write.enabled,
+        "authentication": summary.authentication,
+        "changed_fields": changed_fields,
+        "revisions": &record.revisions,
+    });
+
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::CONNECTION_CHANGED,
+        request_id.clone(),
+        source_ip.clone(),
+        actor.clone(),
+        payload.clone(),
+    ));
+    if credential_changed {
+        state.audit.emit(audit::AuditEvent::new(
+            audit::event::CONNECTION_CREDENTIAL_CHANGED,
+            request_id,
+            source_ip,
+            actor,
+            payload,
+        ));
+    }
+}
+
+fn connection_secret_authority_forbidden(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    route_pattern: &'static str,
+    operation: &'static str,
+) -> Response {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    state.audit.emit(audit::AuditEvent::new(
+        "authz.denied",
+        request_id,
+        source_ip,
+        Some(auth::actor_from_principal(principal)),
+        json!({
+            "path": route_pattern,
+            "method": parts.method.as_str(),
+            "reason": "missing_permission",
+            "permission": ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
+            "authorization_layer": "connection_secret_authority",
+            "operation": operation,
+        }),
+    ));
+    forbidden()
 }
 
 fn emit_service_token_delegation_rejected(
@@ -7233,6 +8236,27 @@ fn token_store_not_configured() -> Response {
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
             error: "token API requires SERVICE_TOKEN_SQLITE_PATH to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn connection_rbac_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "connection API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn connection_store_not_configured() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: "connection mutations require CONNECTIONS_SQLITE_PATH to be configured"
+                .to_owned(),
         }),
     )
         .into_response()
@@ -9129,6 +10153,8 @@ mod tests {
         assert_eq!(default_routes.tokens_route, TOKENS_ADMIN_ROUTE);
         assert_eq!(default_routes.token_route, TOKEN_ADMIN_ROUTE);
         assert_eq!(default_routes.token_rotate_route, TOKEN_ROTATE_ADMIN_ROUTE);
+        assert_eq!(default_routes.connections_route, CONNECTIONS_ADMIN_ROUTE);
+        assert_eq!(default_routes.connection_route, CONNECTION_ADMIN_ROUTE);
         assert_eq!(
             default_routes.tools_openapi_preview_route,
             TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE
@@ -9213,6 +10239,8 @@ mod tests {
             custom_routes.token_rotate_route,
             "/v1/ops/tokens/{id}/rotate"
         );
+        assert_eq!(custom_routes.connections_route, "/v1/ops/connections");
+        assert_eq!(custom_routes.connection_route, "/v1/ops/connections/{id}");
         assert_eq!(
             custom_routes.tools_openapi_preview_route,
             "/v1/ops/tools/openapi/preview"
@@ -17151,6 +18179,907 @@ mod tests {
         );
         let (after_etag, _) = current_policy(&router).await;
         assert_eq!(after_etag, current_etag);
+    }
+
+    fn plain_connection_body(display_name: &str) -> String {
+        json!({
+            "display_name": display_name,
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {
+                "type": "none"
+            }
+        })
+        .to_string()
+    }
+
+    fn credentialed_connection_body() -> String {
+        json!({
+            "display_name": "Credentialed billing API",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://credentialed.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {
+                "type": "static_bearer",
+                "secret_id": "credential-secret-id-canary"
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn explicit_hidden_binding_fields_are_secret_authority_intent() {
+        for candidate in [
+            json!({"authentication": {"secret_id": "alias"}}),
+            json!({"authentication": {"client_secret_id": null}}),
+            json!({"tls": {"ca_bundle_alias": "ca"}}),
+            json!({"tls": {"client_certificate_id": "certificate"}}),
+            json!({"tls": {"client_private_key_id": null}}),
+        ] {
+            assert!(has_explicit_connection_binding_intent(&candidate));
+        }
+        assert!(!has_explicit_connection_binding_intent(&json!({
+            "authentication": {"secret_configured": true},
+            "tls": {
+                "ca_bundle_configured": true,
+                "client_certificate_configured": true,
+                "client_private_key_configured": true
+            }
+        })));
+    }
+
+    #[test]
+    fn redacted_partial_mtls_draft_round_trips_each_hidden_binding_independently() {
+        let current: connections::model::ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Partial mTLS draft",
+            "enabled": false,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://partial.example.test",
+                "base_path": "/"
+            },
+            "authentication": {
+                "type": "none"
+            },
+            "tls": {
+                "client_certificate_id": "certificate-only-binding-canary"
+            }
+        }))
+        .expect("partial disabled draft should deserialize");
+        let redacted_edit = json!({
+            "display_name": "Partial mTLS draft renamed",
+            "enabled": false,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://partial.example.test",
+                "base_path": "/"
+            },
+            "authentication": {
+                "type": "none"
+            },
+            "tls": {
+                "ca_bundle_configured": false,
+                "client_certificate_configured": true,
+                "client_private_key_configured": false
+            }
+        });
+
+        let candidate =
+            parse_connection_write_body(&Bytes::from(redacted_edit.to_string()), &current)
+                .expect("redacted partial draft should retain its lone certificate binding");
+
+        assert_eq!(
+            candidate.tls.client_certificate_id.as_deref(),
+            Some("certificate-only-binding-canary")
+        );
+        assert!(candidate.tls.client_private_key_id.is_none());
+        assert!(!current.requires_secrets_write_to_replace(&candidate));
+
+        let mut private_key_only = current.clone();
+        private_key_only.tls.client_certificate_id = None;
+        private_key_only.tls.client_private_key_id =
+            Some("private-key-only-binding-canary".to_owned());
+        let private_key_edit = json!({
+            "display_name": "Private-key-only mTLS draft renamed",
+            "enabled": false,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://partial.example.test",
+                "base_path": "/"
+            },
+            "authentication": {
+                "type": "none"
+            },
+            "tls": {
+                "ca_bundle_configured": false,
+                "client_certificate_configured": false,
+                "client_private_key_configured": true
+            }
+        });
+        let private_key_candidate = parse_connection_write_body(
+            &Bytes::from(private_key_edit.to_string()),
+            &private_key_only,
+        )
+        .expect("redacted partial draft should retain its lone private-key binding");
+        assert!(private_key_candidate.tls.client_certificate_id.is_none());
+        assert_eq!(
+            private_key_candidate.tls.client_private_key_id.as_deref(),
+            Some("private-key-only-binding-canary")
+        );
+        assert!(!private_key_only.requires_secrets_write_to_replace(&private_key_candidate));
+    }
+
+    #[tokio::test]
+    async fn connection_admin_crud_enforces_etags_secret_authority_and_redaction() {
+        let connection_db = TempDb::new("connection-admin-crud");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = connection_admin_router(&connection_db, &policy, audit_log);
+        let reader = test_principal(&["connections-reader"]);
+        let editor = test_principal(&["connections-editor"]);
+        let secrets_editor = test_principal(&["connections-secrets-editor"]);
+
+        let list = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(reader.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("connection list should complete");
+        assert_eq!(list.status(), StatusCode::OK);
+        let collection_etag = list
+            .headers()
+            .get(CONNECTION_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("collection response should include an ETag")
+            .to_owned();
+        assert_eq!(json_body(list).await["connections"], json!([]));
+
+        let missing_precondition = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(editor.clone()),
+                Some(plain_connection_body("Billing API")),
+                None,
+                true,
+            ))
+            .await
+            .expect("missing precondition request should complete");
+        assert_eq!(
+            missing_precondition.status(),
+            StatusCode::PRECONDITION_REQUIRED
+        );
+
+        let created = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(editor.clone()),
+                Some(plain_connection_body("Billing API")),
+                Some(&collection_etag),
+                true,
+            ))
+            .await
+            .expect("connection create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let plain_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("created connection should include an ETag")
+            .to_owned();
+        let after_create_etag = created
+            .headers()
+            .get(CONNECTION_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("create should include the new collection ETag")
+            .to_owned();
+        assert_ne!(collection_etag, after_create_etag);
+        let created_body = json_body(created).await;
+        let plain_id = created_body["id"]
+            .as_str()
+            .expect("created connection should include an ID")
+            .to_owned();
+        assert_eq!(
+            created_body["configuration"]["authentication"]["type"],
+            json!("none")
+        );
+
+        let stale_create = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(editor.clone()),
+                Some(plain_connection_body("Stale create")),
+                Some(&collection_etag),
+                true,
+            ))
+            .await
+            .expect("stale create should complete");
+        assert_eq!(stale_create.status(), StatusCode::PRECONDITION_FAILED);
+
+        let detail = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{plain_id}"),
+                Some(reader.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("connection detail should complete");
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail_body = json_body(detail).await;
+        assert_eq!(detail_body["actions"]["can_update"], json!(false));
+        assert_eq!(detail_body["actions"]["can_bind_secret"], json!(false));
+
+        let updated = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{plain_id}"),
+                Some(editor.clone()),
+                Some(plain_connection_body("Billing API renamed")),
+                Some(&plain_etag),
+                true,
+            ))
+            .await
+            .expect("connection update should complete");
+        assert_eq!(updated.status(), StatusCode::OK);
+        let updated_etag = updated
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("updated connection should include an ETag")
+            .to_owned();
+        let after_update_collection_etag = updated
+            .headers()
+            .get(CONNECTION_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("update should include the collection ETag")
+            .to_owned();
+        assert_ne!(plain_etag, updated_etag);
+        assert_eq!(
+            json_body(updated).await["display_name"],
+            json!("Billing API renamed")
+        );
+
+        let forbidden_credential_create = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(editor.clone()),
+                Some(credentialed_connection_body()),
+                Some(&after_update_collection_etag),
+                true,
+            ))
+            .await
+            .expect("credential create denial should complete");
+        assert_eq!(forbidden_credential_create.status(), StatusCode::FORBIDDEN);
+        assert!(!body_string(forbidden_credential_create)
+            .await
+            .contains("credential-secret-id-canary"));
+
+        let credentialed = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(secrets_editor.clone()),
+                Some(credentialed_connection_body()),
+                Some(&after_update_collection_etag),
+                true,
+            ))
+            .await
+            .expect("credentialed connection create should complete");
+        assert_eq!(credentialed.status(), StatusCode::CREATED);
+        let mut credentialed_etag = credentialed
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("credentialed connection should include an ETag")
+            .to_owned();
+        let credentialed_body_string = body_string(credentialed).await;
+        assert!(!credentialed_body_string.contains("credential-secret-id-canary"));
+        let credentialed_body: Value = serde_json::from_str(&credentialed_body_string)
+            .expect("credentialed response should be JSON");
+        assert_eq!(
+            credentialed_body["configuration"]["authentication"]["secret_configured"],
+            json!(true)
+        );
+        let credentialed_id = credentialed_body["id"]
+            .as_str()
+            .expect("credentialed connection should include an ID")
+            .to_owned();
+        let initial_credential_revision = credentialed_body["revisions"]["credential"]
+            .as_u64()
+            .expect("credentialed connection should include a credential revision");
+
+        let explicit_current_binding = credentialed_connection_body();
+        let mut explicit_wrong_binding: Value = serde_json::from_str(&explicit_current_binding)
+            .expect("credentialed body should parse");
+        explicit_wrong_binding["authentication"]["secret_id"] = json!("different-secret-id-canary");
+        let explicit_wrong_binding = explicit_wrong_binding.to_string();
+        let mut explicit_null_binding: Value = serde_json::from_str(&explicit_current_binding)
+            .expect("credentialed body should parse");
+        explicit_null_binding["authentication"]["secret_id"] = Value::Null;
+        let explicit_null_binding = explicit_null_binding.to_string();
+        let mut explicit_binding_denial_bodies = Vec::new();
+        for explicit_binding in [
+            explicit_current_binding,
+            explicit_wrong_binding,
+            explicit_null_binding,
+        ] {
+            let response = router
+                .clone()
+                .oneshot(connection_admin_request(
+                    Method::PUT,
+                    &format!("{CONNECTIONS_ADMIN_ROUTE}/{credentialed_id}"),
+                    Some(editor.clone()),
+                    Some(explicit_binding),
+                    Some(&credentialed_etag),
+                    true,
+                ))
+                .await
+                .expect("explicit hidden-binding denial should complete");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            explicit_binding_denial_bodies.push(body_string(response).await);
+        }
+        assert!(explicit_binding_denial_bodies
+            .iter()
+            .all(|body| body == &explicit_binding_denial_bodies[0]));
+
+        let credentialed_detail = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{credentialed_id}"),
+                Some(editor.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("credentialed detail should complete");
+        assert_eq!(credentialed_detail.status(), StatusCode::OK);
+        let credentialed_detail = json_body(credentialed_detail).await;
+        assert_eq!(credentialed_detail["actions"]["can_update"], json!(true));
+        assert_eq!(
+            credentialed_detail["actions"]["can_bind_secret"],
+            json!(false)
+        );
+        let presentation_update = json!({
+            "display_name": "Credentialed billing API renamed",
+            "enabled": credentialed_detail["enabled"].clone(),
+            "kind": credentialed_detail["kind"].clone(),
+            "endpoint": credentialed_detail["configuration"]["endpoint"].clone(),
+            "authentication": credentialed_detail["configuration"]["authentication"].clone(),
+            "tls": credentialed_detail["configuration"]["tls"].clone()
+        })
+        .to_string();
+        let presentation_updated = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{credentialed_id}"),
+                Some(editor.clone()),
+                Some(presentation_update),
+                Some(&credentialed_etag),
+                true,
+            ))
+            .await
+            .expect("presentation-only credentialed update should complete");
+        assert_eq!(presentation_updated.status(), StatusCode::OK);
+        credentialed_etag = presentation_updated
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("presentation update should include an ETag")
+            .to_owned();
+        let presentation_updated_body = body_string(presentation_updated).await;
+        assert!(!presentation_updated_body.contains("credential-secret-id-canary"));
+        assert!(!presentation_updated_body.contains("credential-material-value-canary"));
+        let presentation_updated_body: Value = serde_json::from_str(&presentation_updated_body)
+            .expect("presentation update should return JSON");
+        assert_eq!(
+            presentation_updated_body["revisions"]["credential"],
+            json!(initial_credential_revision)
+        );
+
+        let test_target_update = json!({
+            "display_name": presentation_updated_body["display_name"].clone(),
+            "enabled": presentation_updated_body["enabled"].clone(),
+            "kind": presentation_updated_body["kind"].clone(),
+            "endpoint": presentation_updated_body["configuration"]["endpoint"].clone(),
+            "authentication": presentation_updated_body["configuration"]["authentication"].clone(),
+            "tls": presentation_updated_body["configuration"]["tls"].clone(),
+            "test_profile": {
+                "method": "GET",
+                "path": "/credentialed-health",
+                "expected_statuses": [200]
+            }
+        })
+        .to_string();
+        let forbidden_test_target_update = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{credentialed_id}"),
+                Some(editor.clone()),
+                Some(test_target_update.clone()),
+                Some(&credentialed_etag),
+                true,
+            ))
+            .await
+            .expect("credentialed test-target denial should complete");
+        assert_eq!(forbidden_test_target_update.status(), StatusCode::FORBIDDEN);
+
+        let allowed_test_target_update = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{credentialed_id}"),
+                Some(secrets_editor.clone()),
+                Some(test_target_update),
+                Some(&credentialed_etag),
+                true,
+            ))
+            .await
+            .expect("credentialed test-target update should complete");
+        assert_eq!(allowed_test_target_update.status(), StatusCode::OK);
+        credentialed_etag = allowed_test_target_update
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("test-target update should include an ETag")
+            .to_owned();
+        let allowed_test_target_update = json_body(allowed_test_target_update).await;
+        assert_eq!(
+            allowed_test_target_update["revisions"]["credential"],
+            json!(initial_credential_revision + 1)
+        );
+
+        let first_page = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}?limit=1&enabled=true&source=managed"),
+                Some(secrets_editor.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("first connection page should complete");
+        assert_eq!(first_page.status(), StatusCode::OK);
+        let first_page = json_body(first_page).await;
+        assert_eq!(
+            first_page["connections"]
+                .as_array()
+                .expect("connections should be an array")
+                .len(),
+            1
+        );
+        let cursor = first_page["next_cursor"]
+            .as_str()
+            .expect("first page should include a cursor");
+        let second_page = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &format!(
+                    "{CONNECTIONS_ADMIN_ROUTE}?limit=1&enabled=true&source=managed&cursor={cursor}"
+                ),
+                Some(secrets_editor.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("second connection page should complete");
+        assert_eq!(second_page.status(), StatusCode::OK);
+        let second_page = json_body(second_page).await;
+        assert_eq!(
+            second_page["connections"]
+                .as_array()
+                .expect("connections should be an array")
+                .len(),
+            1
+        );
+        assert!(second_page.get("next_cursor").is_none());
+
+        let credential_delete_without_secret_authority = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::DELETE,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{credentialed_id}"),
+                Some(editor.clone()),
+                None,
+                Some(&credentialed_etag),
+                true,
+            ))
+            .await
+            .expect("credential delete denial should complete");
+        assert_eq!(
+            credential_delete_without_secret_authority.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let dependency_store = connections::store::SqliteConnectionStore::open(&connection_db.path)
+            .expect("dependency store should open");
+        let plain_connection_id =
+            connections::model::ConnectionId::parse(plain_id.clone()).expect("ID should parse");
+        dependency_store
+            .add_dependency(
+                &plain_connection_id,
+                connections::store::ConnectionDependencyKind::ManualTool,
+                "billing.get",
+            )
+            .expect("dependency should insert");
+        let dependent_detail = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{plain_id}"),
+                Some(test_principal(&["connections-editor"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("dependent detail should complete");
+        assert_eq!(dependent_detail.status(), StatusCode::OK);
+        let dependent_detail = json_body(dependent_detail).await;
+        assert_eq!(dependent_detail["actions"]["can_delete"], json!(false));
+        assert_eq!(
+            dependent_detail["dependencies"][0]["consumer_id"],
+            json!("billing.get")
+        );
+        let dependency_conflict = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::DELETE,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{plain_id}"),
+                Some(editor.clone()),
+                None,
+                Some(&updated_etag),
+                true,
+            ))
+            .await
+            .expect("dependency conflict should complete");
+        assert_eq!(dependency_conflict.status(), StatusCode::CONFLICT);
+        dependency_store
+            .remove_dependency(
+                &plain_connection_id,
+                connections::store::ConnectionDependencyKind::ManualTool,
+                "billing.get",
+            )
+            .expect("dependency should remove");
+        drop(dependency_store);
+
+        let plain_delete = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::DELETE,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{plain_id}"),
+                Some(editor),
+                None,
+                Some(&updated_etag),
+                true,
+            ))
+            .await
+            .expect("plain delete should complete");
+        assert_eq!(plain_delete.status(), StatusCode::OK);
+
+        let credential_delete = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::DELETE,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{credentialed_id}"),
+                Some(secrets_editor),
+                None,
+                Some(&credentialed_etag),
+                true,
+            ))
+            .await
+            .expect("credential delete should complete");
+        assert_eq!(credential_delete.status(), StatusCode::OK);
+
+        assert_eventually(Duration::from_secs(1), || {
+            let events = capture.events();
+            events
+                .iter()
+                .filter(|event| event.event_type == audit::event::CONNECTION_CHANGED)
+                .count()
+                == 7
+                && events
+                    .iter()
+                    .filter(|event| event.event_type == audit::event::CONNECTION_CREDENTIAL_CHANGED)
+                    .count()
+                    == 3
+                && events
+                    .iter()
+                    .filter(|event| {
+                        event.event_type == "authz.denied"
+                            && event.payload["permission"]
+                                == json!(ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION)
+                    })
+                    .count()
+                    == 6
+        });
+        let events = capture.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == audit::event::CONNECTION_CHANGED)
+                .count(),
+            7
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| { event.event_type == audit::event::CONNECTION_CREDENTIAL_CHANGED })
+                .count(),
+            3
+        );
+        assert!(events.iter().any(|event| {
+            event.event_type == audit::event::CONNECTION_CREDENTIAL_CHANGED
+                && event.payload["action"] == json!("updated")
+                && event.payload["changed_fields"]
+                    .as_array()
+                    .is_some_and(|fields| fields.contains(&json!("test_profile")))
+        }));
+        let secret_authority_denials = events
+            .iter()
+            .filter(|event| {
+                event.event_type == "authz.denied"
+                    && event.payload["permission"]
+                        == json!(ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(secret_authority_denials.len(), 6);
+        assert_eq!(
+            secret_authority_denials
+                .iter()
+                .filter(|event| event.payload["operation"] == json!("create"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            secret_authority_denials
+                .iter()
+                .filter(|event| event.payload["operation"] == json!("replace"))
+                .count(),
+            4
+        );
+        assert_eq!(
+            secret_authority_denials
+                .iter()
+                .filter(|event| event.payload["operation"] == json!("delete"))
+                .count(),
+            1
+        );
+        assert!(secret_authority_denials.iter().all(|event| {
+            event.payload["reason"] == json!("missing_permission")
+                && event.payload["authorization_layer"] == json!("connection_secret_authority")
+        }));
+        let serialized_events =
+            serde_json::to_string(&events).expect("audit events should serialize");
+        assert!(!serialized_events.contains("credential-secret-id-canary"));
+        assert!(!serialized_events.contains("different-secret-id-canary"));
+        assert!(!serialized_events.contains("credential-material-value-canary"));
+        assert!(!serialized_events.contains("credentialed.example.test"));
+        assert!(!serialized_events.contains("/credentialed-health"));
+    }
+
+    #[tokio::test]
+    async fn connection_admin_authorizes_before_lookup_and_keeps_csrf_and_body_caps() {
+        let connection_db = TempDb::new("connection-admin-boundaries");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let router = connection_admin_router(&connection_db, &policy, test_audit_log());
+
+        let missing_principal = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/invalid@id"),
+                None,
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("missing principal request should complete");
+        assert_eq!(missing_principal.status(), StatusCode::UNAUTHORIZED);
+
+        let forbidden_lookup = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/00000000-0000-0000-0000-000000000000"),
+                Some(test_principal(&["connections-observer"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("forbidden lookup should complete");
+        assert_eq!(forbidden_lookup.status(), StatusCode::FORBIDDEN);
+
+        let list = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-reader"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("list request should complete");
+        let collection_etag = list
+            .headers()
+            .get(CONNECTION_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("list should include collection ETag")
+            .to_owned();
+
+        let mut unknown_binding: Value = serde_json::from_str(&credentialed_connection_body())
+            .expect("credentialed body should parse");
+        unknown_binding["authentication"]["secret_id"] = json!("unknown-secret-alias");
+        let unknown_binding = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-secrets-editor"])),
+                Some(unknown_binding.to_string()),
+                Some(&collection_etag),
+                true,
+            ))
+            .await
+            .expect("unknown enabled binding should complete");
+        assert_eq!(unknown_binding.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            json_body(unknown_binding).await["problems"][0]["code"],
+            json!("unresolvable_binding")
+        );
+
+        let csrf_denied = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-editor"])),
+                Some(plain_connection_body("CSRF denied")),
+                Some(&collection_etag),
+                false,
+            ))
+            .await
+            .expect("CSRF denial should complete");
+        assert_eq!(csrf_denied.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            json_body(csrf_denied).await["error"],
+            json!("csrf token missing or invalid")
+        );
+
+        let mut disabled_draft: Value =
+            serde_json::from_str(&plain_connection_body("Disabled draft"))
+                .expect("plain body should parse");
+        disabled_draft
+            .as_object_mut()
+            .expect("plain body should be an object")
+            .remove("enabled");
+        let disabled_draft = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-editor"])),
+                Some(disabled_draft.to_string()),
+                Some(&collection_etag),
+                true,
+            ))
+            .await
+            .expect("disabled draft create should complete");
+        assert_eq!(disabled_draft.status(), StatusCode::CREATED);
+        assert_eq!(json_body(disabled_draft).await["enabled"], json!(false));
+
+        let oversized = router
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-editor"])),
+                Some("x".repeat(connections::admin::MAX_CONNECTION_ADMIN_BODY_BYTES + 1)),
+                Some(&collection_etag),
+                true,
+            ))
+            .await
+            .expect("oversized connection body should complete");
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn all_connection_mutations_report_unconfigured_store_as_unavailable() {
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config
+            .rbac_exempt_paths
+            .push(CONNECTIONS_ADMIN_ROUTE.to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("read-only connection app should build");
+        let editor = test_principal(&["connections-editor"]);
+
+        for (method, uri, body) in [
+            (
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE.to_owned(),
+                Some(plain_connection_body("Unavailable create")),
+            ),
+            (
+                Method::PUT,
+                format!("{CONNECTIONS_ADMIN_ROUTE}/missing"),
+                Some(plain_connection_body("Unavailable update")),
+            ),
+            (
+                Method::DELETE,
+                format!("{CONNECTIONS_ADMIN_ROUTE}/missing"),
+                None,
+            ),
+        ] {
+            let expected_method = method.clone();
+            let response = router
+                .clone()
+                .oneshot(connection_admin_request(
+                    method,
+                    &uri,
+                    Some(editor.clone()),
+                    body,
+                    Some("\"unused\""),
+                    true,
+                ))
+                .await
+                .expect("unconfigured-store mutation should complete");
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{expected_method} mutation should report the unconfigured store"
+            );
+            assert_eq!(
+                json_body(response).await["error"],
+                json!("connection mutations require CONNECTIONS_SQLITE_PATH to be configured")
+            );
+        }
     }
 
     #[tokio::test]
@@ -25152,6 +27081,78 @@ paths:
         .expect("app should build")
     }
 
+    fn connection_admin_router(
+        connection_db: &TempDb,
+        policy: &TempPolicyFile,
+        audit_log: audit::AuditLog,
+    ) -> Router {
+        let secret_root = connection_db.path.with_extension("secrets");
+        fs::create_dir_all(&secret_root).expect("connection test secret root should create");
+        let secret_file = secret_root.join("credential-token");
+        fs::write(&secret_file, b"credential-material-value-canary")
+            .expect("connection test secret should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&secret_root, fs::Permissions::from_mode(0o700))
+                .expect("connection test secret root permissions should set");
+            fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600))
+                .expect("connection test secret permissions should set");
+        }
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.connections_sqlite_path = Some(connection_db.path.to_string_lossy().into_owned());
+        config.connection_secrets_root =
+            Some(connections::secret::SecretRootConfig::new(secret_root));
+        config.connection_secret_aliases = vec![connections::secret::OperatorSecretAliasConfig {
+            id: "credential-secret-id-canary".to_owned(),
+            label: "Credential test alias".to_owned(),
+            source: connections::secret::OperatorSecretAliasSource::File {
+                key: "credential-token".to_owned(),
+            },
+        }];
+        config
+            .rbac_exempt_paths
+            .push(CONNECTIONS_ADMIN_ROUTE.to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+
+        app(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("connection admin app should build")
+    }
+
+    fn connection_admin_request(
+        method: Method,
+        uri: &str,
+        principal: Option<auth::Principal>,
+        body: Option<String>,
+        if_match: Option<&str>,
+        bearer: bool,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method(method.clone()).uri(uri);
+        if matches!(method, Method::POST | Method::PUT) {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        if bearer {
+            builder = builder.header(header::AUTHORIZATION, "Bearer test-token");
+        }
+        if let Some(if_match) = if_match {
+            builder = builder.header(header::IF_MATCH, if_match);
+        }
+        let mut request = builder
+            .body(Body::from(body.unwrap_or_default()))
+            .expect("connection admin request should build");
+        if let Some(principal) = principal {
+            request.extensions_mut().insert(principal);
+        }
+        request
+    }
+
     fn token_admin_request(
         method: Method,
         uri: &str,
@@ -25501,6 +27502,38 @@ paths:
                 "service-admin": {
                     "permissions": ["*"],
                     "auth_methods": ["service_token"]
+                }
+            },
+            "routes": []
+        })
+        .to_string()
+    }
+
+    fn connection_policy_document_string() -> String {
+        json!({
+            "schema_version": "0.1.0",
+            "id": "connection-admin-policy",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "connections-reader": {
+                    "permissions": [ADMIN_CONNECTIONS_READ_PERMISSION]
+                },
+                "connections-editor": {
+                    "permissions": [
+                        ADMIN_CONNECTIONS_READ_PERMISSION,
+                        ADMIN_CONNECTIONS_WRITE_PERMISSION
+                    ]
+                },
+                "connections-secrets-editor": {
+                    "permissions": [
+                        ADMIN_CONNECTIONS_READ_PERMISSION,
+                        ADMIN_CONNECTIONS_WRITE_PERMISSION,
+                        ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION
+                    ]
+                },
+                "connections-observer": {
+                    "permissions": []
                 }
             },
             "routes": []
@@ -29543,6 +31576,7 @@ O2gecI9QwDJNpm29J9wJB2F8
                 let path = PathBuf::from(format!("{}{}", self.path.display(), suffix));
                 let _ = fs::remove_file(path);
             }
+            let _ = fs::remove_dir_all(self.path.with_extension("secrets"));
         }
     }
 

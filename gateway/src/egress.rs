@@ -1322,6 +1322,38 @@ fn tls_client_identity_pem_shape_is_valid(pem_identity: &[u8]) -> bool {
     certificate_count >= 1 && private_key_count == 1
 }
 
+pub(crate) fn tls_ca_bundle_pem_is_valid(pem_bundle: &[u8]) -> bool {
+    let Ok(certificates) = reqwest::Certificate::from_pem_bundle(pem_bundle) else {
+        return false;
+    };
+    if certificates.is_empty() {
+        return false;
+    }
+
+    certificates
+        .into_iter()
+        .fold(
+            reqwest::Client::builder().no_proxy(),
+            |builder, certificate| builder.add_root_certificate(certificate),
+        )
+        .build()
+        .is_ok()
+}
+
+pub(crate) fn tls_client_identity_pem_is_valid(pem_identity: &[u8]) -> bool {
+    if !tls_client_identity_pem_shape_is_valid(pem_identity) {
+        return false;
+    }
+    let Ok(identity) = reqwest::Identity::from_pem(pem_identity) else {
+        return false;
+    };
+    reqwest::Client::builder()
+        .no_proxy()
+        .identity(identity)
+        .build()
+        .is_ok()
+}
+
 fn egress_config_generation(config: &EgressConfig) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"greengateway:egress-config-generation:v1\0");

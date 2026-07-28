@@ -314,6 +314,91 @@ impl ConnectionWrite {
             Err(errors)
         }
     }
+
+    pub fn configures_credential_authority(&self) -> bool {
+        !matches!(self.authentication, ConnectionAuthentication::None) || !self.tls.is_empty()
+    }
+
+    pub fn requires_secrets_write_to_create(&self) -> bool {
+        self.configures_credential_authority()
+    }
+
+    pub fn requires_secrets_write_to_replace(&self, candidate: &Self) -> bool {
+        self.authentication != candidate.authentication
+            || self.tls != candidate.tls
+            || ((self.configures_credential_authority()
+                || candidate.configures_credential_authority())
+                && (self.endpoint != candidate.endpoint
+                    || test_profile_target_changed(
+                        self.test_profile.as_ref(),
+                        candidate.test_profile.as_ref(),
+                    )))
+            || (discovery_uses_authentication(self.discovery.as_ref())
+                || discovery_uses_authentication(candidate.discovery.as_ref()))
+                && self.discovery != candidate.discovery
+    }
+
+    pub fn requires_secrets_write_to_delete(&self) -> bool {
+        self.configures_credential_authority()
+    }
+
+    pub fn unresolved_enabled_binding_fields(
+        &self,
+        mut binding_is_configured: impl FnMut(&str) -> bool,
+    ) -> Vec<&'static str> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let mut unresolved = Vec::new();
+        match &self.authentication {
+            ConnectionAuthentication::None => {}
+            ConnectionAuthentication::HeaderApiKey {
+                secret_id: Some(secret_id),
+                ..
+            }
+            | ConnectionAuthentication::StaticBearer {
+                secret_id: Some(secret_id),
+            } => {
+                if !binding_is_configured(secret_id) {
+                    unresolved.push("authentication.secret_id");
+                }
+            }
+            ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id: Some(secret_id),
+                ..
+            } => {
+                if !binding_is_configured(secret_id) {
+                    unresolved.push("authentication.client_secret_id");
+                }
+            }
+            ConnectionAuthentication::HeaderApiKey {
+                secret_id: None, ..
+            }
+            | ConnectionAuthentication::StaticBearer { secret_id: None }
+            | ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id: None,
+                ..
+            } => {}
+        }
+        for (field, binding) in [
+            ("tls.ca_bundle_alias", self.tls.ca_bundle_alias.as_deref()),
+            (
+                "tls.client_certificate_id",
+                self.tls.client_certificate_id.as_deref(),
+            ),
+            (
+                "tls.client_private_key_id",
+                self.tls.client_private_key_id.as_deref(),
+            ),
+        ] {
+            if let Some(binding) = binding {
+                if !binding_is_configured(binding) {
+                    unresolved.push(field);
+                }
+            }
+        }
+        unresolved
+    }
 }
 
 pub fn is_valid_connection_id(value: &str) -> bool {
@@ -517,6 +602,32 @@ fn validate_discovery(
                 ));
             }
         }
+    }
+}
+
+fn discovery_uses_authentication(discovery: Option<&DiscoveryConfig>) -> bool {
+    match discovery {
+        Some(DiscoveryConfig::ManagedOpenapi {
+            use_connection_authentication,
+            ..
+        })
+        | Some(DiscoveryConfig::ManagedMcp {
+            use_connection_authentication,
+        }) => *use_connection_authentication,
+        None => false,
+    }
+}
+
+fn test_profile_target_changed(
+    current: Option<&ConnectionTestProfile>,
+    candidate: Option<&ConnectionTestProfile>,
+) -> bool {
+    match (current, candidate) {
+        (None, None) => false,
+        (Some(current), Some(candidate)) => {
+            current.method != candidate.method || current.path != candidate.path
+        }
+        (Some(_), None) | (None, Some(_)) => true,
     }
 }
 
@@ -1075,5 +1186,101 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.field == "test_profile.expected_statuses"));
+    }
+
+    #[test]
+    fn secrets_permission_tracks_credential_use_authority_not_plain_metadata() {
+        let mut plain: ConnectionWrite =
+            serde_json::from_value(example()).expect("example should deserialize");
+        plain.authentication = ConnectionAuthentication::None;
+        plain.tls = TlsProfile::default();
+        plain.discovery = None;
+
+        assert!(!plain.requires_secrets_write_to_create());
+        assert!(!plain.requires_secrets_write_to_delete());
+
+        let mut presentation = plain.clone();
+        presentation.display_name = "Renamed billing API".to_owned();
+        presentation.description = Some("non-sensitive operator note".to_owned());
+        presentation.timeouts = Some(ConnectionTimeouts::default());
+        assert!(!plain.requires_secrets_write_to_replace(&presentation));
+
+        let mut plain_redirect = plain.clone();
+        plain_redirect.endpoint.base_url = "https://replacement.example.test".to_owned();
+        assert!(!plain.requires_secrets_write_to_replace(&plain_redirect));
+
+        let mut credentialed = plain.clone();
+        credentialed.enabled = true;
+        credentialed.authentication = ConnectionAuthentication::StaticBearer {
+            secret_id: Some("billing-token".to_owned()),
+        };
+        assert!(credentialed.requires_secrets_write_to_create());
+        assert!(plain.requires_secrets_write_to_replace(&credentialed));
+        assert!(credentialed.requires_secrets_write_to_delete());
+        assert_eq!(
+            credentialed.unresolved_enabled_binding_fields(|id| id == "billing-token"),
+            Vec::<&'static str>::new()
+        );
+        assert_eq!(
+            credentialed.unresolved_enabled_binding_fields(|_| false),
+            vec!["authentication.secret_id"]
+        );
+        let mut disabled_credentialed = credentialed.clone();
+        disabled_credentialed.enabled = false;
+        assert!(disabled_credentialed
+            .unresolved_enabled_binding_fields(|_| false)
+            .is_empty());
+
+        let mut credential_redirect = credentialed.clone();
+        credential_redirect.endpoint.base_url = "https://replacement.example.test".to_owned();
+        assert!(credentialed.requires_secrets_write_to_replace(&credential_redirect));
+
+        let mut plain_test_target = plain.clone();
+        plain_test_target
+            .test_profile
+            .as_mut()
+            .expect("example should include a test profile")
+            .path = "/alternate-health".to_owned();
+        assert!(!plain.requires_secrets_write_to_replace(&plain_test_target));
+
+        let mut credentialed_test_expectations = credentialed.clone();
+        credentialed_test_expectations
+            .test_profile
+            .as_mut()
+            .expect("example should include a test profile")
+            .expected_statuses = vec![200];
+        assert!(!credentialed.requires_secrets_write_to_replace(&credentialed_test_expectations));
+
+        let mut credentialed_test_method = credentialed.clone();
+        credentialed_test_method
+            .test_profile
+            .as_mut()
+            .expect("example should include a test profile")
+            .method = "OPTIONS".to_owned();
+        assert!(credentialed.requires_secrets_write_to_replace(&credentialed_test_method));
+
+        let mut credentialed_test_path = credentialed.clone();
+        credentialed_test_path
+            .test_profile
+            .as_mut()
+            .expect("example should include a test profile")
+            .path = "/alternate-health".to_owned();
+        assert!(credentialed.requires_secrets_write_to_replace(&credentialed_test_path));
+
+        let mut credentialed_without_test = credentialed.clone();
+        credentialed_without_test.test_profile = None;
+        assert!(credentialed.requires_secrets_write_to_replace(&credentialed_without_test));
+        assert!(credentialed_without_test.requires_secrets_write_to_replace(&credentialed));
+
+        let mut credentialed_discovery = credentialed.clone();
+        credentialed_discovery.discovery = Some(DiscoveryConfig::ManagedOpenapi {
+            path: Some("/openapi.json".to_owned()),
+            use_connection_authentication: true,
+        });
+        assert!(credentialed.requires_secrets_write_to_replace(&credentialed_discovery));
+
+        let mut tls = plain.clone();
+        tls.tls.ca_bundle_alias = Some("billing-ca".to_owned());
+        assert!(plain.requires_secrets_write_to_replace(&tls));
     }
 }

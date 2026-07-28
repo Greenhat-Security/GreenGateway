@@ -357,6 +357,7 @@ Current status:
 | Admin UI | Implemented |
 | JWT/OIDC-style auth | Implemented |
 | Service tokens | Implemented |
+| Managed connection metadata CRUD | Implemented; protocol credential injection and discovery land in later #240 slices |
 | RBAC and direct firewall rules | Implemented |
 | Visual rule builder | Implemented |
 | Shadow-mode review | Implemented |

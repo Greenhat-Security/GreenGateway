@@ -1,21 +1,32 @@
-use std::{collections::BTreeSet, error::Error, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    sync::{Arc, Mutex, MutexGuard},
+};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::config::Config;
 
 use super::{
     local_secret::{
         LocalSecretError, LocalSecretKeyring, LocalSecretKeyringConfigError, LocalSecretManager,
-        LocalSecretProvider,
+        LocalSecretProvider, MasterKeyRotationProgress,
     },
-    model::MAX_CONNECTIONS,
+    model::{ConnectionAuthentication, ConnectionId, ConnectionWrite, MAX_CONNECTIONS},
     projection::{project_legacy_connections, LegacyConnectionProjection, LegacyProjectionError},
     secret::{
         OperatorAliasResolver, ResolvedSecret, SecretAliasMetadata, SecretProviderConfigError,
-        SecretPurpose, SecretResolveError, SecretResolver,
+        SecretPurpose, SecretResolveError, SecretResolveErrorKind, SecretResolver,
     },
-    store::{ConnectionStore, ConnectionStoreError, SqliteConnectionStore},
+    store::{
+        ConnectionEtag, ConnectionStore, ConnectionStoreError, SqliteConnectionStore,
+        StoredConnection,
+    },
 };
 
 #[derive(Clone)]
@@ -23,8 +34,64 @@ pub struct ConnectionControlPlane {
     managed: Option<SqliteConnectionStore>,
     legacy: Arc<[LegacyConnectionProjection]>,
     omitted_legacy_projection_count: usize,
+    runtime: Arc<ArcSwap<ConnectionRuntimeSnapshot>>,
+    mutation_lock: Arc<Mutex<()>>,
     secret_resolver: Arc<ConnectionSecretResolver>,
-    local_secret_provider: Option<Arc<LocalSecretProvider>>,
+    local_secret_manager: Option<Arc<CoordinatedLocalSecretManager>>,
+}
+
+#[derive(Clone)]
+pub struct ConnectionRuntimeSnapshot {
+    managed: Arc<BTreeMap<ConnectionId, StoredConnection>>,
+    legacy: Arc<[LegacyConnectionProjection]>,
+    omitted_legacy_projection_count: usize,
+    collection_etag: Arc<str>,
+}
+
+impl fmt::Debug for ConnectionRuntimeSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectionRuntimeSnapshot")
+            .field("managed_count", &self.managed.len())
+            .field("legacy_count", &self.legacy.len())
+            .field(
+                "omitted_legacy_projection_count",
+                &self.omitted_legacy_projection_count,
+            )
+            .finish()
+    }
+}
+
+impl ConnectionRuntimeSnapshot {
+    fn new(
+        managed: BTreeMap<ConnectionId, StoredConnection>,
+        legacy: Arc<[LegacyConnectionProjection]>,
+        omitted_legacy_projection_count: usize,
+    ) -> Self {
+        let collection_etag = collection_etag(&managed, &legacy, omitted_legacy_projection_count);
+        Self {
+            managed: Arc::new(managed),
+            legacy,
+            omitted_legacy_projection_count,
+            collection_etag: Arc::from(collection_etag),
+        }
+    }
+
+    pub fn managed(&self) -> &BTreeMap<ConnectionId, StoredConnection> {
+        &self.managed
+    }
+
+    pub fn legacy(&self) -> &[LegacyConnectionProjection] {
+        &self.legacy
+    }
+
+    pub fn omitted_legacy_projection_count(&self) -> usize {
+        self.omitted_legacy_projection_count
+    }
+
+    pub fn collection_etag(&self) -> &str {
+        &self.collection_etag
+    }
 }
 
 impl ConnectionControlPlane {
@@ -90,14 +157,18 @@ impl ConnectionControlPlane {
             });
         }
 
-        if let Some(store) = managed.as_ref() {
+        let managed_records = managed
+            .as_ref()
+            .map(ConnectionStore::list)
+            .transpose()?
+            .unwrap_or_default();
+        if managed.is_some() {
             let legacy_ids = legacy
                 .iter()
                 .map(|projection| projection.id().as_str())
                 .collect::<BTreeSet<_>>();
-            if let Some(collision) = store
-                .list()?
-                .into_iter()
+            if let Some(collision) = managed_records
+                .iter()
                 .find(|record| legacy_ids.contains(record.id.as_str()))
             {
                 return Err(ConnectionControlPlaneError::IdCollision {
@@ -135,13 +206,44 @@ impl ConnectionControlPlane {
             operator: secret_resolver,
             local: local_secret_provider.clone(),
         });
+        for record in &managed_records {
+            if secret_resolver
+                .validate_enabled_candidate(&record.write)
+                .is_err()
+            {
+                return Err(ConnectionControlPlaneError::UnresolvableBindings {
+                    id: record.id.to_string(),
+                });
+            }
+        }
+        let legacy: Arc<[LegacyConnectionProjection]> = legacy.into();
+        let managed_runtime = managed_records
+            .into_iter()
+            .map(|record| (record.id.clone(), record))
+            .collect();
+        let runtime = Arc::new(ArcSwap::from_pointee(ConnectionRuntimeSnapshot::new(
+            managed_runtime,
+            legacy.clone(),
+            omitted_legacy_projection_count,
+        )));
+        let mutation_lock = Arc::new(Mutex::new(()));
+        let local_secret_manager = local_secret_provider.map(|provider| {
+            Arc::new(CoordinatedLocalSecretManager {
+                provider,
+                mutation_lock: Arc::clone(&mutation_lock),
+                runtime: Arc::clone(&runtime),
+                secret_resolver: Arc::clone(&secret_resolver),
+            })
+        });
 
         Ok(Self {
             managed,
-            legacy: legacy.into(),
+            legacy,
             omitted_legacy_projection_count,
+            runtime,
+            mutation_lock,
             secret_resolver,
-            local_secret_provider,
+            local_secret_manager,
         })
     }
 
@@ -172,10 +274,182 @@ impl ConnectionControlPlane {
     pub fn local_secret_manager(
         &self,
     ) -> Result<&(dyn LocalSecretManager + Send + Sync), LocalSecretMutationUnavailable> {
-        self.local_secret_provider
+        self.local_secret_manager
             .as_deref()
-            .map(|provider| provider as &(dyn LocalSecretManager + Send + Sync))
+            .map(|manager| manager as &(dyn LocalSecretManager + Send + Sync))
             .ok_or(LocalSecretMutationUnavailable)
+    }
+
+    pub fn runtime_snapshot(&self) -> Arc<ConnectionRuntimeSnapshot> {
+        self.runtime.load_full()
+    }
+
+    pub fn create_managed(
+        &self,
+        expected_collection_etag: &str,
+        candidate: ConnectionWrite,
+    ) -> Result<StoredConnection, ConnectionMutationError> {
+        let _guard = self.mutation_guard();
+        let current = self.runtime.load_full();
+        if current.collection_etag() != expected_collection_etag {
+            return Err(ConnectionMutationError::CollectionConflict {
+                current: current.collection_etag().to_owned(),
+            });
+        }
+        self.ensure_activatable(&candidate)?;
+        let created = self.managed_store()?.create(candidate)?;
+        let mut managed = current.managed().clone();
+        managed.insert(created.id.clone(), created.clone());
+        self.publish_runtime(managed);
+        Ok(created)
+    }
+
+    pub fn replace_managed(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        candidate: ConnectionWrite,
+    ) -> Result<StoredConnection, ConnectionMutationError> {
+        let _guard = self.mutation_guard();
+        self.ensure_activatable(&candidate)?;
+        let replaced = self.managed_store()?.replace(id, expected, candidate)?;
+        let current = self.runtime.load_full();
+        let mut managed = current.managed().clone();
+        managed.insert(id.clone(), replaced.clone());
+        self.publish_runtime(managed);
+        Ok(replaced)
+    }
+
+    pub fn delete_managed(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+    ) -> Result<(), ConnectionMutationError> {
+        let _guard = self.mutation_guard();
+        self.managed_store()?.delete(id, expected)?;
+        let current = self.runtime.load_full();
+        let mut managed = current.managed().clone();
+        managed.remove(id);
+        self.publish_runtime(managed);
+        Ok(())
+    }
+
+    fn publish_runtime(&self, managed: BTreeMap<ConnectionId, StoredConnection>) {
+        self.runtime.store(Arc::new(ConnectionRuntimeSnapshot::new(
+            managed,
+            self.legacy.clone(),
+            self.omitted_legacy_projection_count,
+        )));
+    }
+
+    fn ensure_activatable(
+        &self,
+        candidate: &ConnectionWrite,
+    ) -> Result<(), ConnectionMutationError> {
+        match self.secret_resolver.validate_enabled_candidate(candidate) {
+            Ok(()) => Ok(()),
+            Err(BindingActivationError::Invalid { fields }) => {
+                Err(ConnectionMutationError::UnresolvableBindings { fields })
+            }
+            Err(BindingActivationError::Unavailable) => {
+                Err(ConnectionMutationError::BindingUnavailable)
+            }
+        }
+    }
+
+    fn mutation_guard(&self) -> MutexGuard<'_, ()> {
+        match self.mutation_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    "Connection control-plane mutation lock poisoned; recovering fail-closed state"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+}
+
+fn collection_etag(
+    managed: &BTreeMap<ConnectionId, StoredConnection>,
+    legacy: &[LegacyConnectionProjection],
+    omitted_legacy_projection_count: usize,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"greengateway.connections.collection.v1");
+    digest.update(
+        u64::try_from(omitted_legacy_projection_count)
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for projection in legacy {
+        digest.update(b"legacy");
+        update_digest_field(&mut digest, projection.id().as_str());
+    }
+    for (id, record) in managed {
+        digest.update(b"managed");
+        update_digest_field(&mut digest, id.as_str());
+        update_digest_field(&mut digest, record.etag().as_str());
+    }
+    format!("\"connections:sha256:{}\"", hex::encode(digest.finalize()))
+}
+
+fn update_digest_field(digest: &mut Sha256, value: &str) {
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(value.as_bytes());
+}
+
+#[derive(Debug)]
+pub enum ConnectionMutationError {
+    Unavailable(ManagedConnectionMutationUnavailable),
+    CollectionConflict { current: String },
+    UnresolvableBindings { fields: Vec<&'static str> },
+    BindingUnavailable,
+    Store(ConnectionStoreError),
+}
+
+impl fmt::Display for ConnectionMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(error) => error.fmt(formatter),
+            Self::CollectionConflict { current } => write!(
+                formatter,
+                "connection collection changed; current ETag is {current}"
+            ),
+            Self::UnresolvableBindings { fields } => write!(
+                formatter,
+                "enabled connection has unresolvable bindings in {} field(s)",
+                fields.len()
+            ),
+            Self::BindingUnavailable => {
+                formatter.write_str("enabled connection binding validation is unavailable")
+            }
+            Self::Store(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ConnectionMutationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Unavailable(error) => Some(error),
+            Self::Store(error) => Some(error),
+            Self::CollectionConflict { .. }
+            | Self::UnresolvableBindings { .. }
+            | Self::BindingUnavailable => None,
+        }
+    }
+}
+
+impl From<ManagedConnectionMutationUnavailable> for ConnectionMutationError {
+    fn from(error: ManagedConnectionMutationUnavailable) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+impl From<ConnectionStoreError> for ConnectionMutationError {
+    fn from(error: ConnectionStoreError) -> Self {
+        Self::Store(error)
     }
 }
 
@@ -185,6 +459,12 @@ struct ConnectionSecretResolver {
     local: Option<Arc<LocalSecretProvider>>,
 }
 
+#[derive(Debug)]
+enum BindingActivationError {
+    Invalid { fields: Vec<&'static str> },
+    Unavailable,
+}
+
 impl fmt::Debug for ConnectionSecretResolver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -192,6 +472,252 @@ impl fmt::Debug for ConnectionSecretResolver {
             .field("operator_alias_count", &self.operator.aliases().len())
             .field("local_provider_enabled", &self.local.is_some())
             .finish()
+    }
+}
+
+impl ConnectionSecretResolver {
+    fn resolve_blocking(
+        &self,
+        alias_id: &str,
+        purpose: SecretPurpose,
+    ) -> Result<ResolvedSecret, SecretResolveError> {
+        if self.operator.contains_alias(alias_id) {
+            return self.operator.resolve_blocking(alias_id, purpose);
+        }
+        if let Some(local) = self.local.as_ref() {
+            return local.resolve_blocking(alias_id, purpose);
+        }
+        self.operator.resolve_blocking(alias_id, purpose)
+    }
+
+    fn validate_enabled_candidate(
+        &self,
+        candidate: &ConnectionWrite,
+    ) -> Result<(), BindingActivationError> {
+        if !candidate.enabled {
+            return Ok(());
+        }
+        let configured_alias_ids = self
+            .aliases()
+            .into_iter()
+            .filter(|alias| alias.configured)
+            .map(|alias| alias.id)
+            .collect::<BTreeSet<_>>();
+        let unresolved =
+            candidate.unresolved_enabled_binding_fields(|id| configured_alias_ids.contains(id));
+        if !unresolved.is_empty() {
+            return Err(BindingActivationError::Invalid { fields: unresolved });
+        }
+
+        match &candidate.authentication {
+            ConnectionAuthentication::None => {}
+            ConnectionAuthentication::HeaderApiKey {
+                secret_id: Some(secret_id),
+                ..
+            } => {
+                self.resolve_required(
+                    "authentication.secret_id",
+                    secret_id,
+                    SecretPurpose::HeaderApiKey,
+                )?;
+            }
+            ConnectionAuthentication::StaticBearer {
+                secret_id: Some(secret_id),
+            } => {
+                self.resolve_required(
+                    "authentication.secret_id",
+                    secret_id,
+                    SecretPurpose::StaticBearer,
+                )?;
+            }
+            ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id: Some(secret_id),
+                ..
+            } => {
+                self.resolve_required(
+                    "authentication.client_secret_id",
+                    secret_id,
+                    SecretPurpose::OAuthClientSecret,
+                )?;
+            }
+            ConnectionAuthentication::HeaderApiKey {
+                secret_id: None, ..
+            }
+            | ConnectionAuthentication::StaticBearer { secret_id: None }
+            | ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id: None,
+                ..
+            } => {}
+        }
+
+        let ca_bundle = candidate
+            .tls
+            .ca_bundle_alias
+            .as_deref()
+            .map(|id| self.resolve_required("tls.ca_bundle_alias", id, SecretPurpose::TlsCaBundle))
+            .transpose()?;
+        if ca_bundle
+            .as_ref()
+            .is_some_and(|material| !crate::egress::tls_ca_bundle_pem_is_valid(material.expose()))
+        {
+            return Err(BindingActivationError::Invalid {
+                fields: vec!["tls.ca_bundle_alias"],
+            });
+        }
+
+        let client_certificate = candidate
+            .tls
+            .client_certificate_id
+            .as_deref()
+            .map(|id| {
+                self.resolve_required(
+                    "tls.client_certificate_id",
+                    id,
+                    SecretPurpose::TlsCertificate,
+                )
+            })
+            .transpose()?;
+        let client_private_key = candidate
+            .tls
+            .client_private_key_id
+            .as_deref()
+            .map(|id| {
+                self.resolve_required(
+                    "tls.client_private_key_id",
+                    id,
+                    SecretPurpose::TlsPrivateKey,
+                )
+            })
+            .transpose()?;
+        if let (Some(certificate), Some(private_key)) =
+            (client_certificate.as_ref(), client_private_key.as_ref())
+        {
+            validate_client_identity_material(certificate.expose(), private_key.expose())?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_enabled_candidate_with_rotated_secret(
+        &self,
+        candidate: &ConnectionWrite,
+        rotated_id: &str,
+        replacement: &ResolvedSecret,
+    ) -> Result<(), BindingActivationError> {
+        if !candidate.enabled {
+            return Ok(());
+        }
+
+        let authentication_purpose = match &candidate.authentication {
+            ConnectionAuthentication::HeaderApiKey {
+                secret_id: Some(secret_id),
+                ..
+            } if secret_id == rotated_id => Some(SecretPurpose::HeaderApiKey),
+            ConnectionAuthentication::StaticBearer {
+                secret_id: Some(secret_id),
+            } if secret_id == rotated_id => Some(SecretPurpose::StaticBearer),
+            ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id: Some(secret_id),
+                ..
+            } if secret_id == rotated_id => Some(SecretPurpose::OAuthClientSecret),
+            _ => None,
+        };
+        if authentication_purpose.is_some_and(|purpose| replacement.purpose() != purpose) {
+            return Err(BindingActivationError::Invalid {
+                fields: vec!["authentication"],
+            });
+        }
+
+        if candidate.tls.ca_bundle_alias.as_deref() == Some(rotated_id)
+            && (replacement.purpose() != SecretPurpose::TlsCaBundle
+                || !crate::egress::tls_ca_bundle_pem_is_valid(replacement.expose()))
+        {
+            return Err(BindingActivationError::Invalid {
+                fields: vec!["tls.ca_bundle_alias"],
+            });
+        }
+
+        if candidate.tls.client_certificate_id.as_deref() == Some(rotated_id) {
+            if replacement.purpose() != SecretPurpose::TlsCertificate {
+                return Err(BindingActivationError::Invalid {
+                    fields: vec!["tls.client_certificate_id"],
+                });
+            }
+            let private_key_id =
+                candidate
+                    .tls
+                    .client_private_key_id
+                    .as_deref()
+                    .ok_or_else(|| BindingActivationError::Invalid {
+                        fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
+                    })?;
+            let private_key = self.resolve_required(
+                "tls.client_private_key_id",
+                private_key_id,
+                SecretPurpose::TlsPrivateKey,
+            )?;
+            validate_client_identity_material(replacement.expose(), private_key.expose())?;
+        }
+
+        if candidate.tls.client_private_key_id.as_deref() == Some(rotated_id) {
+            if replacement.purpose() != SecretPurpose::TlsPrivateKey {
+                return Err(BindingActivationError::Invalid {
+                    fields: vec!["tls.client_private_key_id"],
+                });
+            }
+            let certificate_id =
+                candidate
+                    .tls
+                    .client_certificate_id
+                    .as_deref()
+                    .ok_or_else(|| BindingActivationError::Invalid {
+                        fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
+                    })?;
+            let certificate = self.resolve_required(
+                "tls.client_certificate_id",
+                certificate_id,
+                SecretPurpose::TlsCertificate,
+            )?;
+            validate_client_identity_material(certificate.expose(), replacement.expose())?;
+        }
+
+        Ok(())
+    }
+
+    fn resolve_required(
+        &self,
+        field: &'static str,
+        alias_id: &str,
+        purpose: SecretPurpose,
+    ) -> Result<ResolvedSecret, BindingActivationError> {
+        self.resolve_blocking(alias_id, purpose)
+            .map_err(|error| match error.kind() {
+                SecretResolveErrorKind::UnknownAlias
+                | SecretResolveErrorKind::SourceDenied
+                | SecretResolveErrorKind::InvalidMaterial => BindingActivationError::Invalid {
+                    fields: vec![field],
+                },
+                SecretResolveErrorKind::ProviderBusy
+                | SecretResolveErrorKind::SourceUnavailable
+                | SecretResolveErrorKind::UnsafeSource
+                | SecretResolveErrorKind::ProviderFailure => BindingActivationError::Unavailable,
+            })
+    }
+}
+
+fn validate_client_identity_material(
+    certificate: &[u8],
+    private_key: &[u8],
+) -> Result<(), BindingActivationError> {
+    let mut identity = Zeroizing::new(Vec::with_capacity(certificate.len() + private_key.len()));
+    identity.extend_from_slice(certificate);
+    identity.extend_from_slice(private_key);
+    if crate::egress::tls_client_identity_pem_is_valid(identity.as_slice()) {
+        Ok(())
+    } else {
+        Err(BindingActivationError::Invalid {
+            fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
+        })
     }
 }
 
@@ -221,6 +747,79 @@ impl SecretResolver for ConnectionSecretResolver {
     }
 }
 
+#[derive(Clone)]
+struct CoordinatedLocalSecretManager {
+    provider: Arc<LocalSecretProvider>,
+    mutation_lock: Arc<Mutex<()>>,
+    runtime: Arc<ArcSwap<ConnectionRuntimeSnapshot>>,
+    secret_resolver: Arc<ConnectionSecretResolver>,
+}
+
+impl CoordinatedLocalSecretManager {
+    fn mutation_guard(&self) -> MutexGuard<'_, ()> {
+        match self.mutation_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    "Connection/local-secret mutation lock poisoned; recovering fail-closed state"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+}
+
+impl LocalSecretManager for CoordinatedLocalSecretManager {
+    fn create(
+        &self,
+        label: &str,
+        secret: ResolvedSecret,
+    ) -> Result<SecretAliasMetadata, LocalSecretError> {
+        let _guard = self.mutation_guard();
+        self.provider.create(label, secret)
+    }
+
+    fn rotate(
+        &self,
+        id: &str,
+        replacement: ResolvedSecret,
+    ) -> Result<SecretAliasMetadata, LocalSecretError> {
+        let _guard = self.mutation_guard();
+        let snapshot = self.runtime.load_full();
+        for record in snapshot.managed().values() {
+            self.secret_resolver
+                .validate_enabled_candidate_with_rotated_secret(&record.write, id, &replacement)
+                .map_err(|error| match error {
+                    BindingActivationError::Invalid { .. } => LocalSecretError::InvalidSecret,
+                    BindingActivationError::Unavailable => LocalSecretError::StorageFailure,
+                })?;
+        }
+        self.provider.rotate(id, replacement)
+    }
+
+    fn delete(&self, id: &str) -> Result<(), LocalSecretError> {
+        let _guard = self.mutation_guard();
+        self.provider.delete(id)
+    }
+
+    fn metadata(&self) -> Vec<SecretAliasMetadata> {
+        self.provider.metadata()
+    }
+
+    fn reencrypt_master_key_batch(
+        &self,
+        maximum_records: usize,
+    ) -> Result<MasterKeyRotationProgress, LocalSecretError> {
+        let _guard = self.mutation_guard();
+        self.provider.reencrypt_master_key_batch(maximum_records)
+    }
+
+    fn ensure_key_unused(&self, key_id: &str) -> Result<(), LocalSecretError> {
+        let _guard = self.mutation_guard();
+        self.provider.ensure_key_unused(key_id)
+    }
+}
+
 #[derive(Debug)]
 pub enum ConnectionControlPlaneError {
     Store(ConnectionStoreError),
@@ -231,6 +830,7 @@ pub enum ConnectionControlPlaneError {
     LocalSecretKeyringRequired,
     LimitExceeded { count: usize, maximum: usize },
     IdCollision { id: String },
+    UnresolvableBindings { id: String },
 }
 
 impl fmt::Display for ConnectionControlPlaneError {
@@ -251,6 +851,10 @@ impl fmt::Display for ConnectionControlPlaneError {
             Self::IdCollision { id } => write!(
                 formatter,
                 "managed connection ID '{id}' collides with a reserved legacy projection"
+            ),
+            Self::UnresolvableBindings { id } => write!(
+                formatter,
+                "enabled managed connection '{id}' references a secret or TLS binding that is not usable"
             ),
         }
     }
@@ -327,7 +931,7 @@ impl Error for LocalSecretMutationUnavailable {}
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::PathBuf, sync::Barrier};
 
     use crate::{
         config::McpUpstreamServerConfig,
@@ -692,6 +1296,603 @@ mod tests {
                 LocalSecretError::IdentifierCollision
             ))
         ));
+    }
+
+    #[test]
+    fn enabled_persisted_connection_with_unknown_binding_fails_restart_closed() {
+        let temporary = TemporaryLocalControlPlane::new("unknown-persisted-binding");
+        let config = temporary.config();
+        let store = SqliteConnectionStore::open(
+            config
+                .connections_sqlite_path
+                .as_deref()
+                .expect("managed store path should be configured"),
+        )
+        .expect("store should open");
+        let candidate = serde_json::from_value(serde_json::json!({
+            "display_name": "Billing API",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {
+                "type": "static_bearer",
+                "secret_id": "unknown-token"
+            }
+        }))
+        .expect("candidate should deserialize");
+        let created = store
+            .create(candidate)
+            .expect("fixture should persist directly");
+        drop(store);
+
+        assert!(matches!(
+            ConnectionControlPlane::from_config(&config),
+            Err(ConnectionControlPlaneError::UnresolvableBindings { id })
+                if id == created.id.as_str()
+        ));
+    }
+
+    #[test]
+    fn enabled_mutation_resolves_material_and_rejects_wrong_local_purpose() {
+        let temporary = TemporaryLocalControlPlane::new("binding-purpose");
+        let control_plane = ConnectionControlPlane::from_config(&temporary.config())
+            .expect("control plane should build");
+        let secret = control_plane
+            .local_secret_manager()
+            .expect("local manager should exist")
+            .create(
+                "Header-only secret",
+                ResolvedSecret::new(SecretPurpose::HeaderApiKey, b"header-canary".to_vec())
+                    .expect("fixture secret should validate"),
+            )
+            .expect("fixture secret should create");
+        let before = control_plane.runtime_snapshot();
+        let mut candidate = managed_candidate();
+        candidate.authentication = ConnectionAuthentication::StaticBearer {
+            secret_id: Some(secret.id),
+        };
+
+        assert!(matches!(
+            control_plane.create_managed(before.collection_etag(), candidate),
+            Err(ConnectionMutationError::UnresolvableBindings { fields })
+                if fields == vec!["authentication.secret_id"]
+        ));
+        assert!(control_plane.runtime_snapshot().managed().is_empty());
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .count()
+                .expect("count should load"),
+            0
+        );
+    }
+
+    #[test]
+    fn unavailable_operator_material_preserves_previous_persisted_and_runtime_state() {
+        let temporary = TemporaryLocalControlPlane::new("binding-unavailable");
+        let mut config = temporary.config();
+        let alias_id = format!("missing-alias-{}", uuid::Uuid::new_v4());
+        config.connection_secret_aliases =
+            vec![crate::connections::secret::OperatorSecretAliasConfig {
+                id: alias_id.clone(),
+                label: "Unavailable token".to_owned(),
+                source: crate::connections::secret::OperatorSecretAliasSource::Environment {
+                    key: format!("GGW_MISSING_{}", uuid::Uuid::new_v4().simple()),
+                },
+            }];
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let initial = control_plane.runtime_snapshot();
+        let mut unavailable_create = managed_candidate();
+        unavailable_create.authentication = ConnectionAuthentication::StaticBearer {
+            secret_id: Some(alias_id.clone()),
+        };
+        assert!(matches!(
+            control_plane.create_managed(initial.collection_etag(), unavailable_create),
+            Err(ConnectionMutationError::BindingUnavailable)
+        ));
+        assert!(control_plane.runtime_snapshot().managed().is_empty());
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .count()
+                .expect("count should load"),
+            0
+        );
+        let created = control_plane
+            .create_managed(initial.collection_etag(), managed_candidate())
+            .expect("plain connection should create");
+        let before = control_plane.runtime_snapshot();
+        let mut replacement = created.write.clone();
+        replacement.authentication = ConnectionAuthentication::StaticBearer {
+            secret_id: Some(alias_id),
+        };
+
+        assert!(matches!(
+            control_plane.replace_managed(&created.id, &created.etag(), replacement),
+            Err(ConnectionMutationError::BindingUnavailable)
+        ));
+        let after = control_plane.runtime_snapshot();
+        assert_eq!(before.collection_etag(), after.collection_etag());
+        assert_eq!(after.managed().get(&created.id), Some(&created));
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .get(&created.id)
+                .expect("stored connection should load")
+                .expect("stored connection should remain"),
+            created
+        );
+    }
+
+    #[test]
+    fn invalid_der_ca_is_rejected_before_persistence_and_publication() {
+        let temporary = TemporaryLocalControlPlane::new("invalid-der-ca");
+        let control_plane = ConnectionControlPlane::from_config(&temporary.config())
+            .expect("control plane should build");
+        let secret = control_plane
+            .local_secret_manager()
+            .expect("local manager should exist")
+            .create(
+                "Invalid DER CA",
+                ResolvedSecret::new(
+                    SecretPurpose::TlsCaBundle,
+                    b"-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n".to_vec(),
+                )
+                .expect("bounded invalid-DER PEM fixture should validate"),
+            )
+            .expect("fixture secret should create");
+        let before = control_plane.runtime_snapshot();
+        let mut candidate = managed_candidate();
+        candidate.tls.ca_bundle_alias = Some(secret.id);
+
+        let result = control_plane.create_managed(before.collection_etag(), candidate);
+        match result {
+            Err(ConnectionMutationError::UnresolvableBindings { fields }) => {
+                assert_eq!(fields, vec!["tls.ca_bundle_alias"]);
+            }
+            result => panic!("unexpected malformed TLS activation result: {result:?}"),
+        }
+        assert!(control_plane.runtime_snapshot().managed().is_empty());
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .count()
+                .expect("count should load"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_valid_and_invalid_ca_rotation_preserves_previous_material() {
+        let temporary = TemporaryLocalControlPlane::new("mixed-ca-rotation");
+        let config = temporary.config();
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let key = rcgen::KeyPair::generate().expect("test CA key should generate");
+        let certificate = rcgen::CertificateParams::new(vec!["ca.example.test".to_owned()])
+            .expect("test CA parameters should build")
+            .self_signed(&key)
+            .expect("test CA certificate should build");
+        let valid_ca_pem = certificate.pem().into_bytes();
+        let manager = control_plane
+            .local_secret_manager()
+            .expect("local manager should exist");
+        let ca_secret = manager
+            .create(
+                "CA bundle",
+                ResolvedSecret::new(SecretPurpose::TlsCaBundle, valid_ca_pem.clone())
+                    .expect("valid CA secret should construct"),
+            )
+            .expect("valid CA secret should create");
+        let before = control_plane.runtime_snapshot();
+        let mut candidate = managed_candidate();
+        candidate.tls.ca_bundle_alias = Some(ca_secret.id.clone());
+        let created = control_plane
+            .create_managed(before.collection_etag(), candidate)
+            .expect("valid CA connection should activate");
+
+        let mut mixed_bundle = valid_ca_pem.clone();
+        mixed_bundle.extend_from_slice(
+            b"\n-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n",
+        );
+        assert_eq!(
+            manager.rotate(
+                &ca_secret.id,
+                ResolvedSecret::new(SecretPurpose::TlsCaBundle, mixed_bundle)
+                    .expect("bounded mixed CA fixture should construct"),
+            ),
+            Err(LocalSecretError::InvalidSecret)
+        );
+        assert_eq!(
+            control_plane
+                .secret_resolver()
+                .resolve(&ca_secret.id, SecretPurpose::TlsCaBundle)
+                .await
+                .expect("previous CA bundle should remain resolvable")
+                .expose(),
+            valid_ca_pem
+        );
+        assert_eq!(
+            control_plane.runtime_snapshot().managed().get(&created.id),
+            Some(&created)
+        );
+        drop(control_plane);
+        ConnectionControlPlane::from_config(&config)
+            .expect("rejected CA rotation must leave restartable state");
+    }
+
+    #[tokio::test]
+    async fn in_use_local_tls_rotation_is_preflighted_and_preserves_previous_material() {
+        let temporary = TemporaryLocalControlPlane::new("tls-rotation-preflight");
+        let config = temporary.config();
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let key = rcgen::KeyPair::generate().expect("test identity key should generate");
+        let certificate = rcgen::CertificateParams::new(vec!["client.example.test".to_owned()])
+            .expect("test identity parameters should build")
+            .self_signed(&key)
+            .expect("test identity certificate should build");
+        let certificate_pem = certificate.pem().into_bytes();
+        let private_key_pem = key.serialize_pem().into_bytes();
+        let manager = control_plane
+            .local_secret_manager()
+            .expect("local manager should exist");
+        let certificate_secret = manager
+            .create(
+                "Client certificate",
+                ResolvedSecret::new(SecretPurpose::TlsCertificate, certificate_pem.clone())
+                    .expect("certificate secret should validate"),
+            )
+            .expect("certificate secret should create");
+        let private_key_secret = manager
+            .create(
+                "Client private key",
+                ResolvedSecret::new(SecretPurpose::TlsPrivateKey, private_key_pem.clone())
+                    .expect("private-key secret should validate"),
+            )
+            .expect("private-key secret should create");
+        let before = control_plane.runtime_snapshot();
+        let mut candidate = managed_candidate();
+        candidate.tls.client_certificate_id = Some(certificate_secret.id.clone());
+        candidate.tls.client_private_key_id = Some(private_key_secret.id.clone());
+        let created = control_plane
+            .create_managed(before.collection_etag(), candidate)
+            .expect("valid mTLS connection should activate");
+
+        assert_eq!(
+            manager.rotate(
+                &certificate_secret.id,
+                ResolvedSecret::new(
+                    SecretPurpose::TlsCertificate,
+                    b"malformed-certificate-canary".to_vec(),
+                )
+                .expect("bounded malformed fixture should construct"),
+            ),
+            Err(LocalSecretError::InvalidSecret)
+        );
+        let mismatched_key =
+            rcgen::KeyPair::generate().expect("mismatched identity key should generate");
+        assert_eq!(
+            manager.rotate(
+                &private_key_secret.id,
+                ResolvedSecret::new(
+                    SecretPurpose::TlsPrivateKey,
+                    mismatched_key.serialize_pem().into_bytes(),
+                )
+                .expect("mismatched key fixture should construct"),
+            ),
+            Err(LocalSecretError::InvalidSecret)
+        );
+
+        assert_eq!(
+            control_plane
+                .secret_resolver()
+                .resolve(&certificate_secret.id, SecretPurpose::TlsCertificate,)
+                .await
+                .expect("previous certificate should remain resolvable")
+                .expose(),
+            certificate_pem
+        );
+        assert_eq!(
+            control_plane
+                .secret_resolver()
+                .resolve(&private_key_secret.id, SecretPurpose::TlsPrivateKey,)
+                .await
+                .expect("previous private key should remain resolvable")
+                .expose(),
+            private_key_pem
+        );
+        assert_eq!(
+            control_plane.runtime_snapshot().managed().get(&created.id),
+            Some(&created)
+        );
+        drop(control_plane);
+        ConnectionControlPlane::from_config(&config)
+            .expect("rejected rotations must leave restartable state");
+    }
+
+    #[test]
+    fn configured_but_unavailable_persisted_binding_fails_restart_closed() {
+        let temporary = TemporaryLocalControlPlane::new("unavailable-persisted-binding");
+        let mut config = temporary.config();
+        let alias_id = format!("missing-alias-{}", uuid::Uuid::new_v4());
+        config.connection_secret_aliases =
+            vec![crate::connections::secret::OperatorSecretAliasConfig {
+                id: alias_id.clone(),
+                label: "Unavailable token".to_owned(),
+                source: crate::connections::secret::OperatorSecretAliasSource::Environment {
+                    key: format!("GGW_MISSING_{}", uuid::Uuid::new_v4().simple()),
+                },
+            }];
+        let store = SqliteConnectionStore::open(
+            config
+                .connections_sqlite_path
+                .as_deref()
+                .expect("managed store path should be configured"),
+        )
+        .expect("store should open");
+        let mut candidate = managed_candidate();
+        candidate.authentication = ConnectionAuthentication::StaticBearer {
+            secret_id: Some(alias_id),
+        };
+        let created = store
+            .create(candidate)
+            .expect("fixture should persist directly");
+        drop(store);
+
+        assert!(matches!(
+            ConnectionControlPlane::from_config(&config),
+            Err(ConnectionControlPlaneError::UnresolvableBindings { id })
+                if id == created.id.as_str()
+        ));
+    }
+
+    #[test]
+    fn local_secret_delete_and_connection_activation_are_serialized() {
+        let temporary = TemporaryLocalControlPlane::new("delete-activation-race");
+        let control_plane = ConnectionControlPlane::from_config(&temporary.config())
+            .expect("control plane should build");
+
+        for iteration in 0..16 {
+            let secret = control_plane
+                .local_secret_manager()
+                .expect("local manager should exist")
+                .create(
+                    &format!("Race token {iteration}"),
+                    ResolvedSecret::new(
+                        SecretPurpose::StaticBearer,
+                        format!("race-token-{iteration}").into_bytes(),
+                    )
+                    .expect("fixture secret should validate"),
+                )
+                .expect("fixture secret should create");
+            let mut candidate = managed_candidate();
+            candidate.display_name = format!("Race connection {iteration}");
+            candidate.authentication = ConnectionAuthentication::StaticBearer {
+                secret_id: Some(secret.id.clone()),
+            };
+            let expected_collection_etag = control_plane
+                .runtime_snapshot()
+                .collection_etag()
+                .to_owned();
+            let barrier = Arc::new(Barrier::new(2));
+            let create_control_plane = control_plane.clone();
+            let delete_control_plane = control_plane.clone();
+            let create_barrier = Arc::clone(&barrier);
+            let delete_barrier = Arc::clone(&barrier);
+            let secret_id = secret.id.clone();
+
+            let (create_result, delete_result) = std::thread::scope(|scope| {
+                let create = scope.spawn(|| {
+                    create_barrier.wait();
+                    create_control_plane.create_managed(&expected_collection_etag, candidate)
+                });
+                let delete = scope.spawn(|| {
+                    delete_barrier.wait();
+                    delete_control_plane
+                        .local_secret_manager()
+                        .expect("local manager should exist")
+                        .delete(&secret_id)
+                });
+                (
+                    create.join().expect("create thread should not panic"),
+                    delete.join().expect("delete thread should not panic"),
+                )
+            });
+
+            match (create_result, delete_result) {
+                (Ok(created), Err(LocalSecretError::DependencyConflict { connection_ids, .. })) => {
+                    assert_eq!(connection_ids, vec![created.id.to_string()]);
+                    control_plane
+                        .delete_managed(&created.id, &created.etag())
+                        .expect("fixture connection should delete");
+                    control_plane
+                        .local_secret_manager()
+                        .expect("local manager should exist")
+                        .delete(&secret.id)
+                        .expect("fixture secret should delete after dependency removal");
+                }
+                (Err(ConnectionMutationError::UnresolvableBindings { .. }), Ok(())) => {
+                    assert!(control_plane
+                        .runtime_snapshot()
+                        .managed()
+                        .values()
+                        .all(|record| {
+                            record.write.authentication
+                                != (ConnectionAuthentication::StaticBearer {
+                                    secret_id: Some(secret.id.clone()),
+                                })
+                        }));
+                }
+                (create, delete) => {
+                    panic!(
+                        "unexpected serialized race outcome: create={create:?}, delete={delete:?}"
+                    )
+                }
+            }
+        }
+    }
+
+    fn managed_candidate() -> ConnectionWrite {
+        serde_json::from_value(serde_json::json!({
+            "display_name": "Billing API",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {
+                "type": "none"
+            }
+        }))
+        .expect("managed candidate should deserialize")
+    }
+
+    #[test]
+    fn successful_mutations_publish_one_atomic_runtime_snapshot() {
+        let temporary = TemporaryLocalControlPlane::new("runtime-mutations");
+        let control_plane = ConnectionControlPlane::from_config(&temporary.config())
+            .expect("control plane should build");
+        let initial = control_plane.runtime_snapshot();
+        assert!(initial.managed().is_empty());
+
+        let created = control_plane
+            .create_managed(initial.collection_etag(), managed_candidate())
+            .expect("create should succeed");
+        let after_create = control_plane.runtime_snapshot();
+        assert!(
+            initial.managed().is_empty(),
+            "old snapshot must remain immutable"
+        );
+        assert_eq!(after_create.managed().get(&created.id), Some(&created));
+        assert_ne!(initial.collection_etag(), after_create.collection_etag());
+
+        assert!(matches!(
+            control_plane.create_managed(initial.collection_etag(), managed_candidate()),
+            Err(ConnectionMutationError::CollectionConflict { .. })
+        ));
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .count()
+                .expect("count should load"),
+            1,
+            "stale collection mutation must not reach storage"
+        );
+
+        let mut replacement = created.write.clone();
+        replacement.display_name = "Billing API v2".to_owned();
+        let replaced = control_plane
+            .replace_managed(&created.id, &created.etag(), replacement)
+            .expect("replace should succeed");
+        let after_replace = control_plane.runtime_snapshot();
+        assert_eq!(after_create.managed().get(&created.id), Some(&created));
+        assert_eq!(after_replace.managed().get(&created.id), Some(&replaced));
+
+        control_plane
+            .delete_managed(&created.id, &replaced.etag())
+            .expect("delete should succeed");
+        let after_delete = control_plane.runtime_snapshot();
+        assert!(!after_delete.managed().contains_key(&created.id));
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .count()
+                .expect("count should load"),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_mutation_preserves_runtime_and_persisted_state() {
+        let temporary = TemporaryLocalControlPlane::new("runtime-failure");
+        let control_plane = ConnectionControlPlane::from_config(&temporary.config())
+            .expect("control plane should build");
+        let before = control_plane.runtime_snapshot();
+        let mut invalid = managed_candidate();
+        invalid.endpoint.base_url = "https://billing.example.test?secret=forbidden".to_owned();
+
+        assert!(matches!(
+            control_plane.create_managed(before.collection_etag(), invalid),
+            Err(ConnectionMutationError::Store(
+                ConnectionStoreError::Validation { .. }
+            ))
+        ));
+        let after = control_plane.runtime_snapshot();
+        assert!(after.managed().is_empty());
+        assert_eq!(before.collection_etag(), after.collection_etag());
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .count()
+                .expect("count should load"),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_creates_with_one_collection_etag_have_exactly_one_winner() {
+        let temporary = TemporaryLocalControlPlane::new("runtime-one-winner");
+        let control_plane = Arc::new(
+            ConnectionControlPlane::from_config(&temporary.config())
+                .expect("control plane should build"),
+        );
+        let expected = control_plane
+            .runtime_snapshot()
+            .collection_etag()
+            .to_owned();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for index in 0..2 {
+            let control_plane = Arc::clone(&control_plane);
+            let barrier = Arc::clone(&barrier);
+            let expected = expected.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut candidate = managed_candidate();
+                candidate.display_name = format!("Concurrent API {index}");
+                barrier.wait();
+                control_plane.create_managed(&expected, candidate)
+            }));
+        }
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker should join"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        result,
+                        Err(ConnectionMutationError::CollectionConflict { .. })
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(control_plane.runtime_snapshot().managed().len(), 1);
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .count()
+                .expect("count should load"),
+            1
+        );
     }
 
     #[cfg(unix)]

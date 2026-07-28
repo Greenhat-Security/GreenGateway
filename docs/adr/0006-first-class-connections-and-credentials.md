@@ -224,7 +224,9 @@ opened relative to that handle without following links and in nonblocking mode,
 validated from the opened handle, and read through a purpose-specific byte cap.
 Values are resolved on every authorized use rather than cached, so atomic
 mounted-file replacement affects the next resolution without changing an
-already in-flight redacted value.
+already in-flight redacted value. A finite provider permit is reserved before
+submitting blocking environment, filesystem, or encrypted-store work; saturated
+resolution therefore fails closed without building an unbounded blocking queue.
 
 Internal resolved secret wrappers do not implement `Serialize` or `Clone`.
 Their manual `Debug` output is exactly `<redacted>`, their bytes are bounded by
@@ -250,7 +252,12 @@ The management interface can create, rotate, delete, list safe metadata,
 re-encrypt a bounded key batch, and verify old-key disuse. It deliberately has
 no reveal method; runtime plaintext resolution is a separate capability.
 Create and rotate consume a redacted zeroizing value and return only stable
-metadata. Referenced deletion fails with bounded connection dependency IDs.
+metadata. Rotation preflights proposed material against every enabled
+referencing Connection, including parsing every CA bundle entry as valid X.509
+DER and client certificate/private-key pairing, before changing ciphertext; a
+malformed entry in an otherwise valid CA bundle fails the whole preflight, and
+a failed preflight preserves the prior value and runtime. Referenced deletion
+fails with bounded connection dependency IDs.
 The database, WAL, and database backups contain ciphertext only. Database and
 key backups are separate recovery artifacts and must be restored together.
 
@@ -316,10 +323,18 @@ The permission vocabulary is:
 Changing where an existing credential may be sent is a secret-use mutation.
 `admin:connections:secrets:write` is required to change a credentialed origin,
 OAuth token URL, scopes/audience/resource, auth mode/header, mTLS identity, or
-credentialed discovery target, and to attach, replace, rotate, clear, delete,
-or clone a binding. A plain connection writer cannot perform those operations.
-Every sensitive change atomically increments the credential revision and emits
-a separate credential-change audit event.
+credentialed discovery or stored test target, and to attach, replace, rotate,
+clear, delete, or clone a binding. Adding, removing, or changing the method or
+path of a stored test profile is a target change whenever either revision has
+credential or TLS authority. A plain connection writer cannot perform those
+operations. Every sensitive change atomically increments the credential
+revision and emits a separate credential-change audit event.
+Any explicitly submitted hidden credential or TLS binding field requires
+secrets-write even when its value equals the current binding; ordinary writers
+retain redacted bindings only through the server-issued configured markers.
+Secondary secrets-write denials emit a bounded `authz.denied` event containing
+the stable route pattern, operation, and required permission, never submitted
+binding IDs or target values.
 
 All admin routes remain below dynamic `/v1{ADMIN_PREFIX}`. Writes require CSRF
 under existing cookie-auth rules and an exact `If-Match`; missing preconditions

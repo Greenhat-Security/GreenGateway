@@ -774,7 +774,18 @@ impl LocalSecretProvider {
         }
     }
 
-    fn resolve_sync(
+    pub(crate) fn resolve_blocking(
+        &self,
+        alias_id: &str,
+        purpose: SecretPurpose,
+    ) -> Result<ResolvedSecret, SecretResolveError> {
+        let _permit = Arc::clone(&self.concurrent_reads)
+            .try_acquire_owned()
+            .map_err(|_| SecretResolveError::new(alias_id, SecretResolveErrorKind::ProviderBusy))?;
+        self.resolve_blocking_inner(alias_id, purpose)
+    }
+
+    fn resolve_blocking_inner(
         &self,
         alias_id: &str,
         purpose: SecretPurpose,
@@ -959,16 +970,16 @@ impl SecretResolver for LocalSecretProvider {
         purpose: SecretPurpose,
     ) -> Result<ResolvedSecret, SecretResolveError> {
         let safe_alias_id = safe_error_alias_id(alias_id);
+        let provider = self.clone();
+        let join_alias_id = safe_alias_id.clone();
         let permit = Arc::clone(&self.concurrent_reads)
             .try_acquire_owned()
             .map_err(|_| {
                 SecretResolveError::new(&safe_alias_id, SecretResolveErrorKind::ProviderBusy)
             })?;
-        let provider = self.clone();
-        let join_alias_id = safe_alias_id.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            provider.resolve_sync(&safe_alias_id, purpose)
+            provider.resolve_blocking_inner(&safe_alias_id, purpose)
         })
         .await
         .map_err(|_| {
@@ -1538,6 +1549,57 @@ mod tests {
         assert!(message.contains("<invalid-alias>"));
         assert!(!message.contains("secret-and-locator-canary"));
         assert!(message.len() < 128);
+    }
+
+    #[test]
+    fn saturated_local_provider_rejects_before_entering_the_blocking_queue() {
+        let environment = TestEnvironment::new("blocking-admission");
+        environment.write_key(PRIMARY_FILE, 21);
+        let (_store, mut provider) = environment
+            .provider(&environment.primary_config())
+            .expect("provider should open");
+        provider.concurrent_reads = Arc::new(Semaphore::new(0));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("bounded test runtime should build");
+
+        runtime.block_on(async {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx
+                    .send(())
+                    .expect("blocking-pool fixture should report admission");
+                release_rx
+                    .recv()
+                    .expect("blocking-pool fixture should be released");
+            });
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("blocking pool should be occupied");
+
+            let error = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                provider.resolve(
+                    "00000000-0000-0000-0000-000000000001",
+                    SecretPurpose::StaticBearer,
+                ),
+            )
+            .await
+            .expect("saturated admission must not wait behind a blocking task")
+            .expect_err("saturated admission must fail closed");
+            assert_eq!(error.kind(), SecretResolveErrorKind::ProviderBusy);
+
+            release_tx
+                .send(())
+                .expect("blocking-pool fixture should release");
+            blocker
+                .await
+                .expect("blocking-pool fixture should finish cleanly");
+        });
     }
 
     #[test]
