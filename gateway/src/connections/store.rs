@@ -1470,6 +1470,14 @@ impl ConnectionStore for SqliteConnectionStore {
                     count: usize::try_from(managed_tool_count).unwrap_or(usize::MAX),
                 });
             }
+            transaction
+                .execute(
+                    "DELETE FROM connection_mcp_catalogs WHERE connection_id = ?1",
+                    params![id.as_str()],
+                )
+                .map_err(|source| {
+                    sqlite_error(&self.path, "obsolete managed MCP catalog removal", source)
+                })?;
         }
 
         ensure_binding_capacity(
@@ -3080,6 +3088,51 @@ mod tests {
                 .mcp_catalog(&created.id)
                 .expect("reopened catalog should load"),
             Some(retained)
+        );
+    }
+
+    #[test]
+    fn empty_mcp_catalog_is_removed_on_incompatible_update_or_delete() {
+        let (_directory, path, store) = temporary_store("empty-mcp-catalog-cleanup");
+        let converted_source = store
+            .create(mcp_candidate())
+            .expect("convertible MCP Connection should create");
+        store
+            .replace_mcp_catalog(&converted_source.id, &converted_source.etag(), &[])
+            .expect("empty MCP catalog should publish");
+        let converted = store
+            .replace(&converted_source.id, &converted_source.etag(), candidate())
+            .expect("empty catalog should permit an incompatible update");
+        assert!(
+            store
+                .mcp_catalog(&converted.id)
+                .expect("converted catalog lookup should work")
+                .is_none(),
+            "incompatible update must remove the obsolete durable catalog"
+        );
+        store
+            .delete(&converted.id, &converted.etag())
+            .expect("converted Connection should delete");
+
+        let deleted = store
+            .create(mcp_candidate())
+            .expect("deletable MCP Connection should create");
+        store
+            .replace_mcp_catalog(&deleted.id, &deleted.etag(), &[])
+            .expect("deletable empty MCP catalog should publish");
+        store
+            .delete(&deleted.id, &deleted.etag())
+            .expect("empty managed MCP Connection should delete");
+        drop(store);
+
+        let reopened =
+            SqliteConnectionStore::open(&path).expect("cleaned catalog store should reopen");
+        assert!(
+            reopened
+                .mcp_catalogs()
+                .expect("reopened catalogs should load")
+                .is_empty(),
+            "converted and deleted Connections must leave no durable catalog rows"
         );
     }
 

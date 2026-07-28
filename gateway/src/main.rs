@@ -3109,6 +3109,10 @@ async fn connection_put_endpoint(
         }
         Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
     }
+    let _catalog_lifecycle = match state.mcp_catalogs.begin_connection_mutation(&id) {
+        Ok(guard) => guard,
+        Err(error) => return connection_refresh_error_response(error),
+    };
 
     let changed_fields =
         connections::admin::changed_connection_fields(Some(&current.write), Some(&candidate));
@@ -3123,6 +3127,7 @@ async fn connection_put_endpoint(
         Ok(updated) => updated,
         Err(error) => return connection_mutation_error_response(error),
     };
+    state.mcp_catalogs.reconcile_connection(&updated);
     if !changed_fields.is_empty() {
         emit_connection_changed(
             &state,
@@ -3226,10 +3231,15 @@ async fn connection_delete_endpoint(
         }
         Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
     }
+    let _catalog_lifecycle = match state.mcp_catalogs.begin_connection_mutation(&id) {
+        Ok(guard) => guard,
+        Err(error) => return connection_refresh_error_response(error),
+    };
 
     if let Err(error) = state.control_plane.delete_managed(&id, &current_etag) {
         return connection_mutation_error_response(error);
     }
+    state.mcp_catalogs.remove_connection(&id);
     let changed_fields = connections::admin::changed_connection_fields(Some(&current.write), None);
     emit_connection_changed(
         &state,

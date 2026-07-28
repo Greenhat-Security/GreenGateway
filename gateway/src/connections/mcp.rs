@@ -24,8 +24,8 @@ use super::{
     model::{ConnectionId, ConnectionKind, DiscoveryConfig, MAX_CONCURRENT_REFRESHES},
     status::{ConnectionOperationalState, ConnectionStatusReason, SafeConnectionStatus},
     store::{
-        ConnectionEtag, ConnectionStatusUpdate, ConnectionStoreError, StoredMcpCatalog,
-        StoredMcpCatalogEntry,
+        ConnectionEtag, ConnectionStatusUpdate, ConnectionStoreError, StoredConnection,
+        StoredMcpCatalog, StoredMcpCatalogEntry,
     },
 };
 
@@ -164,6 +164,17 @@ impl McpConnectionCatalogRuntime {
         });
     }
 
+    fn remove(&self, connection_id: &ConnectionId) {
+        self.state.rcu(|current| {
+            if !current.contains_key(connection_id) {
+                return Arc::clone(current);
+            }
+            let mut next = current.as_ref().clone();
+            next.remove(connection_id);
+            Arc::new(next)
+        });
+    }
+
     pub fn catalog_status(
         &self,
         connection_id: &ConnectionId,
@@ -227,6 +238,26 @@ impl McpConnectionCatalogService {
 
     pub fn runtime(&self) -> McpConnectionCatalogRuntime {
         self.runtime.clone()
+    }
+
+    pub(crate) fn begin_connection_mutation(
+        &self,
+        connection_id: &ConnectionId,
+    ) -> Result<McpConnectionLifecycleGuard, McpCatalogRefreshError> {
+        McpConnectionLifecycleGuard::acquire(
+            Arc::clone(&self.active_connections),
+            connection_id.clone(),
+        )
+    }
+
+    pub fn reconcile_connection(&self, record: &StoredConnection) {
+        if !supports_managed_mcp_catalog(record) {
+            self.runtime.remove(&record.id);
+        }
+    }
+
+    pub fn remove_connection(&self, connection_id: &ConnectionId) {
+        self.runtime.remove(connection_id);
     }
 
     pub fn status_fallback(
@@ -459,9 +490,35 @@ impl McpConnectionCatalogService {
     }
 }
 
-struct ActiveRefreshGuard {
+pub(crate) struct McpConnectionLifecycleGuard {
     active_connections: Arc<Mutex<BTreeSet<ConnectionId>>>,
     connection_id: ConnectionId,
+}
+
+impl McpConnectionLifecycleGuard {
+    fn acquire(
+        active_connections: Arc<Mutex<BTreeSet<ConnectionId>>>,
+        connection_id: ConnectionId,
+    ) -> Result<Self, McpCatalogRefreshError> {
+        let inserted = active_guard(&active_connections).insert(connection_id.clone());
+        if !inserted {
+            return Err(McpCatalogRefreshError::RefreshInProgress);
+        }
+        Ok(Self {
+            active_connections,
+            connection_id,
+        })
+    }
+}
+
+impl Drop for McpConnectionLifecycleGuard {
+    fn drop(&mut self) {
+        active_guard(&self.active_connections).remove(&self.connection_id);
+    }
+}
+
+struct ActiveRefreshGuard {
+    _lifecycle: McpConnectionLifecycleGuard,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -471,21 +528,11 @@ impl ActiveRefreshGuard {
         connection_id: ConnectionId,
         permit: OwnedSemaphorePermit,
     ) -> Result<Self, McpCatalogRefreshError> {
-        let inserted = active_guard(&active_connections).insert(connection_id.clone());
-        if !inserted {
-            return Err(McpCatalogRefreshError::RefreshInProgress);
-        }
+        let lifecycle = McpConnectionLifecycleGuard::acquire(active_connections, connection_id)?;
         Ok(Self {
-            active_connections,
-            connection_id,
+            _lifecycle: lifecycle,
             _permit: permit,
         })
-    }
-}
-
-impl Drop for ActiveRefreshGuard {
-    fn drop(&mut self) {
-        active_guard(&self.active_connections).remove(&self.connection_id);
     }
 }
 
@@ -499,6 +546,14 @@ fn active_guard(
             poisoned.into_inner()
         }
     }
+}
+
+fn supports_managed_mcp_catalog(record: &StoredConnection) -> bool {
+    record.write.kind == ConnectionKind::McpStreamableHttp
+        && matches!(
+            &record.write.discovery,
+            Some(DiscoveryConfig::ManagedMcp { .. })
+        )
 }
 
 fn catalog_definitions(catalog: &StoredMcpCatalog) -> impl Iterator<Item = ToolDefinition> + '_ {
@@ -676,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_runtime_publications_do_not_lose_connections() {
+    fn concurrent_runtime_publications_and_removals_do_not_lose_updates() {
         let runtime = McpConnectionCatalogRuntime::new(&[]);
         let publication_count = 64_usize;
         let barrier = Arc::new(Barrier::new(publication_count));
@@ -711,6 +766,27 @@ mod tests {
             runtime.state.load().len(),
             publication_count,
             "atomic runtime publication must retain every concurrent Connection"
+        );
+
+        let removals = (0..publication_count)
+            .map(|index| {
+                let runtime = runtime.clone();
+                std::thread::spawn(move || {
+                    let connection_id =
+                        ConnectionId::parse(format!("{index:08x}-1111-4111-8111-111111111111"))
+                            .expect("concurrent removal Connection ID should validate");
+                    runtime.remove(&connection_id);
+                })
+            })
+            .collect::<Vec<_>>();
+        for removal in removals {
+            removal
+                .join()
+                .expect("concurrent runtime removal should not panic");
+        }
+        assert!(
+            runtime.state.load().is_empty(),
+            "deleted or converted Connections must not accumulate in runtime state"
         );
     }
 
@@ -867,11 +943,15 @@ mod tests {
         assert!(matches!(
             ActiveRefreshGuard::acquire(
                 Arc::clone(&active_connections),
-                first_id,
+                first_id.clone(),
                 Arc::clone(&permits)
                     .try_acquire_owned()
                     .expect("duplicate attempt can reserve before ID coordination"),
             ),
+            Err(McpCatalogRefreshError::RefreshInProgress)
+        ));
+        assert!(matches!(
+            McpConnectionLifecycleGuard::acquire(Arc::clone(&active_connections), first_id.clone(),),
             Err(McpCatalogRefreshError::RefreshInProgress)
         ));
 
@@ -900,6 +980,10 @@ mod tests {
             MAX_CONCURRENT_REFRESHES,
             "dropping refresh guards must release every permit"
         );
+        let mutation =
+            McpConnectionLifecycleGuard::acquire(Arc::clone(&active_connections), first_id)
+                .expect("same-Connection mutation should acquire after refresh completion");
+        drop(mutation);
     }
 
     async fn run_mcp_catalog_server(listener: TcpListener, list_count: Arc<AtomicUsize>) {
