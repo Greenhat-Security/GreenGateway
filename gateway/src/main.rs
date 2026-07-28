@@ -2990,17 +2990,27 @@ async fn connection_put_endpoint(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let (candidate, explicit_binding_intent) =
-        match parse_connection_write_body(&body, &current.write) {
-            Ok(candidate) => candidate,
-            Err(response) => return *response,
-        };
+    let has_secrets_write =
+        rbac_state.principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION);
+    let explicit_binding_intent = match explicit_connection_binding_intent_from_body(&body) {
+        Ok(intent) => intent,
+        Err(response) => return *response,
+    };
+    if explicit_binding_intent && !has_secrets_write {
+        return connection_secret_authority_forbidden(
+            &state,
+            &parts,
+            &principal,
+            CONNECTION_ADMIN_ROUTE,
+            "replace",
+        );
+    }
+    let candidate = match parse_connection_write_body(&body, &current.write) {
+        Ok(candidate) => candidate,
+        Err(response) => return *response,
+    };
     let credential_changed = current.write.requires_secrets_write_to_replace(&candidate);
-    let requires_secret_authority = credential_changed || explicit_binding_intent;
-    if requires_secret_authority
-        && !rbac_state
-            .principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION)
-    {
+    if credential_changed && !has_secrets_write {
         return connection_secret_authority_forbidden(
             &state,
             &parts,
@@ -6009,14 +6019,19 @@ fn connection_admin_body_limit(state: &ConnectionAdminState) -> usize {
 fn parse_connection_write_body(
     body: &Bytes,
     current: &connections::model::ConnectionWrite,
-) -> ResponseResult<(connections::model::ConnectionWrite, bool)> {
+) -> ResponseResult<connections::model::ConnectionWrite> {
     let mut candidate = serde_json::from_slice::<Value>(body)
         .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
-    let explicit_binding_intent = has_explicit_connection_binding_intent(&candidate);
     retain_hidden_connection_bindings(&mut candidate, current)?;
     let candidate = serde_json::from_value::<connections::model::ConnectionWrite>(candidate)
         .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
-    validate_connection_write(candidate).map(|candidate| (candidate, explicit_binding_intent))
+    validate_connection_write(candidate)
+}
+
+fn explicit_connection_binding_intent_from_body(body: &Bytes) -> ResponseResult<bool> {
+    let candidate = serde_json::from_slice::<Value>(body)
+        .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
+    Ok(has_explicit_connection_binding_intent(&candidate))
 }
 
 fn has_explicit_connection_binding_intent(candidate: &Value) -> bool {
@@ -18256,10 +18271,9 @@ mod tests {
             }
         });
 
-        let (candidate, explicit_binding_intent) =
+        let candidate =
             parse_connection_write_body(&Bytes::from(redacted_edit.to_string()), &current)
                 .expect("redacted partial draft should retain its lone certificate binding");
-        assert!(!explicit_binding_intent);
 
         assert_eq!(
             candidate.tls.client_certificate_id.as_deref(),
@@ -18289,12 +18303,11 @@ mod tests {
                 "client_private_key_configured": true
             }
         });
-        let (private_key_candidate, explicit_binding_intent) = parse_connection_write_body(
+        let private_key_candidate = parse_connection_write_body(
             &Bytes::from(private_key_edit.to_string()),
             &private_key_only,
         )
         .expect("redacted partial draft should retain its lone private-key binding");
-        assert!(!explicit_binding_intent);
         assert!(private_key_candidate.tls.client_certificate_id.is_none());
         assert_eq!(
             private_key_candidate.tls.client_private_key_id.as_deref(),
@@ -18508,8 +18521,16 @@ mod tests {
             .expect("credentialed body should parse");
         explicit_wrong_binding["authentication"]["secret_id"] = json!("different-secret-id-canary");
         let explicit_wrong_binding = explicit_wrong_binding.to_string();
+        let mut explicit_null_binding: Value = serde_json::from_str(&explicit_current_binding)
+            .expect("credentialed body should parse");
+        explicit_null_binding["authentication"]["secret_id"] = Value::Null;
+        let explicit_null_binding = explicit_null_binding.to_string();
         let mut explicit_binding_denial_bodies = Vec::new();
-        for explicit_binding in [explicit_current_binding, explicit_wrong_binding] {
+        for explicit_binding in [
+            explicit_current_binding,
+            explicit_wrong_binding,
+            explicit_null_binding,
+        ] {
             let response = router
                 .clone()
                 .oneshot(connection_admin_request(
@@ -18525,10 +18546,9 @@ mod tests {
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
             explicit_binding_denial_bodies.push(body_string(response).await);
         }
-        assert_eq!(
-            explicit_binding_denial_bodies[0], explicit_binding_denial_bodies[1],
-            "matching and non-matching hidden binding IDs must be indistinguishable"
-        );
+        assert!(explicit_binding_denial_bodies
+            .iter()
+            .all(|body| body == &explicit_binding_denial_bodies[0]));
 
         let credentialed_detail = router
             .clone()
@@ -18806,7 +18826,7 @@ mod tests {
                                 == json!(ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION)
                     })
                     .count()
-                    == 5
+                    == 6
         });
         let events = capture.events();
         assert_eq!(
@@ -18838,7 +18858,7 @@ mod tests {
                         == json!(ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION)
             })
             .collect::<Vec<_>>();
-        assert_eq!(secret_authority_denials.len(), 5);
+        assert_eq!(secret_authority_denials.len(), 6);
         assert_eq!(
             secret_authority_denials
                 .iter()
@@ -18851,7 +18871,7 @@ mod tests {
                 .iter()
                 .filter(|event| event.payload["operation"] == json!("replace"))
                 .count(),
-            3
+            4
         );
         assert_eq!(
             secret_authority_denials
