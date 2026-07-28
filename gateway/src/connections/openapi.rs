@@ -773,10 +773,15 @@ impl OpenApiConnectionCatalogService {
             return Err(OpenApiCatalogError::PreconditionFailed);
         }
         let destination = target
-            .client()
+            .preflight_client()
             .checked_destination(target.url())
             .await
             .map_err(egress_error)?;
+        let prepared = self
+            .http
+            .prepare_transport(&target, &destination)
+            .await
+            .map_err(connection_http_error)?;
         let credential = self
             .http
             .resolve_credential(&target)
@@ -794,10 +799,10 @@ impl OpenApiConnectionCatalogService {
                 .inject(&mut headers)
                 .map_err(connection_http_error)?;
         }
-        let response = target
+        let response = prepared
             .client()
             .stream_request_with_body_at_checked_destination(
-                &destination,
+                prepared.destination(),
                 Method::GET,
                 target.url(),
                 headers,
@@ -1196,6 +1201,8 @@ fn connection_http_error(error: ConnectionHttpError) -> OpenApiCatalogError {
         ConnectionHttpError::InvalidTargetPath => OpenApiCatalogError::DiscoveryNotConfigured,
         ConnectionHttpError::CredentialInvalid
         | ConnectionHttpError::CredentialUnavailable
+        | ConnectionHttpError::TlsInvalid
+        | ConnectionHttpError::TlsUnavailable
         | ConnectionHttpError::OAuthTokenUnavailable
         | ConnectionHttpError::OAuthTokenRejected
         | ConnectionHttpError::OAuthTokenInvalidResponse => OpenApiCatalogError::SecretUnavailable,
@@ -1204,7 +1211,6 @@ fn connection_http_error(error: ConnectionHttpError) -> OpenApiCatalogError {
             OpenApiCatalogError::AuthenticationFailed
         }
         ConnectionHttpError::UnsupportedAuthentication
-        | ConnectionHttpError::UnsupportedTls
         | ConnectionHttpError::CredentialHeaderConflict => {
             OpenApiCatalogError::AuthenticationMismatch
         }
@@ -1304,6 +1310,18 @@ mod tests {
         assert_eq!(
             connection_http_error(ConnectionHttpError::OAuthTokenEgressDenied),
             OpenApiCatalogError::EgressDenied
+        );
+    }
+
+    #[test]
+    fn tls_transport_material_failures_are_safe_secret_failures() {
+        assert_eq!(
+            connection_http_error(ConnectionHttpError::TlsInvalid),
+            OpenApiCatalogError::SecretUnavailable
+        );
+        assert_eq!(
+            connection_http_error(ConnectionHttpError::TlsUnavailable),
+            OpenApiCatalogError::SecretUnavailable
         );
     }
 

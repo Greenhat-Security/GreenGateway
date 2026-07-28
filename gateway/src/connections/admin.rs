@@ -43,10 +43,19 @@ impl ConnectionActions {
         record: &StoredConnection,
         dependency_count: usize,
     ) -> Self {
+        let has_test_target = match record.write.kind {
+            ConnectionKind::HttpApi => record.write.test_profile.is_some(),
+            ConnectionKind::McpStreamableHttp => matches!(
+                &record.write.discovery,
+                Some(DiscoveryConfig::ManagedMcp { .. })
+            ),
+        };
         Self {
             can_update: permissions.write,
             can_bind_secret: permissions.write && permissions.secrets_write,
-            can_test: permissions.test && record.write.test_profile.is_some(),
+            // Persisted tests intentionally support disabled managed connections so
+            // operators can validate them before enabling production traffic.
+            can_test: permissions.test && has_test_target,
             can_refresh: permissions.refresh
                 && record.write.enabled
                 && record.write.kind == ConnectionKind::McpStreamableHttp
@@ -481,7 +490,7 @@ mod tests {
 
     #[test]
     fn actions_are_derived_from_live_permissions_and_dependencies() {
-        let record = StoredConnection {
+        let mut record = StoredConnection {
             id: ConnectionId::parse("00000000-0000-0000-0000-000000000001")
                 .expect("ID should parse"),
             write: credentialed_write(),
@@ -507,6 +516,58 @@ mod tests {
         assert!(ordinary_actions.can_test);
         assert!(!ordinary_actions.can_delete);
 
+        record.write.enabled = false;
+        assert!(
+            ConnectionActions::managed(ordinary_writer, &record, 0).can_test,
+            "disabled HTTP connections remain testable when a stored profile exists"
+        );
+        record.write.test_profile = None;
+        assert!(
+            !ConnectionActions::managed(ordinary_writer, &record, 0).can_test,
+            "HTTP connections require a stored test profile"
+        );
+
+        record.write.kind = ConnectionKind::McpStreamableHttp;
+        record.write.discovery = Some(DiscoveryConfig::ManagedMcp {
+            use_connection_authentication: true,
+        });
+        assert!(
+            ConnectionActions::managed(ordinary_writer, &record, 0).can_test,
+            "disabled managed MCP connections do not require an HTTP test profile"
+        );
+        record.write.enabled = true;
+        assert!(
+            ConnectionActions::managed(ordinary_writer, &record, 0).can_test,
+            "enabled managed MCP connections are testable"
+        );
+        record.write.discovery = None;
+        assert!(
+            !ConnectionActions::managed(ordinary_writer, &record, 0).can_test,
+            "MCP connections require managed MCP discovery"
+        );
+        record.write.test_profile = Some(ConnectionTestProfile {
+            method: "HEAD".to_owned(),
+            path: "/ready".to_owned(),
+            expected_statuses: vec![200],
+        });
+        assert!(
+            !ConnectionActions::managed(ordinary_writer, &record, 0).can_test,
+            "an HTTP test profile alone must not make an unmanaged MCP connection testable"
+        );
+        let no_test_permission = ConnectionPermissions {
+            test: false,
+            ..ordinary_writer
+        };
+        record.write.discovery = Some(DiscoveryConfig::ManagedMcp {
+            use_connection_authentication: false,
+        });
+        assert!(
+            !ConnectionActions::managed(no_test_permission, &record, 0).can_test,
+            "the test action requires admin:connections:test"
+        );
+        assert!(!ConnectionActions::read_only().can_test);
+
+        record.write = credentialed_write();
         let secrets_writer = ConnectionPermissions {
             secrets_write: true,
             ..ordinary_writer

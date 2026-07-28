@@ -803,10 +803,24 @@ impl ToolExecutor {
         }
 
         let destination = target
-            .client()
+            .preflight_client()
             .checked_destination(target.url())
             .await
             .map_err(|source| connection_egress_tool_error(tool, &source))?;
+        let prepared = runtime
+            .prepare_transport(&target, &destination)
+            .await
+            .map_err(|error| {
+                if error.is_secret_resolution_failure() {
+                    self.emit_connection_secret_resolution_failed(
+                        context,
+                        tool,
+                        &target,
+                        error.safe_reason(),
+                    );
+                }
+                connection_tool_error(tool, error)
+            })?;
         let credential = runtime.resolve_credential(&target).await.map_err(|error| {
             if error.is_secret_resolution_failure() {
                 self.emit_connection_secret_resolution_failed(
@@ -832,10 +846,10 @@ impl ToolExecutor {
             })?;
         }
 
-        let response = target
+        let response = prepared
             .client()
             .stream_request_with_body_at_checked_destination(
-                &destination,
+                prepared.destination(),
                 request.method,
                 target.url(),
                 request.headers,

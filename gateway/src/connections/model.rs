@@ -639,11 +639,11 @@ fn validate_test_profile(
     let Some(profile) = profile else {
         return;
     };
-    if !matches!(profile.method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+    if !matches!(profile.method.as_str(), "GET" | "HEAD") {
         errors.push(ConnectionValidationError::new(
             "test_profile.method",
             "unsafe_method",
-            "must be GET, HEAD, or OPTIONS",
+            "must be GET or HEAD",
         ));
     }
     match normalize_origin_relative_path("test_profile.path", &profile.path) {
@@ -1190,6 +1190,43 @@ mod tests {
     }
 
     #[test]
+    fn test_profile_accepts_get_and_head_but_rejects_options() {
+        let validator = connection_schema_validator();
+
+        for method in ["GET", "HEAD"] {
+            let mut candidate_json = example();
+            candidate_json["test_profile"]["method"] = json!(method);
+            validator
+                .validate(&candidate_json)
+                .unwrap_or_else(|_| panic!("{method} should match the published schema"));
+
+            let candidate: ConnectionWrite = serde_json::from_value(candidate_json)
+                .unwrap_or_else(|_| panic!("{method} should deserialize"));
+            candidate
+                .validated()
+                .unwrap_or_else(|_| panic!("{method} should pass model validation"));
+        }
+
+        let mut options_json = example();
+        options_json["test_profile"]["method"] = json!("OPTIONS");
+        assert!(
+            validator.validate(&options_json).is_err(),
+            "OPTIONS must not match the published schema"
+        );
+
+        let options: ConnectionWrite =
+            serde_json::from_value(options_json).expect("OPTIONS should deserialize");
+        let errors = options
+            .validated()
+            .expect_err("OPTIONS must fail model validation");
+        assert!(errors.iter().any(|error| {
+            error.field == "test_profile.method"
+                && error.code == "unsafe_method"
+                && error.message == "must be GET or HEAD"
+        }));
+    }
+
+    #[test]
     fn secrets_permission_tracks_credential_use_authority_not_plain_metadata() {
         let mut plain: ConnectionWrite =
             serde_json::from_value(example()).expect("example should deserialize");
@@ -1257,7 +1294,7 @@ mod tests {
             .test_profile
             .as_mut()
             .expect("example should include a test profile")
-            .method = "OPTIONS".to_owned();
+            .method = "GET".to_owned();
         assert!(credentialed.requires_secrets_write_to_replace(&credentialed_test_method));
 
         let mut credentialed_test_path = credentialed.clone();

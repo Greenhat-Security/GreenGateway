@@ -48,9 +48,11 @@ use crate::{
             ResolvedConnectionCredential,
         },
         model::MAX_CATALOG_ENTRIES,
+        status::ConnectionStatusReason,
         store::{validate_mcp_resource_metadata, StoredMcpResource, StoredMcpResourceTemplate},
+        test::{ConnectionTestReason, ConnectionTestStageName, CONNECTION_TEST_DEADLINE},
     },
-    egress::{CheckedEgressDestination, EgressClient, EgressError},
+    egress::{rmcp_http, CheckedEgressDestination, EgressClient, EgressError},
     tools::definitions::ToolDefinition,
 };
 
@@ -239,6 +241,51 @@ impl fmt::Display for McpUpstreamCallError {
 
 impl Error for McpUpstreamCallError {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionProtocolProbeError {
+    stage: ConnectionTestStageName,
+    reason: ConnectionTestReason,
+    status_reason: ConnectionStatusReason,
+}
+
+impl ConnectionProtocolProbeError {
+    pub const fn stage(self) -> ConnectionTestStageName {
+        self.stage
+    }
+
+    pub const fn safe_reason(self) -> ConnectionTestReason {
+        self.reason
+    }
+
+    pub const fn status_reason(self) -> ConnectionStatusReason {
+        self.status_reason
+    }
+
+    const fn new(
+        stage: ConnectionTestStageName,
+        reason: ConnectionTestReason,
+        status_reason: ConnectionStatusReason,
+    ) -> Self {
+        Self {
+            stage,
+            reason,
+            status_reason,
+        }
+    }
+}
+
+impl fmt::Display for ConnectionProtocolProbeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "managed MCP protocol probe failed at {:?}: {:?}",
+            self.stage, self.reason
+        )
+    }
+}
+
+impl Error for ConnectionProtocolProbeError {}
+
 #[derive(Clone)]
 pub struct McpUpstreamRuntimeConfig {
     pub timeout: Duration,
@@ -417,11 +464,7 @@ pub async fn discover_connection_catalog(
         });
     }
     let runtime_config = McpUpstreamRuntimeConfig::from_connection_target(&target);
-    let destination = target
-        .client()
-        .checked_destination(target.url())
-        .await
-        .map_err(|_| McpUpstreamCallError::EgressRejected)?;
+    let client = managed_mcp_http_client(runtime, &target).await?;
     let credential = runtime
         .resolve_credential(&target)
         .await
@@ -431,7 +474,7 @@ pub async fn discover_connection_catalog(
     let mut service = connect_connection(
         &target,
         &runtime_config,
-        &destination,
+        client,
         credential,
         Some(response_budget.clone()),
     )
@@ -459,6 +502,105 @@ pub async fn discover_connection_catalog(
         });
     }
     Ok(catalog)
+}
+
+/// Verifies a managed MCP endpoint without publishing discovery metadata.
+///
+/// The probe initializes one RMCP session, requests at most one advertised
+/// metadata page, and closes the session. Tools take precedence over resources;
+/// pagination cursors are deliberately ignored. The probe never publishes
+/// metadata, calls a tool, or reads a resource.
+pub async fn probe_connection_protocol(
+    runtime: &ConnectionHttpRuntime,
+    connection_id: &str,
+    expected_connection_etag: &str,
+) -> Result<(), ConnectionProtocolProbeError> {
+    let target = runtime.mcp_test_target(connection_id).map_err(|error| {
+        protocol_probe_connection_error(error, ConnectionTestStageName::ProtocolValid)
+    })?;
+    if target.connection_etag() != expected_connection_etag {
+        return Err(ConnectionProtocolProbeError::new(
+            ConnectionTestStageName::ProtocolValid,
+            ConnectionTestReason::ConnectionChanged,
+            ConnectionStatusReason::RequestFailed,
+        ));
+    }
+
+    let runtime_config = McpUpstreamRuntimeConfig::from_connection_target(&target);
+    let started = tokio::time::Instant::now();
+    let hard_deadline = started + CONNECTION_TEST_DEADLINE;
+    let operation_timeout = runtime_config
+        .timeout
+        .min(CONNECTION_TEST_DEADLINE.saturating_sub(Duration::from_millis(500)));
+    let operation_deadline = started + operation_timeout;
+    let checked = tokio::time::timeout_at(
+        operation_deadline,
+        target.preflight_client().checked_destination(target.url()),
+    )
+    .await
+    .map_err(|_| protocol_probe_timeout(ConnectionTestStageName::EgressPolicy))?
+    .map_err(|error| protocol_probe_egress_error(&error))?;
+    let prepared = tokio::time::timeout_at(
+        operation_deadline,
+        runtime.prepare_transport(&target, &checked),
+    )
+    .await
+    .map_err(|_| protocol_probe_timeout(ConnectionTestStageName::SecretAvailable))?
+    .map_err(|error| {
+        protocol_probe_connection_error(error, ConnectionTestStageName::SecretAvailable)
+    })?;
+    let client = prepared
+        .client()
+        .mcp_reqwest_client_at_checked_destination(prepared.destination(), target.url())
+        .map_err(|error| protocol_probe_egress_error(&error))?;
+    let credential =
+        tokio::time::timeout_at(operation_deadline, runtime.resolve_credential(&target))
+            .await
+            .map_err(|_| protocol_probe_timeout(ConnectionTestStageName::SecretAvailable))?
+            .map_err(|error| {
+                protocol_probe_connection_error(error, ConnectionTestStageName::SecretAvailable)
+            })?
+            .map(Arc::new);
+    let response_budget = DiscoveryResponseByteBudget::new(MAX_DISCOVERY_RESPONSE_BYTES);
+    let mut service = tokio::time::timeout_at(
+        operation_deadline,
+        connect_connection(
+            &target,
+            &runtime_config,
+            client,
+            credential,
+            Some(response_budget.clone()),
+        ),
+    )
+    .await
+    .map_err(|_| protocol_probe_timeout(ConnectionTestStageName::Connected))?
+    .map_err(|error| protocol_probe_mcp_error(error, ConnectionTestStageName::Connected))?;
+
+    let page_result = tokio::time::timeout_at(
+        operation_deadline,
+        probe_one_advertised_metadata_page(&mut service),
+    )
+    .await
+    .map_err(|_| protocol_probe_timeout(ConnectionTestStageName::ProtocolValid));
+    let close_timeout = hard_deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .min(Duration::from_millis(250));
+    let close_result = service.close_with_timeout(close_timeout).await;
+    drop(service);
+    response_budget
+        .seal()
+        .map_err(|error| protocol_probe_mcp_error(error, ConnectionTestStageName::ProtocolValid))?;
+
+    page_result?
+        .map_err(|error| protocol_probe_mcp_error(error, ConnectionTestStageName::ProtocolValid))?;
+    if !discovery_shutdown_completed_cleanly(&close_result) {
+        return Err(ConnectionProtocolProbeError::new(
+            ConnectionTestStageName::ProtocolValid,
+            ConnectionTestReason::ProtocolError,
+            ConnectionStatusReason::InvalidResponse,
+        ));
+    }
+    Ok(())
 }
 
 fn discovery_shutdown_completed_cleanly<E>(close_result: &Result<Option<QuitReason>, E>) -> bool {
@@ -490,18 +632,14 @@ pub async fn call_connection_tool(
     };
     let request = CallToolRequestParams::new(remote_tool_name.to_owned()).with_arguments(arguments);
     enforce_mcp_call_request_size_before_egress(&request, runtime_config.max_request_body_bytes)?;
-    let destination = target
-        .client()
-        .checked_destination(target.url())
-        .await
-        .map_err(|_| McpUpstreamCallError::EgressRejected)?;
+    let client = managed_mcp_http_client(runtime, &target).await?;
     let credential = runtime
         .resolve_credential(&target)
         .await
         .map_err(connection_mcp_error)?
         .map(Arc::new);
     let mut service =
-        connect_connection(&target, &runtime_config, &destination, credential, None).await?;
+        connect_connection(&target, &runtime_config, client, credential, None).await?;
     let result = service
         .call_tool(request)
         .await
@@ -514,6 +652,284 @@ fn connection_mcp_error(error: ConnectionHttpError) -> McpUpstreamCallError {
     McpUpstreamCallError::Connection {
         reason: error.safe_reason(),
     }
+}
+
+async fn managed_mcp_http_client(
+    runtime: &ConnectionHttpRuntime,
+    target: &ConnectionHttpTarget,
+) -> Result<rmcp_http::Client, McpUpstreamCallError> {
+    let checked = target
+        .preflight_client()
+        .checked_destination(target.url())
+        .await
+        .map_err(|_| McpUpstreamCallError::EgressRejected)?;
+    let prepared = runtime
+        .prepare_transport(target, &checked)
+        .await
+        .map_err(connection_mcp_error)?;
+    prepared
+        .client()
+        .mcp_reqwest_client_at_checked_destination(prepared.destination(), target.url())
+        .map_err(|_| McpUpstreamCallError::EgressRejected)
+}
+
+fn protocol_probe_timeout(stage: ConnectionTestStageName) -> ConnectionProtocolProbeError {
+    ConnectionProtocolProbeError::new(
+        stage,
+        ConnectionTestReason::DeadlineExceeded,
+        ConnectionStatusReason::RequestFailed,
+    )
+}
+
+fn protocol_probe_egress_error(error: &EgressError) -> ConnectionProtocolProbeError {
+    let reason = match error.safe_category() {
+        "host_not_allowed" => ConnectionTestReason::HostNotAllowed,
+        "port_not_allowed" => ConnectionTestReason::PortNotAllowed,
+        "non_global_ip_blocked" => ConnectionTestReason::NonGlobalIpBlocked,
+        "invalid_policy" => ConnectionTestReason::InvalidPolicy,
+        "dns_resolution_failed" => ConnectionTestReason::DnsResolutionFailed,
+        "invalid_url" => ConnectionTestReason::InvalidUrl,
+        "scheme_not_allowed" => ConnectionTestReason::SchemeNotAllowed,
+        "request_body_too_large" => ConnectionTestReason::RequestBodyTooLarge,
+        "request_body_read_failed" => ConnectionTestReason::RequestBodyReadFailed,
+        "unexpected_status" => ConnectionTestReason::UnexpectedStatus,
+        "response_too_large" => ConnectionTestReason::ResponseTooLarge,
+        "response_idle_timeout" => ConnectionTestReason::ResponseIdleTimeout,
+        "invalid_tls_ca_bundle" => ConnectionTestReason::InvalidTlsCaBundle,
+        "invalid_tls_client_identity" => ConnectionTestReason::InvalidTlsClientIdentity,
+        "http_timeout" => ConnectionTestReason::HttpTimeout,
+        "http_connect" => ConnectionTestReason::HttpConnect,
+        "http_request" => ConnectionTestReason::HttpRequest,
+        "http_body" => ConnectionTestReason::HttpBody,
+        "http_decode" => ConnectionTestReason::HttpDecode,
+        "http_status" => ConnectionTestReason::HttpStatus,
+        "http_other" => ConnectionTestReason::HttpOther,
+        _ => ConnectionTestReason::InternalError,
+    };
+    ConnectionProtocolProbeError::new(
+        ConnectionTestStageName::EgressPolicy,
+        reason,
+        ConnectionStatusReason::EgressDenied,
+    )
+}
+
+fn protocol_probe_connection_error(
+    error: ConnectionHttpError,
+    default_stage: ConnectionTestStageName,
+) -> ConnectionProtocolProbeError {
+    let (stage, reason, status_reason) = match error {
+        ConnectionHttpError::InvalidConnectionId
+        | ConnectionHttpError::ConnectionNotFound
+        | ConnectionHttpError::ConnectionDisabled => (
+            default_stage,
+            ConnectionTestReason::ConnectionChanged,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        ConnectionHttpError::WrongConnectionKind => (
+            default_stage,
+            ConnectionTestReason::ConnectionKindMismatch,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        ConnectionHttpError::UnsupportedAuthentication => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::AuthenticationNotSupported,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::TlsInvalid => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::TlsInvalid,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::TlsUnavailable => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::TlsUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::InvalidTargetPath => (
+            default_stage,
+            ConnectionTestReason::TestProfileNotConfigured,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        ConnectionHttpError::CredentialHeaderConflict | ConnectionHttpError::CredentialInvalid => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::CredentialInvalid,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::CredentialUnavailable => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::CredentialUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::OAuthTokenEgressDenied => (
+            ConnectionTestStageName::EgressPolicy,
+            ConnectionTestReason::OauthTokenEgressDenied,
+            ConnectionStatusReason::EgressDenied,
+        ),
+        ConnectionHttpError::OAuthTokenUnavailable => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::OAuthTokenRejected => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenRejected,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::OAuthTokenInvalidResponse => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenInvalidResponse,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::UpstreamAuthenticationRejected => (
+            ConnectionTestStageName::Authenticated,
+            ConnectionTestReason::AuthenticationFailed,
+            ConnectionStatusReason::InvalidResponse,
+        ),
+        ConnectionHttpError::TransportUnavailable => (
+            default_stage,
+            ConnectionTestReason::TransportUnavailable,
+            ConnectionStatusReason::RequestFailed,
+        ),
+    };
+    ConnectionProtocolProbeError::new(stage, reason, status_reason)
+}
+
+fn protocol_probe_mcp_error(
+    error: McpUpstreamCallError,
+    default_stage: ConnectionTestStageName,
+) -> ConnectionProtocolProbeError {
+    match error {
+        McpUpstreamCallError::EgressRejected => ConnectionProtocolProbeError::new(
+            ConnectionTestStageName::EgressPolicy,
+            ConnectionTestReason::InvalidPolicy,
+            ConnectionStatusReason::EgressDenied,
+        ),
+        McpUpstreamCallError::ClientBuild => ConnectionProtocolProbeError::new(
+            ConnectionTestStageName::Connected,
+            ConnectionTestReason::TransportUnavailable,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        McpUpstreamCallError::Connect => ConnectionProtocolProbeError::new(
+            ConnectionTestStageName::Connected,
+            ConnectionTestReason::HttpConnect,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        McpUpstreamCallError::AuthenticationRejected => ConnectionProtocolProbeError::new(
+            ConnectionTestStageName::Authenticated,
+            ConnectionTestReason::AuthenticationFailed,
+            ConnectionStatusReason::InvalidResponse,
+        ),
+        McpUpstreamCallError::Connection { reason } => {
+            protocol_probe_connection_reason(reason, default_stage)
+        }
+        McpUpstreamCallError::RequestBodyTooLarge { .. } => ConnectionProtocolProbeError::new(
+            default_stage,
+            ConnectionTestReason::RequestBodyTooLarge,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        McpUpstreamCallError::ResponseTooLarge { .. }
+        | McpUpstreamCallError::DiscoveryResponseLimitExceeded { .. } => {
+            ConnectionProtocolProbeError::new(
+                default_stage,
+                ConnectionTestReason::ResponseTooLarge,
+                ConnectionStatusReason::InvalidResponse,
+            )
+        }
+        McpUpstreamCallError::Call
+        | McpUpstreamCallError::DiscoveryPageLimitExceeded { .. }
+        | McpUpstreamCallError::DiscoveryToolLimitExceeded { .. }
+        | McpUpstreamCallError::DiscoveryResourceLimitExceeded { .. }
+        | McpUpstreamCallError::DiscoveryResourceTemplateLimitExceeded { .. }
+        | McpUpstreamCallError::DiscoveryCapabilityLimitExceeded { .. }
+        | McpUpstreamCallError::InvalidDiscoveryMetadata => ConnectionProtocolProbeError::new(
+            default_stage,
+            ConnectionTestReason::ProtocolError,
+            ConnectionStatusReason::InvalidResponse,
+        ),
+    }
+}
+
+fn protocol_probe_connection_reason(
+    reason: &'static str,
+    default_stage: ConnectionTestStageName,
+) -> ConnectionProtocolProbeError {
+    let error = match reason {
+        "connection_changed"
+        | "catalog_stale"
+        | "connection_not_found"
+        | "invalid_connection_id"
+        | "connection_disabled" => (
+            default_stage,
+            ConnectionTestReason::ConnectionChanged,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        "connection_kind_mismatch" => (
+            default_stage,
+            ConnectionTestReason::ConnectionKindMismatch,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        "authentication_not_supported" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::AuthenticationNotSupported,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "tls_invalid" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::TlsInvalid,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "tls_unavailable" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::TlsUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "credential_invalid" | "credential_header_conflict" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::CredentialInvalid,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "credential_unavailable" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::CredentialUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "oauth_token_egress_denied" => (
+            ConnectionTestStageName::EgressPolicy,
+            ConnectionTestReason::OauthTokenEgressDenied,
+            ConnectionStatusReason::EgressDenied,
+        ),
+        "oauth_token_unavailable" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "oauth_token_rejected" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenRejected,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "oauth_token_invalid_response" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenInvalidResponse,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "auth_failed" => (
+            ConnectionTestStageName::Authenticated,
+            ConnectionTestReason::AuthenticationFailed,
+            ConnectionStatusReason::InvalidResponse,
+        ),
+        "transport_unavailable" => (
+            default_stage,
+            ConnectionTestReason::TransportUnavailable,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        _ => (
+            default_stage,
+            ConnectionTestReason::InternalError,
+            ConnectionStatusReason::RequestFailed,
+        ),
+    };
+    ConnectionProtocolProbeError::new(error.0, error.1, error.2)
 }
 
 fn enforce_mcp_call_request_size_before_egress(
@@ -575,6 +991,42 @@ async fn list_tools_with_limits(
 ) -> Result<Vec<Tool>, McpUpstreamCallError> {
     let mut budget = DiscoveryPageBudget::new();
     list_tools_with_limits_and_budget(service, &mut budget).await
+}
+
+async fn probe_one_advertised_metadata_page(
+    service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> Result<(), McpUpstreamCallError> {
+    let (supports_tools, supports_resources) = service
+        .peer_info()
+        .map(|info| {
+            (
+                info.capabilities.tools.is_some(),
+                info.capabilities.resources.is_some(),
+            )
+        })
+        .unwrap_or((false, false));
+    if supports_tools {
+        let result = service
+            .list_tools(Some(PaginatedRequestParams::default()))
+            .await
+            .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+        if result.tools.len() > MAX_DISCOVERY_TOOLS_PER_UPSTREAM {
+            return Err(McpUpstreamCallError::DiscoveryToolLimitExceeded {
+                max: MAX_DISCOVERY_TOOLS_PER_UPSTREAM,
+            });
+        }
+    } else if supports_resources {
+        let result = service
+            .list_resources(Some(PaginatedRequestParams::default()))
+            .await
+            .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+        if result.resources.len() > MAX_DISCOVERY_RESOURCES_PER_UPSTREAM {
+            return Err(McpUpstreamCallError::DiscoveryResourceLimitExceeded {
+                max: MAX_DISCOVERY_RESOURCES_PER_UPSTREAM,
+            });
+        }
+    }
+    Ok(())
 }
 
 struct RawMcpDiscoveredCatalog {
@@ -792,18 +1244,15 @@ async fn connect(
 async fn connect_connection(
     target: &ConnectionHttpTarget,
     runtime_config: &McpUpstreamRuntimeConfig,
-    destination: &CheckedEgressDestination,
+    client: rmcp_http::Client,
     credential: Option<Arc<ResolvedConnectionCredential>>,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
-    connect_endpoint(
+    connect_endpoint_with_client(
         target.connection_id().as_str(),
         target.url(),
-        runtime_config.timeout,
-        runtime_config.response_idle_timeout,
-        runtime_config.connect_timeout,
         runtime_config,
-        destination,
+        client,
         Some(ManagedMcpAuthentication {
             credential,
             credential_header_name: target.credential_header_name().cloned(),
@@ -831,11 +1280,34 @@ async fn connect_endpoint(
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
     let client = mcp_http_client(timeout, response_idle_timeout, connect_timeout, destination)?;
+    connect_endpoint_with_client(
+        server_name,
+        url,
+        runtime_config,
+        client,
+        managed_authentication,
+        discovery_response_budget,
+    )
+    .await
+}
+
+async fn connect_endpoint_with_client(
+    server_name: &str,
+    url: &str,
+    runtime_config: &McpUpstreamRuntimeConfig,
+    client: rmcp_http::Client,
+    managed_authentication: Option<ManagedMcpAuthentication>,
+    discovery_response_budget: Option<DiscoveryResponseByteBudget>,
+) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
     let mut client = LimitedMcpHttpClient::new(
         client,
         runtime_config.max_request_body_bytes,
         runtime_config.max_response_bytes,
     );
+    if managed_authentication.is_some() {
+        client = client
+            .with_transport_timeouts(runtime_config.timeout, runtime_config.response_idle_timeout);
+    }
     if let Some(discovery_response_budget) = discovery_response_budget {
         client = client.with_discovery_response_budget(discovery_response_budget);
     }
@@ -867,13 +1339,13 @@ fn mcp_http_client(
     response_idle_timeout: Duration,
     connect_timeout: Duration,
     destination: &CheckedEgressDestination,
-) -> Result<rmcp_reqwest::Client, McpUpstreamCallError> {
-    rmcp_reqwest::Client::builder()
+) -> Result<rmcp_http::Client, McpUpstreamCallError> {
+    rmcp_http::Client::builder()
         .no_proxy()
         .timeout(timeout)
         .read_timeout(response_idle_timeout)
         .connect_timeout(connect_timeout)
-        .redirect(rmcp_reqwest::redirect::Policy::none())
+        .redirect(rmcp_http::redirect::Policy::none())
         .resolve(&destination.host, destination.pinned_addr)
         .build()
         .map_err(|_| McpUpstreamCallError::ClientBuild)
@@ -955,10 +1427,12 @@ impl DiscoveryResponseByteBudget {
 
 #[derive(Clone)]
 struct LimitedMcpHttpClient {
-    inner: rmcp_reqwest::Client,
+    inner: rmcp_http::Client,
     max_request_body_bytes: usize,
     max_response_bytes: usize,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
+    request_timeout: Option<Duration>,
+    response_idle_timeout: Option<Duration>,
     managed_connection: bool,
     connection_credential: Option<Arc<ResolvedConnectionCredential>>,
     credential_header_name: Option<HeaderName>,
@@ -966,7 +1440,7 @@ struct LimitedMcpHttpClient {
 
 impl LimitedMcpHttpClient {
     fn new(
-        inner: rmcp_reqwest::Client,
+        inner: rmcp_http::Client,
         max_request_body_bytes: usize,
         max_response_bytes: usize,
     ) -> Self {
@@ -975,6 +1449,8 @@ impl LimitedMcpHttpClient {
             max_request_body_bytes,
             max_response_bytes,
             discovery_response_budget: None,
+            request_timeout: None,
+            response_idle_timeout: None,
             managed_connection: false,
             connection_credential: None,
             credential_header_name: None,
@@ -986,6 +1462,16 @@ impl LimitedMcpHttpClient {
         discovery_response_budget: DiscoveryResponseByteBudget,
     ) -> Self {
         self.discovery_response_budget = Some(discovery_response_budget);
+        self
+    }
+
+    fn with_transport_timeouts(
+        mut self,
+        request_timeout: Duration,
+        response_idle_timeout: Duration,
+    ) -> Self {
+        self.request_timeout = Some(request_timeout);
+        self.response_idle_timeout = Some(response_idle_timeout);
         self
     }
 
@@ -1002,8 +1488,8 @@ impl LimitedMcpHttpClient {
 
     fn apply_connection_credential(
         &self,
-        builder: rmcp_reqwest::RequestBuilder,
-    ) -> Result<rmcp_reqwest::RequestBuilder, StreamableHttpError<LimitedMcpHttpError>> {
+        builder: rmcp_http::RequestBuilder,
+    ) -> Result<rmcp_http::RequestBuilder, StreamableHttpError<LimitedMcpHttpError>> {
         let Some(credential) = self.connection_credential.as_ref() else {
             return Ok(builder);
         };
@@ -1016,8 +1502,8 @@ impl LimitedMcpHttpClient {
 
     async fn reject_connection_authentication(
         &self,
-        response: rmcp_reqwest::Response,
-    ) -> Result<rmcp_reqwest::Response, StreamableHttpError<LimitedMcpHttpError>> {
+        response: rmcp_http::Response,
+    ) -> Result<rmcp_http::Response, StreamableHttpError<LimitedMcpHttpError>> {
         if self.managed_connection
             && matches!(
                 response.status(),
@@ -1038,6 +1524,26 @@ impl LimitedMcpHttpClient {
             ));
         }
         Ok(response)
+    }
+
+    async fn send_request(
+        &self,
+        request: rmcp_http::RequestBuilder,
+    ) -> Result<
+        (rmcp_http::Response, Option<tokio::time::Instant>),
+        StreamableHttpError<LimitedMcpHttpError>,
+    > {
+        let deadline = self
+            .request_timeout
+            .map(|timeout| tokio::time::Instant::now() + timeout);
+        let response = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, request.send())
+                .await
+                .map_err(|_| mcp_timeout_error())?
+                .map_err(mcp_http_error)?,
+            None => request.send().await.map_err(mcp_http_error)?,
+        };
+        Ok((response, deadline))
     }
 }
 
@@ -1096,8 +1602,8 @@ impl Error for LimitedMcpHttpError {
     }
 }
 
-impl From<rmcp_reqwest::Error> for LimitedMcpHttpError {
-    fn from(error: rmcp_reqwest::Error) -> Self {
+impl From<rmcp_http::Error> for LimitedMcpHttpError {
+    fn from(error: rmcp_http::Error) -> Self {
         Self::Http(mcp_http_error_category(&error))
     }
 }
@@ -1139,7 +1645,7 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
             self.managed_connection,
         )?;
         request_builder = self.apply_connection_credential(request_builder)?;
-        let response = request_builder.send().await.map_err(mcp_http_error)?;
+        let (response, deadline) = self.send_request(request_builder).await?;
         let response = self.reject_connection_authentication(response).await?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
@@ -1152,6 +1658,8 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
             response,
             self.max_response_bytes,
             self.discovery_response_budget.clone(),
+            deadline,
+            self.response_idle_timeout,
         ))
         .boxed();
         Ok(event_stream)
@@ -1178,7 +1686,7 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
             self.managed_connection,
         )?;
         request_builder = self.apply_connection_credential(request_builder)?;
-        let response = request_builder.send().await.map_err(mcp_http_error)?;
+        let (response, _deadline) = self.send_request(request_builder).await?;
         let response = self.reject_connection_authentication(response).await?;
 
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
@@ -1226,7 +1734,7 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
             request = request.header(CONTENT_TYPE, JSON_MIME);
         }
         request = self.apply_connection_credential(request)?;
-        let response = request.body(body).send().await.map_err(mcp_http_error)?;
+        let (response, deadline) = self.send_request(request.body(body)).await?;
         let response = self.reject_connection_authentication(response).await?;
         if response.status() == StatusCode::UNAUTHORIZED
             && response.headers().contains_key(WWW_AUTHENTICATE)
@@ -1279,6 +1787,8 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
                 response,
                 self.max_response_bytes,
                 self.discovery_response_budget.clone(),
+                deadline,
+                self.response_idle_timeout,
             )
             .await
             {
@@ -1298,6 +1808,8 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
                     response,
                     self.max_response_bytes,
                     self.discovery_response_budget.clone(),
+                    deadline,
+                    self.response_idle_timeout,
                 ))
                 .boxed();
                 Ok(StreamableHttpPostResponse::Sse(event_stream, session_id))
@@ -1307,6 +1819,8 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
                     response,
                     self.max_response_bytes,
                     self.discovery_response_budget.clone(),
+                    deadline,
+                    self.response_idle_timeout,
                 )
                 .await
                 {
@@ -1334,28 +1848,84 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
 type LimitedMcpByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, LimitedMcpHttpError>> + Send>>;
 
 fn limited_mcp_response_stream(
-    response: rmcp_reqwest::Response,
+    response: rmcp_http::Response,
     max_response_bytes: usize,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
+    deadline: Option<tokio::time::Instant>,
+    response_idle_timeout: Option<Duration>,
 ) -> LimitedMcpByteStream {
     let body = Box::pin(response.bytes_stream());
-    limited_mcp_body_stream(body, max_response_bytes, discovery_response_budget)
+    limited_mcp_body_stream_with_timeouts(
+        body,
+        max_response_bytes,
+        discovery_response_budget,
+        deadline,
+        response_idle_timeout,
+    )
 }
 
+#[cfg(test)]
 fn limited_mcp_body_stream(
-    body: Pin<Box<dyn Stream<Item = Result<Bytes, rmcp_reqwest::Error>> + Send>>,
+    body: Pin<Box<dyn Stream<Item = Result<Bytes, rmcp_http::Error>> + Send>>,
     max_response_bytes: usize,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
 ) -> LimitedMcpByteStream {
+    limited_mcp_body_stream_with_timeouts(
+        body,
+        max_response_bytes,
+        discovery_response_budget,
+        None,
+        None,
+    )
+}
+
+fn limited_mcp_body_stream_with_timeouts(
+    body: Pin<Box<dyn Stream<Item = Result<Bytes, rmcp_http::Error>> + Send>>,
+    max_response_bytes: usize,
+    discovery_response_budget: Option<DiscoveryResponseByteBudget>,
+    deadline: Option<tokio::time::Instant>,
+    response_idle_timeout: Option<Duration>,
+) -> LimitedMcpByteStream {
     Box::pin(stream::unfold(
-        (body, 0usize, false, discovery_response_budget),
+        (
+            body,
+            0usize,
+            false,
+            discovery_response_budget,
+            deadline,
+            response_idle_timeout,
+        ),
         move |state| async move {
-            let (mut body, mut streamed_bytes, done, discovery_response_budget) = state;
+            let (
+                mut body,
+                mut streamed_bytes,
+                done,
+                discovery_response_budget,
+                deadline,
+                response_idle_timeout,
+            ) = state;
             if done {
                 return None;
             }
 
-            match body.next().await {
+            let next = match next_mcp_body_chunk(&mut body, deadline, response_idle_timeout).await {
+                Ok(next) => next,
+                Err(error) => {
+                    return Some((
+                        Err(error),
+                        (
+                            body,
+                            streamed_bytes,
+                            true,
+                            discovery_response_budget,
+                            deadline,
+                            response_idle_timeout,
+                        ),
+                    ));
+                }
+            };
+
+            match next {
                 Some(Ok(chunk)) => {
                     if streamed_bytes.saturating_add(chunk.len()) > max_response_bytes {
                         tracing::warn!(
@@ -1366,7 +1936,14 @@ fn limited_mcp_body_stream(
                             Err(LimitedMcpHttpError::ResponseTooLarge {
                                 max: max_response_bytes,
                             }),
-                            (body, streamed_bytes, true, discovery_response_budget),
+                            (
+                                body,
+                                streamed_bytes,
+                                true,
+                                discovery_response_budget,
+                                deadline,
+                                response_idle_timeout,
+                            ),
                         ));
                     }
 
@@ -1378,19 +1955,40 @@ fn limited_mcp_body_stream(
                             );
                             return Some((
                                 Err(error),
-                                (body, streamed_bytes, true, discovery_response_budget),
+                                (
+                                    body,
+                                    streamed_bytes,
+                                    true,
+                                    discovery_response_budget,
+                                    deadline,
+                                    response_idle_timeout,
+                                ),
                             ));
                         }
                     }
                     streamed_bytes += chunk.len();
                     Some((
                         Ok(chunk),
-                        (body, streamed_bytes, false, discovery_response_budget),
+                        (
+                            body,
+                            streamed_bytes,
+                            false,
+                            discovery_response_budget,
+                            deadline,
+                            response_idle_timeout,
+                        ),
                     ))
                 }
                 Some(Err(error)) => Some((
                     Err(LimitedMcpHttpError::from(error)),
-                    (body, streamed_bytes, true, discovery_response_budget),
+                    (
+                        body,
+                        streamed_bytes,
+                        true,
+                        discovery_response_budget,
+                        deadline,
+                        response_idle_timeout,
+                    ),
                 )),
                 None => None,
             }
@@ -1398,14 +1996,41 @@ fn limited_mcp_body_stream(
     ))
 }
 
+async fn next_mcp_body_chunk(
+    body: &mut Pin<Box<dyn Stream<Item = Result<Bytes, rmcp_http::Error>> + Send>>,
+    deadline: Option<tokio::time::Instant>,
+    response_idle_timeout: Option<Duration>,
+) -> Result<Option<Result<Bytes, rmcp_http::Error>>, LimitedMcpHttpError> {
+    let idle_deadline = response_idle_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+    let wait_deadline = match (deadline, idle_deadline) {
+        (Some(deadline), Some(idle_deadline)) => Some(deadline.min(idle_deadline)),
+        (Some(deadline), None) => Some(deadline),
+        (None, Some(idle_deadline)) => Some(idle_deadline),
+        (None, None) => None,
+    };
+    match wait_deadline {
+        Some(wait_deadline) => tokio::time::timeout_at(wait_deadline, body.next())
+            .await
+            .map_err(|_| LimitedMcpHttpError::Http("http_timeout")),
+        None => Ok(body.next().await),
+    }
+}
+
 async fn read_limited_mcp_response_body(
-    response: rmcp_reqwest::Response,
+    response: rmcp_http::Response,
     max_response_bytes: usize,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
+    deadline: Option<tokio::time::Instant>,
+    response_idle_timeout: Option<Duration>,
 ) -> Result<Bytes, StreamableHttpError<LimitedMcpHttpError>> {
     enforce_mcp_response_content_length(&response, max_response_bytes)?;
-    let mut stream =
-        limited_mcp_response_stream(response, max_response_bytes, discovery_response_budget);
+    let mut stream = limited_mcp_response_stream(
+        response,
+        max_response_bytes,
+        discovery_response_budget,
+        deadline,
+        response_idle_timeout,
+    );
     let mut body = Vec::new();
 
     while let Some(chunk) = stream.next().await {
@@ -1417,13 +2042,20 @@ async fn read_limited_mcp_response_body(
 }
 
 async fn read_limited_mcp_response_json<T: serde::de::DeserializeOwned>(
-    response: rmcp_reqwest::Response,
+    response: rmcp_http::Response,
     max_response_bytes: usize,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
+    deadline: Option<tokio::time::Instant>,
+    response_idle_timeout: Option<Duration>,
 ) -> Result<T, StreamableHttpError<LimitedMcpHttpError>> {
-    let body =
-        read_limited_mcp_response_body(response, max_response_bytes, discovery_response_budget)
-            .await?;
+    let body = read_limited_mcp_response_body(
+        response,
+        max_response_bytes,
+        discovery_response_budget,
+        deadline,
+        response_idle_timeout,
+    )
+    .await?;
     serde_json::from_slice(&body).map_err(StreamableHttpError::Deserialize)
 }
 
@@ -1456,7 +2088,7 @@ fn enforce_mcp_request_body_size(
 }
 
 fn enforce_mcp_response_content_length(
-    response: &rmcp_reqwest::Response,
+    response: &rmcp_http::Response,
     max_response_bytes: usize,
 ) -> Result<(), StreamableHttpError<LimitedMcpHttpError>> {
     let max_response_bytes_u64 = u64::try_from(max_response_bytes).unwrap_or(u64::MAX);
@@ -1479,7 +2111,7 @@ fn enforce_mcp_response_content_length(
 }
 
 fn validate_mcp_response_content_type(
-    response: &rmcp_reqwest::Response,
+    response: &rmcp_http::Response,
 ) -> Result<(), StreamableHttpError<LimitedMcpHttpError>> {
     match response.headers().get(CONTENT_TYPE) {
         Some(content_type) => {
@@ -1498,11 +2130,11 @@ fn validate_mcp_response_content_type(
 }
 
 fn apply_mcp_custom_headers(
-    mut builder: rmcp_reqwest::RequestBuilder,
+    mut builder: rmcp_http::RequestBuilder,
     custom_headers: HashMap<HeaderName, HeaderValue>,
     credential_header_name: Option<&HeaderName>,
     managed_connection: bool,
-) -> Result<rmcp_reqwest::RequestBuilder, StreamableHttpError<LimitedMcpHttpError>> {
+) -> Result<rmcp_http::RequestBuilder, StreamableHttpError<LimitedMcpHttpError>> {
     for (name, value) in custom_headers {
         validate_mcp_custom_header(&name, credential_header_name, managed_connection)
             .map_err(StreamableHttpError::ReservedHeaderConflict)?;
@@ -1547,11 +2179,15 @@ fn redacted_mcp_content_type_error(
     )
 }
 
-fn mcp_http_error(error: rmcp_reqwest::Error) -> StreamableHttpError<LimitedMcpHttpError> {
+fn mcp_http_error(error: rmcp_http::Error) -> StreamableHttpError<LimitedMcpHttpError> {
     StreamableHttpError::Client(LimitedMcpHttpError::from(error))
 }
 
-fn mcp_http_error_category(error: &rmcp_reqwest::Error) -> &'static str {
+fn mcp_timeout_error() -> StreamableHttpError<LimitedMcpHttpError> {
+    StreamableHttpError::Client(LimitedMcpHttpError::Http("http_timeout"))
+}
+
+fn mcp_http_error_category(error: &rmcp_http::Error) -> &'static str {
     if error.is_timeout() {
         "http_timeout"
     } else if error.is_connect() {
@@ -1826,6 +2462,14 @@ mod tests {
         },
     };
 
+    use rmcp::{
+        model::{
+            ListResourcesResult, ListToolsResult, ReadResourceRequestParams, ReadResourceResult,
+            ServerCapabilities, ServerInfo,
+        },
+        service::RequestContext,
+        ErrorData, RoleServer, ServerHandler, ServiceExt,
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -1834,6 +2478,112 @@ mod tests {
     use tracing_subscriber::{fmt::MakeWriter, prelude::*};
 
     const TEST_RESPONSE_LIMIT: usize = 64;
+
+    #[derive(Default)]
+    struct ProbeRequestCounts {
+        list_tools: AtomicUsize,
+        list_resources: AtomicUsize,
+        call_tool: AtomicUsize,
+        read_resource: AtomicUsize,
+    }
+
+    #[derive(Clone)]
+    struct PaginatedProbeServer {
+        counts: Arc<ProbeRequestCounts>,
+    }
+
+    impl ServerHandler for PaginatedProbeServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(
+                ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_resources()
+                    .build(),
+            )
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            self.counts.list_tools.fetch_add(1, Ordering::SeqCst);
+            Ok(ListToolsResult {
+                next_cursor: Some("second-page-must-not-be-read".to_owned()),
+                ..ListToolsResult::default()
+            })
+        }
+
+        async fn list_resources(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListResourcesResult, ErrorData> {
+            self.counts.list_resources.fetch_add(1, Ordering::SeqCst);
+            Ok(ListResourcesResult {
+                next_cursor: Some("resource-page-must-not-be-read".to_owned()),
+                ..ListResourcesResult::default()
+            })
+        }
+
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, ErrorData> {
+            self.counts.call_tool.fetch_add(1, Ordering::SeqCst);
+            Ok(CallToolResult::default())
+        }
+
+        async fn read_resource(
+            &self,
+            _request: ReadResourceRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ReadResourceResult, ErrorData> {
+            self.counts.read_resource.fetch_add(1, Ordering::SeqCst);
+            Ok(ReadResourceResult::new(Vec::new()))
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_probe_reads_exactly_one_advertised_tool_page() {
+        let counts = Arc::new(ProbeRequestCounts::default());
+        let server = PaginatedProbeServer {
+            counts: Arc::clone(&counts),
+        };
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let server = server
+                .serve(server_transport)
+                .await
+                .expect("probe test server should initialize");
+            server
+                .waiting()
+                .await
+                .expect("probe test server should close cleanly");
+        });
+        let mut client =
+            ().serve(client_transport)
+                .await
+                .expect("probe test client should initialize");
+
+        probe_one_advertised_metadata_page(&mut client)
+            .await
+            .expect("one advertised metadata page should validate");
+        let close = client
+            .close_with_timeout(Duration::from_secs(1))
+            .await
+            .expect("probe test client close should join");
+        assert!(discovery_shutdown_completed_cleanly::<()>(&Ok(close)));
+        server_task
+            .await
+            .expect("probe test server task should join");
+
+        assert_eq!(counts.list_tools.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.list_resources.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.call_tool.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.read_resource.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn managed_discovery_page_budget_is_shared_across_all_collections() {
@@ -1873,7 +2623,7 @@ mod tests {
             .saturating_sub(1);
         let budget = DiscoveryResponseByteBudget::new(maximum);
 
-        let first_body = stream::iter([Ok::<_, rmcp_reqwest::Error>(unknown_json.clone())]);
+        let first_body = stream::iter([Ok::<_, rmcp_http::Error>(unknown_json.clone())]);
         let mut first =
             limited_mcp_body_stream(Box::pin(first_body), usize::MAX, Some(budget.clone()));
         assert_eq!(
@@ -1886,7 +2636,7 @@ mod tests {
         );
         assert!(first.next().await.is_none());
 
-        let second_body = stream::iter([Ok::<_, rmcp_reqwest::Error>(unknown_sse)]);
+        let second_body = stream::iter([Ok::<_, rmcp_http::Error>(unknown_sse)]);
         let mut second = limited_mcp_body_stream(Box::pin(second_body), usize::MAX, Some(budget));
         let error = second
             .next()
@@ -1898,6 +2648,30 @@ mod tests {
             McpUpstreamCallError::DiscoveryResponseLimitExceeded { max }
                 if max == maximum
         ));
+    }
+
+    #[tokio::test]
+    async fn managed_transport_adapter_enforces_total_and_idle_response_deadlines() {
+        for (deadline, response_idle_timeout) in [
+            (
+                Some(tokio::time::Instant::now() + Duration::from_millis(25)),
+                None,
+            ),
+            (None, Some(Duration::from_millis(25))),
+        ] {
+            let mut body: Pin<Box<dyn Stream<Item = Result<Bytes, rmcp_http::Error>> + Send>> =
+                Box::pin(stream::pending());
+            let started = Instant::now();
+            let error = next_mcp_body_chunk(&mut body, deadline, response_idle_timeout)
+                .await
+                .expect_err("a silent managed MCP response must time out");
+
+            assert!(matches!(error, LimitedMcpHttpError::Http("http_timeout")));
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "managed MCP response deadline must remain bounded"
+            );
+        }
     }
 
     #[test]
@@ -2284,7 +3058,7 @@ mod tests {
             .local_addr()
             .expect("timeout sentinel address should be available");
         let host = "secret-mcp.example.test";
-        let inner = rmcp_reqwest::Client::builder()
+        let inner = rmcp_http::Client::builder()
             .no_proxy()
             .timeout(Duration::from_millis(100))
             .read_timeout(Duration::from_millis(50))
@@ -2527,7 +3301,7 @@ mod tests {
                 .expect("managed MCP capture response should write");
             request
         });
-        let inner = rmcp_reqwest::Client::builder()
+        let inner = rmcp_http::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(1))
             .build()
@@ -2569,7 +3343,7 @@ mod tests {
                 .await
                 .expect("raw MCP response server should write its response");
         });
-        let inner = rmcp_reqwest::Client::builder()
+        let inner = rmcp_http::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(1))
             .build()
@@ -2616,7 +3390,7 @@ mod tests {
                 .await
                 .expect("raw MCP GET response server should write its response");
         });
-        let inner = rmcp_reqwest::Client::builder()
+        let inner = rmcp_http::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(1))
             .build()
@@ -2707,7 +3481,7 @@ mod tests {
         let declared_content_length = first_chunk.len();
         assert!(declared_content_length < TEST_RESPONSE_LIMIT);
         let body = stream::iter([
-            Ok::<_, rmcp_reqwest::Error>(Bytes::copy_from_slice(first_chunk.as_bytes())),
+            Ok::<_, rmcp_http::Error>(Bytes::copy_from_slice(first_chunk.as_bytes())),
             Ok(Bytes::from(overflow_chunk)),
         ]);
         let mut stream: BoxStream<'static, Result<Sse, SseError>> =
@@ -2722,7 +3496,7 @@ mod tests {
     }
 
     async fn oversized_sse_get_stream(url: &str) -> BoxStream<'static, Result<Sse, SseError>> {
-        let client = rmcp_reqwest::Client::builder()
+        let client = rmcp_http::Client::builder()
             .no_proxy()
             .build()
             .expect("test MCP HTTP client should build");

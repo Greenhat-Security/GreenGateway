@@ -22,3 +22,4 @@ pub mod projection;
 pub mod secret;
 pub mod status;
 pub mod store;
+pub mod test;

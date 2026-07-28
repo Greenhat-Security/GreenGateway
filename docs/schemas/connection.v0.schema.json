@@ -359,8 +359,7 @@
         "method": {
           "enum": [
             "GET",
-            "HEAD",
-            "OPTIONS"
+            "HEAD"
           ]
         },
         "path": {

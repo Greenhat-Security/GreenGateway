@@ -96,6 +96,7 @@ const TOKEN_ROTATE_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}/rotate";
 const CONNECTIONS_ADMIN_ROUTE: &str = "/v1/admin/connections";
 const CONNECTION_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}";
 const CONNECTION_REFRESH_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/refresh";
+const CONNECTION_TEST_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/test";
 const CONNECTION_OPENAPI_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/openapi/preview";
 const CONNECTION_OPENAPI_REGISTER_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/openapi/register";
 const CONNECTION_COLLECTION_ETAG_HEADER: &str = "x-greengateway-connections-etag";
@@ -223,6 +224,7 @@ struct AdminRoutes {
     connections_route: String,
     connection_route: String,
     connection_refresh_route: String,
+    connection_test_route: String,
     connection_openapi_preview_route: String,
     connection_openapi_register_route: String,
     tools_route: String,
@@ -351,6 +353,7 @@ impl AdminRoutes {
             connections_route: format!("{api_prefix}/connections"),
             connection_route: format!("{api_prefix}/connections/{{id}}"),
             connection_refresh_route: format!("{api_prefix}/connections/{{id}}/refresh"),
+            connection_test_route: format!("{api_prefix}/connections/{{id}}/test"),
             connection_openapi_preview_route: format!(
                 "{api_prefix}/connections/{{id}}/openapi/preview"
             ),
@@ -424,6 +427,7 @@ struct ConnectionAdminState {
     control_plane: connections::control_plane::ConnectionControlPlane,
     mcp_catalogs: connections::mcp::McpConnectionCatalogService,
     openapi_catalogs: connections::openapi::OpenApiConnectionCatalogService,
+    tests: connections::test::ConnectionTestService,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
     client_ip_policy: client_ip::ClientIpPolicy,
@@ -1715,6 +1719,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         control_plane: connection_control_plane.clone(),
         mcp_catalogs: mcp_catalog_service,
         openapi_catalogs: openapi_catalog_service,
+        tests: connections::test::ConnectionTestService::new(connection_http_runtime.clone()),
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
@@ -2457,6 +2462,10 @@ fn add_admin_api_routes(
                 .route(
                     routes.admin.connection_refresh_route.as_str(),
                     post(connection_refresh_endpoint),
+                )
+                .route(
+                    routes.admin.connection_test_route.as_str(),
+                    post(connection_test_endpoint),
                 )
                 .route(
                     routes.admin.connection_openapi_preview_route.as_str(),
@@ -3607,6 +3616,155 @@ async fn connection_refresh_endpoint(
             with_etag(response, current_etag.as_str())
         }
     }
+}
+
+async fn connection_test_endpoint(
+    State(state): State<ConnectionAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_TEST_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) =
+        authorized_connection_state(&state, &principal, ADMIN_CONNECTIONS_TEST_PERMISSION)
+    {
+        return connection_admin_authz_error_response(error);
+    }
+    if !state.control_plane.is_managed_store_configured() {
+        return connection_store_not_configured();
+    }
+    let body = match read_request_body(body, state.max_body_size.min(1024)).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if !body.is_empty() {
+        return bad_request("connection test does not accept a request body");
+    }
+    let id = match connections::model::ConnectionId::parse(raw_id) {
+        Ok(id) => id,
+        Err(_) => return not_found("connection was not found"),
+    };
+    let snapshot = state.control_plane.runtime_snapshot();
+    let Some(record) = snapshot.managed().get(&id) else {
+        if snapshot
+            .legacy()
+            .iter()
+            .any(|projection| projection.id() == &id)
+        {
+            return conflict("legacy connection projections are read-only");
+        }
+        return not_found("connection was not found");
+    };
+    let current_etag = record.etag();
+    match if_match_matches(&parts.headers, current_etag.as_str()) {
+        Ok(true) => {}
+        Ok(false) => {
+            return with_etag(
+                precondition_failed("If-Match does not match the current connection ETag"),
+                current_etag.as_str(),
+            );
+        }
+        Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
+    }
+
+    let permit = match state.tests.admit(&principal, &id) {
+        Ok(permit) => permit,
+        Err(error) => {
+            emit_connection_tested(
+                &state,
+                &parts,
+                &principal,
+                record,
+                "rejected",
+                Some(error.safe_reason()),
+                0,
+                None,
+            );
+            let status = if error == connections::test::ConnectionTestAdmissionError::Unavailable {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            };
+            return (
+                status,
+                [
+                    (header::ETAG, etag_header_value(current_etag.as_str())),
+                    (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                ],
+                Json(json!({
+                    "error": "connection test was not admitted",
+                    "reason": error.safe_reason(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let probe_started = Instant::now();
+    let execution = match tokio::time::timeout(
+        state.tests.deadline(),
+        state.tests.execute(record, current_etag.as_str()),
+    )
+    .await
+    {
+        Ok(execution) => execution,
+        Err(_) => connections::test::deadline_execution(probe_started),
+    };
+    drop(permit);
+
+    if let Err(error) =
+        state
+            .control_plane
+            .append_status(&id, &current_etag, execution.status_update())
+    {
+        emit_connection_tested(
+            &state,
+            &parts,
+            &principal,
+            record,
+            "failure",
+            Some(connections::test::ConnectionTestReason::ConnectionChanged),
+            execution.result.latency_ms,
+            Some(&execution.result),
+        );
+        return connection_mutation_error_response(error);
+    }
+
+    let outcome = if execution.result.ok {
+        "success"
+    } else {
+        "failure"
+    };
+    let reason = execution
+        .result
+        .stages
+        .iter()
+        .rev()
+        .find_map(|stage| stage.reason);
+    emit_connection_tested(
+        &state,
+        &parts,
+        &principal,
+        record,
+        outcome,
+        reason,
+        execution.result.latency_ms,
+        Some(&execution.result),
+    );
+
+    (
+        StatusCode::OK,
+        [
+            (header::ETAG, etag_header_value(current_etag.as_str())),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        Json(execution.result),
+    )
+        .into_response()
 }
 
 async fn connection_openapi_preview_endpoint(
@@ -8828,6 +8986,46 @@ fn emit_connection_refreshed(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_connection_tested(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    record: &connections::store::StoredConnection,
+    outcome: &'static str,
+    reason: Option<connections::test::ConnectionTestReason>,
+    latency_ms: u64,
+    result: Option<&connections::test::ConnectionTestResult>,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    let summary = record.safe_summary(None);
+    let mut payload = json!({
+        "connection_id": &record.id,
+        "kind": record.write.kind,
+        "source": "managed",
+        "authentication": summary.authentication,
+        "revisions": &record.revisions,
+        "outcome": outcome,
+        "latency_ms": latency_ms,
+    });
+    if let Some(reason) = reason {
+        payload["reason"] = json!(reason);
+    }
+    if let Some(result) = result {
+        payload["state"] = json!(result.state);
+        payload["stages"] = json!(&result.stages);
+    }
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::CONNECTION_TESTED,
+        request_id,
+        source_ip,
+        Some(auth::actor_from_principal(principal)),
+        payload,
+    ));
+}
+
 fn connection_secret_authority_forbidden(
     state: &ConnectionAdminState,
     parts: &http::request::Parts,
@@ -11221,6 +11419,10 @@ mod tests {
             CONNECTION_REFRESH_ADMIN_ROUTE
         );
         assert_eq!(
+            default_routes.connection_test_route,
+            CONNECTION_TEST_ADMIN_ROUTE
+        );
+        assert_eq!(
             default_routes.connection_openapi_preview_route,
             CONNECTION_OPENAPI_PREVIEW_ADMIN_ROUTE
         );
@@ -11319,6 +11521,10 @@ mod tests {
         assert_eq!(
             custom_routes.connection_refresh_route,
             "/v1/ops/connections/{id}/refresh"
+        );
+        assert_eq!(
+            custom_routes.connection_test_route,
+            "/v1/ops/connections/{id}/test"
         );
         assert_eq!(
             custom_routes.connection_openapi_preview_route,
@@ -19399,6 +19605,27 @@ mod tests {
         .to_string()
     }
 
+    fn testable_connection_body(display_name: &str, enabled: bool) -> String {
+        json!({
+            "display_name": display_name,
+            "enabled": enabled,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://blocked-test-target.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {
+                "type": "none"
+            },
+            "test_profile": {
+                "method": "HEAD",
+                "path": "/ready",
+                "expected_statuses": [200, 204]
+            }
+        })
+        .to_string()
+    }
+
     fn managed_openapi_connection_body(display_name: &str) -> String {
         json!({
             "display_name": display_name,
@@ -19907,6 +20134,226 @@ mod tests {
                 event.event_type == audit::event::CONNECTION_REFRESHED
                     && event.payload["outcome"] == json!("failure")
                     && event.payload["reason"] == json!("discovery_not_configured")
+            })
+        });
+    }
+
+    #[tokio::test]
+    async fn connection_test_requires_permission_saved_profile_and_exact_etag() {
+        let connection_db = TempDb::new("connection-test-guards");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = connection_admin_router(&connection_db, &policy, audit_log);
+
+        let unauthorized = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                "/v1/admin/connections/00000000-0000-0000-0000-000000000001/test",
+                None,
+                None,
+                Some("\"connection:unknown\""),
+                true,
+            ))
+            .await
+            .expect("unauthorized connection test should complete");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let forbidden_unknown = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                "/v1/admin/connections/00000000-0000-0000-0000-000000000001/test",
+                Some(test_principal(&["connections-editor"])),
+                None,
+                Some("\"connection:unknown\""),
+                true,
+            ))
+            .await
+            .expect("forbidden connection test should complete");
+        assert_eq!(
+            forbidden_unknown.status(),
+            StatusCode::FORBIDDEN,
+            "authorization must run before connection lookup"
+        );
+
+        let list = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-reader"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("connection list should complete");
+        let collection_etag = list
+            .headers()
+            .get(CONNECTION_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("connection list should include collection ETag")
+            .to_owned();
+        let created = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-editor"])),
+                Some(testable_connection_body("Disabled test target", false)),
+                Some(&collection_etag),
+                true,
+            ))
+            .await
+            .expect("testable connection create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let connection_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("created connection should include ETag")
+            .to_owned();
+        let connection_id = json_body(created).await["id"]
+            .as_str()
+            .expect("created connection should include ID")
+            .to_owned();
+        let test_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/test");
+
+        let forbidden = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &test_uri,
+                Some(test_principal(&["connections-editor"])),
+                None,
+                Some(&connection_etag),
+                true,
+            ))
+            .await
+            .expect("connection test permission denial should complete");
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let missing = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &test_uri,
+                Some(test_principal(&["connections-tester"])),
+                None,
+                None,
+                true,
+            ))
+            .await
+            .expect("missing connection test precondition should complete");
+        assert_eq!(missing.status(), StatusCode::PRECONDITION_REQUIRED);
+
+        let stale = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &test_uri,
+                Some(test_principal(&["connections-tester"])),
+                None,
+                Some("\"connection:stale\""),
+                true,
+            ))
+            .await
+            .expect("stale connection test precondition should complete");
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+
+        let non_empty = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &test_uri,
+                Some(test_principal(&["connections-tester"])),
+                Some("{}".to_owned()),
+                Some(&connection_etag),
+                true,
+            ))
+            .await
+            .expect("non-empty connection test should complete");
+        assert_eq!(non_empty.status(), StatusCode::BAD_REQUEST);
+
+        let tested = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &test_uri,
+                Some(test_principal(&["connections-tester"])),
+                None,
+                Some(&connection_etag),
+                true,
+            ))
+            .await
+            .expect("saved-profile connection test should complete");
+        assert_eq!(tested.status(), StatusCode::OK);
+        assert_eq!(
+            tested
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let tested = json_body(tested).await;
+        assert_eq!(tested["ok"], json!(false));
+        assert_eq!(tested["state"], json!("unavailable"));
+        assert_eq!(tested["stages"][0]["name"], json!("egress_policy"));
+        assert_eq!(tested["stages"][0]["outcome"], json!("failure"));
+        assert_eq!(tested["stages"][0]["reason"], json!("host_not_allowed"));
+        assert!(
+            !tested.to_string().contains("blocked-test-target"),
+            "test response must not expose the saved destination"
+        );
+
+        let rate_limited = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &test_uri,
+                Some(test_principal(&["connections-tester"])),
+                None,
+                Some(&connection_etag),
+                true,
+            ))
+            .await
+            .expect("rate-limited connection test should complete");
+        assert_eq!(rate_limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            json_body(rate_limited).await["reason"],
+            json!("test_rate_limited")
+        );
+
+        let detail = router
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}"),
+                Some(test_principal(&["connections-reader"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("tested connection detail should complete");
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail = json_body(detail).await;
+        assert_eq!(detail["status"]["state"], json!("unavailable"));
+        assert_eq!(detail["status"]["reason"], json!("egress_denied"));
+
+        assert_eventually(Duration::from_secs(1), || {
+            let events = capture.events();
+            events.iter().any(|event| {
+                event.event_type == audit::event::CONNECTION_TESTED
+                    && event.payload["outcome"] == json!("failure")
+                    && event.payload["reason"] == json!("host_not_allowed")
+                    && !event.payload.to_string().contains("blocked-test-target")
+            }) && events.iter().any(|event| {
+                event.event_type == audit::event::CONNECTION_TESTED
+                    && event.payload["outcome"] == json!("rejected")
+                    && event.payload["reason"] == json!("test_rate_limited")
             })
         });
     }
@@ -29464,6 +29911,12 @@ paths:
                     "permissions": [
                         ADMIN_CONNECTIONS_READ_PERMISSION,
                         ADMIN_CONNECTIONS_REFRESH_PERMISSION
+                    ]
+                },
+                "connections-tester": {
+                    "permissions": [
+                        ADMIN_CONNECTIONS_READ_PERMISSION,
+                        ADMIN_CONNECTIONS_TEST_PERMISSION
                     ]
                 },
                 "openapi-tools-reader": {

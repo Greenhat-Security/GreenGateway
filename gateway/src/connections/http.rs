@@ -7,23 +7,26 @@ use std::{
 
 use http::{
     header::{self, HeaderName},
-    HeaderMap, HeaderValue, Uri,
+    HeaderMap, HeaderValue, Method, Uri,
 };
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::egress::{EgressClient, EgressConfig};
+use crate::egress::{CheckedEgressDestination, EgressClient, EgressConfig};
 
 use super::{
     control_plane::ConnectionControlPlane,
     model::{
         normalize_origin_relative_path, ConnectionAuthentication, ConnectionId, ConnectionKind,
-        DiscoveryConfig, OAuthClientAuthMethod, MAX_CONNECTIONS, MAX_URL_BYTES,
+        ConnectionTestProfile, ConnectionTimeouts, DiscoveryConfig, OAuthClientAuthMethod,
+        TlsProfile, MAX_CONNECTIONS, MAX_EXPECTED_STATUSES, MAX_URL_BYTES,
     },
     oauth::{
         OAuthBinding, OAuthClientCredentialsRuntime, OAuthError, OAuthTokenLease,
         OAUTH_MAX_REQUEST_BYTES, OAUTH_MAX_RESPONSE_BYTES,
     },
-    secret::{ResolvedSecret, SecretPurpose, SecretResolveErrorKind},
+    secret::{ResolvedSecret, SecretPurpose, SecretResolveError, SecretResolveErrorKind},
+    status::ConnectionRevisions,
     store::{ConnectionDependencyKind, StoredConnection},
 };
 
@@ -32,7 +35,7 @@ pub struct ConnectionHttpRuntime {
     control_plane: ConnectionControlPlane,
     base_egress_config: EgressConfig,
     base_egress_client: Arc<EgressClient>,
-    clients: Arc<Mutex<HashMap<String, Arc<EgressClient>>>>,
+    clients: Arc<Mutex<HashMap<ConnectionClientCacheKey, Arc<EgressClient>>>>,
     oauth: OAuthClientCredentialsRuntime,
 }
 
@@ -51,6 +54,30 @@ pub struct ConnectionHttpTarget {
     url: String,
     client: Arc<EgressClient>,
     authentication: HttpAuthenticationBinding,
+    transport: ConnectionTransportBinding,
+}
+
+#[derive(Clone)]
+struct ConnectionTransportBinding {
+    tls: TlsProfile,
+    timeouts: ConnectionTimeouts,
+    revisions: ConnectionRevisions,
+}
+
+struct ResolvedTlsProfile {
+    ca_bundle: Option<ResolvedSecret>,
+    client_identity: Option<(ResolvedSecret, ResolvedSecret)>,
+}
+
+pub struct PreparedConnectionTransport {
+    client: Arc<EgressClient>,
+    destination: CheckedEgressDestination,
+}
+
+pub struct ConnectionHttpTestTarget {
+    target: ConnectionHttpTarget,
+    method: Method,
+    expected_statuses: Vec<u16>,
 }
 
 enum HttpAuthenticationBinding {
@@ -87,7 +114,8 @@ pub enum ConnectionHttpError {
     ConnectionDisabled,
     WrongConnectionKind,
     UnsupportedAuthentication,
-    UnsupportedTls,
+    TlsInvalid,
+    TlsUnavailable,
     InvalidTargetPath,
     CredentialHeaderConflict,
     CredentialInvalid,
@@ -104,6 +132,12 @@ pub enum ConnectionHttpError {
 enum ConnectionClientProfile {
     Upstream,
     OAuthToken,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ConnectionClientCacheKey {
+    Preflight([u8; 32]),
+    Prepared([u8; 32]),
 }
 
 impl ConnectionClientProfile {
@@ -159,6 +193,7 @@ impl ConnectionHttpRuntime {
             url,
             client,
             authentication,
+            transport: connection_transport_binding(record),
         })
     }
 
@@ -188,6 +223,7 @@ impl ConnectionHttpRuntime {
             url,
             client,
             authentication,
+            transport: connection_transport_binding(record),
         })
     }
 
@@ -217,6 +253,102 @@ impl ConnectionHttpRuntime {
             url,
             client,
             authentication,
+            transport: connection_transport_binding(record),
+        })
+    }
+
+    /// Builds the exact persisted HTTP test target, including for a disabled
+    /// managed connection. Normal data-plane target constructors remain
+    /// fail-closed for disabled connections.
+    pub fn test_target(
+        &self,
+        connection_id: &str,
+    ) -> Result<ConnectionHttpTestTarget, ConnectionHttpError> {
+        let connection_id = ConnectionId::parse(connection_id.to_owned())
+            .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
+        let snapshot = self.control_plane.runtime_snapshot();
+        let record = snapshot
+            .managed()
+            .get(&connection_id)
+            .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        if record.write.kind != ConnectionKind::HttpApi {
+            return Err(ConnectionHttpError::WrongConnectionKind);
+        }
+        validate_authentication(record)?;
+        let ConnectionTestProfile {
+            method,
+            path,
+            expected_statuses,
+        } = record
+            .write
+            .test_profile
+            .as_ref()
+            .ok_or(ConnectionHttpError::InvalidTargetPath)?;
+        let method = Method::from_bytes(method.as_bytes())
+            .map_err(|_| ConnectionHttpError::InvalidTargetPath)?;
+        if !matches!(method, Method::GET | Method::HEAD) {
+            return Err(ConnectionHttpError::InvalidTargetPath);
+        }
+        if expected_statuses.is_empty()
+            || expected_statuses.len() > MAX_EXPECTED_STATUSES
+            || expected_statuses
+                .iter()
+                .any(|status| !(100..=599).contains(status))
+            || expected_statuses
+                .iter()
+                .enumerate()
+                .any(|(index, status)| expected_statuses[..index].contains(status))
+        {
+            return Err(ConnectionHttpError::InvalidTargetPath);
+        }
+        let url = connection_target_url(record, path)?;
+        let client = self.client_for(record)?;
+        let authentication = self.authentication_binding(record)?;
+
+        Ok(ConnectionHttpTestTarget {
+            target: ConnectionHttpTarget {
+                connection_id,
+                connection_etag: record.etag().to_string(),
+                url,
+                client,
+                authentication,
+                transport: connection_transport_binding(record),
+            },
+            method,
+            expected_statuses: expected_statuses.clone(),
+        })
+    }
+
+    /// Builds a managed MCP test target without requiring the persisted
+    /// connection to be enabled. No caller-provided target or authentication
+    /// override is accepted.
+    pub fn mcp_test_target(
+        &self,
+        connection_id: &str,
+    ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
+        let connection_id = ConnectionId::parse(connection_id.to_owned())
+            .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
+        let snapshot = self.control_plane.runtime_snapshot();
+        let record = snapshot
+            .managed()
+            .get(&connection_id)
+            .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        let use_connection_authentication = validate_mcp_connection_mode(record, false)?;
+        let url = connection_target_url(record, "/")?;
+        let client = self.client_for(record)?;
+        let authentication = if use_connection_authentication {
+            self.authentication_binding(record)?
+        } else {
+            HttpAuthenticationBinding::None
+        };
+
+        Ok(ConnectionHttpTarget {
+            connection_id,
+            connection_etag: record.etag().to_string(),
+            url,
+            client,
+            authentication,
+            transport: connection_transport_binding(record),
         })
     }
 
@@ -301,6 +433,73 @@ impl ConnectionHttpRuntime {
         }))
     }
 
+    /// Applies connection-owned TLS only after the caller has completed the
+    /// ordinary egress preflight. The exact checked socket is rebound without
+    /// another DNS lookup.
+    pub async fn prepare_transport(
+        &self,
+        target: &ConnectionHttpTarget,
+        checked: &CheckedEgressDestination,
+    ) -> Result<PreparedConnectionTransport, ConnectionHttpError> {
+        if target.transport.tls.is_empty() {
+            let destination = target
+                .client
+                .rebind_checked_destination(checked, target.url())
+                .map_err(|_| ConnectionHttpError::TransportUnavailable)?;
+            return Ok(PreparedConnectionTransport {
+                client: Arc::clone(&target.client),
+                destination,
+            });
+        }
+
+        let versions_before = self.tls_secret_versions(&target.transport.tls);
+        let resolved = self.resolve_tls_profile(&target.transport.tls).await?;
+        let versions_after = self.tls_secret_versions(&target.transport.tls);
+        if versions_before != versions_after {
+            return Err(ConnectionHttpError::TlsUnavailable);
+        }
+
+        let mut config = self.config_for_timeouts(&target.transport.timeouts);
+        if let Some(ca_bundle) = resolved.ca_bundle.as_ref() {
+            config
+                .apply_tls_ca_bundle_pem(ca_bundle.expose())
+                .map_err(|_| ConnectionHttpError::TlsInvalid)?;
+        }
+        if let Some((certificate, private_key)) = resolved.client_identity.as_ref() {
+            let separator_len = usize::from(!certificate.expose().ends_with(b"\n"));
+            let identity_len = certificate
+                .expose()
+                .len()
+                .checked_add(separator_len)
+                .and_then(|length| length.checked_add(private_key.expose().len()))
+                .ok_or(ConnectionHttpError::TlsInvalid)?;
+            let mut identity = Zeroizing::new(Vec::with_capacity(identity_len));
+            identity.extend_from_slice(certificate.expose());
+            if separator_len == 1 {
+                identity.push(b'\n');
+            }
+            identity.extend_from_slice(private_key.expose());
+            config
+                .apply_tls_client_identity_pem(identity.as_slice())
+                .map_err(|_| ConnectionHttpError::TlsInvalid)?;
+        }
+        config.apply_transport_partition(&connection_transport_partition(
+            &target.connection_id,
+            &target.transport.revisions,
+            ConnectionClientProfile::Upstream,
+            versions_after,
+        ));
+        let client = self.cached_client(config)?;
+        let destination = client
+            .rebind_checked_destination(checked, target.url())
+            .map_err(|_| ConnectionHttpError::TransportUnavailable)?;
+
+        Ok(PreparedConnectionTransport {
+            client,
+            destination,
+        })
+    }
+
     fn authentication_binding(
         &self,
         record: &StoredConnection,
@@ -371,35 +570,128 @@ impl ConnectionHttpRuntime {
         record: &StoredConnection,
         profile: ConnectionClientProfile,
     ) -> Result<Arc<EgressClient>, ConnectionHttpError> {
-        let cache_key = format!("{}:{}:{}", record.id, record.etag().as_str(), profile.key());
+        let partition = connection_transport_partition(
+            &record.id,
+            &record.revisions,
+            profile,
+            [None, None, None],
+        );
+        let cache_key = ConnectionClientCacheKey::Preflight(partition);
         if let Some(client) = self.client_guard().get(&cache_key).cloned() {
             return Ok(client);
         }
 
         let timeouts = record.write.timeouts.clone().unwrap_or_default();
+        let mut config = self.config_for_timeouts(&timeouts);
+        if profile == ConnectionClientProfile::OAuthToken {
+            config.max_response_bytes = OAUTH_MAX_RESPONSE_BYTES;
+            config.max_request_body_bytes = OAUTH_MAX_REQUEST_BYTES;
+        }
+        config.apply_transport_partition(&partition);
+        let candidate = self.build_client(config)?;
+        Ok(self.insert_cached_client(cache_key, candidate))
+    }
+
+    fn config_for_timeouts(&self, timeouts: &ConnectionTimeouts) -> EgressConfig {
         let mut config = self.base_egress_config.clone();
         config.apply_timeout_overrides(
             Some(timeouts.request_timeout_ms),
             Some(timeouts.response_idle_timeout_ms),
             Some(timeouts.connect_timeout_ms),
         );
-        if profile == ConnectionClientProfile::OAuthToken {
-            config.max_response_bytes = OAUTH_MAX_RESPONSE_BYTES;
-            config.max_request_body_bytes = OAUTH_MAX_REQUEST_BYTES;
+        config
+    }
+
+    fn cached_client(
+        &self,
+        config: EgressConfig,
+    ) -> Result<Arc<EgressClient>, ConnectionHttpError> {
+        let candidate = self.build_client(config)?;
+        let cache_key = ConnectionClientCacheKey::Prepared(candidate.configuration_generation());
+        if let Some(client) = self.client_guard().get(&cache_key).cloned() {
+            return Ok(client);
         }
-        let client = Arc::new(
+        Ok(self.insert_cached_client(cache_key, candidate))
+    }
+
+    fn build_client(&self, config: EgressConfig) -> Result<Arc<EgressClient>, ConnectionHttpError> {
+        Ok(Arc::new(
             self.base_egress_client
                 .reconfigured(config)
                 .map_err(|_| ConnectionHttpError::TransportUnavailable)?,
-        );
+        ))
+    }
+
+    fn insert_cached_client(
+        &self,
+        cache_key: ConnectionClientCacheKey,
+        candidate: Arc<EgressClient>,
+    ) -> Arc<EgressClient> {
         let mut clients = self.client_guard();
         if clients.len() >= MAX_CONNECTIONS.saturating_mul(2) && !clients.contains_key(&cache_key) {
             clients.clear();
         }
-        Ok(Arc::clone(clients.entry(cache_key).or_insert(client)))
+        Arc::clone(clients.entry(cache_key).or_insert(candidate))
     }
 
-    fn client_guard(&self) -> MutexGuard<'_, HashMap<String, Arc<EgressClient>>> {
+    fn tls_secret_versions(&self, tls: &TlsProfile) -> [Option<u64>; 3] {
+        [
+            tls.ca_bundle_alias
+                .as_deref()
+                .and_then(|id| self.control_plane.local_secret_version(id)),
+            tls.client_certificate_id
+                .as_deref()
+                .and_then(|id| self.control_plane.local_secret_version(id)),
+            tls.client_private_key_id
+                .as_deref()
+                .and_then(|id| self.control_plane.local_secret_version(id)),
+        ]
+    }
+
+    async fn resolve_tls_profile(
+        &self,
+        tls: &TlsProfile,
+    ) -> Result<ResolvedTlsProfile, ConnectionHttpError> {
+        let ca_bundle = match tls.ca_bundle_alias.as_deref() {
+            Some(id) => Some(
+                self.control_plane
+                    .secret_resolver()
+                    .resolve(id, SecretPurpose::TlsCaBundle)
+                    .await
+                    .map_err(connection_tls_secret_error)?,
+            ),
+            None => None,
+        };
+        let client_identity = match (
+            tls.client_certificate_id.as_deref(),
+            tls.client_private_key_id.as_deref(),
+        ) {
+            (Some(certificate_id), Some(private_key_id)) => {
+                let certificate = self
+                    .control_plane
+                    .secret_resolver()
+                    .resolve(certificate_id, SecretPurpose::TlsCertificate)
+                    .await
+                    .map_err(connection_tls_secret_error)?;
+                let private_key = self
+                    .control_plane
+                    .secret_resolver()
+                    .resolve(private_key_id, SecretPurpose::TlsPrivateKey)
+                    .await
+                    .map_err(connection_tls_secret_error)?;
+                Some((certificate, private_key))
+            }
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => return Err(ConnectionHttpError::TlsInvalid),
+        };
+
+        Ok(ResolvedTlsProfile {
+            ca_bundle,
+            client_identity,
+        })
+    }
+
+    fn client_guard(&self) -> MutexGuard<'_, HashMap<ConnectionClientCacheKey, Arc<EgressClient>>> {
         match self.clients.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -428,6 +720,10 @@ impl ConnectionHttpTarget {
     }
 
     pub fn client(&self) -> &Arc<EgressClient> {
+        &self.client
+    }
+
+    pub fn preflight_client(&self) -> &Arc<EgressClient> {
         &self.client
     }
 
@@ -514,7 +810,8 @@ impl ConnectionHttpError {
             Self::ConnectionDisabled => "connection_disabled",
             Self::WrongConnectionKind => "connection_kind_mismatch",
             Self::UnsupportedAuthentication => "authentication_not_supported",
-            Self::UnsupportedTls => "tls_not_supported",
+            Self::TlsInvalid => "tls_invalid",
+            Self::TlsUnavailable => "tls_unavailable",
             Self::InvalidTargetPath => "invalid_target_path",
             Self::CredentialHeaderConflict => "credential_header_conflict",
             Self::CredentialInvalid => "credential_invalid",
@@ -529,7 +826,13 @@ impl ConnectionHttpError {
     }
 
     pub fn is_secret_resolution_failure(self) -> bool {
-        matches!(self, Self::CredentialInvalid | Self::CredentialUnavailable)
+        matches!(
+            self,
+            Self::CredentialInvalid
+                | Self::CredentialUnavailable
+                | Self::TlsInvalid
+                | Self::TlsUnavailable
+        )
     }
 }
 
@@ -545,6 +848,59 @@ impl fmt::Display for ConnectionHttpError {
 
 impl Error for ConnectionHttpError {}
 
+fn connection_transport_binding(record: &StoredConnection) -> ConnectionTransportBinding {
+    ConnectionTransportBinding {
+        tls: record.write.tls.clone(),
+        timeouts: record.write.timeouts.clone().unwrap_or_default(),
+        revisions: record.revisions.clone(),
+    }
+}
+
+fn connection_transport_partition(
+    connection_id: &ConnectionId,
+    revisions: &ConnectionRevisions,
+    profile: ConnectionClientProfile,
+    local_tls_versions: [Option<u64>; 3],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"greengateway:connection-transport:v1\0");
+    hasher.update((connection_id.as_str().len() as u64).to_be_bytes());
+    hasher.update(connection_id.as_str().as_bytes());
+    for revision in [
+        revisions.connection,
+        revisions.credential,
+        revisions.tls,
+        revisions.discovery,
+        revisions.status,
+    ] {
+        hasher.update(revision.to_be_bytes());
+    }
+    hasher.update((profile.key().len() as u64).to_be_bytes());
+    hasher.update(profile.key().as_bytes());
+    for version in local_tls_versions {
+        match version {
+            Some(version) => {
+                hasher.update([1]);
+                hasher.update(version.to_be_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    hasher.finalize().into()
+}
+
+fn connection_tls_secret_error(error: SecretResolveError) -> ConnectionHttpError {
+    match error.kind() {
+        SecretResolveErrorKind::UnknownAlias
+        | SecretResolveErrorKind::SourceDenied
+        | SecretResolveErrorKind::InvalidMaterial => ConnectionHttpError::TlsInvalid,
+        SecretResolveErrorKind::ProviderBusy
+        | SecretResolveErrorKind::SourceUnavailable
+        | SecretResolveErrorKind::UnsafeSource
+        | SecretResolveErrorKind::ProviderFailure => ConnectionHttpError::TlsUnavailable,
+    }
+}
+
 fn validate_http_connection(record: &StoredConnection) -> Result<(), ConnectionHttpError> {
     if !record.write.enabled {
         return Err(ConnectionHttpError::ConnectionDisabled);
@@ -552,9 +908,10 @@ fn validate_http_connection(record: &StoredConnection) -> Result<(), ConnectionH
     if record.write.kind != ConnectionKind::HttpApi {
         return Err(ConnectionHttpError::WrongConnectionKind);
     }
-    if !record.write.tls.is_empty() {
-        return Err(ConnectionHttpError::UnsupportedTls);
-    }
+    validate_authentication(record)
+}
+
+fn validate_authentication(record: &StoredConnection) -> Result<(), ConnectionHttpError> {
     match &record.write.authentication {
         ConnectionAuthentication::None
         | ConnectionAuthentication::HeaderApiKey {
@@ -578,14 +935,18 @@ fn validate_http_connection(record: &StoredConnection) -> Result<(), ConnectionH
 }
 
 fn validate_mcp_connection(record: &StoredConnection) -> Result<bool, ConnectionHttpError> {
-    if !record.write.enabled {
+    validate_mcp_connection_mode(record, true)
+}
+
+fn validate_mcp_connection_mode(
+    record: &StoredConnection,
+    require_enabled: bool,
+) -> Result<bool, ConnectionHttpError> {
+    if require_enabled && !record.write.enabled {
         return Err(ConnectionHttpError::ConnectionDisabled);
     }
     if record.write.kind != ConnectionKind::McpStreamableHttp {
         return Err(ConnectionHttpError::WrongConnectionKind);
-    }
-    if !record.write.tls.is_empty() {
-        return Err(ConnectionHttpError::UnsupportedTls);
     }
     let use_connection_authentication = match &record.write.discovery {
         Some(DiscoveryConfig::ManagedMcp {
@@ -596,25 +957,35 @@ fn validate_mcp_connection(record: &StoredConnection) -> Result<bool, Connection
     if !use_connection_authentication {
         return Ok(false);
     }
-    match &record.write.authentication {
-        ConnectionAuthentication::None
-        | ConnectionAuthentication::HeaderApiKey {
-            secret_id: Some(_), ..
-        }
-        | ConnectionAuthentication::StaticBearer { secret_id: Some(_) }
-        | ConnectionAuthentication::OAuth2ClientCredentials {
-            client_secret_id: Some(_),
-            client_auth_method: OAuthClientAuthMethod::ClientSecretBasic,
-            ..
-        } => Ok(true),
-        ConnectionAuthentication::HeaderApiKey {
-            secret_id: None, ..
-        }
-        | ConnectionAuthentication::StaticBearer { secret_id: None }
-        | ConnectionAuthentication::OAuth2ClientCredentials {
-            client_secret_id: None,
-            ..
-        } => Err(ConnectionHttpError::UnsupportedAuthentication),
+    validate_authentication(record)?;
+    Ok(true)
+}
+
+impl PreparedConnectionTransport {
+    pub fn client(&self) -> &Arc<EgressClient> {
+        &self.client
+    }
+
+    pub fn destination(&self) -> &CheckedEgressDestination {
+        &self.destination
+    }
+}
+
+impl ConnectionHttpTestTarget {
+    pub fn target(&self) -> &ConnectionHttpTarget {
+        &self.target
+    }
+
+    pub fn method(&self) -> &Method {
+        &self.method
+    }
+
+    pub fn expected_statuses(&self) -> &[u16] {
+        &self.expected_statuses
+    }
+
+    pub fn into_target(self) -> ConnectionHttpTarget {
+        self.target
     }
 }
 
@@ -951,6 +1322,181 @@ mod tests {
         }
     }
 
+    struct TemporaryManagedRuntime {
+        root: PathBuf,
+        runtime: ConnectionHttpRuntime,
+        connection_id: ConnectionId,
+        ca_path: Option<PathBuf>,
+    }
+
+    impl TemporaryManagedRuntime {
+        fn from_write(name: &str, write: ConnectionWrite) -> Self {
+            Self::build(name, write, Vec::new(), None)
+        }
+
+        fn tls_identity(name: &str) -> Self {
+            Self::tls_identity_with_oauth(name, false)
+        }
+
+        fn tls_identity_with_oauth(name: &str, with_oauth: bool) -> Self {
+            let root = temporary_managed_root(name);
+            fs::create_dir(&root).expect("temporary managed root should create");
+            let identity_key = rcgen::KeyPair::generate().expect("test identity key should build");
+            let identity_certificate = CertificateParams::default()
+                .self_signed(&identity_key)
+                .expect("test identity certificate should build");
+            let ca_path = root.join("ca.pem");
+            let certificate_path = root.join("client-certificate.pem");
+            let private_key_path = root.join("client-private-key.pem");
+            let oauth_secret_path = root.join("oauth-secret");
+            fs::write(&ca_path, identity_certificate.pem()).expect("test CA bundle should write");
+            fs::write(&certificate_path, identity_certificate.pem())
+                .expect("test client certificate should write");
+            fs::write(&private_key_path, identity_key.serialize_pem())
+                .expect("test client private key should write");
+            if with_oauth {
+                fs::write(&oauth_secret_path, OAUTH_CLIENT_SECRET_CANARY)
+                    .expect("test OAuth secret should write");
+            }
+
+            let mut write = record("/").write;
+            write.endpoint.base_url = "https://127.0.0.1".to_owned();
+            write.tls = TlsProfile {
+                ca_bundle_alias: Some("test-ca".to_owned()),
+                client_certificate_id: Some("test-client-certificate".to_owned()),
+                client_private_key_id: Some("test-client-private-key".to_owned()),
+            };
+            if with_oauth {
+                write.authentication = ConnectionAuthentication::OAuth2ClientCredentials {
+                    client_id: "test-client".to_owned(),
+                    client_secret_id: Some("test-oauth-secret".to_owned()),
+                    token_url: "https://token.example.test/oauth/token".to_owned(),
+                    scopes: vec![],
+                    audience: None,
+                    resource: None,
+                    client_auth_method: OAuthClientAuthMethod::ClientSecretBasic,
+                };
+            }
+            let mut aliases = vec![
+                OperatorSecretAliasConfig {
+                    id: "test-ca".to_owned(),
+                    label: "Test CA".to_owned(),
+                    source: OperatorSecretAliasSource::File {
+                        key: "ca.pem".to_owned(),
+                    },
+                },
+                OperatorSecretAliasConfig {
+                    id: "test-client-certificate".to_owned(),
+                    label: "Test client certificate".to_owned(),
+                    source: OperatorSecretAliasSource::File {
+                        key: "client-certificate.pem".to_owned(),
+                    },
+                },
+                OperatorSecretAliasConfig {
+                    id: "test-client-private-key".to_owned(),
+                    label: "Test client private key".to_owned(),
+                    source: OperatorSecretAliasSource::File {
+                        key: "client-private-key.pem".to_owned(),
+                    },
+                },
+            ];
+            if with_oauth {
+                aliases.push(OperatorSecretAliasConfig {
+                    id: "test-oauth-secret".to_owned(),
+                    label: "Test OAuth secret".to_owned(),
+                    source: OperatorSecretAliasSource::File {
+                        key: "oauth-secret".to_owned(),
+                    },
+                });
+            }
+            Self::build_with_root(name, root, write, aliases, Some(ca_path))
+        }
+
+        fn build(
+            name: &str,
+            write: ConnectionWrite,
+            aliases: Vec<OperatorSecretAliasConfig>,
+            ca_path: Option<PathBuf>,
+        ) -> Self {
+            let root = temporary_managed_root(name);
+            fs::create_dir(&root).expect("temporary managed root should create");
+            Self::build_with_root(name, root, write, aliases, ca_path)
+        }
+
+        fn build_with_root(
+            _name: &str,
+            root: PathBuf,
+            write: ConnectionWrite,
+            aliases: Vec<OperatorSecretAliasConfig>,
+            ca_path: Option<PathBuf>,
+        ) -> Self {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                    .expect("temporary managed root permissions should set");
+                for entry in fs::read_dir(&root).expect("temporary managed root should read") {
+                    let path = entry.expect("temporary managed entry should read").path();
+                    if path.is_file() {
+                        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                            .expect("temporary managed file permissions should set");
+                    }
+                }
+            }
+            let mut config = Config::test_defaults();
+            config.connections_sqlite_path =
+                Some(root.join("connections.sqlite").display().to_string());
+            config.connection_secrets_root = Some(SecretRootConfig::new(root.clone()));
+            config.connection_secret_aliases = aliases;
+            let control_plane =
+                ConnectionControlPlane::from_config(&config).expect("control plane should build");
+            let initial = control_plane.runtime_snapshot();
+            let created = control_plane
+                .create_managed(initial.collection_etag(), write)
+                .expect("managed connection should create");
+            let egress_config = EgressConfig {
+                allowed_hosts: HashSet::from([
+                    "127.0.0.1".to_owned(),
+                    "billing.example.test".to_owned(),
+                    "token.example.test".to_owned(),
+                ]),
+                deny_private_ips: false,
+                ..EgressConfig::default()
+            };
+            let egress_client = Arc::new(
+                EgressClient::new(egress_config.clone()).expect("egress client should build"),
+            );
+            let runtime = ConnectionHttpRuntime::new(control_plane, egress_config, egress_client);
+            Self {
+                root,
+                runtime,
+                connection_id: created.id,
+                ca_path,
+            }
+        }
+    }
+
+    impl Drop for TemporaryManagedRuntime {
+        fn drop(&mut self) {
+            if self
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("greengateway-managed-http-"))
+                && self.root.starts_with(std::env::temp_dir())
+            {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
+    fn temporary_managed_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "greengateway-managed-http-{name}-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
     struct TemporaryOAuthRuntime {
         root: PathBuf,
         secret_path: PathBuf,
@@ -1121,6 +1667,279 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn connection_tls_is_resolved_only_after_egress_preflight() {
+        let temporary = TemporaryManagedRuntime::tls_identity("tls-preflight-order");
+        let target = temporary
+            .runtime
+            .target(temporary.connection_id.as_str(), "/health")
+            .expect("TLS target creation must not resolve secret material");
+        fs::remove_file(
+            temporary
+                .ca_path
+                .as_ref()
+                .expect("TLS helper should retain CA path"),
+        )
+        .expect("test CA should be removed after target creation");
+
+        let checked = target
+            .preflight_client()
+            .checked_destination(target.url())
+            .await
+            .expect("egress preflight must not require TLS secret material");
+        let error = match temporary.runtime.prepare_transport(&target, &checked).await {
+            Ok(_) => panic!("missing TLS material must fail closed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, ConnectionHttpError::TlsUnavailable);
+        assert_eq!(error.safe_reason(), "tls_unavailable");
+        assert!(!error.to_string().contains("ca.pem"));
+    }
+
+    #[tokio::test]
+    async fn malformed_runtime_tls_material_has_only_stable_redacted_error() {
+        const INVALID_TLS_CANARY: &[u8] = b"invalid-tls-private-canary";
+        let temporary = TemporaryManagedRuntime::tls_identity("invalid-runtime-tls");
+        fs::write(
+            temporary
+                .ca_path
+                .as_ref()
+                .expect("TLS helper should retain CA path"),
+            INVALID_TLS_CANARY,
+        )
+        .expect("test CA should be corrupted after activation");
+        let target = temporary
+            .runtime
+            .target(temporary.connection_id.as_str(), "/health")
+            .expect("target construction must stay TLS-material-free");
+        let checked = target
+            .preflight_client()
+            .checked_destination(target.url())
+            .await
+            .expect("egress preflight should precede TLS resolution");
+        let error = match temporary.runtime.prepare_transport(&target, &checked).await {
+            Ok(_) => panic!("malformed TLS material must fail closed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, ConnectionHttpError::TlsInvalid);
+        assert_eq!(error.safe_reason(), "tls_invalid");
+        assert!(!error.to_string().contains(
+            std::str::from_utf8(INVALID_TLS_CANARY).expect("test canary should be UTF-8")
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepared_upstream_applies_identity_without_leaking_it_to_oauth() {
+        let temporary =
+            TemporaryManagedRuntime::tls_identity_with_oauth("tls-oauth-isolation", true);
+        let target = temporary
+            .runtime
+            .target(temporary.connection_id.as_str(), "/health")
+            .expect("TLS OAuth target should build");
+        let oauth_client = match &target.authentication {
+            HttpAuthenticationBinding::OAuth2ClientCredentials(binding) => &binding.token_client,
+            _ => panic!("test connection should use OAuth"),
+        };
+        assert_eq!(
+            oauth_client.client_identity_fingerprint(),
+            None,
+            "connection-owned mTLS must not be applied to the OAuth token host"
+        );
+
+        let checked = target
+            .preflight_client()
+            .checked_destination(target.url())
+            .await
+            .expect("upstream preflight should succeed");
+        let prepared = temporary
+            .runtime
+            .prepare_transport(&target, &checked)
+            .await
+            .expect("valid in-memory TLS material should prepare");
+
+        assert!(
+            prepared.client().client_identity_fingerprint().is_some(),
+            "prepared upstream must carry the connection-owned identity"
+        );
+        assert_ne!(
+            target.preflight_client().configuration_generation(),
+            prepared.client().configuration_generation(),
+            "resolved TLS material must select a distinct final transport"
+        );
+        assert_eq!(prepared.destination().host, "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn tls_material_is_resolved_again_before_each_cache_selection() {
+        let temporary = TemporaryManagedRuntime::tls_identity("tls-runtime-rotation");
+        let target = temporary
+            .runtime
+            .target(temporary.connection_id.as_str(), "/health")
+            .expect("TLS target should build");
+        let checked = target
+            .preflight_client()
+            .checked_destination(target.url())
+            .await
+            .expect("upstream preflight should succeed");
+        let first = temporary
+            .runtime
+            .prepare_transport(&target, &checked)
+            .await
+            .expect("first TLS material should prepare");
+
+        let replacement_key =
+            rcgen::KeyPair::generate().expect("replacement identity key should build");
+        let replacement_certificate = CertificateParams::default()
+            .self_signed(&replacement_key)
+            .expect("replacement identity certificate should build");
+        fs::write(temporary.root.join("ca.pem"), replacement_certificate.pem())
+            .expect("replacement CA should write");
+        fs::write(
+            temporary.root.join("client-certificate.pem"),
+            replacement_certificate.pem(),
+        )
+        .expect("replacement certificate should write");
+        fs::write(
+            temporary.root.join("client-private-key.pem"),
+            replacement_key.serialize_pem(),
+        )
+        .expect("replacement private key should write");
+
+        let second = temporary
+            .runtime
+            .prepare_transport(&target, &checked)
+            .await
+            .expect("rotated TLS material should prepare");
+        assert_ne!(
+            first.client().client_identity_fingerprint(),
+            second.client().client_identity_fingerprint(),
+            "material rotation must not reuse the previous identity"
+        );
+        assert_ne!(
+            first.client().configuration_generation(),
+            second.client().configuration_generation(),
+            "material rotation must select a distinct cached transport"
+        );
+    }
+
+    #[test]
+    fn persisted_http_test_target_can_probe_disabled_connection_without_widening_runtime() {
+        let mut write = record("/v1").write;
+        write.enabled = false;
+        write.test_profile = Some(ConnectionTestProfile {
+            method: "HEAD".to_owned(),
+            path: "/ready".to_owned(),
+            expected_statuses: vec![200, 204],
+        });
+        let temporary = TemporaryManagedRuntime::from_write("disabled-http-test", write);
+
+        let normal_error = match temporary
+            .runtime
+            .target(temporary.connection_id.as_str(), "/ready")
+        {
+            Ok(_) => panic!("normal target must reject a disabled connection"),
+            Err(error) => error,
+        };
+        assert_eq!(normal_error, ConnectionHttpError::ConnectionDisabled);
+        let test = temporary
+            .runtime
+            .test_target(temporary.connection_id.as_str())
+            .expect("persisted test mode should permit a disabled connection");
+        assert_eq!(test.method(), Method::HEAD);
+        assert_eq!(test.target().url(), "https://billing.example.test/v1/ready");
+        assert_eq!(test.expected_statuses(), &[200, 204]);
+    }
+
+    #[test]
+    fn persisted_mcp_test_target_can_probe_disabled_managed_mcp_only() {
+        let mut write = record("/mcp").write;
+        write.enabled = false;
+        write.kind = ConnectionKind::McpStreamableHttp;
+        write.discovery = Some(DiscoveryConfig::ManagedMcp {
+            use_connection_authentication: false,
+        });
+        let temporary = TemporaryManagedRuntime::from_write("disabled-mcp-test", write);
+
+        let normal_error = match temporary
+            .runtime
+            .mcp_target(temporary.connection_id.as_str())
+        {
+            Ok(_) => panic!("normal MCP target must reject a disabled connection"),
+            Err(error) => error,
+        };
+        assert_eq!(normal_error, ConnectionHttpError::ConnectionDisabled);
+        let test = temporary
+            .runtime
+            .mcp_test_target(temporary.connection_id.as_str())
+            .expect("persisted MCP test mode should permit a disabled managed MCP connection");
+        assert_eq!(test.url(), "https://billing.example.test/mcp");
+        assert_eq!(test.authentication_kind(), "none");
+    }
+
+    #[test]
+    fn transport_partition_covers_identity_revisions_profile_and_local_tls_versions() {
+        let base = record("/");
+        let expected = connection_transport_partition(
+            &base.id,
+            &base.revisions,
+            ConnectionClientProfile::Upstream,
+            [None, None, None],
+        );
+
+        let mut other_id = base.clone();
+        other_id.id = ConnectionId::parse("another").expect("test connection ID");
+        assert_ne!(
+            expected,
+            connection_transport_partition(
+                &other_id.id,
+                &other_id.revisions,
+                ConnectionClientProfile::Upstream,
+                [None, None, None],
+            )
+        );
+        for field in 0..5 {
+            let mut revisions = base.revisions.clone();
+            match field {
+                0 => revisions.connection += 1,
+                1 => revisions.credential += 1,
+                2 => revisions.tls += 1,
+                3 => revisions.discovery += 1,
+                4 => revisions.status += 1,
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                expected,
+                connection_transport_partition(
+                    &base.id,
+                    &revisions,
+                    ConnectionClientProfile::Upstream,
+                    [None, None, None],
+                ),
+                "stored revision field {field} must partition transport identity"
+            );
+        }
+        assert_ne!(
+            expected,
+            connection_transport_partition(
+                &base.id,
+                &base.revisions,
+                ConnectionClientProfile::OAuthToken,
+                [None, None, None],
+            )
+        );
+        assert_ne!(
+            expected,
+            connection_transport_partition(
+                &base.id,
+                &base.revisions,
+                ConnectionClientProfile::Upstream,
+                [Some(1), Some(2), Some(3)],
+            )
+        );
     }
 
     #[test]

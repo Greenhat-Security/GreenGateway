@@ -12,6 +12,7 @@ pub const SERVICE_TOKEN_DELEGATION_REJECTED: &str = "service_token.delegation_re
 pub const CONNECTION_CHANGED: &str = "connection.changed";
 pub const CONNECTION_CREDENTIAL_CHANGED: &str = "connection.credential_changed";
 pub const CONNECTION_REFRESHED: &str = "connection.refreshed";
+pub const CONNECTION_TESTED: &str = "connection.tested";
 pub const CONNECTION_OAUTH_TOKEN_REFRESH: &str = "connection.oauth_token_refresh";
 pub const CONNECTION_SECRET_RESOLUTION_FAILED: &str = "connection.secret_resolution_failed";
 pub const GATEWAY_READY: &str = "gateway.ready";

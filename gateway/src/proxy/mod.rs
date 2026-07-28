@@ -458,7 +458,7 @@ impl ProxyState {
                             "connection-bound route",
                         ),
                         weight: 1,
-                        egress_client: Arc::clone(target.client()),
+                        egress_client: Arc::clone(target.preflight_client()),
                         health: health::UpstreamHealthState::new(
                             Arc::<str>::from(route_id.as_str()),
                             endpoint_id,
