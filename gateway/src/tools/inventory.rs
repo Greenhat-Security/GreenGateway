@@ -9,10 +9,11 @@ use crate::{
     connections::{
         control_plane::{ConnectionControlPlane, ConnectionRuntimeSnapshot},
         model::{ConnectionId, ConnectionKind, ConnectionManagementSource},
+        projection::projected_legacy_mcp_connection_id,
         status::{ConnectionOperationalState, ConnectionStatusReason, SafeConnectionStatus},
         store::{
-            ConnectionStoreError, StoredMcpCatalog, StoredOpenApiCatalogEntry,
-            StoredOpenApiInventoryCatalog,
+            ConnectionStoreError, StoredMcpCatalog, StoredMcpCatalogEntry,
+            StoredOpenApiCatalogEntry, StoredOpenApiInventoryCatalog,
         },
     },
     middleware::rbac::RbacState,
@@ -252,15 +253,15 @@ struct ConnectionContext {
     status: Option<SafeConnectionStatus>,
 }
 
-#[derive(Clone)]
-enum DurableToolCatalog {
+#[derive(Clone, Copy)]
+enum DurableToolCatalog<'a> {
     Openapi {
-        catalog: StoredOpenApiInventoryCatalog,
-        entry: StoredOpenApiCatalogEntry,
+        catalog: &'a StoredOpenApiInventoryCatalog,
+        entry: &'a StoredOpenApiCatalogEntry,
     },
     Mcp {
-        catalog: StoredMcpCatalog,
-        definition: Box<ToolDefinition>,
+        catalog: &'a StoredMcpCatalog,
+        entry: &'a StoredMcpCatalogEntry,
     },
 }
 
@@ -463,7 +464,7 @@ impl CapabilityInventory {
                 return Err(CapabilityInventoryError::CorruptState);
             }
             let (source, connection, state) =
-                local_tool_context(&definition, &snapshot, &connections);
+                local_tool_context(&definition, &snapshot, &connections)?;
             let policy = tool_policy(rbac_state, principal, &definition.name);
             let capability = tool_capability(
                 definition.as_ref().clone(),
@@ -594,25 +595,17 @@ impl CapabilityInventory {
     }
 }
 
-fn durable_tool_catalogs(
-    mcp_catalogs: &[StoredMcpCatalog],
-    openapi_catalogs: &[StoredOpenApiInventoryCatalog],
-) -> Result<BTreeMap<String, DurableToolCatalog>, CapabilityInventoryError> {
+fn durable_tool_catalogs<'a>(
+    mcp_catalogs: &'a [StoredMcpCatalog],
+    openapi_catalogs: &'a [StoredOpenApiInventoryCatalog],
+) -> Result<BTreeMap<String, DurableToolCatalog<'a>>, CapabilityInventoryError> {
     let mut tools = BTreeMap::new();
     for catalog in openapi_catalogs {
         for entry in &catalog.entries {
-            let definition = serde_json::from_value::<ToolDefinition>(entry.definition.clone())
-                .map_err(|_| CapabilityInventoryError::CorruptState)?;
-            if definition.name != entry.tool_name {
-                return Err(CapabilityInventoryError::CorruptState);
-            }
             if tools
                 .insert(
                     entry.tool_name.clone(),
-                    DurableToolCatalog::Openapi {
-                        catalog: catalog.clone(),
-                        entry: entry.clone(),
-                    },
+                    DurableToolCatalog::Openapi { catalog, entry },
                 )
                 .is_some()
             {
@@ -622,20 +615,9 @@ fn durable_tool_catalogs(
     }
     for catalog in mcp_catalogs {
         for entry in &catalog.entries {
-            let definition = ToolDefinition::mcp_connection(
-                catalog.connection_id.to_string(),
-                entry.description.clone(),
-                entry.input_schema.clone(),
-                entry.remote_tool_name.clone(),
-            );
+            let tool_name = format!("{}:{}", catalog.connection_id, entry.remote_tool_name);
             if tools
-                .insert(
-                    definition.name.clone(),
-                    DurableToolCatalog::Mcp {
-                        catalog: catalog.clone(),
-                        definition: Box::new(definition),
-                    },
-                )
+                .insert(tool_name, DurableToolCatalog::Mcp { catalog, entry })
                 .is_some()
             {
                 return Err(CapabilityInventoryError::CorruptState);
@@ -646,7 +628,7 @@ fn durable_tool_catalogs(
 }
 
 fn durable_tool_parts(
-    durable: &DurableToolCatalog,
+    durable: &DurableToolCatalog<'_>,
     connections: &BTreeMap<ConnectionId, ConnectionContext>,
 ) -> Result<
     (
@@ -662,6 +644,9 @@ fn durable_tool_parts(
         DurableToolCatalog::Openapi { catalog, entry } => {
             let definition = serde_json::from_value::<ToolDefinition>(entry.definition.clone())
                 .map_err(|_| CapabilityInventoryError::CorruptState)?;
+            if definition.name != entry.tool_name {
+                return Err(CapabilityInventoryError::CorruptState);
+            }
             let (source_connection_id, operation_id, source_revision) = match &definition.source {
                 ToolSource::OpenApi {
                     connection_id,
@@ -701,10 +686,13 @@ fn durable_tool_parts(
                 ),
             ))
         }
-        DurableToolCatalog::Mcp {
-            catalog,
-            definition,
-        } => {
+        DurableToolCatalog::Mcp { catalog, entry } => {
+            let definition = ToolDefinition::mcp_connection(
+                catalog.connection_id.to_string(),
+                entry.description.clone(),
+                entry.input_schema.clone(),
+                entry.remote_tool_name.clone(),
+            );
             let connection = connections
                 .get(&catalog.connection_id)
                 .ok_or(CapabilityInventoryError::CorruptState)?;
@@ -726,7 +714,7 @@ fn durable_tool_parts(
                 return Err(CapabilityInventoryError::CorruptState);
             }
             Ok((
-                definition.as_ref().clone(),
+                definition,
                 CapabilitySource::McpDiscovery {
                     connection_id: catalog.connection_id.to_string(),
                     remote_tool_name: Some(remote_tool_name),
@@ -844,11 +832,14 @@ fn local_tool_context(
     definition: &ToolDefinition,
     snapshot: &ConnectionRuntimeSnapshot,
     connections: &BTreeMap<ConnectionId, ConnectionContext>,
-) -> (
-    CapabilitySource,
-    Option<CapabilityConnection>,
-    CapabilityState,
-) {
+) -> Result<
+    (
+        CapabilitySource,
+        Option<CapabilityConnection>,
+        CapabilityState,
+    ),
+    CapabilityInventoryError,
+> {
     if let Some(proxy) = definition.upstream.mcp_proxy_mapping() {
         let projection = snapshot.legacy().iter().find(|projection| {
             projection.legacy_mcp_server_name() == Some(proxy.server_name.as_str())
@@ -856,7 +847,7 @@ fn local_tool_context(
         if let Some(projection) = projection {
             let id = projection.id();
             let connection = connections.get(id).map(|context| context.reference.clone());
-            return (
+            return Ok((
                 CapabilitySource::ProjectedLegacyConfig {
                     connection_id: id.to_string(),
                     remote_tool_name: proxy.tool_name,
@@ -868,9 +859,34 @@ fn local_tool_context(
                     stale: false,
                     reason: "available",
                 },
-            );
+            ));
         }
-        return (
+        if snapshot.omitted_legacy_projection_count() > 0
+            && definition.target.is_none()
+            && matches!(&definition.source, ToolSource::Legacy)
+        {
+            let id = projected_legacy_mcp_connection_id(&proxy.server_name)
+                .map_err(|_| CapabilityInventoryError::CorruptState)?;
+            let connection = CapabilityConnection {
+                id: id.clone(),
+                kind: ConnectionKind::McpStreamableHttp,
+                management_source: ConnectionManagementSource::LegacyMcp,
+            };
+            return Ok((
+                CapabilitySource::ProjectedLegacyConfig {
+                    connection_id: id.to_string(),
+                    remote_tool_name: proxy.tool_name,
+                },
+                Some(connection),
+                CapabilityState {
+                    enabled: true,
+                    available: true,
+                    stale: false,
+                    reason: "available",
+                },
+            ));
+        }
+        return Ok((
             CapabilitySource::ManualFile,
             None,
             CapabilityState {
@@ -879,7 +895,7 @@ fn local_tool_context(
                 stale: false,
                 reason: "connection_not_found",
             },
-        );
+        ));
     }
 
     let context = match &definition.target {
@@ -928,11 +944,11 @@ fn local_tool_context(
             reason: "connection_not_found",
         },
     };
-    (
+    Ok((
         CapabilitySource::ManualFile,
         context.map(|context| context.reference.clone()),
         state,
-    )
+    ))
 }
 
 fn tool_capability(
@@ -1060,6 +1076,7 @@ fn normalize_filters(
             (available, availability),
             (true, CapabilityAvailabilityFilter::Available)
                 | (false, CapabilityAvailabilityFilter::Unavailable)
+                | (true, CapabilityAvailabilityFilter::Stale)
                 | (false, CapabilityAvailabilityFilter::Stale)
         );
         if !compatible {
@@ -1219,9 +1236,9 @@ mod tests {
     use crate::{
         audit::{sink::tests::CaptureSink, AuditLog, AuditSink},
         auth::AuthMethod,
-        config::Config,
+        config::{Config, McpUpstreamServerConfig},
         connections::{
-            model::ConnectionWrite,
+            model::{ConnectionWrite, MAX_CONNECTIONS},
             store::{
                 StoredConnection, StoredMcpCatalogEntry, StoredMcpResource,
                 StoredMcpResourceTemplate, StoredOpenApiCatalogEntry,
@@ -1504,6 +1521,117 @@ mod tests {
             }
         }))
         .expect("managed OpenAPI candidate should deserialize")
+    }
+
+    #[test]
+    fn durable_tool_index_borrows_catalogs_and_entries() {
+        let fixture = ManagedInventoryFixture::new("borrowed-durable-index");
+        let snapshot = fixture.control_plane.runtime_snapshot();
+        let (mcp_catalogs, openapi_catalogs, _) = fixture
+            .inventory
+            .load_managed_inventory(&snapshot)
+            .expect("managed catalogs should load");
+        let durable = durable_tool_catalogs(&mcp_catalogs, &openapi_catalogs)
+            .expect("durable tool index should build");
+
+        match *durable
+            .get(&fixture.mcp_tool_name)
+            .expect("MCP tool should be indexed")
+        {
+            DurableToolCatalog::Mcp { catalog, entry } => {
+                assert!(std::ptr::eq(catalog, &mcp_catalogs[0]));
+                assert!(std::ptr::eq(entry, &mcp_catalogs[0].entries[0]));
+            }
+            DurableToolCatalog::Openapi { .. } => panic!("MCP tool used OpenAPI provenance"),
+        }
+        match *durable
+            .get(&fixture.openapi_tool_name)
+            .expect("OpenAPI tool should be indexed")
+        {
+            DurableToolCatalog::Openapi { catalog, entry } => {
+                assert!(std::ptr::eq(catalog, &openapi_catalogs[0]));
+                assert!(std::ptr::eq(entry, &openapi_catalogs[0].entries[0]));
+            }
+            DurableToolCatalog::Mcp { .. } => panic!("OpenAPI tool used MCP provenance"),
+        }
+    }
+
+    #[test]
+    fn stale_filter_accepts_both_callable_and_unavailable_intersections() {
+        for available in [true, false] {
+            assert!(normalize_filters(&CapabilityListParams {
+                available: Some(available),
+                availability: Some(CapabilityAvailabilityFilter::Stale),
+                ..CapabilityListParams::default()
+            })
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn omitted_legacy_mcp_projection_keeps_safe_available_attribution() {
+        let omitted_server_name = format!("server-{MAX_CONNECTIONS}");
+        let mut config = Config::test_defaults();
+        config.mcp_upstream_servers = (0..=MAX_CONNECTIONS)
+            .map(|index| McpUpstreamServerConfig {
+                name: format!("server-{index}"),
+                url: format!("https://mcp-{index}.example.test"),
+                timeout_ms: None,
+                response_idle_timeout_ms: None,
+                connect_timeout_ms: None,
+            })
+            .collect();
+        let control_plane = ConnectionControlPlane::from_config(&config)
+            .expect("legacy projection overflow should remain supported");
+        let snapshot = control_plane.runtime_snapshot();
+        assert_eq!(snapshot.omitted_legacy_projection_count(), 1);
+        assert!(snapshot.legacy().iter().all(|projection| {
+            projection.legacy_mcp_server_name() != Some(omitted_server_name.as_str())
+        }));
+
+        let definition = ToolDefinition::mcp_proxy(
+            "overflow:lookup".to_owned(),
+            "Look up an overflow item".to_owned(),
+            json!({"type": "object"}),
+            omitted_server_name.clone(),
+            "lookup".to_owned(),
+        );
+        let connections = connection_contexts(&snapshot, &BTreeMap::new());
+        let (source, connection, state) = local_tool_context(&definition, &snapshot, &connections)
+            .expect("overflow attribution should build");
+        let expected_id = projected_legacy_mcp_connection_id(&omitted_server_name)
+            .expect("overflow projection identity should be valid");
+
+        assert!(matches!(
+            &source,
+            CapabilitySource::ProjectedLegacyConfig {
+                connection_id,
+                remote_tool_name,
+            } if connection_id == expected_id.as_str() && remote_tool_name == "lookup"
+        ));
+        assert_eq!(
+            connection,
+            Some(CapabilityConnection {
+                id: expected_id,
+                kind: ConnectionKind::McpStreamableHttp,
+                management_source: ConnectionManagementSource::LegacyMcp,
+            })
+        );
+        assert!(state.enabled && state.available && !state.stale);
+        assert_eq!(state.reason, "available");
+        assert!(!serde_json::to_string(&source)
+            .expect("safe attribution should serialize")
+            .contains("example.test"));
+
+        let mut unknown_manual = definition;
+        unknown_manual.source = ToolSource::Manual;
+        let (source, connection, state) =
+            local_tool_context(&unknown_manual, &snapshot, &connections)
+                .expect("manual missing-connection attribution should build");
+        assert_eq!(source, CapabilitySource::ManualFile);
+        assert!(connection.is_none());
+        assert!(state.enabled && !state.available && !state.stale);
+        assert_eq!(state.reason, "connection_not_found");
     }
 
     #[test]

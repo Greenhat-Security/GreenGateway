@@ -142,15 +142,12 @@ pub fn project_legacy_connections(
     }
 
     for server in &config.mcp_upstream_servers {
-        let normalized_name = normalize_mcp_name(&server.name);
+        let id = projected_legacy_mcp_connection_id(&server.name)?;
         push_projection(
             &mut projected,
             &mut ids,
             LegacyProjectionSpec {
-                id: format!(
-                    "{MCP_ID_PREFIX}{normalized_name}-{}",
-                    stable_digest(&server.name)
-                ),
+                id: id.to_string(),
                 display_name: bounded_display_name(server.name.clone()),
                 kind: ConnectionKind::McpStreamableHttp,
                 source: ConnectionManagementSource::LegacyMcp,
@@ -165,6 +162,17 @@ pub fn project_legacy_connections(
         omitted_count: count.saturating_sub(projected.len()),
         connections: projected,
     })
+}
+
+pub(crate) fn projected_legacy_mcp_connection_id(
+    server_name: &str,
+) -> Result<ConnectionId, LegacyProjectionError> {
+    let normalized_name = normalize_mcp_name(server_name);
+    let id = format!(
+        "{MCP_ID_PREFIX}{normalized_name}-{}",
+        stable_digest(server_name)
+    );
+    ConnectionId::parse(id.clone()).map_err(|_| LegacyProjectionError::InvalidGeneratedId { id })
 }
 
 fn push_projection(
@@ -303,6 +311,11 @@ mod tests {
         assert_eq!(ids[0], "legacy-default-http");
         assert_eq!(ids[1], "legacy-route-payments");
         assert!(ids[2].starts_with("legacy-mcp-issue-tracker-"));
+        assert_eq!(
+            projected.connections[2].id(),
+            &projected_legacy_mcp_connection_id("Issue Tracker")
+                .expect("shared MCP projection identity should be valid")
+        );
         assert_eq!(projected.connections[0].legacy_mcp_server_name(), None);
         assert_eq!(projected.connections[1].legacy_mcp_server_name(), None);
         assert_eq!(

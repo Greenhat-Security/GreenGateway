@@ -433,12 +433,17 @@ pub async fn discover_connection_catalog(
         &runtime_config,
         &destination,
         credential,
-        Some(response_budget),
+        Some(response_budget.clone()),
     )
     .await?;
     let discovered = discover_catalog_with_limits(&mut service).await;
-    let _ = service.close_with_timeout(Duration::from_millis(250)).await;
+    let close_result = service.close_with_timeout(Duration::from_millis(250)).await;
+    drop(service);
+    response_budget.seal()?;
     let discovered = discovered?;
+    if !matches!(close_result, Ok(Some(_))) {
+        return Err(McpUpstreamCallError::Call);
+    }
     let catalog = McpDiscoveredCatalog {
         tools: discovered
             .tools
@@ -869,27 +874,75 @@ fn mcp_http_client(
 
 #[derive(Clone)]
 struct DiscoveryResponseByteBudget {
-    consumed: Arc<AtomicUsize>,
+    state: Arc<AtomicUsize>,
     maximum: usize,
 }
 
 impl DiscoveryResponseByteBudget {
+    const SEALED: usize = usize::MAX - 1;
+    const EXCEEDED: usize = usize::MAX;
+
     fn new(maximum: usize) -> Self {
+        assert!(
+            maximum < Self::SEALED,
+            "MCP discovery response byte limit must leave room for internal states"
+        );
         Self {
-            consumed: Arc::new(AtomicUsize::new(0)),
+            state: Arc::new(AtomicUsize::new(0)),
             maximum,
         }
     }
 
     fn charge(&self, bytes: usize) -> Result<(), LimitedMcpHttpError> {
-        self.consumed
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |consumed| {
-                consumed
-                    .checked_add(bytes)
-                    .filter(|next| *next <= self.maximum)
-            })
-            .map(|_| ())
-            .map_err(|_| LimitedMcpHttpError::DiscoveryResponseTooLarge { max: self.maximum })
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            if matches!(current, Self::SEALED | Self::EXCEEDED) {
+                return Err(self.limit_error());
+            }
+            let next = current
+                .checked_add(bytes)
+                .filter(|next| *next <= self.maximum)
+                .unwrap_or(Self::EXCEEDED);
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) if next == Self::EXCEEDED => return Err(self.limit_error()),
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn seal(&self) -> Result<(), McpUpstreamCallError> {
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            match current {
+                Self::EXCEEDED => {
+                    return Err(McpUpstreamCallError::DiscoveryResponseLimitExceeded {
+                        max: self.maximum,
+                    });
+                }
+                Self::SEALED => return Ok(()),
+                _ => {
+                    match self.state.compare_exchange_weak(
+                        current,
+                        Self::SEALED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(observed) => current = observed,
+                    }
+                }
+            }
+        }
+    }
+
+    fn limit_error(&self) -> LimitedMcpHttpError {
+        LimitedMcpHttpError::DiscoveryResponseTooLarge { max: self.maximum }
     }
 }
 
@@ -1837,6 +1890,28 @@ mod tests {
             mcp_service_error(error, McpUpstreamCallError::Call),
             McpUpstreamCallError::DiscoveryResponseLimitExceeded { max }
                 if max == maximum
+        ));
+    }
+
+    #[test]
+    fn discovery_raw_response_budget_exceeded_state_is_shared_and_sticky() {
+        let budget = DiscoveryResponseByteBudget::new(8);
+        let shared = budget.clone();
+
+        budget
+            .charge(8)
+            .expect("bytes at the discovery response limit should fit");
+        assert!(matches!(
+            shared.charge(1),
+            Err(LimitedMcpHttpError::DiscoveryResponseTooLarge { max: 8 })
+        ));
+        assert!(matches!(
+            budget.charge(0),
+            Err(LimitedMcpHttpError::DiscoveryResponseTooLarge { max: 8 })
+        ));
+        assert!(matches!(
+            shared.seal(),
+            Err(McpUpstreamCallError::DiscoveryResponseLimitExceeded { max: 8 })
         ));
     }
 

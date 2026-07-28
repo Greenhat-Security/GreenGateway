@@ -1241,6 +1241,21 @@ impl SqliteConnectionStore {
                 maximum: MAX_CATALOG_ENTRIES,
             });
         }
+        let retained_catalog_bytes = mcp_catalog_bytes(
+            &transaction,
+            &self.path,
+            Some(id),
+            "MCP retained catalog byte count",
+        )?;
+        if retained_catalog_bytes
+            .checked_add(validated.stored_bytes)
+            .is_none_or(|total| total > MAX_MANAGED_MCP_CATALOG_BYTES)
+        {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog bytes",
+                maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+            });
+        }
 
         let previous_revision = transaction
             .query_row(
@@ -2528,6 +2543,7 @@ fn validate_persisted_state(
 
 struct ValidatedMcpCatalog {
     encoded_tool_schemas: Vec<String>,
+    stored_bytes: usize,
 }
 
 fn validate_mcp_catalog(
@@ -2549,9 +2565,15 @@ fn validate_mcp_catalog(
     validate_mcp_resources(resources)?;
     validate_mcp_resource_templates(resource_templates)?;
 
-    let mut encoded_bytes = encoded_tool_schemas
+    let mut encoded_bytes = entries
         .iter()
-        .try_fold(0_usize, |total, encoded| total.checked_add(encoded.len()))
+        .zip(&encoded_tool_schemas)
+        .try_fold(0_usize, |total, (entry, encoded)| {
+            total
+                .checked_add(entry.remote_tool_name.len())
+                .and_then(|total| total.checked_add(entry.description.len()))
+                .and_then(|total| total.checked_add(encoded.len()))
+        })
         .ok_or(ConnectionStoreError::LimitExceeded {
             resource: "connection MCP catalog bytes",
             maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
@@ -2595,6 +2617,7 @@ fn validate_mcp_catalog(
 
     Ok(ValidatedMcpCatalog {
         encoded_tool_schemas,
+        stored_bytes: encoded_bytes,
     })
 }
 
@@ -3034,6 +3057,14 @@ fn load_mcp_catalogs(
     path: &Path,
     requested_id: Option<&ConnectionId>,
 ) -> Result<Vec<StoredMcpCatalog>, ConnectionStoreError> {
+    if mcp_catalog_bytes(connection, path, None, "MCP catalog byte load validation")?
+        > MAX_MANAGED_MCP_CATALOG_BYTES
+    {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection MCP catalog bytes",
+            maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+        });
+    }
     let query = if requested_id.is_some() {
         r#"
         SELECT connection_id, catalog_revision, observed_etag, refreshed_at, entry_count,
@@ -3752,6 +3783,122 @@ fn count_rows(
     usize::try_from(count).map_err(|_| ConnectionStoreError::CorruptRecord {
         id: format!("<{resource}>"),
         reason: "negative or oversized persisted row count",
+    })
+}
+
+fn mcp_catalog_bytes(
+    connection: &Connection,
+    path: &Path,
+    excluded_id: Option<&ConnectionId>,
+    operation: &'static str,
+) -> Result<usize, ConnectionStoreError> {
+    let entry_bytes = aggregate_catalog_bytes(
+        connection,
+        path,
+        excluded_id,
+        operation,
+        r#"
+        SELECT COALESCE(SUM(
+            length(CAST(remote_tool_name AS BLOB))
+          + length(CAST(description AS BLOB))
+          + length(CAST(input_schema_json AS BLOB))
+        ), 0)
+        FROM connection_mcp_catalog_entries
+        "#,
+        r#"
+        SELECT COALESCE(SUM(
+            length(CAST(remote_tool_name AS BLOB))
+          + length(CAST(description AS BLOB))
+          + length(CAST(input_schema_json AS BLOB))
+        ), 0)
+        FROM connection_mcp_catalog_entries
+        WHERE connection_id != ?1
+        "#,
+    )?;
+    let resource_bytes = aggregate_catalog_bytes(
+        connection,
+        path,
+        excluded_id,
+        operation,
+        r#"
+        SELECT COALESCE(SUM(
+            length(CAST(uri AS BLOB))
+          + length(CAST(name AS BLOB))
+          + COALESCE(length(CAST(title AS BLOB)), 0)
+          + COALESCE(length(CAST(description AS BLOB)), 0)
+          + COALESCE(length(CAST(mime_type AS BLOB)), 0)
+          + CASE WHEN size IS NULL THEN 0 ELSE 8 END
+        ), 0)
+        FROM connection_mcp_catalog_resources
+        "#,
+        r#"
+        SELECT COALESCE(SUM(
+            length(CAST(uri AS BLOB))
+          + length(CAST(name AS BLOB))
+          + COALESCE(length(CAST(title AS BLOB)), 0)
+          + COALESCE(length(CAST(description AS BLOB)), 0)
+          + COALESCE(length(CAST(mime_type AS BLOB)), 0)
+          + CASE WHEN size IS NULL THEN 0 ELSE 8 END
+        ), 0)
+        FROM connection_mcp_catalog_resources
+        WHERE connection_id != ?1
+        "#,
+    )?;
+    let template_bytes = aggregate_catalog_bytes(
+        connection,
+        path,
+        excluded_id,
+        operation,
+        r#"
+        SELECT COALESCE(SUM(
+            length(CAST(uri_template AS BLOB))
+          + length(CAST(name AS BLOB))
+          + COALESCE(length(CAST(title AS BLOB)), 0)
+          + COALESCE(length(CAST(description AS BLOB)), 0)
+          + COALESCE(length(CAST(mime_type AS BLOB)), 0)
+        ), 0)
+        FROM connection_mcp_catalog_resource_templates
+        "#,
+        r#"
+        SELECT COALESCE(SUM(
+            length(CAST(uri_template AS BLOB))
+          + length(CAST(name AS BLOB))
+          + COALESCE(length(CAST(title AS BLOB)), 0)
+          + COALESCE(length(CAST(description AS BLOB)), 0)
+          + COALESCE(length(CAST(mime_type AS BLOB)), 0)
+        ), 0)
+        FROM connection_mcp_catalog_resource_templates
+        WHERE connection_id != ?1
+        "#,
+    )?;
+
+    entry_bytes
+        .checked_add(resource_bytes)
+        .and_then(|bytes| bytes.checked_add(template_bytes))
+        .ok_or(ConnectionStoreError::LimitExceeded {
+            resource: "connection MCP catalog bytes",
+            maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aggregate_catalog_bytes(
+    connection: &Connection,
+    path: &Path,
+    excluded_id: Option<&ConnectionId>,
+    operation: &'static str,
+    all_query: &'static str,
+    excluding_query: &'static str,
+) -> Result<usize, ConnectionStoreError> {
+    let bytes: i64 = if let Some(id) = excluded_id {
+        connection.query_row(excluding_query, params![id.as_str()], |row| row.get(0))
+    } else {
+        connection.query_row(all_query, [], |row| row.get(0))
+    }
+    .map_err(|source| sqlite_error(path, operation, source))?;
+    usize::try_from(bytes).map_err(|_| ConnectionStoreError::CorruptRecord {
+        id: "<mcp-catalogs>".to_owned(),
+        reason: "invalid MCP catalog byte count",
     })
 }
 
@@ -4579,6 +4726,61 @@ mod tests {
         }
     }
 
+    fn persist_oversized_mcp_resource_catalog(
+        store: &SqliteConnectionStore,
+        connection_id: &ConnectionId,
+        locator_canary: &str,
+    ) {
+        let oversized_description = "😀".repeat(MAX_MCP_RESOURCE_DESCRIPTION_CHARS);
+        let mut connection = store.connection_guard();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("corrupt MCP fixture transaction should begin");
+        {
+            let mut statement = transaction
+                .prepare(
+                    r#"
+                    INSERT INTO connection_mcp_catalog_resources (
+                        connection_id, uri, name, title, description, mime_type, size, ordinal
+                    ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, NULL, ?5)
+                    "#,
+                )
+                .expect("corrupt MCP resource insert should prepare");
+            for ordinal in 0..MAX_CATALOG_ENTRIES {
+                let uri = if ordinal == 0 {
+                    format!("gg://resource/first?token={locator_canary}")
+                } else {
+                    format!("gg://resource/{ordinal:04}")
+                };
+                statement
+                    .execute(params![
+                        connection_id.as_str(),
+                        uri,
+                        format!("resource-{ordinal:04}"),
+                        oversized_description,
+                        i64::try_from(ordinal).expect("fixture ordinal should fit"),
+                    ])
+                    .expect("corrupt MCP resource fixture should insert");
+            }
+        }
+        transaction
+            .execute(
+                r#"
+                UPDATE connection_mcp_catalogs
+                SET resource_count = ?1
+                WHERE connection_id = ?2
+                "#,
+                params![
+                    i64::try_from(MAX_CATALOG_ENTRIES).expect("fixture count should fit"),
+                    connection_id.as_str(),
+                ],
+            )
+            .expect("corrupt MCP resource count should update");
+        transaction
+            .commit()
+            .expect("corrupt MCP fixture transaction should commit");
+    }
+
     fn openapi_catalog_entry(name: &str) -> StoredOpenApiCatalogEntry {
         StoredOpenApiCatalogEntry {
             tool_name: name.to_owned(),
@@ -5226,6 +5428,121 @@ mod tests {
             Some(baseline),
             "invalid count and byte candidates must not replace the last-known-good catalog"
         );
+    }
+
+    #[test]
+    fn aggregate_mcp_catalog_byte_bound_preserves_all_last_known_good_catalogs() {
+        let (_directory, _path, store) = temporary_store("mcp-aggregate-byte-bound");
+        let first = store
+            .create(mcp_candidate())
+            .expect("first MCP Connection should create");
+        let mut second_candidate = mcp_candidate();
+        second_candidate.display_name = "Second managed MCP".to_owned();
+        let second = store
+            .create(second_candidate)
+            .expect("second MCP Connection should create");
+        let baseline = store
+            .replace_mcp_catalog(
+                &second.id,
+                &second.etag(),
+                &[mcp_catalog_entry("baseline", "Baseline")],
+                &[],
+                &[],
+            )
+            .expect("second MCP baseline should publish");
+
+        let maximum_description = "😀".repeat(MAX_MCP_TOOL_DESCRIPTION_CHARS);
+        let first_entries = (0..MAX_CATALOG_ENTRIES / 2)
+            .map(|index| mcp_catalog_entry(&format!("first-{index:04}"), &maximum_description))
+            .collect::<Vec<_>>();
+        let first_bytes = validate_mcp_catalog(&first_entries, &[], &[])
+            .expect("first half-bound catalog should validate")
+            .stored_bytes;
+        store
+            .replace_mcp_catalog(&first.id, &first.etag(), &first_entries, &[], &[])
+            .expect("first half-bound catalog should publish");
+        drop(first_entries);
+
+        let second_entries = (0..MAX_CATALOG_ENTRIES / 2)
+            .map(|index| mcp_catalog_entry(&format!("second-{index:04}"), &maximum_description))
+            .collect::<Vec<_>>();
+        let second_bytes = validate_mcp_catalog(&second_entries, &[], &[])
+            .expect("second half-bound catalog should validate")
+            .stored_bytes;
+        assert!(first_bytes <= MAX_MANAGED_MCP_CATALOG_BYTES);
+        assert!(second_bytes <= MAX_MANAGED_MCP_CATALOG_BYTES);
+        assert!(
+            first_bytes
+                .checked_add(second_bytes)
+                .is_some_and(|total| total > MAX_MANAGED_MCP_CATALOG_BYTES),
+            "the two independently valid catalogs must exceed the global byte bound"
+        );
+
+        assert!(matches!(
+            store.replace_mcp_catalog(&second.id, &second.etag(), &second_entries, &[], &[],),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog bytes",
+                maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+            })
+        ));
+        assert_eq!(
+            store
+                .mcp_catalog(&first.id)
+                .expect("retained first catalog should load")
+                .expect("retained first catalog should remain")
+                .entries
+                .len(),
+            MAX_CATALOG_ENTRIES / 2,
+            "aggregate rejection must not disturb another Connection's catalog"
+        );
+        assert_eq!(
+            store
+                .mcp_catalog(&second.id)
+                .expect("retained second catalog should load"),
+            Some(baseline),
+            "aggregate rejection must preserve the prior catalog"
+        );
+    }
+
+    #[test]
+    fn corrupt_aggregate_mcp_bytes_are_preflighted_on_load_and_restart() {
+        const LOCATOR_CANARY: &str = "OVERSIZED_MCP_LOCATOR_CANARY";
+
+        let (_directory, path, store) = temporary_store("mcp-aggregate-byte-corruption");
+        let created = store
+            .create(mcp_candidate())
+            .expect("MCP Connection should create");
+        store
+            .replace_mcp_catalog(&created.id, &created.etag(), &[], &[], &[])
+            .expect("empty MCP catalog should publish");
+        persist_oversized_mcp_resource_catalog(&store, &created.id, LOCATOR_CANARY);
+
+        let load_error = store
+            .mcp_catalogs()
+            .expect_err("oversized aggregate must fail before catalog rows load");
+        assert!(matches!(
+            &load_error,
+            ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog bytes",
+                maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+            }
+        ));
+        assert!(!format!("{load_error:?}").contains(LOCATOR_CANARY));
+        assert!(!load_error.to_string().contains(LOCATOR_CANARY));
+        drop(store);
+
+        let restart_error = SqliteConnectionStore::open(&path)
+            .err()
+            .expect("oversized aggregate must fail startup validation");
+        assert!(matches!(
+            &restart_error,
+            ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog bytes",
+                maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+            }
+        ));
+        assert!(!format!("{restart_error:?}").contains(LOCATOR_CANARY));
+        assert!(!restart_error.to_string().contains(LOCATOR_CANARY));
     }
 
     #[test]
