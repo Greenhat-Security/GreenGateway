@@ -28,9 +28,9 @@ use crate::{
     config::Config,
     path_match::{is_unsafe_request_path, path_prefix_matches},
     rbac::{
-        policy::ToolPolicyEntry, DefaultAction, EgressPolicy, EnforcementMode, Policy,
-        PolicyEngine, RouteRule, RuleAction, RuleDecision, RuleDispatchContext, RuleDispatchKind,
-        RuleMatcher,
+        policy::ToolPolicyEntry, rule::principal_identity_matches, DefaultAction, EgressPolicy,
+        EnforcementMode, Policy, PolicyEngine, RouteRule, RuleAction, RuleDecision,
+        RuleDispatchContext, RuleDispatchKind, RuleMatcher,
     },
     upstream_route::{
         self, ProxyRouteAuthorizationContext, ProxyRouteClassificationCompleted,
@@ -177,6 +177,12 @@ pub(crate) struct ToolPolicySnapshot<'a> {
     pub auth_methods: &'a [String],
     pub timeout_ms: u64,
     pub max_concurrent: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct ToolPolicyEligibility {
+    pub eligible: bool,
+    pub reason: &'static str,
 }
 
 #[derive(Serialize)]
@@ -346,6 +352,66 @@ impl RbacState {
             .load()
             .evaluate_tool_http_rule(method, path, principal)
     }
+
+    /// Previews whether the requesting principal may invoke a policy-backed
+    /// tool without emitting audit events or beginning tool execution.
+    ///
+    /// The live policy is loaded exactly once so the tool entry and any direct
+    /// tool-name rule are evaluated from the same immutable snapshot.
+    pub(crate) fn tool_policy_eligibility(
+        &self,
+        tool_name: &str,
+        principal: &auth::Principal,
+    ) -> ToolPolicyEligibility {
+        let policy = self.policy.load();
+        let Some(tool) = policy.tool_policy(tool_name) else {
+            return ToolPolicyEligibility {
+                eligible: false,
+                reason: "not_in_policy",
+            };
+        };
+
+        if !tool.enabled {
+            return ToolPolicyEligibility {
+                eligible: false,
+                reason: "policy_disabled",
+            };
+        }
+
+        if !tool_policy_principal_matches(tool, principal) {
+            return ToolPolicyEligibility {
+                eligible: false,
+                reason: "principal_not_eligible",
+            };
+        }
+
+        if policy
+            .evaluate_tool_rule(tool_name, Some(principal))
+            .is_some_and(|decision| decision.action == RuleAction::Deny)
+        {
+            return ToolPolicyEligibility {
+                eligible: false,
+                reason: "policy_denied",
+            };
+        }
+
+        ToolPolicyEligibility {
+            eligible: true,
+            reason: "eligible",
+        }
+    }
+}
+
+fn tool_policy_principal_matches(
+    tool: ToolPolicySnapshot<'_>,
+    principal: &auth::Principal,
+) -> bool {
+    principal_identity_matches(tool.issuers, tool.auth_methods, principal)
+        && (tool.allowed_roles.is_empty()
+            || tool
+                .allowed_roles
+                .iter()
+                .any(|allowed_role| principal.roles.iter().any(|role| role == allowed_role)))
 }
 
 impl RbacPolicyState {
@@ -1256,10 +1322,114 @@ mod tests {
         audit::{sink::tests::CaptureSink, AuditSink},
         auth::{AuthMethod, Principal},
         rbac::{
-            policy::{EgressPolicy, PolicyError, RoleEntry},
+            policy::{EgressPolicy, PolicyError, RoleEntry, ToolPolicyEntry},
             PrincipalMatcher, Rule, RuleAction,
         },
     };
+
+    #[test]
+    fn tool_policy_eligibility_returns_bounded_safe_reasons_without_auditing() {
+        let principal = test_principal(&["operator"]);
+
+        let (missing_state, missing_capture) =
+            test_state(test_policy(DefaultAction::Deny, &[], &[]), &[]);
+        assert_eq!(
+            missing_state.tool_policy_eligibility("reports.export", &principal),
+            ToolPolicyEligibility {
+                eligible: false,
+                reason: "not_in_policy",
+            }
+        );
+        assert!(missing_capture.events().is_empty());
+
+        let (disabled_state, disabled_capture) =
+            tool_eligibility_state(tool_policy_entry(false, &["operator"], &[], &[]), None);
+        assert_eq!(
+            disabled_state.tool_policy_eligibility("reports.export", &principal),
+            ToolPolicyEligibility {
+                eligible: false,
+                reason: "policy_disabled",
+            }
+        );
+        assert!(disabled_capture.events().is_empty());
+
+        let (role_state, role_capture) =
+            tool_eligibility_state(tool_policy_entry(true, &["admin"], &[], &[]), None);
+        assert_eq!(
+            role_state.tool_policy_eligibility("reports.export", &principal),
+            ToolPolicyEligibility {
+                eligible: false,
+                reason: "principal_not_eligible",
+            }
+        );
+        assert!(role_capture.events().is_empty());
+
+        let (issuer_state, issuer_capture) = tool_eligibility_state(
+            tool_policy_entry(true, &[], &["https://idp.example/"], &[]),
+            None,
+        );
+        assert_eq!(
+            issuer_state.tool_policy_eligibility("reports.export", &principal),
+            ToolPolicyEligibility {
+                eligible: false,
+                reason: "principal_not_eligible",
+            }
+        );
+        assert!(issuer_capture.events().is_empty());
+
+        let (auth_method_state, auth_method_capture) =
+            tool_eligibility_state(tool_policy_entry(true, &[], &[], &["service_token"]), None);
+        assert_eq!(
+            auth_method_state.tool_policy_eligibility("reports.export", &principal),
+            ToolPolicyEligibility {
+                eligible: false,
+                reason: "principal_not_eligible",
+            }
+        );
+        assert!(auth_method_capture.events().is_empty());
+
+        let (deny_state, deny_capture) = tool_eligibility_state(
+            tool_policy_entry(true, &["operator"], &[], &["bearer_token"]),
+            Some(RuleAction::Deny),
+        );
+        let denied = deny_state.tool_policy_eligibility("reports.export", &principal);
+        assert_eq!(
+            denied,
+            ToolPolicyEligibility {
+                eligible: false,
+                reason: "policy_denied",
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(denied).expect("eligibility should serialize"),
+            json!({
+                "eligible": false,
+                "reason": "policy_denied"
+            })
+        );
+        assert!(deny_capture.events().is_empty());
+    }
+
+    #[test]
+    fn tool_policy_eligibility_treats_allow_and_shadow_rules_as_eligible() {
+        let principal = test_principal(&["operator"]);
+
+        for action in [None, Some(RuleAction::Allow), Some(RuleAction::Shadow)] {
+            let (state, capture) = tool_eligibility_state(
+                tool_policy_entry(true, &["operator"], &[], &["bearer_token"]),
+                action,
+            );
+
+            assert_eq!(
+                state.tool_policy_eligibility("reports.export", &principal),
+                ToolPolicyEligibility {
+                    eligible: true,
+                    reason: "eligible",
+                }
+            );
+            assert!(capture.events().is_empty());
+        }
+    }
 
     #[tokio::test]
     async fn exempt_path_returns_ok_without_authz_event() {
@@ -3369,6 +3539,49 @@ mod tests {
             roles: roles.iter().map(|role| (*role).to_owned()).collect(),
             session_id: "session-123".to_owned(),
             auth_method: AuthMethod::Bearer,
+        }
+    }
+
+    fn tool_eligibility_state(
+        tool: ToolPolicyEntry,
+        rule_action: Option<RuleAction>,
+    ) -> (RbacState, CaptureSink) {
+        let mut policy = test_policy(DefaultAction::Deny, &[], &[]);
+        policy.tools.insert("reports.export".to_owned(), tool);
+        if let Some(action) = rule_action {
+            policy.rules.push(Rule {
+                id: Some("reports-export-rule".to_owned()),
+                enabled: true,
+                methods: Vec::new(),
+                path: String::new(),
+                tool_name: Some("reports.export".to_owned()),
+                dispatch: None,
+                principal: PrincipalMatcher::default(),
+                action,
+            });
+        }
+        test_state(policy, &[])
+    }
+
+    fn tool_policy_entry(
+        enabled: bool,
+        allowed_roles: &[&str],
+        issuers: &[&str],
+        auth_methods: &[&str],
+    ) -> ToolPolicyEntry {
+        ToolPolicyEntry {
+            enabled,
+            allowed_roles: allowed_roles
+                .iter()
+                .map(|role| (*role).to_owned())
+                .collect(),
+            issuers: issuers.iter().map(|issuer| (*issuer).to_owned()).collect(),
+            auth_methods: auth_methods
+                .iter()
+                .map(|auth_method| (*auth_method).to_owned())
+                .collect(),
+            timeout_ms: 1_000,
+            max_concurrent: 1,
         }
     }
 

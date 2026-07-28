@@ -100,6 +100,8 @@ const CONNECTION_OPENAPI_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}
 const CONNECTION_OPENAPI_REGISTER_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/openapi/register";
 const CONNECTION_COLLECTION_ETAG_HEADER: &str = "x-greengateway-connections-etag";
 const MANAGED_OPENAPI_JSON_ENVELOPE_OVERHEAD_BYTES: usize = 64 * 1024;
+const TOOLS_ADMIN_ROUTE: &str = "/v1/admin/tools";
+const TOOL_ADMIN_ROUTE: &str = "/v1/admin/tools/{id}";
 const TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/preview";
 const TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/register";
 const OPENAPI_TOOLS_UNSUPPORTED_AUTH_REQUIREMENTS_ERROR: &str = "cannot register selected OpenAPI tools: upstream API-key header injection is not yet supported; see issue #36's known limitation";
@@ -223,6 +225,8 @@ struct AdminRoutes {
     connection_refresh_route: String,
     connection_openapi_preview_route: String,
     connection_openapi_register_route: String,
+    tools_route: String,
+    tool_route: String,
     tools_openapi_preview_route: String,
     tools_openapi_register_route: String,
     schema_coverage_route: String,
@@ -353,6 +357,8 @@ impl AdminRoutes {
             connection_openapi_register_route: format!(
                 "{api_prefix}/connections/{{id}}/openapi/register"
             ),
+            tools_route: format!("{api_prefix}/tools"),
+            tool_route: format!("{api_prefix}/tools/{{id}}"),
             tools_openapi_preview_route: format!("{api_prefix}/tools/openapi/preview"),
             tools_openapi_register_route: format!("{api_prefix}/tools/openapi/register"),
             schema_coverage_route: format!("{api_prefix}/schema/coverage"),
@@ -428,6 +434,7 @@ struct ConnectionAdminState {
 struct ToolAdminState {
     tools_file: Option<PathBuf>,
     registry: tools::definitions::ToolRegistry,
+    inventory: tools::inventory::CapabilityInventory,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
     client_ip_policy: client_ip::ClientIpPolicy,
@@ -1227,6 +1234,11 @@ struct MiddlewareStack {
     proxy_dispatch_state: ProxyDispatchState,
 }
 
+#[derive(Clone)]
+struct CapabilityInventoryCacheControlState {
+    collection_route: String,
+}
+
 #[derive(Default)]
 struct GatewayAppBuildOverrides {
     lifecycle: Option<GatewayLifecycle>,
@@ -1710,7 +1722,11 @@ fn gateway_app_with_process_started_at_and_overrides(
     };
     let tool_admin_state = ToolAdminState {
         tools_file: config.tools_file.as_ref().map(PathBuf::from),
-        registry: tool_registry,
+        registry: tool_registry.clone(),
+        inventory: tools::inventory::CapabilityInventory::new(
+            tool_registry,
+            connection_control_plane.clone(),
+        ),
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
@@ -2455,6 +2471,14 @@ fn add_admin_api_routes(
         .merge(
             Router::new()
                 .route(
+                    routes.admin.tools_route.as_str(),
+                    get(tool_inventory_list_endpoint),
+                )
+                .route(
+                    routes.admin.tool_route.as_str(),
+                    get(tool_inventory_detail_endpoint),
+                )
+                .route(
                     routes.admin.tools_openapi_preview_route.as_str(),
                     post(tools_openapi_preview_endpoint),
                 )
@@ -2588,7 +2612,38 @@ fn apply_middleware(
     #[cfg(test)]
     let router = router.layer(axum::middleware::from_fn(audit_extension_probe_middleware));
 
-    router.layer(Extension(stack.audit_log.clone()))
+    let router = router.layer(Extension(stack.audit_log.clone()));
+    router.layer(axum::middleware::from_fn_with_state(
+        CapabilityInventoryCacheControlState {
+            collection_route: AdminRoutes::from_prefix(&stack.config.admin_prefix).tools_route,
+        },
+        capability_inventory_cache_control_middleware,
+    ))
+}
+
+async fn capability_inventory_cache_control_middleware(
+    State(state): State<CapabilityInventoryCacheControlState>,
+    request: AxumRequest,
+    next: axum::middleware::Next,
+) -> Response {
+    let no_store = is_capability_inventory_path(request.uri().path(), &state.collection_route);
+    let mut response = next.run(request).await;
+    if no_store {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
+}
+
+fn is_capability_inventory_path(path: &str, collection_route: &str) -> bool {
+    if path == collection_route {
+        return true;
+    }
+
+    path.strip_prefix(collection_route)
+        .and_then(|remainder| remainder.strip_prefix('/'))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 async fn proxy_dispatch_context_middleware(
@@ -4440,6 +4495,94 @@ async fn token_rotate_endpoint(
         }
         Err(error) => token_store_error_response(error),
     }
+}
+
+async fn tool_inventory_list_endpoint(
+    State(state): State<ToolAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(TOOLS_ADMIN_ROUTE);
+
+    let Some(principal) = request.extensions().get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    let rbac_state =
+        match authorized_tool_rbac_state(&state, principal, ADMIN_TOOLS_READ_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return tool_admin_authz_error_response(error),
+        };
+    let params = match Query::<tools::inventory::CapabilityListParams>::try_from_uri(request.uri())
+    {
+        Ok(Query(params)) => params,
+        Err(_) => return bad_request("capability inventory query is invalid"),
+    };
+
+    let page = match state.inventory.list(rbac_state, principal, &params) {
+        Ok(page) => page,
+        Err(error) => return capability_inventory_error_response(error),
+    };
+    let etag = page.collection_etag().to_owned();
+
+    (
+        StatusCode::OK,
+        [
+            (header::ETAG, etag_header_value(&etag)),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        Json(page),
+    )
+        .into_response()
+}
+
+async fn tool_inventory_detail_endpoint(
+    State(state): State<ToolAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(TOOL_ADMIN_ROUTE);
+
+    let Some(principal) = request.extensions().get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    let rbac_state =
+        match authorized_tool_rbac_state(&state, principal, ADMIN_TOOLS_READ_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return tool_admin_authz_error_response(error),
+        };
+    let Some(raw_id) = request
+        .uri()
+        .path()
+        .rsplit('/')
+        .next()
+        .filter(|raw_id| !raw_id.is_empty())
+    else {
+        return not_found("capability was not found");
+    };
+
+    let detail = match state.inventory.detail(rbac_state, principal, raw_id) {
+        Ok(Some(detail)) => detail,
+        Ok(None) => return not_found("capability was not found"),
+        Err(error) => return capability_inventory_error_response(error),
+    };
+    let etag = match serialized_response_etag(&detail) {
+        Ok(etag) => etag,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "failed to compute capability inventory detail ETag"
+            );
+            return internal_server_error("capability inventory response failed");
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::ETAG, etag_header_value(&etag)),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        Json(detail),
+    )
+        .into_response()
 }
 
 async fn tools_openapi_preview_endpoint(
@@ -6381,6 +6524,19 @@ fn authorized_tools_file<'a>(
     principal: &auth::Principal,
     permission: &str,
 ) -> Result<&'a FsPath, ToolAdminAuthzError> {
+    authorized_tool_rbac_state(state, principal, permission)?;
+
+    state
+        .tools_file
+        .as_deref()
+        .ok_or(ToolAdminAuthzError::ToolsFileNotConfigured)
+}
+
+fn authorized_tool_rbac_state<'a>(
+    state: &'a ToolAdminState,
+    principal: &auth::Principal,
+    permission: &str,
+) -> Result<&'a middleware::rbac::RbacState, ToolAdminAuthzError> {
     let Some(rbac_state) = state.rbac_state.as_ref() else {
         return Err(ToolAdminAuthzError::RbacNotConfigured);
     };
@@ -6389,10 +6545,7 @@ fn authorized_tools_file<'a>(
         return Err(ToolAdminAuthzError::Forbidden);
     }
 
-    state
-        .tools_file
-        .as_deref()
-        .ok_or(ToolAdminAuthzError::ToolsFileNotConfigured)
+    Ok(rbac_state)
 }
 
 fn authorized_schema_reader(state: &SchemaAdminState, principal: &auth::Principal) -> bool {
@@ -6521,6 +6674,71 @@ fn tool_admin_authz_error_response(error: ToolAdminAuthzError) -> Response {
         ToolAdminAuthzError::RbacNotConfigured => tools_rbac_not_configured(),
         ToolAdminAuthzError::ToolsFileNotConfigured => tools_file_not_configured(),
         ToolAdminAuthzError::Forbidden => forbidden(),
+    }
+}
+
+fn capability_inventory_error_response(
+    error: tools::inventory::CapabilityInventoryError,
+) -> Response {
+    use tools::inventory::CapabilityInventoryError;
+
+    match error {
+        CapabilityInventoryError::InvalidLimit => {
+            bad_request("capability inventory limit must be between 1 and 100")
+        }
+        CapabilityInventoryError::InvalidFilter => {
+            bad_request("capability inventory filter is invalid")
+        }
+        CapabilityInventoryError::InvalidCursor => {
+            bad_request("capability inventory cursor is invalid")
+        }
+        CapabilityInventoryError::StaleCursor { current_etag } => (
+            StatusCode::PRECONDITION_FAILED,
+            [
+                (header::ETAG, etag_header_value(&current_etag)),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            ],
+            Json(ErrorResponse {
+                error: "capability inventory cursor does not match the current collection"
+                    .to_owned(),
+            }),
+        )
+            .into_response(),
+        CapabilityInventoryError::StoreUnavailable => {
+            tracing::error!(
+                reason = "store_unavailable",
+                "capability inventory request failed"
+            );
+            service_unavailable("capability inventory is unavailable")
+        }
+        CapabilityInventoryError::CardinalityExceeded => {
+            tracing::error!(
+                reason = "cardinality_exceeded",
+                "capability inventory request failed"
+            );
+            service_unavailable("capability inventory is unavailable")
+        }
+        CapabilityInventoryError::CorruptState => {
+            tracing::error!(
+                reason = "corrupt_state",
+                "capability inventory request failed"
+            );
+            service_unavailable("capability inventory is unavailable")
+        }
+        CapabilityInventoryError::ResponseTooLarge => {
+            tracing::error!(
+                reason = "response_too_large",
+                "capability inventory response failed"
+            );
+            internal_server_error("capability inventory response failed")
+        }
+        CapabilityInventoryError::IdentityCollision => {
+            tracing::error!(
+                reason = "identity_collision",
+                "capability inventory response failed"
+            );
+            internal_server_error("capability inventory response failed")
+        }
     }
 }
 
@@ -8326,6 +8544,15 @@ fn policy_etag(policy: &rbac::Policy) -> Result<String, serde_json::Error> {
 
 fn tools_file_etag(value: &Value) -> Result<String, serde_json::Error> {
     let mut value = value.clone();
+    sort_json_value(&mut value);
+    let bytes = serde_json::to_vec(&value)?;
+    let digest = Sha256::digest(&bytes);
+
+    Ok(format!("\"sha256:{}\"", hex::encode(digest)))
+}
+
+fn serialized_response_etag<T: Serialize>(response: &T) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(response)?;
     sort_json_value(&mut value);
     let bytes = serde_json::to_vec(&value)?;
     let digest = Sha256::digest(&bytes);
@@ -11001,6 +11228,8 @@ mod tests {
             default_routes.connection_openapi_register_route,
             CONNECTION_OPENAPI_REGISTER_ADMIN_ROUTE
         );
+        assert_eq!(default_routes.tools_route, TOOLS_ADMIN_ROUTE);
+        assert_eq!(default_routes.tool_route, TOOL_ADMIN_ROUTE);
         assert_eq!(
             default_routes.tools_openapi_preview_route,
             TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE
@@ -11099,6 +11328,8 @@ mod tests {
             custom_routes.connection_openapi_register_route,
             "/v1/ops/connections/{id}/openapi/register"
         );
+        assert_eq!(custom_routes.tools_route, "/v1/ops/tools");
+        assert_eq!(custom_routes.tool_route, "/v1/ops/tools/{id}");
         assert_eq!(
             custom_routes.tools_openapi_preview_route,
             "/v1/ops/tools/openapi/preview"
@@ -11142,6 +11373,42 @@ mod tests {
         );
         assert_eq!(custom_routes.principals_route, "/v1/ops/principals");
         assert_eq!(custom_routes.principal_detail_route, "/v1/ops/principal");
+    }
+
+    #[test]
+    fn capability_inventory_cache_control_matches_only_collection_and_detail_paths() {
+        for (collection_route, matching_paths) in [
+            (
+                "/v1/admin/tools",
+                ["/v1/admin/tools", "/v1/admin/tools/cap_123"],
+            ),
+            (
+                "/v1/ops/tools",
+                ["/v1/ops/tools", "/v1/ops/tools/not-yet-valid"],
+            ),
+        ] {
+            for path in matching_paths {
+                assert!(
+                    is_capability_inventory_path(path, collection_route),
+                    "{path} should be treated as a capability inventory path"
+                );
+            }
+        }
+
+        for path in [
+            "/v1/admin/tool",
+            "/v1/admin/toolsmith",
+            "/v1/admin/tools/",
+            "/v1/admin/tools/cap_123/extra",
+            "/v1/admin/tools/openapi/preview",
+            "/v1/ops/tools/cap_123/extra",
+        ] {
+            assert!(
+                !is_capability_inventory_path(path, "/v1/admin/tools")
+                    && !is_capability_inventory_path(path, "/v1/ops/tools"),
+                "{path} must not change unrelated cache behavior"
+            );
+        }
     }
 
     #[tokio::test]
@@ -20770,6 +21037,339 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capability_inventory_list_works_without_tools_file_and_sets_cache_headers() {
+        let token_db = TempDb::new("capability-inventory-no-tools-file-token");
+        let token_store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        let admin_token = create_service_token(&token_store, &["admin"]);
+        let policy = TempPolicyFile::new(&tools_policy_document());
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("capability inventory app should build without TOOLS_FILE");
+
+        let response = router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&admin_token),
+                TOOLS_ADMIN_ROUTE,
+            ))
+            .await
+            .expect("capability inventory request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().contains_key(header::ETAG),
+            "inventory response should include an ETag"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+
+        let invalid_query = router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&admin_token),
+                &format!("{TOOLS_ADMIN_ROUTE}?limit=0"),
+            ))
+            .await
+            .expect("invalid capability inventory query should complete");
+        assert_eq!(invalid_query.status(), StatusCode::BAD_REQUEST);
+        assert_capability_inventory_no_store(&invalid_query);
+
+        let unauthenticated_invalid_query = router
+            .oneshot(tools_inventory_request(
+                None,
+                &format!("{TOOLS_ADMIN_ROUTE}?limit=0"),
+            ))
+            .await
+            .expect("unauthenticated invalid inventory query should complete");
+        assert_eq!(
+            unauthenticated_invalid_query.status(),
+            StatusCode::UNAUTHORIZED,
+            "authentication must run before query validation"
+        );
+        assert_capability_inventory_no_store(&unauthenticated_invalid_query);
+    }
+
+    #[tokio::test]
+    async fn capability_inventory_authenticated_without_policy_fails_closed_without_caching() {
+        let token_db = TempDb::new("capability-inventory-no-policy-token");
+        let token_store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        let token = create_service_token(&token_store, &["admin"]);
+        let mut config = test_config(Vec::new());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("capability inventory app should build without POLICY_FILE");
+
+        for uri in [
+            TOOLS_ADMIN_ROUTE.to_owned(),
+            format!("{TOOLS_ADMIN_ROUTE}/cap_{}", "0".repeat(64)),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(tools_inventory_request(Some(&token), &uri))
+                .await
+                .expect("policy-unconfigured capability inventory request should complete");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_capability_inventory_no_store(&response);
+            assert_eq!(
+                body_string(response).await,
+                r#"{"error":"tools API requires POLICY_FILE to be configured"}"#
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_inventory_custom_prefix_accepts_wildcard_permission() {
+        const CUSTOM_TOOLS_ROUTE: &str = "/v1/ops/tools";
+
+        let token_db = TempDb::new("capability-inventory-custom-prefix-token");
+        let token_store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        let token = create_service_token(&token_store, &["superadmin"]);
+        let policy = TempPolicyFile::new(
+            &json!({
+                "schema_version": "0.1.0",
+                "id": "capability-inventory-custom-prefix-policy",
+                "default_action": "deny",
+                "enforcement_mode": "enforce",
+                "roles": {
+                    "superadmin": {
+                        "permissions": ["*"]
+                    }
+                },
+                "routes": [
+                    {
+                        "methods": ["GET"],
+                        "path_prefix": CUSTOM_TOOLS_ROUTE,
+                        "permission": ADMIN_TOOLS_READ_PERMISSION
+                    }
+                ]
+            })
+            .to_string(),
+        );
+        let mut config = test_config(Vec::new());
+        config.admin_prefix = "/ops".to_owned();
+        config
+            .auth_exempt_paths
+            .retain(|path| path != config::DEFAULT_ADMIN_PREFIX);
+        config.auth_exempt_paths.push("/ops".to_owned());
+        config.rbac_exempt_paths = config.auth_exempt_paths.clone();
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("custom-prefix capability inventory app should build");
+
+        let collection = router
+            .clone()
+            .oneshot(tools_inventory_request(Some(&token), CUSTOM_TOOLS_ROUTE))
+            .await
+            .expect("custom-prefix capability inventory request should complete");
+        assert_eq!(collection.status(), StatusCode::OK);
+        assert_capability_inventory_no_store(&collection);
+
+        let detail = router
+            .oneshot(tools_inventory_request(
+                Some(&token),
+                &format!("{CUSTOM_TOOLS_ROUTE}/cap_{}", "0".repeat(64)),
+            ))
+            .await
+            .expect("custom-prefix capability detail request should complete");
+        assert_eq!(detail.status(), StatusCode::NOT_FOUND);
+        assert_capability_inventory_no_store(&detail);
+    }
+
+    #[tokio::test]
+    async fn capability_inventory_paginates_filters_and_returns_safe_detail() {
+        let harness = tools_admin_harness(mcp_tools_document(), test_audit_log()).await;
+        let first_response = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.reader_token),
+                &format!(
+                    "{TOOLS_ADMIN_ROUTE}?kind=tool&source=manual_file&connection_id=legacy-default-http&available=true&limit=1"
+                ),
+            ))
+            .await
+            .expect("first capability inventory page should complete");
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first = json_body(first_response).await;
+        assert_eq!(first["total_count"], json!(2));
+        let first_capability = first["capabilities"]
+            .as_array()
+            .and_then(|capabilities| capabilities.first())
+            .expect("first page should contain one capability");
+        assert_eq!(first_capability["kind"], json!("tool"));
+        assert_eq!(first_capability["source"]["type"], json!("manual_file"));
+        assert_eq!(
+            first_capability["connection"]["id"],
+            json!("legacy-default-http")
+        );
+        assert_eq!(first_capability["state"]["available"], json!(true));
+        assert_eq!(first_capability["policy"]["eligible"], json!(false));
+        assert_eq!(first_capability["policy"]["reason"], json!("not_in_policy"));
+        let first_id = first_capability["id"]
+            .as_str()
+            .expect("capability should have an opaque id")
+            .to_owned();
+        let cursor = first["next_cursor"]
+            .as_str()
+            .expect("first page should include a cursor");
+
+        let second_response = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.reader_token),
+                &format!(
+                    "{TOOLS_ADMIN_ROUTE}?kind=tool&source=manual_file&connection_id=legacy-default-http&available=true&limit=1&cursor={cursor}"
+                ),
+            ))
+            .await
+            .expect("second capability inventory page should complete");
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let second = json_body(second_response).await;
+        assert_eq!(
+            second["total_count"],
+            json!(2),
+            "total_count should describe the full filtered collection on every page"
+        );
+        assert!(
+            second.get("next_cursor").is_none(),
+            "the final page should not include a cursor"
+        );
+        let second_id = second["capabilities"][0]["id"]
+            .as_str()
+            .expect("second capability should have an opaque id");
+        assert_ne!(first_id, second_id);
+
+        let filtered_response = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.reader_token),
+                &format!("{TOOLS_ADMIN_ROUTE}?text=widget"),
+            ))
+            .await
+            .expect("filtered capability inventory request should complete");
+        assert_eq!(filtered_response.status(), StatusCode::OK);
+        let filtered = json_body(filtered_response).await;
+        assert_eq!(filtered["total_count"], json!(1));
+        assert_eq!(filtered["capabilities"][0]["name"], json!("get_widget"));
+
+        let detail_response = harness
+            .router
+            .oneshot(tools_inventory_request(
+                Some(&harness.reader_token),
+                &format!("{TOOLS_ADMIN_ROUTE}/{first_id}"),
+            ))
+            .await
+            .expect("capability detail request should complete");
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        assert_capability_inventory_no_store(&detail_response);
+        let detail = json_body(detail_response).await;
+        assert_eq!(detail["id"], json!(first_id));
+        assert_eq!(detail["mapping"]["type"], json!("http"));
+        assert_eq!(detail["input_json_schema"]["type"], json!("object"));
+        let serialized = serde_json::to_string(&detail).expect("detail should serialize");
+        assert!(!serialized.contains("Authorization"));
+        assert!(!serialized.contains("Cookie"));
+    }
+
+    #[tokio::test]
+    async fn capability_inventory_detail_authorizes_before_lookup_and_hides_id_validity() {
+        let harness = tools_admin_harness(empty_tools_document(), test_audit_log()).await;
+        let malformed_uri = format!("{TOOLS_ADMIN_ROUTE}/not-a-capability-id");
+        let unknown_uri = format!("{TOOLS_ADMIN_ROUTE}/cap_{}", "0".repeat(64));
+
+        let unauthenticated = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(None, &malformed_uri))
+            .await
+            .expect("unauthenticated inventory detail request should complete");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let forbidden_malformed = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.blocked_token),
+                &malformed_uri,
+            ))
+            .await
+            .expect("forbidden malformed inventory detail request should complete");
+        let forbidden_malformed_status = forbidden_malformed.status();
+        assert_capability_inventory_no_store(&forbidden_malformed);
+        let forbidden_malformed_body = body_string(forbidden_malformed).await;
+        let forbidden_unknown = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.blocked_token),
+                &unknown_uri,
+            ))
+            .await
+            .expect("forbidden unknown inventory detail request should complete");
+        let forbidden_unknown_status = forbidden_unknown.status();
+        assert_capability_inventory_no_store(&forbidden_unknown);
+        let forbidden_unknown_body = body_string(forbidden_unknown).await;
+        assert_eq!(forbidden_malformed_status, StatusCode::FORBIDDEN);
+        assert_eq!(forbidden_unknown_status, StatusCode::FORBIDDEN);
+        assert_eq!(forbidden_malformed_body, forbidden_unknown_body);
+
+        let authorized_malformed = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.reader_token),
+                &malformed_uri,
+            ))
+            .await
+            .expect("authorized malformed inventory detail request should complete");
+        let authorized_malformed_status = authorized_malformed.status();
+        assert_capability_inventory_no_store(&authorized_malformed);
+        let authorized_malformed_body = body_string(authorized_malformed).await;
+        let authorized_unknown = harness
+            .router
+            .oneshot(tools_inventory_request(
+                Some(&harness.reader_token),
+                &unknown_uri,
+            ))
+            .await
+            .expect("authorized unknown inventory detail request should complete");
+        let authorized_unknown_status = authorized_unknown.status();
+        assert_capability_inventory_no_store(&authorized_unknown);
+        let authorized_unknown_body = body_string(authorized_unknown).await;
+        assert_eq!(authorized_malformed_status, StatusCode::NOT_FOUND);
+        assert_eq!(authorized_unknown_status, StatusCode::NOT_FOUND);
+        assert_eq!(authorized_malformed_body, authorized_unknown_body);
+    }
+
+    #[tokio::test]
     async fn openapi_tools_preview_returns_generated_tools_and_current_tools_etag() {
         let harness = tools_admin_harness(empty_tools_document(), test_audit_log()).await;
 
@@ -29004,6 +29604,24 @@ paths:
         }
     }
 
+    fn tools_inventory_request(token: Option<&str>, uri: &str) -> Request<Body> {
+        let mut builder = Request::builder().method(Method::GET).uri(uri);
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder
+            .body(Body::empty())
+            .expect("capability inventory request should build")
+    }
+
+    fn assert_capability_inventory_no_store(response: &Response) {
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store")),
+            "capability inventory responses must never be cached"
+        );
+    }
+
     fn tools_openapi_preview_request(token: &str, spec: &str) -> Request<Body> {
         tools_openapi_preview_request_with_content_type(token, spec, "text/plain; charset=utf-8")
     }
@@ -29068,6 +29686,11 @@ paths:
                 }
             },
             "routes": [
+                {
+                    "methods": ["GET"],
+                    "path_prefix": TOOLS_ADMIN_ROUTE,
+                    "permission": ADMIN_TOOLS_READ_PERMISSION
+                },
                 {
                     "methods": ["POST"],
                     "path_prefix": TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE,

@@ -24,7 +24,7 @@ use super::{
     status::{ConnectionOperationalState, ConnectionStatusReason, SafeConnectionStatus},
     store::{
         ConnectionEtag, ConnectionStatusUpdate, ConnectionStoreError, StoredConnection,
-        StoredMcpCatalog, StoredMcpCatalogEntry,
+        StoredMcpCatalog, StoredMcpCatalogEntry, StoredMcpResource, StoredMcpResourceTemplate,
     },
 };
 
@@ -39,6 +39,8 @@ struct ActiveMcpCatalog {
     catalog_revision: u64,
     refreshed_at: String,
     entry_count: usize,
+    resources: Arc<[StoredMcpResource]>,
+    resource_templates: Arc<[StoredMcpResourceTemplate]>,
 }
 
 #[derive(Clone)]
@@ -123,7 +125,9 @@ impl McpConnectionCatalogRuntime {
                         observed_etag: catalog.observed_etag.to_string(),
                         catalog_revision: catalog.catalog_revision,
                         refreshed_at: catalog.refreshed_at.clone(),
-                        entry_count: catalog.entries.len(),
+                        entry_count: catalog_total_count(catalog),
+                        resources: Arc::from(catalog.resources.clone()),
+                        resource_templates: Arc::from(catalog.resource_templates.clone()),
                     },
                 )
             })
@@ -148,7 +152,9 @@ impl McpConnectionCatalogRuntime {
                 observed_etag: catalog.observed_etag.to_string(),
                 catalog_revision: catalog.catalog_revision,
                 refreshed_at: catalog.refreshed_at.clone(),
-                entry_count: catalog.entries.len(),
+                entry_count: catalog_total_count(catalog),
+                resources: Arc::from(catalog.resources.clone()),
+                resource_templates: Arc::from(catalog.resource_templates.clone()),
             },
         );
     }
@@ -323,7 +329,7 @@ impl McpConnectionCatalogService {
             .mcp_catalog(&connection_id)
             .map_err(|_| McpCatalogRefreshError::StorageUnavailable)?;
 
-        let candidate = match mcp_upstream::discover_connection_tools(
+        let candidate = match mcp_upstream::discover_connection_catalog(
             &self.http,
             connection_id.as_str(),
             record.etag().as_str(),
@@ -345,6 +351,7 @@ impl McpConnectionCatalogService {
             }
         };
         let stored_entries = match candidate
+            .tools
             .iter()
             .map(definition_store_entry)
             .collect::<Result<Vec<_>, _>>()
@@ -361,14 +368,29 @@ impl McpConnectionCatalogService {
                 return Err(failure);
             }
         };
-        let counts = catalog_change_counts(prior.as_ref(), &stored_entries);
+        let counts = catalog_change_counts(
+            prior.as_ref(),
+            &stored_entries,
+            &candidate.resources,
+            &candidate.resource_templates,
+        );
+        let mcp_upstream::McpDiscoveredCatalog {
+            tools,
+            resources,
+            resource_templates,
+        } = candidate;
         let mut persisted = None;
         let expected = record.etag();
         let publish =
             self.registry
-                .replace_mcp_connection_catalog(connection_id.as_str(), candidate, || {
-                    let catalog =
-                        store.replace_mcp_catalog(&connection_id, &expected, &stored_entries)?;
+                .replace_mcp_connection_catalog(connection_id.as_str(), tools, || {
+                    let catalog = store.replace_mcp_catalog(
+                        &connection_id,
+                        &expected,
+                        &stored_entries,
+                        &resources,
+                        &resource_templates,
+                    )?;
                     persisted = Some(catalog);
                     Ok::<(), ConnectionStoreError>(())
                 });
@@ -391,6 +413,7 @@ impl McpConnectionCatalogService {
             return Err(failure);
         }
         let catalog = persisted.ok_or(McpCatalogRefreshError::StorageUnavailable)?;
+        let total_count = catalog_total_count(&catalog);
         self.runtime.publish(&catalog);
         let status = self
             .control_plane
@@ -402,7 +425,7 @@ impl McpConnectionCatalogService {
                     reason: ConnectionStatusReason::CatalogRefreshed,
                     latency_ms: Some(duration_millis(started.elapsed())),
                     catalog_age_secs: Some(0),
-                    catalog_entry_count: Some(catalog.entries.len()),
+                    catalog_entry_count: Some(total_count),
                 },
             )
             .unwrap_or_else(|error| {
@@ -417,7 +440,7 @@ impl McpConnectionCatalogService {
                     observed_at: Some(catalog.refreshed_at.clone()),
                     latency_ms: Some(duration_millis(started.elapsed())),
                     catalog_age_secs: Some(0),
-                    catalog_entry_count: Some(catalog.entries.len()),
+                    catalog_entry_count: Some(total_count),
                 }
             });
         drop(active);
@@ -425,7 +448,7 @@ impl McpConnectionCatalogService {
             connection_id,
             catalog_revision: catalog.catalog_revision,
             status,
-            total_count: catalog.entries.len(),
+            total_count,
             added_count: counts.0,
             changed_count: counts.1,
             removed_count: counts.2,
@@ -445,7 +468,7 @@ impl McpConnectionCatalogService {
                 ConnectionOperationalState::Degraded,
                 ConnectionStatusReason::CatalogStale,
                 Some(timestamp_age_seconds(&prior.refreshed_at)),
-                Some(prior.entries.len()),
+                Some(catalog_total_count(prior)),
             )
         } else {
             let reason = match failure {
@@ -534,17 +557,61 @@ fn definition_store_entry(
 
 fn catalog_change_counts(
     prior: Option<&StoredMcpCatalog>,
-    candidate: &[StoredMcpCatalogEntry],
+    candidate_entries: &[StoredMcpCatalogEntry],
+    candidate_resources: &[StoredMcpResource],
+    candidate_resource_templates: &[StoredMcpResourceTemplate],
 ) -> (usize, usize, usize) {
-    let prior = prior
+    let prior_entries = prior
         .into_iter()
         .flat_map(|catalog| catalog.entries.iter())
         .map(|entry| (entry.remote_tool_name.as_str(), entry))
         .collect::<BTreeMap<_, _>>();
-    let candidate = candidate
+    let candidate_entries = candidate_entries
         .iter()
         .map(|entry| (entry.remote_tool_name.as_str(), entry))
         .collect::<BTreeMap<_, _>>();
+    let prior_resources = prior
+        .into_iter()
+        .flat_map(|catalog| catalog.resources.iter())
+        .map(|resource| (resource.uri.as_str(), resource))
+        .collect::<BTreeMap<_, _>>();
+    let candidate_resources = candidate_resources
+        .iter()
+        .map(|resource| (resource.uri.as_str(), resource))
+        .collect::<BTreeMap<_, _>>();
+    let prior_resource_templates = prior
+        .into_iter()
+        .flat_map(|catalog| catalog.resource_templates.iter())
+        .map(|resource_template| (resource_template.uri_template.as_str(), resource_template))
+        .collect::<BTreeMap<_, _>>();
+    let candidate_resource_templates = candidate_resource_templates
+        .iter()
+        .map(|resource_template| (resource_template.uri_template.as_str(), resource_template))
+        .collect::<BTreeMap<_, _>>();
+
+    let (tool_added, tool_changed, tool_removed) =
+        keyed_catalog_change_counts(&prior_entries, &candidate_entries);
+    let (resource_added, resource_changed, resource_removed) =
+        keyed_catalog_change_counts(&prior_resources, &candidate_resources);
+    let (template_added, template_changed, template_removed) =
+        keyed_catalog_change_counts(&prior_resource_templates, &candidate_resource_templates);
+    (
+        tool_added
+            .saturating_add(resource_added)
+            .saturating_add(template_added),
+        tool_changed
+            .saturating_add(resource_changed)
+            .saturating_add(template_changed),
+        tool_removed
+            .saturating_add(resource_removed)
+            .saturating_add(template_removed),
+    )
+}
+
+fn keyed_catalog_change_counts<T: PartialEq>(
+    prior: &BTreeMap<&str, &T>,
+    candidate: &BTreeMap<&str, &T>,
+) -> (usize, usize, usize) {
     let added = candidate
         .keys()
         .filter(|name| !prior.contains_key(**name))
@@ -558,6 +625,14 @@ fn catalog_change_counts(
         .filter(|name| !candidate.contains_key(**name))
         .count();
     (added, changed, removed)
+}
+
+fn catalog_total_count(catalog: &StoredMcpCatalog) -> usize {
+    catalog
+        .entries
+        .len()
+        .saturating_add(catalog.resources.len())
+        .saturating_add(catalog.resource_templates.len())
 }
 
 fn refresh_transport_error(error: &McpUpstreamCallError) -> McpCatalogRefreshError {
@@ -584,6 +659,11 @@ fn refresh_transport_error(error: &McpUpstreamCallError) -> McpCatalogRefreshErr
         }
         McpUpstreamCallError::DiscoveryPageLimitExceeded { .. }
         | McpUpstreamCallError::DiscoveryToolLimitExceeded { .. }
+        | McpUpstreamCallError::DiscoveryResourceLimitExceeded { .. }
+        | McpUpstreamCallError::DiscoveryResourceTemplateLimitExceeded { .. }
+        | McpUpstreamCallError::DiscoveryCapabilityLimitExceeded { .. }
+        | McpUpstreamCallError::DiscoveryResponseLimitExceeded { .. }
+        | McpUpstreamCallError::InvalidDiscoveryMetadata
         | McpUpstreamCallError::RequestBodyTooLarge { .. }
         | McpUpstreamCallError::ResponseTooLarge { .. } => McpCatalogRefreshError::InvalidResponse,
         McpUpstreamCallError::ClientBuild
@@ -689,6 +769,8 @@ mod tests {
                             catalog_revision: 1,
                             refreshed_at: "2026-07-28T00:00:00Z".to_owned(),
                             entry_count: 1,
+                            resources: Arc::from([]),
+                            resource_templates: Arc::from([]),
                         },
                     );
                 })
@@ -737,7 +819,12 @@ mod tests {
             .local_addr()
             .expect("managed MCP test address should be available");
         let list_count = Arc::new(AtomicUsize::new(0));
-        let server = tokio::spawn(run_mcp_catalog_server(listener, Arc::clone(&list_count)));
+        let resource_method_count = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(run_mcp_catalog_server(
+            listener,
+            Arc::clone(&list_count),
+            Arc::clone(&resource_method_count),
+        ));
 
         let database = TemporaryDatabase::new();
         let mut config = Config::test_defaults();
@@ -832,7 +919,7 @@ mod tests {
         assert_ne!(expected_catalog_etag, renamed.etag().as_str());
         let discovery_requests_before_stale_check = list_count.load(Ordering::SeqCst);
         assert!(matches!(
-            mcp_upstream::discover_connection_tools(
+            mcp_upstream::discover_connection_catalog(
                 &service.http,
                 record.id.as_str(),
                 &expected_catalog_etag,
@@ -847,6 +934,11 @@ mod tests {
             discovery_requests_before_stale_check,
             "a stale refresh precondition must fail before MCP discovery egress"
         );
+        assert_eq!(
+            resource_method_count.load(Ordering::SeqCst),
+            0,
+            "resource methods must not be called when the capability is absent"
+        );
         assert!(matches!(
             mcp_upstream::call_connection_tool(
                 &service.http,
@@ -860,6 +952,106 @@ mod tests {
                 reason: "catalog_stale"
             })
         ));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn discovery_paginates_resource_metadata_without_reading_resource_contents() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("resource metadata test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("resource metadata test address should be available");
+        let resource_list_count = Arc::new(AtomicUsize::new(0));
+        let resource_template_list_count = Arc::new(AtomicUsize::new(0));
+        let resource_read_count = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(run_mcp_resource_catalog_server(
+            listener,
+            Arc::clone(&resource_list_count),
+            Arc::clone(&resource_template_list_count),
+            Arc::clone(&resource_read_count),
+        ));
+
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        config.egress_allowed_hosts = vec![Ipv4Addr::LOCALHOST.to_string()];
+        config.egress_deny_private_ips = false;
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Managed MCP resources",
+            "enabled": true,
+            "kind": "mcp_streamable_http",
+            "endpoint": {
+                "base_url": format!("http://{address}"),
+                "base_path": "/mcp"
+            },
+            "authentication": { "type": "none" },
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {
+                "type": "managed_mcp",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed MCP resource Connection should deserialize");
+        let snapshot = control_plane.runtime_snapshot();
+        let record = control_plane
+            .create_managed(snapshot.collection_etag(), candidate)
+            .expect("managed MCP resource Connection should create");
+        let egress_client = Arc::new(
+            EgressClient::new(EgressConfig::from_config(&config))
+                .expect("managed MCP resource egress client should build"),
+        );
+        let http = ConnectionHttpRuntime::new(
+            control_plane,
+            EgressConfig::from_config(&config),
+            egress_client,
+        );
+
+        let catalog = mcp_upstream::discover_connection_catalog(
+            &http,
+            record.id.as_str(),
+            record.etag().as_str(),
+        )
+        .await
+        .expect("resource metadata discovery should succeed");
+        assert_eq!(catalog.tools.len(), 1);
+        assert_eq!(
+            catalog
+                .resources
+                .iter()
+                .map(|resource| resource.uri.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gg://resource/alpha", "gg://resource/beta"]
+        );
+        assert_eq!(
+            catalog
+                .resource_templates
+                .iter()
+                .map(|template| template.uri_template.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gg://resource/{id}", "gg://asset/{name}"]
+        );
+        let safe_resource =
+            serde_json::to_value(&catalog.resources[0]).expect("safe resource should serialize");
+        assert!(safe_resource.get("icons").is_none());
+        assert!(safe_resource.get("_meta").is_none());
+        assert!(safe_resource.get("annotations").is_none());
+        assert_eq!(resource_list_count.load(Ordering::SeqCst), 2);
+        assert_eq!(resource_template_list_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            resource_read_count.load(Ordering::SeqCst),
+            0,
+            "metadata discovery must never read resource contents"
+        );
 
         server.abort();
     }
@@ -921,12 +1113,17 @@ mod tests {
         drop(mutation);
     }
 
-    async fn run_mcp_catalog_server(listener: TcpListener, list_count: Arc<AtomicUsize>) {
+    async fn run_mcp_catalog_server(
+        listener: TcpListener,
+        list_count: Arc<AtomicUsize>,
+        resource_method_count: Arc<AtomicUsize>,
+    ) {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
             let list_count = Arc::clone(&list_count);
+            let resource_method_count = Arc::clone(&resource_method_count);
             tokio::spawn(async move {
                 let request = read_json_request(&mut stream).await;
                 let method = request
@@ -989,9 +1186,202 @@ mod tests {
                         )
                         .await;
                     }
+                    "resources/list" | "resources/templates/list" | "resources/read" => {
+                        resource_method_count.fetch_add(1, Ordering::SeqCst);
+                        write_json_response(
+                            &mut stream,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "error": {
+                                    "code": -32601,
+                                    "message": "unexpected resource method"
+                                }
+                            }),
+                        )
+                        .await;
+                    }
                     _ => {
                         write_empty_response(&mut stream, StatusCode::ACCEPTED).await;
                     }
+                }
+            });
+        }
+    }
+
+    async fn run_mcp_resource_catalog_server(
+        listener: TcpListener,
+        resource_list_count: Arc<AtomicUsize>,
+        resource_template_list_count: Arc<AtomicUsize>,
+        resource_read_count: Arc<AtomicUsize>,
+    ) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let resource_list_count = Arc::clone(&resource_list_count);
+            let resource_template_list_count = Arc::clone(&resource_template_list_count);
+            let resource_read_count = Arc::clone(&resource_read_count);
+            tokio::spawn(async move {
+                let request = read_json_request(&mut stream).await;
+                let method = request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match method {
+                    "initialize" => {
+                        let protocol_version = request
+                            .pointer("/params/protocolVersion")
+                            .cloned()
+                            .unwrap_or_else(|| json!("2025-06-18"));
+                        write_json_response(
+                            &mut stream,
+                            StatusCode::OK,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": {
+                                    "protocolVersion": protocol_version,
+                                    "capabilities": {
+                                        "tools": {},
+                                        "resources": {
+                                            "subscribe": false,
+                                            "listChanged": false
+                                        }
+                                    },
+                                    "serverInfo": {
+                                        "name": "resource-catalog-test",
+                                        "version": "1.0.0"
+                                    }
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "tools/list" => {
+                        write_json_response(
+                            &mut stream,
+                            StatusCode::OK,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": {
+                                    "tools": [{
+                                        "name": "alpha",
+                                        "description": "Alpha tool",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {}
+                                        }
+                                    }]
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "resources/list" => {
+                        resource_list_count.fetch_add(1, Ordering::SeqCst);
+                        let second_page = request
+                            .pointer("/params/cursor")
+                            .and_then(Value::as_str)
+                            .is_some();
+                        let result = if second_page {
+                            json!({
+                                "resources": [{
+                                    "uri": "gg://resource/beta",
+                                    "name": "resource-beta",
+                                    "mimeType": "text/plain",
+                                    "size": 7
+                                }]
+                            })
+                        } else {
+                            json!({
+                                "resources": [{
+                                    "uri": "gg://resource/alpha",
+                                    "name": "resource-alpha",
+                                    "title": "Alpha resource",
+                                    "description": "Safe metadata",
+                                    "mimeType": "application/json",
+                                    "size": 42,
+                                    "icons": [{
+                                        "src": "https://example.test/icon.png",
+                                        "mimeType": "image/png"
+                                    }],
+                                    "_meta": { "private": "drop-me" }
+                                }],
+                                "nextCursor": "resource-page-2"
+                            })
+                        };
+                        write_json_response(
+                            &mut stream,
+                            StatusCode::OK,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": result
+                            }),
+                        )
+                        .await;
+                    }
+                    "resources/templates/list" => {
+                        resource_template_list_count.fetch_add(1, Ordering::SeqCst);
+                        let second_page = request
+                            .pointer("/params/cursor")
+                            .and_then(Value::as_str)
+                            .is_some();
+                        let result = if second_page {
+                            json!({
+                                "resourceTemplates": [{
+                                    "uriTemplate": "gg://asset/{name}",
+                                    "name": "asset-by-name",
+                                    "mimeType": "application/octet-stream"
+                                }]
+                            })
+                        } else {
+                            json!({
+                                "resourceTemplates": [{
+                                    "uriTemplate": "gg://resource/{id}",
+                                    "name": "resource-by-id",
+                                    "title": "Resource by ID",
+                                    "description": "Safe template metadata",
+                                    "mimeType": "application/json",
+                                    "icons": [{
+                                        "src": "https://example.test/template.png"
+                                    }],
+                                    "_meta": { "private": "drop-me" }
+                                }],
+                                "nextCursor": "template-page-2"
+                            })
+                        };
+                        write_json_response(
+                            &mut stream,
+                            StatusCode::OK,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": result
+                            }),
+                        )
+                        .await;
+                    }
+                    "resources/read" => {
+                        resource_read_count.fetch_add(1, Ordering::SeqCst);
+                        write_json_response(
+                            &mut stream,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "error": {
+                                    "code": -32601,
+                                    "message": "resource reads are forbidden during discovery"
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    _ => write_empty_response(&mut stream, StatusCode::ACCEPTED).await,
                 }
             });
         }

@@ -350,6 +350,106 @@ CREATE UNIQUE INDEX idx_connection_openapi_catalog_ordinal
 ON connection_openapi_catalog_entries(connection_id, ordinal);
 "#;
 
+const MIGRATION_6_SQL: &str = r#"
+ALTER TABLE connection_mcp_catalogs
+ADD COLUMN resource_count INTEGER NOT NULL DEFAULT 0
+CHECK (resource_count BETWEEN 0 AND 4096);
+
+ALTER TABLE connection_mcp_catalogs
+ADD COLUMN resource_template_count INTEGER NOT NULL DEFAULT 0
+CHECK (
+    resource_template_count BETWEEN 0 AND 4096
+    AND entry_count + resource_count + resource_template_count <= 4096
+);
+
+CREATE TABLE connection_mcp_catalog_resources (
+    connection_id TEXT NOT NULL,
+    uri TEXT NOT NULL CHECK (
+        length(CAST(uri AS BLOB)) BETWEEN 1 AND 2048
+        AND instr(uri, char(0)) = 0
+    ),
+    name TEXT NOT NULL CHECK (
+        length(name) BETWEEN 1 AND 128
+        AND length(CAST(name AS BLOB)) BETWEEN 1 AND 512
+        AND instr(name, char(0)) = 0
+    ),
+    title TEXT CHECK (
+        title IS NULL
+        OR (
+            length(title) BETWEEN 1 AND 256
+            AND length(CAST(title AS BLOB)) BETWEEN 1 AND 1024
+            AND instr(title, char(0)) = 0
+        )
+    ),
+    description TEXT CHECK (
+        description IS NULL
+        OR (
+            length(description) BETWEEN 1 AND 1024
+            AND length(CAST(description AS BLOB)) BETWEEN 1 AND 4096
+            AND instr(description, char(0)) = 0
+        )
+    ),
+    mime_type TEXT CHECK (
+        mime_type IS NULL
+        OR (
+            length(CAST(mime_type AS BLOB)) BETWEEN 1 AND 256
+            AND instr(mime_type, char(0)) = 0
+        )
+    ),
+    size INTEGER CHECK (size IS NULL OR size >= 0),
+    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 4095),
+    PRIMARY KEY (connection_id, uri),
+    FOREIGN KEY (connection_id)
+        REFERENCES connection_mcp_catalogs(connection_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX idx_connection_mcp_catalog_resource_ordinal
+ON connection_mcp_catalog_resources(connection_id, ordinal);
+
+CREATE TABLE connection_mcp_catalog_resource_templates (
+    connection_id TEXT NOT NULL,
+    uri_template TEXT NOT NULL CHECK (
+        length(CAST(uri_template AS BLOB)) BETWEEN 1 AND 2048
+        AND instr(uri_template, char(0)) = 0
+    ),
+    name TEXT NOT NULL CHECK (
+        length(name) BETWEEN 1 AND 128
+        AND length(CAST(name AS BLOB)) BETWEEN 1 AND 512
+        AND instr(name, char(0)) = 0
+    ),
+    title TEXT CHECK (
+        title IS NULL
+        OR (
+            length(title) BETWEEN 1 AND 256
+            AND length(CAST(title AS BLOB)) BETWEEN 1 AND 1024
+            AND instr(title, char(0)) = 0
+        )
+    ),
+    description TEXT CHECK (
+        description IS NULL
+        OR (
+            length(description) BETWEEN 1 AND 1024
+            AND length(CAST(description AS BLOB)) BETWEEN 1 AND 4096
+            AND instr(description, char(0)) = 0
+        )
+    ),
+    mime_type TEXT CHECK (
+        mime_type IS NULL
+        OR (
+            length(CAST(mime_type AS BLOB)) BETWEEN 1 AND 256
+            AND instr(mime_type, char(0)) = 0
+        )
+    ),
+    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 4095),
+    PRIMARY KEY (connection_id, uri_template),
+    FOREIGN KEY (connection_id)
+        REFERENCES connection_mcp_catalogs(connection_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX idx_connection_mcp_catalog_resource_template_ordinal
+ON connection_mcp_catalog_resource_templates(connection_id, ordinal);
+"#;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -371,14 +471,27 @@ const MIGRATIONS: &[Migration] = &[
         version: 5,
         sql: MIGRATION_5_SQL,
     },
+    Migration {
+        version: 6,
+        sql: MIGRATION_6_SQL,
+    },
 ];
 
 const SOURCE_MANAGED: &str = "managed";
 const MAX_DEPENDENCY_FIELD_BYTES: usize = 256;
 pub const MAX_CONNECTION_DEPENDENCIES: usize = 4_096;
 const MAX_MCP_CATALOG_ENTRY_BYTES: usize = 262_144;
+const MAX_MANAGED_MCP_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MCP_TOOL_NAME_CHARS: usize = 128;
 const MAX_MCP_TOOL_DESCRIPTION_CHARS: usize = 1_024;
+const MAX_MCP_RESOURCE_URI_BYTES: usize = 2_048;
+const MAX_MCP_RESOURCE_NAME_CHARS: usize = 128;
+const MAX_MCP_RESOURCE_NAME_BYTES: usize = 512;
+const MAX_MCP_RESOURCE_TITLE_CHARS: usize = 256;
+const MAX_MCP_RESOURCE_TITLE_BYTES: usize = 1_024;
+const MAX_MCP_RESOURCE_DESCRIPTION_CHARS: usize = 1_024;
+const MAX_MCP_RESOURCE_DESCRIPTION_BYTES: usize = 4_096;
+const MAX_MCP_RESOURCE_MIME_TYPE_BYTES: usize = 256;
 const MAX_OPENAPI_CATALOG_ENTRY_BYTES: usize = 262_144;
 const MAX_OPENAPI_TOOL_NAME_CHARS: usize = 128;
 const MAX_OPENAPI_OPERATION_ID_CHARS: usize = 256;
@@ -548,6 +661,27 @@ pub struct StoredMcpCatalogEntry {
     pub input_schema: Value,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredMcpResource {
+    pub uri: String,
+    pub name: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+    pub size: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredMcpResourceTemplate {
+    pub uri_template: String,
+    pub name: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredMcpCatalog {
     pub connection_id: ConnectionId,
@@ -555,6 +689,8 @@ pub struct StoredMcpCatalog {
     pub observed_etag: ConnectionEtag,
     pub refreshed_at: String,
     pub entries: Vec<StoredMcpCatalogEntry>,
+    pub resources: Vec<StoredMcpResource>,
+    pub resource_templates: Vec<StoredMcpResourceTemplate>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -573,6 +709,17 @@ pub struct StoredOpenApiCatalog {
     pub observed_etag: ConnectionEtag,
     pub spec_digest: String,
     pub spec: String,
+    pub refreshed_at: String,
+    pub entries: Vec<StoredOpenApiCatalogEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredOpenApiInventoryCatalog {
+    pub connection_id: ConnectionId,
+    pub spec_revision: u64,
+    pub catalog_revision: u64,
+    pub observed_etag: ConnectionEtag,
+    pub spec_digest: String,
     pub refreshed_at: String,
     pub entries: Vec<StoredOpenApiCatalogEntry>,
 }
@@ -1036,8 +1183,10 @@ impl SqliteConnectionStore {
         id: &ConnectionId,
         expected: &ConnectionEtag,
         entries: &[StoredMcpCatalogEntry],
+        resources: &[StoredMcpResource],
+        resource_templates: &[StoredMcpResourceTemplate],
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
-        let encoded_entries = validate_mcp_catalog_entries(entries)?;
+        let validated = validate_mcp_catalog(entries, resources, resource_templates)?;
         let now = utc_timestamp()?;
         let mut connection = self.connection_guard();
         let transaction = connection
@@ -1063,6 +1212,12 @@ impl SqliteConnectionStore {
                     (SELECT COUNT(*)
                      FROM connection_mcp_catalog_entries
                      WHERE connection_id != ?1)
+                  + (SELECT COUNT(*)
+                     FROM connection_mcp_catalog_resources
+                     WHERE connection_id != ?1)
+                  + (SELECT COUNT(*)
+                     FROM connection_mcp_catalog_resource_templates
+                     WHERE connection_id != ?1)
                   + (SELECT COUNT(*) FROM connection_openapi_catalog_entries)
                 "#,
                 params![id.as_str()],
@@ -1076,10 +1231,29 @@ impl SqliteConnectionStore {
                     reason: "invalid MCP catalog entry count",
                 }
             })?;
-        if retained_catalog_entries.saturating_add(entries.len()) > MAX_CATALOG_ENTRIES {
+        let candidate_count = entries
+            .len()
+            .saturating_add(resources.len())
+            .saturating_add(resource_templates.len());
+        if retained_catalog_entries.saturating_add(candidate_count) > MAX_CATALOG_ENTRIES {
             return Err(ConnectionStoreError::LimitExceeded {
                 resource: "connection catalog entries",
                 maximum: MAX_CATALOG_ENTRIES,
+            });
+        }
+        let retained_catalog_bytes = mcp_catalog_bytes(
+            &transaction,
+            &self.path,
+            Some(id),
+            "MCP retained catalog byte count",
+        )?;
+        if retained_catalog_bytes
+            .checked_add(validated.stored_bytes)
+            .is_none_or(|total| total > MAX_MANAGED_MCP_CATALOG_BYTES)
+        {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog bytes",
+                maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
             });
         }
 
@@ -1132,8 +1306,9 @@ impl SqliteConnectionStore {
             .execute(
                 r#"
                 INSERT INTO connection_mcp_catalogs (
-                    connection_id, catalog_revision, observed_etag, refreshed_at, entry_count
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                    connection_id, catalog_revision, observed_etag, refreshed_at, entry_count,
+                    resource_count, resource_template_count
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 "#,
                 params![
                     id.as_str(),
@@ -1141,12 +1316,16 @@ impl SqliteConnectionStore {
                     expected.as_str(),
                     now,
                     i64::try_from(entries.len()).unwrap_or(i64::MAX),
+                    i64::try_from(resources.len()).unwrap_or(i64::MAX),
+                    i64::try_from(resource_templates.len()).unwrap_or(i64::MAX),
                 ],
             )
             .map_err(|source| sqlite_error(&self.path, "MCP catalog insert", source))?;
 
-        for (ordinal, (entry, input_schema_json)) in
-            entries.iter().zip(encoded_entries.iter()).enumerate()
+        for (ordinal, (entry, input_schema_json)) in entries
+            .iter()
+            .zip(validated.encoded_tool_schemas.iter())
+            .enumerate()
         {
             transaction
                 .execute(
@@ -1184,6 +1363,63 @@ impl SqliteConnectionStore {
                 })?;
         }
 
+        for (ordinal, resource) in resources.iter().enumerate() {
+            let size = resource
+                .size
+                .map(|size| {
+                    i64::try_from(size).map_err(|_| ConnectionStoreError::Validation {
+                        problems: vec![format!(
+                            "MCP resource {ordinal} size exceeds the durable integer range"
+                        )],
+                    })
+                })
+                .transpose()?;
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO connection_mcp_catalog_resources (
+                        connection_id, uri, name, title, description, mime_type, size, ordinal
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    "#,
+                    params![
+                        id.as_str(),
+                        resource.uri,
+                        resource.name,
+                        resource.title,
+                        resource.description,
+                        resource.mime_type,
+                        size,
+                        i64::try_from(ordinal).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(|source| {
+                    sqlite_error(&self.path, "MCP catalog resource insert", source)
+                })?;
+        }
+
+        for (ordinal, resource_template) in resource_templates.iter().enumerate() {
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO connection_mcp_catalog_resource_templates (
+                        connection_id, uri_template, name, title, description, mime_type, ordinal
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    "#,
+                    params![
+                        id.as_str(),
+                        resource_template.uri_template,
+                        resource_template.name,
+                        resource_template.title,
+                        resource_template.description,
+                        resource_template.mime_type,
+                        i64::try_from(ordinal).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(|source| {
+                    sqlite_error(&self.path, "MCP catalog resource template insert", source)
+                })?;
+        }
+
         transaction
             .commit()
             .map_err(|source| sqlite_error(&self.path, "MCP catalog transaction commit", source))?;
@@ -1194,12 +1430,21 @@ impl SqliteConnectionStore {
             observed_etag: expected.clone(),
             refreshed_at: now,
             entries: entries.to_vec(),
+            resources: resources.to_vec(),
+            resource_templates: resource_templates.to_vec(),
         })
     }
 
     pub fn openapi_catalogs(&self) -> Result<Vec<StoredOpenApiCatalog>, ConnectionStoreError> {
         let connection = self.connection_guard();
         load_openapi_catalogs(&connection, &self.path, None)
+    }
+
+    pub fn openapi_inventory_catalogs(
+        &self,
+    ) -> Result<Vec<StoredOpenApiInventoryCatalog>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        load_openapi_inventory_catalogs(&connection, &self.path)
     }
 
     pub fn openapi_catalog(
@@ -1289,6 +1534,8 @@ impl SqliteConnectionStore {
                 r#"
                 SELECT
                     (SELECT COUNT(*) FROM connection_mcp_catalog_entries)
+                  + (SELECT COUNT(*) FROM connection_mcp_catalog_resources)
+                  + (SELECT COUNT(*) FROM connection_mcp_catalog_resource_templates)
                   + (SELECT COUNT(*)
                      FROM connection_openapi_catalog_entries
                      WHERE connection_id != ?1)
@@ -2004,8 +2251,10 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
         "SELECT connection_id, status_revision, observed_connection_revision, observed_credential_revision, observed_tls_revision, observed_discovery_revision, state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count FROM connection_current_status LIMIT 0",
         "SELECT sequence, connection_id, status_revision, observed_connection_revision, observed_credential_revision, observed_tls_revision, observed_discovery_revision, state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count FROM connection_status_history LIMIT 0",
         "SELECT id, schema_version, label, purpose, secret_version, algorithm, key_id, nonce, ciphertext, created_at, rotated_at, updated_at FROM connection_local_secrets LIMIT 0",
-        "SELECT connection_id, catalog_revision, observed_etag, refreshed_at, entry_count FROM connection_mcp_catalogs LIMIT 0",
+        "SELECT connection_id, catalog_revision, observed_etag, refreshed_at, entry_count, resource_count, resource_template_count FROM connection_mcp_catalogs LIMIT 0",
         "SELECT connection_id, remote_tool_name, description, input_schema_json, ordinal FROM connection_mcp_catalog_entries LIMIT 0",
+        "SELECT connection_id, uri, name, title, description, mime_type, size, ordinal FROM connection_mcp_catalog_resources LIMIT 0",
+        "SELECT connection_id, uri_template, name, title, description, mime_type, ordinal FROM connection_mcp_catalog_resource_templates LIMIT 0",
         "SELECT connection_id, spec_revision, catalog_revision, observed_etag, spec_digest, spec, refreshed_at, entry_count FROM connection_openapi_catalogs LIMIT 0",
         "SELECT connection_id, tool_name, operation_id, selected_scheme_names_json, definition_json, ordinal FROM connection_openapi_catalog_entries LIMIT 0",
     ] {
@@ -2089,6 +2338,8 @@ fn validate_persisted_state(
         r#"
         SELECT
             (SELECT COUNT(*) FROM connection_mcp_catalog_entries)
+          + (SELECT COUNT(*) FROM connection_mcp_catalog_resources)
+          + (SELECT COUNT(*) FROM connection_mcp_catalog_resource_templates)
           + (SELECT COUNT(*) FROM connection_openapi_catalog_entries)
         "#,
     )?;
@@ -2163,9 +2414,25 @@ fn validate_persisted_state(
                 FROM connection_mcp_catalog_entries AS entry
                 WHERE entry.connection_id = catalog.connection_id
               )
+           OR catalog.resource_count != (
+                SELECT COUNT(*)
+                FROM connection_mcp_catalog_resources AS resource
+                WHERE resource.connection_id = catalog.connection_id
+              )
+           OR catalog.resource_template_count != (
+                SELECT COUNT(*)
+                FROM connection_mcp_catalog_resource_templates AS template
+                WHERE template.connection_id = catalog.connection_id
+              )
+           OR catalog.entry_count + catalog.resource_count
+                + catalog.resource_template_count > 4096
            OR catalog.catalog_revision < 1
            OR catalog.entry_count < 0
            OR catalog.entry_count > 4096
+           OR catalog.resource_count < 0
+           OR catalog.resource_count > 4096
+           OR catalog.resource_template_count < 0
+           OR catalog.resource_template_count > 4096
         "#,
         "stored MCP catalog metadata is inconsistent",
     )?;
@@ -2274,6 +2541,86 @@ fn validate_persisted_state(
         .map_err(|source| sqlite_error(path, "startup validation commit", source))
 }
 
+struct ValidatedMcpCatalog {
+    encoded_tool_schemas: Vec<String>,
+    stored_bytes: usize,
+}
+
+fn validate_mcp_catalog(
+    entries: &[StoredMcpCatalogEntry],
+    resources: &[StoredMcpResource],
+    resource_templates: &[StoredMcpResourceTemplate],
+) -> Result<ValidatedMcpCatalog, ConnectionStoreError> {
+    let total_count = entries
+        .len()
+        .saturating_add(resources.len())
+        .saturating_add(resource_templates.len());
+    if total_count > MAX_CATALOG_ENTRIES {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection MCP catalog entries",
+            maximum: MAX_CATALOG_ENTRIES,
+        });
+    }
+    let encoded_tool_schemas = validate_mcp_catalog_entries(entries)?;
+    validate_mcp_resources(resources)?;
+    validate_mcp_resource_templates(resource_templates)?;
+
+    let mut encoded_bytes = entries
+        .iter()
+        .zip(&encoded_tool_schemas)
+        .try_fold(0_usize, |total, (entry, encoded)| {
+            total
+                .checked_add(entry.remote_tool_name.len())
+                .and_then(|total| total.checked_add(entry.description.len()))
+                .and_then(|total| total.checked_add(encoded.len()))
+        })
+        .ok_or(ConnectionStoreError::LimitExceeded {
+            resource: "connection MCP catalog bytes",
+            maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+        })?;
+    for resource in resources {
+        encoded_bytes = encoded_bytes
+            .checked_add(
+                serde_json::to_vec(resource)
+                    .map_err(|source| ConnectionStoreError::Json {
+                        operation: "MCP resource metadata",
+                        source,
+                    })?
+                    .len(),
+            )
+            .ok_or(ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog bytes",
+                maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+            })?;
+    }
+    for resource_template in resource_templates {
+        encoded_bytes = encoded_bytes
+            .checked_add(
+                serde_json::to_vec(resource_template)
+                    .map_err(|source| ConnectionStoreError::Json {
+                        operation: "MCP resource template metadata",
+                        source,
+                    })?
+                    .len(),
+            )
+            .ok_or(ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog bytes",
+                maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+            })?;
+    }
+    if encoded_bytes > MAX_MANAGED_MCP_CATALOG_BYTES {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection MCP catalog bytes",
+            maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+        });
+    }
+
+    Ok(ValidatedMcpCatalog {
+        encoded_tool_schemas,
+        stored_bytes: encoded_bytes,
+    })
+}
+
 fn validate_mcp_catalog_entries(
     entries: &[StoredMcpCatalogEntry],
 ) -> Result<Vec<String>, ConnectionStoreError> {
@@ -2329,6 +2676,230 @@ fn validate_mcp_catalog_entries(
         Ok(encoded)
     } else {
         Err(ConnectionStoreError::Validation { problems })
+    }
+}
+
+fn validate_mcp_resources(resources: &[StoredMcpResource]) -> Result<(), ConnectionStoreError> {
+    let mut seen = BTreeSet::new();
+    let mut problems = Vec::new();
+    for (index, resource) in resources.iter().enumerate() {
+        validate_mcp_resource_identity(
+            "resource",
+            index,
+            "uri",
+            &resource.uri,
+            MAX_MCP_RESOURCE_URI_BYTES,
+            MAX_MCP_RESOURCE_URI_BYTES,
+            &mut problems,
+        );
+        validate_mcp_resource_locator("resource", index, "URI", &resource.uri, &mut problems);
+        if !seen.insert(resource.uri.as_str()) {
+            problems.push(format!(
+                "MCP resource {index} duplicates an earlier resource URI"
+            ));
+        }
+        validate_mcp_resource_identity(
+            "resource",
+            index,
+            "name",
+            &resource.name,
+            MAX_MCP_RESOURCE_NAME_CHARS,
+            MAX_MCP_RESOURCE_NAME_BYTES,
+            &mut problems,
+        );
+        validate_optional_mcp_metadata(
+            "resource",
+            index,
+            "title",
+            resource.title.as_deref(),
+            MAX_MCP_RESOURCE_TITLE_CHARS,
+            MAX_MCP_RESOURCE_TITLE_BYTES,
+            &mut problems,
+        );
+        validate_optional_mcp_metadata(
+            "resource",
+            index,
+            "description",
+            resource.description.as_deref(),
+            MAX_MCP_RESOURCE_DESCRIPTION_CHARS,
+            MAX_MCP_RESOURCE_DESCRIPTION_BYTES,
+            &mut problems,
+        );
+        validate_optional_mcp_metadata(
+            "resource",
+            index,
+            "mime type",
+            resource.mime_type.as_deref(),
+            MAX_MCP_RESOURCE_MIME_TYPE_BYTES,
+            MAX_MCP_RESOURCE_MIME_TYPE_BYTES,
+            &mut problems,
+        );
+        if resource.size.is_some_and(|size| size > i64::MAX as u64) {
+            problems.push(format!(
+                "MCP resource {index} size exceeds the durable integer range"
+            ));
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(ConnectionStoreError::Validation { problems })
+    }
+}
+
+pub(crate) fn validate_mcp_resource_metadata(
+    resources: &[StoredMcpResource],
+    resource_templates: &[StoredMcpResourceTemplate],
+) -> Result<(), ConnectionStoreError> {
+    validate_mcp_resources(resources)?;
+    validate_mcp_resource_templates(resource_templates)
+}
+
+fn validate_mcp_resource_templates(
+    resource_templates: &[StoredMcpResourceTemplate],
+) -> Result<(), ConnectionStoreError> {
+    let mut seen = BTreeSet::new();
+    let mut problems = Vec::new();
+    for (index, resource_template) in resource_templates.iter().enumerate() {
+        validate_mcp_resource_identity(
+            "resource template",
+            index,
+            "URI template",
+            &resource_template.uri_template,
+            MAX_MCP_RESOURCE_URI_BYTES,
+            MAX_MCP_RESOURCE_URI_BYTES,
+            &mut problems,
+        );
+        validate_mcp_resource_locator(
+            "resource template",
+            index,
+            "URI template",
+            &resource_template.uri_template,
+            &mut problems,
+        );
+        if !seen.insert(resource_template.uri_template.as_str()) {
+            problems.push(format!(
+                "MCP resource template {index} duplicates an earlier URI template"
+            ));
+        }
+        validate_mcp_resource_identity(
+            "resource template",
+            index,
+            "name",
+            &resource_template.name,
+            MAX_MCP_RESOURCE_NAME_CHARS,
+            MAX_MCP_RESOURCE_NAME_BYTES,
+            &mut problems,
+        );
+        validate_optional_mcp_metadata(
+            "resource template",
+            index,
+            "title",
+            resource_template.title.as_deref(),
+            MAX_MCP_RESOURCE_TITLE_CHARS,
+            MAX_MCP_RESOURCE_TITLE_BYTES,
+            &mut problems,
+        );
+        validate_optional_mcp_metadata(
+            "resource template",
+            index,
+            "description",
+            resource_template.description.as_deref(),
+            MAX_MCP_RESOURCE_DESCRIPTION_CHARS,
+            MAX_MCP_RESOURCE_DESCRIPTION_BYTES,
+            &mut problems,
+        );
+        validate_optional_mcp_metadata(
+            "resource template",
+            index,
+            "mime type",
+            resource_template.mime_type.as_deref(),
+            MAX_MCP_RESOURCE_MIME_TYPE_BYTES,
+            MAX_MCP_RESOURCE_MIME_TYPE_BYTES,
+            &mut problems,
+        );
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(ConnectionStoreError::Validation { problems })
+    }
+}
+
+fn validate_mcp_resource_locator(
+    kind: &str,
+    index: usize,
+    field: &str,
+    value: &str,
+    problems: &mut Vec<String>,
+) {
+    if value.contains(['?', '#']) || mcp_locator_has_authority_userinfo(value) {
+        problems.push(format!(
+            "MCP {kind} {index} {field} must not contain query, fragment, or authority userinfo components"
+        ));
+    }
+}
+
+fn mcp_locator_has_authority_userinfo(value: &str) -> bool {
+    let authority = if let Some(authority) = value.strip_prefix("//") {
+        authority
+    } else {
+        let Some(scheme_end) = value.find(':') else {
+            return false;
+        };
+        if value[..scheme_end].contains(['/', '?', '#']) {
+            return false;
+        }
+        let Some(authority) = value[scheme_end + 1..].strip_prefix("//") else {
+            return false;
+        };
+        authority
+    };
+    let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+    authority[..authority_end].contains('@')
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_mcp_resource_identity(
+    kind: &str,
+    index: usize,
+    field: &str,
+    value: &str,
+    maximum_chars: usize,
+    maximum_bytes: usize,
+    problems: &mut Vec<String>,
+) {
+    if value.is_empty()
+        || value.chars().count() > maximum_chars
+        || value.len() > maximum_bytes
+        || value.chars().any(char::is_control)
+    {
+        problems.push(format!(
+            "MCP {kind} {index} {field} must contain 1-{maximum_chars} characters and at most {maximum_bytes} UTF-8 bytes without control characters"
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_optional_mcp_metadata(
+    kind: &str,
+    index: usize,
+    field: &str,
+    value: Option<&str>,
+    maximum_chars: usize,
+    maximum_bytes: usize,
+    problems: &mut Vec<String>,
+) {
+    if let Some(value) = value {
+        validate_mcp_resource_identity(
+            kind,
+            index,
+            field,
+            value,
+            maximum_chars,
+            maximum_bytes,
+            problems,
+        );
     }
 }
 
@@ -2486,16 +3057,26 @@ fn load_mcp_catalogs(
     path: &Path,
     requested_id: Option<&ConnectionId>,
 ) -> Result<Vec<StoredMcpCatalog>, ConnectionStoreError> {
+    if mcp_catalog_bytes(connection, path, None, "MCP catalog byte load validation")?
+        > MAX_MANAGED_MCP_CATALOG_BYTES
+    {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection MCP catalog bytes",
+            maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+        });
+    }
     let query = if requested_id.is_some() {
         r#"
-        SELECT connection_id, catalog_revision, observed_etag, refreshed_at, entry_count
+        SELECT connection_id, catalog_revision, observed_etag, refreshed_at, entry_count,
+               resource_count, resource_template_count
         FROM connection_mcp_catalogs
         WHERE connection_id = ?1
         ORDER BY connection_id ASC
         "#
     } else {
         r#"
-        SELECT connection_id, catalog_revision, observed_etag, refreshed_at, entry_count
+        SELECT connection_id, catalog_revision, observed_etag, refreshed_at, entry_count,
+               resource_count, resource_template_count
         FROM connection_mcp_catalogs
         ORDER BY connection_id ASC
         "#
@@ -2512,6 +3093,8 @@ fn load_mcp_catalogs(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             })
             .map_err(|source| sqlite_error(path, "MCP catalog query", source))?
@@ -2526,6 +3109,8 @@ fn load_mcp_catalogs(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             })
             .map_err(|source| sqlite_error(path, "MCP catalog query", source))?
@@ -2536,7 +3121,15 @@ fn load_mcp_catalogs(
 
     raw.into_iter()
         .map(
-            |(raw_id, raw_revision, observed_etag, refreshed_at, raw_entry_count)| {
+            |(
+                raw_id,
+                raw_revision,
+                observed_etag,
+                refreshed_at,
+                raw_entry_count,
+                raw_resource_count,
+                raw_resource_template_count,
+            )| {
                 let connection_id = ConnectionId::parse(raw_id.clone()).map_err(|_| {
                     ConnectionStoreError::CorruptRecord {
                         id: raw_id.clone(),
@@ -2567,11 +3160,33 @@ fn load_mcp_catalogs(
                         maximum: MAX_CATALOG_ENTRIES,
                     });
                 }
+                let expected_resource_count =
+                    usize::try_from(raw_resource_count).map_err(|_| {
+                        ConnectionStoreError::CorruptRecord {
+                            id: connection_id.to_string(),
+                            reason: "invalid MCP resource count",
+                        }
+                    })?;
+                let expected_resource_template_count = usize::try_from(raw_resource_template_count)
+                    .map_err(|_| ConnectionStoreError::CorruptRecord {
+                        id: connection_id.to_string(),
+                        reason: "invalid MCP resource template count",
+                    })?;
+                if expected_entry_count
+                    .saturating_add(expected_resource_count)
+                    .saturating_add(expected_resource_template_count)
+                    > MAX_CATALOG_ENTRIES
+                {
+                    return Err(ConnectionStoreError::LimitExceeded {
+                        resource: "connection MCP catalog entries",
+                        maximum: MAX_CATALOG_ENTRIES,
+                    });
+                }
 
                 let mut entry_statement = connection
                     .prepare(
                         r#"
-                        SELECT remote_tool_name, description, input_schema_json
+                        SELECT remote_tool_name, description, input_schema_json, ordinal
                         FROM connection_mcp_catalog_entries
                         WHERE connection_id = ?1
                         ORDER BY ordinal ASC
@@ -2586,6 +3201,7 @@ fn load_mcp_catalogs(
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
                         ))
                     })
                     .map_err(|source| sqlite_error(path, "MCP catalog entry query", source))?
@@ -2599,28 +3215,158 @@ fn load_mcp_catalogs(
                 }
                 let entries = raw_entries
                     .into_iter()
-                    .map(|(remote_tool_name, description, input_schema_json)| {
-                        let input_schema =
-                            serde_json::from_str(&input_schema_json).map_err(|source| {
-                                ConnectionStoreError::Json {
-                                    operation: "stored MCP catalog input schema",
-                                    source,
-                                }
+                    .enumerate()
+                    .map(
+                        |(index, (remote_tool_name, description, input_schema_json, ordinal))| {
+                            if usize::try_from(ordinal).ok() != Some(index) {
+                                return Err(ConnectionStoreError::CorruptRecord {
+                                    id: connection_id.to_string(),
+                                    reason: "MCP catalog entry ordinals are not contiguous",
+                                });
+                            }
+                            let input_schema =
+                                serde_json::from_str(&input_schema_json).map_err(|source| {
+                                    ConnectionStoreError::Json {
+                                        operation: "stored MCP catalog input schema",
+                                        source,
+                                    }
+                                })?;
+                            Ok(StoredMcpCatalogEntry {
+                                remote_tool_name,
+                                description,
+                                input_schema,
+                            })
+                        },
+                    )
+                    .collect::<Result<Vec<_>, ConnectionStoreError>>()?;
+
+                let mut resource_statement = connection
+                    .prepare(
+                        r#"
+                        SELECT uri, name, title, description, mime_type, size, ordinal
+                        FROM connection_mcp_catalog_resources
+                        WHERE connection_id = ?1
+                        ORDER BY ordinal ASC
+                        "#,
+                    )
+                    .map_err(|source| {
+                        sqlite_error(path, "MCP catalog resource query prepare", source)
+                    })?;
+                let resources = resource_statement
+                    .query_map(params![connection_id.as_str()], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<i64>>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    })
+                    .map_err(|source| sqlite_error(path, "MCP catalog resource query", source))?
+                    .enumerate()
+                    .map(|(index, row)| {
+                        let (uri, name, title, description, mime_type, raw_size, ordinal) = row
+                            .map_err(|source| {
+                                sqlite_error(path, "MCP catalog resource read", source)
                             })?;
-                        Ok(StoredMcpCatalogEntry {
-                            remote_tool_name,
+                        if usize::try_from(ordinal).ok() != Some(index) {
+                            return Err(ConnectionStoreError::CorruptRecord {
+                                id: connection_id.to_string(),
+                                reason: "MCP resource ordinals are not contiguous",
+                            });
+                        }
+                        let size = raw_size
+                            .map(|size| {
+                                u64::try_from(size).map_err(|_| {
+                                    ConnectionStoreError::CorruptRecord {
+                                        id: connection_id.to_string(),
+                                        reason: "invalid MCP resource size",
+                                    }
+                                })
+                            })
+                            .transpose()?;
+                        Ok(StoredMcpResource {
+                            uri,
+                            name,
+                            title,
                             description,
-                            input_schema,
+                            mime_type,
+                            size,
                         })
                     })
                     .collect::<Result<Vec<_>, ConnectionStoreError>>()?;
-                let _ = validate_mcp_catalog_entries(&entries)?;
+                if resources.len() != expected_resource_count {
+                    return Err(ConnectionStoreError::CorruptRecord {
+                        id: connection_id.to_string(),
+                        reason: "MCP resource count mismatch",
+                    });
+                }
+
+                let mut resource_template_statement = connection
+                    .prepare(
+                        r#"
+                        SELECT uri_template, name, title, description, mime_type, ordinal
+                        FROM connection_mcp_catalog_resource_templates
+                        WHERE connection_id = ?1
+                        ORDER BY ordinal ASC
+                        "#,
+                    )
+                    .map_err(|source| {
+                        sqlite_error(path, "MCP catalog resource template query prepare", source)
+                    })?;
+                let resource_templates = resource_template_statement
+                    .query_map(params![connection_id.as_str()], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    })
+                    .map_err(|source| {
+                        sqlite_error(path, "MCP catalog resource template query", source)
+                    })?
+                    .enumerate()
+                    .map(|(index, row)| {
+                        let (uri_template, name, title, description, mime_type, ordinal) = row
+                            .map_err(|source| {
+                                sqlite_error(path, "MCP catalog resource template read", source)
+                            })?;
+                        if usize::try_from(ordinal).ok() != Some(index) {
+                            return Err(ConnectionStoreError::CorruptRecord {
+                                id: connection_id.to_string(),
+                                reason: "MCP resource template ordinals are not contiguous",
+                            });
+                        }
+                        Ok(StoredMcpResourceTemplate {
+                            uri_template,
+                            name,
+                            title,
+                            description,
+                            mime_type,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ConnectionStoreError>>()?;
+                if resource_templates.len() != expected_resource_template_count {
+                    return Err(ConnectionStoreError::CorruptRecord {
+                        id: connection_id.to_string(),
+                        reason: "MCP resource template count mismatch",
+                    });
+                }
+
+                let _ = validate_mcp_catalog(&entries, &resources, &resource_templates)?;
                 Ok(StoredMcpCatalog {
                     connection_id,
                     catalog_revision,
                     observed_etag: ConnectionEtag(observed_etag),
                     refreshed_at,
                     entries,
+                    resources,
+                    resource_templates,
                 })
             },
         )
@@ -2737,82 +3483,12 @@ fn load_openapi_catalogs(
                     });
                 }
 
-                let mut entry_statement = connection
-                    .prepare(
-                        r#"
-                        SELECT tool_name, operation_id, selected_scheme_names_json,
-                               definition_json, ordinal
-                        FROM connection_openapi_catalog_entries
-                        WHERE connection_id = ?1
-                        ORDER BY ordinal ASC
-                        "#,
-                    )
-                    .map_err(|source| {
-                        sqlite_error(path, "OpenAPI catalog entry query prepare", source)
-                    })?;
-                let raw_entries = entry_statement
-                    .query_map(params![connection_id.as_str()], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, i64>(4)?,
-                        ))
-                    })
-                    .map_err(|source| sqlite_error(path, "OpenAPI catalog entry query", source))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|source| sqlite_error(path, "OpenAPI catalog entry read", source))?;
-                if raw_entries.len() != expected_entry_count {
-                    return Err(ConnectionStoreError::CorruptRecord {
-                        id: connection_id.to_string(),
-                        reason: "OpenAPI catalog entry count mismatch",
-                    });
-                }
-                let mut entries = Vec::with_capacity(raw_entries.len());
-                for (
-                    index,
-                    (tool_name, operation_id, selected_scheme_names_json, definition_json, ordinal),
-                ) in raw_entries.into_iter().enumerate()
-                {
-                    if usize::try_from(ordinal).ok() != Some(index) {
-                        return Err(ConnectionStoreError::CorruptRecord {
-                            id: connection_id.to_string(),
-                            reason: "OpenAPI catalog entry ordinals are not contiguous",
-                        });
-                    }
-                    let selected_scheme_names = serde_json::from_str::<Vec<String>>(
-                        &selected_scheme_names_json,
-                    )
-                    .map_err(|source| ConnectionStoreError::Json {
-                        operation: "stored OpenAPI selected security schemes",
-                        source,
-                    })?;
-                    let definition =
-                        serde_json::from_str::<Value>(&definition_json).map_err(|source| {
-                            ConnectionStoreError::Json {
-                                operation: "stored OpenAPI catalog tool definition",
-                                source,
-                            }
-                        })?;
-                    entries.push(StoredOpenApiCatalogEntry {
-                        tool_name,
-                        operation_id,
-                        selected_scheme_names,
-                        definition,
-                    });
-                }
-                let normalized = validate_openapi_catalog_entries(&entries)?;
-                if normalized
-                    .iter()
-                    .map(|entry| &entry.entry)
-                    .ne(entries.iter())
-                {
-                    return Err(ConnectionStoreError::CorruptRecord {
-                        id: connection_id.to_string(),
-                        reason: "OpenAPI catalog security scheme selections are not canonical",
-                    });
-                }
+                let entries = load_openapi_catalog_entries(
+                    connection,
+                    path,
+                    &connection_id,
+                    expected_entry_count,
+                )?;
                 Ok(StoredOpenApiCatalog {
                     connection_id,
                     spec_revision,
@@ -2826,6 +3502,198 @@ fn load_openapi_catalogs(
             },
         )
         .collect()
+}
+
+fn load_openapi_inventory_catalogs(
+    connection: &Connection,
+    path: &Path,
+) -> Result<Vec<StoredOpenApiInventoryCatalog>, ConnectionStoreError> {
+    if openapi_definition_bytes(
+        connection,
+        path,
+        None,
+        "OpenAPI inventory definition byte load validation",
+    )? > MAX_MANAGED_OPENAPI_CATALOG_BYTES
+    {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection OpenAPI catalog definition bytes",
+            maximum: MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+        });
+    }
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT connection_id, spec_revision, catalog_revision, observed_etag,
+                   spec_digest, refreshed_at, entry_count
+            FROM connection_openapi_catalogs
+            ORDER BY connection_id ASC
+            "#,
+        )
+        .map_err(|source| sqlite_error(path, "OpenAPI inventory query prepare", source))?;
+    let raw = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(|source| sqlite_error(path, "OpenAPI inventory query", source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error(path, "OpenAPI inventory read", source))?;
+    drop(statement);
+
+    raw.into_iter()
+        .map(
+            |(
+                raw_id,
+                raw_spec_revision,
+                raw_catalog_revision,
+                observed_etag,
+                spec_digest,
+                refreshed_at,
+                raw_entry_count,
+            )| {
+                let connection_id = ConnectionId::parse(raw_id.clone()).map_err(|_| {
+                    ConnectionStoreError::CorruptRecord {
+                        id: raw_id,
+                        reason: "invalid OpenAPI catalog connection ID",
+                    }
+                })?;
+                let spec_revision = persisted_revision(
+                    &connection_id,
+                    raw_spec_revision,
+                    "invalid OpenAPI spec revision",
+                )?;
+                let catalog_revision = persisted_revision(
+                    &connection_id,
+                    raw_catalog_revision,
+                    "invalid OpenAPI catalog revision",
+                )?;
+                if spec_digest.len() != SHA256_HEX_CHARS
+                    || !spec_digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(ConnectionStoreError::CorruptRecord {
+                        id: connection_id.to_string(),
+                        reason: "invalid stored OpenAPI spec digest",
+                    });
+                }
+                let expected_entry_count = usize::try_from(raw_entry_count).map_err(|_| {
+                    ConnectionStoreError::CorruptRecord {
+                        id: connection_id.to_string(),
+                        reason: "invalid OpenAPI catalog entry count",
+                    }
+                })?;
+                if expected_entry_count > MAX_CATALOG_ENTRIES {
+                    return Err(ConnectionStoreError::LimitExceeded {
+                        resource: "connection OpenAPI catalog entries",
+                        maximum: MAX_CATALOG_ENTRIES,
+                    });
+                }
+                let entries = load_openapi_catalog_entries(
+                    connection,
+                    path,
+                    &connection_id,
+                    expected_entry_count,
+                )?;
+                Ok(StoredOpenApiInventoryCatalog {
+                    connection_id,
+                    spec_revision,
+                    catalog_revision,
+                    observed_etag: ConnectionEtag(observed_etag),
+                    spec_digest,
+                    refreshed_at,
+                    entries,
+                })
+            },
+        )
+        .collect()
+}
+
+fn load_openapi_catalog_entries(
+    connection: &Connection,
+    path: &Path,
+    connection_id: &ConnectionId,
+    expected_entry_count: usize,
+) -> Result<Vec<StoredOpenApiCatalogEntry>, ConnectionStoreError> {
+    let mut entry_statement = connection
+        .prepare(
+            r#"
+            SELECT tool_name, operation_id, selected_scheme_names_json,
+                   definition_json, ordinal
+            FROM connection_openapi_catalog_entries
+            WHERE connection_id = ?1
+            ORDER BY ordinal ASC
+            "#,
+        )
+        .map_err(|source| sqlite_error(path, "OpenAPI catalog entry query prepare", source))?;
+    let raw_entries = entry_statement
+        .query_map(params![connection_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|source| sqlite_error(path, "OpenAPI catalog entry query", source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error(path, "OpenAPI catalog entry read", source))?;
+    if raw_entries.len() != expected_entry_count {
+        return Err(ConnectionStoreError::CorruptRecord {
+            id: connection_id.to_string(),
+            reason: "OpenAPI catalog entry count mismatch",
+        });
+    }
+    let mut entries = Vec::with_capacity(raw_entries.len());
+    for (index, (tool_name, operation_id, selected_scheme_names_json, definition_json, ordinal)) in
+        raw_entries.into_iter().enumerate()
+    {
+        if usize::try_from(ordinal).ok() != Some(index) {
+            return Err(ConnectionStoreError::CorruptRecord {
+                id: connection_id.to_string(),
+                reason: "OpenAPI catalog entry ordinals are not contiguous",
+            });
+        }
+        let selected_scheme_names =
+            serde_json::from_str::<Vec<String>>(&selected_scheme_names_json).map_err(|source| {
+                ConnectionStoreError::Json {
+                    operation: "stored OpenAPI selected security schemes",
+                    source,
+                }
+            })?;
+        let definition = serde_json::from_str::<Value>(&definition_json).map_err(|source| {
+            ConnectionStoreError::Json {
+                operation: "stored OpenAPI catalog tool definition",
+                source,
+            }
+        })?;
+        entries.push(StoredOpenApiCatalogEntry {
+            tool_name,
+            operation_id,
+            selected_scheme_names,
+            definition,
+        });
+    }
+    let normalized = validate_openapi_catalog_entries(&entries)?;
+    if normalized
+        .iter()
+        .map(|entry| &entry.entry)
+        .ne(entries.iter())
+    {
+        return Err(ConnectionStoreError::CorruptRecord {
+            id: connection_id.to_string(),
+            reason: "OpenAPI catalog security scheme selections are not canonical",
+        });
+    }
+    Ok(entries)
 }
 
 fn validate_managed_catalog_dependencies(
@@ -2915,6 +3783,122 @@ fn count_rows(
     usize::try_from(count).map_err(|_| ConnectionStoreError::CorruptRecord {
         id: format!("<{resource}>"),
         reason: "negative or oversized persisted row count",
+    })
+}
+
+fn mcp_catalog_bytes(
+    connection: &Connection,
+    path: &Path,
+    excluded_id: Option<&ConnectionId>,
+    operation: &'static str,
+) -> Result<usize, ConnectionStoreError> {
+    let entry_bytes = aggregate_catalog_bytes(
+        connection,
+        path,
+        excluded_id,
+        operation,
+        r#"
+        SELECT COALESCE(SUM(
+            length(CAST(remote_tool_name AS BLOB))
+          + length(CAST(description AS BLOB))
+          + length(CAST(input_schema_json AS BLOB))
+        ), 0)
+        FROM connection_mcp_catalog_entries
+        "#,
+        r#"
+        SELECT COALESCE(SUM(
+            length(CAST(remote_tool_name AS BLOB))
+          + length(CAST(description AS BLOB))
+          + length(CAST(input_schema_json AS BLOB))
+        ), 0)
+        FROM connection_mcp_catalog_entries
+        WHERE connection_id != ?1
+        "#,
+    )?;
+    let resource_bytes = aggregate_catalog_bytes(
+        connection,
+        path,
+        excluded_id,
+        operation,
+        r#"
+        SELECT COALESCE(SUM(
+            length(CAST(uri AS BLOB))
+          + length(CAST(name AS BLOB))
+          + COALESCE(length(CAST(title AS BLOB)), 0)
+          + COALESCE(length(CAST(description AS BLOB)), 0)
+          + COALESCE(length(CAST(mime_type AS BLOB)), 0)
+          + CASE WHEN size IS NULL THEN 0 ELSE 8 END
+        ), 0)
+        FROM connection_mcp_catalog_resources
+        "#,
+        r#"
+        SELECT COALESCE(SUM(
+            length(CAST(uri AS BLOB))
+          + length(CAST(name AS BLOB))
+          + COALESCE(length(CAST(title AS BLOB)), 0)
+          + COALESCE(length(CAST(description AS BLOB)), 0)
+          + COALESCE(length(CAST(mime_type AS BLOB)), 0)
+          + CASE WHEN size IS NULL THEN 0 ELSE 8 END
+        ), 0)
+        FROM connection_mcp_catalog_resources
+        WHERE connection_id != ?1
+        "#,
+    )?;
+    let template_bytes = aggregate_catalog_bytes(
+        connection,
+        path,
+        excluded_id,
+        operation,
+        r#"
+        SELECT COALESCE(SUM(
+            length(CAST(uri_template AS BLOB))
+          + length(CAST(name AS BLOB))
+          + COALESCE(length(CAST(title AS BLOB)), 0)
+          + COALESCE(length(CAST(description AS BLOB)), 0)
+          + COALESCE(length(CAST(mime_type AS BLOB)), 0)
+        ), 0)
+        FROM connection_mcp_catalog_resource_templates
+        "#,
+        r#"
+        SELECT COALESCE(SUM(
+            length(CAST(uri_template AS BLOB))
+          + length(CAST(name AS BLOB))
+          + COALESCE(length(CAST(title AS BLOB)), 0)
+          + COALESCE(length(CAST(description AS BLOB)), 0)
+          + COALESCE(length(CAST(mime_type AS BLOB)), 0)
+        ), 0)
+        FROM connection_mcp_catalog_resource_templates
+        WHERE connection_id != ?1
+        "#,
+    )?;
+
+    entry_bytes
+        .checked_add(resource_bytes)
+        .and_then(|bytes| bytes.checked_add(template_bytes))
+        .ok_or(ConnectionStoreError::LimitExceeded {
+            resource: "connection MCP catalog bytes",
+            maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aggregate_catalog_bytes(
+    connection: &Connection,
+    path: &Path,
+    excluded_id: Option<&ConnectionId>,
+    operation: &'static str,
+    all_query: &'static str,
+    excluding_query: &'static str,
+) -> Result<usize, ConnectionStoreError> {
+    let bytes: i64 = if let Some(id) = excluded_id {
+        connection.query_row(excluding_query, params![id.as_str()], |row| row.get(0))
+    } else {
+        connection.query_row(all_query, [], |row| row.get(0))
+    }
+    .map_err(|source| sqlite_error(path, operation, source))?;
+    usize::try_from(bytes).map_err(|_| ConnectionStoreError::CorruptRecord {
+        id: "<mcp-catalogs>".to_owned(),
+        reason: "invalid MCP catalog byte count",
     })
 }
 
@@ -3721,6 +4705,82 @@ mod tests {
         }
     }
 
+    fn mcp_resource(uri: &str, name: &str) -> StoredMcpResource {
+        StoredMcpResource {
+            uri: uri.to_owned(),
+            name: name.to_owned(),
+            title: Some(format!("{name} title")),
+            description: Some(format!("{name} description")),
+            mime_type: Some("application/json".to_owned()),
+            size: Some(42),
+        }
+    }
+
+    fn mcp_resource_template(uri_template: &str, name: &str) -> StoredMcpResourceTemplate {
+        StoredMcpResourceTemplate {
+            uri_template: uri_template.to_owned(),
+            name: name.to_owned(),
+            title: Some(format!("{name} title")),
+            description: Some(format!("{name} description")),
+            mime_type: Some("application/json".to_owned()),
+        }
+    }
+
+    fn persist_oversized_mcp_resource_catalog(
+        store: &SqliteConnectionStore,
+        connection_id: &ConnectionId,
+        locator_canary: &str,
+    ) {
+        let oversized_description = "😀".repeat(MAX_MCP_RESOURCE_DESCRIPTION_CHARS);
+        let mut connection = store.connection_guard();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("corrupt MCP fixture transaction should begin");
+        {
+            let mut statement = transaction
+                .prepare(
+                    r#"
+                    INSERT INTO connection_mcp_catalog_resources (
+                        connection_id, uri, name, title, description, mime_type, size, ordinal
+                    ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, NULL, ?5)
+                    "#,
+                )
+                .expect("corrupt MCP resource insert should prepare");
+            for ordinal in 0..MAX_CATALOG_ENTRIES {
+                let uri = if ordinal == 0 {
+                    format!("gg://resource/first?token={locator_canary}")
+                } else {
+                    format!("gg://resource/{ordinal:04}")
+                };
+                statement
+                    .execute(params![
+                        connection_id.as_str(),
+                        uri,
+                        format!("resource-{ordinal:04}"),
+                        oversized_description,
+                        i64::try_from(ordinal).expect("fixture ordinal should fit"),
+                    ])
+                    .expect("corrupt MCP resource fixture should insert");
+            }
+        }
+        transaction
+            .execute(
+                r#"
+                UPDATE connection_mcp_catalogs
+                SET resource_count = ?1
+                WHERE connection_id = ?2
+                "#,
+                params![
+                    i64::try_from(MAX_CATALOG_ENTRIES).expect("fixture count should fit"),
+                    connection_id.as_str(),
+                ],
+            )
+            .expect("corrupt MCP resource count should update");
+        transaction
+            .commit()
+            .expect("corrupt MCP fixture transaction should commit");
+    }
+
     fn openapi_catalog_entry(name: &str) -> StoredOpenApiCatalogEntry {
         StoredOpenApiCatalogEntry {
             tool_name: name.to_owned(),
@@ -3815,7 +4875,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -4064,7 +5124,111 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn migration_six_preserves_populated_v5_mcp_catalog_state() {
+        let database = TemporaryDatabase::new("migration-v5-populated");
+        let path = database.path.clone();
+        let connection_id = ConnectionId::new_managed();
+        let write = mcp_candidate();
+        let spec_json =
+            serde_json::to_string(&write).expect("v5 fixture candidate should serialize");
+        let timestamp = "2026-07-28T00:00:00Z";
+        {
+            let connection =
+                Connection::open(&path).expect("v5 fixture database should open directly");
+            connection
+                .execute_batch(CONFIGURE_SQL)
+                .expect("v5 fixture pragmas should apply");
+            connection
+                .execute_batch(CREATE_MIGRATIONS_TABLE_SQL)
+                .expect("v5 fixture migration table should create");
+            for migration in MIGRATIONS.iter().take(5) {
+                connection
+                    .execute_batch(migration.sql)
+                    .expect("v5 fixture migration should apply");
+                connection
+                    .execute(
+                        "INSERT INTO connection_schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        params![migration.version, timestamp],
+                    )
+                    .expect("v5 fixture migration should record");
+            }
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_records (
+                        id, schema_version, source, spec_json, connection_revision,
+                        credential_revision, tls_revision, discovery_revision,
+                        status_revision, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, 1, 0, 0, 1, 0, ?5, ?5)
+                    "#,
+                    params![
+                        connection_id.as_str(),
+                        CONNECTION_SCHEMA_VERSION,
+                        SOURCE_MANAGED,
+                        spec_json,
+                        timestamp,
+                    ],
+                )
+                .expect("v5 fixture Connection should insert");
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_mcp_catalogs (
+                        connection_id, catalog_revision, observed_etag, refreshed_at, entry_count
+                    ) VALUES (?1, 7, '"fixture-etag"', ?2, 1)
+                    "#,
+                    params![connection_id.as_str(), timestamp],
+                )
+                .expect("v5 fixture MCP catalog should insert");
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_mcp_catalog_entries (
+                        connection_id, remote_tool_name, description, input_schema_json, ordinal
+                    ) VALUES (?1, 'alpha', 'Alpha', '{}', 0)
+                    "#,
+                    params![connection_id.as_str()],
+                )
+                .expect("v5 fixture MCP entry should insert");
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_dependencies (
+                        connection_id, consumer_kind, consumer_id, created_at
+                    ) VALUES (?1, 'managed_tool', ?2, ?3)
+                    "#,
+                    params![
+                        connection_id.as_str(),
+                        format!("{}:alpha", connection_id.as_str()),
+                        timestamp,
+                    ],
+                )
+                .expect("v5 fixture managed-tool dependency should insert");
+        }
+
+        let store =
+            SqliteConnectionStore::open(&path).expect("migration 6 should upgrade populated v5");
+        let catalog = store
+            .mcp_catalog(&connection_id)
+            .expect("migrated MCP catalog should load")
+            .expect("migrated MCP catalog should remain");
+        assert_eq!(catalog.catalog_revision, 7);
+        assert_eq!(catalog.entries.len(), 1);
+        assert!(catalog.resources.is_empty());
+        assert!(catalog.resource_templates.is_empty());
+        let connection = store.connection_guard();
+        let versions = connection
+            .prepare("SELECT version FROM connection_schema_migrations ORDER BY version")
+            .expect("migration query should prepare")
+            .query_map([], |row| row.get::<_, u32>(0))
+            .expect("migration query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("migration rows should read");
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -4081,9 +5245,16 @@ mod tests {
                     mcp_catalog_entry("alpha", "Alpha"),
                     mcp_catalog_entry("beta", "Beta"),
                 ],
+                &[mcp_resource("gg://resource/alpha", "resource-alpha")],
+                &[mcp_resource_template(
+                    "gg://resource/{id}",
+                    "resource-by-id",
+                )],
             )
             .expect("first MCP catalog should publish");
         assert_eq!(first.catalog_revision, 1);
+        assert_eq!(first.resources.len(), 1);
+        assert_eq!(first.resource_templates.len(), 1);
         assert_eq!(
             store
                 .dependencies(&created.id)
@@ -4106,6 +5277,11 @@ mod tests {
                     mcp_catalog_entry("beta", "Beta changed"),
                     mcp_catalog_entry("gamma", "Gamma"),
                 ],
+                &[mcp_resource("gg://resource/beta", "resource-beta")],
+                &[mcp_resource_template(
+                    "gg://resource/{slug}",
+                    "resource-by-slug",
+                )],
             )
             .expect("second MCP catalog should publish");
         assert_eq!(second.catalog_revision, 2);
@@ -4116,6 +5292,11 @@ mod tests {
                 .map(|entry| entry.remote_tool_name.as_str())
                 .collect::<Vec<_>>(),
             vec!["beta", "gamma"]
+        );
+        assert_eq!(second.resources[0].uri, "gg://resource/beta");
+        assert_eq!(
+            second.resource_templates[0].uri_template,
+            "gg://resource/{slug}"
         );
 
         let mut discovery_removed = created.write.clone();
@@ -4143,7 +5324,21 @@ mod tests {
             mcp_catalog_entry("duplicate", "Second"),
         ];
         assert!(matches!(
-            store.replace_mcp_catalog(&created.id, &created.etag(), &duplicate),
+            store.replace_mcp_catalog(&created.id, &created.etag(), &duplicate, &[], &[]),
+            Err(ConnectionStoreError::Validation { .. })
+        ));
+        let duplicate_resources = [
+            mcp_resource("gg://duplicate", "first"),
+            mcp_resource("gg://duplicate", "second"),
+        ];
+        assert!(matches!(
+            store.replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                &[mcp_catalog_entry("replacement", "Replacement")],
+                &duplicate_resources,
+                &[],
+            ),
             Err(ConnectionStoreError::Validation { .. })
         ));
         let retained = store
@@ -4159,6 +5354,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["beta", "gamma"]
         );
+        assert_eq!(retained.resources, second.resources);
+        assert_eq!(retained.resource_templates, second.resource_templates);
 
         drop(store);
         let reopened = SqliteConnectionStore::open(&path).expect("catalog store should reopen");
@@ -4171,13 +5368,296 @@ mod tests {
     }
 
     #[test]
+    fn mcp_catalog_combined_count_and_byte_limits_preserve_last_known_good() {
+        let (_directory, _path, store) = temporary_store("mcp-catalog-limits");
+        let created = store
+            .create(mcp_candidate())
+            .expect("MCP connection should create");
+        let baseline = store
+            .replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                &[mcp_catalog_entry("baseline", "Baseline")],
+                &[mcp_resource("gg://baseline", "baseline-resource")],
+                &[mcp_resource_template(
+                    "gg://baseline/{id}",
+                    "baseline-template",
+                )],
+            )
+            .expect("baseline MCP catalog should publish");
+
+        let maximum_tools = (0..MAX_CATALOG_ENTRIES)
+            .map(|index| mcp_catalog_entry(&format!("tool-{index:04}"), "Bounded"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            store.replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                &maximum_tools,
+                &[mcp_resource("gg://overflow", "overflow")],
+                &[],
+            ),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog entries",
+                ..
+            })
+        ));
+
+        let filler = "x".repeat(255_000);
+        let oversized_bytes = (0..66)
+            .map(|index| StoredMcpCatalogEntry {
+                remote_tool_name: format!("large-{index:03}"),
+                description: "Large bounded schema".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "description": filler.clone()
+                }),
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            store.replace_mcp_catalog(&created.id, &created.etag(), &oversized_bytes, &[], &[],),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog bytes",
+                ..
+            })
+        ));
+        assert_eq!(
+            store
+                .mcp_catalog(&created.id)
+                .expect("retained catalog should load"),
+            Some(baseline),
+            "invalid count and byte candidates must not replace the last-known-good catalog"
+        );
+    }
+
+    #[test]
+    fn aggregate_mcp_catalog_byte_bound_preserves_all_last_known_good_catalogs() {
+        let (_directory, _path, store) = temporary_store("mcp-aggregate-byte-bound");
+        let first = store
+            .create(mcp_candidate())
+            .expect("first MCP Connection should create");
+        let mut second_candidate = mcp_candidate();
+        second_candidate.display_name = "Second managed MCP".to_owned();
+        let second = store
+            .create(second_candidate)
+            .expect("second MCP Connection should create");
+        let baseline = store
+            .replace_mcp_catalog(
+                &second.id,
+                &second.etag(),
+                &[mcp_catalog_entry("baseline", "Baseline")],
+                &[],
+                &[],
+            )
+            .expect("second MCP baseline should publish");
+
+        let maximum_description = "😀".repeat(MAX_MCP_TOOL_DESCRIPTION_CHARS);
+        let first_entries = (0..MAX_CATALOG_ENTRIES / 2)
+            .map(|index| mcp_catalog_entry(&format!("first-{index:04}"), &maximum_description))
+            .collect::<Vec<_>>();
+        let first_bytes = validate_mcp_catalog(&first_entries, &[], &[])
+            .expect("first half-bound catalog should validate")
+            .stored_bytes;
+        store
+            .replace_mcp_catalog(&first.id, &first.etag(), &first_entries, &[], &[])
+            .expect("first half-bound catalog should publish");
+        drop(first_entries);
+
+        let second_entries = (0..MAX_CATALOG_ENTRIES / 2)
+            .map(|index| mcp_catalog_entry(&format!("second-{index:04}"), &maximum_description))
+            .collect::<Vec<_>>();
+        let second_bytes = validate_mcp_catalog(&second_entries, &[], &[])
+            .expect("second half-bound catalog should validate")
+            .stored_bytes;
+        assert!(first_bytes <= MAX_MANAGED_MCP_CATALOG_BYTES);
+        assert!(second_bytes <= MAX_MANAGED_MCP_CATALOG_BYTES);
+        assert!(
+            first_bytes
+                .checked_add(second_bytes)
+                .is_some_and(|total| total > MAX_MANAGED_MCP_CATALOG_BYTES),
+            "the two independently valid catalogs must exceed the global byte bound"
+        );
+
+        assert!(matches!(
+            store.replace_mcp_catalog(&second.id, &second.etag(), &second_entries, &[], &[],),
+            Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog bytes",
+                maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+            })
+        ));
+        assert_eq!(
+            store
+                .mcp_catalog(&first.id)
+                .expect("retained first catalog should load")
+                .expect("retained first catalog should remain")
+                .entries
+                .len(),
+            MAX_CATALOG_ENTRIES / 2,
+            "aggregate rejection must not disturb another Connection's catalog"
+        );
+        assert_eq!(
+            store
+                .mcp_catalog(&second.id)
+                .expect("retained second catalog should load"),
+            Some(baseline),
+            "aggregate rejection must preserve the prior catalog"
+        );
+    }
+
+    #[test]
+    fn corrupt_aggregate_mcp_bytes_are_preflighted_on_load_and_restart() {
+        const LOCATOR_CANARY: &str = "OVERSIZED_MCP_LOCATOR_CANARY";
+
+        let (_directory, path, store) = temporary_store("mcp-aggregate-byte-corruption");
+        let created = store
+            .create(mcp_candidate())
+            .expect("MCP Connection should create");
+        store
+            .replace_mcp_catalog(&created.id, &created.etag(), &[], &[], &[])
+            .expect("empty MCP catalog should publish");
+        persist_oversized_mcp_resource_catalog(&store, &created.id, LOCATOR_CANARY);
+
+        let load_error = store
+            .mcp_catalogs()
+            .expect_err("oversized aggregate must fail before catalog rows load");
+        assert!(matches!(
+            &load_error,
+            ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog bytes",
+                maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+            }
+        ));
+        assert!(!format!("{load_error:?}").contains(LOCATOR_CANARY));
+        assert!(!load_error.to_string().contains(LOCATOR_CANARY));
+        drop(store);
+
+        let restart_error = SqliteConnectionStore::open(&path)
+            .err()
+            .expect("oversized aggregate must fail startup validation");
+        assert!(matches!(
+            &restart_error,
+            ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog bytes",
+                maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
+            }
+        ));
+        assert!(!format!("{restart_error:?}").contains(LOCATOR_CANARY));
+        assert!(!restart_error.to_string().contains(LOCATOR_CANARY));
+    }
+
+    #[test]
+    fn mcp_resource_locators_reject_secret_bearing_components_without_leaking() {
+        let (_directory, _path, store) = temporary_store("mcp-catalog-safe-locators");
+        let created = store
+            .create(mcp_candidate())
+            .expect("MCP connection should create");
+        let baseline = store
+            .replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                &[mcp_catalog_entry("baseline", "Baseline")],
+                &[mcp_resource("gg://resource/baseline", "baseline-resource")],
+                &[mcp_resource_template(
+                    "gg://resource/{id}",
+                    "baseline-template",
+                )],
+            )
+            .expect("baseline MCP catalog should publish");
+
+        let invalid_candidates = [
+            (
+                vec![mcp_resource(
+                    "gg://resource/alpha?token=QUERY_SECRET_CANARY",
+                    "query-secret",
+                )],
+                Vec::new(),
+                "QUERY_SECRET_CANARY",
+            ),
+            (
+                Vec::new(),
+                vec![mcp_resource_template(
+                    "gg://resource/{id}?token=TEMPLATE_QUERY_SECRET_CANARY",
+                    "template-query-secret",
+                )],
+                "TEMPLATE_QUERY_SECRET_CANARY",
+            ),
+            (
+                vec![mcp_resource(
+                    "gg://resource/alpha#RESOURCE_FRAGMENT_SECRET_CANARY",
+                    "resource-fragment-secret",
+                )],
+                Vec::new(),
+                "RESOURCE_FRAGMENT_SECRET_CANARY",
+            ),
+            (
+                Vec::new(),
+                vec![mcp_resource_template(
+                    "gg://resource/{id}#TEMPLATE_FRAGMENT_SECRET_CANARY",
+                    "template-fragment-secret",
+                )],
+                "TEMPLATE_FRAGMENT_SECRET_CANARY",
+            ),
+            (
+                vec![mcp_resource(
+                    "gg://RESOURCE_USERINFO_SECRET_CANARY@resource/alpha",
+                    "resource-userinfo-secret",
+                )],
+                Vec::new(),
+                "RESOURCE_USERINFO_SECRET_CANARY",
+            ),
+            (
+                Vec::new(),
+                vec![mcp_resource_template(
+                    "gg://TEMPLATE_USERINFO_SECRET_CANARY@resource/{id}",
+                    "template-userinfo-secret",
+                )],
+                "TEMPLATE_USERINFO_SECRET_CANARY",
+            ),
+        ];
+
+        for (resources, resource_templates, canary) in invalid_candidates {
+            let error = store
+                .replace_mcp_catalog(
+                    &created.id,
+                    &created.etag(),
+                    &[mcp_catalog_entry("replacement", "Replacement")],
+                    &resources,
+                    &resource_templates,
+                )
+                .expect_err("secret-bearing MCP locator should fail closed");
+            assert!(matches!(error, ConnectionStoreError::Validation { .. }));
+            assert!(
+                !error.to_string().contains(canary),
+                "validation Display must not contain the rejected locator"
+            );
+            assert!(
+                !format!("{error:?}").contains(canary),
+                "validation Debug must not contain the rejected locator"
+            );
+            assert_eq!(
+                store
+                    .mcp_catalog(&created.id)
+                    .expect("retained catalog should load"),
+                Some(baseline.clone()),
+                "invalid locator candidates must not replace the last-known-good catalog"
+            );
+        }
+    }
+
+    #[test]
     fn empty_mcp_catalog_is_removed_on_incompatible_update_or_delete() {
         let (_directory, path, store) = temporary_store("empty-mcp-catalog-cleanup");
         let converted_source = store
             .create(mcp_candidate())
             .expect("convertible MCP Connection should create");
         store
-            .replace_mcp_catalog(&converted_source.id, &converted_source.etag(), &[])
+            .replace_mcp_catalog(
+                &converted_source.id,
+                &converted_source.etag(),
+                &[],
+                &[],
+                &[],
+            )
             .expect("empty MCP catalog should publish");
         let converted = store
             .replace(&converted_source.id, &converted_source.etag(), candidate())
@@ -4197,7 +5677,7 @@ mod tests {
             .create(mcp_candidate())
             .expect("deletable MCP Connection should create");
         store
-            .replace_mcp_catalog(&deleted.id, &deleted.etag(), &[])
+            .replace_mcp_catalog(&deleted.id, &deleted.etag(), &[], &[], &[])
             .expect("deletable empty MCP catalog should publish");
         store
             .delete(&deleted.id, &deleted.etag())
@@ -4439,7 +5919,7 @@ mod tests {
             .map(|index| mcp_catalog_entry(&format!("m{index:04}"), "Bounded"))
             .collect::<Vec<_>>();
         assert!(matches!(
-            store.replace_mcp_catalog(&mcp.id, &mcp.etag(), &oversized_mcp),
+            store.replace_mcp_catalog(&mcp.id, &mcp.etag(), &oversized_mcp, &[], &[]),
             Err(ConnectionStoreError::LimitExceeded {
                 resource: "connection catalog entries",
                 ..
@@ -4451,7 +5931,7 @@ mod tests {
             .take(MAX_CATALOG_ENTRIES - 2)
             .collect::<Vec<_>>();
         store
-            .replace_mcp_catalog(&mcp.id, &mcp.etag(), &bounded_mcp)
+            .replace_mcp_catalog(&mcp.id, &mcp.etag(), &bounded_mcp, &[], &[])
             .expect("combined catalog at the exact limit should publish");
         assert!(matches!(
             store.replace_openapi_catalog(
@@ -4702,6 +6182,44 @@ mod tests {
             .expect("corrupt definition fixture should write");
         drop(connection);
         assert!(SqliteConnectionStore::open(&path).is_err());
+    }
+
+    #[test]
+    fn corrupt_mcp_resource_catalog_is_rejected_on_restart() {
+        let (_directory, path, store) = temporary_store("mcp-resource-corrupt-restart");
+        let created = store
+            .create(mcp_candidate())
+            .expect("MCP Connection should create");
+        store
+            .replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                &[mcp_catalog_entry("alpha", "Alpha")],
+                &[mcp_resource("gg://resource/alpha", "resource-alpha")],
+                &[mcp_resource_template(
+                    "gg://resource/{id}",
+                    "resource-by-id",
+                )],
+            )
+            .expect("MCP resource catalog should publish");
+        drop(store);
+
+        let connection = Connection::open(&path).expect("catalog database should open directly");
+        connection
+            .execute(
+                "UPDATE connection_mcp_catalogs SET resource_count = 2 WHERE connection_id = ?1",
+                params![created.id.as_str()],
+            )
+            .expect("corrupt MCP resource count fixture should write");
+        drop(connection);
+
+        assert!(matches!(
+            SqliteConnectionStore::open(&path),
+            Err(ConnectionStoreError::CorruptRecord {
+                reason: "stored MCP catalog metadata is inconsistent",
+                ..
+            })
+        ));
     }
 
     #[test]
