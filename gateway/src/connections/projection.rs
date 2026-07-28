@@ -78,8 +78,13 @@ impl Error for LegacyProjectionError {}
 pub fn project_legacy_connections(
     config: &Config,
 ) -> Result<LegacyProjectionSet, LegacyProjectionError> {
+    let legacy_route_count = config
+        .upstream_routes
+        .iter()
+        .filter(|route| route.connection_id.is_none())
+        .count();
     let count = usize::from(config.upstream_url.is_some())
-        + config.upstream_routes.len()
+        + legacy_route_count
         + config.mcp_upstream_servers.len();
     let mut projected = Vec::with_capacity(count.min(MAX_CONNECTIONS));
     let mut ids = BTreeSet::new();
@@ -100,6 +105,9 @@ pub fn project_legacy_connections(
     }
 
     for (index, route) in config.upstream_routes.iter().enumerate() {
+        if route.connection_id.is_some() {
+            continue;
+        }
         let id = projected_route_id(route);
         let display_name = bounded_display_name(match route.id.as_deref() {
             Some(route_id) => format!("Legacy route {route_id}"),

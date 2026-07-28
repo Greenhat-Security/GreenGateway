@@ -12,7 +12,14 @@ use http::{HeaderMap, HeaderName, HeaderValue, Request};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::{audit, config, egress, lifecycle, upstream_route};
+use crate::{
+    audit, config,
+    connections::{
+        http::{ConnectionHttpRuntime, ConnectionHttpTarget},
+        store::ConnectionDependencyKind,
+    },
+    egress, lifecycle, upstream_route,
+};
 
 mod admission;
 mod circuit;
@@ -119,6 +126,7 @@ fn classifier_route_for_request<'a>(
 #[derive(Clone)]
 pub(crate) struct ProxyState {
     routes: ProxyRoutes,
+    connection_http: Option<ConnectionHttpRuntime>,
     upstream_health: Vec<health::UpstreamHealthTarget>,
     max_request_body_bytes: usize,
     health_runtime: health::UpstreamHealthRuntime,
@@ -142,6 +150,7 @@ struct ProxyRoute {
     path_prefix: Option<String>,
     host: Option<String>,
     authorization_origin: String,
+    connection_id: Option<String>,
     request_header_policy: RouteRequestHeaderPolicy,
     pool: Arc<UpstreamPool>,
     request_body_mode: RequestBodyMode,
@@ -166,6 +175,7 @@ struct RouteRequestHeaderPolicy {
 
 #[derive(Clone)]
 struct MatchedUpstream {
+    connection_id: Option<String>,
     request_header_policy: RouteRequestHeaderPolicy,
     pool: Arc<UpstreamPool>,
     request_body_mode: RequestBodyMode,
@@ -332,14 +342,25 @@ impl UpstreamPool {
 }
 
 impl ProxyState {
-    pub(crate) fn from_config_with_lifecycle(
+    pub(crate) fn from_config_with_connections_and_lifecycle(
         config: &config::Config,
         default_egress_config: &egress::EgressConfig,
         egress_client: Arc<egress::EgressClient>,
+        connection_http: Option<ConnectionHttpRuntime>,
         audit: audit::AuditLog,
         lifecycle: lifecycle::GatewayLifecycle,
     ) -> Result<Option<Self>, egress::EgressError> {
         if let Some(upstream_url) = config.upstream_url.as_deref() {
+            if let Some(runtime) = connection_http.as_ref() {
+                runtime
+                    .replace_dependencies(ConnectionDependencyKind::ProxyRoute, &[])
+                    .map_err(|error| {
+                        egress::EgressError::InvalidPolicy(format!(
+                            "proxy dependencies could not be reconciled: {}",
+                            error.safe_reason()
+                        ))
+                    })?;
+            }
             let upstream_origin = upstream_origin_from_url(upstream_url, "UPSTREAM_URL");
             let health = health::UpstreamHealthState::new("legacy", "primary", Some(audit.clone()));
             let pool = Arc::new(UpstreamPool::new(
@@ -359,6 +380,7 @@ impl ProxyState {
 
             return Ok(Some(Self {
                 routes: ProxyRoutes::Legacy { pool },
+                connection_http,
                 upstream_health: health::upstream_health_targets([(
                     "legacy".to_owned(),
                     "primary".to_owned(),
@@ -379,6 +401,16 @@ impl ProxyState {
         }
 
         if config.upstream_routes.is_empty() {
+            if let Some(runtime) = connection_http.as_ref() {
+                runtime
+                    .replace_dependencies(ConnectionDependencyKind::ProxyRoute, &[])
+                    .map_err(|error| {
+                        egress::EgressError::InvalidPolicy(format!(
+                            "proxy dependencies could not be reconciled: {}",
+                            error.safe_reason()
+                        ))
+                    })?;
+            }
             return Ok(None);
         }
 
@@ -395,24 +427,69 @@ impl ProxyState {
                         "upstream routes have duplicate effective route IDs".to_owned(),
                     ));
                 }
-                let endpoints = route_endpoints(
-                    route,
-                    index,
-                    default_egress_config,
-                    &egress_client,
-                    &mut route_clients,
-                    &route_id,
-                    &audit,
-                )?;
-                let authorization_origin = if route.upstreams.is_empty() {
-                    endpoints
-                        .first()
-                        .expect("validated route must have one endpoint")
-                        .upstream_origin
-                        .clone()
+                let connection_target = route
+                    .connection_id
+                    .as_deref()
+                    .map(|connection_id| {
+                        let runtime = connection_http.as_ref().ok_or_else(|| {
+                            egress::EgressError::InvalidPolicy(
+                                "connection-bound proxy route requires the Connection HTTP runtime"
+                                    .to_owned(),
+                            )
+                        })?;
+                        runtime.target(connection_id, "/").map_err(|error| {
+                            egress::EgressError::InvalidPolicy(format!(
+                                "connection-bound proxy route is unavailable: {}",
+                                error.safe_reason()
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                let request_header_policy = route_request_header_policy(route);
+                if let Some(target) = connection_target.as_ref() {
+                    validate_connection_header_policy(&request_header_policy, target)?;
+                }
+                let endpoints = if let Some(target) = connection_target.as_ref() {
+                    let endpoint_id: Arc<str> = Arc::from("primary");
+                    vec![ProxyEndpoint {
+                        id: Arc::clone(&endpoint_id),
+                        upstream_origin: upstream_origin_from_url(
+                            target.url(),
+                            "connection-bound route",
+                        ),
+                        weight: 1,
+                        egress_client: Arc::clone(target.client()),
+                        health: health::UpstreamHealthState::new(
+                            Arc::<str>::from(route_id.as_str()),
+                            endpoint_id,
+                            Some(audit.clone()),
+                        ),
+                        health_config: None,
+                        circuit: None,
+                    }]
                 } else {
-                    logical_pool_origin(&route_id)
+                    route_endpoints(
+                        route,
+                        index,
+                        default_egress_config,
+                        &egress_client,
+                        &mut route_clients,
+                        &route_id,
+                        &audit,
+                    )?
                 };
+                let authorization_origin =
+                    if let Some(connection_id) = route.connection_id.as_deref() {
+                        format!("connection:{connection_id}")
+                    } else if route.upstreams.is_empty() {
+                        endpoints
+                            .first()
+                            .expect("validated route must have one endpoint")
+                            .upstream_origin
+                            .clone()
+                    } else {
+                        logical_pool_origin(&route_id)
+                    };
                 let pool = Arc::new(UpstreamPool::new(
                     route_id.clone(),
                     endpoints,
@@ -425,7 +502,8 @@ impl ProxyState {
                     path_prefix: route.path_prefix.clone(),
                     host: route.host.as_ref().map(|host| host.to_ascii_lowercase()),
                     authorization_origin,
-                    request_header_policy: route_request_header_policy(route),
+                    connection_id: route.connection_id.clone(),
+                    request_header_policy,
                     pool,
                     request_body_mode: route.request_body.mode.into(),
                     sse: route.sse.as_ref().map(Into::into),
@@ -444,9 +522,29 @@ impl ProxyState {
                 )
             })
         }));
+        if let Some(runtime) = connection_http.as_ref() {
+            let dependencies = routes
+                .iter()
+                .filter_map(|route| {
+                    route
+                        .connection_id
+                        .as_ref()
+                        .map(|connection_id| (connection_id.clone(), route.route_id.clone()))
+                })
+                .collect::<Vec<_>>();
+            runtime
+                .replace_dependencies(ConnectionDependencyKind::ProxyRoute, &dependencies)
+                .map_err(|error| {
+                    egress::EgressError::InvalidPolicy(format!(
+                        "connection-bound proxy dependencies could not be reconciled: {}",
+                        error.safe_reason()
+                    ))
+                })?;
+        }
 
         Ok(Some(Self {
             routes: ProxyRoutes::RoutingTable { routes },
+            connection_http,
             upstream_health,
             max_request_body_bytes: config.egress_max_request_body_bytes,
             health_runtime: health::UpstreamHealthRuntime::default(),
@@ -499,6 +597,7 @@ impl ProxyState {
     fn upstream_for_request(&self, path: &str, headers: &HeaderMap) -> Option<MatchedUpstream> {
         let upstream = match &self.routes {
             ProxyRoutes::Legacy { pool } => Some(MatchedUpstream {
+                connection_id: None,
                 request_header_policy: RouteRequestHeaderPolicy::default(),
                 pool: Arc::clone(pool),
                 request_body_mode: RequestBodyMode::Buffered,
@@ -506,6 +605,7 @@ impl ProxyState {
             }),
             ProxyRoutes::RoutingTable { routes } => {
                 routing_route_for_request(routes, path, headers).map(|route| MatchedUpstream {
+                    connection_id: route.connection_id.clone(),
                     request_header_policy: route.request_header_policy.clone(),
                     pool: Arc::clone(&route.pool),
                     request_body_mode: route.request_body_mode,
@@ -745,6 +845,36 @@ fn route_request_header_policy(route: &config::UpstreamRouteConfig) -> RouteRequ
     }
 }
 
+fn validate_connection_header_policy(
+    policy: &RouteRequestHeaderPolicy,
+    target: &ConnectionHttpTarget,
+) -> Result<(), egress::EgressError> {
+    validate_connection_credential_header_policy(policy, target.credential_header_name())
+}
+
+fn validate_connection_credential_header_policy(
+    policy: &RouteRequestHeaderPolicy,
+    credential_header: Option<&HeaderName>,
+) -> Result<(), egress::EgressError> {
+    let Some(credential_header) = credential_header else {
+        return Ok(());
+    };
+    if policy
+        .add_request_headers
+        .iter()
+        .any(|(name, _)| name == credential_header)
+        || policy
+            .strip_request_headers
+            .iter()
+            .any(|name| name == credential_header)
+    {
+        return Err(egress::EgressError::InvalidPolicy(
+            "connection-bound route must not add or strip its credential header".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn routing_route_for_request<'a>(
     routes: &'a [ProxyRoute],
     path: &str,
@@ -834,6 +964,49 @@ mod tests {
     }
 
     #[test]
+    fn connection_route_header_policy_rejects_credential_conflicts() {
+        let credential_header = HeaderName::from_static("x-api-key");
+        let safe = RouteRequestHeaderPolicy {
+            add_request_headers: vec![(
+                HeaderName::from_static("x-route-label"),
+                HeaderValue::from_static("billing"),
+            )],
+            strip_request_headers: vec![HeaderName::from_static("x-caller-value")],
+        };
+        validate_connection_credential_header_policy(&safe, Some(&credential_header))
+            .expect("unrelated route transforms should remain valid");
+
+        let adding_credential = RouteRequestHeaderPolicy {
+            add_request_headers: vec![(
+                credential_header.clone(),
+                HeaderValue::from_static("forbidden"),
+            )],
+            strip_request_headers: Vec::new(),
+        };
+        assert!(matches!(
+            validate_connection_credential_header_policy(
+                &adding_credential,
+                Some(&credential_header)
+            ),
+            Err(egress::EgressError::InvalidPolicy(_))
+        ));
+
+        let stripping_credential = RouteRequestHeaderPolicy {
+            add_request_headers: Vec::new(),
+            strip_request_headers: vec![credential_header.clone()],
+        };
+        assert!(matches!(
+            validate_connection_credential_header_policy(
+                &stripping_credential,
+                Some(&credential_header)
+            ),
+            Err(egress::EgressError::InvalidPolicy(_))
+        ));
+        validate_connection_credential_header_policy(&safe, None)
+            .expect("no-auth Connections have no credential header conflict");
+    }
+
+    #[test]
     fn weighted_pool_selection_is_deterministic_and_uses_only_configured_endpoints() {
         let client = Arc::new(
             egress::EgressClient::new(egress::EgressConfig::default())
@@ -880,6 +1053,7 @@ mod tests {
     fn generated_legacy_route_id_depends_on_logical_matcher_not_endpoint() {
         let mut route = config::UpstreamRouteConfig {
             id: None,
+            connection_id: None,
             path_prefix: Some("/api".to_owned()),
             host: Some("api.example.test".to_owned()),
             upstream_url: "https://first.example.test".to_owned(),
@@ -988,6 +1162,7 @@ mod tests {
         ));
         let state = ProxyState {
             routes: ProxyRoutes::Legacy { pool },
+            connection_http: None,
             upstream_health: Vec::new(),
             max_request_body_bytes: 1024,
             health_runtime: health::UpstreamHealthRuntime::default(),
@@ -1024,6 +1199,7 @@ mod tests {
         );
         let route = config::UpstreamRouteConfig {
             id: None,
+            connection_id: None,
             path_prefix: Some("/api".to_owned()),
             host: None,
             upstream_url: format!("http://{host}"),
@@ -1069,6 +1245,7 @@ mod tests {
         let second_identity_path = write_test_client_identity("second");
         let route = config::UpstreamRouteConfig {
             id: Some("payments".to_owned()),
+            connection_id: None,
             path_prefix: Some("/payments".to_owned()),
             host: None,
             upstream_url: String::new(),

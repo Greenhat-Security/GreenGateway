@@ -1307,10 +1307,7 @@ mod tests {
         let client = mcp_http_client(
             &upstream,
             &runtime,
-            &CheckedEgressDestination {
-                host: host.to_owned(),
-                pinned_addr: direct_addr,
-            },
+            &CheckedEgressDestination::for_test(host, direct_addr),
         )
         .expect("MCP client should build");
 

@@ -1,14 +1,16 @@
 //! First-class connection vocabulary and security boundaries.
 //!
 //! The control-plane store, legacy projections, and permission-separated
-//! metadata CRUD are active. Outbound authentication and protocol migration
-//! remain isolated to their later issue #240 slices so the existing legacy
-//! runtime is unchanged until each named compatibility boundary lands.
+//! metadata CRUD are active. Static HTTP authentication is available only
+//! through explicitly connection-bound proxy routes and manual tools; the
+//! remaining protocol migrations stay isolated to their named issue #240
+//! slices.
 
 #![allow(dead_code)]
 
 pub mod admin;
 pub mod control_plane;
+pub mod http;
 pub mod local_secret;
 pub mod model;
 pub mod permissions;

@@ -260,11 +260,14 @@ impl Error for ToolRegistryError {
 pub struct ToolRegistry {
     state: Arc<ArcSwap<ToolRegistryState>>,
     write_lock: Arc<Mutex<()>>,
+    definition_validator: Arc<Mutex<Option<ToolDefinitionsValidator>>>,
     audit: Option<AuditLog>,
 }
 
 pub type McpProxyDefinitionsProvider =
     Arc<dyn Fn() -> Option<Vec<ToolDefinition>> + Send + Sync + 'static>;
+pub type ToolDefinitionsValidator =
+    Arc<dyn Fn(&[ToolDefinition]) -> Result<(), Vec<String>> + Send + Sync + 'static>;
 
 impl fmt::Debug for ToolRegistry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -347,12 +350,12 @@ impl ToolRegistry {
         self.state.load().tools.values().cloned().collect()
     }
 
-    pub fn has_http_tools(&self) -> bool {
+    pub fn has_legacy_http_tools(&self) -> bool {
         self.state
             .load()
             .tools
             .values()
-            .any(|definition| !definition.upstream.is_mcp_proxy())
+            .any(|definition| definition.target.is_none() && !definition.upstream.is_mcp_proxy())
     }
 
     pub fn merge_definitions(
@@ -383,6 +386,7 @@ impl ToolRegistry {
         if !semantic_problems.is_empty() {
             return Err(ToolRegistryError::invalid(semantic_problems));
         }
+        self.validate_definitions(&merged)?;
 
         self.state
             .store(Arc::new(ToolRegistryState::from_definition_sources(
@@ -401,8 +405,29 @@ impl ToolRegistry {
                 definitions,
             ))),
             write_lock: Arc::new(Mutex::new(())),
+            definition_validator: Arc::new(Mutex::new(None)),
             audit,
         }
+    }
+
+    pub fn set_definition_validator(
+        &self,
+        validator: ToolDefinitionsValidator,
+    ) -> Result<(), ToolRegistryError> {
+        let _guard = match self.write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let state = self.state.load();
+        let definitions =
+            combined_definitions(&state.local_definitions, &state.mcp_proxy_definitions);
+        drop(state);
+        validator(&definitions).map_err(ToolRegistryError::invalid)?;
+        match self.definition_validator.lock() {
+            Ok(mut current) => *current = Some(validator),
+            Err(poisoned) => *poisoned.into_inner() = Some(validator),
+        }
+        Ok(())
     }
 
     fn replace_local_definitions(
@@ -444,12 +469,27 @@ impl ToolRegistry {
         if !semantic_problems.is_empty() {
             return Err(ToolRegistryError::invalid(semantic_problems));
         }
+        self.validate_definitions(&merged)?;
 
         self.state
             .store(Arc::new(ToolRegistryState::from_definition_sources(
                 local_definitions,
                 mcp_proxy_definitions,
             )));
+        Ok(())
+    }
+
+    fn validate_definitions(
+        &self,
+        definitions: &[ToolDefinition],
+    ) -> Result<(), ToolRegistryError> {
+        let validator = match self.definition_validator.lock() {
+            Ok(validator) => validator.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if let Some(validator) = validator {
+            validator(definitions).map_err(ToolRegistryError::invalid)?;
+        }
         Ok(())
     }
 

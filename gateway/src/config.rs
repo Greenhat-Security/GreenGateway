@@ -286,6 +286,8 @@ pub struct UpstreamRouteConfig {
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
+    pub connection_id: Option<String>,
+    #[serde(default)]
     pub path_prefix: Option<String>,
     #[serde(default)]
     pub host: Option<String>,
@@ -2637,16 +2639,24 @@ fn validate_upstream_routes(
             problems,
         );
         let host = normalize_route_host(&format!("{route_name}.host"), route.host, problems);
+        let connection_id = route.connection_id.and_then(|connection_id| {
+            normalize_connection_id(
+                &format!("{route_name}.connection_id"),
+                &connection_id,
+                problems,
+            )
+        });
+        let has_connection = connection_id.is_some();
         let has_legacy_url = !route.upstream_url.trim().is_empty();
         let has_pool = !route.upstreams.is_empty();
-        if has_legacy_url == has_pool {
+        if usize::from(has_connection) + usize::from(has_legacy_url) + usize::from(has_pool) != 1 {
             problems.push(format!(
-                "{route_name} must set exactly one of upstream_url or a non-empty upstreams pool"
+                "{route_name} must set exactly one of connection_id, upstream_url, or a non-empty upstreams pool"
             ));
         }
-        if has_pool && id.is_none() {
+        if (has_pool || has_connection) && id.is_none() {
             problems.push(format!(
-                "{route_name}.id is required when upstreams is configured"
+                "{route_name}.id is required when upstreams or connection_id is configured"
             ));
         }
         if route.upstreams.len() > MAX_ENDPOINTS_PER_ROUTE {
@@ -2740,6 +2750,11 @@ fn validate_upstream_routes(
                 "{route_name}.tls_ca_bundle_path must be configured per endpoint when upstreams is used"
             ));
         }
+        if has_connection && tls_ca_bundle_path.is_some() {
+            problems.push(format!(
+                "{route_name}.tls_ca_bundle_path must not be configured with connection_id; Connection TLS is managed separately"
+            ));
+        }
         let openapi_spec_path = normalize_route_openapi_spec_path(
             &format!("{route_name}.openapi_spec_path"),
             route.openapi_spec_path,
@@ -2798,6 +2813,15 @@ fn validate_upstream_routes(
             route.connect_timeout_ms,
             problems,
         );
+        if has_connection
+            && (route.timeout_ms.is_some()
+                || route.response_idle_timeout_ms.is_some()
+                || route.connect_timeout_ms.is_some())
+        {
+            problems.push(format!(
+                "{route_name} must not configure route timeout overrides with connection_id; use the stored Connection timeouts"
+            ));
+        }
         if let Some(sse) = route.sse.as_ref() {
             if sse.max_duration_ms > MAX_UPSTREAM_SSE_MAX_DURATION_MS {
                 problems.push(format!(
@@ -2806,6 +2830,11 @@ fn validate_upstream_routes(
             }
         }
         if let Some(health) = route.health_check.as_ref() {
+            if has_connection {
+                problems.push(format!(
+                    "{route_name}.health_check is not supported with connection_id; use the stored Connection test profile"
+                ));
+            }
             if !matches!(health.method.as_str(), "GET" | "HEAD") {
                 problems.push(format!(
                     "{route_name}.health_check.method must be GET or HEAD"
@@ -2889,6 +2918,11 @@ fn validate_upstream_routes(
             }
         }
         if let Some(retry) = route.retry.as_mut() {
+            if has_connection {
+                problems.push(format!(
+                    "{route_name}.retry is not supported with connection_id in this static-authentication phase"
+                ));
+            }
             retry.methods = retry
                 .methods
                 .iter()
@@ -2935,6 +2969,11 @@ fn validate_upstream_routes(
             }
         }
         if let Some(circuit) = route.circuit_breaker.as_ref() {
+            if has_connection {
+                problems.push(format!(
+                    "{route_name}.circuit_breaker is not supported with connection_id in this static-authentication phase"
+                ));
+            }
             if !(1..=MAX_UPSTREAM_CIRCUIT_THRESHOLD).contains(&circuit.failure_threshold) {
                 problems.push(format!(
                     "{route_name}.circuit_breaker.failure_threshold must be between 1 and {MAX_UPSTREAM_CIRCUIT_THRESHOLD}"
@@ -2969,6 +3008,7 @@ fn validate_upstream_routes(
 
         validated.push(UpstreamRouteConfig {
             id,
+            connection_id,
             path_prefix,
             host,
             upstream_url,
@@ -3003,6 +3043,17 @@ fn normalize_stable_id(name: &str, value: &str, problems: &mut Vec<String>) -> O
             upstream_route::STABLE_ROUTE_ID_MAX_LEN
         ));
         None
+    }
+}
+
+fn normalize_connection_id(name: &str, value: &str, problems: &mut Vec<String>) -> Option<String> {
+    let value = value.trim();
+    match crate::connections::model::ConnectionId::parse(value.to_owned()) {
+        Ok(id) => Some(id.to_string()),
+        Err(_) => {
+            problems.push(format!("{name} must be a stable URL-safe Connection ID"));
+            None
+        }
     }
 }
 
@@ -6165,6 +6216,7 @@ mod tests {
             vec![
                 UpstreamRouteConfig {
                     id: None,
+                    connection_id: None,
                     path_prefix: Some("/api".to_owned()),
                     host: Some("api.example.test".to_owned()),
                     upstream_url: "https://api-upstream.example.test/base".to_owned(),
@@ -6189,6 +6241,7 @@ mod tests {
                 },
                 UpstreamRouteConfig {
                     id: None,
+                    connection_id: None,
                     path_prefix: Some("/assets".to_owned()),
                     host: None,
                     upstream_url: "http://assets.example.test".to_owned(),
@@ -6210,6 +6263,80 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn connection_bound_upstream_route_parses_without_a_legacy_destination() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[{
+                    "id": "billing-route",
+                    "path_prefix": "/billing",
+                    "connection_id": " billing-api ",
+                    "add_request_headers": {
+                        "x-route-label": "billing"
+                    }
+                }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("connection-bound route should parse");
+
+        let route = &config.upstream_routes[0];
+        assert_eq!(route.id.as_deref(), Some("billing-route"));
+        assert_eq!(route.connection_id.as_deref(), Some("billing-api"));
+        assert!(route.upstream_url.is_empty());
+        assert!(route.upstreams.is_empty());
+        assert_eq!(
+            route.add_request_headers.get("x-route-label"),
+            Some(&"billing".to_owned())
+        );
+    }
+
+    #[test]
+    fn connection_bound_route_rejects_ambiguous_or_unsupported_transport_settings() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[
+                {
+                    "path_prefix":"/missing-id",
+                    "connection_id":"billing-api"
+                },
+                {
+                    "id":"ambiguous",
+                    "path_prefix":"/ambiguous",
+                    "connection_id":"billing-api",
+                    "upstream_url":"https://legacy.example.test"
+                },
+                {
+                    "id":"unsupported",
+                    "path_prefix":"/unsupported",
+                    "connection_id":"billing-api",
+                    "tls_ca_bundle_path":"/run/secrets/ca.pem",
+                    "timeout_ms":1000,
+                    "health_check":{},
+                    "retry":{"max_attempts":1},
+                    "circuit_breaker":{}
+                }
+            ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("unsafe connection route settings must fail startup");
+        let message = error.to_string();
+
+        for expected in [
+            "[0].id is required when upstreams or connection_id is configured",
+            "[1] must set exactly one of connection_id, upstream_url, or a non-empty upstreams pool",
+            "[2].tls_ca_bundle_path must not be configured with connection_id",
+            "[2] must not configure route timeout overrides with connection_id",
+            "[2].health_check is not supported with connection_id",
+            "[2].retry is not supported with connection_id",
+            "[2].circuit_breaker is not supported with connection_id",
+        ] {
+            assert!(
+                message.contains(expected),
+                "aggregated validation should contain '{expected}': {message}"
+            );
+        }
     }
 
     #[test]
@@ -6671,7 +6798,7 @@ mod tests {
 
         for expected in [
             ".id must be 1-64 ASCII",
-            "must set exactly one of upstream_url or a non-empty upstreams pool",
+            "must set exactly one of connection_id, upstream_url, or a non-empty upstreams pool",
             ".id duplicates",
             "must not contain userinfo, query, or fragment",
             ".weight must be between 1 and 1000",
