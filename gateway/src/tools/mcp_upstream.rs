@@ -28,7 +28,7 @@ use rmcp::{
         Resource as McpResource, ResourceTemplate as McpResourceTemplate, ServerJsonRpcMessage,
         Tool,
     },
-    service::{ClientInitializeError, ServiceError},
+    service::{ClientInitializeError, QuitReason, ServiceError},
     transport::{
         streamable_http_client::{
             AuthRequiredError, InsufficientScopeError, SseError, StreamableHttpClient,
@@ -441,7 +441,7 @@ pub async fn discover_connection_catalog(
     drop(service);
     response_budget.seal()?;
     let discovered = discovered?;
-    if !matches!(close_result, Ok(Some(_))) {
+    if !discovery_shutdown_completed_cleanly(&close_result) {
         return Err(McpUpstreamCallError::Call);
     }
     let catalog = McpDiscoveredCatalog {
@@ -459,6 +459,13 @@ pub async fn discover_connection_catalog(
         });
     }
     Ok(catalog)
+}
+
+fn discovery_shutdown_completed_cleanly<E>(close_result: &Result<Option<QuitReason>, E>) -> bool {
+    matches!(
+        close_result,
+        Ok(Some(QuitReason::Cancelled | QuitReason::Closed))
+    )
 }
 
 pub async fn call_connection_tool(
@@ -1913,6 +1920,27 @@ mod tests {
             shared.seal(),
             Err(McpUpstreamCallError::DiscoveryResponseLimitExceeded { max: 8 })
         ));
+    }
+
+    #[tokio::test]
+    async fn discovery_shutdown_gate_rejects_join_failures_and_incomplete_close() {
+        assert!(discovery_shutdown_completed_cleanly::<()>(&Ok(Some(
+            QuitReason::Cancelled,
+        ))));
+        assert!(discovery_shutdown_completed_cleanly::<()>(&Ok(Some(
+            QuitReason::Closed,
+        ))));
+        assert!(!discovery_shutdown_completed_cleanly::<()>(&Ok(None)));
+        assert!(!discovery_shutdown_completed_cleanly::<()>(&Err(())));
+
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let join_error = handle
+            .await
+            .expect_err("aborted task should produce a join error");
+        assert!(!discovery_shutdown_completed_cleanly::<()>(&Ok(Some(
+            QuitReason::JoinError(join_error),
+        ))));
     }
 
     struct CountingDnsResolver {
