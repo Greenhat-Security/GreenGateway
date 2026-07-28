@@ -461,8 +461,8 @@ impl OpenApiSchemaExpansionBudget {
         self.consume(1, bytes)
     }
 
-    fn consume_reference(&mut self, _reference: &str) -> Result<(), OpenApiToolGenerationError> {
-        self.consume(1, 0)
+    fn consume_reference(&mut self, reference: &str) -> Result<(), OpenApiToolGenerationError> {
+        self.consume(1, json_string_bytes(reference))
     }
 
     fn consume(&mut self, nodes: usize, bytes: usize) -> Result<(), OpenApiToolGenerationError> {
@@ -1294,7 +1294,12 @@ fn collect_parameters(
     };
 
     for parameter_value in parameter_values {
-        let parameter_value = resolve_reference(document, parameter_value, &mut BTreeSet::new())?;
+        let parameter_value = resolve_reference_with_schema_budget(
+            document,
+            parameter_value,
+            &mut BTreeSet::new(),
+            expansion_budget,
+        )?;
         let Some(parameter) = generated_parameter(document, parameter_value, expansion_budget)?
         else {
             continue;
@@ -1449,7 +1454,12 @@ fn json_request_body_schema(
     let Some(request_body) = operation_value.and_then(|value| value.get("requestBody")) else {
         return Ok(None);
     };
-    let request_body = resolve_reference(document, request_body, &mut BTreeSet::new())?;
+    let request_body = resolve_reference_with_schema_budget(
+        document,
+        request_body,
+        &mut BTreeSet::new(),
+        expansion_budget,
+    )?;
     let Some(content) = request_body.get("content").and_then(Value::as_object) else {
         return Ok(None);
     };
@@ -1593,6 +1603,67 @@ fn resolve_reference_with_depth<'a>(
     };
 
     resolve_reference_with_depth(document, resolved, seen_references, depth + 1)
+}
+
+fn resolve_reference_with_schema_budget<'a>(
+    document: &'a Value,
+    value: &'a Value,
+    seen_references: &mut BTreeSet<String>,
+    expansion_budget: &mut OpenApiSchemaExpansionBudget,
+) -> Result<&'a Value, OpenApiToolGenerationError> {
+    resolve_reference_with_schema_budget_and_depth(
+        document,
+        value,
+        seen_references,
+        expansion_budget,
+        0,
+    )
+}
+
+fn resolve_reference_with_schema_budget_and_depth<'a>(
+    document: &'a Value,
+    value: &'a Value,
+    seen_references: &mut BTreeSet<String>,
+    expansion_budget: &mut OpenApiSchemaExpansionBudget,
+    depth: usize,
+) -> Result<&'a Value, OpenApiToolGenerationError> {
+    let Some(reference) = value.get("$ref").and_then(Value::as_str) else {
+        return Ok(value);
+    };
+
+    expansion_budget.consume_reference(reference)?;
+    if depth >= MAX_OPENAPI_REFERENCE_DEPTH {
+        return Err(OpenApiToolGenerationError::Reference {
+            reference: reference.to_owned(),
+            message: format!("reference depth exceeds {MAX_OPENAPI_REFERENCE_DEPTH}"),
+        });
+    }
+    if !seen_references.insert(reference.to_owned()) {
+        return Err(OpenApiToolGenerationError::Reference {
+            reference: reference.to_owned(),
+            message: "circular local reference".to_owned(),
+        });
+    }
+    let Some(pointer) = reference.strip_prefix('#') else {
+        return Err(OpenApiToolGenerationError::Reference {
+            reference: reference.to_owned(),
+            message: "only local OpenAPI references are supported".to_owned(),
+        });
+    };
+    let Some(resolved) = document.pointer(pointer) else {
+        return Err(OpenApiToolGenerationError::Reference {
+            reference: reference.to_owned(),
+            message: "target does not exist".to_owned(),
+        });
+    };
+
+    resolve_reference_with_schema_budget_and_depth(
+        document,
+        resolved,
+        seen_references,
+        expansion_budget,
+        depth + 1,
+    )
 }
 
 fn effective_security_value<'a>(
@@ -2553,6 +2624,77 @@ paths:
                 }
             ),
             "unexpected wide-schema error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_repeated_long_alias_pointer_work_with_schema_byte_budget() {
+        let target_name = format!("Target_{}", "t".repeat(512 * 1024));
+        let mut properties = serde_json::Map::new();
+        for index in 0..4_096 {
+            properties.insert(
+                format!("property_{index}"),
+                json!({ "$ref": "#/components/schemas/Alias" }),
+            );
+        }
+        let mut schemas = serde_json::Map::new();
+        schemas.insert(target_name.clone(), json!({ "type": "string" }));
+        schemas.insert(
+            "Alias".to_owned(),
+            json!({
+                "$ref": format!("#/components/schemas/{target_name}")
+            }),
+        );
+        schemas.insert(
+            "Wide".to_owned(),
+            json!({
+                "type": "object",
+                "properties": properties
+            }),
+        );
+        let spec = json!({
+            "openapi": "3.0.3",
+            "info": {
+                "title": "Repeated long alias pointer",
+                "version": "1.0.0"
+            },
+            "paths": {
+                "/wide": {
+                    "post": {
+                        "operationId": "wideAlias",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": "#/components/schemas/Wide"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": schemas
+            }
+        })
+        .to_string();
+        assert!(
+            spec.len() < 2 * 1024 * 1024,
+            "long-alias regression must remain a bounded managed spec"
+        );
+
+        let error = generate_tools_from_openapi_str("long-alias.json", &spec)
+            .expect_err("repeated long local references must consume the byte budget");
+        assert!(
+            matches!(
+                &error,
+                OpenApiToolGenerationError::GenerationLimit {
+                    limit: OpenApiToolGenerationLimit::SchemaExpansionBytes,
+                    maximum: MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+                }
+            ),
+            "unexpected long-alias error: {error:?}"
         );
     }
 
