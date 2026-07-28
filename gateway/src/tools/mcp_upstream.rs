@@ -2975,6 +2975,10 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::*;
 
+    use crate::connections::{
+        status::ConnectionOperationalState, test::connection_failure_classification,
+    };
+
     use std::{
         collections::HashSet,
         io::{self, ErrorKind},
@@ -3002,6 +3006,33 @@ mod tests {
     use tracing_subscriber::{fmt::MakeWriter, prelude::*};
 
     const TEST_RESPONSE_LIMIT: usize = 64;
+
+    #[test]
+    fn http_and_mcp_oauth_mint_failures_share_unavailable_dependency_classification() {
+        for (error, expected_reason) in [
+            (
+                ConnectionHttpError::OAuthTokenRejected,
+                ConnectionTestReason::OauthTokenRejected,
+            ),
+            (
+                ConnectionHttpError::OAuthTokenInvalidResponse,
+                ConnectionTestReason::OauthTokenInvalidResponse,
+            ),
+        ] {
+            let (http_stage, http_state, http_status_reason) =
+                connection_failure_classification(error);
+            let mcp =
+                protocol_probe_connection_error(error, ConnectionTestStageName::ProtocolValid);
+
+            assert_eq!(http_stage, ConnectionTestStageName::SecretAvailable);
+            assert_eq!(http_state, ConnectionOperationalState::Unavailable);
+            assert_eq!(
+                (http_stage, http_status_reason),
+                (mcp.stage(), mcp.status_reason())
+            );
+            assert_eq!(mcp.safe_reason(), expected_reason);
+        }
+    }
 
     #[derive(Default)]
     struct ProbeRequestCounts {

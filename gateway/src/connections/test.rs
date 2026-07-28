@@ -831,7 +831,7 @@ fn failed_connection_execution(
     )
 }
 
-fn connection_failure_classification(
+pub(crate) fn connection_failure_classification(
     error: ConnectionHttpError,
 ) -> (
     ConnectionTestStageName,
@@ -848,7 +848,9 @@ fn connection_failure_classification(
         | ConnectionHttpError::CredentialHeaderConflict
         | ConnectionHttpError::CredentialUnavailable
         | ConnectionHttpError::UnsupportedAuthentication
-        | ConnectionHttpError::OAuthTokenUnavailable => (
+        | ConnectionHttpError::OAuthTokenUnavailable
+        | ConnectionHttpError::OAuthTokenRejected
+        | ConnectionHttpError::OAuthTokenInvalidResponse => (
             ConnectionTestStageName::SecretAvailable,
             ConnectionOperationalState::Unavailable,
             ConnectionStatusReason::SecretUnavailable,
@@ -858,9 +860,7 @@ fn connection_failure_classification(
             ConnectionOperationalState::Unavailable,
             ConnectionStatusReason::EgressDenied,
         ),
-        ConnectionHttpError::OAuthTokenRejected
-        | ConnectionHttpError::OAuthTokenInvalidResponse
-        | ConnectionHttpError::UpstreamAuthenticationRejected => (
+        ConnectionHttpError::UpstreamAuthenticationRejected => (
             ConnectionTestStageName::Authenticated,
             ConnectionOperationalState::Degraded,
             ConnectionStatusReason::InvalidResponse,
@@ -1147,6 +1147,18 @@ mod tests {
             ),
             (
                 ConnectionHttpError::OAuthTokenRejected,
+                ConnectionTestStageName::SecretAvailable,
+                ConnectionOperationalState::Unavailable,
+                ConnectionStatusReason::SecretUnavailable,
+            ),
+            (
+                ConnectionHttpError::OAuthTokenInvalidResponse,
+                ConnectionTestStageName::SecretAvailable,
+                ConnectionOperationalState::Unavailable,
+                ConnectionStatusReason::SecretUnavailable,
+            ),
+            (
+                ConnectionHttpError::UpstreamAuthenticationRejected,
                 ConnectionTestStageName::Authenticated,
                 ConnectionOperationalState::Degraded,
                 ConnectionStatusReason::InvalidResponse,
