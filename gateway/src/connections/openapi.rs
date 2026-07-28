@@ -314,8 +314,8 @@ impl OpenApiConnectionCatalogService {
             Vec::new()
         };
         let snapshot = control_plane.runtime_snapshot();
-        let definitions = catalogs
-            .iter()
+        let active_catalogs = catalogs
+            .into_iter()
             .filter(|catalog| {
                 snapshot
                     .managed()
@@ -324,6 +324,9 @@ impl OpenApiConnectionCatalogService {
                         record.write.enabled && supports_managed_openapi_catalog(record)
                     })
             })
+            .collect::<Vec<_>>();
+        let definitions = active_catalogs
+            .iter()
             .map(catalog_definitions)
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
@@ -332,7 +335,7 @@ impl OpenApiConnectionCatalogService {
         registry
             .merge_definitions(definitions)
             .map_err(tool_registry_store_error)?;
-        let runtime = OpenApiConnectionCatalogRuntime::new(&catalogs)?;
+        let runtime = OpenApiConnectionCatalogRuntime::new(&active_catalogs)?;
         Ok(Self {
             control_plane,
             http,
@@ -1580,7 +1583,7 @@ paths:
             .replace_managed(&record.id, &record.etag(), disabled_write)
             .expect("registered Connection should be disableable");
         let disabled_registry = ToolRegistry::disabled();
-        OpenApiConnectionCatalogService::load(
+        let disabled_service = OpenApiConnectionCatalogService::load(
             control_plane.clone(),
             http,
             disabled_registry.clone(),
@@ -1589,6 +1592,19 @@ paths:
         assert!(
             disabled_registry.get("get_invoice").is_none(),
             "disabled persisted catalog tools must not be republished at restart"
+        );
+        let disabled_status = disabled
+            .safe_summary(disabled_service.status_fallback(&disabled.id, &disabled.etag(), None))
+            .status;
+        assert_eq!(
+            disabled_status.state,
+            ConnectionOperationalState::Disabled,
+            "a disabled persisted catalog must not become stale after restart"
+        );
+        assert_eq!(
+            disabled_status.reason,
+            ConnectionStatusReason::Disabled,
+            "a disabled persisted catalog must retain its disabled reason after restart"
         );
         let cleared = service
             .register(
