@@ -2884,7 +2884,13 @@ async fn connection_create_endpoint(
         && !rbac_state
             .principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION)
     {
-        return forbidden();
+        return connection_secret_authority_forbidden(
+            &state,
+            &parts,
+            &principal,
+            CONNECTIONS_ADMIN_ROUTE,
+            "create",
+        );
     }
 
     let snapshot = state.control_plane.runtime_snapshot();
@@ -2984,16 +2990,24 @@ async fn connection_put_endpoint(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let candidate = match parse_connection_write_body(&body, &current.write) {
-        Ok(candidate) => candidate,
-        Err(response) => return *response,
-    };
+    let (candidate, explicit_binding_intent) =
+        match parse_connection_write_body(&body, &current.write) {
+            Ok(candidate) => candidate,
+            Err(response) => return *response,
+        };
     let credential_changed = current.write.requires_secrets_write_to_replace(&candidate);
-    if credential_changed
+    let requires_secret_authority = credential_changed || explicit_binding_intent;
+    if requires_secret_authority
         && !rbac_state
             .principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION)
     {
-        return forbidden();
+        return connection_secret_authority_forbidden(
+            &state,
+            &parts,
+            &principal,
+            CONNECTION_ADMIN_ROUTE,
+            "replace",
+        );
     }
 
     let current_etag = current.etag();
@@ -3105,7 +3119,13 @@ async fn connection_delete_endpoint(
         && !rbac_state
             .principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION)
     {
-        return forbidden();
+        return connection_secret_authority_forbidden(
+            &state,
+            &parts,
+            &principal,
+            CONNECTION_ADMIN_ROUTE,
+            "delete",
+        );
     }
     let current_etag = current.etag();
     match if_match_matches(&parts.headers, current_etag.as_str()) {
@@ -5989,13 +6009,32 @@ fn connection_admin_body_limit(state: &ConnectionAdminState) -> usize {
 fn parse_connection_write_body(
     body: &Bytes,
     current: &connections::model::ConnectionWrite,
-) -> ResponseResult<connections::model::ConnectionWrite> {
+) -> ResponseResult<(connections::model::ConnectionWrite, bool)> {
     let mut candidate = serde_json::from_slice::<Value>(body)
         .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
+    let explicit_binding_intent = has_explicit_connection_binding_intent(&candidate);
     retain_hidden_connection_bindings(&mut candidate, current)?;
     let candidate = serde_json::from_value::<connections::model::ConnectionWrite>(candidate)
         .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
-    validate_connection_write(candidate)
+    validate_connection_write(candidate).map(|candidate| (candidate, explicit_binding_intent))
+}
+
+fn has_explicit_connection_binding_intent(candidate: &Value) -> bool {
+    candidate
+        .get("authentication")
+        .and_then(Value::as_object)
+        .is_some_and(|authentication| {
+            authentication.contains_key("secret_id")
+                || authentication.contains_key("client_secret_id")
+        })
+        || candidate
+            .get("tls")
+            .and_then(Value::as_object)
+            .is_some_and(|tls| {
+                tls.contains_key("ca_bundle_alias")
+                    || tls.contains_key("client_certificate_id")
+                    || tls.contains_key("client_private_key_id")
+            })
 }
 
 fn retain_hidden_connection_bindings(
@@ -7853,6 +7892,33 @@ fn emit_connection_changed(
             payload,
         ));
     }
+}
+
+fn connection_secret_authority_forbidden(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    route_pattern: &'static str,
+    operation: &'static str,
+) -> Response {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    state.audit.emit(audit::AuditEvent::new(
+        "authz.denied",
+        request_id,
+        source_ip,
+        Some(auth::actor_from_principal(principal)),
+        json!({
+            "path": route_pattern,
+            "method": parts.method.as_str(),
+            "reason": "missing_permission",
+            "permission": ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
+            "authorization_layer": "connection_secret_authority",
+            "operation": operation,
+        }),
+    ));
+    forbidden()
 }
 
 fn emit_service_token_delegation_rejected(
@@ -18134,6 +18200,27 @@ mod tests {
     }
 
     #[test]
+    fn explicit_hidden_binding_fields_are_secret_authority_intent() {
+        for candidate in [
+            json!({"authentication": {"secret_id": "alias"}}),
+            json!({"authentication": {"client_secret_id": null}}),
+            json!({"tls": {"ca_bundle_alias": "ca"}}),
+            json!({"tls": {"client_certificate_id": "certificate"}}),
+            json!({"tls": {"client_private_key_id": null}}),
+        ] {
+            assert!(has_explicit_connection_binding_intent(&candidate));
+        }
+        assert!(!has_explicit_connection_binding_intent(&json!({
+            "authentication": {"secret_configured": true},
+            "tls": {
+                "ca_bundle_configured": true,
+                "client_certificate_configured": true,
+                "client_private_key_configured": true
+            }
+        })));
+    }
+
+    #[test]
     fn redacted_partial_mtls_draft_round_trips_each_hidden_binding_independently() {
         let current: connections::model::ConnectionWrite = serde_json::from_value(json!({
             "display_name": "Partial mTLS draft",
@@ -18169,9 +18256,10 @@ mod tests {
             }
         });
 
-        let candidate =
+        let (candidate, explicit_binding_intent) =
             parse_connection_write_body(&Bytes::from(redacted_edit.to_string()), &current)
                 .expect("redacted partial draft should retain its lone certificate binding");
+        assert!(!explicit_binding_intent);
 
         assert_eq!(
             candidate.tls.client_certificate_id.as_deref(),
@@ -18201,11 +18289,12 @@ mod tests {
                 "client_private_key_configured": true
             }
         });
-        let private_key_candidate = parse_connection_write_body(
+        let (private_key_candidate, explicit_binding_intent) = parse_connection_write_body(
             &Bytes::from(private_key_edit.to_string()),
             &private_key_only,
         )
         .expect("redacted partial draft should retain its lone private-key binding");
+        assert!(!explicit_binding_intent);
         assert!(private_key_candidate.tls.client_certificate_id.is_none());
         assert_eq!(
             private_key_candidate.tls.client_private_key_id.as_deref(),
@@ -18413,6 +18502,33 @@ mod tests {
         let initial_credential_revision = credentialed_body["revisions"]["credential"]
             .as_u64()
             .expect("credentialed connection should include a credential revision");
+
+        let explicit_current_binding = credentialed_connection_body();
+        let mut explicit_wrong_binding: Value = serde_json::from_str(&explicit_current_binding)
+            .expect("credentialed body should parse");
+        explicit_wrong_binding["authentication"]["secret_id"] = json!("different-secret-id-canary");
+        let explicit_wrong_binding = explicit_wrong_binding.to_string();
+        let mut explicit_binding_denial_bodies = Vec::new();
+        for explicit_binding in [explicit_current_binding, explicit_wrong_binding] {
+            let response = router
+                .clone()
+                .oneshot(connection_admin_request(
+                    Method::PUT,
+                    &format!("{CONNECTIONS_ADMIN_ROUTE}/{credentialed_id}"),
+                    Some(editor.clone()),
+                    Some(explicit_binding),
+                    Some(&credentialed_etag),
+                    true,
+                ))
+                .await
+                .expect("explicit hidden-binding denial should complete");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            explicit_binding_denial_bodies.push(body_string(response).await);
+        }
+        assert_eq!(
+            explicit_binding_denial_bodies[0], explicit_binding_denial_bodies[1],
+            "matching and non-matching hidden binding IDs must be indistinguishable"
+        );
 
         let credentialed_detail = router
             .clone()
@@ -18682,6 +18798,15 @@ mod tests {
                     .filter(|event| event.event_type == audit::event::CONNECTION_CREDENTIAL_CHANGED)
                     .count()
                     == 3
+                && events
+                    .iter()
+                    .filter(|event| {
+                        event.event_type == "authz.denied"
+                            && event.payload["permission"]
+                                == json!(ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION)
+                    })
+                    .count()
+                    == 5
         });
         let events = capture.events();
         assert_eq!(
@@ -18705,11 +18830,47 @@ mod tests {
                     .as_array()
                     .is_some_and(|fields| fields.contains(&json!("test_profile")))
         }));
+        let secret_authority_denials = events
+            .iter()
+            .filter(|event| {
+                event.event_type == "authz.denied"
+                    && event.payload["permission"]
+                        == json!(ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(secret_authority_denials.len(), 5);
+        assert_eq!(
+            secret_authority_denials
+                .iter()
+                .filter(|event| event.payload["operation"] == json!("create"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            secret_authority_denials
+                .iter()
+                .filter(|event| event.payload["operation"] == json!("replace"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            secret_authority_denials
+                .iter()
+                .filter(|event| event.payload["operation"] == json!("delete"))
+                .count(),
+            1
+        );
+        assert!(secret_authority_denials.iter().all(|event| {
+            event.payload["reason"] == json!("missing_permission")
+                && event.payload["authorization_layer"] == json!("connection_secret_authority")
+        }));
         let serialized_events =
             serde_json::to_string(&events).expect("audit events should serialize");
         assert!(!serialized_events.contains("credential-secret-id-canary"));
+        assert!(!serialized_events.contains("different-secret-id-canary"));
         assert!(!serialized_events.contains("credential-material-value-canary"));
         assert!(!serialized_events.contains("credentialed.example.test"));
+        assert!(!serialized_events.contains("/credentialed-health"));
     }
 
     #[tokio::test]

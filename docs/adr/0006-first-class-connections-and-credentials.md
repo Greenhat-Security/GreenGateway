@@ -329,6 +329,12 @@ path of a stored test profile is a target change whenever either revision has
 credential or TLS authority. A plain connection writer cannot perform those
 operations. Every sensitive change atomically increments the credential
 revision and emits a separate credential-change audit event.
+Any explicitly submitted hidden credential or TLS binding field requires
+secrets-write even when its value equals the current binding; ordinary writers
+retain redacted bindings only through the server-issued configured markers.
+Secondary secrets-write denials emit a bounded `authz.denied` event containing
+the stable route pattern, operation, and required permission, never submitted
+binding IDs or target values.
 
 All admin routes remain below dynamic `/v1{ADMIN_PREFIX}`. Writes require CSRF
 under existing cookie-auth rules and an exact `If-Match`; missing preconditions
