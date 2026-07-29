@@ -60,6 +60,20 @@ test('captures traffic inventory create-rule prefill journey', async ({
             reviewed_at: null,
             reviewed_by: null,
             covered_by_rule: false,
+            coverage_scope: 'none',
+            routing_context_known: true,
+            routing_context_known_since: '2026-07-04T08:00:00Z',
+            routing_contexts: [
+              {
+                upstream_origin: null,
+                first_seen: '2026-07-04T08:00:00Z',
+                last_seen: '2026-07-04T10:30:00Z',
+                call_count: 128,
+                distinct_principal_count: 18,
+                covered_by_rule: false,
+                coverage_scope: 'none',
+              },
+            ],
             latency: {
               count: 128,
               p50_ms: 18,

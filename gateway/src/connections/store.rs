@@ -451,6 +451,100 @@ CREATE UNIQUE INDEX idx_connection_mcp_catalog_resource_template_ordinal
 ON connection_mcp_catalog_resource_templates(connection_id, ordinal);
 "#;
 
+const MIGRATION_7_SQL: &str = r#"
+ALTER TABLE connection_records
+ADD COLUMN last_test_at TEXT CHECK (
+    last_test_at IS NULL
+    OR (
+        length(CAST(last_test_at AS BLOB)) BETWEEN 1 AND 64
+        AND instr(last_test_at, char(0)) = 0
+    )
+);
+
+ALTER TABLE connection_records
+ADD COLUMN last_refresh_at TEXT CHECK (
+    last_refresh_at IS NULL
+    OR (
+        length(CAST(last_refresh_at AS BLOB)) BETWEEN 1 AND 64
+        AND instr(last_refresh_at, char(0)) = 0
+    )
+);
+
+UPDATE connection_records
+SET last_test_at = COALESCE(
+    (
+        SELECT current.observed_at
+        FROM connection_current_status AS current
+        WHERE current.connection_id = connection_records.id
+          AND (
+              current.reason = 'test_succeeded'
+              OR (
+                  current.reason IN (
+                      'request_failed', 'egress_denied',
+                      'secret_unavailable', 'invalid_response'
+                  )
+                  AND current.catalog_entry_count IS NULL
+              )
+          )
+        LIMIT 1
+    ),
+    (
+        SELECT history.observed_at
+        FROM connection_status_history AS history
+        WHERE history.connection_id = connection_records.id
+          AND (
+              history.reason = 'test_succeeded'
+              OR (
+                  history.reason IN (
+                      'request_failed', 'egress_denied',
+                      'secret_unavailable', 'invalid_response'
+                  )
+                  AND history.catalog_entry_count IS NULL
+              )
+          )
+        ORDER BY history.status_revision DESC
+        LIMIT 1
+    )
+);
+
+UPDATE connection_records
+SET last_refresh_at = COALESCE(
+    (
+        SELECT current.observed_at
+        FROM connection_current_status AS current
+        WHERE current.connection_id = connection_records.id
+          AND (
+              current.reason IN ('catalog_refreshed', 'catalog_stale')
+              OR (
+                  current.reason IN (
+                      'request_failed', 'egress_denied',
+                      'secret_unavailable', 'invalid_response'
+                  )
+                  AND current.catalog_entry_count IS NOT NULL
+              )
+          )
+        LIMIT 1
+    ),
+    (
+        SELECT history.observed_at
+        FROM connection_status_history AS history
+        WHERE history.connection_id = connection_records.id
+          AND (
+              history.reason IN ('catalog_refreshed', 'catalog_stale')
+              OR (
+                  history.reason IN (
+                      'request_failed', 'egress_denied',
+                      'secret_unavailable', 'invalid_response'
+                  )
+                  AND history.catalog_entry_count IS NOT NULL
+              )
+          )
+        ORDER BY history.status_revision DESC
+        LIMIT 1
+    )
+);
+"#;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -475,6 +569,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 6,
         sql: MIGRATION_6_SQL,
+    },
+    Migration {
+        version: 7,
+        sql: MIGRATION_7_SQL,
     },
 ];
 
@@ -565,6 +663,12 @@ pub struct StoredConnection {
     pub revisions: ConnectionRevisions,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConnectionActivityTimes {
+    pub last_test_at: Option<String>,
+    pub last_refresh_at: Option<String>,
 }
 
 impl StoredConnection {
@@ -1172,6 +1276,61 @@ impl SqliteConnectionStore {
                     });
                 }
                 Ok((parsed, count))
+            })
+            .collect()
+    }
+
+    pub fn activity_times(
+        &self,
+    ) -> Result<BTreeMap<ConnectionId, ConnectionActivityTimes>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT id, last_test_at, last_refresh_at
+                FROM connection_records
+                ORDER BY id ASC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(|source| sqlite_error(&self.path, "connection activity prepare", source))?;
+        let rows = statement
+            .query_map(
+                params![i64::try_from(MAX_CONNECTIONS + 1).unwrap_or(i64::MAX)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|source| sqlite_error(&self.path, "connection activity query", source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| sqlite_error(&self.path, "connection activity read", source))?;
+        if rows.len() > MAX_CONNECTIONS {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection activity metadata",
+                maximum: MAX_CONNECTIONS,
+            });
+        }
+        rows.into_iter()
+            .map(|(id, last_test_at, last_refresh_at)| {
+                let parsed = ConnectionId::parse(id.clone()).map_err(|_| {
+                    ConnectionStoreError::CorruptRecord {
+                        id,
+                        reason: "invalid activity owner ID",
+                    }
+                })?;
+                validate_activity_timestamp(&parsed, last_test_at.as_deref())?;
+                validate_activity_timestamp(&parsed, last_refresh_at.as_deref())?;
+                Ok((
+                    parsed,
+                    ConnectionActivityTimes {
+                        last_test_at,
+                        last_refresh_at,
+                    },
+                ))
             })
             .collect()
     }
@@ -1791,6 +1950,21 @@ impl SqliteConnectionStore {
                 })
             })
             .transpose()?;
+        let ambiguous_failure = matches!(
+            update.reason,
+            ConnectionStatusReason::RequestFailed
+                | ConnectionStatusReason::EgressDenied
+                | ConnectionStatusReason::SecretUnavailable
+                | ConnectionStatusReason::InvalidResponse
+        );
+        let last_test_at = (update.reason == ConnectionStatusReason::TestSucceeded
+            || (ambiguous_failure && update.catalog_entry_count.is_none()))
+        .then_some(observed_at.as_str());
+        let last_refresh_at = (matches!(
+            update.reason,
+            ConnectionStatusReason::CatalogRefreshed | ConnectionStatusReason::CatalogStale
+        ) || (ambiguous_failure && update.catalog_entry_count.is_some()))
+        .then_some(observed_at.as_str());
         refresh_status_busy_timeout(&transaction, &self.path, deadline)?;
         transaction
             .execute(
@@ -1827,7 +2001,9 @@ impl SqliteConnectionStore {
                     observed_credential_revision, observed_tls_revision,
                     observed_discovery_revision, state, reason, observed_at,
                     latency_ms, catalog_age_secs, catalog_entry_count
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                )
                 ON CONFLICT(connection_id) DO UPDATE SET
                     status_revision = excluded.status_revision,
                     observed_connection_revision = excluded.observed_connection_revision,
@@ -1875,8 +2051,19 @@ impl SqliteConnectionStore {
         refresh_status_busy_timeout(&transaction, &self.path, deadline)?;
         transaction
             .execute(
-                "UPDATE connection_records SET status_revision = ?1 WHERE id = ?2",
-                params![u64_to_i64(id, status_revision)?, id.as_str()],
+                r#"
+                UPDATE connection_records
+                SET status_revision = ?1,
+                    last_test_at = COALESCE(?2, last_test_at),
+                    last_refresh_at = COALESCE(?3, last_refresh_at)
+                WHERE id = ?4
+                "#,
+                params![
+                    u64_to_i64(id, status_revision)?,
+                    last_test_at,
+                    last_refresh_at,
+                    id.as_str(),
+                ],
             )
             .map_err(|source| {
                 status_sqlite_error(&self.path, "status revision update", source, deadline)
@@ -2334,7 +2521,7 @@ fn run_migrations(
 
 fn validate_schema(connection: &Connection, path: &Path) -> Result<(), ConnectionStoreError> {
     for query in [
-        "SELECT id, schema_version, source, spec_json, connection_revision, credential_revision, tls_revision, discovery_revision, status_revision, created_at, updated_at FROM connection_records LIMIT 0",
+        "SELECT id, schema_version, source, spec_json, connection_revision, credential_revision, tls_revision, discovery_revision, status_revision, created_at, updated_at, last_test_at, last_refresh_at FROM connection_records LIMIT 0",
         "SELECT connection_id, purpose, secret_id, binding_version, updated_at FROM connection_credential_bindings LIMIT 0",
         "SELECT connection_id, consumer_kind, consumer_id, created_at FROM connection_dependencies LIMIT 0",
         "SELECT connection_id, status_revision, observed_connection_revision, observed_credential_revision, observed_tls_revision, observed_discovery_revision, state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count FROM connection_current_status LIMIT 0",
@@ -2584,6 +2771,7 @@ fn validate_persisted_state(
     for record in &records {
         validate_record_bindings(&transaction, path, record)?;
     }
+    validate_connection_activity_rows(&transaction, path)?;
     validate_safe_status_rows(
         &transaction,
         path,
@@ -4044,6 +4232,58 @@ fn ensure_no_invalid_rows(
     }
 }
 
+fn validate_activity_timestamp(
+    id: &ConnectionId,
+    value: Option<&str>,
+) -> Result<(), ConnectionStoreError> {
+    if value.is_some_and(|value| OffsetDateTime::parse(value, &Rfc3339).is_err()) {
+        Err(ConnectionStoreError::CorruptRecord {
+            id: id.to_string(),
+            reason: "invalid connection activity timestamp",
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_connection_activity_rows(
+    connection: &Connection,
+    path: &Path,
+) -> Result<(), ConnectionStoreError> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT id, last_test_at, last_refresh_at
+            FROM connection_records
+            WHERE last_test_at IS NOT NULL OR last_refresh_at IS NOT NULL
+            ORDER BY id ASC
+            "#,
+        )
+        .map_err(|source| sqlite_error(path, "activity timestamp validation prepare", source))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|source| sqlite_error(path, "activity timestamp validation query", source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error(path, "activity timestamp validation read", source))?;
+    for (raw_id, last_test_at, last_refresh_at) in rows {
+        let id = ConnectionId::parse(raw_id.clone()).map_err(|_| {
+            ConnectionStoreError::CorruptRecord {
+                id: raw_id,
+                reason: "activity row has an invalid connection ID",
+            }
+        })?;
+        validate_activity_timestamp(&id, last_test_at.as_deref())?;
+        validate_activity_timestamp(&id, last_refresh_at.as_deref())?;
+    }
+    Ok(())
+}
+
 fn validate_safe_status_rows(
     connection: &Connection,
     path: &Path,
@@ -5015,7 +5255,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]
@@ -5342,7 +5582,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]
@@ -5446,7 +5686,127 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn migration_seven_backfills_test_and_refresh_activity_from_populated_v6_history() {
+        let database = TemporaryDatabase::new("migration-v6-populated-activity");
+        let path = database.path.clone();
+        let connection_id = ConnectionId::new_managed();
+        let write = mcp_candidate();
+        let spec_json =
+            serde_json::to_string(&write).expect("v6 fixture candidate should serialize");
+        let migration_timestamp = "2026-07-28T00:00:00Z";
+        let test_success_at = "2026-07-28T00:00:01Z";
+        let refresh_success_at = "2026-07-28T00:00:02Z";
+        let test_failure_at = "2026-07-28T00:00:03Z";
+        let refresh_failure_at = "2026-07-28T00:00:04Z";
+        {
+            let connection =
+                Connection::open(&path).expect("v6 fixture database should open directly");
+            connection
+                .execute_batch(CONFIGURE_SQL)
+                .expect("v6 fixture pragmas should apply");
+            connection
+                .execute_batch(CREATE_MIGRATIONS_TABLE_SQL)
+                .expect("v6 fixture migration table should create");
+            for migration in MIGRATIONS.iter().take(6) {
+                connection
+                    .execute_batch(migration.sql)
+                    .expect("v6 fixture migration should apply");
+                connection
+                    .execute(
+                        "INSERT INTO connection_schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        params![migration.version, migration_timestamp],
+                    )
+                    .expect("v6 fixture migration should record");
+            }
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_records (
+                        id, schema_version, source, spec_json, connection_revision,
+                        credential_revision, tls_revision, discovery_revision,
+                        status_revision, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, 1, 0, 0, 1, 4, ?5, ?5)
+                    "#,
+                    params![
+                        connection_id.as_str(),
+                        CONNECTION_SCHEMA_VERSION,
+                        SOURCE_MANAGED,
+                        spec_json,
+                        migration_timestamp,
+                    ],
+                )
+                .expect("v6 fixture Connection should insert");
+            for (revision, reason, observed_at, catalog_entry_count) in [
+                (1_i64, "test_succeeded", test_success_at, None),
+                (2_i64, "catalog_refreshed", refresh_success_at, Some(1_i64)),
+                (3_i64, "request_failed", test_failure_at, None),
+            ] {
+                connection
+                    .execute(
+                        r#"
+                        INSERT INTO connection_status_history (
+                            connection_id, status_revision, observed_connection_revision,
+                            observed_credential_revision, observed_tls_revision,
+                            observed_discovery_revision, state, reason, observed_at,
+                            latency_ms, catalog_age_secs, catalog_entry_count
+                        ) VALUES (
+                            ?1, ?2, 1, 0, 0, 1, 'degraded', ?3, ?4, NULL, NULL, ?5
+                        )
+                        "#,
+                        params![
+                            connection_id.as_str(),
+                            revision,
+                            reason,
+                            observed_at,
+                            catalog_entry_count,
+                        ],
+                    )
+                    .expect("v6 fixture history row should insert");
+            }
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_current_status (
+                        connection_id, status_revision, observed_connection_revision,
+                        observed_credential_revision, observed_tls_revision,
+                        observed_discovery_revision, state, reason, observed_at,
+                        latency_ms, catalog_age_secs, catalog_entry_count
+                    ) VALUES (
+                        ?1, 4, 1, 0, 0, 1, 'degraded', 'invalid_response', ?2,
+                        NULL, NULL, 0
+                    )
+                    "#,
+                    params![connection_id.as_str(), refresh_failure_at],
+                )
+                .expect("v6 fixture current status should insert");
+        }
+
+        let store = SqliteConnectionStore::open(&path)
+            .expect("migration 7 should upgrade populated v6 activity");
+        let activity = store
+            .activity_times()
+            .expect("migrated activity should load")
+            .remove(&connection_id)
+            .expect("migrated Connection activity should remain");
+        assert_eq!(activity.last_test_at.as_deref(), Some(test_failure_at));
+        assert_eq!(
+            activity.last_refresh_at.as_deref(),
+            Some(refresh_failure_at)
+        );
+        drop(store);
+
+        let reopened = SqliteConnectionStore::open(&path)
+            .expect("populated migration 7 database should pass restart validation");
+        let restarted_activity = reopened
+            .activity_times()
+            .expect("restarted activity should load")
+            .remove(&connection_id)
+            .expect("restarted Connection activity should remain");
+        assert_eq!(restarted_activity, activity);
     }
 
     #[test]
@@ -6975,6 +7335,206 @@ mod tests {
     }
 
     #[test]
+    fn activity_timestamps_track_successes_and_ambiguous_failures_in_the_correct_lane() {
+        let (_directory, _path, store) = temporary_store("status-activity-lanes");
+        let created = store
+            .create(mcp_candidate())
+            .expect("Connection should create");
+
+        let tested = store
+            .append_status(
+                &created.id,
+                &created.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::TestSucceeded,
+                    latency_ms: Some(3),
+                    catalog_age_secs: None,
+                    catalog_entry_count: None,
+                },
+            )
+            .expect("test success should append");
+        let mut expected_test_at = tested
+            .observed_at
+            .clone()
+            .expect("test success should carry an observation time");
+        let initial_activity = store
+            .activity_times()
+            .expect("initial activity should load")
+            .remove(&created.id)
+            .expect("initial activity should exist");
+        assert_eq!(
+            initial_activity,
+            ConnectionActivityTimes {
+                last_test_at: Some(expected_test_at.clone()),
+                last_refresh_at: None,
+            }
+        );
+
+        let current = store
+            .get(&created.id)
+            .expect("Connection should load")
+            .expect("Connection should remain");
+        let refreshed = store
+            .append_status(
+                &created.id,
+                &current.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::CatalogRefreshed,
+                    latency_ms: Some(5),
+                    catalog_age_secs: Some(0),
+                    catalog_entry_count: Some(2),
+                },
+            )
+            .expect("refresh success should append");
+        let mut expected_refresh_at = refreshed.observed_at.clone();
+        let refreshed_activity = store
+            .activity_times()
+            .expect("refreshed activity should load")
+            .remove(&created.id)
+            .expect("refreshed activity should exist");
+        assert_eq!(
+            refreshed_activity,
+            ConnectionActivityTimes {
+                last_test_at: Some(expected_test_at.clone()),
+                last_refresh_at: expected_refresh_at.clone(),
+            }
+        );
+
+        for reason in [
+            ConnectionStatusReason::RequestFailed,
+            ConnectionStatusReason::EgressDenied,
+            ConnectionStatusReason::SecretUnavailable,
+            ConnectionStatusReason::InvalidResponse,
+        ] {
+            let current = store
+                .get(&created.id)
+                .expect("Connection should load before test failure")
+                .expect("Connection should remain before test failure");
+            let test_failure = store
+                .append_status(
+                    &created.id,
+                    &current.etag(),
+                    ConnectionStatusUpdate {
+                        state: ConnectionOperationalState::Degraded,
+                        reason,
+                        latency_ms: None,
+                        catalog_age_secs: None,
+                        catalog_entry_count: None,
+                    },
+                )
+                .expect("test-lane failure should append");
+            expected_test_at = test_failure
+                .observed_at
+                .clone()
+                .expect("test-lane failure should carry an observation time");
+            let test_failure_activity = store
+                .activity_times()
+                .expect("test-failure activity should load")
+                .remove(&created.id)
+                .expect("test-failure activity should exist");
+            assert_eq!(
+                test_failure_activity,
+                ConnectionActivityTimes {
+                    last_test_at: Some(expected_test_at.clone()),
+                    last_refresh_at: expected_refresh_at.clone(),
+                },
+                "{reason:?} without a catalog count must update only the test lane"
+            );
+
+            let current = store
+                .get(&created.id)
+                .expect("Connection should load before refresh failure")
+                .expect("Connection should remain before refresh failure");
+            let refresh_failure = store
+                .append_status(
+                    &created.id,
+                    &current.etag(),
+                    ConnectionStatusUpdate {
+                        state: ConnectionOperationalState::Degraded,
+                        reason,
+                        latency_ms: None,
+                        catalog_age_secs: Some(0),
+                        catalog_entry_count: Some(0),
+                    },
+                )
+                .expect("refresh-lane failure should append");
+            expected_refresh_at = refresh_failure.observed_at.clone();
+            let refresh_failure_activity = store
+                .activity_times()
+                .expect("refresh-failure activity should load")
+                .remove(&created.id)
+                .expect("refresh-failure activity should exist");
+            assert_eq!(
+                refresh_failure_activity,
+                ConnectionActivityTimes {
+                    last_test_at: Some(expected_test_at.clone()),
+                    last_refresh_at: expected_refresh_at.clone(),
+                },
+                "{reason:?} with a catalog count must update only the refresh lane"
+            );
+        }
+
+        let before_replace = ConnectionActivityTimes {
+            last_test_at: Some(expected_test_at),
+            last_refresh_at: expected_refresh_at,
+        };
+        let current = store
+            .get(&created.id)
+            .expect("Connection should load before replacement")
+            .expect("Connection should remain before replacement");
+        let mut replacement = current.write.clone();
+        replacement.display_name = "Managed MCP after edit".to_owned();
+        store
+            .replace(&created.id, &current.etag(), replacement)
+            .expect("Connection replacement should succeed");
+        assert!(
+            store
+                .latest_status(&created.id)
+                .expect("latest status should load after replacement")
+                .is_none(),
+            "replacement must still invalidate the revision-bound current status"
+        );
+        let after_replace = store
+            .activity_times()
+            .expect("activity should load after replacement")
+            .remove(&created.id)
+            .expect("activity should remain after replacement");
+        assert_eq!(
+            after_replace, before_replace,
+            "configuration replacement must preserve both historical activity timestamps"
+        );
+    }
+
+    #[test]
+    fn malformed_bounded_activity_timestamps_fail_closed_on_restart() {
+        for column in ["last_test_at", "last_refresh_at"] {
+            let (_database, path, store) =
+                temporary_store(&format!("status-activity-corrupt-{column}"));
+            let created = store
+                .create(mcp_candidate())
+                .expect("Connection should create");
+            store
+                .connection_guard()
+                .execute(
+                    &format!("UPDATE connection_records SET {column} = ?1 WHERE id = ?2"),
+                    params!["bounded-but-not-rfc3339", created.id.as_str()],
+                )
+                .expect("bounded malformed timestamp fixture should persist");
+            drop(store);
+
+            assert!(matches!(
+                SqliteConnectionStore::open(path),
+                Err(ConnectionStoreError::CorruptRecord {
+                    id,
+                    reason: "invalid connection activity timestamp",
+                }) if id == created.id.to_string()
+            ));
+        }
+    }
+
+    #[test]
     fn bounded_status_append_rejects_expired_and_contended_locks_without_writing() {
         let (_directory, _path, store) = temporary_store("status-bounded-lock");
         let created = store.create(candidate()).expect("create should succeed");
@@ -7222,16 +7782,42 @@ mod tests {
         let noisy = store
             .create(noisy_candidate)
             .expect("noisy connection should create");
-        let quiet_status = ConnectionStatusUpdate {
-            state: ConnectionOperationalState::Healthy,
-            reason: ConnectionStatusReason::TestSucceeded,
-            latency_ms: Some(3),
-            catalog_age_secs: None,
-            catalog_entry_count: None,
-        };
-        store
-            .append_status(&quiet.id, &quiet.etag(), quiet_status)
+        let quiet_test = store
+            .append_status(
+                &quiet.id,
+                &quiet.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::TestSucceeded,
+                    latency_ms: Some(3),
+                    catalog_age_secs: None,
+                    catalog_entry_count: None,
+                },
+            )
             .expect("quiet status should append");
+        let quiet_test_at = quiet_test
+            .observed_at
+            .expect("quiet test should carry an observation time");
+        let quiet_after_test = store
+            .get(&quiet.id)
+            .expect("quiet Connection should load")
+            .expect("quiet Connection should remain");
+        let quiet_refresh = store
+            .append_status(
+                &quiet.id,
+                &quiet_after_test.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::CatalogRefreshed,
+                    latency_ms: Some(4),
+                    catalog_age_secs: Some(0),
+                    catalog_entry_count: Some(1),
+                },
+            )
+            .expect("quiet refresh should append");
+        let quiet_refresh_at = quiet_refresh
+            .observed_at
+            .expect("quiet refresh should carry an observation time");
         store
             .append_status(
                 &noisy.id,
@@ -7315,6 +7901,30 @@ mod tests {
             .expect("quiet latest query should succeed")
             .expect("quiet current status must be retained");
         assert_eq!(quiet_latest.state, ConnectionOperationalState::Healthy);
+        assert_eq!(
+            quiet_latest.reason,
+            ConnectionStatusReason::CatalogRefreshed
+        );
+        assert!(
+            store
+                .status_history(&quiet.id, MAX_STATUS_HISTORY_ROWS)
+                .expect("quiet history query should succeed")
+                .is_empty(),
+            "global pruning fixture must remove both quiet activity history rows"
+        );
+        let quiet_activity = store
+            .activity_times()
+            .expect("quiet activity should load")
+            .remove(&quiet.id)
+            .expect("quiet activity metadata must be retained");
+        assert_eq!(
+            quiet_activity,
+            ConnectionActivityTimes {
+                last_test_at: Some(quiet_test_at),
+                last_refresh_at: Some(quiet_refresh_at),
+            },
+            "durable activity timestamps must survive global history pruning"
+        );
         let connection = store.connection_guard();
         let total_status_rows: i64 = connection
             .query_row(

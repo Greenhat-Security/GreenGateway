@@ -531,6 +531,7 @@ impl LocalSecretProvider {
             label: label.to_owned(),
             provider: SecretProviderKind::LocalEncrypted,
             configured: true,
+            purpose: Some(purpose),
             version: Some(version),
             rotated_at: None,
         };
@@ -601,6 +602,7 @@ impl LocalSecretProvider {
             label: current.label,
             provider: SecretProviderKind::LocalEncrypted,
             configured: true,
+            purpose: Some(current.purpose),
             version: Some(next_version),
             rotated_at: Some(now),
         };
@@ -1093,6 +1095,7 @@ impl EncryptedSecretRecord {
             label: self.label.clone(),
             provider: SecretProviderKind::LocalEncrypted,
             configured: true,
+            purpose: Some(self.purpose),
             version: Some(self.version),
             rotated_at: self.rotated_at.clone(),
         }

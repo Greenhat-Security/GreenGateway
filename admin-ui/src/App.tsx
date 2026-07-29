@@ -14,6 +14,13 @@ import {
   setStoredToken,
 } from './lib/auth';
 import { adminApiUrl, adminBasePath } from './lib/config';
+import {
+  CapabilityDetail,
+  CapabilityInventoryView,
+} from './views/CapabilityInventoryView';
+import { ConnectionDetail } from './views/ConnectionDetail';
+import { ConnectionEditor } from './views/ConnectionEditor';
+import { ConnectionsView } from './views/ConnectionsView';
 import { IdentitiesView } from './views/IdentitiesView';
 import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
@@ -97,6 +104,12 @@ export function AdminShell() {
           <NavLink to="/tokens" className={navItemClassName}>
             Tokens
           </NavLink>
+          <NavLink to="/connections" className={navItemClassName}>
+            Connections
+          </NavLink>
+          <NavLink to="/tools" end className={navItemClassName}>
+            Tool inventory
+          </NavLink>
           <NavLink to="/tools/openapi" className={navItemClassName}>
             OpenAPI tools
           </NavLink>
@@ -160,7 +173,13 @@ export function AdminShell() {
           <Route path="/traffic/detail" element={<TrafficEndpointDetail />} />
           <Route path="/rules" element={<RuleTable />} />
           <Route path="/tokens" element={<TokensView />} />
+          <Route path="/connections" element={<ConnectionsView />} />
+          <Route path="/connections/new" element={<ConnectionEditor />} />
+          <Route path="/connections/:id/edit" element={<ConnectionEditor />} />
+          <Route path="/connections/:id" element={<ConnectionDetail />} />
           <Route path="/tools/openapi" element={<OpenApiToolsView />} />
+          <Route path="/tools" element={<CapabilityInventoryView />} />
+          <Route path="/tools/:id" element={<CapabilityDetail />} />
           <Route path="/identities" element={<IdentitiesView />} />
           <Route path="/identities/detail" element={<PrincipalDetail />} />
           <Route path="/policy/history" element={<PolicyHistoryView />} />
@@ -211,6 +230,14 @@ function Dashboard({
           <Link to="/tokens">
             <span>Tokens</span>
             <small>Create, rotate, and revoke service tokens</small>
+          </Link>
+          <Link to="/connections">
+            <span>Connections</span>
+            <small>Configure, test, and refresh upstream connections</small>
+          </Link>
+          <Link to="/tools">
+            <span>Tool inventory</span>
+            <small>Review registered tools and connection health</small>
           </Link>
           <Link to="/tools/openapi">
             <span>OpenAPI tools</span>
@@ -483,8 +510,26 @@ function pageTitleForPath(pathname: string): string {
   if (pathname === '/tokens') {
     return 'Tokens';
   }
+  if (pathname === '/connections') {
+    return 'Connections';
+  }
+  if (pathname === '/connections/new') {
+    return 'New connection';
+  }
+  if (/^\/connections\/[^/]+\/edit$/.test(pathname)) {
+    return 'Edit connection';
+  }
+  if (/^\/connections\/[^/]+$/.test(pathname)) {
+    return 'Connection details';
+  }
   if (pathname === '/tools/openapi') {
     return 'OpenAPI tools';
+  }
+  if (pathname === '/tools') {
+    return 'Tool inventory';
+  }
+  if (/^\/tools\/[^/]+$/.test(pathname)) {
+    return 'Tool details';
   }
   if (pathname === '/identities') {
     return 'Identity directory';

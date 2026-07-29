@@ -219,12 +219,6 @@ pub struct CapabilityListPage {
     collection_etag: String,
 }
 
-impl CapabilityListPage {
-    pub fn collection_etag(&self) -> &str {
-        &self.collection_etag
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CapabilityInventoryError {
     InvalidLimit,
@@ -407,6 +401,16 @@ impl CapabilityInventory {
             return Err(CapabilityInventoryError::ResponseTooLarge);
         }
         Ok(Some(detail))
+    }
+
+    pub fn connection_counts(
+        &self,
+        rbac_state: &RbacState,
+        principal: &Principal,
+    ) -> Result<BTreeMap<ConnectionId, usize>, CapabilityInventoryError> {
+        Ok(connection_counts_from_capabilities(
+            self.build(rbac_state, principal)?,
+        ))
     }
 
     fn build(
@@ -593,6 +597,18 @@ impl CapabilityInventory {
         }
         Ok((mcp, openapi, statuses))
     }
+}
+
+fn connection_counts_from_capabilities(
+    capabilities: impl IntoIterator<Item = BuiltCapability>,
+) -> BTreeMap<ConnectionId, usize> {
+    let mut counts = BTreeMap::new();
+    for capability in capabilities {
+        if let Some(connection) = capability.summary.connection {
+            *counts.entry(connection.id).or_default() += 1;
+        }
+    }
+    counts
 }
 
 fn durable_tool_catalogs<'a>(
@@ -1293,6 +1309,7 @@ mod tests {
         rbac_state: RbacState,
         principal: Principal,
         mcp_record: StoredConnection,
+        openapi_record: StoredConnection,
         mcp_tool_name: String,
         openapi_tool_name: String,
         _database: TemporaryInventoryDatabase,
@@ -1454,6 +1471,7 @@ mod tests {
                 rbac_state,
                 principal,
                 mcp_record,
+                openapi_record,
                 mcp_tool_name,
                 openapi_tool_name,
                 _database: database,
@@ -1775,6 +1793,140 @@ mod tests {
             } if operation_id == "inventoryLookup"
         ));
         assert!(openapi_tool.policy.eligible);
+    }
+
+    #[test]
+    fn connection_counts_build_once_and_include_all_managed_capability_kinds() {
+        let fixture = ManagedInventoryFixture::new("connection-counts");
+        let manual_mapping = HttpToolMapping {
+            method: "GET".to_owned(),
+            path_template: "/unassociated".to_owned(),
+            query_params: Vec::new(),
+            body: None,
+        };
+        fixture
+            .inventory
+            .registry
+            .merge_definitions(vec![ToolDefinition {
+                name: "unassociated_manual_capability".to_owned(),
+                description: "Manual capability without a connection".to_owned(),
+                input_schema: json!({"type": "object"}),
+                target: None,
+                source: ToolSource::Manual,
+                upstream: manual_mapping,
+            }])
+            .expect("unassociated manual capability should publish");
+
+        let counts = fixture
+            .inventory
+            .connection_counts(&fixture.rbac_state, &fixture.principal)
+            .expect("connection capability counts should build");
+
+        assert_eq!(counts.get(&fixture.mcp_record.id), Some(&3));
+        assert_eq!(counts.get(&fixture.openapi_record.id), Some(&1));
+        assert_eq!(counts.values().sum::<usize>(), 4);
+        assert_eq!(counts.len(), 2);
+    }
+
+    #[test]
+    fn connection_count_fold_accepts_exact_inventory_bound_and_rejects_the_next_entry() {
+        assert_eq!(MAX_CAPABILITY_INVENTORY_ENTRIES, 8_192);
+        let first_connection = ConnectionId::parse("00000000-0000-0000-0000-000000000001")
+            .expect("first connection ID should parse");
+        let second_connection = ConnectionId::parse("00000000-0000-0000-0000-000000000002")
+            .expect("second connection ID should parse");
+        let mut capabilities = BTreeMap::new();
+        for index in 0..MAX_CAPABILITY_INVENTORY_ENTRIES {
+            let connection = if index % 2 == 0 {
+                first_connection.clone()
+            } else {
+                second_connection.clone()
+            };
+            insert_capability(
+                &mut capabilities,
+                BuiltCapability {
+                    summary: CapabilitySummary {
+                        id: format!("bounded-capability-{index:05}"),
+                        kind: CapabilityKind::Tool,
+                        name: format!("bounded_tool_{index:05}"),
+                        title: None,
+                        uri: None,
+                        uri_template: None,
+                        description: None,
+                        description_truncated: false,
+                        source: CapabilitySource::ManualFile,
+                        connection: Some(CapabilityConnection {
+                            id: connection,
+                            kind: ConnectionKind::HttpApi,
+                            management_source: ConnectionManagementSource::Managed,
+                        }),
+                        schema_digest: None,
+                        discovered_at: None,
+                        last_success_at: None,
+                        state: CapabilityState {
+                            enabled: true,
+                            available: true,
+                            stale: false,
+                            reason: "available",
+                        },
+                        policy: CapabilityPolicyEligibility {
+                            eligible: true,
+                            reason: "eligible",
+                        },
+                    },
+                    input_schema: None,
+                    mapping: None,
+                },
+            )
+            .expect("capability at the exact bound should insert");
+        }
+        let overflow = insert_capability(
+            &mut capabilities,
+            BuiltCapability {
+                summary: CapabilitySummary {
+                    id: "bounded-capability-overflow".to_owned(),
+                    kind: CapabilityKind::Tool,
+                    name: "bounded_tool_overflow".to_owned(),
+                    title: None,
+                    uri: None,
+                    uri_template: None,
+                    description: None,
+                    description_truncated: false,
+                    source: CapabilitySource::ManualFile,
+                    connection: None,
+                    schema_digest: None,
+                    discovered_at: None,
+                    last_success_at: None,
+                    state: CapabilityState {
+                        enabled: true,
+                        available: true,
+                        stale: false,
+                        reason: "available",
+                    },
+                    policy: CapabilityPolicyEligibility {
+                        eligible: true,
+                        reason: "eligible",
+                    },
+                },
+                input_schema: None,
+                mapping: None,
+            },
+        );
+        assert_eq!(overflow, Err(CapabilityInventoryError::CardinalityExceeded));
+
+        let counts = connection_counts_from_capabilities(capabilities.into_values());
+        assert_eq!(
+            counts.get(&first_connection),
+            Some(&(MAX_CAPABILITY_INVENTORY_ENTRIES / 2))
+        );
+        assert_eq!(
+            counts.get(&second_connection),
+            Some(&(MAX_CAPABILITY_INVENTORY_ENTRIES / 2))
+        );
+        assert_eq!(
+            counts.values().sum::<usize>(),
+            MAX_CAPABILITY_INVENTORY_ENTRIES
+        );
     }
 
     #[test]
