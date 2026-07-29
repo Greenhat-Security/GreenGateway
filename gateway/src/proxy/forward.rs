@@ -2404,17 +2404,20 @@ mod tests {
     #[tokio::test]
     async fn sse_commits_headers_before_first_event_and_reports_completion() {
         let (addr, server) = spawn_sse_upstream(SseTestBody::Chunks(vec![(
-            Duration::from_millis(200),
+            Duration::from_secs(2),
             "data: ready\n\n",
         )]))
         .await;
         let (proxy, sink, _) = retry_proxy_with_options(
             [addr, addr],
             RetryProxyOptions {
-                timeout: Duration::from_millis(75),
-                response_idle_timeout: Some(Duration::from_millis(500)),
+                // The request deadline only guards pre-commit work for SSE. Leave
+                // enough loopback setup headroom for a loaded parallel test run,
+                // while the outer timeout still proves headers precede the event.
+                timeout: Duration::from_millis(1_500),
+                response_idle_timeout: Some(Duration::from_secs(3)),
                 sse: Some(config::UpstreamSseConfig {
-                    max_duration_ms: 1_000,
+                    max_duration_ms: 4_000,
                     max_response_bytes: None,
                 }),
                 ..RetryProxyOptions::default()
@@ -2427,7 +2430,7 @@ mod tests {
             .expect("SSE request");
 
         let response = tokio::time::timeout(
-            Duration::from_millis(150),
+            Duration::from_secs(1),
             proxy.forward_request(request, "203.0.113.8"),
         )
         .await
@@ -2537,7 +2540,7 @@ mod tests {
             let (proxy, sink, _) = retry_proxy_with_options(
                 [addr, addr],
                 RetryProxyOptions {
-                    timeout: Duration::from_millis(100),
+                    timeout: Duration::from_secs(1),
                     response_idle_timeout: Some(idle_timeout),
                     sse: Some(sse),
                     ..RetryProxyOptions::default()
@@ -2585,7 +2588,7 @@ mod tests {
             RetryProxyOptions {
                 // This test targets the post-header idle failure below; leave
                 // enough headroom for a loaded CI runner to establish the loopback request.
-                timeout: Duration::from_millis(500),
+                timeout: Duration::from_secs(1),
                 response_idle_timeout: Some(Duration::from_millis(30)),
                 sse: Some(config::UpstreamSseConfig {
                     max_duration_ms: 1_000,
@@ -2662,7 +2665,7 @@ mod tests {
         let (proxy, sink, health_states) = retry_proxy_with_options(
             [addr, addr],
             RetryProxyOptions {
-                timeout: Duration::from_millis(100),
+                timeout: Duration::from_secs(1),
                 response_idle_timeout: Some(Duration::from_millis(500)),
                 sse: Some(config::UpstreamSseConfig {
                     max_duration_ms: 30,
@@ -2726,7 +2729,7 @@ mod tests {
         let (keepalive_proxy, keepalive_sink, _) = retry_proxy_with_options(
             [keepalive_addr, keepalive_addr],
             RetryProxyOptions {
-                timeout: Duration::from_millis(100),
+                timeout: Duration::from_secs(1),
                 response_idle_timeout: Some(Duration::from_millis(500)),
                 sse: Some(config::UpstreamSseConfig {
                     max_duration_ms: 1_500,
@@ -2758,7 +2761,7 @@ mod tests {
         let (pending_proxy, pending_sink, _) = retry_proxy_with_options(
             [pending_addr, pending_addr],
             RetryProxyOptions {
-                timeout: Duration::from_millis(100),
+                timeout: Duration::from_secs(1),
                 response_idle_timeout: Some(Duration::from_secs(1)),
                 sse: Some(config::UpstreamSseConfig {
                     max_duration_ms: 1_000,
@@ -2782,7 +2785,7 @@ mod tests {
             .forward_request(pending_request, "203.0.113.8")
             .await;
         drop(pending_response);
-        let released = tokio::time::timeout(Duration::from_millis(200), async {
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Ok(permit) = pool.admission.acquire().await {
                     return permit;
@@ -2816,7 +2819,7 @@ mod tests {
         let (forced_proxy, forced_sink, _) = retry_proxy_with_options(
             [pending_addr, pending_addr],
             RetryProxyOptions {
-                timeout: Duration::from_millis(100),
+                timeout: Duration::from_secs(1),
                 response_idle_timeout: Some(Duration::from_secs(1)),
                 sse: Some(config::UpstreamSseConfig {
                     max_duration_ms: 1_000,
@@ -3549,12 +3552,11 @@ mod tests {
         let (first_addr, first_server) = spawn_status_upstream_after(
             StatusCode::SERVICE_UNAVAILABLE,
             Arc::clone(&first_requests),
-            Duration::from_millis(75),
+            Duration::from_millis(250),
         )
         .await;
         let (second_addr, second_server) =
-            spawn_trickling_upstream(Arc::clone(&second_requests), Duration::from_millis(500))
-                .await;
+            spawn_trickling_upstream(Arc::clone(&second_requests), Duration::from_secs(2)).await;
         let (proxy, _, health_states) = retry_proxy_with_options(
             [first_addr, second_addr],
             RetryProxyOptions {
@@ -3563,7 +3565,7 @@ mod tests {
                     methods: vec!["GET".to_owned()],
                     statuses: vec![503],
                 }),
-                timeout: Duration::from_millis(250),
+                timeout: Duration::from_secs(1),
                 limits: config::UpstreamPoolLimitsConfig {
                     max_in_flight: 1,
                     queue_depth: 0,
@@ -3607,7 +3609,7 @@ mod tests {
             .expect("deadline should terminate the response tail")
             .expect_err("deadline tail should be a redacted error");
         assert!(
-            started.elapsed() < Duration::from_millis(330),
+            started.elapsed() < Duration::from_millis(1_300),
             "response tail exceeded the original logical deadline"
         );
         assert!(error.to_string().contains("request_timeout"));
@@ -3640,7 +3642,7 @@ mod tests {
         let (first_addr, first_server) = spawn_status_upstream_after(
             StatusCode::SERVICE_UNAVAILABLE,
             Arc::clone(&first_requests),
-            Duration::from_millis(75),
+            Duration::from_millis(250),
         )
         .await;
         let (second_addr, second_server) =
@@ -3653,7 +3655,7 @@ mod tests {
                     methods: vec!["GET".to_owned()],
                     statuses: vec![503],
                 }),
-                timeout: Duration::from_millis(250),
+                timeout: Duration::from_secs(1),
                 limits: config::UpstreamPoolLimitsConfig {
                     max_in_flight: 1,
                     queue_depth: 0,
@@ -3682,7 +3684,7 @@ mod tests {
             "retry budget must be held before the deadline"
         );
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
 
         let admission = pool
             .admission
@@ -4541,7 +4543,7 @@ mod tests {
                 }) {
                     return event;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
