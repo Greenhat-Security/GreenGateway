@@ -5,8 +5,8 @@ use std::{
     fmt,
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -30,6 +30,7 @@ use rmcp::{
     },
     service::{ClientInitializeError, QuitReason, ServiceError},
     transport::{
+        common::client_side_sse::NeverRetry,
         streamable_http_client::{
             AuthRequiredError, InsufficientScopeError, SseError, StreamableHttpClient,
             StreamableHttpClientTransportConfig, StreamableHttpError, StreamableHttpPostResponse,
@@ -48,9 +49,11 @@ use crate::{
             ResolvedConnectionCredential,
         },
         model::MAX_CATALOG_ENTRIES,
+        status::{ConnectionOperationalState, ConnectionStatusReason},
         store::{validate_mcp_resource_metadata, StoredMcpResource, StoredMcpResourceTemplate},
+        test::{ConnectionTestReason, ConnectionTestStageName},
     },
-    egress::{CheckedEgressDestination, EgressClient, EgressError},
+    egress::{rmcp_http, CheckedEgressDestination, EgressClient, EgressError},
     tools::definitions::ToolDefinition,
 };
 
@@ -65,6 +68,7 @@ const MAX_DISCOVERY_TOOLS_PER_UPSTREAM: usize = 1024;
 const MAX_DISCOVERY_RESOURCES_PER_UPSTREAM: usize = 1024;
 const MAX_DISCOVERY_RESOURCE_TEMPLATES_PER_UPSTREAM: usize = 1024;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const PROTOCOL_PROBE_CLEANUP_RESERVE: Duration = Duration::from_millis(500);
 const REDACTED_MCP_UPSTREAM_VALUE: &str = "<redacted>";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -238,6 +242,58 @@ impl fmt::Display for McpUpstreamCallError {
 }
 
 impl Error for McpUpstreamCallError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionProtocolProbeError {
+    stage: ConnectionTestStageName,
+    reason: ConnectionTestReason,
+    status_reason: ConnectionStatusReason,
+}
+
+impl ConnectionProtocolProbeError {
+    pub const fn stage(self) -> ConnectionTestStageName {
+        self.stage
+    }
+
+    pub const fn safe_reason(self) -> ConnectionTestReason {
+        self.reason
+    }
+
+    pub const fn status_reason(self) -> ConnectionStatusReason {
+        self.status_reason
+    }
+
+    pub const fn operational_state(self) -> ConnectionOperationalState {
+        match self.status_reason {
+            ConnectionStatusReason::InvalidResponse => ConnectionOperationalState::Degraded,
+            _ => ConnectionOperationalState::Unavailable,
+        }
+    }
+
+    const fn new(
+        stage: ConnectionTestStageName,
+        reason: ConnectionTestReason,
+        status_reason: ConnectionStatusReason,
+    ) -> Self {
+        Self {
+            stage,
+            reason,
+            status_reason,
+        }
+    }
+}
+
+impl fmt::Display for ConnectionProtocolProbeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "managed MCP protocol probe failed at {:?}: {:?}",
+            self.stage, self.reason
+        )
+    }
+}
+
+impl Error for ConnectionProtocolProbeError {}
 
 #[derive(Clone)]
 pub struct McpUpstreamRuntimeConfig {
@@ -417,11 +473,7 @@ pub async fn discover_connection_catalog(
         });
     }
     let runtime_config = McpUpstreamRuntimeConfig::from_connection_target(&target);
-    let destination = target
-        .client()
-        .checked_destination(target.url())
-        .await
-        .map_err(|_| McpUpstreamCallError::EgressRejected)?;
+    let client = managed_mcp_http_client(runtime, &target).await?;
     let credential = runtime
         .resolve_credential(&target)
         .await
@@ -431,7 +483,7 @@ pub async fn discover_connection_catalog(
     let mut service = connect_connection(
         &target,
         &runtime_config,
-        &destination,
+        client,
         credential,
         Some(response_budget.clone()),
     )
@@ -459,6 +511,457 @@ pub async fn discover_connection_catalog(
         });
     }
     Ok(catalog)
+}
+
+/// Verifies a managed MCP endpoint without publishing discovery metadata.
+///
+/// The probe initializes one RMCP session, requests at most one advertised
+/// metadata page, and closes the session. Tools take precedence over resources;
+/// pagination cursors are deliberately ignored. The probe never publishes
+/// metadata, calls a tool, or reads a resource.
+pub async fn probe_connection_protocol_before(
+    runtime: &ConnectionHttpRuntime,
+    connection_id: &str,
+    expected_connection_etag: &str,
+    hard_deadline: tokio::time::Instant,
+) -> Result<(), ConnectionProtocolProbeError> {
+    let target = runtime
+        .mcp_test_target(connection_id, expected_connection_etag)
+        .map_err(|error| {
+            protocol_probe_connection_error(error, ConnectionTestStageName::ProtocolValid)
+        })?;
+    let Some(target) = target else {
+        return Err(ConnectionProtocolProbeError::new(
+            ConnectionTestStageName::ProtocolValid,
+            ConnectionTestReason::ConnectionChanged,
+            ConnectionStatusReason::RequestFailed,
+        ));
+    };
+
+    let runtime_config = McpUpstreamRuntimeConfig::from_connection_target(&target);
+    let operation_deadline =
+        protocol_probe_operation_deadline(runtime_config.timeout, hard_deadline)?;
+    let checked = tokio::time::timeout_at(
+        operation_deadline,
+        target.preflight_client().checked_destination(target.url()),
+    )
+    .await
+    .map_err(|_| protocol_probe_timeout(ConnectionTestStageName::EgressPolicy))?
+    .map_err(|error| protocol_probe_egress_error(&error))?;
+    let prepared = tokio::time::timeout_at(
+        operation_deadline,
+        runtime.prepare_transport(&target, &checked),
+    )
+    .await
+    .map_err(|_| protocol_probe_timeout(ConnectionTestStageName::SecretAvailable))?
+    .map_err(|error| {
+        protocol_probe_connection_error(error, ConnectionTestStageName::SecretAvailable)
+    })?;
+    let client = prepared
+        .client()
+        .mcp_reqwest_client_at_checked_destination(prepared.destination(), target.url())
+        .map_err(|error| protocol_probe_egress_error(&error))?;
+    let credential =
+        tokio::time::timeout_at(operation_deadline, runtime.resolve_credential(&target))
+            .await
+            .map_err(|_| protocol_probe_timeout(ConnectionTestStageName::SecretAvailable))?
+            .map_err(|error| {
+                protocol_probe_connection_error(error, ConnectionTestStageName::SecretAvailable)
+            })?
+            .map(Arc::new);
+    run_bounded_protocol_probe(
+        target.connection_id().as_str().to_owned(),
+        target.url().to_owned(),
+        runtime_config,
+        client,
+        ManagedMcpAuthentication {
+            credential,
+            credential_header_name: target.credential_header_name().cloned(),
+        },
+        operation_deadline,
+        hard_deadline,
+    )
+    .await
+}
+
+fn protocol_probe_operation_deadline(
+    configured_timeout: Duration,
+    hard_deadline: tokio::time::Instant,
+) -> Result<tokio::time::Instant, ConnectionProtocolProbeError> {
+    let now = tokio::time::Instant::now();
+    let remaining = hard_deadline.saturating_duration_since(now);
+    let Some(operation_budget) = remaining.checked_sub(PROTOCOL_PROBE_CLEANUP_RESERVE) else {
+        return Err(protocol_probe_timeout(ConnectionTestStageName::Connected));
+    };
+    if operation_budget.is_zero() {
+        return Err(protocol_probe_timeout(ConnectionTestStageName::Connected));
+    }
+    Ok(now + configured_timeout.min(operation_budget))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_bounded_protocol_probe(
+    server_name: String,
+    url: String,
+    runtime_config: McpUpstreamRuntimeConfig,
+    client: rmcp_http::Client,
+    managed_authentication: ManagedMcpAuthentication,
+    operation_deadline: tokio::time::Instant,
+    hard_deadline: tokio::time::Instant,
+) -> Result<(), ConnectionProtocolProbeError> {
+    let control = ProtocolProbeTransportControl::new(operation_deadline);
+    let worker_control = control.clone();
+    let worker = tokio::spawn(async move {
+        run_protocol_probe_worker(
+            server_name,
+            url,
+            runtime_config,
+            client,
+            managed_authentication,
+            worker_control,
+        )
+        .await
+    });
+    ProtocolProbeWorkerGuard::new(worker, control)
+        .finish_before(hard_deadline)
+        .await
+}
+
+async fn run_protocol_probe_worker(
+    server_name: String,
+    url: String,
+    runtime_config: McpUpstreamRuntimeConfig,
+    client: rmcp_http::Client,
+    managed_authentication: ManagedMcpAuthentication,
+    control: ProtocolProbeTransportControl,
+) -> Result<(), ConnectionProtocolProbeError> {
+    let response_budget = DiscoveryResponseByteBudget::new(MAX_DISCOVERY_RESPONSE_BYTES);
+    let connect_result = tokio::time::timeout_at(
+        control.deadline(),
+        connect_endpoint_with_client(
+            &server_name,
+            &url,
+            &runtime_config,
+            client,
+            Some(managed_authentication),
+            Some(response_budget.clone()),
+            Some(control.clone()),
+        ),
+    )
+    .await;
+    let mut service = match connect_result {
+        Ok(Ok(service)) => service,
+        Ok(Err(error)) => {
+            return Err(protocol_probe_mcp_error(
+                error,
+                ConnectionTestStageName::Connected,
+            ));
+        }
+        Err(_) => {
+            let error = protocol_probe_timeout(ConnectionTestStageName::Connected);
+            control.record_failure(error);
+            return Err(error);
+        }
+    };
+
+    let page_result = tokio::time::timeout_at(
+        control.deadline(),
+        probe_one_advertised_metadata_page(&mut service),
+    )
+    .await
+    .map_err(|_| protocol_probe_timeout(ConnectionTestStageName::ProtocolValid))
+    .and_then(|result| {
+        result.map_err(|error| {
+            protocol_probe_mcp_error(error, ConnectionTestStageName::ProtocolValid)
+        })
+    });
+    if let Err(error) = page_result {
+        control.record_failure(error);
+    }
+    let common_get_result = if page_result.is_ok() {
+        control.wait_for_common_get().await
+    } else {
+        Ok(())
+    };
+    let close_result = service.close().await.map(Some);
+    drop(service);
+    let response_budget_result = response_budget
+        .seal()
+        .map_err(|error| protocol_probe_mcp_error(error, ConnectionTestStageName::ProtocolValid));
+
+    if let Some(error) = control.failure() {
+        return Err(error);
+    }
+    response_budget_result?;
+    page_result?;
+    common_get_result?;
+    if !discovery_shutdown_completed_cleanly(&close_result) {
+        return Err(ConnectionProtocolProbeError::new(
+            ConnectionTestStageName::ProtocolValid,
+            ConnectionTestReason::ProtocolError,
+            ConnectionStatusReason::InvalidResponse,
+        ));
+    }
+    Ok(())
+}
+
+struct ProtocolProbeWorkerGuard {
+    handle: Option<tokio::task::JoinHandle<Result<(), ConnectionProtocolProbeError>>>,
+    control: ProtocolProbeTransportControl,
+}
+
+impl ProtocolProbeWorkerGuard {
+    fn new(
+        handle: tokio::task::JoinHandle<Result<(), ConnectionProtocolProbeError>>,
+        control: ProtocolProbeTransportControl,
+    ) -> Self {
+        Self {
+            handle: Some(handle),
+            control,
+        }
+    }
+
+    async fn finish_before(
+        mut self,
+        hard_deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectionProtocolProbeError> {
+        let Some(handle) = self.handle.as_mut() else {
+            return Err(protocol_probe_internal_error());
+        };
+        let joined = tokio::time::timeout_at(hard_deadline, handle).await;
+        match joined {
+            Ok(Ok(result)) => {
+                self.handle.take();
+                self.control.wait_for_idle_io().await;
+                result
+            }
+            Ok(Err(_)) => {
+                self.handle.take();
+                self.control.wait_for_idle_io().await;
+                Err(protocol_probe_internal_error())
+            }
+            Err(_) => {
+                self.control.cancel();
+                if let Some(handle) = self.handle.take() {
+                    handle.abort();
+                    let _ = handle.await;
+                }
+                self.control.wait_for_idle_io().await;
+                Err(protocol_probe_timeout(
+                    ConnectionTestStageName::ProtocolValid,
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for ProtocolProbeWorkerGuard {
+    fn drop(&mut self) {
+        self.control.cancel();
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ProtocolProbeTransportControl {
+    state: Arc<ProtocolProbeTransportState>,
+}
+
+struct ProtocolProbeTransportState {
+    deadline: tokio::time::Instant,
+    cancellation: tokio_util::sync::CancellationToken,
+    failure: Mutex<Option<ConnectionProtocolProbeError>>,
+    common_get_expected: AtomicBool,
+    common_get_completed: AtomicBool,
+    common_get_notify: tokio::sync::Notify,
+    active_io: AtomicUsize,
+    idle_io_notify: tokio::sync::Notify,
+}
+
+impl ProtocolProbeTransportControl {
+    fn new(deadline: tokio::time::Instant) -> Self {
+        Self {
+            state: Arc::new(ProtocolProbeTransportState {
+                deadline,
+                cancellation: tokio_util::sync::CancellationToken::new(),
+                failure: Mutex::new(None),
+                common_get_expected: AtomicBool::new(false),
+                common_get_completed: AtomicBool::new(false),
+                common_get_notify: tokio::sync::Notify::new(),
+                active_io: AtomicUsize::new(0),
+                idle_io_notify: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+
+    fn deadline(&self) -> tokio::time::Instant {
+        self.state.deadline
+    }
+
+    fn cancellation(&self) -> &tokio_util::sync::CancellationToken {
+        &self.state.cancellation
+    }
+
+    fn cancel(&self) {
+        self.state.cancellation.cancel();
+    }
+
+    fn record_failure(&self, error: ConnectionProtocolProbeError) {
+        let mut failure = match self.state.failure.lock() {
+            Ok(failure) => failure,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if failure.is_none() {
+            *failure = Some(error);
+        }
+    }
+
+    fn failure(&self) -> Option<ConnectionProtocolProbeError> {
+        match self.state.failure.lock() {
+            Ok(failure) => *failure,
+            Err(_) => Some(protocol_probe_internal_error()),
+        }
+    }
+
+    fn record_limited_error(&self, error: &LimitedMcpHttpError) {
+        let error = match error {
+            LimitedMcpHttpError::Http("http_timeout") => {
+                protocol_probe_timeout(ConnectionTestStageName::ProtocolValid)
+            }
+            LimitedMcpHttpError::Http(category) => ConnectionProtocolProbeError::new(
+                ConnectionTestStageName::ProtocolValid,
+                protocol_probe_http_reason(category),
+                ConnectionStatusReason::RequestFailed,
+            ),
+            LimitedMcpHttpError::Connection(error) => {
+                protocol_probe_connection_error(*error, ConnectionTestStageName::ProtocolValid)
+            }
+            LimitedMcpHttpError::AuthenticationRejected => ConnectionProtocolProbeError::new(
+                ConnectionTestStageName::Authenticated,
+                ConnectionTestReason::AuthenticationFailed,
+                ConnectionStatusReason::InvalidResponse,
+            ),
+            LimitedMcpHttpError::RequestBodyTooLarge { .. } => ConnectionProtocolProbeError::new(
+                ConnectionTestStageName::ProtocolValid,
+                ConnectionTestReason::RequestBodyTooLarge,
+                ConnectionStatusReason::RequestFailed,
+            ),
+            LimitedMcpHttpError::ResponseTooLarge { .. }
+            | LimitedMcpHttpError::DiscoveryResponseTooLarge { .. } => {
+                ConnectionProtocolProbeError::new(
+                    ConnectionTestStageName::ProtocolValid,
+                    ConnectionTestReason::ResponseTooLarge,
+                    ConnectionStatusReason::InvalidResponse,
+                )
+            }
+            LimitedMcpHttpError::Serialize(_) => ConnectionProtocolProbeError::new(
+                ConnectionTestStageName::ProtocolValid,
+                ConnectionTestReason::ProtocolError,
+                ConnectionStatusReason::InvalidResponse,
+            ),
+        };
+        self.record_failure(error);
+    }
+
+    fn observe_streamable_error(&self, error: &StreamableHttpError<LimitedMcpHttpError>) {
+        match error {
+            StreamableHttpError::ServerDoesNotSupportSse
+            | StreamableHttpError::ServerDoesNotSupportDeleteSession => {}
+            StreamableHttpError::Client(error) => self.record_limited_error(error),
+            _ => self.record_failure(ConnectionProtocolProbeError::new(
+                ConnectionTestStageName::ProtocolValid,
+                ConnectionTestReason::ProtocolError,
+                ConnectionStatusReason::InvalidResponse,
+            )),
+        }
+    }
+
+    fn expect_common_get(&self) {
+        self.state
+            .common_get_expected
+            .store(true, Ordering::Release);
+    }
+
+    fn complete_common_get(&self) {
+        self.state
+            .common_get_completed
+            .store(true, Ordering::Release);
+        self.state.common_get_notify.notify_waiters();
+    }
+
+    async fn wait_for_common_get(&self) -> Result<(), ConnectionProtocolProbeError> {
+        if !self.state.common_get_expected.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        loop {
+            let notified = self.state.common_get_notify.notified();
+            if self.state.common_get_completed.load(Ordering::Acquire) {
+                return self.failure().map_or(Ok(()), Err);
+            }
+            tokio::select! {
+                _ = self.cancellation().cancelled() => {
+                    return Err(protocol_probe_timeout(ConnectionTestStageName::ProtocolValid));
+                }
+                _ = tokio::time::sleep_until(self.deadline()) => {
+                    let error = protocol_probe_timeout(ConnectionTestStageName::ProtocolValid);
+                    self.record_failure(error);
+                    return Err(error);
+                }
+                _ = notified => {}
+            }
+        }
+    }
+
+    fn begin_io(&self) -> ProtocolProbeIoGuard {
+        self.state.active_io.fetch_add(1, Ordering::AcqRel);
+        ProtocolProbeIoGuard {
+            control: self.clone(),
+        }
+    }
+
+    async fn wait_for_idle_io(&self) {
+        loop {
+            let notified = self.state.idle_io_notify.notified();
+            if self.state.active_io.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct ProtocolProbeIoGuard {
+    control: ProtocolProbeTransportControl,
+}
+
+impl Drop for ProtocolProbeIoGuard {
+    fn drop(&mut self) {
+        if self.control.state.active_io.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.control.state.idle_io_notify.notify_waiters();
+        }
+    }
+}
+
+fn protocol_probe_http_reason(category: &str) -> ConnectionTestReason {
+    match category {
+        "http_timeout" => ConnectionTestReason::HttpTimeout,
+        "http_connect" => ConnectionTestReason::HttpConnect,
+        "http_request" => ConnectionTestReason::HttpRequest,
+        "http_body" => ConnectionTestReason::HttpBody,
+        "http_decode" => ConnectionTestReason::HttpDecode,
+        "http_status" => ConnectionTestReason::HttpStatus,
+        _ => ConnectionTestReason::HttpOther,
+    }
+}
+
+fn protocol_probe_internal_error() -> ConnectionProtocolProbeError {
+    ConnectionProtocolProbeError::new(
+        ConnectionTestStageName::ProtocolValid,
+        ConnectionTestReason::InternalError,
+        ConnectionStatusReason::RequestFailed,
+    )
 }
 
 fn discovery_shutdown_completed_cleanly<E>(close_result: &Result<Option<QuitReason>, E>) -> bool {
@@ -490,18 +993,14 @@ pub async fn call_connection_tool(
     };
     let request = CallToolRequestParams::new(remote_tool_name.to_owned()).with_arguments(arguments);
     enforce_mcp_call_request_size_before_egress(&request, runtime_config.max_request_body_bytes)?;
-    let destination = target
-        .client()
-        .checked_destination(target.url())
-        .await
-        .map_err(|_| McpUpstreamCallError::EgressRejected)?;
+    let client = managed_mcp_http_client(runtime, &target).await?;
     let credential = runtime
         .resolve_credential(&target)
         .await
         .map_err(connection_mcp_error)?
         .map(Arc::new);
     let mut service =
-        connect_connection(&target, &runtime_config, &destination, credential, None).await?;
+        connect_connection(&target, &runtime_config, client, credential, None).await?;
     let result = service
         .call_tool(request)
         .await
@@ -514,6 +1013,284 @@ fn connection_mcp_error(error: ConnectionHttpError) -> McpUpstreamCallError {
     McpUpstreamCallError::Connection {
         reason: error.safe_reason(),
     }
+}
+
+async fn managed_mcp_http_client(
+    runtime: &ConnectionHttpRuntime,
+    target: &ConnectionHttpTarget,
+) -> Result<rmcp_http::Client, McpUpstreamCallError> {
+    let checked = target
+        .preflight_client()
+        .checked_destination(target.url())
+        .await
+        .map_err(|_| McpUpstreamCallError::EgressRejected)?;
+    let prepared = runtime
+        .prepare_transport(target, &checked)
+        .await
+        .map_err(connection_mcp_error)?;
+    prepared
+        .client()
+        .mcp_reqwest_client_at_checked_destination(prepared.destination(), target.url())
+        .map_err(|_| McpUpstreamCallError::EgressRejected)
+}
+
+fn protocol_probe_timeout(stage: ConnectionTestStageName) -> ConnectionProtocolProbeError {
+    ConnectionProtocolProbeError::new(
+        stage,
+        ConnectionTestReason::DeadlineExceeded,
+        ConnectionStatusReason::RequestFailed,
+    )
+}
+
+fn protocol_probe_egress_error(error: &EgressError) -> ConnectionProtocolProbeError {
+    let reason = match error.safe_category() {
+        "host_not_allowed" => ConnectionTestReason::HostNotAllowed,
+        "port_not_allowed" => ConnectionTestReason::PortNotAllowed,
+        "non_global_ip_blocked" => ConnectionTestReason::NonGlobalIpBlocked,
+        "invalid_policy" => ConnectionTestReason::InvalidPolicy,
+        "dns_resolution_failed" => ConnectionTestReason::DnsResolutionFailed,
+        "invalid_url" => ConnectionTestReason::InvalidUrl,
+        "scheme_not_allowed" => ConnectionTestReason::SchemeNotAllowed,
+        "request_body_too_large" => ConnectionTestReason::RequestBodyTooLarge,
+        "request_body_read_failed" => ConnectionTestReason::RequestBodyReadFailed,
+        "unexpected_status" => ConnectionTestReason::UnexpectedStatus,
+        "response_too_large" => ConnectionTestReason::ResponseTooLarge,
+        "response_idle_timeout" => ConnectionTestReason::ResponseIdleTimeout,
+        "invalid_tls_ca_bundle" => ConnectionTestReason::InvalidTlsCaBundle,
+        "invalid_tls_client_identity" => ConnectionTestReason::InvalidTlsClientIdentity,
+        "http_timeout" => ConnectionTestReason::HttpTimeout,
+        "http_connect" => ConnectionTestReason::HttpConnect,
+        "http_request" => ConnectionTestReason::HttpRequest,
+        "http_body" => ConnectionTestReason::HttpBody,
+        "http_decode" => ConnectionTestReason::HttpDecode,
+        "http_status" => ConnectionTestReason::HttpStatus,
+        "http_other" => ConnectionTestReason::HttpOther,
+        _ => ConnectionTestReason::InternalError,
+    };
+    ConnectionProtocolProbeError::new(
+        ConnectionTestStageName::EgressPolicy,
+        reason,
+        ConnectionStatusReason::EgressDenied,
+    )
+}
+
+fn protocol_probe_connection_error(
+    error: ConnectionHttpError,
+    default_stage: ConnectionTestStageName,
+) -> ConnectionProtocolProbeError {
+    let (stage, reason, status_reason) = match error {
+        ConnectionHttpError::InvalidConnectionId
+        | ConnectionHttpError::ConnectionNotFound
+        | ConnectionHttpError::ConnectionDisabled => (
+            default_stage,
+            ConnectionTestReason::ConnectionChanged,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        ConnectionHttpError::WrongConnectionKind => (
+            default_stage,
+            ConnectionTestReason::ConnectionKindMismatch,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        ConnectionHttpError::UnsupportedAuthentication => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::AuthenticationNotSupported,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::TlsInvalid => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::TlsInvalid,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::TlsUnavailable => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::TlsUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::InvalidTargetPath => (
+            default_stage,
+            ConnectionTestReason::TestProfileNotConfigured,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        ConnectionHttpError::CredentialHeaderConflict | ConnectionHttpError::CredentialInvalid => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::CredentialInvalid,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::CredentialUnavailable => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::CredentialUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::OAuthTokenEgressDenied => (
+            ConnectionTestStageName::EgressPolicy,
+            ConnectionTestReason::OauthTokenEgressDenied,
+            ConnectionStatusReason::EgressDenied,
+        ),
+        ConnectionHttpError::OAuthTokenUnavailable => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::OAuthTokenRejected => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenRejected,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::OAuthTokenInvalidResponse => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenInvalidResponse,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::UpstreamAuthenticationRejected => (
+            ConnectionTestStageName::Authenticated,
+            ConnectionTestReason::AuthenticationFailed,
+            ConnectionStatusReason::InvalidResponse,
+        ),
+        ConnectionHttpError::TransportUnavailable => (
+            default_stage,
+            ConnectionTestReason::TransportUnavailable,
+            ConnectionStatusReason::RequestFailed,
+        ),
+    };
+    ConnectionProtocolProbeError::new(stage, reason, status_reason)
+}
+
+fn protocol_probe_mcp_error(
+    error: McpUpstreamCallError,
+    default_stage: ConnectionTestStageName,
+) -> ConnectionProtocolProbeError {
+    match error {
+        McpUpstreamCallError::EgressRejected => ConnectionProtocolProbeError::new(
+            ConnectionTestStageName::EgressPolicy,
+            ConnectionTestReason::InvalidPolicy,
+            ConnectionStatusReason::EgressDenied,
+        ),
+        McpUpstreamCallError::ClientBuild => ConnectionProtocolProbeError::new(
+            ConnectionTestStageName::Connected,
+            ConnectionTestReason::TransportUnavailable,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        McpUpstreamCallError::Connect => ConnectionProtocolProbeError::new(
+            ConnectionTestStageName::Connected,
+            ConnectionTestReason::HttpConnect,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        McpUpstreamCallError::AuthenticationRejected => ConnectionProtocolProbeError::new(
+            ConnectionTestStageName::Authenticated,
+            ConnectionTestReason::AuthenticationFailed,
+            ConnectionStatusReason::InvalidResponse,
+        ),
+        McpUpstreamCallError::Connection { reason } => {
+            protocol_probe_connection_reason(reason, default_stage)
+        }
+        McpUpstreamCallError::RequestBodyTooLarge { .. } => ConnectionProtocolProbeError::new(
+            default_stage,
+            ConnectionTestReason::RequestBodyTooLarge,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        McpUpstreamCallError::ResponseTooLarge { .. }
+        | McpUpstreamCallError::DiscoveryResponseLimitExceeded { .. } => {
+            ConnectionProtocolProbeError::new(
+                default_stage,
+                ConnectionTestReason::ResponseTooLarge,
+                ConnectionStatusReason::InvalidResponse,
+            )
+        }
+        McpUpstreamCallError::Call
+        | McpUpstreamCallError::DiscoveryPageLimitExceeded { .. }
+        | McpUpstreamCallError::DiscoveryToolLimitExceeded { .. }
+        | McpUpstreamCallError::DiscoveryResourceLimitExceeded { .. }
+        | McpUpstreamCallError::DiscoveryResourceTemplateLimitExceeded { .. }
+        | McpUpstreamCallError::DiscoveryCapabilityLimitExceeded { .. }
+        | McpUpstreamCallError::InvalidDiscoveryMetadata => ConnectionProtocolProbeError::new(
+            default_stage,
+            ConnectionTestReason::ProtocolError,
+            ConnectionStatusReason::InvalidResponse,
+        ),
+    }
+}
+
+fn protocol_probe_connection_reason(
+    reason: &'static str,
+    default_stage: ConnectionTestStageName,
+) -> ConnectionProtocolProbeError {
+    let error = match reason {
+        "connection_changed"
+        | "catalog_stale"
+        | "connection_not_found"
+        | "invalid_connection_id"
+        | "connection_disabled" => (
+            default_stage,
+            ConnectionTestReason::ConnectionChanged,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        "connection_kind_mismatch" => (
+            default_stage,
+            ConnectionTestReason::ConnectionKindMismatch,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        "authentication_not_supported" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::AuthenticationNotSupported,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "tls_invalid" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::TlsInvalid,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "tls_unavailable" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::TlsUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "credential_invalid" | "credential_header_conflict" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::CredentialInvalid,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "credential_unavailable" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::CredentialUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "oauth_token_egress_denied" => (
+            ConnectionTestStageName::EgressPolicy,
+            ConnectionTestReason::OauthTokenEgressDenied,
+            ConnectionStatusReason::EgressDenied,
+        ),
+        "oauth_token_unavailable" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "oauth_token_rejected" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenRejected,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "oauth_token_invalid_response" => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenInvalidResponse,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        "auth_failed" => (
+            ConnectionTestStageName::Authenticated,
+            ConnectionTestReason::AuthenticationFailed,
+            ConnectionStatusReason::InvalidResponse,
+        ),
+        "transport_unavailable" => (
+            default_stage,
+            ConnectionTestReason::TransportUnavailable,
+            ConnectionStatusReason::RequestFailed,
+        ),
+        _ => (
+            default_stage,
+            ConnectionTestReason::InternalError,
+            ConnectionStatusReason::RequestFailed,
+        ),
+    };
+    ConnectionProtocolProbeError::new(error.0, error.1, error.2)
 }
 
 fn enforce_mcp_call_request_size_before_egress(
@@ -575,6 +1352,42 @@ async fn list_tools_with_limits(
 ) -> Result<Vec<Tool>, McpUpstreamCallError> {
     let mut budget = DiscoveryPageBudget::new();
     list_tools_with_limits_and_budget(service, &mut budget).await
+}
+
+async fn probe_one_advertised_metadata_page(
+    service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> Result<(), McpUpstreamCallError> {
+    let (supports_tools, supports_resources) = service
+        .peer_info()
+        .map(|info| {
+            (
+                info.capabilities.tools.is_some(),
+                info.capabilities.resources.is_some(),
+            )
+        })
+        .unwrap_or((false, false));
+    if supports_tools {
+        let result = service
+            .list_tools(Some(PaginatedRequestParams::default()))
+            .await
+            .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+        if result.tools.len() > MAX_DISCOVERY_TOOLS_PER_UPSTREAM {
+            return Err(McpUpstreamCallError::DiscoveryToolLimitExceeded {
+                max: MAX_DISCOVERY_TOOLS_PER_UPSTREAM,
+            });
+        }
+    } else if supports_resources {
+        let result = service
+            .list_resources(Some(PaginatedRequestParams::default()))
+            .await
+            .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+        if result.resources.len() > MAX_DISCOVERY_RESOURCES_PER_UPSTREAM {
+            return Err(McpUpstreamCallError::DiscoveryResourceLimitExceeded {
+                max: MAX_DISCOVERY_RESOURCES_PER_UPSTREAM,
+            });
+        }
+    }
+    Ok(())
 }
 
 struct RawMcpDiscoveredCatalog {
@@ -792,23 +1605,21 @@ async fn connect(
 async fn connect_connection(
     target: &ConnectionHttpTarget,
     runtime_config: &McpUpstreamRuntimeConfig,
-    destination: &CheckedEgressDestination,
+    client: rmcp_http::Client,
     credential: Option<Arc<ResolvedConnectionCredential>>,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
-    connect_endpoint(
+    connect_endpoint_with_client(
         target.connection_id().as_str(),
         target.url(),
-        runtime_config.timeout,
-        runtime_config.response_idle_timeout,
-        runtime_config.connect_timeout,
         runtime_config,
-        destination,
+        client,
         Some(ManagedMcpAuthentication {
             credential,
             credential_header_name: target.credential_header_name().cloned(),
         }),
         discovery_response_budget,
+        None,
     )
     .await
 }
@@ -831,13 +1642,41 @@ async fn connect_endpoint(
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
     let client = mcp_http_client(timeout, response_idle_timeout, connect_timeout, destination)?;
+    connect_endpoint_with_client(
+        server_name,
+        url,
+        runtime_config,
+        client,
+        managed_authentication,
+        discovery_response_budget,
+        None,
+    )
+    .await
+}
+
+async fn connect_endpoint_with_client(
+    server_name: &str,
+    url: &str,
+    runtime_config: &McpUpstreamRuntimeConfig,
+    client: rmcp_http::Client,
+    managed_authentication: Option<ManagedMcpAuthentication>,
+    discovery_response_budget: Option<DiscoveryResponseByteBudget>,
+    protocol_probe_control: Option<ProtocolProbeTransportControl>,
+) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
     let mut client = LimitedMcpHttpClient::new(
         client,
         runtime_config.max_request_body_bytes,
         runtime_config.max_response_bytes,
     );
+    if managed_authentication.is_some() {
+        client = client
+            .with_transport_timeouts(runtime_config.timeout, runtime_config.response_idle_timeout);
+    }
     if let Some(discovery_response_budget) = discovery_response_budget {
         client = client.with_discovery_response_budget(discovery_response_budget);
+    }
+    if let Some(protocol_probe_control) = protocol_probe_control.as_ref() {
+        client = client.with_protocol_probe_control(protocol_probe_control.clone());
     }
     let client = if let Some(authentication) = managed_authentication {
         client.with_connection_credential(
@@ -847,10 +1686,12 @@ async fn connect_endpoint(
     } else {
         client
     };
-    let transport = StreamableHttpClientTransport::with_client(
-        client,
-        StreamableHttpClientTransportConfig::with_uri(url.to_owned()),
-    );
+    let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url.to_owned());
+    if protocol_probe_control.is_some() {
+        transport_config.retry_config = Arc::new(NeverRetry::default());
+        transport_config = transport_config.reinit_on_expired_session(false);
+    }
+    let transport = StreamableHttpClientTransport::with_client(client, transport_config);
 
     let started = Instant::now();
     let result = rmcp::serve_client((), transport).await;
@@ -867,13 +1708,13 @@ fn mcp_http_client(
     response_idle_timeout: Duration,
     connect_timeout: Duration,
     destination: &CheckedEgressDestination,
-) -> Result<rmcp_reqwest::Client, McpUpstreamCallError> {
-    rmcp_reqwest::Client::builder()
+) -> Result<rmcp_http::Client, McpUpstreamCallError> {
+    rmcp_http::Client::builder()
         .no_proxy()
         .timeout(timeout)
         .read_timeout(response_idle_timeout)
         .connect_timeout(connect_timeout)
-        .redirect(rmcp_reqwest::redirect::Policy::none())
+        .redirect(rmcp_http::redirect::Policy::none())
         .resolve(&destination.host, destination.pinned_addr)
         .build()
         .map_err(|_| McpUpstreamCallError::ClientBuild)
@@ -955,10 +1796,13 @@ impl DiscoveryResponseByteBudget {
 
 #[derive(Clone)]
 struct LimitedMcpHttpClient {
-    inner: rmcp_reqwest::Client,
+    inner: rmcp_http::Client,
     max_request_body_bytes: usize,
     max_response_bytes: usize,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
+    request_timeout: Option<Duration>,
+    response_idle_timeout: Option<Duration>,
+    protocol_probe_control: Option<ProtocolProbeTransportControl>,
     managed_connection: bool,
     connection_credential: Option<Arc<ResolvedConnectionCredential>>,
     credential_header_name: Option<HeaderName>,
@@ -966,7 +1810,7 @@ struct LimitedMcpHttpClient {
 
 impl LimitedMcpHttpClient {
     fn new(
-        inner: rmcp_reqwest::Client,
+        inner: rmcp_http::Client,
         max_request_body_bytes: usize,
         max_response_bytes: usize,
     ) -> Self {
@@ -975,6 +1819,9 @@ impl LimitedMcpHttpClient {
             max_request_body_bytes,
             max_response_bytes,
             discovery_response_budget: None,
+            request_timeout: None,
+            response_idle_timeout: None,
+            protocol_probe_control: None,
             managed_connection: false,
             connection_credential: None,
             credential_header_name: None,
@@ -986,6 +1833,24 @@ impl LimitedMcpHttpClient {
         discovery_response_budget: DiscoveryResponseByteBudget,
     ) -> Self {
         self.discovery_response_budget = Some(discovery_response_budget);
+        self
+    }
+
+    fn with_transport_timeouts(
+        mut self,
+        request_timeout: Duration,
+        response_idle_timeout: Duration,
+    ) -> Self {
+        self.request_timeout = Some(request_timeout);
+        self.response_idle_timeout = Some(response_idle_timeout);
+        self
+    }
+
+    fn with_protocol_probe_control(
+        mut self,
+        protocol_probe_control: ProtocolProbeTransportControl,
+    ) -> Self {
+        self.protocol_probe_control = Some(protocol_probe_control);
         self
     }
 
@@ -1002,8 +1867,8 @@ impl LimitedMcpHttpClient {
 
     fn apply_connection_credential(
         &self,
-        builder: rmcp_reqwest::RequestBuilder,
-    ) -> Result<rmcp_reqwest::RequestBuilder, StreamableHttpError<LimitedMcpHttpError>> {
+        builder: rmcp_http::RequestBuilder,
+    ) -> Result<rmcp_http::RequestBuilder, StreamableHttpError<LimitedMcpHttpError>> {
         let Some(credential) = self.connection_credential.as_ref() else {
             return Ok(builder);
         };
@@ -1016,8 +1881,8 @@ impl LimitedMcpHttpClient {
 
     async fn reject_connection_authentication(
         &self,
-        response: rmcp_reqwest::Response,
-    ) -> Result<rmcp_reqwest::Response, StreamableHttpError<LimitedMcpHttpError>> {
+        response: rmcp_http::Response,
+    ) -> Result<rmcp_http::Response, StreamableHttpError<LimitedMcpHttpError>> {
         if self.managed_connection
             && matches!(
                 response.status(),
@@ -1038,6 +1903,62 @@ impl LimitedMcpHttpClient {
             ));
         }
         Ok(response)
+    }
+
+    async fn send_request(
+        &self,
+        request: rmcp_http::RequestBuilder,
+    ) -> Result<
+        (rmcp_http::Response, Option<tokio::time::Instant>),
+        StreamableHttpError<LimitedMcpHttpError>,
+    > {
+        let request_deadline = self
+            .request_timeout
+            .map(|timeout| tokio::time::Instant::now() + timeout);
+        let deadline = match (
+            request_deadline,
+            self.protocol_probe_control
+                .as_ref()
+                .map(ProtocolProbeTransportControl::deadline),
+        ) {
+            (Some(request_deadline), Some(probe_deadline)) => {
+                Some(request_deadline.min(probe_deadline))
+            }
+            (Some(request_deadline), None) => Some(request_deadline),
+            (None, Some(probe_deadline)) => Some(probe_deadline),
+            (None, None) => None,
+        };
+        let result = match (deadline, self.protocol_probe_control.as_ref()) {
+            (Some(deadline), Some(control)) => {
+                let _io_guard = control.begin_io();
+                tokio::select! {
+                    biased;
+                    _ = control.cancellation().cancelled() => Err(mcp_timeout_error()),
+                    result = tokio::time::timeout_at(deadline, request.send()) => {
+                        result
+                            .map_err(|_| mcp_timeout_error())
+                            .and_then(|result| result.map_err(mcp_http_error))
+                    }
+                }
+            }
+            (Some(deadline), None) => tokio::time::timeout_at(deadline, request.send())
+                .await
+                .map_err(|_| mcp_timeout_error())
+                .and_then(|result| result.map_err(mcp_http_error)),
+            (None, Some(control)) => {
+                let _io_guard = control.begin_io();
+                tokio::select! {
+                    biased;
+                    _ = control.cancellation().cancelled() => Err(mcp_timeout_error()),
+                    result = request.send() => result.map_err(mcp_http_error),
+                }
+            }
+            (None, None) => request.send().await.map_err(mcp_http_error),
+        };
+        if let (Some(control), Err(error)) = (self.protocol_probe_control.as_ref(), &result) {
+            control.observe_streamable_error(error);
+        }
+        result.map(|response| (response, deadline))
     }
 }
 
@@ -1096,8 +2017,8 @@ impl Error for LimitedMcpHttpError {
     }
 }
 
-impl From<rmcp_reqwest::Error> for LimitedMcpHttpError {
-    fn from(error: rmcp_reqwest::Error) -> Self {
+impl From<rmcp_http::Error> for LimitedMcpHttpError {
+    fn from(error: rmcp_http::Error) -> Self {
         Self::Http(mcp_http_error_category(&error))
     }
 }
@@ -1119,42 +2040,69 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
-        let mut request_builder = self
-            .inner
-            .get(uri.as_ref())
-            .header(ACCEPT, [EVENT_STREAM_MIME, JSON_MIME].join(", "))
-            .header(HEADER_SESSION_ID, session_id.as_ref());
-        if let Some(last_event_id) = last_event_id {
-            request_builder = request_builder.header(HEADER_LAST_EVENT_ID, last_event_id);
-        }
-        if !self.managed_connection {
-            if let Some(auth_header) = auth_token {
-                request_builder = request_builder.bearer_auth(auth_header);
+        let result = async {
+            let mut request_builder = self
+                .inner
+                .get(uri.as_ref())
+                .header(ACCEPT, [EVENT_STREAM_MIME, JSON_MIME].join(", "))
+                .header(HEADER_SESSION_ID, session_id.as_ref());
+            if let Some(last_event_id) = last_event_id {
+                request_builder = request_builder.header(HEADER_LAST_EVENT_ID, last_event_id);
             }
-        }
-        request_builder = apply_mcp_custom_headers(
-            request_builder,
-            custom_headers,
-            self.credential_header_name.as_ref(),
-            self.managed_connection,
-        )?;
-        request_builder = self.apply_connection_credential(request_builder)?;
-        let response = request_builder.send().await.map_err(mcp_http_error)?;
-        let response = self.reject_connection_authentication(response).await?;
-        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
-            return Err(StreamableHttpError::ServerDoesNotSupportSse);
-        }
-        let response = response.error_for_status().map_err(mcp_http_error)?;
-        validate_mcp_response_content_type(&response)?;
-        enforce_mcp_response_content_length(&response, self.max_response_bytes)?;
+            if !self.managed_connection {
+                if let Some(auth_header) = auth_token {
+                    request_builder = request_builder.bearer_auth(auth_header);
+                }
+            }
+            request_builder = apply_mcp_custom_headers(
+                request_builder,
+                custom_headers,
+                self.credential_header_name.as_ref(),
+                self.managed_connection,
+            )?;
+            request_builder = self.apply_connection_credential(request_builder)?;
+            let (response, deadline) = self.send_request(request_builder).await?;
+            let response = self.reject_connection_authentication(response).await?;
+            if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+                return Err(StreamableHttpError::ServerDoesNotSupportSse);
+            }
+            let response = response.error_for_status().map_err(mcp_http_error)?;
+            validate_mcp_response_content_type(&response)?;
+            enforce_mcp_response_content_length(&response, self.max_response_bytes)?;
 
-        let event_stream = SseStream::from_byte_stream(limited_mcp_response_stream(
-            response,
-            self.max_response_bytes,
-            self.discovery_response_budget.clone(),
-        ))
-        .boxed();
-        Ok(event_stream)
+            let event_stream = SseStream::from_byte_stream(limited_mcp_response_stream(
+                response,
+                self.max_response_bytes,
+                self.discovery_response_budget.clone(),
+                deadline,
+                self.response_idle_timeout,
+                self.protocol_probe_control.clone(),
+            ));
+            let event_stream = if self.protocol_probe_control.is_some() {
+                event_stream
+                    .map(|event| {
+                        event.map(|mut event| {
+                            // RMCP gives a server-provided `retry` interval precedence over
+                            // NeverRetry. Strip that control field only for the bounded probe
+                            // so a peer cannot force a reconnect after its initial GET closes.
+                            event.retry = None;
+                            event
+                        })
+                    })
+                    .boxed()
+            } else {
+                event_stream.boxed()
+            };
+            Ok(event_stream)
+        }
+        .await;
+        if let Some(control) = self.protocol_probe_control.as_ref() {
+            if let Err(error) = &result {
+                control.observe_streamable_error(error);
+            }
+            control.complete_common_get();
+        }
+        result
     }
 
     async fn delete_session(
@@ -1164,29 +2112,36 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
-        let mut request_builder = self.inner.delete(uri.as_ref());
-        if !self.managed_connection {
-            if let Some(auth_header) = auth_token {
-                request_builder = request_builder.bearer_auth(auth_header);
+        let result = async {
+            let mut request_builder = self.inner.delete(uri.as_ref());
+            if !self.managed_connection {
+                if let Some(auth_header) = auth_token {
+                    request_builder = request_builder.bearer_auth(auth_header);
+                }
             }
-        }
-        request_builder = request_builder.header(HEADER_SESSION_ID, session.as_ref());
-        request_builder = apply_mcp_custom_headers(
-            request_builder,
-            custom_headers,
-            self.credential_header_name.as_ref(),
-            self.managed_connection,
-        )?;
-        request_builder = self.apply_connection_credential(request_builder)?;
-        let response = request_builder.send().await.map_err(mcp_http_error)?;
-        let response = self.reject_connection_authentication(response).await?;
+            request_builder = request_builder.header(HEADER_SESSION_ID, session.as_ref());
+            request_builder = apply_mcp_custom_headers(
+                request_builder,
+                custom_headers,
+                self.credential_header_name.as_ref(),
+                self.managed_connection,
+            )?;
+            request_builder = self.apply_connection_credential(request_builder)?;
+            let (response, _deadline) = self.send_request(request_builder).await?;
+            let response = self.reject_connection_authentication(response).await?;
 
-        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
-            tracing::debug!("upstream MCP server does not support deleting sessions");
-            return Ok(());
+            if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+                tracing::debug!("upstream MCP server does not support deleting sessions");
+                return Ok(());
+            }
+            let _response = response.error_for_status().map_err(mcp_http_error)?;
+            Ok(())
         }
-        let _response = response.error_for_status().map_err(mcp_http_error)?;
-        Ok(())
+        .await;
+        if let (Some(control), Err(error)) = (self.protocol_probe_control.as_ref(), &result) {
+            control.observe_streamable_error(error);
+        }
+        result
     }
 
     async fn post_message(
@@ -1197,176 +2152,290 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let mut request = self
-            .inner
-            .post(uri.as_ref())
-            .header(ACCEPT, [EVENT_STREAM_MIME, JSON_MIME].join(", "));
-        if !self.managed_connection {
-            if let Some(auth_header) = auth_token {
-                request = request.bearer_auth(auth_header);
-            }
-        }
-
-        let custom_content_type = custom_headers
-            .keys()
-            .any(|name| name.as_str().eq_ignore_ascii_case(CONTENT_TYPE.as_str()));
-        request = apply_mcp_custom_headers(
-            request,
-            custom_headers,
-            self.credential_header_name.as_ref(),
-            self.managed_connection,
-        )?;
-        let session_was_attached = session_id.is_some();
-        if let Some(session_id) = session_id {
-            request = request.header(HEADER_SESSION_ID, session_id.as_ref());
-        }
-        let body = serialize_mcp_request_body(&message)?;
-        enforce_mcp_request_body_size(body.len(), self.max_request_body_bytes)?;
-        if !custom_content_type {
-            request = request.header(CONTENT_TYPE, JSON_MIME);
-        }
-        request = self.apply_connection_credential(request)?;
-        let response = request.body(body).send().await.map_err(mcp_http_error)?;
-        let response = self.reject_connection_authentication(response).await?;
-        if response.status() == StatusCode::UNAUTHORIZED
-            && response.headers().contains_key(WWW_AUTHENTICATE)
-        {
-            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
-                REDACTED_MCP_UPSTREAM_VALUE.to_owned(),
-            )));
-        }
-        if response.status() == StatusCode::FORBIDDEN
-            && response.headers().contains_key(WWW_AUTHENTICATE)
-        {
-            return Err(StreamableHttpError::InsufficientScope(
-                InsufficientScopeError::new(REDACTED_MCP_UPSTREAM_VALUE.to_owned(), None),
-            ));
-        }
-
-        let status = response.status();
-        if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
-            return Ok(StreamableHttpPostResponse::Accepted);
-        }
-        if status == StatusCode::NOT_FOUND && session_was_attached {
-            return Err(StreamableHttpError::SessionExpired);
-        }
-
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .map(|ct| String::from_utf8_lossy(ct.as_bytes()).to_string());
-        let content_length = response.content_length();
-        let session_id = response
-            .headers()
-            .get(HEADER_SESSION_ID)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-
-        if status.is_success()
-            && content_length == Some(0)
-            && matches!(
-                message,
-                ClientJsonRpcMessage::Notification(_)
-                    | ClientJsonRpcMessage::Response(_)
-                    | ClientJsonRpcMessage::Error(_)
-            )
-        {
-            return Ok(StreamableHttpPostResponse::Accepted);
-        }
-
-        if !status.is_success() {
-            match read_limited_mcp_response_body(
-                response,
-                self.max_response_bytes,
-                self.discovery_response_budget.clone(),
-            )
-            .await
-            {
-                Ok(_) => {}
-                Err(error) if mcp_streamable_error_response_too_large(&error).is_some() => {
-                    return Err(error);
+        let result = async {
+            let mut request = self
+                .inner
+                .post(uri.as_ref())
+                .header(ACCEPT, [EVENT_STREAM_MIME, JSON_MIME].join(", "));
+            if !self.managed_connection {
+                if let Some(auth_header) = auth_token {
+                    request = request.bearer_auth(auth_header);
                 }
-                Err(_) => {}
             }
-            return Err(redacted_mcp_status_error(status));
-        }
 
-        match content_type.as_deref() {
-            Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME.as_bytes()) => {
-                enforce_mcp_response_content_length(&response, self.max_response_bytes)?;
-                let event_stream = SseStream::from_byte_stream(limited_mcp_response_stream(
-                    response,
-                    self.max_response_bytes,
-                    self.discovery_response_budget.clone(),
-                ))
-                .boxed();
-                Ok(StreamableHttpPostResponse::Sse(event_stream, session_id))
+            let custom_content_type = custom_headers
+                .keys()
+                .any(|name| name.as_str().eq_ignore_ascii_case(CONTENT_TYPE.as_str()));
+            request = apply_mcp_custom_headers(
+                request,
+                custom_headers,
+                self.credential_header_name.as_ref(),
+                self.managed_connection,
+            )?;
+            let session_was_attached = session_id.is_some();
+            if let Some(session_id) = session_id {
+                request = request.header(HEADER_SESSION_ID, session_id.as_ref());
             }
-            Some(ct) if ct.as_bytes().starts_with(JSON_MIME.as_bytes()) => {
-                match read_limited_mcp_response_json::<ServerJsonRpcMessage>(
+            let body = serialize_mcp_request_body(&message)?;
+            enforce_mcp_request_body_size(body.len(), self.max_request_body_bytes)?;
+            if !custom_content_type {
+                request = request.header(CONTENT_TYPE, JSON_MIME);
+            }
+            request = self.apply_connection_credential(request)?;
+            let (response, deadline) = self.send_request(request.body(body)).await?;
+            let response = self.reject_connection_authentication(response).await?;
+            if response.status() == StatusCode::UNAUTHORIZED
+                && response.headers().contains_key(WWW_AUTHENTICATE)
+            {
+                return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                    REDACTED_MCP_UPSTREAM_VALUE.to_owned(),
+                )));
+            }
+            if response.status() == StatusCode::FORBIDDEN
+                && response.headers().contains_key(WWW_AUTHENTICATE)
+            {
+                return Err(StreamableHttpError::InsufficientScope(
+                    InsufficientScopeError::new(REDACTED_MCP_UPSTREAM_VALUE.to_owned(), None),
+                ));
+            }
+
+            let status = response.status();
+            if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
+                return Ok(StreamableHttpPostResponse::Accepted);
+            }
+            if status == StatusCode::NOT_FOUND && session_was_attached {
+                return Err(StreamableHttpError::SessionExpired);
+            }
+
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .map(|ct| String::from_utf8_lossy(ct.as_bytes()).to_string());
+            let content_length = response.content_length();
+            let response_session_id = response
+                .headers()
+                .get(HEADER_SESSION_ID)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            if !session_was_attached && response_session_id.is_some() {
+                if let Some(control) = self.protocol_probe_control.as_ref() {
+                    control.expect_common_get();
+                }
+            }
+
+            if status.is_success()
+                && content_length == Some(0)
+                && matches!(
+                    message,
+                    ClientJsonRpcMessage::Notification(_)
+                        | ClientJsonRpcMessage::Response(_)
+                        | ClientJsonRpcMessage::Error(_)
+                )
+            {
+                return Ok(StreamableHttpPostResponse::Accepted);
+            }
+
+            if !status.is_success() {
+                match read_limited_mcp_response_body(
                     response,
                     self.max_response_bytes,
                     self.discovery_response_budget.clone(),
+                    deadline,
+                    self.response_idle_timeout,
+                    self.protocol_probe_control.clone(),
                 )
                 .await
                 {
-                    Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
+                    Ok(_) => {}
                     Err(error) if mcp_streamable_error_response_too_large(&error).is_some() => {
-                        Err(error)
+                        return Err(error);
                     }
-                    Err(_) => {
-                        tracing::warn!("could not parse MCP JSON response; treating as accepted");
-                        Ok(StreamableHttpPostResponse::Accepted)
+                    Err(_) => {}
+                }
+                return Err(redacted_mcp_status_error(status));
+            }
+
+            match content_type.as_deref() {
+                Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME.as_bytes()) => {
+                    enforce_mcp_response_content_length(&response, self.max_response_bytes)?;
+                    let event_stream = SseStream::from_byte_stream(limited_mcp_response_stream(
+                        response,
+                        self.max_response_bytes,
+                        self.discovery_response_budget.clone(),
+                        deadline,
+                        self.response_idle_timeout,
+                        self.protocol_probe_control.clone(),
+                    ))
+                    .boxed();
+                    Ok(StreamableHttpPostResponse::Sse(
+                        event_stream,
+                        response_session_id,
+                    ))
+                }
+                Some(ct) if ct.as_bytes().starts_with(JSON_MIME.as_bytes()) => {
+                    match read_limited_mcp_response_json::<ServerJsonRpcMessage>(
+                        response,
+                        self.max_response_bytes,
+                        self.discovery_response_budget.clone(),
+                        deadline,
+                        self.response_idle_timeout,
+                        self.protocol_probe_control.clone(),
+                    )
+                    .await
+                    {
+                        Ok(message) => Ok(StreamableHttpPostResponse::Json(
+                            message,
+                            response_session_id,
+                        )),
+                        Err(error) if mcp_streamable_error_response_too_large(&error).is_some() => {
+                            Err(error)
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "could not parse MCP JSON response; treating as accepted"
+                            );
+                            Ok(StreamableHttpPostResponse::Accepted)
+                        }
                     }
                 }
-            }
-            _ => {
-                tracing::error!(
-                    content_type_present = content_type.is_some(),
-                    "unexpected MCP upstream content type"
-                );
-                Err(redacted_mcp_content_type_error(content_type.is_some()))
+                _ => {
+                    tracing::error!(
+                        content_type_present = content_type.is_some(),
+                        "unexpected MCP upstream content type"
+                    );
+                    Err(redacted_mcp_content_type_error(content_type.is_some()))
+                }
             }
         }
+        .await;
+        if let (Some(control), Err(error)) = (self.protocol_probe_control.as_ref(), &result) {
+            control.observe_streamable_error(error);
+        }
+        result
     }
 }
 
 type LimitedMcpByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, LimitedMcpHttpError>> + Send>>;
 
 fn limited_mcp_response_stream(
-    response: rmcp_reqwest::Response,
+    response: rmcp_http::Response,
     max_response_bytes: usize,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
+    deadline: Option<tokio::time::Instant>,
+    response_idle_timeout: Option<Duration>,
+    protocol_probe_control: Option<ProtocolProbeTransportControl>,
 ) -> LimitedMcpByteStream {
     let body = Box::pin(response.bytes_stream());
-    limited_mcp_body_stream(body, max_response_bytes, discovery_response_budget)
+    limited_mcp_body_stream_with_timeouts(
+        body,
+        max_response_bytes,
+        discovery_response_budget,
+        deadline,
+        response_idle_timeout,
+        protocol_probe_control,
+    )
 }
 
+#[cfg(test)]
 fn limited_mcp_body_stream(
-    body: Pin<Box<dyn Stream<Item = Result<Bytes, rmcp_reqwest::Error>> + Send>>,
+    body: Pin<Box<dyn Stream<Item = Result<Bytes, rmcp_http::Error>> + Send>>,
     max_response_bytes: usize,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
 ) -> LimitedMcpByteStream {
+    limited_mcp_body_stream_with_timeouts(
+        body,
+        max_response_bytes,
+        discovery_response_budget,
+        None,
+        None,
+        None,
+    )
+}
+
+fn limited_mcp_body_stream_with_timeouts(
+    body: Pin<Box<dyn Stream<Item = Result<Bytes, rmcp_http::Error>> + Send>>,
+    max_response_bytes: usize,
+    discovery_response_budget: Option<DiscoveryResponseByteBudget>,
+    deadline: Option<tokio::time::Instant>,
+    response_idle_timeout: Option<Duration>,
+    protocol_probe_control: Option<ProtocolProbeTransportControl>,
+) -> LimitedMcpByteStream {
     Box::pin(stream::unfold(
-        (body, 0usize, false, discovery_response_budget),
+        (
+            body,
+            0usize,
+            false,
+            discovery_response_budget,
+            deadline,
+            response_idle_timeout,
+            protocol_probe_control,
+        ),
         move |state| async move {
-            let (mut body, mut streamed_bytes, done, discovery_response_budget) = state;
+            let (
+                mut body,
+                mut streamed_bytes,
+                done,
+                discovery_response_budget,
+                deadline,
+                response_idle_timeout,
+                protocol_probe_control,
+            ) = state;
             if done {
                 return None;
             }
 
-            match body.next().await {
+            let next = match next_mcp_body_chunk(
+                &mut body,
+                deadline,
+                response_idle_timeout,
+                protocol_probe_control.as_ref(),
+            )
+            .await
+            {
+                Ok(next) => next,
+                Err(error) => {
+                    if let Some(control) = protocol_probe_control.as_ref() {
+                        control.record_limited_error(&error);
+                    }
+                    return Some((
+                        Err(error),
+                        (
+                            body,
+                            streamed_bytes,
+                            true,
+                            discovery_response_budget,
+                            deadline,
+                            response_idle_timeout,
+                            protocol_probe_control,
+                        ),
+                    ));
+                }
+            };
+
+            match next {
                 Some(Ok(chunk)) => {
                     if streamed_bytes.saturating_add(chunk.len()) > max_response_bytes {
                         tracing::warn!(
                             max = max_response_bytes,
                             "egress blocked oversized MCP upstream response"
                         );
+                        let error = LimitedMcpHttpError::ResponseTooLarge {
+                            max: max_response_bytes,
+                        };
+                        if let Some(control) = protocol_probe_control.as_ref() {
+                            control.record_limited_error(&error);
+                        }
                         return Some((
-                            Err(LimitedMcpHttpError::ResponseTooLarge {
-                                max: max_response_bytes,
-                            }),
-                            (body, streamed_bytes, true, discovery_response_budget),
+                            Err(error),
+                            (
+                                body,
+                                streamed_bytes,
+                                true,
+                                discovery_response_budget,
+                                deadline,
+                                response_idle_timeout,
+                                protocol_probe_control,
+                            ),
                         ));
                     }
 
@@ -1376,36 +2445,121 @@ fn limited_mcp_body_stream(
                                 max = budget.maximum,
                                 "MCP discovery exceeded aggregate raw response byte limit"
                             );
+                            if let Some(control) = protocol_probe_control.as_ref() {
+                                control.record_limited_error(&error);
+                            }
                             return Some((
                                 Err(error),
-                                (body, streamed_bytes, true, discovery_response_budget),
+                                (
+                                    body,
+                                    streamed_bytes,
+                                    true,
+                                    discovery_response_budget,
+                                    deadline,
+                                    response_idle_timeout,
+                                    protocol_probe_control,
+                                ),
                             ));
                         }
                     }
                     streamed_bytes += chunk.len();
                     Some((
                         Ok(chunk),
-                        (body, streamed_bytes, false, discovery_response_budget),
+                        (
+                            body,
+                            streamed_bytes,
+                            false,
+                            discovery_response_budget,
+                            deadline,
+                            response_idle_timeout,
+                            protocol_probe_control,
+                        ),
                     ))
                 }
-                Some(Err(error)) => Some((
-                    Err(LimitedMcpHttpError::from(error)),
-                    (body, streamed_bytes, true, discovery_response_budget),
-                )),
+                Some(Err(error)) => {
+                    let error = LimitedMcpHttpError::from(error);
+                    if let Some(control) = protocol_probe_control.as_ref() {
+                        control.record_limited_error(&error);
+                    }
+                    Some((
+                        Err(error),
+                        (
+                            body,
+                            streamed_bytes,
+                            true,
+                            discovery_response_budget,
+                            deadline,
+                            response_idle_timeout,
+                            protocol_probe_control,
+                        ),
+                    ))
+                }
                 None => None,
             }
         },
     ))
 }
 
+async fn next_mcp_body_chunk(
+    body: &mut Pin<Box<dyn Stream<Item = Result<Bytes, rmcp_http::Error>> + Send>>,
+    deadline: Option<tokio::time::Instant>,
+    response_idle_timeout: Option<Duration>,
+    protocol_probe_control: Option<&ProtocolProbeTransportControl>,
+) -> Result<Option<Result<Bytes, rmcp_http::Error>>, LimitedMcpHttpError> {
+    let idle_deadline = response_idle_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+    let wait_deadline = match (deadline, idle_deadline) {
+        (Some(deadline), Some(idle_deadline)) => Some(deadline.min(idle_deadline)),
+        (Some(deadline), None) => Some(deadline),
+        (None, Some(idle_deadline)) => Some(idle_deadline),
+        (None, None) => None,
+    };
+    match (wait_deadline, protocol_probe_control) {
+        (Some(wait_deadline), Some(control)) => {
+            let _io_guard = control.begin_io();
+            tokio::select! {
+                biased;
+                _ = control.cancellation().cancelled() => {
+                    Err(LimitedMcpHttpError::Http("http_timeout"))
+                }
+                result = tokio::time::timeout_at(wait_deadline, body.next()) => {
+                    result.map_err(|_| LimitedMcpHttpError::Http("http_timeout"))
+                }
+            }
+        }
+        (Some(wait_deadline), None) => tokio::time::timeout_at(wait_deadline, body.next())
+            .await
+            .map_err(|_| LimitedMcpHttpError::Http("http_timeout")),
+        (None, Some(control)) => {
+            let _io_guard = control.begin_io();
+            tokio::select! {
+                biased;
+                _ = control.cancellation().cancelled() => {
+                    Err(LimitedMcpHttpError::Http("http_timeout"))
+                }
+                result = body.next() => Ok(result),
+            }
+        }
+        (None, None) => Ok(body.next().await),
+    }
+}
+
 async fn read_limited_mcp_response_body(
-    response: rmcp_reqwest::Response,
+    response: rmcp_http::Response,
     max_response_bytes: usize,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
+    deadline: Option<tokio::time::Instant>,
+    response_idle_timeout: Option<Duration>,
+    protocol_probe_control: Option<ProtocolProbeTransportControl>,
 ) -> Result<Bytes, StreamableHttpError<LimitedMcpHttpError>> {
     enforce_mcp_response_content_length(&response, max_response_bytes)?;
-    let mut stream =
-        limited_mcp_response_stream(response, max_response_bytes, discovery_response_budget);
+    let mut stream = limited_mcp_response_stream(
+        response,
+        max_response_bytes,
+        discovery_response_budget,
+        deadline,
+        response_idle_timeout,
+        protocol_probe_control,
+    );
     let mut body = Vec::new();
 
     while let Some(chunk) = stream.next().await {
@@ -1417,13 +2571,22 @@ async fn read_limited_mcp_response_body(
 }
 
 async fn read_limited_mcp_response_json<T: serde::de::DeserializeOwned>(
-    response: rmcp_reqwest::Response,
+    response: rmcp_http::Response,
     max_response_bytes: usize,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
+    deadline: Option<tokio::time::Instant>,
+    response_idle_timeout: Option<Duration>,
+    protocol_probe_control: Option<ProtocolProbeTransportControl>,
 ) -> Result<T, StreamableHttpError<LimitedMcpHttpError>> {
-    let body =
-        read_limited_mcp_response_body(response, max_response_bytes, discovery_response_budget)
-            .await?;
+    let body = read_limited_mcp_response_body(
+        response,
+        max_response_bytes,
+        discovery_response_budget,
+        deadline,
+        response_idle_timeout,
+        protocol_probe_control,
+    )
+    .await?;
     serde_json::from_slice(&body).map_err(StreamableHttpError::Deserialize)
 }
 
@@ -1456,7 +2619,7 @@ fn enforce_mcp_request_body_size(
 }
 
 fn enforce_mcp_response_content_length(
-    response: &rmcp_reqwest::Response,
+    response: &rmcp_http::Response,
     max_response_bytes: usize,
 ) -> Result<(), StreamableHttpError<LimitedMcpHttpError>> {
     let max_response_bytes_u64 = u64::try_from(max_response_bytes).unwrap_or(u64::MAX);
@@ -1479,7 +2642,7 @@ fn enforce_mcp_response_content_length(
 }
 
 fn validate_mcp_response_content_type(
-    response: &rmcp_reqwest::Response,
+    response: &rmcp_http::Response,
 ) -> Result<(), StreamableHttpError<LimitedMcpHttpError>> {
     match response.headers().get(CONTENT_TYPE) {
         Some(content_type) => {
@@ -1498,11 +2661,11 @@ fn validate_mcp_response_content_type(
 }
 
 fn apply_mcp_custom_headers(
-    mut builder: rmcp_reqwest::RequestBuilder,
+    mut builder: rmcp_http::RequestBuilder,
     custom_headers: HashMap<HeaderName, HeaderValue>,
     credential_header_name: Option<&HeaderName>,
     managed_connection: bool,
-) -> Result<rmcp_reqwest::RequestBuilder, StreamableHttpError<LimitedMcpHttpError>> {
+) -> Result<rmcp_http::RequestBuilder, StreamableHttpError<LimitedMcpHttpError>> {
     for (name, value) in custom_headers {
         validate_mcp_custom_header(&name, credential_header_name, managed_connection)
             .map_err(StreamableHttpError::ReservedHeaderConflict)?;
@@ -1547,11 +2710,15 @@ fn redacted_mcp_content_type_error(
     )
 }
 
-fn mcp_http_error(error: rmcp_reqwest::Error) -> StreamableHttpError<LimitedMcpHttpError> {
+fn mcp_http_error(error: rmcp_http::Error) -> StreamableHttpError<LimitedMcpHttpError> {
     StreamableHttpError::Client(LimitedMcpHttpError::from(error))
 }
 
-fn mcp_http_error_category(error: &rmcp_reqwest::Error) -> &'static str {
+fn mcp_timeout_error() -> StreamableHttpError<LimitedMcpHttpError> {
+    StreamableHttpError::Client(LimitedMcpHttpError::Http("http_timeout"))
+}
+
+fn mcp_http_error_category(error: &rmcp_http::Error) -> &'static str {
     if error.is_timeout() {
         "http_timeout"
     } else if error.is_connect() {
@@ -1815,6 +2982,8 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::*;
 
+    use crate::connections::test::connection_failure_classification;
+
     use std::{
         collections::HashSet,
         io::{self, ErrorKind},
@@ -1826,6 +2995,14 @@ mod tests {
         },
     };
 
+    use rmcp::{
+        model::{
+            ListResourcesResult, ListToolsResult, ReadResourceRequestParams, ReadResourceResult,
+            ServerCapabilities, ServerInfo,
+        },
+        service::RequestContext,
+        ErrorData, RoleServer, ServerHandler, ServiceExt,
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -1834,6 +3011,280 @@ mod tests {
     use tracing_subscriber::{fmt::MakeWriter, prelude::*};
 
     const TEST_RESPONSE_LIMIT: usize = 64;
+
+    #[test]
+    fn http_and_mcp_oauth_mint_failures_share_unavailable_dependency_classification() {
+        for (error, expected_reason) in [
+            (
+                ConnectionHttpError::OAuthTokenRejected,
+                ConnectionTestReason::OauthTokenRejected,
+            ),
+            (
+                ConnectionHttpError::OAuthTokenInvalidResponse,
+                ConnectionTestReason::OauthTokenInvalidResponse,
+            ),
+        ] {
+            let (http_stage, http_state, http_status_reason) =
+                connection_failure_classification(error);
+            let mcp =
+                protocol_probe_connection_error(error, ConnectionTestStageName::ProtocolValid);
+
+            assert_eq!(http_stage, ConnectionTestStageName::SecretAvailable);
+            assert_eq!(http_state, ConnectionOperationalState::Unavailable);
+            assert_eq!(
+                mcp.operational_state(),
+                ConnectionOperationalState::Unavailable
+            );
+            assert_eq!(
+                (http_stage, http_status_reason),
+                (mcp.stage(), mcp.status_reason())
+            );
+            assert_eq!(mcp.safe_reason(), expected_reason);
+        }
+    }
+
+    #[derive(Default)]
+    struct ProbeRequestCounts {
+        list_tools: AtomicUsize,
+        list_resources: AtomicUsize,
+        call_tool: AtomicUsize,
+        read_resource: AtomicUsize,
+    }
+
+    #[derive(Clone)]
+    struct PaginatedProbeServer {
+        counts: Arc<ProbeRequestCounts>,
+    }
+
+    impl ServerHandler for PaginatedProbeServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(
+                ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_resources()
+                    .build(),
+            )
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            self.counts.list_tools.fetch_add(1, Ordering::SeqCst);
+            Ok(ListToolsResult {
+                next_cursor: Some("second-page-must-not-be-read".to_owned()),
+                ..ListToolsResult::default()
+            })
+        }
+
+        async fn list_resources(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListResourcesResult, ErrorData> {
+            self.counts.list_resources.fetch_add(1, Ordering::SeqCst);
+            Ok(ListResourcesResult {
+                next_cursor: Some("resource-page-must-not-be-read".to_owned()),
+                ..ListResourcesResult::default()
+            })
+        }
+
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, ErrorData> {
+            self.counts.call_tool.fetch_add(1, Ordering::SeqCst);
+            Ok(CallToolResult::default())
+        }
+
+        async fn read_resource(
+            &self,
+            _request: ReadResourceRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ReadResourceResult, ErrorData> {
+            self.counts.read_resource.fetch_add(1, Ordering::SeqCst);
+            Ok(ReadResourceResult::new(Vec::new()))
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_probe_reads_exactly_one_advertised_tool_page() {
+        let counts = Arc::new(ProbeRequestCounts::default());
+        let server = PaginatedProbeServer {
+            counts: Arc::clone(&counts),
+        };
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let server = server
+                .serve(server_transport)
+                .await
+                .expect("probe test server should initialize");
+            server
+                .waiting()
+                .await
+                .expect("probe test server should close cleanly");
+        });
+        let mut client =
+            ().serve(client_transport)
+                .await
+                .expect("probe test client should initialize");
+
+        probe_one_advertised_metadata_page(&mut client)
+            .await
+            .expect("one advertised metadata page should validate");
+        let close = client
+            .close_with_timeout(Duration::from_secs(1))
+            .await
+            .expect("probe test client close should join");
+        assert!(discovery_shutdown_completed_cleanly::<()>(&Ok(close)));
+        server_task
+            .await
+            .expect("probe test server task should join");
+
+        assert_eq!(counts.list_tools.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.list_resources.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.call_tool.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.read_resource.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn protocol_probe_does_not_retry_list_after_session_404() {
+        let upstream =
+            RawProtocolProbeUpstream::spawn(RawProtocolProbeScenario::ListSessionExpired).await;
+
+        let error = run_raw_protocol_probe(&upstream.url, Duration::from_secs(2))
+            .await
+            .expect_err("session-expired inventory response must fail the bounded probe");
+        assert_eq!(error.safe_reason(), ConnectionTestReason::ProtocolError);
+        assert_eq!(upstream.counts.initialize.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream.counts.list_tools.load(Ordering::SeqCst), 1);
+
+        upstream.join().await;
+    }
+
+    #[tokio::test]
+    async fn protocol_probe_refuses_server_requested_sse_reconnect() {
+        let upstream =
+            RawProtocolProbeUpstream::spawn(RawProtocolProbeScenario::ImmediateSseRetry).await;
+
+        run_raw_protocol_probe(&upstream.url, Duration::from_secs(2))
+            .await
+            .expect("one inventory page should succeed without reconnecting SSE");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert_eq!(
+            upstream.counts.get_stream.load(Ordering::SeqCst),
+            1,
+            "probe-specific NeverRetry must refuse the server's retry: 0 reconnect"
+        );
+
+        upstream.join().await;
+    }
+
+    #[tokio::test]
+    async fn protocol_probe_cancels_stalled_initialize_and_list_without_live_io() {
+        for scenario in [
+            RawProtocolProbeScenario::StallInitialize,
+            RawProtocolProbeScenario::StallList,
+        ] {
+            let upstream = RawProtocolProbeUpstream::spawn(scenario).await;
+            let started = Instant::now();
+            let error = run_raw_protocol_probe(&upstream.url, Duration::from_millis(150))
+                .await
+                .expect_err("stalled probe I/O must hit the shared absolute deadline");
+
+            assert_eq!(error.safe_reason(), ConnectionTestReason::DeadlineExceeded);
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "probe worker must be aborted and joined within its hard deadline"
+            );
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                upstream.stalled_disconnect.notified(),
+            )
+            .await
+            .expect("the timed-out credential-bearing HTTP request must be dropped");
+            let requests_after_return = upstream.counts.total();
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            assert_eq!(
+                upstream.counts.total(),
+                requests_after_return,
+                "no RMCP HTTP request may survive or start after probe return"
+            );
+
+            upstream.join().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_probe_consumes_prior_endpoint_time_and_finishes_io_before_return() {
+        let upstream =
+            RawProtocolProbeUpstream::spawn(RawProtocolProbeScenario::StallInitialize).await;
+        let endpoint_started = tokio::time::Instant::now();
+        let endpoint_deadline = endpoint_started + Duration::from_millis(900);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let error = run_raw_protocol_probe_before(&upstream.url, endpoint_deadline)
+            .await
+            .expect_err("remaining endpoint budget must bound the delayed MCP probe");
+        assert_eq!(error.safe_reason(), ConnectionTestReason::DeadlineExceeded);
+        assert!(
+            tokio::time::Instant::now() < endpoint_deadline,
+            "cleanup reserve should join the timed-out worker before the endpoint deadline"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            upstream.stalled_disconnect.notified(),
+        )
+        .await
+        .expect("the stalled initialize request must be closed before probe return");
+        assert_eq!(upstream.counts.initialize.load(Ordering::SeqCst), 1);
+        let requests_after_return = upstream.counts.total();
+        tokio::time::sleep_until(endpoint_deadline + Duration::from_millis(75)).await;
+        assert_eq!(
+            upstream.counts.total(),
+            requests_after_return,
+            "no request or credential-bearing I/O may survive the shared endpoint deadline"
+        );
+
+        upstream.join().await;
+    }
+
+    #[tokio::test]
+    async fn protocol_probe_fails_get_delete_auth_and_allows_method_not_allowed() {
+        for scenario in [
+            RawProtocolProbeScenario::GetUnauthorized,
+            RawProtocolProbeScenario::GetForbidden,
+            RawProtocolProbeScenario::DeleteUnauthorized,
+            RawProtocolProbeScenario::DeleteForbidden,
+        ] {
+            let upstream = RawProtocolProbeUpstream::spawn(scenario).await;
+            let error = run_raw_protocol_probe(&upstream.url, Duration::from_secs(2))
+                .await
+                .expect_err("background GET/DELETE authentication rejection must fail the probe");
+            assert_eq!(error.stage(), ConnectionTestStageName::Authenticated);
+            assert_eq!(
+                error.safe_reason(),
+                ConnectionTestReason::AuthenticationFailed
+            );
+            assert_eq!(
+                error.operational_state(),
+                ConnectionOperationalState::Degraded,
+                "an actual upstream authentication rejection is degraded, not a missing dependency"
+            );
+            upstream.join().await;
+        }
+
+        let upstream =
+            RawProtocolProbeUpstream::spawn(RawProtocolProbeScenario::MethodNotAllowed).await;
+        run_raw_protocol_probe(&upstream.url, Duration::from_secs(2))
+            .await
+            .expect("protocol-defined GET and DELETE 405 responses must remain allowed");
+        assert_eq!(upstream.counts.get_stream.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream.counts.delete_session.load(Ordering::SeqCst), 1);
+        upstream.join().await;
+    }
 
     #[test]
     fn managed_discovery_page_budget_is_shared_across_all_collections() {
@@ -1873,7 +3324,7 @@ mod tests {
             .saturating_sub(1);
         let budget = DiscoveryResponseByteBudget::new(maximum);
 
-        let first_body = stream::iter([Ok::<_, rmcp_reqwest::Error>(unknown_json.clone())]);
+        let first_body = stream::iter([Ok::<_, rmcp_http::Error>(unknown_json.clone())]);
         let mut first =
             limited_mcp_body_stream(Box::pin(first_body), usize::MAX, Some(budget.clone()));
         assert_eq!(
@@ -1886,7 +3337,7 @@ mod tests {
         );
         assert!(first.next().await.is_none());
 
-        let second_body = stream::iter([Ok::<_, rmcp_reqwest::Error>(unknown_sse)]);
+        let second_body = stream::iter([Ok::<_, rmcp_http::Error>(unknown_sse)]);
         let mut second = limited_mcp_body_stream(Box::pin(second_body), usize::MAX, Some(budget));
         let error = second
             .next()
@@ -1898,6 +3349,30 @@ mod tests {
             McpUpstreamCallError::DiscoveryResponseLimitExceeded { max }
                 if max == maximum
         ));
+    }
+
+    #[tokio::test]
+    async fn managed_transport_adapter_enforces_total_and_idle_response_deadlines() {
+        for (deadline, response_idle_timeout) in [
+            (
+                Some(tokio::time::Instant::now() + Duration::from_millis(25)),
+                None,
+            ),
+            (None, Some(Duration::from_millis(25))),
+        ] {
+            let mut body: Pin<Box<dyn Stream<Item = Result<Bytes, rmcp_http::Error>> + Send>> =
+                Box::pin(stream::pending());
+            let started = Instant::now();
+            let error = next_mcp_body_chunk(&mut body, deadline, response_idle_timeout, None)
+                .await
+                .expect_err("a silent managed MCP response must time out");
+
+            assert!(matches!(error, LimitedMcpHttpError::Http("http_timeout")));
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "managed MCP response deadline must remain bounded"
+            );
+        }
     }
 
     #[test]
@@ -2284,7 +3759,7 @@ mod tests {
             .local_addr()
             .expect("timeout sentinel address should be available");
         let host = "secret-mcp.example.test";
-        let inner = rmcp_reqwest::Client::builder()
+        let inner = rmcp_http::Client::builder()
             .no_proxy()
             .timeout(Duration::from_millis(100))
             .read_timeout(Duration::from_millis(50))
@@ -2527,7 +4002,7 @@ mod tests {
                 .expect("managed MCP capture response should write");
             request
         });
-        let inner = rmcp_reqwest::Client::builder()
+        let inner = rmcp_http::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(1))
             .build()
@@ -2569,7 +4044,7 @@ mod tests {
                 .await
                 .expect("raw MCP response server should write its response");
         });
-        let inner = rmcp_reqwest::Client::builder()
+        let inner = rmcp_http::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(1))
             .build()
@@ -2616,7 +4091,7 @@ mod tests {
                 .await
                 .expect("raw MCP GET response server should write its response");
         });
-        let inner = rmcp_reqwest::Client::builder()
+        let inner = rmcp_http::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(1))
             .build()
@@ -2636,6 +4111,400 @@ mod tests {
             .await
             .expect("raw MCP GET response server should finish");
         result
+    }
+
+    #[derive(Clone, Copy)]
+    enum RawProtocolProbeScenario {
+        ListSessionExpired,
+        ImmediateSseRetry,
+        StallInitialize,
+        StallList,
+        GetUnauthorized,
+        GetForbidden,
+        DeleteUnauthorized,
+        DeleteForbidden,
+        MethodNotAllowed,
+    }
+
+    #[derive(Default)]
+    struct RawProtocolProbeCounts {
+        initialize: AtomicUsize,
+        initialized: AtomicUsize,
+        list_tools: AtomicUsize,
+        get_stream: AtomicUsize,
+        delete_session: AtomicUsize,
+    }
+
+    impl RawProtocolProbeCounts {
+        fn total(&self) -> usize {
+            self.initialize
+                .load(Ordering::SeqCst)
+                .saturating_add(self.initialized.load(Ordering::SeqCst))
+                .saturating_add(self.list_tools.load(Ordering::SeqCst))
+                .saturating_add(self.get_stream.load(Ordering::SeqCst))
+                .saturating_add(self.delete_session.load(Ordering::SeqCst))
+        }
+    }
+
+    struct RawProtocolProbeUpstream {
+        url: String,
+        counts: Arc<RawProtocolProbeCounts>,
+        stalled_disconnect: Arc<tokio::sync::Notify>,
+        stop: tokio_util::sync::CancellationToken,
+        handle: JoinHandle<()>,
+    }
+
+    impl RawProtocolProbeUpstream {
+        async fn spawn(scenario: RawProtocolProbeScenario) -> Self {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("raw protocol-probe listener should bind");
+            let address = listener
+                .local_addr()
+                .expect("raw protocol-probe address should be available");
+            let counts = Arc::new(RawProtocolProbeCounts::default());
+            let stalled_disconnect = Arc::new(tokio::sync::Notify::new());
+            let stop = tokio_util::sync::CancellationToken::new();
+            let server_counts = Arc::clone(&counts);
+            let server_disconnect = Arc::clone(&stalled_disconnect);
+            let server_stop = stop.clone();
+            let handle = tokio::spawn(async move {
+                let mut handlers = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        _ = server_stop.cancelled() => break,
+                        accepted = listener.accept() => {
+                            let Ok((stream, _)) = accepted else {
+                                break;
+                            };
+                            handlers.spawn(handle_raw_protocol_probe_request(
+                                stream,
+                                scenario,
+                                Arc::clone(&server_counts),
+                                Arc::clone(&server_disconnect),
+                                server_stop.clone(),
+                            ));
+                        }
+                    }
+                }
+                while handlers.join_next().await.is_some() {}
+            });
+
+            Self {
+                url: format!("http://{address}/mcp"),
+                counts,
+                stalled_disconnect,
+                stop,
+                handle,
+            }
+        }
+
+        async fn join(self) {
+            self.stop.cancel();
+            tokio::time::timeout(Duration::from_secs(2), self.handle)
+                .await
+                .expect("raw protocol-probe server should stop")
+                .expect("raw protocol-probe server task should join");
+        }
+    }
+
+    async fn run_raw_protocol_probe(
+        url: &str,
+        operation_timeout: Duration,
+    ) -> Result<(), ConnectionProtocolProbeError> {
+        run_raw_protocol_probe_before(
+            url,
+            tokio::time::Instant::now() + operation_timeout + PROTOCOL_PROBE_CLEANUP_RESERVE,
+        )
+        .await
+    }
+
+    async fn run_raw_protocol_probe_before(
+        url: &str,
+        hard_deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectionProtocolProbeError> {
+        let runtime_config = McpUpstreamRuntimeConfig {
+            timeout: Duration::from_secs(5),
+            response_idle_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 64 * 1024,
+            max_response_bytes: 64 * 1024,
+        };
+        let client = rmcp_http::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(1))
+            .build()
+            .expect("raw protocol-probe client should build");
+        let operation_deadline =
+            protocol_probe_operation_deadline(runtime_config.timeout, hard_deadline)?;
+        run_bounded_protocol_probe(
+            "raw-protocol-probe".to_owned(),
+            url.to_owned(),
+            runtime_config,
+            client,
+            ManagedMcpAuthentication {
+                credential: None,
+                credential_header_name: None,
+            },
+            operation_deadline,
+            hard_deadline,
+        )
+        .await
+    }
+
+    struct RawProtocolProbeRequest {
+        method: String,
+        body: Option<Value>,
+    }
+
+    async fn handle_raw_protocol_probe_request(
+        mut stream: tokio::net::TcpStream,
+        scenario: RawProtocolProbeScenario,
+        counts: Arc<RawProtocolProbeCounts>,
+        stalled_disconnect: Arc<tokio::sync::Notify>,
+        stop: tokio_util::sync::CancellationToken,
+    ) {
+        let Some(request) = read_raw_protocol_probe_request(&mut stream).await else {
+            return;
+        };
+        match request.method.as_str() {
+            "GET" => {
+                counts.get_stream.fetch_add(1, Ordering::SeqCst);
+                match scenario {
+                    RawProtocolProbeScenario::ImmediateSseRetry => {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10\r\nConnection: close\r\n\r\nretry: 0\n\n",
+                            )
+                            .await
+                            .expect("raw protocol-probe SSE response should write");
+                    }
+                    RawProtocolProbeScenario::GetUnauthorized => {
+                        write_raw_protocol_probe_status(&mut stream, "401 Unauthorized").await;
+                    }
+                    RawProtocolProbeScenario::GetForbidden => {
+                        write_raw_protocol_probe_status(&mut stream, "403 Forbidden").await;
+                    }
+                    _ => {
+                        write_raw_protocol_probe_status(&mut stream, "405 Method Not Allowed")
+                            .await;
+                    }
+                }
+            }
+            "DELETE" => {
+                counts.delete_session.fetch_add(1, Ordering::SeqCst);
+                match scenario {
+                    RawProtocolProbeScenario::DeleteUnauthorized => {
+                        write_raw_protocol_probe_status(&mut stream, "401 Unauthorized").await;
+                    }
+                    RawProtocolProbeScenario::DeleteForbidden => {
+                        write_raw_protocol_probe_status(&mut stream, "403 Forbidden").await;
+                    }
+                    _ => {
+                        write_raw_protocol_probe_status(&mut stream, "405 Method Not Allowed")
+                            .await;
+                    }
+                }
+            }
+            "POST" => {
+                let rpc_method = request
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.get("method"))
+                    .and_then(Value::as_str);
+                match rpc_method {
+                    Some("initialize") => {
+                        counts.initialize.fetch_add(1, Ordering::SeqCst);
+                        if matches!(scenario, RawProtocolProbeScenario::StallInitialize) {
+                            wait_for_raw_protocol_probe_disconnect(
+                                &mut stream,
+                                &stalled_disconnect,
+                                &stop,
+                            )
+                            .await;
+                            return;
+                        }
+                        let id = request
+                            .body
+                            .as_ref()
+                            .and_then(|body| body.get("id"))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        write_raw_protocol_probe_json(
+                            &mut stream,
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "protocolVersion": "2025-06-18",
+                                    "capabilities": {"tools": {}},
+                                    "serverInfo": {
+                                        "name": "raw-protocol-probe",
+                                        "version": "0.0.0"
+                                    }
+                                }
+                            }),
+                            true,
+                        )
+                        .await;
+                    }
+                    Some("notifications/initialized") => {
+                        counts.initialized.fetch_add(1, Ordering::SeqCst);
+                        write_raw_protocol_probe_status(&mut stream, "202 Accepted").await;
+                    }
+                    Some("tools/list") => {
+                        counts.list_tools.fetch_add(1, Ordering::SeqCst);
+                        if matches!(scenario, RawProtocolProbeScenario::StallList) {
+                            wait_for_raw_protocol_probe_disconnect(
+                                &mut stream,
+                                &stalled_disconnect,
+                                &stop,
+                            )
+                            .await;
+                            return;
+                        }
+                        if matches!(scenario, RawProtocolProbeScenario::ListSessionExpired) {
+                            write_raw_protocol_probe_status(&mut stream, "404 Not Found").await;
+                            return;
+                        }
+                        if matches!(scenario, RawProtocolProbeScenario::ImmediateSseRetry) {
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                        }
+                        let id = request
+                            .body
+                            .as_ref()
+                            .and_then(|body| body.get("id"))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        write_raw_protocol_probe_json(
+                            &mut stream,
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {"tools": []}
+                            }),
+                            false,
+                        )
+                        .await;
+                    }
+                    _ => {
+                        write_raw_protocol_probe_status(&mut stream, "400 Bad Request").await;
+                    }
+                }
+            }
+            _ => write_raw_protocol_probe_status(&mut stream, "400 Bad Request").await,
+        }
+    }
+
+    async fn read_raw_protocol_probe_request(
+        stream: &mut tokio::net::TcpStream,
+    ) -> Option<RawProtocolProbeRequest> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .expect("raw protocol-probe server should read request");
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(offset) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break offset;
+            }
+            assert!(
+                buffer.len() <= 16 * 1024,
+                "raw protocol-probe request headers should stay bounded"
+            );
+        };
+        let headers = std::str::from_utf8(&buffer[..header_end])
+            .expect("raw protocol-probe headers should be UTF-8");
+        let method = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .unwrap_or_default()
+            .to_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body_start = header_end + 4;
+        while buffer.len() < body_start.saturating_add(content_length) {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .expect("raw protocol-probe server should read request body");
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        let body = (content_length > 0).then(|| {
+            serde_json::from_slice(&buffer[body_start..body_start + content_length])
+                .expect("raw protocol-probe request body should be JSON")
+        });
+        Some(RawProtocolProbeRequest { method, body })
+    }
+
+    async fn write_raw_protocol_probe_json(
+        stream: &mut tokio::net::TcpStream,
+        body: Value,
+        include_session: bool,
+    ) {
+        let body = body.to_string();
+        let session = if include_session {
+            "Mcp-Session-Id: raw-protocol-probe-session\r\n"
+        } else {
+            ""
+        };
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{session}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("raw protocol-probe JSON response should write");
+    }
+
+    async fn write_raw_protocol_probe_status(stream: &mut tokio::net::TcpStream, status: &str) {
+        let response =
+            format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("raw protocol-probe status response should write");
+    }
+
+    async fn wait_for_raw_protocol_probe_disconnect(
+        stream: &mut tokio::net::TcpStream,
+        disconnected: &tokio::sync::Notify,
+        stop: &tokio_util::sync::CancellationToken,
+    ) {
+        let mut byte = [0_u8; 1];
+        loop {
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                read = stream.read(&mut byte) => {
+                    match read {
+                        Ok(0) | Err(_) => {
+                            disconnected.notify_one();
+                            return;
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            }
+        }
     }
 
     #[derive(Clone, Default)]
@@ -2707,7 +4576,7 @@ mod tests {
         let declared_content_length = first_chunk.len();
         assert!(declared_content_length < TEST_RESPONSE_LIMIT);
         let body = stream::iter([
-            Ok::<_, rmcp_reqwest::Error>(Bytes::copy_from_slice(first_chunk.as_bytes())),
+            Ok::<_, rmcp_http::Error>(Bytes::copy_from_slice(first_chunk.as_bytes())),
             Ok(Bytes::from(overflow_chunk)),
         ]);
         let mut stream: BoxStream<'static, Result<Sse, SseError>> =
@@ -2722,7 +4591,7 @@ mod tests {
     }
 
     async fn oversized_sse_get_stream(url: &str) -> BoxStream<'static, Result<Sse, SseError>> {
-        let client = rmcp_reqwest::Client::builder()
+        let client = rmcp_http::Client::builder()
             .no_proxy()
             .build()
             .expect("test MCP HTTP client should build");

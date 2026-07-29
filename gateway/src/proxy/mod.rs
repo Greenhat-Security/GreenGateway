@@ -458,7 +458,7 @@ impl ProxyState {
                             "connection-bound route",
                         ),
                         weight: 1,
-                        egress_client: Arc::clone(target.client()),
+                        egress_client: Arc::clone(target.preflight_client()),
                         health: health::UpstreamHealthState::new(
                             Arc::<str>::from(route_id.as_str()),
                             endpoint_id,
@@ -510,18 +510,7 @@ impl ProxyState {
                 })
             })
             .collect::<Result<_, egress::EgressError>>()?;
-        let upstream_health = health::upstream_health_targets(routes.iter().flat_map(|route| {
-            route.pool.endpoints.iter().map(|endpoint| {
-                (
-                    route.route_id.clone(),
-                    endpoint.id.to_string(),
-                    endpoint.upstream_origin.clone(),
-                    Arc::clone(&endpoint.egress_client),
-                    endpoint.health.clone(),
-                    endpoint.health_config.as_deref().cloned(),
-                )
-            })
-        }));
+        let upstream_health = routing_table_health_targets(&routes);
         if let Some(runtime) = connection_http.as_ref() {
             let dependencies = routes
                 .iter()
@@ -651,11 +640,21 @@ impl ProxyState {
     }
 
     pub(crate) fn spawn_upstream_health_checks(&self) {
-        self.health_runtime.spawn(
-            &self.upstream_health,
-            Arc::new(lifecycle::SystemClock),
-            &self.lifecycle,
-        );
+        match &self.routes {
+            ProxyRoutes::Legacy { .. } => self.health_runtime.spawn(
+                &self.upstream_health,
+                Arc::new(lifecycle::SystemClock),
+                &self.lifecycle,
+            ),
+            ProxyRoutes::RoutingTable { routes } => {
+                let active_targets = routing_table_active_health_targets(routes);
+                self.health_runtime.spawn(
+                    &active_targets,
+                    Arc::new(lifecycle::SystemClock),
+                    &self.lifecycle,
+                );
+            }
+        }
     }
 }
 
@@ -709,6 +708,41 @@ impl RouteEgressClientKey {
 
         Ok(())
     }
+}
+
+fn routing_table_health_targets(routes: &[ProxyRoute]) -> Vec<health::UpstreamHealthTarget> {
+    health::upstream_health_targets(routes.iter().flat_map(|route| {
+        route.pool.endpoints.iter().map(|endpoint| {
+            (
+                route.route_id.clone(),
+                endpoint.id.to_string(),
+                endpoint.upstream_origin.clone(),
+                Arc::clone(&endpoint.egress_client),
+                endpoint.health.clone(),
+                endpoint.health_config.as_deref().cloned(),
+            )
+        })
+    }))
+}
+
+fn routing_table_active_health_targets(routes: &[ProxyRoute]) -> Vec<health::UpstreamHealthTarget> {
+    health::upstream_health_targets(
+        routes
+            .iter()
+            .filter(|route| route.connection_id.is_none())
+            .flat_map(|route| {
+                route.pool.endpoints.iter().map(|endpoint| {
+                    (
+                        route.route_id.clone(),
+                        endpoint.id.to_string(),
+                        endpoint.upstream_origin.clone(),
+                        Arc::clone(&endpoint.egress_client),
+                        endpoint.health.clone(),
+                        endpoint.health_config.as_deref().cloned(),
+                    )
+                })
+            }),
+    )
 }
 
 fn route_egress_client(
@@ -927,6 +961,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
+    use serde_json::Value;
 
     use super::*;
 
@@ -1178,6 +1213,112 @@ mod tests {
 
         assert!(context.is_some());
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn connection_bound_mtls_route_is_not_probed_by_legacy_health_client() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mTLS sentinel listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("mTLS sentinel address should load");
+        let preflight_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig {
+                allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
+                deny_private_ips: false,
+                ..egress::EgressConfig::default()
+            })
+            .expect("preflight-only client should build"),
+        );
+        assert_eq!(
+            preflight_client.client_identity_fingerprint(),
+            None,
+            "connection-owned mTLS material must not exist on the preflight client"
+        );
+        let pool = Arc::new(UpstreamPool::new(
+            "connection-route".to_owned(),
+            vec![ProxyEndpoint {
+                id: Arc::from("primary"),
+                upstream_origin: format!("https://{address}"),
+                weight: 1,
+                egress_client: preflight_client,
+                health: health::UpstreamHealthState::new("connection-route", "primary", None),
+                health_config: None,
+                circuit: None,
+            }],
+            &config::UpstreamPoolLimitsConfig::default(),
+            None,
+        ));
+        let connection_route = ProxyRoute {
+            route_id: "connection-route".to_owned(),
+            path_prefix: Some("/secure".to_owned()),
+            host: None,
+            authorization_origin: "connection:mtls-api".to_owned(),
+            connection_id: Some("mtls-api".to_owned()),
+            request_header_policy: RouteRequestHeaderPolicy::default(),
+            pool: Arc::clone(&pool),
+            request_body_mode: RequestBodyMode::Buffered,
+            sse: None,
+        };
+        let upstream_health = routing_table_health_targets(std::slice::from_ref(&connection_route));
+        assert_eq!(
+            upstream_health.len(),
+            1,
+            "connection-bound endpoints must remain in safe unknown-state health inventory"
+        );
+        assert!(
+            routing_table_active_health_targets(std::slice::from_ref(&connection_route)).is_empty(),
+            "connection-bound endpoints require prepared TLS and credentials and must not enter the legacy HEAD loop"
+        );
+
+        let state = ProxyState {
+            routes: ProxyRoutes::RoutingTable {
+                routes: vec![connection_route.clone()],
+            },
+            connection_http: None,
+            upstream_health,
+            max_request_body_bytes: 1024,
+            health_runtime: health::UpstreamHealthRuntime::default(),
+            lifecycle: lifecycle::GatewayLifecycle::new(),
+            audit: audit::AuditLog::new(Arc::new(audit::sink::tests::CaptureSink::new())),
+            request_selection_count: None,
+            request_body_mode_override: None,
+        };
+        let health_response = serde_json::to_value(state.upstream_health_response().await)
+            .expect("health response should serialize");
+        assert_eq!(health_response["reachable"], Value::Null);
+        let admin_response = serde_json::to_value(state.upstream_health_admin_response().await)
+            .expect("admin health response should serialize");
+        assert_eq!(admin_response["pools"][0]["pool_id"], "connection-route");
+        assert_eq!(
+            admin_response["pools"][0]["endpoints"][0]["state"],
+            "unknown"
+        );
+        assert_eq!(
+            admin_response["pools"][0]["endpoints"][0]["last_checked"],
+            Value::Null
+        );
+
+        state.spawn_upstream_health_checks();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "the custom-CA/mTLS endpoint must not receive an unauthenticated preflight-only HEAD"
+        );
+        assert!(
+            pool.select_endpoint().is_some(),
+            "excluding the unsafe active probe must not falsely mark the Connection endpoint unhealthy"
+        );
+
+        let mut legacy_route = connection_route;
+        legacy_route.connection_id = None;
+        assert_eq!(
+            routing_table_active_health_targets(&[legacy_route]).len(),
+            1,
+            "ordinary configured upstreams must retain legacy active health behavior"
+        );
     }
 
     #[tokio::test]

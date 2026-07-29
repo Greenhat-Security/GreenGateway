@@ -264,7 +264,23 @@ impl fmt::Display for ConnectionValidationError {
 
 impl ConnectionWrite {
     /// Validate and normalize a complete candidate before it can be persisted.
-    pub fn validated(mut self) -> Result<Self, Vec<ConnectionValidationError>> {
+    pub fn validated(self) -> Result<Self, Vec<ConnectionValidationError>> {
+        self.validated_with_legacy_options(false)
+    }
+
+    /// Validate a document already persisted under the v0 write contract.
+    ///
+    /// Early v0 releases accepted `OPTIONS` test profiles. Keep that one
+    /// historical value readable across upgrades, while [`Self::validated`]
+    /// remains the only validator for new and replacement writes.
+    pub(crate) fn validated_persisted_v0(self) -> Result<Self, Vec<ConnectionValidationError>> {
+        self.validated_with_legacy_options(true)
+    }
+
+    fn validated_with_legacy_options(
+        mut self,
+        allow_legacy_options: bool,
+    ) -> Result<Self, Vec<ConnectionValidationError>> {
         let mut errors = Vec::new();
 
         validate_bounded_text(
@@ -297,7 +313,11 @@ impl ConnectionWrite {
         validate_tls(&self.tls, self.enabled, &mut errors);
         validate_timeouts(self.timeouts.as_ref(), &mut errors);
         validate_discovery(self.kind, self.discovery.as_mut(), &mut errors);
-        validate_test_profile(self.test_profile.as_mut(), &mut errors);
+        validate_test_profile(
+            self.test_profile.as_mut(),
+            allow_legacy_options,
+            &mut errors,
+        );
 
         let requires_tls =
             self.authentication.requires_confidential_transport() || !self.tls.is_empty();
@@ -634,16 +654,19 @@ fn test_profile_target_changed(
 
 fn validate_test_profile(
     profile: Option<&mut ConnectionTestProfile>,
+    allow_legacy_options: bool,
     errors: &mut Vec<ConnectionValidationError>,
 ) {
     let Some(profile) = profile else {
         return;
     };
-    if !matches!(profile.method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+    if !(matches!(profile.method.as_str(), "GET" | "HEAD")
+        || allow_legacy_options && profile.method == "OPTIONS")
+    {
         errors.push(ConnectionValidationError::new(
             "test_profile.method",
             "unsafe_method",
-            "must be GET, HEAD, or OPTIONS",
+            "must be GET or HEAD",
         ));
     }
     match normalize_origin_relative_path("test_profile.path", &profile.path) {
@@ -1190,6 +1213,67 @@ mod tests {
     }
 
     #[test]
+    fn test_profile_accepts_get_and_head_but_rejects_options() {
+        let validator = connection_schema_validator();
+
+        for method in ["GET", "HEAD"] {
+            let mut candidate_json = example();
+            candidate_json["test_profile"]["method"] = json!(method);
+            validator
+                .validate(&candidate_json)
+                .unwrap_or_else(|_| panic!("{method} should match the published schema"));
+
+            let candidate: ConnectionWrite = serde_json::from_value(candidate_json)
+                .unwrap_or_else(|_| panic!("{method} should deserialize"));
+            candidate
+                .validated()
+                .unwrap_or_else(|_| panic!("{method} should pass model validation"));
+        }
+
+        let mut options_json = example();
+        options_json["test_profile"]["method"] = json!("OPTIONS");
+        assert!(
+            validator.validate(&options_json).is_err(),
+            "OPTIONS must not match the published schema"
+        );
+
+        let options: ConnectionWrite =
+            serde_json::from_value(options_json).expect("OPTIONS should deserialize");
+        let errors = options
+            .clone()
+            .validated()
+            .expect_err("OPTIONS must fail model validation");
+        assert!(errors.iter().any(|error| {
+            error.field == "test_profile.method"
+                && error.code == "unsafe_method"
+                && error.message == "must be GET or HEAD"
+        }));
+
+        let persisted = options
+            .validated_persisted_v0()
+            .expect("an already-persisted v0 OPTIONS profile must remain readable");
+        assert_eq!(
+            persisted
+                .test_profile
+                .as_ref()
+                .expect("legacy profile should remain present")
+                .method,
+            "OPTIONS"
+        );
+
+        let mut unsupported = persisted;
+        unsupported
+            .test_profile
+            .as_mut()
+            .expect("legacy profile should remain present")
+            .method = "POST".to_owned();
+        assert!(
+            unsupported.validated_persisted_v0().is_err(),
+            "the persisted reader exception must remain limited to OPTIONS"
+        );
+    }
+
+    #[test]
     fn secrets_permission_tracks_credential_use_authority_not_plain_metadata() {
         let mut plain: ConnectionWrite =
             serde_json::from_value(example()).expect("example should deserialize");
@@ -1257,7 +1341,7 @@ mod tests {
             .test_profile
             .as_mut()
             .expect("example should include a test profile")
-            .method = "OPTIONS".to_owned();
+            .method = "GET".to_owned();
         assert!(credentialed.requires_secrets_write_to_replace(&credentialed_test_method));
 
         let mut credentialed_test_path = credentialed.clone();

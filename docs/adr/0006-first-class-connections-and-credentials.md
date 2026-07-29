@@ -301,7 +301,7 @@ reads, request/response bodies, status, metrics cardinality, and retained
 catalog generations receive separate lower bounds in the PR that implements
 them.
 
-Stored test profiles use exact uppercase `GET`, `HEAD`, or `OPTIONS` methods
+Stored test profiles use exact uppercase `GET` or `HEAD` methods
 and 1–16 unique status codes from 100 through 599. Case and duplicates are
 rejected rather than silently normalized.
 

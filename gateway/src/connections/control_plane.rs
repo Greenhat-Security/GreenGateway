@@ -2,7 +2,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    time::Instant,
 };
 
 use arc_swap::ArcSwap;
@@ -424,6 +425,23 @@ impl ConnectionControlPlane {
         Ok(status)
     }
 
+    pub fn append_status_before(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        update: ConnectionStatusUpdate,
+        deadline: Instant,
+    ) -> Result<SafeConnectionStatus, ConnectionMutationError> {
+        let _guard = self.try_mutation_guard_before(deadline)?;
+        let store = self.managed_store()?;
+        let (status, updated) = store.append_status_before(id, expected, update, deadline)?;
+        let current = self.runtime.load_full();
+        let mut managed = current.managed().clone();
+        managed.insert(id.clone(), updated);
+        self.publish_runtime(managed);
+        Ok(status)
+    }
+
     pub fn create_managed(
         &self,
         expected_collection_etag: &str,
@@ -508,6 +526,25 @@ impl ConnectionControlPlane {
             }
         }
     }
+
+    fn try_mutation_guard_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<MutexGuard<'_, ()>, ConnectionMutationError> {
+        if Instant::now() >= deadline {
+            return Err(ConnectionMutationError::DeadlineExceeded);
+        }
+        match self.mutation_lock.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(TryLockError::WouldBlock) => Err(ConnectionMutationError::Busy),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                tracing::error!(
+                    "Connection control-plane mutation lock poisoned; recovering bounded fail-closed state"
+                );
+                Ok(poisoned.into_inner())
+            }
+        }
+    }
 }
 
 fn catalog_active_guard(
@@ -559,6 +596,8 @@ pub enum ConnectionMutationError {
     CollectionConflict { current: String },
     UnresolvableBindings { fields: Vec<&'static str> },
     BindingUnavailable,
+    Busy,
+    DeadlineExceeded,
     Store(ConnectionStoreError),
 }
 
@@ -578,6 +617,10 @@ impl fmt::Display for ConnectionMutationError {
             Self::BindingUnavailable => {
                 formatter.write_str("enabled connection binding validation is unavailable")
             }
+            Self::Busy => formatter.write_str("connection control-plane mutation is busy"),
+            Self::DeadlineExceeded => {
+                formatter.write_str("connection control-plane mutation deadline exceeded")
+            }
             Self::Store(error) => error.fmt(formatter),
         }
     }
@@ -590,7 +633,9 @@ impl Error for ConnectionMutationError {
             Self::Store(error) => Some(error),
             Self::CollectionConflict { .. }
             | Self::UnresolvableBindings { .. }
-            | Self::BindingUnavailable => None,
+            | Self::BindingUnavailable
+            | Self::Busy
+            | Self::DeadlineExceeded => None,
         }
     }
 }

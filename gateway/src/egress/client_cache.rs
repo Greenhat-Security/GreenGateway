@@ -12,7 +12,7 @@ use std::{
 
 use reqwest::Client;
 
-use super::EgressError;
+use super::{EgressError, TransportPartition};
 use crate::metrics::{
     EGRESS_CLIENT_CACHE_ENTRIES, EGRESS_CLIENT_CACHE_EVICTIONS_TOTAL,
     EGRESS_CLIENT_CACHE_REQUESTS_TOTAL, LOCK_POISON_RECOVERIES_TOTAL,
@@ -41,6 +41,7 @@ pub(super) struct PinnedClientCacheKey {
     pub connect_timeout: Duration,
     pub tls_root_set_fingerprint: [u8; 32],
     pub client_identity_fingerprint: Option<[u8; 32]>,
+    pub transport_partition: Option<TransportPartition>,
     pub protocol_profile: ProtocolProfile,
     pub outbound_proxy_policy: OutboundProxyPolicy,
 }
@@ -60,6 +61,7 @@ impl fmt::Debug for PinnedClientCacheKey {
                 "client_identity_configured",
                 &self.client_identity_fingerprint.is_some(),
             )
+            .field("transport_partitioned", &self.transport_partition.is_some())
             .field("protocol_profile", &self.protocol_profile)
             .field("outbound_proxy_policy", &self.outbound_proxy_policy)
             .finish()
@@ -354,6 +356,7 @@ mod tests {
             connect_timeout: Duration::from_secs(10),
             tls_root_set_fingerprint: [0; 32],
             client_identity_fingerprint: None,
+            transport_partition: None,
             protocol_profile: ProtocolProfile::Http1AndHttp2,
             outbound_proxy_policy: OutboundProxyPolicy::Disabled,
         }
@@ -415,18 +418,47 @@ mod tests {
     }
 
     #[test]
+    fn opaque_transport_partition_is_an_explicit_cache_partition() {
+        let clock = Arc::new(FakeCacheClock::default());
+        let cache = PinnedClientCache::with_limits(4, Duration::from_secs(30), clock);
+        let mut first_key = key(1);
+        first_key.egress_generation = [9; 32];
+        first_key.transport_partition = Some(TransportPartition::from_opaque(b"connection-a"));
+        let mut second_key = first_key.clone();
+        second_key.transport_partition = Some(TransportPartition::from_opaque(b"connection-b"));
+
+        cache
+            .get_or_build(first_key, || Ok(client()))
+            .expect("first partitioned client should build");
+        cache
+            .get_or_build(second_key, || Ok(client()))
+            .expect("second partitioned client should build");
+
+        assert_eq!(
+            cache.len(),
+            2,
+            "opaque partitions must separate otherwise identical transports"
+        );
+    }
+
+    #[test]
     fn cache_key_debug_redacts_transport_fingerprints() {
         let mut cache_key = key(7);
         cache_key.egress_generation = [11; 32];
         cache_key.tls_root_set_fingerprint = [12; 32];
         cache_key.client_identity_fingerprint = Some([13; 32]);
+        cache_key.transport_partition =
+            Some(TransportPartition::from_opaque(b"partition-debug-canary"));
 
         let debug = format!("{cache_key:?}");
 
         assert!(debug.contains("client_identity_configured: true"));
+        assert!(debug.contains("transport_partitioned: true"));
         assert!(!debug.contains("egress_generation"));
         assert!(!debug.contains("tls_root_set_fingerprint"));
         assert!(!debug.contains("client_identity_fingerprint"));
+        assert!(!debug.contains("transport_partition:"));
+        assert!(!debug.contains("partition-debug-canary"));
     }
 
     #[test]

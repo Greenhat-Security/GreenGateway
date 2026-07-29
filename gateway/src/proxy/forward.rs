@@ -383,10 +383,10 @@ async fn forward_to_upstream(
     let request_started = Instant::now();
     let request_timeout = connection_target.as_ref().map_or_else(
         || upstream.pool.request_timeout(),
-        |target| target.client().request_timeout(),
+        |target| target.preflight_client().request_timeout(),
     );
     let deadline = tokio::time::Instant::now() + request_timeout;
-    let (checked_connection_destination, connection_headers) =
+    let (prepared_connection_transport, connection_headers) =
         if let Some(target) = connection_target.as_ref() {
             let checked = tokio::select! {
                 biased;
@@ -395,7 +395,7 @@ async fn forward_to_upstream(
                 }
                 checked = tokio::time::timeout_at(
                     deadline,
-                    target.client().checked_destination(target.url()),
+                    target.preflight_client().checked_destination(target.url()),
                 ) => checked,
             };
             let checked = match checked {
@@ -426,6 +426,47 @@ async fn forward_to_upstream(
                 .connection_http
                 .as_ref()
                 .expect("connection target requires a Connection HTTP runtime");
+            let prepared = tokio::select! {
+                biased;
+                () = forced_shutdown.cancelled() => {
+                    return admission_unavailable_response(&upstream.pool.id, request_id);
+                }
+                prepared = tokio::time::timeout_at(
+                    deadline,
+                    runtime.prepare_transport(target, &checked),
+                ) => prepared,
+            };
+            let prepared = match prepared {
+                Err(_) => {
+                    return connection_failure_response(
+                        ConnectionHttpError::TransportUnavailable,
+                        &upstream.pool.id,
+                        request_id,
+                        Vec::new(),
+                        request_started.elapsed(),
+                    );
+                }
+                Ok(Err(error)) => {
+                    if error.is_secret_resolution_failure() {
+                        emit_connection_secret_resolution_failed(
+                            proxy,
+                            &parts,
+                            source_ip,
+                            &upstream.pool.id,
+                            target,
+                            error.safe_reason(),
+                        );
+                    }
+                    return connection_failure_response(
+                        error,
+                        &upstream.pool.id,
+                        request_id,
+                        Vec::new(),
+                        request_started.elapsed(),
+                    );
+                }
+                Ok(Ok(prepared)) => prepared,
+            };
             let credential = tokio::select! {
                 biased;
                 () = forced_shutdown.cancelled() => {
@@ -507,7 +548,7 @@ async fn forward_to_upstream(
                     );
                 }
             }
-            (Some(checked), Some((headers, credential)))
+            (Some(prepared), Some((headers, credential)))
         } else {
             (None, None)
         };
@@ -593,20 +634,20 @@ async fn forward_to_upstream(
             },
             |(headers, _credential)| headers.clone(),
         );
-        let egress_client = connection_target
+        let egress_client = prepared_connection_transport
             .as_ref()
-            .map_or(&endpoint.egress_client, ConnectionHttpTarget::client);
+            .map_or(&endpoint.egress_client, |prepared| prepared.client());
         let attempt_started = Instant::now();
         let send = async {
             if let Some(sse) = upstream.sse {
                 let max_response_bytes = sse
                     .max_response_bytes
                     .unwrap_or_else(|| Some(egress_client.max_response_bytes()));
-                match checked_connection_destination.as_ref() {
-                    Some(destination) => {
+                match prepared_connection_transport.as_ref() {
+                    Some(prepared) => {
                         egress_client
                             .stream_request_with_body_for_sse_at_checked_destination(
-                                destination,
+                                prepared.destination(),
                                 parts.method.clone(),
                                 &target_url,
                                 headers,
@@ -628,11 +669,11 @@ async fn forward_to_upstream(
                     }
                 }
             } else {
-                match checked_connection_destination.as_ref() {
-                    Some(destination) => {
+                match prepared_connection_transport.as_ref() {
+                    Some(prepared) => {
                         egress_client
                             .stream_request_with_body_at_checked_destination(
-                                destination,
+                                prepared.destination(),
                                 parts.method.clone(),
                                 &target_url,
                                 headers,
@@ -1681,13 +1722,14 @@ fn connection_failure_response(
     let status = match error {
         ConnectionHttpError::ConnectionDisabled
         | ConnectionHttpError::CredentialUnavailable
+        | ConnectionHttpError::TlsUnavailable
         | ConnectionHttpError::OAuthTokenUnavailable
         | ConnectionHttpError::TransportUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         ConnectionHttpError::InvalidConnectionId
         | ConnectionHttpError::ConnectionNotFound
         | ConnectionHttpError::WrongConnectionKind
         | ConnectionHttpError::UnsupportedAuthentication
-        | ConnectionHttpError::UnsupportedTls
+        | ConnectionHttpError::TlsInvalid
         | ConnectionHttpError::InvalidTargetPath
         | ConnectionHttpError::CredentialHeaderConflict
         | ConnectionHttpError::CredentialInvalid
@@ -2240,6 +2282,27 @@ mod tests {
             .expect("sanitized response body should read");
         assert_eq!(body.as_ref(), br#"{"error":"bad_gateway"}"#);
         assert!(!String::from_utf8_lossy(&body).contains("upstream-auth-body-canary"));
+    }
+
+    #[test]
+    fn connection_tls_failures_use_safe_gateway_statuses() {
+        let invalid = connection_failure_response(
+            ConnectionHttpError::TlsInvalid,
+            "payments",
+            None,
+            Vec::new(),
+            Duration::ZERO,
+        );
+        assert_eq!(invalid.status(), StatusCode::BAD_GATEWAY);
+
+        let unavailable = connection_failure_response(
+            ConnectionHttpError::TlsUnavailable,
+            "payments",
+            None,
+            Vec::new(),
+            Duration::ZERO,
+        );
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

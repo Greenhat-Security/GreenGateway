@@ -24,6 +24,11 @@ use zeroize::Zeroizing;
 
 use crate::{config::Config, rbac::EgressPolicy};
 
+// MCP's transport adapter needs the same HTTP types as the exact-pinned egress
+// client. Keeping the crate alias here makes that dependency cross the egress
+// boundary without creating a second, independently versioned HTTP stack.
+pub(crate) use reqwest as rmcp_http;
+
 mod client_cache;
 #[cfg(test)]
 mod mtls_tests;
@@ -32,6 +37,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+const MAX_TLS_CA_BUNDLE_PEM_BYTES: usize = 1024 * 1024;
 const MAX_TLS_CLIENT_IDENTITY_PEM_BYTES: usize = 1024 * 1024;
 static PROCESS_PINNED_CLIENT_CACHE: LazyLock<Arc<client_cache::PinnedClientCache>> =
     LazyLock::new(|| Arc::new(client_cache::PinnedClientCache::new()));
@@ -103,6 +109,24 @@ static WELL_KNOWN_NAT64_PREFIX: LazyLock<IpNet> = LazyLock::new(|| {
 });
 
 #[derive(Debug)]
+pub enum TlsCaBundleErrorSource {
+    Path(PathBuf),
+    Material,
+}
+
+impl From<PathBuf> for TlsCaBundleErrorSource {
+    fn from(path: PathBuf) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl From<&str> for TlsCaBundleErrorSource {
+    fn from(path: &str) -> Self {
+        Self::Path(PathBuf::from(path))
+    }
+}
+
+#[derive(Debug)]
 pub enum EgressError {
     HostNotAllowed(String),
     PortNotAllowed(u16),
@@ -111,12 +135,23 @@ pub enum EgressError {
     DnsResolutionFailed(String),
     InvalidUrl(String),
     SchemeNotAllowed(String),
-    RequestBodyTooLarge { size: usize, max: usize },
+    RequestBodyTooLarge {
+        size: usize,
+        max: usize,
+    },
     RequestBodyReadFailed,
     UnexpectedStatus(u16),
-    ResponseTooLarge { size: usize, max: usize },
-    ResponseIdleTimeout { timeout: Duration },
-    InvalidTlsCaBundle { path: PathBuf, message: String },
+    ResponseTooLarge {
+        size: usize,
+        max: usize,
+    },
+    ResponseIdleTimeout {
+        timeout: Duration,
+    },
+    InvalidTlsCaBundle {
+        path: TlsCaBundleErrorSource,
+        message: String,
+    },
     InvalidTlsClientIdentity,
     Http(reqwest::Error),
 }
@@ -159,11 +194,18 @@ impl fmt::Display for EgressError {
                 "egress response body was idle for {}ms",
                 timeout.as_millis()
             ),
-            Self::InvalidTlsCaBundle { path, message } => write!(
+            Self::InvalidTlsCaBundle {
+                path: TlsCaBundleErrorSource::Path(path),
+                message,
+            } => write!(
                 formatter,
                 "egress TLS CA bundle '{}' is invalid: {message}",
                 path.display()
             ),
+            Self::InvalidTlsCaBundle {
+                path: TlsCaBundleErrorSource::Material,
+                message,
+            } => write!(formatter, "egress TLS CA bundle is invalid: {message}"),
             Self::InvalidTlsClientIdentity => {
                 formatter.write_str("egress TLS client identity is invalid")
             }
@@ -340,6 +382,19 @@ impl EgressRequestBody {
 /// address still blocks the request unless that address is explicitly covered
 /// by one of the policy CIDRs. The legacy field name is retained for config
 /// compatibility; policy CIDRs do not disable non-global blocking globally.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) struct TransportPartition([u8; 32]);
+
+impl TransportPartition {
+    fn from_opaque(value: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"greengateway:egress-transport-partition:v1\0");
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+        Self(hasher.finalize().into())
+    }
+}
+
 #[derive(Clone)]
 pub struct EgressConfig {
     pub allowed_hosts: HashSet<String>,
@@ -358,6 +413,7 @@ pub struct EgressConfig {
     pub(crate) tls_root_set_fingerprint: [u8; 32],
     pub(crate) client_identity: Option<reqwest::Identity>,
     pub(crate) client_identity_fingerprint: Option<[u8; 32]>,
+    pub(crate) transport_partition: Option<TransportPartition>,
 }
 
 impl fmt::Debug for EgressConfig {
@@ -384,6 +440,7 @@ impl fmt::Debug for EgressConfig {
                 "client_identity_configured",
                 &self.client_identity.is_some(),
             )
+            .field("transport_partitioned", &self.transport_partition.is_some())
             .finish()
     }
 }
@@ -405,6 +462,7 @@ impl PartialEq for EgressConfig {
             && self.tls_root_certificates.len() == other.tls_root_certificates.len()
             && self.tls_root_set_fingerprint == other.tls_root_set_fingerprint
             && self.client_identity_fingerprint == other.client_identity_fingerprint
+            && self.transport_partition == other.transport_partition
     }
 }
 
@@ -429,6 +487,7 @@ impl Default for EgressConfig {
             tls_root_set_fingerprint: empty_tls_root_set_fingerprint(),
             client_identity: None,
             client_identity_fingerprint: None,
+            transport_partition: None,
         }
     }
 }
@@ -521,6 +580,7 @@ impl EgressConfig {
             tls_root_set_fingerprint: empty_tls_root_set_fingerprint(),
             client_identity: None,
             client_identity_fingerprint: None,
+            transport_partition: None,
         }
     }
 
@@ -593,37 +653,58 @@ impl EgressConfig {
         }
     }
 
-    pub fn apply_tls_ca_bundle_path(&mut self, path: PathBuf) -> Result<(), EgressError> {
-        let bytes = fs::read(&path).map_err(|err| EgressError::InvalidTlsCaBundle {
-            path: path.clone(),
-            message: err.to_string(),
-        })?;
-        let certificates = reqwest::Certificate::from_pem_bundle(&bytes).map_err(|err| {
-            EgressError::InvalidTlsCaBundle {
-                path: path.clone(),
-                message: err.to_string(),
-            }
-        })?;
+    /// Applies an opaque caller-provided partition to transport cache identity.
+    ///
+    /// The opaque value is domain-separated and hashed immediately. It is never
+    /// retained or rendered by `Debug`.
+    pub(crate) fn apply_transport_partition(&mut self, partition: &[u8]) {
+        self.transport_partition = Some(TransportPartition::from_opaque(partition));
+    }
+
+    /// Applies an in-memory PEM CA bundle without retaining a source locator.
+    pub(crate) fn apply_tls_ca_bundle_pem(&mut self, pem_bundle: &[u8]) -> Result<(), EgressError> {
+        if pem_bundle.len() > MAX_TLS_CA_BUNDLE_PEM_BYTES {
+            return Err(in_memory_tls_ca_bundle_error(
+                "PEM bundle exceeds the supported size limit",
+            ));
+        }
+        let certificates = reqwest::Certificate::from_pem_bundle(pem_bundle)
+            .map_err(|_| in_memory_tls_ca_bundle_error("PEM bundle could not be parsed"))?;
 
         if certificates.is_empty() {
-            return Err(EgressError::InvalidTlsCaBundle {
-                path,
-                message: "PEM bundle did not contain any certificates".to_owned(),
-            });
+            return Err(in_memory_tls_ca_bundle_error(
+                "PEM bundle did not contain any certificates",
+            ));
         }
 
-        self.tls_ca_bundle_path = Some(path);
+        self.tls_ca_bundle_path = None;
         self.tls_root_certificates = certificates;
-        self.tls_root_set_fingerprint = tls_root_set_fingerprint(&bytes);
+        self.tls_root_set_fingerprint = tls_root_set_fingerprint(pem_bundle);
         Ok(())
     }
 
-    pub fn apply_tls_client_identity_pem_path(&mut self, path: PathBuf) -> Result<(), EgressError> {
-        let bytes = read_tls_client_identity_pem(&path)?;
-        if !tls_client_identity_pem_shape_is_valid(&bytes) {
+    pub fn apply_tls_ca_bundle_path(&mut self, path: PathBuf) -> Result<(), EgressError> {
+        let bytes = fs::read(&path).map_err(|err| EgressError::InvalidTlsCaBundle {
+            path: path.clone().into(),
+            message: err.to_string(),
+        })?;
+        self.apply_tls_ca_bundle_pem(&bytes)
+            .map_err(|error| with_tls_ca_bundle_path(error, &path))?;
+        self.tls_ca_bundle_path = Some(path);
+        Ok(())
+    }
+
+    /// Applies an in-memory combined certificate-chain and private-key PEM.
+    pub(crate) fn apply_tls_client_identity_pem(
+        &mut self,
+        pem_identity: &[u8],
+    ) -> Result<(), EgressError> {
+        if pem_identity.len() > MAX_TLS_CLIENT_IDENTITY_PEM_BYTES
+            || !tls_client_identity_pem_shape_is_valid(pem_identity)
+        {
             return Err(EgressError::InvalidTlsClientIdentity);
         }
-        let identity = reqwest::Identity::from_pem(&bytes)
+        let identity = reqwest::Identity::from_pem(pem_identity)
             .map_err(|_| EgressError::InvalidTlsClientIdentity)?;
 
         reqwest::Client::builder()
@@ -633,8 +714,30 @@ impl EgressConfig {
             .map_err(|_| EgressError::InvalidTlsClientIdentity)?;
 
         self.client_identity = Some(identity);
-        self.client_identity_fingerprint = Some(tls_client_identity_fingerprint(&bytes));
+        self.client_identity_fingerprint = Some(tls_client_identity_fingerprint(pem_identity));
         Ok(())
+    }
+
+    pub fn apply_tls_client_identity_pem_path(&mut self, path: PathBuf) -> Result<(), EgressError> {
+        let bytes = read_tls_client_identity_pem(&path)?;
+        self.apply_tls_client_identity_pem(&bytes)
+    }
+}
+
+fn in_memory_tls_ca_bundle_error(message: &str) -> EgressError {
+    EgressError::InvalidTlsCaBundle {
+        path: TlsCaBundleErrorSource::Material,
+        message: message.to_owned(),
+    }
+}
+
+fn with_tls_ca_bundle_path(error: EgressError, path: &Path) -> EgressError {
+    match error {
+        EgressError::InvalidTlsCaBundle { message, .. } => EgressError::InvalidTlsCaBundle {
+            path: path.to_path_buf().into(),
+            message,
+        },
+        error => error,
     }
 }
 
@@ -736,6 +839,7 @@ pub struct EgressClient {
     config: EgressConfig,
     resolver: Arc<dyn DnsResolver>,
     config_generation: [u8; 32],
+    policy_generation: [u8; 32],
     client_cache: Arc<client_cache::PinnedClientCache>,
 }
 
@@ -755,12 +859,24 @@ impl DnsResolver for SystemDnsResolver {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CheckedEgressDestination {
     scheme: String,
     pub host: String,
     pub pinned_addr: SocketAddr,
     config_generation: [u8; 32],
+    policy_generation: [u8; 32],
+}
+
+impl fmt::Debug for CheckedEgressDestination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CheckedEgressDestination")
+            .field("scheme", &self.scheme)
+            .field("host", &self.host)
+            .field("pinned_addr", &self.pinned_addr)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CheckedEgressDestination {
@@ -771,6 +887,7 @@ impl CheckedEgressDestination {
             host: host.into(),
             pinned_addr,
             config_generation: [0; 32],
+            policy_generation: [0; 32],
         }
     }
 }
@@ -829,11 +946,13 @@ impl EgressClient {
         // exact-pinned clients are created lazily after DNS validation.
         base_client_builder(&config).build()?;
         let config_generation = egress_config_generation(&config);
+        let policy_generation = egress_policy_generation(&config);
 
         Ok(Self {
             config,
             resolver,
             config_generation,
+            policy_generation,
             client_cache,
         })
     }
@@ -886,7 +1005,72 @@ impl EgressClient {
             host,
             pinned_addr,
             config_generation: self.config_generation,
+            policy_generation: self.policy_generation,
         })
+    }
+
+    /// Rebinds an already checked exact destination to this client's transport profile.
+    ///
+    /// This performs no DNS lookup. It succeeds only when the destination was
+    /// checked under the exact same effective egress policy and still matches
+    /// the supplied request authority. The pinned socket is revalidated before
+    /// it receives this client's configuration generation.
+    pub(crate) fn rebind_checked_destination(
+        &self,
+        destination: &CheckedEgressDestination,
+        url: &str,
+    ) -> Result<CheckedEgressDestination, EgressError> {
+        if destination.policy_generation != self.policy_generation {
+            return Err(EgressError::InvalidPolicy(
+                "checked destination belongs to a different egress policy".to_owned(),
+            ));
+        }
+
+        let parsed = self.checked_url(url)?;
+        let host = checked_host(
+            &parsed,
+            &self.config.allowed_hosts,
+            &self.config.allowed_host_globs,
+        )?;
+        let port = checked_port(&parsed)?;
+        checked_policy_port(port, &self.config.allowed_ports)?;
+        if destination.scheme != parsed.scheme()
+            || destination.host != host
+            || destination.pinned_addr.port() != port
+        {
+            return Err(EgressError::InvalidPolicy(
+                "checked destination does not match the request authority".to_owned(),
+            ));
+        }
+        checked_socket_addr(
+            &host,
+            &[destination.pinned_addr],
+            self.config.deny_private_ips,
+            &self.config.nat64_prefixes,
+            &self.config.private_ip_allow_cidrs,
+        )?;
+
+        Ok(CheckedEgressDestination {
+            scheme: destination.scheme.clone(),
+            host: destination.host.clone(),
+            pinned_addr: destination.pinned_addr,
+            config_generation: self.config_generation,
+            policy_generation: self.policy_generation,
+        })
+    }
+
+    /// Returns the shared exact-pinned client for MCP's long-lived SSE profile.
+    ///
+    /// Authority, policy, socket, and configuration binding are rechecked
+    /// before the cached client is selected. Request and response bounds remain
+    /// the responsibility of the Egress-backed MCP adapter.
+    pub(crate) fn mcp_reqwest_client_at_checked_destination(
+        &self,
+        destination: &CheckedEgressDestination,
+        url: &str,
+    ) -> Result<reqwest::Client, EgressError> {
+        let (_, client) = self.client_for_checked_destination(destination, url, true)?;
+        Ok(client)
     }
 
     pub(crate) async fn request_with_headers_at_checked_destination(
@@ -1135,6 +1319,7 @@ impl EgressClient {
             connect_timeout: self.config.connect_timeout,
             tls_root_set_fingerprint: self.config.tls_root_set_fingerprint,
             client_identity_fingerprint: self.config.client_identity_fingerprint,
+            transport_partition: self.config.transport_partition,
             protocol_profile: if sse {
                 client_cache::ProtocolProfile::Sse
             } else {
@@ -1569,11 +1754,44 @@ pub(crate) fn tls_client_identity_pem_is_valid(pem_identity: &[u8]) -> bool {
 
 fn egress_config_generation(config: &EgressConfig) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"greengateway:egress-config-generation:v1\0");
+    hasher.update(b"greengateway:egress-config-generation:v2\0");
+    hash_egress_policy(&mut hasher, config);
 
+    hash_duration(&mut hasher, config.timeout);
+    hash_duration(&mut hasher, config.response_idle_timeout);
+    hash_duration(&mut hasher, config.connect_timeout);
+    hasher.update((config.max_response_bytes as u64).to_be_bytes());
+    hasher.update((config.max_request_body_bytes as u64).to_be_bytes());
+    hasher.update(config.tls_root_set_fingerprint);
+    match config.client_identity_fingerprint {
+        Some(fingerprint) => {
+            hasher.update([1]);
+            hasher.update(fingerprint);
+        }
+        None => hasher.update([0]),
+    }
+    match config.transport_partition {
+        Some(partition) => {
+            hasher.update([1]);
+            hasher.update(partition.0);
+        }
+        None => hasher.update([0]),
+    }
+
+    hasher.finalize().into()
+}
+
+fn egress_policy_generation(config: &EgressConfig) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"greengateway:egress-policy-generation:v1\0");
+    hash_egress_policy(&mut hasher, config);
+    hasher.finalize().into()
+}
+
+fn hash_egress_policy(hasher: &mut Sha256, config: &EgressConfig) {
     let mut allowed_hosts: Vec<_> = config.allowed_hosts.iter().collect();
     allowed_hosts.sort_unstable();
-    hash_strings(&mut hasher, allowed_hosts.into_iter().map(String::as_str));
+    hash_strings(hasher, allowed_hosts.into_iter().map(String::as_str));
 
     let mut allowed_host_globs: Vec<_> = config
         .allowed_host_globs
@@ -1581,7 +1799,7 @@ fn egress_config_generation(config: &EgressConfig) -> [u8; 32] {
         .map(String::as_str)
         .collect();
     allowed_host_globs.sort_unstable();
-    hash_strings(&mut hasher, allowed_host_globs);
+    hash_strings(hasher, allowed_host_globs);
 
     let mut private_cidrs: Vec<_> = config
         .private_ip_allow_cidrs
@@ -1589,7 +1807,7 @@ fn egress_config_generation(config: &EgressConfig) -> [u8; 32] {
         .map(ToString::to_string)
         .collect();
     private_cidrs.sort_unstable();
-    hash_strings(&mut hasher, private_cidrs.iter().map(String::as_str));
+    hash_strings(hasher, private_cidrs.iter().map(String::as_str));
 
     let mut allowed_ports: Vec<_> = config.allowed_ports.iter().copied().collect();
     allowed_ports.sort_unstable();
@@ -1604,24 +1822,8 @@ fn egress_config_generation(config: &EgressConfig) -> [u8; 32] {
         .map(ToString::to_string)
         .collect();
     nat64_prefixes.sort_unstable();
-    hash_strings(&mut hasher, nat64_prefixes.iter().map(String::as_str));
-
-    hash_duration(&mut hasher, config.timeout);
-    hash_duration(&mut hasher, config.response_idle_timeout);
-    hash_duration(&mut hasher, config.connect_timeout);
-    hasher.update((config.max_response_bytes as u64).to_be_bytes());
-    hasher.update((config.max_request_body_bytes as u64).to_be_bytes());
+    hash_strings(hasher, nat64_prefixes.iter().map(String::as_str));
     hasher.update([u8::from(config.deny_private_ips)]);
-    hasher.update(config.tls_root_set_fingerprint);
-    match config.client_identity_fingerprint {
-        Some(fingerprint) => {
-            hasher.update([1]);
-            hasher.update(fingerprint);
-        }
-        None => hasher.update([0]),
-    }
-
-    hasher.finalize().into()
 }
 
 fn hash_strings<'a>(hasher: &mut Sha256, values: impl IntoIterator<Item = &'a str>) {
@@ -2118,6 +2320,204 @@ mod tests {
         );
     }
 
+    #[test]
+    fn in_memory_tls_material_is_validated_without_retaining_or_rendering_input() {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["tls-material.example.test".to_owned()])
+                .expect("test certificate should generate");
+        let ca_pem = certified.cert.pem();
+        let identity_pem = format!("{}{}", ca_pem, certified.key_pair.serialize_pem());
+
+        let mut config = EgressConfig {
+            tls_ca_bundle_path: Some(PathBuf::from("old-locator-canary.pem")),
+            ..EgressConfig::default()
+        };
+        config
+            .apply_tls_ca_bundle_pem(ca_pem.as_bytes())
+            .expect("in-memory CA bundle should be accepted");
+        config
+            .apply_tls_client_identity_pem(identity_pem.as_bytes())
+            .expect("in-memory combined identity should be accepted");
+
+        assert!(config.tls_ca_bundle_path.is_none());
+        assert!(!config.tls_root_certificates.is_empty());
+        assert!(config.client_identity.is_some());
+        assert!(config.client_identity_fingerprint.is_some());
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("old-locator-canary"));
+        assert!(!debug.contains("BEGIN CERTIFICATE"));
+        assert!(!debug.contains("BEGIN PRIVATE KEY"));
+        assert!(!debug.contains("tls_root_set_fingerprint"));
+        assert!(!debug.contains("client_identity_fingerprint"));
+
+        let invalid_ca = b"TOP_SECRET_INVALID_CA_MATERIAL";
+        let ca_error = EgressConfig::default()
+            .apply_tls_ca_bundle_pem(invalid_ca)
+            .expect_err("invalid in-memory CA material must fail");
+        let rendered_ca_error = format!("{ca_error:?}\n{ca_error}");
+        assert_eq!(ca_error.safe_category(), "invalid_tls_ca_bundle");
+        assert!(!rendered_ca_error.contains(std::str::from_utf8(invalid_ca).expect("ASCII marker")));
+        assert!(!rendered_ca_error.contains("memory"));
+
+        let invalid_identity = b"TOP_SECRET_INVALID_IDENTITY_MATERIAL";
+        let identity_error = EgressConfig::default()
+            .apply_tls_client_identity_pem(invalid_identity)
+            .expect_err("invalid in-memory identity material must fail");
+        let rendered_identity_error = format!("{identity_error:?}\n{identity_error}");
+        assert_eq!(
+            identity_error.safe_category(),
+            "invalid_tls_client_identity"
+        );
+        assert!(!rendered_identity_error
+            .contains(std::str::from_utf8(invalid_identity).expect("ASCII marker")));
+
+        let ca_path = std::env::temp_dir().join(format!(
+            "greengateway-in-memory-ca-delegation-{}.pem",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&ca_path, ca_pem.as_bytes()).expect("test CA file should be written");
+        let mut from_path = EgressConfig::default();
+        from_path
+            .apply_tls_ca_bundle_path(ca_path.clone())
+            .expect("path CA setter should delegate to the PEM validator");
+        assert_eq!(from_path.tls_ca_bundle_path.as_ref(), Some(&ca_path));
+        assert_eq!(
+            from_path.tls_root_set_fingerprint,
+            config.tls_root_set_fingerprint
+        );
+        let _ = fs::remove_file(ca_path);
+    }
+
+    #[test]
+    fn opaque_transport_partition_changes_transport_but_not_policy_identity() {
+        let base = egress_config_for_host("partition.example.test");
+        let mut first = base.clone();
+        first.apply_transport_partition(b"connection-partition-a-canary");
+        let mut same = base.clone();
+        same.apply_transport_partition(b"connection-partition-a-canary");
+        let mut different = base.clone();
+        different.apply_transport_partition(b"connection-partition-b-canary");
+
+        assert_ne!(base, first);
+        assert_eq!(first, same);
+        assert_ne!(first, different);
+        assert_eq!(
+            egress_policy_generation(&first),
+            egress_policy_generation(&different),
+            "transport partitioning must not alter effective egress policy"
+        );
+        assert_eq!(
+            egress_config_generation(&first),
+            egress_config_generation(&same)
+        );
+        assert_ne!(
+            egress_config_generation(&first),
+            egress_config_generation(&different)
+        );
+
+        let debug = format!("{first:?}");
+        assert!(debug.contains("transport_partitioned: true"));
+        assert!(!debug.contains("transport_partition:"));
+        assert!(!debug.contains("connection-partition-a-canary"));
+    }
+
+    #[tokio::test]
+    async fn rebind_adopts_only_same_policy_and_authority_without_dns() {
+        let resolver = Arc::new(FakeDnsResolver::with_addresses(vec![socket("8.8.8.8:443")]));
+        let base_config = EgressConfig {
+            allowed_hosts: HashSet::from([
+                "rebind.example.test".to_owned(),
+                "other.example.test".to_owned(),
+            ]),
+            ..EgressConfig::default()
+        };
+        let client = isolated_egress_client(base_config.clone(), resolver.clone());
+        let url = "https://rebind.example.test/resource";
+        let destination = client
+            .checked_destination(url)
+            .await
+            .expect("initial egress policy and DNS check should succeed");
+
+        let mut transport_config = base_config.clone();
+        transport_config.timeout += Duration::from_secs(1);
+        transport_config.apply_transport_partition(b"reconfigured-transport");
+        let reconfigured = client
+            .reconfigured(transport_config)
+            .expect("transport-only reconfiguration should build");
+
+        assert_eq!(
+            destination.policy_generation,
+            reconfigured.policy_generation
+        );
+        assert_ne!(
+            destination.config_generation,
+            reconfigured.config_generation
+        );
+        let rebound = reconfigured
+            .rebind_checked_destination(&destination, url)
+            .expect("same-policy exact destination should be rebound");
+        assert_eq!(rebound.pinned_addr, destination.pinned_addr);
+        assert_eq!(rebound.config_generation, reconfigured.config_generation);
+        assert_eq!(
+            resolver.calls(),
+            vec![("rebind.example.test".to_owned(), 443)],
+            "rebind must not perform DNS"
+        );
+
+        reconfigured
+            .mcp_reqwest_client_at_checked_destination(&rebound, url)
+            .expect("rebound destination should select an MCP-safe pinned client");
+        reconfigured
+            .mcp_reqwest_client_at_checked_destination(&rebound, url)
+            .expect("identical MCP transport should reuse the pinned client");
+        assert_eq!(reconfigured.client_cache.len(), 1);
+        assert_eq!(
+            resolver.calls().len(),
+            1,
+            "cached MCP client selection must not perform DNS"
+        );
+
+        let old_generation_error = reconfigured
+            .mcp_reqwest_client_at_checked_destination(&destination, url)
+            .expect_err("an un-rebound destination must not cross configurations");
+        assert!(matches!(
+            old_generation_error,
+            EgressError::InvalidPolicy(_)
+        ));
+
+        let authority_error = reconfigured
+            .rebind_checked_destination(&destination, "https://other.example.test/resource")
+            .expect_err("rebind must not authorize another authority");
+        assert!(matches!(authority_error, EgressError::InvalidPolicy(_)));
+
+        let mut changed_policy = base_config;
+        changed_policy
+            .allowed_hosts
+            .insert("policy-change.example.test".to_owned());
+        let changed_policy_client = client
+            .reconfigured(changed_policy)
+            .expect("changed-policy client should build");
+        let policy_error = changed_policy_client
+            .rebind_checked_destination(&destination, url)
+            .expect_err("destination must not cross effective egress policies");
+        assert!(matches!(policy_error, EgressError::InvalidPolicy(_)));
+
+        let mut tampered_destination = destination;
+        tampered_destination.pinned_addr = socket("10.0.0.1:443");
+        let socket_error = reconfigured
+            .rebind_checked_destination(&tampered_destination, url)
+            .expect_err("pinned socket must be revalidated without DNS");
+        assert!(matches!(
+            socket_error,
+            EgressError::NonGlobalIpBlocked(blocked) if blocked == ip("10.0.0.1")
+        ));
+        assert_eq!(resolver.calls().len(), 1);
+
+        let destination_debug = format!("{rebound:?}");
+        assert!(!destination_debug.contains("generation"));
+        assert!(!destination_debug.contains("transport_partition"));
+    }
+
     fn isolated_egress_client(
         config: EgressConfig,
         resolver: Arc<dyn DnsResolver>,
@@ -2174,7 +2574,7 @@ mod tests {
             ),
             (
                 EgressError::InvalidTlsCaBundle {
-                    path: PathBuf::from("secret-ca-path"),
+                    path: PathBuf::from("secret-ca-path").into(),
                     message: "secret-ca-error".to_owned(),
                 },
                 "invalid_tls_ca_bundle",

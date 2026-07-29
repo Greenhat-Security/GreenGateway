@@ -62,7 +62,7 @@ pub(crate) struct OAuthBinding {
 
 pub(crate) struct OAuthTokenLease {
     access_token: Zeroizing<Vec<u8>>,
-    slot: Arc<OAuthTokenSlot>,
+    slot: Option<Arc<OAuthTokenSlot>>,
     generation: u64,
 }
 
@@ -146,6 +146,10 @@ impl OAuthClock for SystemOAuthClock {
 
 struct SecretString(Zeroizing<String>);
 
+tokio::task_local! {
+    static CONNECTION_TEST_OWNS_OAUTH_MINT: ();
+}
+
 impl<'de> Deserialize<'de> for SecretString {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -201,6 +205,15 @@ impl OAuthClientCredentialsRuntime {
         &self,
         binding: &OAuthBinding,
     ) -> Result<OAuthTokenLease, OAuthError> {
+        if CONNECTION_TEST_OWNS_OAUTH_MINT.try_with(|()| ()).is_ok() {
+            let minted = self.mint(binding).await?;
+            return Ok(OAuthTokenLease {
+                access_token: minted.access_token,
+                slot: None,
+                generation: 0,
+            });
+        }
+
         let secret_version = self
             .control_plane
             .local_secret_version(&binding.client_secret_id);
@@ -359,7 +372,10 @@ impl OAuthTokenLease {
     }
 
     pub(crate) async fn invalidate_after_unauthorized(&self) {
-        let mut state = self.slot.state.lock().await;
+        let Some(slot) = self.slot.as_ref() else {
+            return;
+        };
+        let mut state = slot.state.lock().await;
         if state
             .cached
             .as_ref()
@@ -442,7 +458,7 @@ impl OAuthTokenCache {
                 generation,
             } => Ok(OAuthTokenLease {
                 access_token,
-                slot,
+                slot: Some(slot),
                 generation,
             }),
             OAuthMintOutcome::Failure(error) => Err(error),
@@ -575,9 +591,22 @@ fn lease_from_cached(
 ) -> Result<OAuthTokenLease, OAuthError> {
     Ok(OAuthTokenLease {
         access_token: Zeroizing::new(cached.access_token.to_vec()),
-        slot,
+        slot: Some(slot),
         generation: cached.generation,
     })
+}
+
+/// Runs a saved-connection probe with OAuth minting owned by the caller.
+///
+/// Data-plane resolution keeps the shared detached single-flight cache so a
+/// cancelled waiter cannot cancel other callers. Probes mint inline without
+/// caching, allowing the endpoint deadline to drop all secret and token-server
+/// work before its admission permit is released.
+pub(crate) async fn scope_connection_test_oauth_mints<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    CONNECTION_TEST_OWNS_OAUTH_MINT.scope((), future).await
 }
 
 fn token_request_headers(client_id: &str, client_secret: &[u8]) -> Result<HeaderMap, OAuthError> {
