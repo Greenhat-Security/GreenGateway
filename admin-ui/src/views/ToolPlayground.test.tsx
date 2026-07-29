@@ -436,6 +436,58 @@ describe('ToolPlayground', () => {
     );
     expect(await screen.findByText('second result')).toBeTruthy();
   });
+
+  it.each([
+    ['malformed JSON', '{"value":'],
+    ['a non-object value', '[1,2,3]'],
+    ['an oversized object', `{"value":"${'x'.repeat(65_536)}"}`],
+  ])(
+    'blocks a rapid duplicate submit after rejecting %s',
+    async (_label, invalidArguments) => {
+      let executions = 0;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+          if (!init?.method) {
+            return Promise.resolve(
+              jsonResponse(200, capabilityDetail(), {
+                ETag: '"capability:v1"',
+              }),
+            );
+          }
+          executions += 1;
+          return Promise.resolve(
+            jsonResponse(
+              200,
+              {
+                kind: 'http',
+                status: 200,
+                body: { type: 'text', value: 'must not run' },
+              },
+              { ETag: '"capability:v1"' },
+            ),
+          );
+        }),
+      );
+
+      renderPlayground('/tools/cap_abc/playground');
+      const editor = await screen.findByLabelText(
+        'Arguments (JSON)',
+      ) as HTMLTextAreaElement;
+      fireEvent.change(editor, { target: { value: invalidArguments } });
+      const run = screen.getByRole('button', { name: 'Run tool' });
+      fireEvent.click(run);
+      fireEvent.click(run);
+
+      await waitFor(() => expect(editor.value).toBe('{}'));
+      expect(executions).toBe(0);
+      expect(screen.queryByText('must not run')).toBeNull();
+
+      fireEvent.change(editor, { target: { value: '{"retry":true}' } });
+      fireEvent.click(run);
+      await waitFor(() => expect(executions).toBe(1));
+    },
+  );
 });
 
 function renderPlayground(initialEntry: string, switchTo?: string) {

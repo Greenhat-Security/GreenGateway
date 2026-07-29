@@ -785,6 +785,18 @@ impl ToolExecutor {
         };
         self.enforce_execution_precondition(context, &tool, precondition)?;
         if precondition.is_some()
+            && !self.runtime.authorize_http_operation(
+                &tool.name,
+                request.method.as_str(),
+                &request.path,
+                context,
+            )
+        {
+            return Err(ToolExecutorError::HttpRuleDenied {
+                tool_name: tool.name.clone(),
+            });
+        }
+        if precondition.is_some()
             && captured_connection_target
                 .as_ref()
                 .and_then(|target| target.as_ref().ok())
@@ -3325,6 +3337,126 @@ mod tests {
                 .await
                 .is_err(),
             "the edited target must not receive upstream bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_http_deny_published_during_precondition_fails_before_secret_or_upstream_io() {
+        const ARGUMENT_CANARY: &str = "policy-race-argument-canary";
+        const SECRET_CANARY: &str = "policy-race-secret-canary";
+
+        let (addr, ca_pem, server) = one_request_tls_server().await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, SECRET_CANARY.as_bytes());
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let initial_policy = Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "get_charge": {
+                    "timeout_ms": 500,
+                    "max_concurrent": 1
+                }
+            }
+        }))
+        .expect("initial live policy should validate");
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            initial_policy,
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let runtime = ToolRuntime::new_with_rbac_state(
+            runtime_config([("get_charge", enabled_tool(500, 1))], 2, 1, 100),
+            audit.clone(),
+            Some(rbac_state.clone()),
+        );
+        let executor = executor_for_connection_tool(
+            connection_charge_tool(&connection.connection_id),
+            &connection,
+            runtime,
+            audit,
+        );
+        let policy_path = connection.root.join("live-policy.json");
+        let policy_path_for_precondition = policy_path.clone();
+        let rbac_state_for_precondition = rbac_state.clone();
+        let secret_path = connection.secret_path.clone();
+        let precondition = ToolExecutionPrecondition::new(move |_| {
+            let deny_policy = json!({
+                "schema_version": "0.1.0",
+                "tools": {
+                    "get_charge": {
+                        "timeout_ms": 500,
+                        "max_concurrent": 1
+                    }
+                },
+                "rules": [{
+                    "id": "deny-charge-after-precondition",
+                    "methods": ["GET"],
+                    "path": "/charges/{charge_id}",
+                    "action": "deny"
+                }]
+            });
+            fs::write(
+                &policy_path_for_precondition,
+                serde_json::to_vec(&deny_policy).expect("deny policy should serialize"),
+            )
+            .expect("deny policy should write");
+            crate::middleware::rbac::reload_policy_from_file(
+                &rbac_state_for_precondition,
+                &policy_path_for_precondition,
+            )
+            .expect("deny policy should publish during the final precondition");
+            fs::remove_file(&secret_path)
+                .expect("secret canary should disappear after the policy reload");
+            Ok(())
+        });
+        let mut context = invocation_context();
+        context.source = ToolInvocationSource::AdminPlayground;
+
+        let error = executor
+            .execute_inner(
+                "get_charge",
+                json!({ "charge_id": ARGUMENT_CANARY }),
+                &context,
+                Some(&precondition),
+            )
+            .await
+            .expect_err("the newly published direct HTTP Deny rule must fail closed");
+
+        assert!(matches!(
+            error,
+            ToolExecutorError::HttpRuleDenied { ref tool_name } if tool_name == "get_charge"
+        ));
+        let events = audit_events(&capture, 1).await;
+        let denied = events
+            .iter()
+            .find(|event| event.event_type == "authz.denied")
+            .expect("the final authorization check should audit the live Deny rule");
+        assert_eq!(denied.payload["tool_name"], json!("get_charge"));
+        assert_eq!(denied.payload["method"], json!("GET"));
+        assert_eq!(denied.payload["path"], json!("/mcp/tools/get_charge"));
+        assert_eq!(
+            denied.payload["matched_rule_id"],
+            json!("deny-charge-after-precondition")
+        );
+        assert_eq!(
+            denied.payload["invocation_source"],
+            json!("admin_playground")
+        );
+        assert!(events.iter().all(|event| {
+            event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
+                && event.event_type != audit::event::TOOL_UPSTREAM_REQUEST
+        }));
+        let rendered_events =
+            serde_json::to_string(&events).expect("policy-race audit events should serialize");
+        assert!(!rendered_events.contains(ARGUMENT_CANARY));
+        assert!(!rendered_events.contains(SECRET_CANARY));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "the newly denied invocation must not send upstream bytes"
         );
     }
 

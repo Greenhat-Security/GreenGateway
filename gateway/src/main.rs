@@ -5455,17 +5455,22 @@ async fn tool_playground_execute_endpoint(
     let precondition_rbac_state = rbac_state.clone();
     let precondition_principal = principal.clone();
     let expected_etag = supplied_etag.clone();
-    let precondition =
-        tools::executor::ToolExecutionPrecondition::new(move |current_definition| match inventory
-            .execution_etag_for_definition(
-                &precondition_rbac_state,
-                &precondition_principal,
-                current_definition,
-            ) {
+    let precondition = tools::executor::ToolExecutionPrecondition::new(move |current_definition| {
+        if !precondition_rbac_state
+            .principal_has_permission(&precondition_principal, ADMIN_TOOLS_EXECUTE_PERMISSION)
+        {
+            return Err(tools::executor::ToolExecutionPreconditionError::Failed);
+        }
+        match inventory.execution_etag_for_definition(
+            &precondition_rbac_state,
+            &precondition_principal,
+            current_definition,
+        ) {
             Ok(Some(current_etag)) if current_etag == expected_etag => Ok(()),
             Ok(_) => Err(tools::executor::ToolExecutionPreconditionError::Failed),
             Err(_) => Err(tools::executor::ToolExecutionPreconditionError::Unavailable),
-        });
+        }
+    });
     let context = tools::runtime::ToolInvocationContext {
         request_id: client_ip::request_id(&parts.headers, &parts.extensions),
         source_ip: client_ip::canonical_client_ip(
@@ -24872,6 +24877,388 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_playground_queued_execution_rechecks_live_execute_permission() {
+        const FIRST_REQUEST_ID: &str = "playground-live-revocation-first";
+        const SECOND_REQUEST_ID: &str = "playground-live-revocation-second";
+        const SECOND_ARGUMENT_CANARY: &str = "playground-live-revocation-argument-canary";
+
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let upstream = Router::new().route(
+            "/v1/echo",
+            post({
+                let upstream_calls = Arc::clone(&upstream_calls);
+                let first_started = Arc::clone(&first_started);
+                let release_first = Arc::clone(&release_first);
+                move |Json(arguments): Json<Value>| {
+                    let upstream_calls = Arc::clone(&upstream_calls);
+                    let first_started = Arc::clone(&first_started);
+                    let release_first = Arc::clone(&release_first);
+                    async move {
+                        let call_index = upstream_calls.fetch_add(1, Ordering::SeqCst);
+                        if call_index == 0 {
+                            first_started.notify_one();
+                            release_first.notified().await;
+                        }
+                        Json(json!({ "echoed": arguments }))
+                    }
+                }
+            }),
+        );
+        let upstream_addr = spawn_router(upstream).await;
+
+        let mut initial_policy: Value = serde_json::from_str(
+            &tools_policy_document_with_execute_route_permission(ADMIN_TOOLS_READ_PERMISSION),
+        )
+        .expect("initial playground policy should parse");
+        initial_policy["tools"]["echo"]["max_concurrent"] = json!(1);
+        initial_policy["rules"] = json!([{
+            "id": "allow-admin-playground-echo",
+            "tool_name": "echo",
+            "principal": {
+                "roles": ["admin"]
+            },
+            "action": "allow"
+        }]);
+        let mut revoked_policy = initial_policy.clone();
+        revoked_policy["roles"]["admin"]["permissions"]
+            .as_array_mut()
+            .expect("admin permissions should be an array")
+            .retain(|permission| permission.as_str() != Some(ADMIN_TOOLS_EXECUTE_PERMISSION));
+
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let resolver = Arc::new(CountingDnsResolver {
+            calls: AtomicUsize::new(0),
+            address_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        });
+        let resolver_trait: Arc<dyn egress::DnsResolver> = resolver.clone();
+        let harness = tools_admin_harness_with_options(
+            mcp_tools_document(),
+            audit_log,
+            format!("http://playground.test:{}", upstream_addr.port()),
+            initial_policy.to_string(),
+            |config| {
+                config.egress_allowed_hosts = vec!["playground.test".to_owned()];
+                config.tool_runtime_queue_depth = 8;
+                config.tool_runtime_global_concurrency = 1;
+                config.tool_runtime_queue_timeout_ms = 5_000;
+            },
+            GatewayAppBuildOverrides {
+                egress_resolver: Some(resolver_trait),
+                disable_proxy_health_checks: true,
+                ..GatewayAppBuildOverrides::default()
+            },
+        )
+        .await;
+
+        let list_response = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.admin_token),
+                &format!("{TOOLS_ADMIN_ROUTE}?text=echo"),
+            ))
+            .await
+            .expect("tool inventory request should complete");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list = json_body(list_response).await;
+        let capability_id = list["capabilities"][0]["id"]
+            .as_str()
+            .expect("echo should have an opaque capability ID")
+            .to_owned();
+        let detail_response = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.admin_token),
+                &format!("{TOOLS_ADMIN_ROUTE}/{capability_id}"),
+            ))
+            .await
+            .expect("tool detail request should complete");
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let execution_etag = detail_response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("tool detail should include an execution ETag")
+            .to_owned();
+
+        let mut first_request = tool_playground_request(
+            Some(&harness.admin_token),
+            &capability_id,
+            Some(&execution_etag),
+            Body::from(r#"{"arguments":{"message":"occupy-runtime-permit"}}"#),
+        );
+        first_request.headers_mut().insert(
+            HeaderName::from_static(REQUEST_ID_HEADER),
+            HeaderValue::from_static(FIRST_REQUEST_ID),
+        );
+        let first = tokio::spawn({
+            let router = harness.router.clone();
+            async move {
+                router
+                    .oneshot(first_request)
+                    .await
+                    .expect("first playground request should complete")
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), first_started.notified())
+            .await
+            .expect("first request should occupy the runtime permit");
+        let dns_calls_after_first = resolver.calls.load(Ordering::SeqCst);
+        assert!(
+            dns_calls_after_first > 0,
+            "the first request should prove DNS and upstream work are instrumented"
+        );
+
+        let mut second_request = tool_playground_request(
+            Some(&harness.admin_token),
+            &capability_id,
+            Some(&execution_etag),
+            Body::from(format!(
+                r#"{{"arguments":{{"message":"{SECOND_ARGUMENT_CANARY}"}}}}"#
+            )),
+        );
+        second_request.headers_mut().insert(
+            HeaderName::from_static(REQUEST_ID_HEADER),
+            HeaderValue::from_static(SECOND_REQUEST_ID),
+        );
+        let second = tokio::spawn({
+            let router = harness.router.clone();
+            async move {
+                router
+                    .oneshot(second_request)
+                    .await
+                    .expect("queued playground request should complete")
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if capture.events().iter().any(|event| {
+                    event.request_id == SECOND_REQUEST_ID
+                        && event.event_type == "authz.allowed"
+                        && event.payload["matched_rule_id"] == json!("allow-admin-playground-echo")
+                        && event.payload["invocation_source"] == json!("admin_playground")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second request should pass normal tool policy before queueing");
+        assert!(
+            !second.is_finished(),
+            "the second request must still be queued behind the first"
+        );
+
+        harness._policy.write(&revoked_policy.to_string());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let probe = harness
+                    .router
+                    .clone()
+                    .oneshot(tool_playground_request(
+                        Some(&harness.admin_token),
+                        &capability_id,
+                        None,
+                        Body::from("not-json"),
+                    ))
+                    .await
+                    .expect("permission reload probe should complete");
+                assert_capability_inventory_no_store(&probe);
+                if probe.status() == StatusCode::FORBIDDEN {
+                    break;
+                }
+                assert_eq!(
+                    probe.status(),
+                    StatusCode::PRECONDITION_REQUIRED,
+                    "the probe may only observe the old or revoked permission state"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("live policy should revoke the execute permission");
+
+        release_first.notify_one();
+        let first_response = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first playground task should finish")
+            .expect("first playground task should join");
+        assert_eq!(first_response.status(), StatusCode::OK);
+        assert_capability_inventory_no_store(&first_response);
+        let second_response = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("queued playground task should finish")
+            .expect("queued playground task should join");
+        assert_eq!(
+            second_response.status(),
+            StatusCode::PRECONDITION_FAILED,
+            "permission revoked while queued must fail the final execution precondition"
+        );
+        assert_capability_inventory_no_store(&second_response);
+        assert_eq!(
+            json_body(second_response).await["reason"],
+            json!("precondition_failed")
+        );
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            1,
+            "the revoked queued request must not reach the upstream"
+        );
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            dns_calls_after_first,
+            "the revoked queued request must not start another DNS resolution"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if capture.events().iter().any(|event| {
+                    event.request_id == SECOND_REQUEST_ID
+                        && event.event_type == audit::event::TOOL_INVOKE_REJECTED
+                        && event.payload["reason"] == json!("precondition_failed")
+                        && event.payload["invocation_source"] == json!("admin_playground")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("queued permission revocation should emit a safe rejection audit");
+        let second_events = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.request_id == SECOND_REQUEST_ID)
+            .collect::<Vec<_>>();
+        assert!(second_events.iter().all(|event| {
+            event.event_type != audit::event::TOOL_UPSTREAM_REQUEST
+                && event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
+        }));
+        let serialized_events =
+            serde_json::to_string(&second_events).expect("audit events should serialize");
+        assert!(
+            !serialized_events.contains(SECOND_ARGUMENT_CANARY),
+            "queued request arguments must not enter audit payloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_playground_preserves_arbitrary_precision_numbers_to_http_upstream() {
+        const INPUT_ARGUMENTS: &str = r#"{"beyond_u64":18446744073709551616,"high_precision_decimal":0.123456789012345678901234567890123456789,"huge_exponent":1e400}"#;
+        const EXPECTED_UPSTREAM_BODY: &str = r#"{"beyond_u64":18446744073709551616,"high_precision_decimal":0.123456789012345678901234567890123456789,"huge_exponent":1e+400}"#;
+
+        let captured_body = Arc::new(Mutex::new(None::<String>));
+        let upstream = Router::new().route(
+            "/v1/echo",
+            post({
+                let captured_body = Arc::clone(&captured_body);
+                move |body: Bytes| {
+                    let captured_body = Arc::clone(&captured_body);
+                    async move {
+                        let body = String::from_utf8(body.to_vec())
+                            .expect("playground upstream body should be UTF-8 JSON");
+                        *captured_body
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(body);
+                        Json(json!({ "accepted": true }))
+                    }
+                }
+            }),
+        );
+        let upstream_addr = spawn_router(upstream).await;
+        let tools_document = json!({
+            "schema_version": "0.1.0",
+            "tools": [{
+                "name": "echo",
+                "description": "Preserves arbitrary-precision numeric arguments.",
+                "input_json_schema": {
+                    "type": "object",
+                    "required": ["beyond_u64", "high_precision_decimal", "huge_exponent"],
+                    "properties": {
+                        "beyond_u64": { "type": "integer" },
+                        "high_precision_decimal": { "type": "number" },
+                        "huge_exponent": { "type": "number" }
+                    },
+                    "additionalProperties": false
+                },
+                "upstream": {
+                    "method": "POST",
+                    "path_template": "/v1/echo",
+                    "body": {
+                        "mode": "whole_args_json"
+                    }
+                }
+            }]
+        })
+        .to_string();
+        let harness = tools_admin_harness_with_upstream(
+            tools_document,
+            test_audit_log(),
+            format!("http://{upstream_addr}"),
+        )
+        .await;
+
+        let list_response = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.admin_token),
+                &format!("{TOOLS_ADMIN_ROUTE}?text=echo"),
+            ))
+            .await
+            .expect("tool inventory request should complete");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list = json_body(list_response).await;
+        let capability_id = list["capabilities"][0]["id"]
+            .as_str()
+            .expect("echo should have an opaque capability ID")
+            .to_owned();
+        let detail_response = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.admin_token),
+                &format!("{TOOLS_ADMIN_ROUTE}/{capability_id}"),
+            ))
+            .await
+            .expect("tool detail request should complete");
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let execution_etag = detail_response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("tool detail should include an execution ETag")
+            .to_owned();
+
+        let response = harness
+            .router
+            .oneshot(tool_playground_request(
+                Some(&harness.admin_token),
+                &capability_id,
+                Some(&execution_etag),
+                Body::from(format!(r#"{{"arguments":{INPUT_ARGUMENTS}}}"#)),
+            ))
+            .await
+            .expect("arbitrary-precision playground request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_capability_inventory_no_store(&response);
+        assert_eq!(
+            captured_body
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_deref(),
+            Some(EXPECTED_UPSTREAM_BODY),
+            "the endpoint parser and whole-args HTTP mapping must preserve exact numeric values; serde_json may normalize the positive exponent sign"
+        );
+    }
+
+    #[tokio::test]
     async fn openapi_tools_preview_returns_generated_tools_and_current_tools_etag() {
         let harness = tools_admin_harness(empty_tools_document(), test_audit_log()).await;
 
@@ -33141,6 +33528,25 @@ paths:
         upstream_url: String,
         policy_document: String,
     ) -> ToolsAdminTestHarness {
+        tools_admin_harness_with_options(
+            tools_document,
+            audit_log,
+            upstream_url,
+            policy_document,
+            |_| {},
+            GatewayAppBuildOverrides::default(),
+        )
+        .await
+    }
+
+    async fn tools_admin_harness_with_options(
+        tools_document: String,
+        audit_log: audit::AuditLog,
+        upstream_url: String,
+        policy_document: String,
+        configure: impl FnOnce(&mut config::Config),
+        build_overrides: GatewayAppBuildOverrides,
+    ) -> ToolsAdminTestHarness {
         let token_db = TempDb::new("tools-admin-service-tokens");
         let token_store =
             auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
@@ -33158,15 +33564,22 @@ paths:
         config.upstream_url = Some(upstream_url);
         config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
         config.egress_deny_private_ips = false;
+        configure(&mut config);
 
         let recorder = PrometheusBuilder::new().build_recorder();
-        let router = app(
+        let app = gateway_app_with_process_started_at_and_overrides(
             config,
             recorder.handle(),
             audit_log,
             test_audit_event_sender(),
+            Instant::now(),
+            build_overrides,
         )
         .expect("tools admin test app should build");
+        let router = match app {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("tools admin test app should be unified"),
+        };
 
         ToolsAdminTestHarness {
             router,

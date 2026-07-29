@@ -275,6 +275,29 @@ mod tests {
     }
 
     #[test]
+    fn request_preserves_arbitrary_precision_numbers_for_executor_mapping() {
+        let request: ToolPlaygroundRequest = serde_json::from_str(
+            r#"{"arguments":{"beyond_u64":18446744073709551616,"high_precision_decimal":0.123456789012345678901234567890123456789,"huge_exponent":1e400}}"#,
+        )
+        .expect("valid arbitrary-precision JSON numbers should deserialize");
+
+        assert_eq!(
+            request.arguments["beyond_u64"].to_string(),
+            "18446744073709551616"
+        );
+        assert_eq!(
+            request.arguments["high_precision_decimal"].to_string(),
+            "0.123456789012345678901234567890123456789"
+        );
+        assert_eq!(request.arguments["huge_exponent"].to_string(), "1e+400");
+        let serialized = serde_json::to_string(&request.arguments)
+            .expect("arbitrary-precision arguments should reserialize");
+        assert!(serialized.contains("18446744073709551616"));
+        assert!(serialized.contains("0.123456789012345678901234567890123456789"));
+        assert!(serialized.contains("1e+400"));
+    }
+
+    #[test]
     fn http_projection_exposes_only_status_and_json_body() {
         let mut headers = HeaderMap::new();
         headers.insert(

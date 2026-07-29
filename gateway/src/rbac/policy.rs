@@ -2062,7 +2062,7 @@ mod tests {
                     "schema_version": "0.1.0",
                     "egress": { "ports": [70000] }
                 }"#,
-                "invalid value",
+                "invalid number",
             ),
             (
                 "unknown egress field",

@@ -45,6 +45,7 @@ export function ToolPlayground() {
     useState<PlaygroundFeedback | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const runningRef = useRef(false);
+  const requiresArgumentEditRef = useRef(false);
   const executionController = useRef<AbortController | null>(null);
   const feedbackRef = useRef<HTMLDivElement | null>(null);
   const resultRef = useRef<HTMLElement | null>(null);
@@ -55,6 +56,7 @@ export function ToolPlayground() {
     executionController.current?.abort();
     executionController.current = null;
     runningRef.current = false;
+    requiresArgumentEditRef.current = false;
     argumentsRef.current = EMPTY_ARGUMENTS;
     setArgumentsText(EMPTY_ARGUMENTS);
     setResult(null);
@@ -110,6 +112,7 @@ export function ToolPlayground() {
       executionController.current?.abort();
       executionController.current = null;
       runningRef.current = false;
+      requiresArgumentEditRef.current = false;
       argumentsRef.current = EMPTY_ARGUMENTS;
     };
   }, [id, reloadKey]);
@@ -127,6 +130,7 @@ export function ToolPlayground() {
   }, [result]);
 
   function updateArguments(value: string) {
+    requiresArgumentEditRef.current = false;
     argumentsRef.current = value;
     setArgumentsText(value);
     setRunFeedback(null);
@@ -134,9 +138,10 @@ export function ToolPlayground() {
 
   async function runTool(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (runningRef.current) {
+    if (runningRef.current || requiresArgumentEditRef.current) {
       return;
     }
+    runningRef.current = true;
 
     setResult(null);
     setRunFeedback(null);
@@ -153,6 +158,8 @@ export function ToolPlayground() {
       const parsed = JSON.parse(submittedText) as unknown;
       if (!isJsonObject(parsed)) {
         submittedText = '';
+        runningRef.current = false;
+        requiresArgumentEditRef.current = true;
         setRunFeedback({
           tone: 'error',
           title: 'JSON object required',
@@ -163,6 +170,8 @@ export function ToolPlayground() {
       }
     } catch {
       submittedText = '';
+      runningRef.current = false;
+      requiresArgumentEditRef.current = true;
       setRunFeedback({
         tone: 'error',
         title: 'Valid JSON object required',
@@ -178,6 +187,7 @@ export function ToolPlayground() {
       etag === null
     ) {
       submittedText = '';
+      runningRef.current = false;
       setRunFeedback({
         tone: 'warning',
         title: 'Tool execution unavailable',
@@ -190,7 +200,6 @@ export function ToolPlayground() {
     const controller = new AbortController();
     executionController.current?.abort();
     executionController.current = controller;
-    runningRef.current = true;
     setIsRunning(true);
     setAnnouncement('Tool execution started. Submitted arguments were cleared.');
 
@@ -241,6 +250,7 @@ export function ToolPlayground() {
     executionController.current?.abort();
     executionController.current = null;
     runningRef.current = false;
+    requiresArgumentEditRef.current = false;
     argumentsRef.current = EMPTY_ARGUMENTS;
     setArgumentsText(EMPTY_ARGUMENTS);
     setResult(null);
