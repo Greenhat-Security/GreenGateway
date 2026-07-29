@@ -3200,7 +3200,7 @@ async fn connection_secret_create_endpoint(
     match if_match_matches(&parts.headers, &current_collection_etag) {
         Ok(true) => {}
         Ok(false) => {
-            return with_etag(
+            return with_connection_secret_collection_etag(
                 precondition_failed(
                     "If-Match does not match the current connection-secret collection ETag",
                 ),
@@ -3208,7 +3208,10 @@ async fn connection_secret_create_endpoint(
             );
         }
         Err(error) => {
-            return with_etag(if_match_error_response(error), &current_collection_etag);
+            return with_connection_secret_collection_etag(
+                if_match_error_response(error),
+                &current_collection_etag,
+            );
         }
     }
     if !state.control_plane.is_local_secret_manager_configured() {
@@ -3242,7 +3245,7 @@ async fn connection_secret_create_endpoint(
     let locked_collection_etag = connections::admin::secret_collection_etag(&locked_metadata);
     if locked_collection_etag != current_collection_etag {
         drop(mutation_guard);
-        return with_etag(
+        return with_connection_secret_collection_etag(
             precondition_failed(
                 "If-Match does not match the current connection-secret collection ETag",
             ),
@@ -22003,6 +22006,7 @@ mod tests {
         let capture = audit::sink::tests::CaptureSink::new();
         let audit_log =
             audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let audit_drain = audit_log.clone();
         let router = connection_admin_router(&connection_db, &policy, audit_log);
         let secret_manager = test_principal(&["connections-secret-manager"]);
 
@@ -22129,6 +22133,19 @@ mod tests {
             missing_create_precondition.status(),
             StatusCode::PRECONDITION_REQUIRED
         );
+        assert!(
+            !missing_create_precondition
+                .headers()
+                .contains_key(header::ETAG),
+            "a collection precondition failure must not use the representation ETag header"
+        );
+        assert_eq!(
+            missing_create_precondition
+                .headers()
+                .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(initial_collection_etag.as_str())
+        );
         let stale_create_precondition = router
             .clone()
             .oneshot(connection_admin_request(
@@ -22144,6 +22161,19 @@ mod tests {
         assert_eq!(
             stale_create_precondition.status(),
             StatusCode::PRECONDITION_FAILED
+        );
+        assert!(
+            !stale_create_precondition
+                .headers()
+                .contains_key(header::ETAG),
+            "a stale collection mutation has no item representation validator"
+        );
+        assert_eq!(
+            stale_create_precondition
+                .headers()
+                .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(initial_collection_etag.as_str())
         );
 
         let csrf_denied = router
@@ -22615,7 +22645,15 @@ mod tests {
             json!(secret_id)
         );
 
-        let secret_events = captured_connection_secret_changes(&capture, 3);
+        audit_drain
+            .close_and_drain(Duration::from_secs(5))
+            .await
+            .expect("connection-secret CRUD audit events should drain");
+        let secret_events = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.event_type == audit::event::CONNECTION_SECRET_CHANGED)
+            .collect::<Vec<_>>();
         assert_eq!(secret_events.len(), 3);
         assert_eq!(
             secret_events
@@ -22692,6 +22730,7 @@ mod tests {
         let capture = audit::sink::tests::CaptureSink::new();
         let audit_log =
             audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let audit_drain = audit_log.clone();
         let router = connection_admin_router(&connection_db, &policy, audit_log);
         let principal = test_principal(&["connections-secret-manager"]);
 
@@ -22753,6 +22792,21 @@ mod tests {
             create_statuses,
             [StatusCode::CREATED, StatusCode::PRECONDITION_FAILED]
         );
+        let create_loser = if create_one.status() == StatusCode::PRECONDITION_FAILED {
+            &create_one
+        } else {
+            &create_two
+        };
+        assert!(
+            !create_loser.headers().contains_key(header::ETAG),
+            "a collection race loser must not return an item representation validator"
+        );
+        let create_loser_collection_etag = create_loser
+            .headers()
+            .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("a collection race loser should return the current collection validator")
+            .to_owned();
 
         let after_create = router
             .clone()
@@ -22766,6 +22820,13 @@ mod tests {
             ))
             .await
             .expect("secret list after concurrent create should complete");
+        assert_eq!(
+            after_create
+                .headers()
+                .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(create_loser_collection_etag.as_str())
+        );
         let after_create = json_body(after_create).await;
         let locals = after_create["secrets"]
             .as_array()
@@ -22958,7 +23019,15 @@ mod tests {
             Some(missing_rotate_collection_etag.as_str())
         );
 
-        let secret_events = captured_connection_secret_changes(&capture, 3);
+        audit_drain
+            .close_and_drain(Duration::from_secs(5))
+            .await
+            .expect("connection-secret race audit events should drain");
+        let secret_events = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.event_type == audit::event::CONNECTION_SECRET_CHANGED)
+            .collect::<Vec<_>>();
         assert_eq!(secret_events.len(), 3);
         let serialized =
             serde_json::to_string(&secret_events).expect("race audit events should serialize");
@@ -33949,31 +34018,6 @@ paths:
             ]
         })
         .to_string()
-    }
-
-    fn captured_connection_secret_changes(
-        capture: &audit::sink::tests::CaptureSink,
-        expected_count: usize,
-    ) -> Vec<audit::AuditEvent> {
-        let timeout = Duration::from_secs(5);
-        let started = Instant::now();
-
-        loop {
-            let events = capture
-                .events()
-                .into_iter()
-                .filter(|event| event.event_type == audit::event::CONNECTION_SECRET_CHANGED)
-                .collect::<Vec<_>>();
-            if events.len() >= expected_count {
-                return events;
-            }
-            assert!(
-                started.elapsed() < timeout,
-                "expected {expected_count} connection-secret audit events within {timeout:?}, got {}",
-                events.len()
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     fn captured_policy_change(
