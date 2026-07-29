@@ -7,6 +7,13 @@ import {
   GREEN_GATEWAY_ENV_KEYS,
 } from "./config";
 
+const CONNECTION_ENV_KEYS = [
+  "CONNECTIONS_SQLITE_PATH",
+  "CONNECTION_SECRETS_ROOT",
+  "CONNECTION_SECRET_ALIASES",
+  "CONNECTION_LOCAL_SECRET_KEYRING",
+] as const;
+
 describe("buildGreenGatewayContainerEnv", () => {
   it("uses the process-only liveness probe for container supervision", () => {
     expect(CONTAINER_PING_ENDPOINT).toBe("localhost/livez");
@@ -86,5 +93,56 @@ describe("buildGreenGatewayContainerEnv", () => {
       DISCOVERY_ENDPOINT_LIMIT: "10000",
       EGRESS_NAT64_PREFIXES: "64:ff9b::/96",
     });
+  });
+
+  it("explicitly supports every Connections storage and secret setting", () => {
+    for (const key of CONNECTION_ENV_KEYS) {
+      expect(GREEN_GATEWAY_ENV_KEYS).toContain(key);
+    }
+
+    const env = buildGreenGatewayContainerEnv({
+      CONNECTIONS_SQLITE_PATH: "/data/connections.sqlite",
+      CONNECTION_SECRETS_ROOT: "/run/secrets/greengateway",
+      CONNECTION_SECRET_ALIASES:
+        '[{"id":"billing-token","label":"Billing token","source":{"type":"environment","key":"GGW_BILLING_TOKEN"}}]',
+      CONNECTION_LOCAL_SECRET_KEYRING:
+        '[{"id":"primary","file":"primary.key","role":"primary"}]',
+    });
+
+    expect(env).toMatchObject({
+      CONNECTIONS_SQLITE_PATH: "/data/connections.sqlite",
+      CONNECTION_SECRETS_ROOT: "/run/secrets/greengateway",
+      CONNECTION_SECRET_ALIASES:
+        '[{"id":"billing-token","label":"Billing token","source":{"type":"environment","key":"GGW_BILLING_TOKEN"}}]',
+      CONNECTION_LOCAL_SECRET_KEYRING:
+        '[{"id":"primary","file":"primary.key","role":"primary"}]',
+    });
+  });
+
+  it("omits unset, empty, non-string, and whitespace-only Connections settings", () => {
+    const env = buildGreenGatewayContainerEnv({
+      CONNECTIONS_SQLITE_PATH: "",
+      CONNECTION_SECRETS_ROOT: " \t ",
+      CONNECTION_SECRET_ALIASES: undefined,
+      CONNECTION_LOCAL_SECRET_KEYRING: [],
+    });
+
+    for (const key of CONNECTION_ENV_KEYS) {
+      expect(env).not.toHaveProperty(key);
+    }
+  });
+
+  it("does not expand environment aliases outside the exact forwarding allowlist", () => {
+    const aliases =
+      '[{"id":"billing-token","label":"Billing token","source":{"type":"environment","key":"GGW_BILLING_TOKEN"}}]';
+    const env = buildGreenGatewayContainerEnv({
+      CONNECTION_SECRET_ALIASES: aliases,
+      GGW_BILLING_TOKEN: "must-not-cross-the-worker-boundary",
+      CLOUDFLARE_API_TOKEN: "must-not-cross-the-worker-boundary",
+    });
+
+    expect(env.CONNECTION_SECRET_ALIASES).toBe(aliases);
+    expect(env).not.toHaveProperty("GGW_BILLING_TOKEN");
+    expect(env).not.toHaveProperty("CLOUDFLARE_API_TOKEN");
   });
 });

@@ -1152,11 +1152,9 @@ fn attempt_headers(
 ) -> HeaderMap {
     let mut headers = strip_hop_by_hop_headers(inbound);
     strip_gateway_credentials(&mut headers);
+    headers.remove(REQUEST_ID_HEADER);
     if let Some(credential_header) = credential_header {
         headers.remove(credential_header);
-    }
-    if let Some(request_id) = inbound.get(REQUEST_ID_HEADER) {
-        headers.insert(request_id_header(), request_id.clone());
     }
     set_upstream_client_ip(&mut headers, source_ip);
     apply_route_request_header_policy(&mut headers, policy);
@@ -2122,6 +2120,8 @@ mod tests {
         proxy::{health, ProxyEndpoint, ProxyRoute, ProxyRoutes, RequestBodyMode, UpstreamPool},
     };
 
+    const TEST_ATTEMPT_KEY_HEADER: &str = "x-test-attempt-key";
+
     #[test]
     fn content_length_preflight_accepts_equal_duplicates_only() {
         let mut headers = HeaderMap::new();
@@ -2201,6 +2201,10 @@ mod tests {
         inbound.insert(header::COOKIE, HeaderValue::from_static("session=caller"));
         inbound.insert("x-api-key", HeaderValue::from_static("caller-api-key"));
         inbound.insert("x-end-to-end", HeaderValue::from_static("caller-value"));
+        inbound.insert(
+            REQUEST_ID_HEADER,
+            HeaderValue::from_static("caller-request-id"),
+        );
         let policy = RouteRequestHeaderPolicy {
             add_request_headers: vec![(
                 HeaderName::from_static("x-route-label"),
@@ -2220,6 +2224,7 @@ mod tests {
         assert!(!forwarded.contains_key(header::COOKIE));
         assert!(!forwarded.contains_key("x-api-key"));
         assert!(!forwarded.contains_key("x-end-to-end"));
+        assert!(!forwarded.contains_key(REQUEST_ID_HEADER));
         assert_eq!(
             forwarded.get("x-route-label"),
             Some(&HeaderValue::from_static("billing"))
@@ -3031,14 +3036,14 @@ mod tests {
         assert_eq!(
             first_requests.lock().expect("first captures").as_slice(),
             &[CapturedRequest {
-                request_id: Some("request-stable".to_owned()),
+                request_id: None,
                 body: b"bounded-body".to_vec(),
             }]
         );
         assert_eq!(
             second_requests.lock().expect("second captures").as_slice(),
             &[CapturedRequest {
-                request_id: Some("request-stable".to_owned()),
+                request_id: None,
                 body: b"bounded-body".to_vec(),
             }]
         );
@@ -3995,6 +4000,7 @@ mod tests {
                     .method(http::Method::GET)
                     .uri("/items")
                     .header(REQUEST_ID_HEADER, format!("budget-{index}"))
+                    .header(TEST_ATTEMPT_KEY_HEADER, format!("budget-{index}"))
                     .body(Body::empty())
                     .expect("request");
                 proxy.forward_request(request, "203.0.113.8").await
@@ -4306,15 +4312,15 @@ mod tests {
         let app = Router::new().fallback(move |request: Request<Body>| {
             let attempts = Arc::clone(&attempts);
             async move {
-                let request_id = request
+                let attempt_key = request
                     .headers()
-                    .get(REQUEST_ID_HEADER)
+                    .get(TEST_ATTEMPT_KEY_HEADER)
                     .and_then(|value| value.to_str().ok())
-                    .expect("test request ID")
+                    .expect("test attempt key")
                     .to_owned();
                 let attempt = {
                     let mut attempts = attempts.lock().expect("attempt counts");
-                    let attempt = attempts.entry(request_id).or_default();
+                    let attempt = attempts.entry(attempt_key).or_default();
                     *attempt += 1;
                     *attempt
                 };

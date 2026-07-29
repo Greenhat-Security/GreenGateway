@@ -1,0 +1,26 @@
+# Optional production-oriented Connections overlay.
+#
+# Before starting it:
+#   1. create ./var/greengateway owned and writable by UID/GID 10001;
+#   2. create ./secrets/greengateway owned by UID/GID 10001 with mode 0700;
+#   3. place exactly 32 raw random bytes in
+#      ./secrets/greengateway/local-secret-primary.key with mode 0600.
+#
+# Never commit either host directory. Back up the SQLite database, WAL, and SHM
+# boundary separately from the master key.
+services:
+  gateway:
+    environment:
+      CONNECTIONS_SQLITE_PATH: /var/lib/greengateway/connections.sqlite
+      CONNECTION_SECRETS_ROOT: /run/greengateway-secrets
+      CONNECTION_LOCAL_SECRET_KEYRING: >-
+        [{"id":"local-primary","file":"local-secret-primary.key","role":"primary"}]
+      CONNECTION_SECRET_ALIASES: "[]"
+    volumes:
+      - type: bind
+        source: ./var/greengateway
+        target: /var/lib/greengateway
+      - type: bind
+        source: ./secrets/greengateway
+        target: /run/greengateway-secrets
+        read_only: true

@@ -1,6 +1,9 @@
 export const CONTAINER_PORT = 8080;
 export const CONTAINER_PING_ENDPOINT = "localhost/livez";
 
+// This is an exact allowlist. In particular, forwarding
+// CONNECTION_SECRET_ALIASES does not dynamically forward the environment
+// variable names referenced by those aliases.
 export const GREEN_GATEWAY_ENV_KEYS = [
   "ADMIN_PREFIX",
   "ADMIN_LOGIN_PROVIDER",

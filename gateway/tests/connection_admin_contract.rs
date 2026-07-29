@@ -1,0 +1,722 @@
+use serde_json::{json, Value};
+use std::collections::{BTreeSet, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const OPENAPI_RELATIVE_PATH: &str = "openapi/admin-connections.v1.openapi.json";
+const SCHEMA_RELATIVE_PATH: &str = "schemas/connection-admin.v1.schema.json";
+
+#[derive(Clone, Copy)]
+struct ExpectedOperation {
+    path: &'static str,
+    method: &'static str,
+    operation_id: &'static str,
+    request_definition: Option<&'static str>,
+    success_status: &'static str,
+    response_definition: &'static str,
+}
+
+const EXPECTED_OPERATIONS: &[ExpectedOperation] = &[
+    ExpectedOperation {
+        path: "/v1/admin/connections",
+        method: "get",
+        operation_id: "listConnections",
+        request_definition: None,
+        success_status: "200",
+        response_definition: "ConnectionList",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connections",
+        method: "post",
+        operation_id: "createConnection",
+        request_definition: Some("ConnectionCreateRequest"),
+        success_status: "201",
+        response_definition: "ConnectionDetail",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connections/{id}",
+        method: "get",
+        operation_id: "getConnection",
+        request_definition: None,
+        success_status: "200",
+        response_definition: "ConnectionDetail",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connections/{id}",
+        method: "put",
+        operation_id: "replaceConnection",
+        request_definition: Some("ConnectionReplaceRequest"),
+        success_status: "200",
+        response_definition: "ConnectionDetail",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connections/{id}",
+        method: "delete",
+        operation_id: "deleteConnection",
+        request_definition: None,
+        success_status: "200",
+        response_definition: "ConnectionDeleted",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connections/{id}/test",
+        method: "post",
+        operation_id: "testConnection",
+        request_definition: None,
+        success_status: "200",
+        response_definition: "ConnectionTestResult",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connections/{id}/refresh",
+        method: "post",
+        operation_id: "refreshConnectionCatalog",
+        request_definition: None,
+        success_status: "200",
+        response_definition: "CatalogPublishResult",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connections/{id}/openapi/preview",
+        method: "post",
+        operation_id: "previewManagedOpenApi",
+        request_definition: Some("OpenApiPreviewRequest"),
+        success_status: "200",
+        response_definition: "OpenApiPreviewResponse",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connections/{id}/openapi/register",
+        method: "post",
+        operation_id: "registerManagedOpenApi",
+        request_definition: Some("OpenApiRegisterRequest"),
+        success_status: "201",
+        response_definition: "CatalogPublishResult",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connection-secrets",
+        method: "get",
+        operation_id: "listConnectionSecretAliases",
+        request_definition: None,
+        success_status: "200",
+        response_definition: "SecretList",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connection-secrets",
+        method: "post",
+        operation_id: "createEncryptedConnectionSecret",
+        request_definition: Some("SecretCreateRequest"),
+        success_status: "201",
+        response_definition: "SafeSecretAlias",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connection-secrets/{id}",
+        method: "put",
+        operation_id: "rotateEncryptedConnectionSecret",
+        request_definition: Some("SecretRotateRequest"),
+        success_status: "200",
+        response_definition: "SafeSecretAlias",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connection-secrets/{id}",
+        method: "delete",
+        operation_id: "deleteEncryptedConnectionSecret",
+        request_definition: None,
+        success_status: "200",
+        response_definition: "SecretDeleted",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/tools",
+        method: "get",
+        operation_id: "listCapabilities",
+        request_definition: None,
+        success_status: "200",
+        response_definition: "CapabilityList",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/tools/{id}",
+        method: "get",
+        operation_id: "getCapability",
+        request_definition: None,
+        success_status: "200",
+        response_definition: "CapabilityDetail",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/tools/{id}/execute",
+        method: "post",
+        operation_id: "executeCapabilityInPlayground",
+        request_definition: Some("PlaygroundRequest"),
+        success_status: "200",
+        response_definition: "PlaygroundResult",
+    },
+];
+
+fn docs_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("gateway crate should have a workspace parent")
+        .join("docs")
+}
+
+fn load_json(path: &Path) -> Value {
+    let contents = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    serde_json::from_str(&contents)
+        .unwrap_or_else(|error| panic!("failed to parse {} as JSON: {error}", path.display()))
+}
+
+fn schema_reference(definition: &str) -> String {
+    format!("../schemas/connection-admin.v1.schema.json#/$defs/{definition}")
+}
+
+fn collect_references<'a>(value: &'a Value, references: &mut Vec<&'a str>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                references.push(reference);
+            }
+            for child in object.values() {
+                collect_references(child, references);
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                collect_references(child, references);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assert_references_resolve(document_path: &Path, document: &Value) {
+    let document_path = document_path.canonicalize().unwrap_or_else(|error| {
+        panic!(
+            "failed to canonicalize {}: {error}",
+            document_path.display()
+        )
+    });
+    let mut references = Vec::new();
+    collect_references(document, &mut references);
+    assert!(
+        !references.is_empty(),
+        "{} should contain contract references",
+        document_path.display()
+    );
+
+    for reference in references {
+        let (relative_path, fragment) = reference.split_once('#').unwrap_or((reference, ""));
+        assert!(
+            !relative_path.contains("://"),
+            "{} contains a non-local reference {reference:?}",
+            document_path.display()
+        );
+
+        let target_path = if relative_path.is_empty() {
+            document_path.clone()
+        } else {
+            document_path
+                .parent()
+                .expect("contract document should have a parent directory")
+                .join(relative_path)
+                .canonicalize()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{} has missing reference target {reference:?}: {error}",
+                        document_path.display()
+                    )
+                })
+        };
+        let target_document = if target_path == document_path {
+            document.clone()
+        } else {
+            load_json(&target_path)
+        };
+
+        if !fragment.is_empty() {
+            assert!(
+                fragment.starts_with('/'),
+                "{} contains a non-JSON-Pointer fragment in {reference:?}",
+                document_path.display()
+            );
+            assert!(
+                target_document.pointer(fragment).is_some(),
+                "{} contains unresolved reference {reference:?}",
+                document_path.display()
+            );
+        }
+    }
+}
+
+fn definition<'a>(schema: &'a Value, name: &str) -> &'a Value {
+    schema
+        .pointer(&format!("/$defs/{name}"))
+        .unwrap_or_else(|| panic!("schema is missing $defs/{name}"))
+}
+
+fn assert_closed_object(schema: &Value, name: &str) {
+    let value = definition(schema, name);
+    assert_eq!(
+        value.get("type").and_then(Value::as_str),
+        Some("object"),
+        "$defs/{name} should be an object"
+    );
+    assert_eq!(
+        value.get("additionalProperties").and_then(Value::as_bool),
+        Some(false),
+        "$defs/{name} must reject undeclared fields"
+    );
+    assert!(
+        value.get("properties").and_then(Value::as_object).is_some(),
+        "$defs/{name} should declare properties"
+    );
+}
+
+fn assert_one_of_objects_are_closed(schema: &Value, name: &str) {
+    let variants = definition(schema, name)
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("$defs/{name} should contain oneOf"));
+    assert!(!variants.is_empty(), "$defs/{name} should contain variants");
+    for (index, variant) in variants.iter().enumerate() {
+        assert_eq!(
+            variant.get("type").and_then(Value::as_str),
+            Some("object"),
+            "$defs/{name}/oneOf/{index} should be an object"
+        );
+        assert_eq!(
+            variant.get("additionalProperties").and_then(Value::as_bool),
+            Some(false),
+            "$defs/{name}/oneOf/{index} must reject undeclared fields"
+        );
+    }
+}
+
+fn collect_reachable_property_names(
+    schema: &Value,
+    value: &Value,
+    visited_definitions: &mut HashSet<String>,
+    property_names: &mut BTreeSet<String>,
+) {
+    match value {
+        Value::Object(object) => {
+            if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                property_names.extend(properties.keys().cloned());
+            }
+
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                if let Some(name) = reference.strip_prefix("#/$defs/") {
+                    if visited_definitions.insert(name.to_owned()) {
+                        collect_reachable_property_names(
+                            schema,
+                            definition(schema, name),
+                            visited_definitions,
+                            property_names,
+                        );
+                    }
+                }
+            }
+
+            for child in object.values() {
+                collect_reachable_property_names(
+                    schema,
+                    child,
+                    visited_definitions,
+                    property_names,
+                );
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                collect_reachable_property_names(
+                    schema,
+                    child,
+                    visited_definitions,
+                    property_names,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn reachable_property_names(schema: &Value, root_definition: &str) -> BTreeSet<String> {
+    let mut visited_definitions = HashSet::from([root_definition.to_owned()]);
+    let mut property_names = BTreeSet::new();
+    collect_reachable_property_names(
+        schema,
+        definition(schema, root_definition),
+        &mut visited_definitions,
+        &mut property_names,
+    );
+    property_names
+}
+
+#[test]
+fn connection_admin_openapi_has_exact_routes_operations_and_safe_contracts() {
+    let docs = docs_root();
+    let openapi_path = docs.join(OPENAPI_RELATIVE_PATH);
+    let openapi = load_json(&openapi_path);
+
+    assert_eq!(
+        openapi.get("openapi").and_then(Value::as_str),
+        Some("3.1.0")
+    );
+    assert_references_resolve(&openapi_path, &openapi);
+
+    let paths = openapi
+        .get("paths")
+        .and_then(Value::as_object)
+        .expect("OpenAPI paths should be an object");
+    let expected_paths: BTreeSet<_> = EXPECTED_OPERATIONS
+        .iter()
+        .map(|operation| operation.path)
+        .collect();
+    let actual_paths: BTreeSet<_> = paths.keys().map(String::as_str).collect();
+    assert_eq!(
+        actual_paths, expected_paths,
+        "the v1 Connection admin path surface changed"
+    );
+
+    let mut actual_operation_count = 0;
+    let mut operation_ids = BTreeSet::new();
+    for operation in EXPECTED_OPERATIONS {
+        let operation_value = paths
+            .get(operation.path)
+            .and_then(|path| path.get(operation.method))
+            .unwrap_or_else(|| {
+                panic!(
+                    "OpenAPI is missing {} {}",
+                    operation.method.to_ascii_uppercase(),
+                    operation.path
+                )
+            });
+        assert_eq!(
+            operation_value.get("operationId").and_then(Value::as_str),
+            Some(operation.operation_id),
+            "{} {} has the wrong operationId",
+            operation.method.to_ascii_uppercase(),
+            operation.path
+        );
+        assert!(
+            operation_ids.insert(operation.operation_id),
+            "operationId {} is duplicated",
+            operation.operation_id
+        );
+
+        match operation.request_definition {
+            Some(request_definition) => assert_eq!(
+                operation_value.pointer("/requestBody/content/application~1json/schema/$ref"),
+                Some(&Value::String(schema_reference(request_definition))),
+                "{} {} should use the documented request schema",
+                operation.method.to_ascii_uppercase(),
+                operation.path
+            ),
+            None => assert!(
+                operation_value.get("requestBody").is_none(),
+                "{} {} must not accept a request body",
+                operation.method.to_ascii_uppercase(),
+                operation.path
+            ),
+        }
+
+        assert_eq!(
+            operation_value.pointer(&format!(
+                "/responses/{}/content/application~1json/schema/$ref",
+                operation.success_status
+            )),
+            Some(&Value::String(schema_reference(
+                operation.response_definition
+            ))),
+            "{} {} should use the documented safe response schema",
+            operation.method.to_ascii_uppercase(),
+            operation.path
+        );
+    }
+
+    const HTTP_METHODS: &[&str] = &[
+        "get", "put", "post", "delete", "options", "head", "patch", "trace",
+    ];
+    for path in paths.values() {
+        let path = path
+            .as_object()
+            .expect("each OpenAPI path should be an object");
+        actual_operation_count += path
+            .keys()
+            .filter(|key| HTTP_METHODS.contains(&key.as_str()))
+            .count();
+    }
+    assert_eq!(
+        actual_operation_count,
+        EXPECTED_OPERATIONS.len(),
+        "the v1 Connection admin operation surface changed"
+    );
+
+    let security = openapi
+        .get("security")
+        .and_then(Value::as_array)
+        .expect("OpenAPI should declare global authentication alternatives");
+    assert_eq!(
+        security.len(),
+        2,
+        "bearer and session-cookie authentication must be alternatives"
+    );
+    assert_eq!(security[0].as_object().map(|value| value.len()), Some(1));
+    assert_eq!(
+        security[0].pointer("/bearerAuth"),
+        Some(&Value::Array(Vec::new()))
+    );
+    assert_eq!(security[1].as_object().map(|value| value.len()), Some(1));
+    assert_eq!(
+        security[1].pointer("/cookieAuth"),
+        Some(&Value::Array(Vec::new()))
+    );
+
+    let session_cookie = openapi
+        .pointer("/components/securitySchemes/cookieAuth")
+        .expect("OpenAPI should document session-cookie authentication");
+    assert_eq!(
+        session_cookie.get("type").and_then(Value::as_str),
+        Some("apiKey")
+    );
+    assert_eq!(
+        session_cookie.get("in").and_then(Value::as_str),
+        Some("cookie")
+    );
+    assert_eq!(
+        session_cookie.get("name").and_then(Value::as_str),
+        Some("session"),
+        "the schema should show the default cookie name"
+    );
+    let session_description = session_cookie
+        .get("description")
+        .and_then(Value::as_str)
+        .expect("cookieAuth should describe configurable cookie and CSRF behavior");
+    for required_text in [
+        "AUTH_COOKIE_NAME",
+        "CSRF_COOKIE_NAME",
+        "CSRF_HEADER_NAME",
+        "x-csrf-token",
+    ] {
+        assert!(
+            session_description.contains(required_text),
+            "cookieAuth description should mention {required_text}"
+        );
+    }
+    let lowercase_description = session_description.to_ascii_lowercase();
+    assert!(
+        lowercase_description.contains("double-submit"),
+        "cookieAuth should document the double-submit CSRF requirement"
+    );
+
+    for (scheme, location, name, setting) in [
+        ("csrfCookie", "cookie", "csrf_token", "CSRF_COOKIE_NAME"),
+        ("csrfHeader", "header", "x-csrf-token", "CSRF_HEADER_NAME"),
+    ] {
+        let value = openapi
+            .pointer(&format!("/components/securitySchemes/{scheme}"))
+            .unwrap_or_else(|| panic!("OpenAPI should define {scheme}"));
+        assert_eq!(value.get("type").and_then(Value::as_str), Some("apiKey"));
+        assert_eq!(value.get("in").and_then(Value::as_str), Some(location));
+        assert_eq!(value.get("name").and_then(Value::as_str), Some(name));
+        let description = value
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{scheme} should have a description"));
+        assert!(description.contains(setting));
+    }
+
+    let expected_mutation_security = json!([
+        {"bearerAuth": []},
+        {"cookieAuth": [], "csrfCookie": [], "csrfHeader": []}
+    ]);
+    for operation in EXPECTED_OPERATIONS
+        .iter()
+        .filter(|operation| matches!(operation.method, "post" | "put" | "delete"))
+    {
+        let actual = paths
+            .get(operation.path)
+            .and_then(|path| path.get(operation.method))
+            .and_then(|value| value.get("security"));
+        assert_eq!(
+            actual,
+            Some(&expected_mutation_security),
+            "{} {} must require bearer auth or cookie auth plus both CSRF values",
+            operation.method.to_ascii_uppercase(),
+            operation.path
+        );
+    }
+}
+
+#[test]
+fn connection_admin_json_schema_is_strict_resolvable_and_secret_safe() {
+    let docs = docs_root();
+    let schema_path = docs.join(SCHEMA_RELATIVE_PATH);
+    let schema = load_json(&schema_path);
+
+    assert_eq!(
+        schema.get("$schema").and_then(Value::as_str),
+        Some("https://json-schema.org/draft/2020-12/schema")
+    );
+    let definitions = schema
+        .get("$defs")
+        .and_then(Value::as_object)
+        .expect("JSON Schema should contain a non-empty $defs object");
+    assert!(
+        !definitions.is_empty(),
+        "JSON Schema $defs must not be empty"
+    );
+    assert_references_resolve(&schema_path, &schema);
+    jsonschema::validator_for(&schema).expect("connection admin JSON Schema should compile");
+
+    for name in [
+        "ConnectionCreateRequest",
+        "ConnectionReplaceRequest",
+        "CreateTls",
+        "MutationTls",
+        "SecretCreateRequest",
+        "SecretRotateRequest",
+        "OpenApiPreviewRequest",
+        "OpenApiRegisterRequest",
+        "PlaygroundRequest",
+    ] {
+        assert_closed_object(&schema, name);
+    }
+    for name in [
+        "CreateAuthentication",
+        "MutationAuthentication",
+        "Discovery",
+    ] {
+        assert_one_of_objects_are_closed(&schema, name);
+    }
+
+    let create = definition(&schema, "ConnectionCreateRequest");
+    assert_eq!(
+        create
+            .pointer("/properties/authentication/$ref")
+            .and_then(Value::as_str),
+        Some("#/$defs/CreateAuthentication")
+    );
+    assert_eq!(
+        create
+            .pointer("/properties/tls/$ref")
+            .and_then(Value::as_str),
+        Some("#/$defs/CreateTls")
+    );
+    let create_properties = reachable_property_names(&schema, "ConnectionCreateRequest");
+    assert!(
+        create_properties
+            .iter()
+            .all(|property| !property.ends_with("_configured")),
+        "POST requests must reject PUT-only configured markers"
+    );
+
+    let replace = definition(&schema, "ConnectionReplaceRequest");
+    assert!(
+        replace
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| required.iter().any(|field| field == "enabled")),
+        "replacement requests should require enabled"
+    );
+    let replace_properties = reachable_property_names(&schema, "ConnectionReplaceRequest");
+    assert!(
+        replace_properties.contains("secret_configured")
+            && replace_properties.contains("client_private_key_configured"),
+        "PUT requests should retain explicit redaction markers"
+    );
+
+    for name in [
+        "ConnectionList",
+        "ConnectionDetail",
+        "ConnectionDeleted",
+        "ConnectionTestResult",
+        "CatalogPublishResult",
+        "OpenApiPreviewResponse",
+        "SecretList",
+        "SafeSecretAlias",
+        "SecretDeleted",
+        "CapabilityList",
+        "CapabilityDetail",
+        "PlaygroundHttpResult",
+        "PlaygroundMcpResult",
+        "Error",
+        "ReasonedError",
+        "ValidationError",
+        "DependencyConflict",
+    ] {
+        assert_closed_object(&schema, name);
+    }
+
+    let safe_response_definitions = [
+        "ConnectionList",
+        "ConnectionDetail",
+        "ConnectionDeleted",
+        "ConnectionTestResult",
+        "CatalogPublishResult",
+        "OpenApiPreviewResponse",
+        "SecretList",
+        "SafeSecretAlias",
+        "SecretDeleted",
+        "CapabilityList",
+        "CapabilityDetail",
+        "PlaygroundResult",
+        "Error",
+        "ReasonedError",
+        "ValidationError",
+        "DependencyConflict",
+    ];
+    let forbidden_secret_fields = [
+        "secret_id",
+        "client_secret_id",
+        "client_private_key_id",
+        "client_certificate_id",
+        "ca_bundle_alias",
+        "provider_locator",
+        "provider_path",
+        "provider_key",
+        "environment_variable",
+        "file_path",
+        "ciphertext",
+        "nonce",
+        "key_id",
+        "master_key",
+        "private_key",
+    ];
+    for response_definition in safe_response_definitions {
+        let properties = reachable_property_names(&schema, response_definition);
+        for forbidden in forbidden_secret_fields {
+            assert!(
+                !properties.contains(forbidden),
+                "$defs/{response_definition} exposes protected field {forbidden:?}"
+            );
+        }
+    }
+
+    let safe_alias_properties = reachable_property_names(&schema, "SafeSecretAlias");
+    assert!(
+        !safe_alias_properties.contains("value"),
+        "safe secret-alias responses must never expose secret values"
+    );
+    assert_eq!(
+        definition(&schema, "SafeSecretAlias")
+            .pointer("/properties/provider/$ref")
+            .and_then(Value::as_str),
+        Some("#/$defs/SecretProvider"),
+        "safe aliases may identify a provider class but not a provider locator"
+    );
+
+    let mutation_authentication = reachable_property_names(&schema, "MutationAuthentication");
+    assert!(
+        mutation_authentication.contains("secret_id"),
+        "credential write requests should permit an explicit secret binding"
+    );
+    assert!(
+        mutation_authentication.contains("client_secret_id"),
+        "OAuth write requests should permit an explicit client-secret binding"
+    );
+    for name in ["SecretCreateRequest", "SecretRotateRequest"] {
+        assert_eq!(
+            definition(&schema, name)
+                .pointer("/properties/value/writeOnly")
+                .and_then(Value::as_bool),
+            Some(true),
+            "$defs/{name}.value should be accepted only as write-only input"
+        );
+    }
+}

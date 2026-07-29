@@ -454,7 +454,7 @@ export async function testConnection(
     {
       method: 'POST',
       signal,
-      headers: { 'If-Match': etag },
+      headers: jsonMutationHeaders(etag),
     },
   );
   const value = projectConnectionMutationResponse('test', () =>
@@ -476,7 +476,7 @@ export async function refreshConnection(
     {
       method: 'POST',
       signal,
-      headers: { 'If-Match': etag },
+      headers: jsonMutationHeaders(etag),
     },
   );
   const value = projectConnectionMutationResponse('refresh', () =>

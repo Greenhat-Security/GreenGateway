@@ -16,6 +16,8 @@ build/
 coverage/
 /artifacts/
 /.wrangler/
+/var/greengateway/
+/secrets/greengateway/
 cloudflare-env.d.ts
 
 # Environment

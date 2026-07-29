@@ -2,6 +2,8 @@ name: CI
 
 "on":
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
@@ -94,10 +96,16 @@ jobs:
   admin-ui:
     name: admin-ui
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -122,6 +130,10 @@ jobs:
         working-directory: admin-ui
         run: npx playwright install --with-deps chromium
 
+      - name: Test live Connection admin UI
+        working-directory: admin-ui
+        run: npx playwright test --config playwright.issue240.config.ts
+
       - name: Test admin UI screenshots
         working-directory: admin-ui
         run: npm run screenshots
@@ -133,9 +145,34 @@ jobs:
           name: admin-ui-test-artifacts
           path: |
             admin-ui/.screenshots/
+            admin-ui/playwright-report/
             admin-ui/test-results/
           if-no-files-found: ignore
           retention-days: 7
+
+  cloudflare:
+    name: cloudflare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install Cloudflare wrapper dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Test Cloudflare wrapper
+        run: npm test
+
+      - name: Type-check Cloudflare wrapper
+        run: npm run typecheck
 
   dev-traffic-smoke:
     name: dev-traffic-smoke
@@ -236,3 +273,68 @@ jobs:
 
       - name: Audit dependencies
         run: cargo audit
+
+  connections-acceptance:
+    name: connections-acceptance
+    needs:
+      - egress-only
+      - fmt
+      - clippy
+      - test
+      - admin-ui
+      - cloudflare
+      - dev-traffic-smoke
+      - audit
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Run Issue 240 acceptance gate
+        if: ${{ always() }}
+        shell: bash
+        env:
+          EGRESS_ONLY_RESULT: ${{ needs.egress-only.result }}
+          FMT_RESULT: ${{ needs.fmt.result }}
+          CLIPPY_RESULT: ${{ needs.clippy.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          ADMIN_UI_RESULT: ${{ needs.admin-ui.result }}
+          CLOUDFLARE_RESULT: ${{ needs.cloudflare.result }}
+          DEV_TRAFFIC_SMOKE_RESULT: ${{ needs.dev-traffic-smoke.result }}
+          AUDIT_RESULT: ${{ needs.audit.result }}
+        run: |
+          set +e
+
+          node scripts/check-issue-240-acceptance.mjs
+          acceptance_status=$?
+
+          dependency_status=0
+          names=(egress-only fmt clippy test admin-ui cloudflare dev-traffic-smoke audit)
+          results=(
+            "$EGRESS_ONLY_RESULT"
+            "$FMT_RESULT"
+            "$CLIPPY_RESULT"
+            "$TEST_RESULT"
+            "$ADMIN_UI_RESULT"
+            "$CLOUDFLARE_RESULT"
+            "$DEV_TRAFFIC_SMOKE_RESULT"
+            "$AUDIT_RESULT"
+          )
+
+          for index in "${!names[@]}"; do
+            if [ "${results[$index]}" != "success" ]; then
+              echo "::error::${names[$index]} completed with result ${results[$index]}"
+              dependency_status=1
+            fi
+          done
+
+          if [ "$acceptance_status" -ne 0 ] || [ "$dependency_status" -ne 0 ]; then
+            exit 1
+          fi

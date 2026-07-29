@@ -1,0 +1,2652 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/connection-admin.v1.schema.json",
+  "title": "GreenGateway Connection and Capability Admin API",
+  "description": "Strict request and safe response contracts used by the Connection, secret-alias, managed OpenAPI, capability inventory, and constrained playground admin APIs. Response definitions intentionally exclude secret IDs, provider locators, ciphertext, nonces, key material, raw upstream topology, and private-key material.",
+  "$ref": "#/$defs/ConnectionDetail",
+  "$defs": {
+    "StableId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "OpaqueCapabilityId": {
+      "type": "string",
+      "pattern": "^cap_[0-9a-f]{64}$"
+    },
+    "Etag": {
+      "type": "string",
+      "minLength": 2,
+      "description": "Opaque strong entity tag, including its double quotes."
+    },
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "ConnectionKind": {
+      "enum": [
+        "http_api",
+        "mcp_streamable_http"
+      ]
+    },
+    "ConnectionSource": {
+      "enum": [
+        "managed",
+        "legacy_default_http",
+        "legacy_route",
+        "legacy_mcp"
+      ]
+    },
+    "OperationalState": {
+      "enum": [
+        "unknown",
+        "configured",
+        "healthy",
+        "degraded",
+        "unavailable",
+        "disabled"
+      ]
+    },
+    "StatusReason": {
+      "enum": [
+        "not_tested",
+        "legacy_configured",
+        "disabled",
+        "test_succeeded",
+        "catalog_refreshed",
+        "request_failed",
+        "egress_denied",
+        "secret_unavailable",
+        "invalid_response",
+        "catalog_stale"
+      ]
+    },
+    "AuthenticationKind": {
+      "enum": [
+        "none",
+        "header_api_key",
+        "static_bearer",
+        "oauth2_client_credentials",
+        "legacy_configured"
+      ]
+    },
+    "Endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "base_url",
+        "base_path"
+      ],
+      "properties": {
+        "base_url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "format": "uri",
+          "pattern": "^https?://"
+        },
+        "base_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^/(?!/)[^?#\\\\]*$"
+        }
+      }
+    },
+    "Timeouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connect_timeout_ms",
+        "request_timeout_ms",
+        "response_idle_timeout_ms"
+      ],
+      "properties": {
+        "connect_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120000
+        },
+        "request_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120000
+        },
+        "response_idle_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120000
+        }
+      }
+    },
+    "Discovery": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "use_connection_authentication"
+          ],
+          "properties": {
+            "type": {
+              "const": "managed_openapi"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "pattern": "^/(?!/)[^?#\\\\]*$"
+            },
+            "use_connection_authentication": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "use_connection_authentication"
+          ],
+          "properties": {
+            "type": {
+              "const": "managed_mcp"
+            },
+            "use_connection_authentication": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "TestProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "path",
+        "expected_statuses"
+      ],
+      "properties": {
+        "method": {
+          "enum": [
+            "GET",
+            "HEAD"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^/(?!/)[^?#\\\\]*$"
+        },
+        "expected_statuses": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599
+          }
+        }
+      }
+    },
+    "MutationAuthentication": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "header_name"
+          ],
+          "properties": {
+            "type": {
+              "const": "header_api_key"
+            },
+            "header_name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "secret_id": {
+              "$ref": "#/$defs/StableId"
+            },
+            "secret_configured": {
+              "type": "boolean",
+              "description": "PUT-only redaction marker. true retains the current hidden binding and false clears it."
+            }
+          },
+          "not": {
+            "required": [
+              "secret_id",
+              "secret_configured"
+            ]
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "static_bearer"
+            },
+            "secret_id": {
+              "$ref": "#/$defs/StableId"
+            },
+            "secret_configured": {
+              "type": "boolean",
+              "description": "PUT-only redaction marker. true retains the current hidden binding and false clears it."
+            }
+          },
+          "not": {
+            "required": [
+              "secret_id",
+              "secret_configured"
+            ]
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "client_id",
+            "token_url",
+            "client_auth_method"
+          ],
+          "properties": {
+            "type": {
+              "const": "oauth2_client_credentials"
+            },
+            "client_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "client_secret_id": {
+              "$ref": "#/$defs/StableId"
+            },
+            "client_secret_configured": {
+              "type": "boolean",
+              "description": "PUT-only redaction marker. true retains the current hidden binding and false clears it."
+            },
+            "token_url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "format": "uri",
+              "pattern": "^https://"
+            },
+            "scopes": {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^\\S+$"
+              }
+            },
+            "audience": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "resource": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "client_auth_method": {
+              "const": "client_secret_basic"
+            }
+          },
+          "not": {
+            "required": [
+              "client_secret_id",
+              "client_secret_configured"
+            ]
+          }
+        }
+      ]
+    },
+    "MutationTls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ca_bundle_alias": {
+          "$ref": "#/$defs/StableId"
+        },
+        "ca_bundle_configured": {
+          "type": "boolean"
+        },
+        "client_certificate_id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "client_certificate_configured": {
+          "type": "boolean"
+        },
+        "client_private_key_id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "client_private_key_configured": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "ca_bundle_alias",
+              "ca_bundle_configured"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "client_certificate_id",
+              "client_certificate_configured"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "client_private_key_id",
+              "client_private_key_configured"
+            ]
+          }
+        }
+      ]
+    },
+    "ConnectionCreateRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "display_name",
+        "kind",
+        "endpoint",
+        "authentication"
+      ],
+      "properties": {
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "kind": {
+          "$ref": "#/$defs/ConnectionKind"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/Endpoint"
+        },
+        "authentication": {
+          "$ref": "#/$defs/CreateAuthentication"
+        },
+        "tls": {
+          "$ref": "#/$defs/CreateTls"
+        },
+        "timeouts": {
+          "$ref": "#/$defs/Timeouts"
+        },
+        "discovery": {
+          "$ref": "#/$defs/Discovery"
+        },
+        "test_profile": {
+          "$ref": "#/$defs/TestProfile"
+        }
+      }
+    },
+    "ConnectionReplaceRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "display_name",
+        "kind",
+        "endpoint",
+        "authentication",
+        "enabled"
+      ],
+      "properties": {
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "kind": {
+          "$ref": "#/$defs/ConnectionKind"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/Endpoint"
+        },
+        "authentication": {
+          "$ref": "#/$defs/MutationAuthentication"
+        },
+        "tls": {
+          "$ref": "#/$defs/MutationTls"
+        },
+        "timeouts": {
+          "$ref": "#/$defs/Timeouts"
+        },
+        "discovery": {
+          "$ref": "#/$defs/Discovery"
+        },
+        "test_profile": {
+          "$ref": "#/$defs/TestProfile"
+        }
+      },
+      "description": "Full replacement. Hidden binding IDs may be supplied by a secrets-writer, or their corresponding configured markers may be round-tripped to retain or clear the current hidden binding."
+    },
+    "SafeAuthentication": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "header_name",
+            "secret_configured"
+          ],
+          "properties": {
+            "type": {
+              "const": "header_api_key"
+            },
+            "header_name": {
+              "type": "string"
+            },
+            "secret_configured": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "secret_configured"
+          ],
+          "properties": {
+            "type": {
+              "const": "static_bearer"
+            },
+            "secret_configured": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "client_id",
+            "token_url",
+            "scopes",
+            "client_auth_method",
+            "client_secret_configured"
+          ],
+          "properties": {
+            "type": {
+              "const": "oauth2_client_credentials"
+            },
+            "client_id": {
+              "type": "string"
+            },
+            "token_url": {
+              "type": "string",
+              "format": "uri"
+            },
+            "scopes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "audience": {
+              "type": "string"
+            },
+            "resource": {
+              "type": "string"
+            },
+            "client_auth_method": {
+              "const": "client_secret_basic"
+            },
+            "client_secret_configured": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "SafeTls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ca_bundle_configured",
+        "client_certificate_configured",
+        "client_private_key_configured"
+      ],
+      "properties": {
+        "ca_bundle_configured": {
+          "type": "boolean"
+        },
+        "client_certificate_configured": {
+          "type": "boolean"
+        },
+        "client_private_key_configured": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ConnectionRevisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connection",
+        "credential",
+        "tls",
+        "discovery",
+        "status"
+      ],
+      "properties": {
+        "connection": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "credential": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tls": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "discovery": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "ConnectionStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "reason"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/OperationalState"
+        },
+        "reason": {
+          "$ref": "#/$defs/StatusReason"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "latency_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "catalog_age_secs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "catalog_entry_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
+        }
+      }
+    },
+    "ConnectionActions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "can_update",
+        "can_bind_secret",
+        "can_manage_secrets",
+        "can_test",
+        "can_refresh",
+        "can_delete"
+      ],
+      "properties": {
+        "can_update": {
+          "type": "boolean"
+        },
+        "can_bind_secret": {
+          "type": "boolean"
+        },
+        "can_manage_secrets": {
+          "type": "boolean"
+        },
+        "can_test": {
+          "type": "boolean"
+        },
+        "can_refresh": {
+          "type": "boolean"
+        },
+        "can_delete": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ConnectionCollectionActions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "can_create",
+        "can_bind_secret",
+        "can_manage_secrets"
+      ],
+      "properties": {
+        "can_create": {
+          "type": "boolean"
+        },
+        "can_bind_secret": {
+          "type": "boolean"
+        },
+        "can_manage_secrets": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ConnectionSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "display_name",
+        "enabled",
+        "kind",
+        "source",
+        "read_only",
+        "authentication",
+        "endpoint_count",
+        "revisions",
+        "status",
+        "sanitized_origin",
+        "capability_count",
+        "last_test_at",
+        "last_refresh_at",
+        "actions"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/ConnectionKind"
+        },
+        "source": {
+          "$ref": "#/$defs/ConnectionSource"
+        },
+        "read_only": {
+          "type": "boolean"
+        },
+        "authentication": {
+          "$ref": "#/$defs/AuthenticationKind"
+        },
+        "endpoint_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "revisions": {
+          "$ref": "#/$defs/ConnectionRevisions"
+        },
+        "status": {
+          "$ref": "#/$defs/ConnectionStatus"
+        },
+        "sanitized_origin": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Origin-only display value; never includes credentials, query, fragment, or path."
+        },
+        "capability_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "last_test_at": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_refresh_at": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "actions": {
+          "$ref": "#/$defs/ConnectionActions"
+        }
+      }
+    },
+    "ConnectionList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connections",
+        "omitted_legacy_projection_count",
+        "actions"
+      ],
+      "properties": {
+        "connections": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "$ref": "#/$defs/ConnectionSummary"
+          }
+        },
+        "next_cursor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "omitted_legacy_projection_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "actions": {
+          "$ref": "#/$defs/ConnectionCollectionActions"
+        }
+      }
+    },
+    "SafeConfiguration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint",
+        "authentication",
+        "tls"
+      ],
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/Endpoint"
+        },
+        "authentication": {
+          "$ref": "#/$defs/SafeAuthentication"
+        },
+        "tls": {
+          "$ref": "#/$defs/SafeTls"
+        },
+        "timeouts": {
+          "$ref": "#/$defs/Timeouts"
+        },
+        "discovery": {
+          "$ref": "#/$defs/Discovery"
+        },
+        "test_profile": {
+          "$ref": "#/$defs/TestProfile"
+        }
+      }
+    },
+    "ConnectionDependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "consumer_id"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "proxy_route",
+            "manual_tool",
+            "managed_tool",
+            "control_plane"
+          ]
+        },
+        "consumer_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "ConnectionDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "display_name",
+        "enabled",
+        "kind",
+        "source",
+        "read_only",
+        "authentication",
+        "endpoint_count",
+        "revisions",
+        "status",
+        "dependencies",
+        "actions"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/ConnectionKind"
+        },
+        "source": {
+          "$ref": "#/$defs/ConnectionSource"
+        },
+        "read_only": {
+          "type": "boolean"
+        },
+        "authentication": {
+          "$ref": "#/$defs/AuthenticationKind"
+        },
+        "endpoint_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "revisions": {
+          "$ref": "#/$defs/ConnectionRevisions"
+        },
+        "status": {
+          "$ref": "#/$defs/ConnectionStatus"
+        },
+        "configuration": {
+          "$ref": "#/$defs/SafeConfiguration"
+        },
+        "dependencies": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/ConnectionDependency"
+          }
+        },
+        "actions": {
+          "$ref": "#/$defs/ConnectionActions"
+        },
+        "created_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      }
+    },
+    "ConnectionDeleted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deleted_connection_id"
+      ],
+      "properties": {
+        "deleted_connection_id": {
+          "$ref": "#/$defs/StableId"
+        }
+      }
+    },
+    "SecretPurpose": {
+      "enum": [
+        "header_api_key",
+        "static_bearer",
+        "oauth_client_secret",
+        "tls_private_key",
+        "tls_certificate",
+        "tls_ca_bundle"
+      ]
+    },
+    "SecretProvider": {
+      "enum": [
+        "operator_environment",
+        "operator_file",
+        "local_encrypted"
+      ]
+    },
+    "SecretActions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "can_rotate",
+        "can_delete"
+      ],
+      "properties": {
+        "can_rotate": {
+          "type": "boolean"
+        },
+        "can_delete": {
+          "type": "boolean"
+        }
+      }
+    },
+    "SafeSecretAlias": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "etag",
+        "label",
+        "provider",
+        "configured",
+        "compatible_purposes",
+        "dependency_count",
+        "actions"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "etag": {
+          "$ref": "#/$defs/Etag"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "provider": {
+          "$ref": "#/$defs/SecretProvider"
+        },
+        "configured": {
+          "type": "boolean"
+        },
+        "compatible_purposes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/SecretPurpose"
+          }
+        },
+        "dependency_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rotated_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "actions": {
+          "$ref": "#/$defs/SecretActions"
+        }
+      }
+    },
+    "SecretList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "secrets",
+        "actions",
+        "providers"
+      ],
+      "properties": {
+        "secrets": {
+          "type": "array",
+          "maxItems": 512,
+          "items": {
+            "$ref": "#/$defs/SafeSecretAlias"
+          }
+        },
+        "actions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "can_create"
+          ],
+          "properties": {
+            "can_create": {
+              "type": "boolean"
+            }
+          }
+        },
+        "providers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operator_aliases",
+            "local_encrypted"
+          ],
+          "properties": {
+            "operator_aliases": {
+              "type": "boolean"
+            },
+            "local_encrypted": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "SecretCreateRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "purpose",
+        "value"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "purpose": {
+          "$ref": "#/$defs/SecretPurpose"
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "writeOnly": true,
+          "description": "One-use secret material. Never returned by any response."
+        }
+      }
+    },
+    "SecretRotateRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "purpose",
+        "value"
+      ],
+      "properties": {
+        "purpose": {
+          "$ref": "#/$defs/SecretPurpose"
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "writeOnly": true,
+          "description": "One-use replacement material. Never returned by any response."
+        }
+      }
+    },
+    "SecretDeleted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deleted_secret_id"
+      ],
+      "properties": {
+        "deleted_secret_id": {
+          "$ref": "#/$defs/StableId"
+        }
+      }
+    },
+    "ConnectionTestStage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "outcome"
+      ],
+      "properties": {
+        "name": {
+          "enum": [
+            "egress_policy",
+            "secret_available",
+            "connected",
+            "tls_valid",
+            "authenticated",
+            "protocol_valid"
+          ]
+        },
+        "outcome": {
+          "enum": [
+            "success",
+            "failure",
+            "not_applicable"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "ConnectionTestResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "state",
+        "tested_at",
+        "latency_ms",
+        "stages"
+      ],
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "state": {
+          "$ref": "#/$defs/OperationalState"
+        },
+        "tested_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "latency_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": {
+            "$ref": "#/$defs/ConnectionTestStage"
+          }
+        }
+      }
+    },
+    "CatalogPublishResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connection_id",
+        "catalog_revision",
+        "status",
+        "total_count",
+        "added_count",
+        "changed_count",
+        "removed_count"
+      ],
+      "properties": {
+        "connection_id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "spec_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "spec_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "catalog_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "$ref": "#/$defs/ConnectionStatus"
+        },
+        "registered_tool_names": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "total_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "added_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "changed_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "removed_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "spec_digest",
+            "spec_revision",
+            "registered_tool_names"
+          ]
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "spec_digest"
+                ]
+              },
+              {
+                "required": [
+                  "spec_revision"
+                ]
+              },
+              {
+                "required": [
+                  "registered_tool_names"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "HttpMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "path_template"
+      ],
+      "properties": {
+        "method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path_template": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "query_params": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "arg_name",
+              "query_name",
+              "required"
+            ],
+            "properties": {
+              "arg_name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "query_name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "required": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "const": "whole_args_json"
+            }
+          }
+        }
+      }
+    },
+    "ToolTarget": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "connection_id",
+            "mapping"
+          ],
+          "properties": {
+            "type": {
+              "const": "http"
+            },
+            "connection_id": {
+              "$ref": "#/$defs/StableId"
+            },
+            "mapping": {
+              "$ref": "#/$defs/HttpMapping"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "connection_id",
+            "remote_tool_name"
+          ],
+          "properties": {
+            "type": {
+              "const": "mcp"
+            },
+            "connection_id": {
+              "$ref": "#/$defs/StableId"
+            },
+            "remote_tool_name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        }
+      ]
+    },
+    "ToolSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "manual"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "connection_id"
+          ],
+          "properties": {
+            "type": {
+              "const": "open_api"
+            },
+            "connection_id": {
+              "$ref": "#/$defs/StableId"
+            },
+            "operation_id": {
+              "type": "string"
+            },
+            "catalog_revision": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "connection_id",
+            "remote_tool_name"
+          ],
+          "properties": {
+            "type": {
+              "const": "mcp"
+            },
+            "connection_id": {
+              "$ref": "#/$defs/StableId"
+            },
+            "remote_tool_name": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "legacy"
+            }
+          }
+        }
+      ]
+    },
+    "ToolDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "description",
+        "input_json_schema",
+        "source",
+        "target",
+        "upstream"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input_json_schema": {
+          "type": "object"
+        },
+        "target": {
+          "$ref": "#/$defs/ToolTarget"
+        },
+        "source": {
+          "$ref": "#/$defs/ToolSource"
+        },
+        "upstream": {
+          "$ref": "#/$defs/HttpMapping"
+        }
+      }
+    },
+    "OpenApiPreviewRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "spec"
+      ],
+      "properties": {
+        "spec": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2097152
+        }
+      }
+    },
+    "OpenApiSecuritySelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool_name",
+        "selected_scheme_names"
+      ],
+      "properties": {
+        "tool_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "selected_scheme_names": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "OpenApiNameFallback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "path_template",
+        "generated_name",
+        "reason"
+      ],
+      "properties": {
+        "method": {
+          "type": "string"
+        },
+        "path_template": {
+          "type": "string"
+        },
+        "original_operation_id": {
+          "type": "string"
+        },
+        "generated_name": {
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "missing_operation_id",
+            "invalid_operation_id",
+            "duplicate_tool_name"
+          ]
+        }
+      }
+    },
+    "OpenApiSkippedOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "path_template",
+        "reason"
+      ],
+      "properties": {
+        "method": {
+          "type": "string"
+        },
+        "path_template": {
+          "type": "string"
+        },
+        "original_operation_id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "property_name": {
+          "type": "string"
+        }
+      }
+    },
+    "OpenApiIncompatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool_name",
+        "reason"
+      ],
+      "properties": {
+        "tool_name": {
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "missing_security_metadata",
+            "no_compatible_security_alternative",
+            "invalid_mapping_path"
+          ]
+        },
+        "path_template": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        }
+      }
+    },
+    "OpenApiPreviewResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connection_id",
+        "connection_etag",
+        "spec_digest",
+        "spec_revision",
+        "catalog_revision",
+        "tools",
+        "security_confirmations",
+        "incompatibilities",
+        "operation_id_fallbacks",
+        "skipped_operations"
+      ],
+      "properties": {
+        "connection_id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "connection_etag": {
+          "$ref": "#/$defs/Etag"
+        },
+        "spec_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "spec_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "catalog_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tools": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/ToolDefinition"
+          }
+        },
+        "security_confirmations": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiSecuritySelection"
+          }
+        },
+        "incompatibilities": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiIncompatibility"
+          }
+        },
+        "operation_id_fallbacks": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiNameFallback"
+          }
+        },
+        "skipped_operations": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiSkippedOperation"
+          }
+        }
+      }
+    },
+    "OpenApiRegisterRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "spec",
+        "spec_digest",
+        "expected_spec_revision",
+        "expected_catalog_revision",
+        "selected_tool_names",
+        "security_confirmations"
+      ],
+      "properties": {
+        "spec": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2097152
+        },
+        "spec_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "expected_spec_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expected_catalog_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "selected_tool_names": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "security_confirmations": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiSecuritySelection"
+          }
+        }
+      }
+    },
+    "CapabilitySource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "manual_file"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "connection_id",
+            "catalog_revision",
+            "spec_revision",
+            "spec_digest"
+          ],
+          "properties": {
+            "type": {
+              "const": "openapi"
+            },
+            "connection_id": {
+              "$ref": "#/$defs/StableId"
+            },
+            "operation_id": {
+              "type": "string"
+            },
+            "catalog_revision": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "spec_revision": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "spec_digest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "connection_id"
+          ],
+          "properties": {
+            "type": {
+              "const": "mcp_discovery"
+            },
+            "connection_id": {
+              "$ref": "#/$defs/StableId"
+            },
+            "remote_tool_name": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "connection_id",
+            "remote_tool_name"
+          ],
+          "properties": {
+            "type": {
+              "const": "projected_legacy_config"
+            },
+            "connection_id": {
+              "$ref": "#/$defs/StableId"
+            },
+            "remote_tool_name": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "CapabilityConnection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "management_source"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "kind": {
+          "$ref": "#/$defs/ConnectionKind"
+        },
+        "management_source": {
+          "$ref": "#/$defs/ConnectionSource"
+        }
+      }
+    },
+    "CapabilityState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "available",
+        "stale",
+        "reason"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "stale": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "CapabilityPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "eligible",
+        "reason"
+      ],
+      "properties": {
+        "eligible": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "CapabilitySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "name",
+        "description_truncated",
+        "source",
+        "state",
+        "policy"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/OpaqueCapabilityId"
+        },
+        "kind": {
+          "enum": [
+            "tool",
+            "resource",
+            "resource_template"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string"
+        },
+        "uri": {
+          "type": "string"
+        },
+        "uri_template": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "description_truncated": {
+          "type": "boolean"
+        },
+        "source": {
+          "$ref": "#/$defs/CapabilitySource"
+        },
+        "connection": {
+          "$ref": "#/$defs/CapabilityConnection"
+        },
+        "schema_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "discovered_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "last_success_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "state": {
+          "$ref": "#/$defs/CapabilityState"
+        },
+        "policy": {
+          "$ref": "#/$defs/CapabilityPolicy"
+        }
+      }
+    },
+    "CapabilityMapping": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "method",
+            "path_template",
+            "query_params"
+          ],
+          "properties": {
+            "type": {
+              "const": "http"
+            },
+            "method": {
+              "type": "string"
+            },
+            "path_template": {
+              "type": "string"
+            },
+            "query_params": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "arg_name",
+                  "query_name",
+                  "required"
+                ],
+                "properties": {
+                  "arg_name": {
+                    "type": "string"
+                  },
+                  "query_name": {
+                    "type": "string"
+                  },
+                  "required": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "body": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "mode"
+              ],
+              "properties": {
+                "mode": {
+                  "const": "whole_args_json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "remote_tool_name"
+          ],
+          "properties": {
+            "type": {
+              "const": "mcp"
+            },
+            "remote_tool_name": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "uri"
+          ],
+          "properties": {
+            "type": {
+              "const": "resource"
+            },
+            "uri": {
+              "type": "string"
+            },
+            "mime_type": {
+              "type": "string"
+            },
+            "size": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "uri_template"
+          ],
+          "properties": {
+            "type": {
+              "const": "resource_template"
+            },
+            "uri_template": {
+              "type": "string"
+            },
+            "mime_type": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "CapabilityActions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "can_execute",
+        "reason"
+      ],
+      "properties": {
+        "can_execute": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "CapabilityDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "name",
+        "description_truncated",
+        "source",
+        "state",
+        "policy",
+        "actions"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/OpaqueCapabilityId"
+        },
+        "kind": {
+          "enum": [
+            "tool",
+            "resource",
+            "resource_template"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "uri": {
+          "type": "string"
+        },
+        "uri_template": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "description_truncated": {
+          "type": "boolean"
+        },
+        "source": {
+          "$ref": "#/$defs/CapabilitySource"
+        },
+        "connection": {
+          "$ref": "#/$defs/CapabilityConnection"
+        },
+        "schema_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "discovered_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "last_success_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "state": {
+          "$ref": "#/$defs/CapabilityState"
+        },
+        "policy": {
+          "$ref": "#/$defs/CapabilityPolicy"
+        },
+        "input_json_schema": {
+          "type": "object"
+        },
+        "mapping": {
+          "$ref": "#/$defs/CapabilityMapping"
+        },
+        "actions": {
+          "$ref": "#/$defs/CapabilityActions"
+        }
+      }
+    },
+    "CapabilityList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capabilities",
+        "total_count"
+      ],
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "$ref": "#/$defs/CapabilitySummary"
+          }
+        },
+        "next_cursor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "total_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8192
+        }
+      }
+    },
+    "PlaygroundRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "arguments"
+      ],
+      "properties": {
+        "arguments": {
+          "type": "object"
+        }
+      }
+    },
+    "ProjectedHttpBody": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "const": "json"
+            },
+            "value": true
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "value"
+          ],
+          "properties": {
+            "type": {
+              "const": "text"
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "PlaygroundHttpResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "status",
+        "body"
+      ],
+      "properties": {
+        "kind": {
+          "const": "http"
+        },
+        "status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599
+        },
+        "body": {
+          "$ref": "#/$defs/ProjectedHttpBody"
+        }
+      }
+    },
+    "McpContent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "text"
+          ],
+          "properties": {
+            "type": {
+              "const": "text"
+            },
+            "text": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "data",
+            "mime_type"
+          ],
+          "properties": {
+            "type": {
+              "enum": [
+                "image",
+                "audio"
+              ]
+            },
+            "data": {
+              "type": "string"
+            },
+            "mime_type": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "resource"
+          ],
+          "properties": {
+            "type": {
+              "const": "resource"
+            },
+            "resource": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "uri"
+              ],
+              "properties": {
+                "uri": {
+                  "type": "string"
+                },
+                "mime_type": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "blob": {
+                  "type": "string"
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "text"
+                  ]
+                },
+                {
+                  "required": [
+                    "blob"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "uri",
+            "name"
+          ],
+          "properties": {
+            "type": {
+              "const": "resource_link"
+            },
+            "uri": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            },
+            "mime_type": {
+              "type": "string"
+            },
+            "size": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      ]
+    },
+    "PlaygroundMcpResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "content",
+        "is_error"
+      ],
+      "properties": {
+        "kind": {
+          "const": "mcp"
+        },
+        "content": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/McpContent"
+          }
+        },
+        "structured_content": true,
+        "is_error": {
+          "type": "boolean"
+        }
+      }
+    },
+    "PlaygroundResult": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/PlaygroundHttpResult"
+        },
+        {
+          "$ref": "#/$defs/PlaygroundMcpResult"
+        }
+      ]
+    },
+    "Error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error"
+      ],
+      "properties": {
+        "error": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "ReasonedError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "reason"
+      ],
+      "properties": {
+        "error": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "ValidationProblem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "code"
+      ],
+      "properties": {
+        "field": {
+          "type": "string",
+          "minLength": 1
+        },
+        "code": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "ValidationError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "problems"
+      ],
+      "properties": {
+        "error": {
+          "const": "connection validation failed"
+        },
+        "problems": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/ValidationProblem"
+          }
+        }
+      }
+    },
+    "CreateAuthentication": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "header_name"
+          ],
+          "properties": {
+            "type": {
+              "const": "header_api_key"
+            },
+            "header_name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "secret_id": {
+              "$ref": "#/$defs/StableId"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "static_bearer"
+            },
+            "secret_id": {
+              "$ref": "#/$defs/StableId"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "client_id",
+            "token_url",
+            "client_auth_method"
+          ],
+          "properties": {
+            "type": {
+              "const": "oauth2_client_credentials"
+            },
+            "client_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "client_secret_id": {
+              "$ref": "#/$defs/StableId"
+            },
+            "token_url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "format": "uri",
+              "pattern": "^https://"
+            },
+            "scopes": {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^\\S+$"
+              }
+            },
+            "audience": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "resource": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "client_auth_method": {
+              "const": "client_secret_basic"
+            }
+          }
+        }
+      ]
+    },
+    "CreateTls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ca_bundle_alias": {
+          "$ref": "#/$defs/StableId"
+        },
+        "client_certificate_id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "client_private_key_id": {
+          "$ref": "#/$defs/StableId"
+        }
+      }
+    },
+    "DependencyConflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "dependency_count",
+        "connection_ids"
+      ],
+      "properties": {
+        "error": {
+          "const": "connection secret is referenced by managed connections"
+        },
+        "dependency_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "connection_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/StableId"
+          }
+        }
+      }
+    }
+  }
+}

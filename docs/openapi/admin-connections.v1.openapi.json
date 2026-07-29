@@ -1,0 +1,1089 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "GreenGateway Connection and Capability Admin API",
+    "version": "1.0.0",
+    "description": "The default paths are shown with ADMIN_PREFIX=/admin. Replace /admin with the configured ADMIN_PREFIX while retaining the /v1 API prefix. Every route requires an authenticated principal and the operation-specific RBAC permission. Safe read responses and projected playground output never expose secret IDs, provider locators, ciphertext, nonces, key/private-key material, raw DNS or transport errors, or upstream response headers."
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "The active GreenGateway listener."
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    },
+    {
+      "cookieAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Connections"
+    },
+    {
+      "name": "Connection secrets"
+    },
+    {
+      "name": "Managed OpenAPI"
+    },
+    {
+      "name": "Capabilities"
+    }
+  ],
+  "paths": {
+    "/v1/admin/connections": {
+      "get": {
+        "operationId": "listConnections",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "List safe Connection summaries",
+        "description": "Requires admin:connections:read. The opaque cursor is valid only with the same filters and current collection.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConnectionLimit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "name": "enabled",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "schema": {
+              "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ConnectionKind"
+            }
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "schema": {
+              "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ConnectionSource"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "schema": {
+              "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OperationalState"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Safe Connection page.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "x-greengateway-connections-etag": {
+                "$ref": "#/components/headers/ConnectionCollectionETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ConnectionList"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createConnection",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Create a managed Connection",
+        "description": "Requires admin:connections:write. Configuring credential or TLS authority also requires admin:connections:secrets:write. enabled defaults to false when omitted.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ConnectionCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created safe Connection detail.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "x-greengateway-connections-etag": {
+                "$ref": "#/components/headers/ConnectionCollectionETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ConnectionDetail"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/admin/connections/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/StableId"
+        }
+      ],
+      "get": {
+        "operationId": "getConnection",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Get a redacted Connection detail",
+        "description": "Requires admin:connections:read. Legacy projections use a collection-bound ETag and have all mutation actions disabled.",
+        "responses": {
+          "200": {
+            "description": "Safe Connection detail.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ConnectionDetail"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        }
+      },
+      "put": {
+        "operationId": "replaceConnection",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Replace a managed Connection",
+        "description": "Requires admin:connections:write and an exact resource ETag. Explicit binding IDs, credential/TLS authority changes, and credentialed target changes require admin:connections:secrets:write. A caller may round-trip configured redaction markers instead of hidden IDs.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ConnectionReplaceRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated safe Connection detail.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "x-greengateway-connections-etag": {
+                "$ref": "#/components/headers/ConnectionCollectionETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ConnectionDetail"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      },
+      "delete": {
+        "operationId": "deleteConnection",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Delete an unreferenced managed Connection",
+        "description": "Requires admin:connections:write and an exact resource ETag. Deleting credential/TLS authority also requires admin:connections:secrets:write. There is no force-delete mode.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted Connection identifier.",
+            "headers": {
+              "x-greengateway-connections-etag": {
+                "$ref": "#/components/headers/ConnectionCollectionETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ConnectionDeleted"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/admin/connections/{id}/test": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/StableId"
+        }
+      ],
+      "post": {
+        "operationId": "testConnection",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Run the saved bounded Connection test",
+        "description": "Requires admin:connections:test, an exact resource ETag, and an empty body. Operational probe failures still return a sanitized 200 result; API/admission failures use HTTP errors.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sanitized staged test result.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ConnectionTestResult"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/admin/connections/{id}/refresh": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/StableId"
+        }
+      ],
+      "post": {
+        "operationId": "refreshConnectionCatalog",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Refresh a registered managed MCP or OpenAPI catalog",
+        "description": "Requires admin:connections:refresh, an exact resource ETag, and an empty body. Failure leaves the prior catalog as last-known-good.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Safe catalog publication summary.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/CatalogPublishResult"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/admin/connections/{id}/openapi/preview": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/StableId"
+        }
+      ],
+      "post": {
+        "operationId": "previewManagedOpenApi",
+        "tags": [
+          "Managed OpenAPI"
+        ],
+        "summary": "Preview a bounded OpenAPI document without persistence",
+        "description": "Requires admin:tools:read. Preview performs no network request or tool invocation and returns the current Connection ETag for a later register precondition.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiPreviewRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Deterministic generated catalog preview.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiPreviewResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/admin/connections/{id}/openapi/register": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/StableId"
+        }
+      ],
+      "post": {
+        "operationId": "registerManagedOpenApi",
+        "tags": [
+          "Managed OpenAPI"
+        ],
+        "summary": "Persist and publish an explicit OpenAPI selection",
+        "description": "Requires admin:tools:write and the exact Connection ETag. The repeated spec/digest/revisions bind registration to the reviewed preview.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiRegisterRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Safe managed OpenAPI catalog publication summary.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/CatalogPublishResult"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/admin/connection-secrets": {
+      "get": {
+        "operationId": "listConnectionSecretAliases",
+        "tags": [
+          "Connection secrets"
+        ],
+        "summary": "List safe secret-alias metadata",
+        "description": "Requires admin:connections:secrets:write. The response never contains values, hidden binding IDs, provider locators, ciphertext, nonces, or key material.",
+        "responses": {
+          "200": {
+            "description": "Safe secret-alias collection.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "x-greengateway-connection-secrets-etag": {
+                "$ref": "#/components/headers/SecretCollectionETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/SecretList"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createEncryptedConnectionSecret",
+        "tags": [
+          "Connection secrets"
+        ],
+        "summary": "Create an encrypted-local secret alias",
+        "description": "Requires admin:connections:secrets:write and the exact secret collection ETag. The one-use value is never returned.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/SecretCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Safe created alias metadata.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "x-greengateway-connection-secrets-etag": {
+                "$ref": "#/components/headers/SecretCollectionETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/SafeSecretAlias"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/admin/connection-secrets/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/StableId"
+        }
+      ],
+      "put": {
+        "operationId": "rotateEncryptedConnectionSecret",
+        "tags": [
+          "Connection secrets"
+        ],
+        "summary": "Rotate an encrypted-local value",
+        "description": "Requires admin:connections:secrets:write and the exact item ETag. Operator-provisioned aliases are read-only.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/SecretRotateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Safe rotated alias metadata.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "x-greengateway-connection-secrets-etag": {
+                "$ref": "#/components/headers/SecretCollectionETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/SafeSecretAlias"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      },
+      "delete": {
+        "operationId": "deleteEncryptedConnectionSecret",
+        "tags": [
+          "Connection secrets"
+        ],
+        "summary": "Delete an unreferenced encrypted-local alias",
+        "description": "Requires admin:connections:secrets:write and the exact item ETag. Referenced and operator-provisioned aliases cannot be deleted.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted alias identifier.",
+            "headers": {
+              "x-greengateway-connection-secrets-etag": {
+                "$ref": "#/components/headers/SecretCollectionETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/SecretDeleted"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/admin/tools": {
+      "get": {
+        "operationId": "listCapabilities",
+        "tags": [
+          "Capabilities"
+        ],
+        "summary": "List unified safe capabilities",
+        "description": "Requires admin:tools:read. The page combines manual, managed OpenAPI/MCP, and projected legacy capabilities.",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "query",
+            "schema": {
+              "enum": [
+                "tool",
+                "resource",
+                "resource_template"
+              ]
+            }
+          },
+          {
+            "name": "connection_id",
+            "in": "query",
+            "schema": {
+              "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/StableId"
+            }
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "schema": {
+              "enum": [
+                "manual_file",
+                "openapi",
+                "mcp_discovery",
+                "projected_legacy_config"
+              ]
+            }
+          },
+          {
+            "name": "available",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "availability",
+            "in": "query",
+            "schema": {
+              "enum": [
+                "available",
+                "unavailable",
+                "stale"
+              ]
+            }
+          },
+          {
+            "name": "text",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          {
+            "$ref": "#/components/parameters/CapabilityLimit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Safe capability page.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/CapabilityList"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        }
+      }
+    },
+    "/v1/admin/tools/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpaqueCapabilityId"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getCapability",
+        "tags": [
+          "Capabilities"
+        ],
+        "summary": "Get safe capability detail and execution precondition",
+        "description": "Requires admin:tools:read. The ETag binds the caller-visible definition, policy eligibility, and Connection/catalog revision.",
+        "responses": {
+          "200": {
+            "description": "Safe capability detail.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/CapabilityDetail"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        }
+      }
+    },
+    "/v1/admin/tools/{id}/execute": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpaqueCapabilityId"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "executeCapabilityInPlayground",
+        "tags": [
+          "Capabilities"
+        ],
+        "summary": "Execute a constrained registered tool",
+        "description": "Requires admin:tools:execute and the exact strong capability ETag. The body can contain arguments only; URL/header/credential/TLS/timeout/Connection overrides are not accepted. HTTP response headers and non-success bodies are withheld.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/PlaygroundRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bounded projected HTTP or MCP result.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/PlaygroundResult"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "A validated bearer JWT or ggw_ service token. A bearer-authenticated mutation is exempt from the cookie double-submit CSRF check."
+      },
+      "cookieAuth": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "session",
+        "description": "The default session cookie. AUTH_COOKIE_NAME changes this name. When CSRF_ENABLED is true (the default), every cookie-authenticated POST, PUT, or DELETE also requires the double-submit CSRF_COOKIE_NAME cookie and matching CSRF_HEADER_NAME header. The default CSRF names are csrf_token and x-csrf-token."
+      },
+      "csrfCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "csrf_token",
+        "description": "The default double-submit CSRF cookie for cookie-authenticated mutations. CSRF_COOKIE_NAME changes this name; CSRF_ENABLED defaults to true."
+      },
+      "csrfHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-csrf-token",
+        "description": "The default double-submit CSRF header. CSRF_HEADER_NAME changes this name, and its value must exactly match the configured CSRF cookie."
+      }
+    },
+    "parameters": {
+      "StableId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/StableId"
+        }
+      },
+      "IfMatch": {
+        "name": "If-Match",
+        "in": "header",
+        "required": true,
+        "description": "Exactly one current strong entity tag. Missing preconditions return 428 and stale preconditions return 412.",
+        "schema": {
+          "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/Etag"
+        }
+      },
+      "Cursor": {
+        "name": "cursor",
+        "in": "query",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      },
+      "ConnectionLimit": {
+        "name": "limit",
+        "in": "query",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 50
+        }
+      },
+      "CapabilityLimit": {
+        "name": "limit",
+        "in": "query",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 50
+        }
+      }
+    },
+    "headers": {
+      "ETag": {
+        "description": "Strong ETag for the returned representation or resource.",
+        "schema": {
+          "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/Etag"
+        }
+      },
+      "ConnectionCollectionETag": {
+        "description": "Canonical current Connection collection ETag used by create and stale-cursor preconditions.",
+        "schema": {
+          "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/Etag"
+        }
+      },
+      "SecretCollectionETag": {
+        "description": "Canonical current connection-secret collection ETag used by create preconditions.",
+        "schema": {
+          "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/Etag"
+        }
+      },
+      "NoStore": {
+        "description": "Sensitive control-plane representations are not cacheable.",
+        "schema": {
+          "type": "string",
+          "const": "no-store"
+        }
+      }
+    },
+    "schemas": {
+      "AdminError": {
+        "oneOf": [
+          {
+            "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/Error"
+          },
+          {
+            "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ReasonedError"
+          },
+          {
+            "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ValidationError"
+          },
+          {
+            "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/DependencyConflict"
+          }
+        ]
+      }
+    },
+    "responses": {
+      "AdminError": {
+        "description": "Stable sanitized error body. Authorization and availability details remain bounded.",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/AdminError"
+            }
+          }
+        }
+      }
+    }
+  }
+}

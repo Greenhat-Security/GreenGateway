@@ -1,0 +1,148 @@
+# Single-replica managed-Connections example.
+#
+# Pre-create `greengateway-connection-secrets` outside source control. Its
+# `local-secret-primary.key` entry must contain exactly 32 raw random bytes.
+# The init container copies the projected Secret through a memory-backed
+# staging volume because Kubernetes projected Secret leaves are symlinks and
+# GreenGateway intentionally rejects symlink-backed secret files.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: greengateway-connections
+data:
+  LISTEN_ADDR: "0.0.0.0:8080"
+  AUTH_ENABLED: "true"
+  AUTH_MODE: "required"
+  CONNECTIONS_SQLITE_PATH: "/var/lib/greengateway/connections.sqlite"
+  CONNECTION_SECRETS_ROOT: "/run/greengateway-secrets"
+  CONNECTION_LOCAL_SECRET_KEYRING: >-
+    [{"id":"local-primary","file":"local-secret-primary.key","role":"primary"}]
+  CONNECTION_SECRET_ALIASES: "[]"
+  EGRESS_DENY_PRIVATE_IPS: "true"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: greengateway-connections
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: greengateway-connections
+spec:
+  # SQLite is a single-process control-plane store. Do not scale this example
+  # horizontally or share its database between gateway processes.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: greengateway-connections
+  template:
+    metadata:
+      labels:
+        app: greengateway-connections
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      initContainers:
+        - name: prepare-connections-storage
+          image: busybox:1.37.0
+          command:
+            - /bin/sh
+            - -eu
+            - -c
+            - |
+              mkdir -p /state /protected
+              chown 10001:10001 /state /protected
+              chmod 0700 /state /protected
+              cp /projected/local-secret-primary.key /protected/local-secret-primary.key
+              chown 10001:10001 /protected/local-secret-primary.key
+              chmod 0600 /protected/local-secret-primary.key
+              test "$(wc -c < /protected/local-secret-primary.key)" -eq 32
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: false
+            runAsUser: 0
+          volumeMounts:
+            - name: connections-state
+              mountPath: /state
+            - name: projected-secrets
+              mountPath: /projected
+              readOnly: true
+            - name: protected-secrets
+              mountPath: /protected
+      containers:
+        - name: gateway
+          # Replace latest with an immutable release digest before production.
+          image: ghcr.io/greenhat-security/greengateway:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: greengateway-connections
+            - secretRef:
+                # Supply inbound authentication settings separately.
+                name: greengateway-secrets
+          ports:
+            - name: http
+              containerPort: 8080
+          startupProbe:
+            httpGet:
+              path: /startupz
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+          volumeMounts:
+            - name: connections-state
+              mountPath: /var/lib/greengateway
+            - name: protected-secrets
+              mountPath: /run/greengateway-secrets
+              readOnly: true
+      volumes:
+        - name: connections-state
+          persistentVolumeClaim:
+            claimName: greengateway-connections
+        - name: projected-secrets
+          secret:
+            secretName: greengateway-connection-secrets
+            defaultMode: 0400
+            items:
+              - key: local-secret-primary.key
+                path: local-secret-primary.key
+        - name: protected-secrets
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi

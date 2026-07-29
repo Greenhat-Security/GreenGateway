@@ -2,138 +2,140 @@
 
 ## Status
 
-Accepted
+Accepted and implemented for the issue #240 runtime, control-plane, discovery,
+inventory, UI, test, and constrained-playground slices on the current `main`
+branch.
 
 ## Context
 
-Issue #240 introduces a shared upstream `Connection` for proxy routes, manual
-HTTP tools, OpenAPI-managed tools, and streamable-HTTP MCP servers. Today those
-surfaces use separate legacy configuration, HTTP tools share one global
-upstream, and MCP provenance is encoded through an internal sentinel mapping.
-Literal route headers are the only compatibility mechanism for some upstream
-credentials.
+GreenGateway originally configured HTTP proxy routes, manual HTTP tools,
+OpenAPI-generated tools, and streamable-HTTP MCP servers through separate
+legacy settings. HTTP tools shared a global upstream, MCP provenance used an
+internal mapping, and literal route headers were the only compatibility
+mechanism for some upstream credentials.
 
-A connection combines a destination with references to credentials and TLS
-material. That makes destination mutation, discovery, testing, catalog refresh,
-and tool invocation security-sensitive: if authorization, egress, or authority
-binding is performed in the wrong order, a normal editor can redirect a stored
-credential or turn the gateway into an SSRF scanner.
-
-This decision is based on main commit
-`17a50bf658247c813f63cfb14b06fc97cdd21d38`, after issue #239 landed its
-production data-plane transport, DNS-generation, bounded resilience, lifecycle,
-streaming, and mTLS isolation primitives. Connections must consume those
-primitives; they do not create another client or pool stack.
-
-Checklist item 1 adds the vocabulary, schemas, validation boundaries, typed
-tool metadata, and redacted secret wrappers. It does not add a database,
-secret provider, credential injection, OAuth, admin route, discovery request,
-test request, inventory, UI, or runtime connection selection. Existing legacy
-execution remains authoritative until the later checklist item that migrates
-each lane with parity tests.
+A reusable upstream configuration is useful only if it does not become an
+implicit authorization grant or a new SSRF/credential exfiltration path.
+Destination mutation, secret binding, TLS identity, OAuth, stored tests,
+discovery, inventory, and tool execution all cross security boundaries. The
+implementation therefore consumes the production data-plane primitives from
+[ADR-0005](0005-production-proxy-data-plane.md); it does not create an alternate
+resolver, HTTP client, or redirect path.
 
 ## Decision
 
-### Terminology and ownership
+### Connection model and ownership
 
 A `Connection` is a stable logical destination and credential profile. It is
-never an authorization grant. It contains:
+never an authorization grant and never modifies the egress allowlist. The
+initial kinds are `http_api` and `mcp_streamable_http`.
 
-- an immutable stable ID, bounded display metadata, enabled state, kind, and
-  management source;
-- one normalized HTTP(S) origin and explicit origin-relative base path;
-- an authentication binding and an independent TLS profile;
+A managed Connection contains:
+
+- an immutable generated ID, bounded presentation fields, enabled state, kind,
+  and `managed` source;
+- one normalized HTTP(S) origin and a separately validated origin-relative base
+  path;
+- one HTTP authentication binding and an independent TLS profile;
 - bounded timeout and stored test profiles;
 - optional typed OpenAPI or MCP discovery configuration; and
 - monotonic connection, credential, TLS, discovery, and status revisions.
 
-It never contains resolved secret material. The initial kinds are `http_api`
-and `mcp_streamable_http`.
+It contains opaque secret references, never resolved secret material.
 
-The implementation is divided into focused responsibilities:
-
-| Responsibility | Interface |
-|---|---|
-| Transactional metadata, dependency, catalog, binding, and revision state | `ConnectionStore` |
-| Complete-candidate validation and atomic immutable runtime publication | `ConnectionManager` |
-| Opaque ID to bounded redacted material resolution | `SecretResolver` |
-| Static header, bearer, and OAuth behavior | `CredentialProvider` |
-| CA trust and optional client identity independent of HTTP authentication | `TlsProfile` |
-| Bounded all-or-nothing OpenAPI/MCP refresh | `ConnectionCatalogService` |
-| Safe reason/state/time/count history | `ConnectionStatusStore` |
+| Responsibility | Current implementation |
+| --- | --- |
+| Transactional metadata, dependency, catalog, binding, and revision state | `ConnectionStore` / `SqliteConnectionStore` |
+| Complete-candidate validation and immutable runtime publication | `ConnectionControlPlane` and `ConnectionRuntimeSnapshot` |
+| Opaque alias to bounded redacted material | `SecretResolver` |
+| Header API key, bearer, and OAuth behavior | `ConnectionHttpRuntime` |
+| Custom CA and optional client identity, separate from HTTP auth | `TlsProfile` and the checked egress client |
+| All-or-nothing OpenAPI/MCP refresh | `OpenApiConnectionCatalogService` and `McpConnectionCatalogService` |
+| Safe status/history | Connection status store |
 | Manual, legacy, OpenAPI, and MCP capability merge | `CapabilityInventory` |
+| Persisted bounded test execution | `ConnectionTestService` |
 
-The control plane will use one versioned SQLite store when explicitly
-configured. An unset store preserves legacy runtime behavior and makes managed
-mutation read-only/unavailable; it never creates an implicit database. Runtime
-publication will use an immutable snapshot and atomic swap. A failed parse,
-validation, resolution, TLS build, transaction, or catalog compile leaves both
-the stored and active prior revision unchanged.
+When `CONNECTIONS_SQLITE_PATH` is unset, GreenGateway creates no implicit
+database. Legacy HTTP routes, the default HTTP upstream, and MCP upstreams are
+projected as read-only Connections. Managed create/update/delete, local
+encrypted-secret management, tests, and refresh that require the store return a
+sanitized unavailable response.
+
+When the store is configured, a mutation validates the complete candidate,
+commits it and its dependencies transactionally, then atomically publishes one
+immutable runtime snapshot. A failed parse, validation, provider/TLS preflight,
+transaction, or catalog compile leaves the stored and active prior revision
+unchanged.
 
 ### Authorization and side-effect order
 
-Authentication, global rate limiting, RBAC/direct route policy, tool policy,
-and admin permission checks remain authoritative. A Connection does not make
-its endpoint reachable and never edits the egress allowlist.
-
-The required invocation order is:
+Authentication, global/principal rate limiting, RBAC, direct method/path rules,
+tool policy, and admin permissions remain authoritative. The common managed
+outbound order is:
 
 ```text
-authenticate
-  -> global rate limit
-  -> classify the stable logical route/tool
-  -> RBAC/direct/tool authorization
-  -> connection snapshot lookup
-  -> credential/TLS resolution
-  -> final authority and egress validation
-  -> #239 client acquisition and DNS pinning
-  -> credential injection
-  -> upstream bytes
+authenticate and rate-limit
+  -> authorize stable route/tool/admin operation
+  -> capture immutable Connection/definition/catalog authority
+  -> validate scheme/host/port
+  -> resolve DNS, validate every answer, exact-pin one accepted address
+  -> prepare TLS/provider/client against that checked destination
+  -> resolve static credential or obtain OAuth token
+  -> remove caller/conflicting credentials and inject configured credential last
+  -> send bounded upstream bytes
 ```
 
-A denial produces zero connection-specific store/provider reads, OAuth calls,
-DNS lookups, client acquisition, or upstream bytes. Tool arguments, bodies,
-headers, OpenAPI `servers`, discovered MCP metadata, and client input can never
-choose or replace the configured connection ID.
+An initial security denial produces zero Connection-specific provider reads,
+OAuth calls, DNS lookups, client acquisition, or upstream bytes. In-memory
+lookup of a registered opaque capability ID does not inspect provider, DNS, or
+upstream state.
 
-Tests, OpenAPI retrieval, MCP initialize/list/call/SSE/session deletion, OAuth
-token requests, and refreshes follow the same egress and transport boundary.
-Redirects remain disabled. Every DNS answer is validated and the accepted
-address generation is pinned as specified by ADR-0005.
+The zero-side-effect statement is not a promise to recall already-authorized
+work. Ordinary proxy and MCP/tool runtime authorization is snapshot-based: an
+invocation already admitted under that snapshot can finish even if policy is
+reloaded later. Bytes already sent cannot be revoked. New invocations use the
+new state.
 
-### IDs, URLs, and path authority
+The admin playground has a stricter queued-execution boundary. After its bounded
+runtime queue, it rechecks the live `admin:tools:execute` permission, execution
+ETag, rendered HTTP direct rule, and captured Connection/catalog revision
+before egress. Revocation or mutation while queued therefore stops that
+playground call before provider, DNS, or upstream side effects.
 
-Connection and secret IDs are 1–128 ASCII bytes, begin with an ASCII letter or
-digit, and contain only letters, digits, `.`, `_`, or `-`. Managed connection
-IDs are immutable generated UUIDs. Bounded slugs may be used for presentation
-and namespacing. Projected legacy IDs reserve `legacy-default-http`,
-`legacy-route-*`, and `legacy-mcp-*`; managed IDs cannot collide with them.
+Stored tests and refreshes require the exact current Connection ETag. Their
+target builders compare the expected ETag again before protocol/egress work;
+catalog publication also remains conditional on the captured revision.
 
-An endpoint `base_url` is at most 2,048 bytes and is an `http` or `https`
-origin only. Parsing rejects missing hosts, userinfo, paths, queries, and
-fragments. Host casing and default ports normalize through the URL parser. A
-credentialed or mTLS connection requires HTTPS.
+### IDs, URLs, and authority
 
-Base, test, and discovery paths are 1–1,024 byte origin-relative paths. They
-start with one `/` and reject scheme-relative forms, repeated leading
-authorities, backslashes, queries, fragments, literal or percent-encoded dot
-segments, encoded separators, NULs, and invalid UTF-8 percent encoding.
-Absolute URLs and authority-changing mappings are forbidden.
+Connection and secret IDs contain 1-128 URL-safe ASCII bytes, start with an
+ASCII letter or digit, and use only letters, digits, `.`, `_`, or `-`. Managed
+Connection IDs are generated UUIDs. Projected legacy IDs reserve
+`legacy-default-http`, `legacy-route-*`, and `legacy-mcp-*`; managed IDs cannot
+collide with them.
 
-OAuth token URLs are explicit HTTPS URLs of at most 2,048 bytes, with no
-userinfo, query, or fragment. There is no metadata discovery or redirect
-following. Token endpoint egress, DNS, TLS, pinning, bounds, and client identity
-are evaluated independently.
+An endpoint `base_url` is at most 2,048 bytes and contains an `http` or `https`
+origin only. Missing hosts, userinfo, paths, queries, and fragments are
+rejected. A credentialed or mTLS Connection requires HTTPS.
 
-### Wire model and typed tool metadata
+Base, test, and discovery paths are 1-1,024 byte origin-relative paths. They
+reject scheme-relative forms, repeated leading authorities, backslashes,
+queries, fragments, literal or percent-encoded dot segments, encoded
+separators, NULs, and invalid percent-encoded UTF-8. Tool arguments, request
+headers/bodies, OpenAPI `servers`, and discovered MCP metadata cannot replace
+the configured Connection ID, origin, token URL, credential header, or TLS
+profile.
 
-The version 0.1 connection write shape is
-[`connection.v0.schema.json`](../schemas/connection.v0.schema.json). Every
-object rejects unknown fields. The schema accepts opaque secret IDs only; it
-cannot express environment names, file paths, inline credential values,
-ciphertext, nonces, provider locators, access tokens, or private keys.
+The version 0.1 write schema is
+[`connection.v0.schema.json`](../schemas/connection.v0.schema.json). Objects
+reject unknown fields. The schema accepts opaque secret IDs only; it cannot
+express environment names, file paths, inline secrets, ciphertext, nonces,
+access tokens, or private keys.
 
-`ToolTarget` and `ToolSource` make destination and provenance explicit:
+### Typed tool authority
+
+`ToolTarget` identifies the configured execution destination and `ToolSource`
+records provenance:
 
 ```rust
 enum ToolTarget {
@@ -152,6 +154,7 @@ enum ToolSource {
     OpenApi {
         connection_id: String,
         operation_id: Option<String>,
+        catalog_revision: Option<u64>,
     },
     Mcp {
         connection_id: String,
@@ -161,250 +164,275 @@ enum ToolSource {
 }
 ```
 
-The version 0 tools schema permits optional `target` and `source` fields. During
-migration the legacy `upstream` field remains required and executable.
-If typed metadata is present, its HTTP mapping or MCP names must equal that
-legacy mapping, preventing two conflicting authorities. Existing files
-deserialize with `source=legacy`, serialize without the new optional fields,
-and execute exactly as before. Credentials and unrestricted URLs are forbidden
-from tool arguments and path templates.
+Legacy tool files remain readable. When typed metadata is present, its HTTP
+mapping or MCP names must agree with the compatible legacy mapping, so two
+authorities cannot coexist in one definition. Managed OpenAPI/MCP definitions
+bind both source and target to the same Connection and catalog revision.
 
 ### Credential and TLS model
 
 HTTP authentication is one of:
 
 - `none`;
-- `header_api_key` with one opaque secret ID and a validated header name;
-- `static_bearer` with one opaque token secret ID; or
+- `header_api_key` with a validated header name and opaque secret ID;
+- `static_bearer` with an opaque token secret ID; or
 - `oauth2_client_credentials` with explicit client ID, opaque client-secret ID,
-  explicit HTTPS token URL, optional bounded scopes and audience/resource, and
+  explicit HTTPS token URL, bounded scopes/audience/resource, and
   `client_secret_basic`.
 
-TLS is separate so custom trust and mTLS can accompany any HTTP authentication
-mode. Client certificate and private-key IDs are configured together. No
-`skip_verify` option exists.
+TLS is independent of HTTP authentication. A custom CA alias and an optional
+paired client-certificate/private-key identity can accompany any authentication
+mode. There is no skip-verification setting.
 
-Disabled drafts may omit an opaque HTTP secret binding or retain only one side
-of a pending mTLS identity selection. Every supplied field is still validated.
-Before `enabled` can become true, the selected authentication mode must have
-its required secret ID and a client certificate/private-key selection must be
-complete and resolvable. This conditional completeness is part of the v0.1
-write schema, not an API-specific exception.
+Disabled drafts can omit a required HTTP secret binding or hold only one side
+of a pending mTLS identity, but every supplied field is still validated. An
+enabled Connection must be complete and all referenced material must pass
+purpose-specific preflight.
 
 Header API-key names reject `Authorization`, `Cookie`, `Host`,
-`Content-Length`, proxy authentication, forwarding headers, hop-by-hop and
-connection-nominated headers, framing headers, the gateway request ID,
-security/protocol-managed `Sec-*` headers, and invalid HTTP names. Later
-injection strips inbound `Authorization`, `Cookie`, and the selected API-key
-header; applies safe legacy header transforms; validates the final authority
-and egress destination; and injects the connection credential last. Failure to
-resolve or construct a credential fails closed with no anonymous retry.
+`Content-Length`, proxy authentication, forwarding, hop-by-hop,
+connection-nominated, framing, request-ID, and `Sec-*` headers. Runtime
+forwarding strips gateway/caller credentials and the configured API-key header,
+applies permitted route transforms, and injects the Connection credential only
+after egress/TLS preparation. Resolution or injection failure is fail-closed;
+there is no anonymous retry. A credentialed `TRACE` tool call is rejected.
+
+TLS material is resolved only after the ordinary egress preflight. The exact
+checked socket is rebound to the prepared TLS client without another DNS lookup.
+Local-secret versions are read before and after TLS resolution; a concurrent
+rotation fails preparation. Transport partitioning includes Connection ID and
+revisions, profile, egress generation, timeouts, TLS material versions, roots,
+and client identity.
+
+### OAuth token endpoint and cache
+
+An OAuth token URL is an explicit HTTPS URL of at most 2,048 bytes with no
+userinfo, query, or fragment. There is no discovery or redirect following.
+
+The token endpoint has its own `EgressClient` profile. It independently applies
+scheme/host/port policy, complete DNS-answer validation, exact pinning, TLS
+hostname/certificate verification, redirect denial, timeout limits, and 16 KiB
+request/response limits before resolving or sending the client secret. Passing
+egress for the upstream API never authorizes the token endpoint.
+
+The upstream Connection's custom CA and mTLS identity are not inherited by the
+OAuth token client. This prevents a credential or client identity intended for
+the API origin from crossing into the identity-provider transport.
+
+The in-memory access-token cache is bounded to the maximum Connection count and
+single-flights one mint per cache slot. A key includes Connection ID,
+Connection ETag, encrypted-local client-secret version when present, and token
+client egress generation. Tokens refresh before expiry, are not persisted, and
+are zeroized on replacement/drop. A `401` from the intended managed upstream
+invalidates only the matching token generation; it does not erase a newer
+generation. Connection tests mint within their own deadline and do not reuse
+the detached data-plane token cache.
 
 ### Secret trust and confidentiality
 
 The trust chain is:
 
 ```text
-Connection -> CredentialBinding -> SecretId -> SecretResolver -> ResolvedSecret
+Connection -> credential/TLS binding -> opaque SecretId
+  -> SecretResolver -> purpose-bounded ResolvedSecret
 ```
 
-Ordinary connection APIs accept opaque IDs only. Environment variables and
-mounted-file locators are trusted startup configuration behind operator
-aliases, never admin-controlled input. An optional local provider may accept a
-secret value exactly once at its dedicated write/rotate endpoint and has no
-reveal operation.
+Ordinary Connection APIs accept opaque IDs only. Operator environment and file
+locators are trusted startup configuration behind aliases, never admin input.
+File aliases are one validated filename below a canonical configured root.
+Traversal, absolute/drive/alternate-stream forms, symbolic links, Windows
+reparse points, non-regular files, unsafe permissions, and replacement races
+fail closed. Environment/file values are resolved on every authorized use under
+a bounded provider permit.
 
-Operator aliases are bounded startup JSON. Environment locators use validated
-ASCII variable names. File locators are one validated filename segment below a
-canonical configured root; traversal, absolute/drive/alternate-stream forms,
-symbolic links, Windows reparse points, non-regular files, and unsafe
-platform-supported permissions fail closed. A capability-backed handle anchors
-the validated root across later path or ancestor replacement. The leaf is
-opened relative to that handle without following links and in nonblocking mode,
-validated from the opened handle, and read through a purpose-specific byte cap.
-Values are resolved on every authorized use rather than cached, so atomic
-mounted-file replacement affects the next resolution without changing an
-already in-flight redacted value. A finite provider permit is reserved before
-submitting blocking environment, filesystem, or encrypted-store work; saturated
-resolution therefore fails closed without building an unbounded blocking queue.
+`ResolvedSecret` does not implement `Serialize` or `Clone`, prints only a
+redacted marker, enforces a purpose-specific byte cap, and zeroizes material on
+replacement and drop. Values are not trimmed or transformed.
 
-Internal resolved secret wrappers do not implement `Serialize` or `Clone`.
-Their manual `Debug` output is exactly `<redacted>`, their bytes are bounded by
-purpose, borrowed rather than copied for use, and zeroized on replacement and
-drop. Values are not trimmed or transformed. Public/admin DTOs are distinct
-from internal material and omit resolved values, ciphertext, nonces, hashes,
-fingerprints, locators, master-key IDs, access tokens, private keys, and
-low-entropy suffixes.
+The optional encrypted local provider uses XChaCha20-Poly1305 with a fresh
+24-byte nonce per encrypted field and 32-byte master keys loaded from protected
+mounted files outside SQLite. Authenticated additional data binds schema,
+secret ID/version, credential purpose, and field purpose. Exactly one keyring
+entry is primary; predecessors are decrypt-only.
 
-The encrypted local provider uses XChaCha20-Poly1305 with a fresh random
-24-byte nonce for every encrypted field and 32-byte master keys loaded from
-protected mounted files below the canonical secrets root, outside the
-database. Canonical authenticated additional data includes schema version,
-secret UUID, secret version, connection/credential purpose, and field purpose.
-A bounded keyring has exactly one primary encrypt key and explicit decrypt-only
-predecessors. Master-key re-encryption runs in bounded immediate transactions;
-an unauthenticated row rolls back the whole batch, and an old key cannot be
-declared unused while any row still names it. Unknown algorithms, missing or
-wrong keys, AAD mismatch, ciphertext/tag modification, or interrupted rotation
-fail closed.
+Create, rotate, delete, bounded re-encryption, and old-key disuse verification
+have no reveal operation. Rotation preflights replacement material against
+every enabled dependent Connection before atomically changing ciphertext and
+the published local-secret version. Referenced deletion fails with bounded
+Connection dependency IDs. Database/WAL/backups contain ciphertext, but the
+database and key files are separate recovery artifacts that must be restored
+together.
 
-The management interface can create, rotate, delete, list safe metadata,
-re-encrypt a bounded key batch, and verify old-key disuse. It deliberately has
-no reveal method; runtime plaintext resolution is a separate capability.
-Create and rotate consume a redacted zeroizing value and return only stable
-metadata. Rotation preflights proposed material against every enabled
-referencing Connection, including parsing every CA bundle entry as valid X.509
-DER and client certificate/private-key pairing, before changing ciphertext; a
-malformed entry in an otherwise valid CA bundle fails the whole preflight, and
-a failed preflight preserves the prior value and runtime. Referenced deletion
-fails with bounded connection dependency IDs.
-The database, WAL, and database backups contain ciphertext only. Database and
-key backups are separate recovery artifacts and must be restored together.
+Connection DTOs expose only configured booleans for bound credentials/TLS.
+The separately permissioned secret catalog exposes opaque resource IDs, label,
+provider kind, compatible purpose, version, dependency count, and allowed
+actions; it never exposes a locator or value.
 
-### Fixed conservative limits
+### Discovery, tests, inventory, and playground
 
-These limits are schema/versioned defaults. A later configurable value may only
-be equal or more restrictive unless a new schema and resource review changes
-the ceiling.
+Managed MCP refresh initializes one checked streamable-HTTP session and builds
+a bounded tool/resource/template catalog. Managed OpenAPI refresh downloads a
+bounded document from the stored path, validates and compiles the entire
+candidate, and binds definitions to the Connection/catalog revision.
+Successful publication is transactional and atomic. Failed discovery, parse,
+validation, or publication retains the last-known-good catalog and records a
+bounded degraded/stale status.
 
-| Resource | Limit/default |
-|---|---:|
-| Managed and projected connections | 256 |
-| Credential records | 512 |
+Stored tests accept no body or target override. HTTP tests use only persisted
+`GET`/`HEAD`, path, and expected statuses. MCP tests initialize, inspect at most
+one advertised metadata page, and close; they do not call tools or read
+resources. Tests have global/principal/Connection rate and concurrency limits,
+a ten-second total deadline, exact ETag binding, and safe per-stage results.
+
+The capability inventory requires `admin:tools:read`. It merges manual, legacy,
+last-known-good OpenAPI, and last-known-good MCP metadata with typed provenance,
+safe status, and policy visibility. Listing/detail performs no provider read,
+OAuth exchange, DNS lookup, or upstream request. A stale catalog remains
+visible as stale rather than disappearing.
+
+The admin playground requires `admin:tools:execute`, a registered available
+tool, and the strong execution ETag returned by inventory detail. It accepts
+only a bounded JSON `arguments` object and preserves JSON numeric tokens through
+backend mapping. It has no arbitrary URL/header/TLS/credential/method override.
+HTTP arguments are validated before the rendered method/path rule. MCP and HTTP
+requests run through the normal executor, Connection, egress, TLS, credential,
+and audit paths. Projected output is capped at 64 KiB; HTTP headers and
+non-success bodies are withheld and unsafe output fails closed with a safe
+reason.
+
+### Conservative bounds
+
+| Resource | Implemented limit/default |
+| --- | ---: |
+| Managed plus projected Connections | 256 |
 | Operator secret aliases | 512 entries / 256 KiB startup JSON |
-| Concurrent operator alias reads | 16 |
-| Environment locator / file key | 128 / 255 bytes |
-| Retained connection dependency rows | 4,096 |
+| Local keyring | 8 entries / 16 KiB startup JSON |
+| Concurrent operator provider reads | 16 |
+| Retained dependency rows | 4,096 |
 | Managed OpenAPI document | 2 MiB |
 | Published catalog entries | 4,096 |
-| Current plus retained safe status/history rows | 4,096 |
-| Concurrent refreshes | 4 |
+| Concurrent refreshes | 4 globally; one catalog mutation per Connection |
+| Stored test concurrency | 4 global / 2 per principal / 1 per Connection |
+| Stored test deadline | 10 seconds |
+| OAuth request/response | 16 KiB each |
+| OAuth token cache | 256 revision/version-partitioned slots |
+| Playground request/result | 64 KiB each |
 | Connection/secret ID | 128 bytes |
-| Display name | 128 characters |
-| Description | 1,024 characters |
-| URL | 2,048 bytes |
-| Base/test/discovery path | 1,024 bytes |
+| Display name / description | 128 / 1,024 characters |
+| URL / origin-relative path | 2,048 / 1,024 bytes |
 | Header name | 64 bytes |
 | OAuth client ID | 256 bytes |
 | OAuth scopes | 16 entries, 128 characters each |
-| OAuth audience/resource | 512 bytes each |
-| Stored expected statuses | 16 |
-| Connect/request/response-idle timeout | 1–120,000 ms |
-| Timeout defaults | 10,000 / 30,000 / 30,000 ms |
 | API key, bearer, or OAuth client secret | 8 KiB |
 | TLS private key | 256 KiB |
 | Certificate or CA bundle | 1 MiB |
 
-Collection and byte limits are checked before expensive parsing, compilation,
-resolution, or network work. OAuth response/cache, test concurrency, provider
-reads, request/response bodies, status, metrics cardinality, and retained
-catalog generations receive separate lower bounds in the PR that implements
-them.
-
-Stored test profiles use exact uppercase `GET` or `HEAD` methods
-and 1–16 unique status codes from 100 through 599. Case and duplicates are
-rejected rather than silently normalized.
+Collection and byte limits are checked before expensive parsing, provider,
+compilation, or network work.
 
 ### Permissions and mutation authority
 
-The permission vocabulary is:
-
 | Permission | Authority |
-|---|---|
-| `admin:connections:read` | Safe connection/status metadata |
+| --- | --- |
+| `admin:connections:read` | Safe Connection and status metadata |
 | `admin:connections:write` | Non-sensitive presentation and operational metadata |
-| `admin:connections:secrets:write` | Bind, rotate, clear, clone, or redirect credential/TLS use |
+| `admin:connections:secrets:write` | Bind, rotate, clear, clone, redirect, or delete credential/TLS authority |
 | `admin:connections:test` | Run the persisted bounded test profile |
 | `admin:connections:refresh` | Refresh persisted OpenAPI/MCP discovery |
-| `admin:tools:read` | Inventory and safe capability detail |
-| `admin:tools:write` | Manual/managed tool mutation |
-| `admin:tools:execute` | Enter the constrained tool playground |
+| `admin:tools:read` | Read policy-filtered inventory and capability detail |
+| `admin:tools:write` | Mutate manual/managed tool definitions |
+| `admin:tools:execute` | Run the constrained admin playground |
 
 Changing where an existing credential may be sent is a secret-use mutation.
-`admin:connections:secrets:write` is required to change a credentialed origin,
-OAuth token URL, scopes/audience/resource, auth mode/header, mTLS identity, or
-credentialed discovery or stored test target, and to attach, replace, rotate,
-clear, delete, or clone a binding. Adding, removing, or changing the method or
-path of a stored test profile is a target change whenever either revision has
-credential or TLS authority. A plain connection writer cannot perform those
-operations. Every sensitive change atomically increments the credential
-revision and emits a separate credential-change audit event.
-Any explicitly submitted hidden credential or TLS binding field requires
-secrets-write even when its value equals the current binding; ordinary writers
-retain redacted bindings only through the server-issued configured markers.
-Secondary secrets-write denials emit a bounded `authz.denied` event containing
-the stable route pattern, operation, and required permission, never submitted
-binding IDs or target values.
+Secrets-write is required for a credentialed origin, OAuth token URL,
+scopes/audience/resource, authentication mode/header, mTLS identity, or
+credentialed discovery/test target, and for explicit hidden binding fields even
+when the submitted marker appears unchanged. A plain Connection writer cannot
+perform these operations.
 
-All admin routes remain below dynamic `/v1{ADMIN_PREFIX}`. Writes require CSRF
-under existing cookie-auth rules and an exact `If-Match`; missing preconditions
-return 428 and stale revisions return 412. Validation is 400/422, authorized
-missing resources are 404, dependencies/concurrent refreshes are 409, bounded
-busy work is 429, and unavailable configured storage/providers are sanitized
-503 responses. Authorization precedes ID lookup. There is no force-delete,
-secret reveal, URL/header override, arbitrary request, or client-decoded
-permission path.
+Authorization precedes resource-ID lookup. Control-plane writes use exact strong
+ETags/`If-Match`; missing preconditions are `428`, stale revisions are `412`,
+and concurrent catalog/dependency conflicts are `409`. Cookie-authenticated
+writes remain subject to CSRF. There is no force-delete, secret reveal, URL or
+header override, arbitrary probe body, or client-decoded permission path.
 
 ### Status, audit, and errors
 
 Safe status contains bounded state/reason codes, times, latency, catalog age and
-count, kind, source, and revisions. Public probes reveal no connection
-topology. Read DTOs summarize authentication/provider configuration and never
-include revealing secret IDs or internal locators.
+count, kind/source, and revisions. Public probes reveal no Connection topology.
+Connection read DTOs summarize authentication/provider configuration without
+bound secret IDs or locators.
 
-Structured events are `connection.changed`,
-`connection.credential_changed`, `connection.refreshed`,
-`connection.oauth_token_refresh`, and
-`connection.secret_resolution_failed`. Allowed fields are bounded stable
-connection ID/kind, source, action and changed-field names, auth type,
-old/new revisions, safe outcome/reason, latency, and bounded counts. URLs with
-userinfo/query/fragment, resolved IPs, DNS answers, raw errors, credentials,
-headers, forms, tokens, ciphertext, fingerprints, provider locators, private
-keys, certificate contents, tool arguments/results, MCP contents, and upstream
-bodies/challenges are forbidden.
+Implemented event types include `connection.changed`,
+`connection.credential_changed`, `connection.secret_changed`,
+`connection.refreshed`, `connection.tested`,
+`connection.oauth_token_refresh`,
+`connection.secret_resolution_failed`, tool invocation/upstream outcomes, and
+`tool.playground_output_rejected`.
+
+Protected secret-management audit may include the stable opaque local-secret
+resource ID. Other safe fields are stable Connection/tool IDs, kind/source,
+action and changed-field names, authentication kind, revisions, outcome/reason,
+latency, invocation source, and bounded counts. Audit, logs, metrics, public
+errors, and admin DTOs exclude secret values, environment/file/key locators,
+key material, ciphertext/nonces, access/refresh tokens, credential headers,
+certificate/private-key contents, tool arguments/results, raw URLs with
+query/userinfo, resolved addresses/DNS answers, raw errors, upstream bodies,
+credential challenges, and MCP session/content payloads.
 
 ### Threat model
 
-| Threat | Prevention and detection | Residual risk |
-|---|---|---|
-| Stored credential redirected by an ordinary editor | Separate secret-use permission, immutable ID, conditional revision, sensitive-field diff, audit | A fully authorized secrets writer can intentionally rebind; alerts and least privilege are required |
-| Denied call causes secret or network side effects | Authorization-before-lookup invariant and zero-call counter tests | Bugs in future adapters require regression tests for every lane |
-| Tool/OpenAPI/MCP input replaces authority | Typed configured target, origin-relative mappings, server metadata ignored for authority | Malicious schemas/content remain untrusted and bounded |
-| SSRF, rebinding, or redirect credential leak | Existing #239 egress, all-answer validation, exact pinning, cache isolation, redirects off, injection last | Operators can explicitly allow risky destinations |
-| Cross-connection credential/client reuse | Cache key includes connection/revisions, authority, destination/egress generation, timeouts/protocol, TLS roots, and mTLS identity | In-flight calls may finish on their immutable old revision |
-| Caller header overrides configured credential | Strip inbound sensitive/configured header, reject conflicts, inject last | Approved legacy literal headers remain a migration risk |
-| Secret exposure through serialization/debug/storage | Separate DTOs, non-serializable redacted wrapper, encryption, canary scans | Process memory and privileged host inspection remain in the operator trust boundary |
-| Local file/environment exfiltration | Opaque admin IDs, trusted alias config, canonical root, traversal/symlink/device/permission checks | Platform permission guarantees vary and must be documented |
-| OAuth token misuse or stampede | Narrow flow, separate egress/TLS, bounded single-flight memory cache, revision key, no persistence/replay | Compromised upstream or IdP can still observe its intended credential |
-| Test/refresh becomes arbitrary client or scanner | Persisted ID/profile only, no overrides, permissions, quotas, egress, safe result stages | Authorized operators can exercise already configured destinations |
-| Partial refresh publishes broken catalog | Build and validate candidate, transactional revision, atomic publish, last-known-good retention | Catalog may be stale and must be visibly marked |
-| Resource exhaustion/cardinality attack | Fixed collection/byte/time/concurrency/history bounds and low-cardinality labels | Limits may need tuning through reviewed schema revisions |
+| Threat | Implemented prevention/detection | Residual risk |
+| --- | --- | --- |
+| Ordinary editor redirects a stored credential | Separate secrets-write permission, sensitive-field intent/diff, immutable ID, exact ETag, credential-change audit | A fully authorized secrets writer can intentionally rebind; least privilege and alerts remain required |
+| Initial denial triggers provider or network side effects | Authorization-before-snapshot/provider/egress invariant and zero-counter regressions | Does not recall work already authorized or bytes already sent |
+| Policy/ETag/Connection changes while playground call is queued | Final live permission, execution ETag, rendered rule, and revision checks before egress | An in-flight call that has already passed the final check may finish |
+| Connection mutates between target lookup and dispatch | Immutable target, revision/ETag partitioning, and current-revision check on preconditioned lanes | Ordinary already-authorized invocations intentionally retain snapshot semantics |
+| Tool/OpenAPI/MCP input replaces authority | Typed configured target, origin-relative mappings, source/target equality, server metadata ignored for authority | Malicious schemas/content are still untrusted input and must remain bounded |
+| SSRF, rebinding, or redirect leaks a credential | Host/port policy, validate all DNS answers, exact pin, TLS verification, redirects/ambient proxy off, credential injection last | Operators can explicitly allow risky destinations |
+| OAuth token endpoint bypasses upstream egress | Independent token client, egress/DNS/pin/TLS/bounds, no discovery/redirects, no inherited upstream mTLS | A compromised intended IdP observes the client credential |
+| Cross-Connection credential/client reuse | Cache partitions include Connection/revisions, destination/egress generation, profile/timeouts, TLS identity/roots, and local-secret versions | Bounded old entries can remain unreachable until eviction; in-flight calls hold old material |
+| Caller overrides configured credential | Strip inbound sensitive/configured headers, reject conflicts, inject last | Approved legacy literal route headers remain a migration risk |
+| Secret exposure through DTO/debug/storage/audit | Separate DTOs, redacted non-serializable wrapper, encryption, no reveal, canary scans, safe event vocabulary | Process memory and privileged host inspection remain trusted |
+| Local file/environment exfiltration | Opaque admin aliases, trusted startup locators, canonical root, no-follow/permission/device checks, bounded reads | Platform filesystem guarantees vary |
+| OAuth stampede or stale token reuse | Bounded single-flight cache, expiry skew, revision/version/egress key, exact-generation `401` invalidation | Provider outage fails closed and can reduce availability |
+| Test/refresh becomes arbitrary client or scanner | Persisted ID/profile only, permission, exact ETag, no override/body, quotas/deadline, egress, safe stages | Authorized operators can exercise an already-configured destination |
+| Partial refresh replaces a good catalog | Candidate build/validation, transactional revision, atomic publish, last-known-good retention | Catalog can become stale and must be monitored |
+| Secret rotation mixes old/new TLS material | Mutation serialization, dependent preflight, version-before/after check, versioned transport/token keys | Already in-flight immutable use may finish |
+| Audit itself leaks secrets | Bounded allowlisted fields/reasons, sanitized transport categories, forbidden-field/canary regressions | A future event requires the same review discipline |
+| Resource/cardinality exhaustion | Fixed collection, byte, time, concurrency, cache, and history bounds with low-cardinality labels | Limits may require reviewed versioned tuning |
 
-## Compatibility and rollout
+## Compatibility and migration
 
-Legacy `UPSTREAM_URL`, `UPSTREAM_ROUTES`, `MCP_UPSTREAM_SERVERS`, tools files,
-OpenAPI wrappers, route selection, authorization, and exposed MCP names remain
-unchanged until their named migration PR. Projections use
-`legacy-default-http`, collision-checked route IDs, and
-`legacy-mcp-{normalized-name}`. Manual tools later appear as `local_file`
-provenance. Existing `add_request_headers` remains compatible but is deprecated
-for secrets; migration copies references only and never emits literal values.
+Legacy `UPSTREAM_URL`, `UPSTREAM_ROUTES`, `MCP_UPSTREAM_SERVERS`, and tool files
+remain supported. Their read-only projections provide a common inventory model
+without writing managed state. Existing `add_request_headers` remains a
+compatibility feature but is deprecated for credentials because literal values
+can enter configuration and operational tooling.
 
-The rollout sequence is the issue #240 checklist: vocabulary and schema; store
-and projections; operator aliases; encrypted local provider; admin CRUD;
-static authentication; OAuth; MCP; OpenAPI; inventory; test and mTLS; UI;
-playground; migration/deployment/docs. Each lane preserves the old runtime
-until its candidate passes parity and failure-path tests.
+Migration is explicit and reversible per route/tool. Operators create trusted
+aliases or encrypted local secrets, create a managed Connection, bind one
+consumer, verify test/catalog/inventory behavior, then remove the legacy
+literal. GreenGateway never reveals or copies a legacy literal into a public
+API response.
+
+Operational procedures are documented in the
+[operator guide](../connections/operator-guide.md),
+[migration and rollback guide](../connections/migration.md),
+[admin guide](../connections/admin-guide.md), and
+[issue #240 acceptance map](../testing/issue-240-acceptance.md).
 
 ## Consequences
 
-Connections have one authority model before persistence or credential behavior
-lands. Later changes have explicit schema, permission, revision, egress,
-redaction, and resource contracts to test. Secret handling gains a narrow type
-that is difficult to serialize or debug accidentally.
+Proxy, HTTP tool, OpenAPI, MCP, test, refresh, inventory, and playground lanes
+share one destination and credential authority model. New providers can
+implement the narrow opaque-ID resolver boundary without changing admin input
+into an arbitrary locator. Egress, TLS, cache, audit, and revision behavior are
+explicit and testable.
 
-The cost is additional typed metadata, conservative bounds, separate
-permissions, revision-aware clients, and staged migration. The first PR
-deliberately carries unused model vocabulary while runtime remains legacy; this
-is preferable to introducing security-sensitive behavior before the store and
-authorization boundaries exist.
+The cost is additional typed metadata, exact preconditions, conservative
+bounds, distinct permissions, immutable snapshots, and operator-managed key and
+database recovery. Authorization remains invocation-scoped rather than a
+retroactive recall system, so emergency revocation procedures must include
+gateway drain or upstream/network revocation when already-dispatched work must
+be stopped.
