@@ -22615,11 +22615,7 @@ mod tests {
             json!(secret_id)
         );
 
-        let secret_events = capture
-            .events()
-            .into_iter()
-            .filter(|event| event.event_type == audit::event::CONNECTION_SECRET_CHANGED)
-            .collect::<Vec<_>>();
+        let secret_events = captured_connection_secret_changes(&capture, 3);
         assert_eq!(secret_events.len(), 3);
         assert_eq!(
             secret_events
@@ -22962,11 +22958,7 @@ mod tests {
             Some(missing_rotate_collection_etag.as_str())
         );
 
-        let secret_events = capture
-            .events()
-            .into_iter()
-            .filter(|event| event.event_type == audit::event::CONNECTION_SECRET_CHANGED)
-            .collect::<Vec<_>>();
+        let secret_events = captured_connection_secret_changes(&capture, 3);
         assert_eq!(secret_events.len(), 3);
         let serialized =
             serde_json::to_string(&secret_events).expect("race audit events should serialize");
@@ -33957,6 +33949,31 @@ paths:
             ]
         })
         .to_string()
+    }
+
+    fn captured_connection_secret_changes(
+        capture: &audit::sink::tests::CaptureSink,
+        expected_count: usize,
+    ) -> Vec<audit::AuditEvent> {
+        let timeout = Duration::from_secs(5);
+        let started = Instant::now();
+
+        loop {
+            let events = capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == audit::event::CONNECTION_SECRET_CHANGED)
+                .collect::<Vec<_>>();
+            if events.len() >= expected_count {
+                return events;
+            }
+            assert!(
+                started.elapsed() < timeout,
+                "expected {expected_count} connection-secret audit events within {timeout:?}, got {}",
+                events.len()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn captured_policy_change(
