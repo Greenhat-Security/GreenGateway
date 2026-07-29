@@ -2583,7 +2583,9 @@ mod tests {
         let (proxy, sink, _) = retry_proxy_with_options(
             [addr, addr],
             RetryProxyOptions {
-                timeout: Duration::from_millis(100),
+                // This test targets the post-header idle failure below; leave
+                // enough headroom for a loaded CI runner to establish the loopback request.
+                timeout: Duration::from_millis(500),
                 response_idle_timeout: Some(Duration::from_millis(30)),
                 sse: Some(config::UpstreamSseConfig {
                     max_duration_ms: 1_000,

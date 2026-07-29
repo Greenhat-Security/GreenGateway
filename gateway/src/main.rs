@@ -3356,7 +3356,7 @@ async fn connection_secret_rotate_endpoint(
                 &state.control_plane.secret_alias_metadata(),
             );
             drop(mutation_guard);
-            return with_etag(
+            return with_connection_secret_collection_etag(
                 precondition_failed("connection secret changed during rotation"),
                 &current_collection_etag,
             );
@@ -3460,13 +3460,10 @@ async fn connection_secret_delete_endpoint(
             let current_collection_etag = connections::admin::secret_collection_etag(
                 &state.control_plane.secret_alias_metadata(),
             );
-            let mut response =
-                precondition_failed("If-Match does not match an existing connection secret");
-            response.headers_mut().insert(
-                HeaderName::from_static(CONNECTION_SECRET_COLLECTION_ETAG_HEADER),
-                etag_header_value(&current_collection_etag),
+            return with_connection_secret_collection_etag(
+                precondition_failed("If-Match does not match an existing connection secret"),
+                &current_collection_etag,
             );
-            return response;
         }
         Err(response) => return *response,
     };
@@ -3500,7 +3497,7 @@ async fn connection_secret_delete_endpoint(
                 &state.control_plane.secret_alias_metadata(),
             );
             drop(mutation_guard);
-            return with_etag(
+            return with_connection_secret_collection_etag(
                 precondition_failed("connection secret changed during deletion"),
                 &current_collection_etag,
             );
@@ -9638,6 +9635,15 @@ fn with_etag(mut response: Response, etag: &str) -> Response {
 fn with_connection_collection_etag(mut response: Response, etag: &str) -> Response {
     response.headers_mut().insert(
         HeaderName::from_static(CONNECTION_COLLECTION_ETAG_HEADER),
+        etag_header_value(etag),
+    );
+    response
+}
+
+fn with_connection_secret_collection_etag(mut response: Response, etag: &str) -> Response {
+    response.headers_mut().remove(header::ETAG);
+    response.headers_mut().insert(
+        HeaderName::from_static(CONNECTION_SECRET_COLLECTION_ETAG_HEADER),
         etag_header_value(etag),
     );
     response
@@ -22805,6 +22811,21 @@ mod tests {
             rotate_statuses,
             [StatusCode::OK, StatusCode::PRECONDITION_FAILED]
         );
+        let rotate_loser = if rotate_one.status() == StatusCode::PRECONDITION_FAILED {
+            &rotate_one
+        } else {
+            &rotate_two
+        };
+        assert!(
+            rotate_loser.headers().contains_key(header::ETAG),
+            "a stale rotate keeps returning the current item validator while the item exists"
+        );
+        assert!(
+            !rotate_loser
+                .headers()
+                .contains_key(CONNECTION_SECRET_COLLECTION_ETAG_HEADER),
+            "an item-version conflict must not relabel its validator as a collection validator"
+        );
 
         let after_rotate = router
             .clone()
@@ -22841,7 +22862,7 @@ mod tests {
         let delete_two = router.clone().oneshot(connection_admin_request(
             Method::DELETE,
             &local_uri,
-            Some(principal),
+            Some(principal.clone()),
             None,
             Some(&rotated_etag),
             true,
@@ -22854,6 +22875,40 @@ mod tests {
         assert_eq!(
             delete_statuses,
             [StatusCode::OK, StatusCode::PRECONDITION_FAILED]
+        );
+        let delete_loser = if delete_one.status() == StatusCode::PRECONDITION_FAILED {
+            &delete_one
+        } else {
+            &delete_two
+        };
+        assert!(
+            !delete_loser.headers().contains_key(header::ETAG),
+            "a disappeared item has no current item validator"
+        );
+        let delete_loser_collection_etag = delete_loser
+            .headers()
+            .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("a disappeared item should return the current secret collection validator")
+            .to_owned();
+        let after_delete = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(principal),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("secret list after concurrent delete should complete");
+        assert_eq!(
+            after_delete
+                .headers()
+                .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(delete_loser_collection_etag.as_str())
         );
 
         let secret_events = capture
