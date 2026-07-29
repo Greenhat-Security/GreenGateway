@@ -1104,6 +1104,50 @@ textarea:focus-visible {
   white-space: pre-wrap;
 }
 
+.tool-playground-page {
+  width: min(1440px, 100%);
+}
+
+.tool-playground-panel,
+.tool-playground-layout,
+.tool-playground-form,
+.tool-playground-schema,
+.tool-playground-result {
+  min-width: 0;
+}
+
+.tool-playground-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--gh-ref-space-5);
+  align-items: start;
+}
+
+.tool-playground-form textarea {
+  min-height: 280px;
+}
+
+.tool-playground-output {
+  width: 100%;
+  max-width: 100%;
+  max-height: 560px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-ref-radius-md);
+  padding: var(--gh-ref-space-4);
+  color: var(--gh-sys-fg);
+  background: var(--gh-sys-bg-surface);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.tool-playground-result:focus {
+  outline: 2px solid var(--gh-sys-primary);
+  outline-offset: var(--gh-ref-space-1);
+}
+
 .live-summary {
   display: flex;
   flex-wrap: wrap;
@@ -2600,6 +2644,10 @@ textarea:focus-visible {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .tool-playground-layout {
+    grid-template-columns: 1fr;
+  }
+
   .rule-check-grid,
   .action-choice-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2846,6 +2894,11 @@ textarea:focus-visible {
   .connection-actions .secondary-button,
   .capability-actions .primary-button,
   .capability-actions .secondary-button {
+    width: 100%;
+  }
+
+  .tool-playground-panel .capability-actions,
+  .tool-playground-panel .capability-actions a {
     width: 100%;
   }
 

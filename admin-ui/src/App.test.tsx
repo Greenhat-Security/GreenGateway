@@ -483,6 +483,7 @@ describe('AdminShell', () => {
       ['/connections/connection-a/edit', 'Edit connection'],
       ['/tools', 'Tool inventory'],
       ['/tools/tool-a', 'Tool details'],
+      ['/tools/tool-a/playground', 'Tool playground'],
     ] as const;
 
     for (const [path, title] of routes) {

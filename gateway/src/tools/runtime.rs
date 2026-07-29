@@ -121,11 +121,31 @@ impl ToolRuntimeConfig {
 }
 
 #[allow(dead_code)] // Issue #32's tool registry and issue #33's MCP endpoint will invoke this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolInvocationSource {
+    Mcp,
+    AdminPlayground,
+    #[default]
+    Internal,
+}
+
+impl ToolInvocationSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::AdminPlayground => "admin_playground",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+#[allow(dead_code)] // Issue #32's tool registry and issue #33's MCP endpoint will invoke this.
 #[derive(Debug, Clone)]
 pub struct ToolInvocationContext {
     pub request_id: String,
     pub source_ip: String,
     pub actor: Option<Actor>,
+    pub source: ToolInvocationSource,
 }
 
 impl Default for ToolInvocationContext {
@@ -137,6 +157,7 @@ impl Default for ToolInvocationContext {
             request_id: "tool-runtime".to_owned(),
             source_ip: "127.0.0.1".to_owned(),
             actor: None,
+            source: ToolInvocationSource::Internal,
         }
     }
 }
@@ -991,6 +1012,7 @@ impl ToolRuntime {
                 "method": MCP_TOOL_OBSERVATION_METHOD,
                 "reason": "matched_rule",
                 "matched_rule_id": matched_rule_id,
+                "invocation_source": context.source.as_str(),
             }),
         ));
     }
@@ -1002,6 +1024,11 @@ impl ToolRuntime {
         principal: Option<&Principal>,
         observation: HttpRuleAudit<'_>,
     ) {
+        let path = if context.source == ToolInvocationSource::AdminPlayground {
+            tool_observation_path(observation.tool_name)
+        } else {
+            observation.path.to_owned()
+        };
         self.inner.audit.emit(AuditEvent::new(
             event_type,
             &context.request_id,
@@ -1009,10 +1036,11 @@ impl ToolRuntime {
             principal.map(crate::auth::actor_from_principal),
             json!({
                 "tool_name": observation.tool_name,
-                "path": observation.path,
+                "path": path,
                 "method": observation.method,
                 "reason": "matched_rule",
                 "matched_rule_id": observation.matched_rule_id,
+                "invocation_source": context.source.as_str(),
             }),
         ));
     }
@@ -1030,7 +1058,7 @@ impl ToolRuntime {
             &context.request_id,
             &context.source_ip,
             context.actor.clone(),
-            tool_audit_payload(tool_name, outcome, reason),
+            tool_audit_payload(tool_name, outcome, reason, context.source),
         ));
     }
 }
@@ -1148,10 +1176,16 @@ fn auth_method_from_audit_mode(auth_mode: &str) -> Option<AuthMethod> {
     }
 }
 
-fn tool_audit_payload(tool_name: &str, outcome: &'static str, reason: Option<&str>) -> Value {
+fn tool_audit_payload(
+    tool_name: &str,
+    outcome: &'static str,
+    reason: Option<&str>,
+    source: ToolInvocationSource,
+) -> Value {
     let mut payload = json!({
         "tool_name": tool_name,
         "outcome": outcome,
+        "invocation_source": source.as_str(),
     });
 
     if let Some(reason) = reason {
@@ -1361,6 +1395,7 @@ mod tests {
                     && event.payload["method"] == json!("MCP")
                     && event.payload["path"] == json!("/mcp/tools/tool")
                     && event.payload["matched_rule_id"] == json!("deny-tool-for-viewers")
+                    && event.payload["invocation_source"] == json!("internal")
             }),
             "tool Deny rule should emit an authz.denied direct-rule event: {events:#?}"
         );
@@ -1527,6 +1562,58 @@ mod tests {
         assert_eq!(
             events[0].payload["matched_rule_id"],
             json!("deny-echo-http-after-reload")
+        );
+        assert_eq!(events[0].payload["invocation_source"], json!("internal"));
+    }
+
+    #[tokio::test]
+    async fn admin_playground_http_rule_audit_never_contains_rendered_arguments() {
+        let canary = "submitted-path-canary";
+        let rendered_path = format!("/v1/echo/{canary}");
+        let policy = Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "echo": {
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            },
+            "rules": [{
+                "id": "deny-rendered-playground-path",
+                "methods": ["POST"],
+                "path": rendered_path,
+                "action": "deny"
+            }]
+        }))
+        .expect("tool policy should parse");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let runtime_config =
+            ToolRuntimeConfig::from_policy(&policy).expect("tool policy should configure runtime");
+        let runtime = ToolRuntime::new_with_rbac_state(runtime_config, audit, Some(rbac_state));
+        let mut context = context_with_roles(&["admin"]);
+        context.source = ToolInvocationSource::AdminPlayground;
+
+        assert!(!runtime.authorize_http_operation("echo", "POST", &rendered_path, &context,));
+
+        let events = audit_events(&capture, 1).await;
+        assert_eq!(events[0].event_type, "authz.denied");
+        assert_eq!(events[0].payload["path"], json!("/mcp/tools/echo"));
+        assert_eq!(
+            events[0].payload["invocation_source"],
+            json!("admin_playground")
+        );
+        assert!(
+            !serde_json::to_string(&events)
+                .expect("audit events should serialize")
+                .contains(canary),
+            "playground argument values must not enter audit payloads"
         );
     }
 
@@ -2495,6 +2582,7 @@ mod tests {
                         roles: Some(vec!["operator".to_owned()]),
                         auth_mode: "bearer_token".to_owned(),
                     }),
+                    source: ToolInvocationSource::AdminPlayground,
                 },
                 CancellationToken::new(),
                 || async { 42 },
@@ -2514,6 +2602,10 @@ mod tests {
                 Some("user-123")
             );
             assert_eq!(event.payload["tool_name"], json!("tool"));
+            assert_eq!(
+                event.payload["invocation_source"],
+                json!("admin_playground")
+            );
         }
         assert_eq!(events[0].payload["outcome"], json!("started"));
         assert_eq!(events[1].payload["outcome"], json!("success"));
@@ -2875,6 +2967,7 @@ mod tests {
             request_id: "request-test".to_owned(),
             source_ip: "127.0.0.1".to_owned(),
             actor: None,
+            source: ToolInvocationSource::Internal,
         }
     }
 
@@ -2897,6 +2990,7 @@ mod tests {
                 roles: Some(roles.iter().map(|role| (*role).to_owned()).collect()),
                 auth_mode: auth_mode.to_owned(),
             }),
+            source: ToolInvocationSource::Internal,
         }
     }
 

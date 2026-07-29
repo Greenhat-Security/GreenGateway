@@ -74,6 +74,8 @@ const TOOL_TIMEOUT_REASON: &str = "timeout";
 const TOOL_CANCELLED_REASON: &str = "cancelled";
 const TOOL_RUNTIME_CLOSED_REASON: &str = "runtime_closed";
 const TOOL_RUNTIME_REJECTED_REASON: &str = "runtime_rejected";
+const TOOL_PRECONDITION_FAILED_REASON: &str = "precondition_failed";
+const TOOL_EXECUTION_STATE_UNAVAILABLE_REASON: &str = "execution_state_unavailable";
 const TOOL_TASK_UNSUPPORTED_STATUS: u16 = 400;
 const TOOL_TASK_UNSUPPORTED_REASON: &str = "task_unsupported";
 const STRICT_SCHEMA_INJECTION_SKIP_KEYWORDS: &[&str] =
@@ -184,6 +186,12 @@ pub enum ToolExecutorError {
     HttpRuleDenied {
         tool_name: String,
     },
+    PreconditionFailed {
+        tool_name: String,
+    },
+    ExecutionStateUnavailable {
+        tool_name: String,
+    },
     Connection {
         tool_name: String,
         reason: &'static str,
@@ -194,6 +202,38 @@ pub enum ToolExecutorError {
 pub enum ToolExecutionResult {
     Http(EgressResponse),
     McpCallToolResult(CallToolResult),
+}
+
+type ToolExecutionPreconditionChecker =
+    dyn Fn(&ToolDefinition) -> Result<(), ToolExecutionPreconditionError> + Send + Sync + 'static;
+
+#[derive(Clone)]
+pub struct ToolExecutionPrecondition {
+    checker: Arc<ToolExecutionPreconditionChecker>,
+}
+
+impl ToolExecutionPrecondition {
+    pub fn new<F>(checker: F) -> Self
+    where
+        F: Fn(&ToolDefinition) -> Result<(), ToolExecutionPreconditionError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            checker: Arc::new(checker),
+        }
+    }
+
+    fn check(&self, definition: &ToolDefinition) -> Result<(), ToolExecutionPreconditionError> {
+        (self.checker)(definition)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolExecutionPreconditionError {
+    Failed,
+    Unavailable,
 }
 
 impl fmt::Display for ToolExecutorError {
@@ -278,6 +318,18 @@ impl fmt::Display for ToolExecutorError {
             ),
             Self::HttpRuleDenied { tool_name } => {
                 write!(formatter, "tool '{tool_name}' HTTP operation is denied by policy")
+            }
+            Self::PreconditionFailed { tool_name } => {
+                write!(
+                    formatter,
+                    "tool '{tool_name}' execution precondition no longer holds"
+                )
+            }
+            Self::ExecutionStateUnavailable { tool_name } => {
+                write!(
+                    formatter,
+                    "tool '{tool_name}' execution state is unavailable"
+                )
             }
             Self::Connection { tool_name, reason } => {
                 write!(
@@ -442,6 +494,36 @@ impl ToolExecutor {
         context: ToolInvocationContext,
         cancel: CancellationToken,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        self.execute_with_optional_precondition(tool_name, args, context, cancel, None)
+            .await
+    }
+
+    pub async fn execute_with_precondition(
+        &self,
+        tool_name: &str,
+        args: Value,
+        context: ToolInvocationContext,
+        cancel: CancellationToken,
+        precondition: ToolExecutionPrecondition,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        self.execute_with_optional_precondition(
+            tool_name,
+            args,
+            context,
+            cancel,
+            Some(precondition),
+        )
+        .await
+    }
+
+    async fn execute_with_optional_precondition(
+        &self,
+        tool_name: &str,
+        args: Value,
+        context: ToolInvocationContext,
+        cancel: CancellationToken,
+        precondition: Option<ToolExecutionPrecondition>,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let started = Instant::now();
         let runtime_tool_name = tool_name.to_owned();
         let work_tool_name = runtime_tool_name.clone();
@@ -460,7 +542,7 @@ impl ToolExecutor {
                 move || async move {
                     work_started_for_closure.store(true, Ordering::SeqCst);
                     executor
-                        .execute_inner(&work_tool_name, args, &work_context)
+                        .execute_inner(&work_tool_name, args, &work_context, precondition.as_ref())
                         .await
                 },
                 executor_work_error_disposition,
@@ -549,6 +631,7 @@ impl ToolExecutor {
         tool_name: &str,
         args: Value,
         context: &ToolInvocationContext,
+        precondition: Option<&ToolExecutionPrecondition>,
     ) -> Result<ToolExecutionResult, ToolExecutorError> {
         let lookup_started = Instant::now();
         let tool = match self.registry.get(tool_name) {
@@ -588,32 +671,13 @@ impl ToolExecutor {
             return Err(error);
         }
 
-        if let ToolSource::OpenApi {
-            connection_id: source_connection_id,
-            ..
-        } = &tool.source
-        {
-            let binding_matches = matches!(
-                &tool.target,
-                Some(ToolTarget::Http { connection_id, .. })
-                    if connection_id == source_connection_id
-            );
-            if !binding_matches {
-                let error = ToolExecutorError::Connection {
-                    tool_name: tool.name.clone(),
-                    reason: "catalog_stale",
-                };
-                self.emit_executor_failure_observation(
-                    context,
-                    &tool,
-                    duration_millis(validation_started.elapsed()),
-                    &error,
-                );
-                return Err(error);
-            }
-        }
-
         if let Some(mapping) = tool.upstream.mcp_proxy_mapping() {
+            self.validate_openapi_target_binding(
+                context,
+                &tool,
+                duration_millis(validation_started.elapsed()),
+            )?;
+            self.enforce_execution_precondition(context, &tool, precondition)?;
             return self.execute_mcp_proxy(context, &tool, mapping, args).await;
         }
 
@@ -640,6 +704,12 @@ impl ToolExecutor {
                 tool_name: tool.name.clone(),
             });
         }
+        self.validate_openapi_target_binding(
+            context,
+            &tool,
+            duration_millis(request_build_started.elapsed()),
+        )?;
+        self.enforce_execution_precondition(context, &tool, precondition)?;
         let started = Instant::now();
         let request_method = request.method.clone();
         let (result, connection_id) = match (&tool.target, &tool.source) {
@@ -760,6 +830,69 @@ impl ToolExecutor {
                 Err(error)
             }
         }
+    }
+
+    fn enforce_execution_precondition(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        precondition: Option<&ToolExecutionPrecondition>,
+    ) -> Result<(), ToolExecutorError> {
+        let Some(precondition) = precondition else {
+            return Ok(());
+        };
+        let started = Instant::now();
+
+        match precondition.check(tool) {
+            Ok(()) => Ok(()),
+            Err(ToolExecutionPreconditionError::Failed) => {
+                Err(ToolExecutorError::PreconditionFailed {
+                    tool_name: tool.name.clone(),
+                })
+            }
+            Err(ToolExecutionPreconditionError::Unavailable) => {
+                let error = ToolExecutorError::ExecutionStateUnavailable {
+                    tool_name: tool.name.clone(),
+                };
+                self.emit_executor_failure_observation(
+                    context,
+                    tool,
+                    duration_millis(started.elapsed()),
+                    &error,
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn validate_openapi_target_binding(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        latency_ms: u64,
+    ) -> Result<(), ToolExecutorError> {
+        let ToolSource::OpenApi {
+            connection_id: source_connection_id,
+            ..
+        } = &tool.source
+        else {
+            return Ok(());
+        };
+        let binding_matches = matches!(
+            &tool.target,
+            Some(ToolTarget::Http { connection_id, .. })
+                if connection_id == source_connection_id
+        );
+        if binding_matches {
+            return Ok(());
+        }
+
+        let error = ToolExecutorError::Connection {
+            tool_name: tool.name.clone(),
+            reason: "catalog_stale",
+        };
+        self.emit_executor_failure_observation(context, tool, latency_ms, &error);
+        Err(error)
     }
 
     async fn execute_connection_http(
@@ -1181,6 +1314,7 @@ impl ToolExecutor {
             "path_template": tool.upstream.path_template,
             "outcome": outcome.outcome,
             "latency_ms": outcome.latency_ms,
+            "invocation_source": context.source.as_str(),
         });
 
         if let Some(status) = outcome.status {
@@ -1242,6 +1376,7 @@ impl ToolExecutor {
             "mcp_tool_name": mapping.tool_name,
             "outcome": outcome.outcome,
             "latency_ms": outcome.latency_ms,
+            "invocation_source": context.source.as_str(),
         });
         if matches!(&tool.target, Some(ToolTarget::Mcp { .. })) {
             payload["connection_id"] = json!(mapping.server_name);
@@ -1309,6 +1444,7 @@ impl ToolExecutor {
                 "tool_name": tool_name,
                 "schema_mismatch": outcome.schema_mismatch,
                 "routing_context_known": true,
+                "invocation_source": context.source.as_str(),
         });
 
         if let Some(reason) = outcome.reason {
@@ -1811,6 +1947,18 @@ fn executor_failure_observation_outcome(
             schema_mismatch: false,
             reason: Some(TOOL_MATCHED_RULE_REASON),
         },
+        ToolExecutorError::PreconditionFailed { .. } => ToolObservationOutcome {
+            status: StatusCode::PRECONDITION_FAILED.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_PRECONDITION_FAILED_REASON),
+        },
+        ToolExecutorError::ExecutionStateUnavailable { .. } => ToolObservationOutcome {
+            status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_EXECUTION_STATE_UNAVAILABLE_REASON),
+        },
         ToolExecutorError::MissingUpstreamUrl
         | ToolExecutorError::InvalidUpstreamUrl { .. }
         | ToolExecutorError::SchemaCacheKey { .. }
@@ -1854,6 +2002,10 @@ fn runtime_admission_failure_observation_outcome(
                 TOOL_MATCHED_RULE_REASON => {
                     (StatusCode::FORBIDDEN.as_u16(), TOOL_MATCHED_RULE_REASON)
                 }
+                TOOL_PRECONDITION_FAILED_REASON => (
+                    StatusCode::PRECONDITION_FAILED.as_u16(),
+                    TOOL_PRECONDITION_FAILED_REASON,
+                ),
                 TOOL_RUNTIME_CLOSED_REASON => (
                     StatusCode::SERVICE_UNAVAILABLE.as_u16(),
                     TOOL_RUNTIME_CLOSED_REASON,
@@ -1895,8 +2047,14 @@ fn runtime_admission_failure_observation_outcome(
 }
 
 fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDisposition {
-    if matches!(error, ToolExecutorError::HttpRuleDenied { .. }) {
-        return ToolWorkErrorDisposition::Rejected(TOOL_MATCHED_RULE_REASON.to_owned());
+    match error {
+        ToolExecutorError::HttpRuleDenied { .. } => {
+            return ToolWorkErrorDisposition::Rejected(TOOL_MATCHED_RULE_REASON.to_owned());
+        }
+        ToolExecutorError::PreconditionFailed { .. } => {
+            return ToolWorkErrorDisposition::Rejected(TOOL_PRECONDITION_FAILED_REASON.to_owned());
+        }
+        _ => {}
     }
 
     ToolWorkErrorDisposition::Failure(Some(
@@ -1909,6 +2067,9 @@ fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDi
             ToolExecutorError::Egress { source, .. } => egress_error_reason(source),
             ToolExecutorError::McpUpstream { reason, .. } => reason,
             ToolExecutorError::Connection { reason, .. } => reason,
+            ToolExecutorError::ExecutionStateUnavailable { .. } => {
+                TOOL_EXECUTION_STATE_UNAVAILABLE_REASON
+            }
             ToolExecutorError::MissingUpstreamUrl
             | ToolExecutorError::InvalidUpstreamUrl { .. }
             | ToolExecutorError::SchemaCacheKey { .. }
@@ -1917,7 +2078,8 @@ fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDi
             | ToolExecutorError::InvalidMethod { .. }
             | ToolExecutorError::BodySerialize { .. }
             | ToolExecutorError::UrlBuild { .. } => TOOL_EXECUTOR_CONFIGURATION_ERROR_REASON,
-            ToolExecutorError::HttpRuleDenied { .. } => unreachable!("handled above"),
+            ToolExecutorError::HttpRuleDenied { .. }
+            | ToolExecutorError::PreconditionFailed { .. } => unreachable!("handled above"),
         }
         .to_owned(),
     ))
@@ -1940,7 +2102,7 @@ mod tests {
         net::{IpAddr, Ipv4Addr},
         path::{Path, PathBuf},
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex, MutexGuard,
         },
         time::Duration,
@@ -1984,7 +2146,9 @@ mod tests {
         },
         egress::EgressConfig,
         rbac::Policy,
-        tools::runtime::{DefaultToolPolicy, ToolRuntimeConfig, ToolRuntimeToolConfig},
+        tools::runtime::{
+            DefaultToolPolicy, ToolInvocationSource, ToolRuntimeConfig, ToolRuntimeToolConfig,
+        },
     };
 
     const EXPECTED_STRICT_SCHEMA_INJECTION_MAX_DEPTH: usize = 64;
@@ -2037,6 +2201,9 @@ mod tests {
         assert_eq!(events[1].event_type, audit::event::TOOL_UPSTREAM_REQUEST);
         assert_eq!(events[2].event_type, HTTP_REQUEST_OBSERVED);
         assert_eq!(events[3].event_type, audit::event::TOOL_INVOKE_SUCCESS);
+        for event in &events {
+            assert_eq!(event.payload["invocation_source"], json!("internal"));
+        }
         assert_eq!(events[1].payload["tool_name"], json!("echo"));
         assert_eq!(events[1].payload["method"], json!("POST"));
         assert_eq!(events[1].payload["path_template"], json!("/v1/echo"));
@@ -2061,6 +2228,254 @@ mod tests {
             "tool observation event should include latency_ms"
         );
         assert_eq!(executor.validator_cache_guard().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_execution_precondition_rejects_before_egress() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"should-not-run").await;
+        let (executor, capture) = executor_for_tools(
+            addr,
+            [echo_tool()],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checks_for_precondition = Arc::clone(&checks);
+
+        let error = executor
+            .execute_with_precondition(
+                "echo",
+                json!({ "message": "hello" }),
+                invocation_context(),
+                CancellationToken::new(),
+                ToolExecutionPrecondition::new(move |definition| {
+                    assert_eq!(definition.name, "echo");
+                    checks_for_precondition.fetch_add(1, Ordering::SeqCst);
+                    Err(ToolExecutionPreconditionError::Failed)
+                }),
+            )
+            .await
+            .expect_err("failed execution precondition should reject the invocation");
+
+        assert!(matches!(
+            error,
+            ToolRuntimeError::Rejected { ref reason, .. }
+                if reason == TOOL_PRECONDITION_FAILED_REASON
+        ));
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "failed precondition must stop execution before egress"
+        );
+
+        let events = audit_events(&capture, 3).await;
+        assert!(events.iter().any(|event| {
+            event.event_type == audit::event::TOOL_INVOKE_REJECTED
+                && event.payload["reason"] == json!(TOOL_PRECONDITION_FAILED_REASON)
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == HTTP_REQUEST_OBSERVED
+                && event.payload["status"] == json!(StatusCode::PRECONDITION_FAILED.as_u16())
+                && event.payload["reason"] == json!(TOOL_PRECONDITION_FAILED_REASON)
+        }));
+    }
+
+    #[tokio::test]
+    async fn unavailable_execution_precondition_is_a_safe_work_failure() {
+        let (executor, capture) = executor_for_tools(
+            socket_addr(1),
+            [echo_tool()],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+
+        let error = executor
+            .execute_with_precondition(
+                "echo",
+                json!({ "message": "hello" }),
+                invocation_context(),
+                CancellationToken::new(),
+                ToolExecutionPrecondition::new(|_| {
+                    Err(ToolExecutionPreconditionError::Unavailable)
+                }),
+            )
+            .await
+            .expect_err("unavailable execution state should fail closed");
+
+        assert!(matches!(
+            error,
+            ToolRuntimeError::WorkFailed {
+                ref reason,
+                ..
+            } if reason.as_deref() == Some(TOOL_EXECUTION_STATE_UNAVAILABLE_REASON)
+        ));
+        let events = audit_events(&capture, 3).await;
+        assert!(events.iter().any(|event| {
+            event.event_type == HTTP_REQUEST_OBSERVED
+                && event.payload["status"] == json!(StatusCode::SERVICE_UNAVAILABLE.as_u16())
+                && event.payload["reason"] == json!(TOOL_EXECUTION_STATE_UNAVAILABLE_REASON)
+        }));
+    }
+
+    #[tokio::test]
+    async fn schema_validation_runs_before_execution_precondition() {
+        let (executor, _capture) = executor_for_tools(
+            socket_addr(1),
+            [echo_tool()],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checks_for_precondition = Arc::clone(&checks);
+
+        let error = executor
+            .execute_with_precondition(
+                "echo",
+                json!({ "unexpected": true }),
+                invocation_context(),
+                CancellationToken::new(),
+                ToolExecutionPrecondition::new(move |_| {
+                    checks_for_precondition.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            )
+            .await
+            .expect_err("invalid input must fail before the execution precondition");
+
+        assert!(matches!(
+            error,
+            ToolRuntimeError::WorkFailed {
+                ref reason,
+                ..
+            } if reason.as_deref() == Some(TOOL_INVALID_PARAMS_REASON)
+        ));
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn execution_keeps_the_checked_definition_across_registry_reloads() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"ok").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [echo_tool()],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let registry = executor.registry.clone();
+        let replacement_registry = registry.clone();
+        let mut replacement = registry
+            .get("echo")
+            .expect("echo definition should exist")
+            .as_ref()
+            .clone();
+        replacement.upstream.path_template = "/v2/echo".to_owned();
+
+        let response = http_response(
+            executor
+                .execute_with_precondition(
+                    "echo",
+                    json!({ "message": "hello" }),
+                    invocation_context(),
+                    CancellationToken::new(),
+                    ToolExecutionPrecondition::new(move |definition| {
+                        assert_eq!(definition.upstream.path_template, "/v1/echo");
+                        replacement_registry
+                            .replace_local_definitions_with_persist(
+                                vec![replacement.clone()],
+                                || Ok::<(), ()>(()),
+                            )
+                            .expect("replacement definition should publish");
+                        Ok(())
+                    }),
+                )
+                .await
+                .expect("checked invocation should retain its original definition"),
+        );
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            server.await.expect("server task should join").target,
+            "/v1/echo",
+            "dispatch must use the same definition that passed the precondition"
+        );
+        assert_eq!(
+            registry
+                .get("echo")
+                .expect("replacement definition should exist")
+                .upstream
+                .path_template,
+            "/v2/echo"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_precondition_runs_after_schema_and_before_upstream_lookup() {
+        let registry = ToolRegistry::disabled();
+        registry
+            .merge_definitions(vec![ToolDefinition::mcp_proxy(
+                "remote_echo".to_owned(),
+                "Remote echo".to_owned(),
+                json!({
+                    "type": "object",
+                    "required": ["message"],
+                    "properties": {
+                        "message": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }),
+                "missing_server".to_owned(),
+                "echo".to_owned(),
+            )])
+            .expect("MCP proxy definition should publish");
+        let audit = AuditLog::new(Arc::new(CaptureSink::new()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new(
+            runtime_config([("remote_echo", enabled_tool(500, 1))], 2, 1, 100),
+            audit.clone(),
+        );
+        let executor = executor_for_registry_with_runtime(registry, runtime, audit, None);
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checks_for_invalid = Arc::clone(&checks);
+
+        let invalid = executor
+            .execute_with_precondition(
+                "remote_echo",
+                json!({ "unexpected": true }),
+                invocation_context(),
+                CancellationToken::new(),
+                ToolExecutionPrecondition::new(move |_| {
+                    checks_for_invalid.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            )
+            .await
+            .expect_err("MCP schema failure should precede the precondition");
+        assert!(matches!(
+            invalid,
+            ToolRuntimeError::WorkFailed {
+                ref reason,
+                ..
+            } if reason.as_deref() == Some(TOOL_INVALID_PARAMS_REASON)
+        ));
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+
+        let checks_for_valid = Arc::clone(&checks);
+        let rejected = executor
+            .execute_with_precondition(
+                "remote_echo",
+                json!({ "message": "hello" }),
+                invocation_context(),
+                CancellationToken::new(),
+                ToolExecutionPrecondition::new(move |_| {
+                    checks_for_valid.fetch_add(1, Ordering::SeqCst);
+                    Err(ToolExecutionPreconditionError::Failed)
+                }),
+            )
+            .await
+            .expect_err("MCP precondition should precede missing upstream lookup");
+        assert!(matches!(
+            rejected,
+            ToolRuntimeError::Rejected { ref reason, .. }
+                if reason == TOOL_PRECONDITION_FAILED_REASON
+        ));
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3396,13 +3811,19 @@ mod tests {
         );
         let executor =
             executor_for_tools_with_runtime(addr, [widget_tool(false, true)], runtime, audit);
+        let precondition_checks = Arc::new(AtomicUsize::new(0));
+        let precondition_checks_for_call = Arc::clone(&precondition_checks);
 
         let error = executor
-            .execute(
+            .execute_with_precondition(
                 "get_widget",
                 json!({ "widget_id": "private/record" }),
                 invocation_context(),
                 CancellationToken::new(),
+                ToolExecutionPrecondition::new(move |_| {
+                    precondition_checks_for_call.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
             )
             .await
             .expect_err("matching direct HTTP Deny rule should reject the tool invocation");
@@ -3411,6 +3832,11 @@ mod tests {
             error,
             ToolRuntimeError::Rejected { ref reason, .. } if reason == TOOL_MATCHED_RULE_REASON
         ));
+        assert_eq!(
+            precondition_checks.load(Ordering::SeqCst),
+            0,
+            "direct HTTP policy must reject before the execution precondition"
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(100), server)
                 .await
@@ -3433,6 +3859,7 @@ mod tests {
             denied.payload["matched_rule_id"],
             json!("deny-widget-http-path")
         );
+        assert_eq!(denied.payload["invocation_source"], json!("internal"));
         assert!(events.iter().any(|event| {
             event.event_type == audit::event::TOOL_INVOKE_REJECTED
                 && event.payload["reason"] == json!(TOOL_MATCHED_RULE_REASON)
@@ -3954,18 +4381,29 @@ mod tests {
             [echo_tool()],
             runtime_config_without_tools(DefaultToolPolicy::Deny),
         );
+        let precondition_checks = Arc::new(AtomicUsize::new(0));
+        let precondition_checks_for_call = Arc::clone(&precondition_checks);
 
         let error = executor
-            .execute(
+            .execute_with_precondition(
                 "echo",
                 json!({ "message": "hello" }),
                 invocation_context(),
                 CancellationToken::new(),
+                ToolExecutionPrecondition::new(move |_| {
+                    precondition_checks_for_call.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
             )
             .await
             .expect_err("default deny should reject registry tools absent from policy map");
 
         assert!(matches!(error, ToolRuntimeError::UnknownTool { .. }));
+        assert_eq!(
+            precondition_checks.load(Ordering::SeqCst),
+            0,
+            "normal tool policy must reject before the execution precondition"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             server.request_count(),
@@ -5218,6 +5656,7 @@ mod tests {
             request_id: "request-tool-test".to_owned(),
             source_ip: "203.0.113.10".to_owned(),
             actor: None,
+            source: ToolInvocationSource::Internal,
         }
     }
 
@@ -5232,6 +5671,7 @@ mod tests {
                 roles: Some(roles.iter().map(|role| (*role).to_owned()).collect()),
                 auth_mode: "bearer_token".to_owned(),
             }),
+            source: ToolInvocationSource::Internal,
         }
     }
 

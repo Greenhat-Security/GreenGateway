@@ -28,7 +28,7 @@ use crate::{
     tools::{
         definitions::{ToolDefinition, ToolRegistry},
         executor::{ToolConnectionRuntimes, ToolExecutionResult, ToolExecutor, ToolExecutorError},
-        runtime::{ToolInvocationContext, ToolRuntimeError},
+        runtime::{ToolInvocationContext, ToolInvocationSource, ToolRuntimeError},
     },
 };
 
@@ -245,7 +245,10 @@ fn invocation_context_from_request(
     client_ip_policy: &client_ip::ClientIpPolicy,
 ) -> ToolInvocationContext {
     let Some(parts) = context.extensions.get::<Parts>() else {
-        return ToolInvocationContext::default();
+        return ToolInvocationContext {
+            source: ToolInvocationSource::Mcp,
+            ..ToolInvocationContext::default()
+        };
     };
 
     ToolInvocationContext {
@@ -259,6 +262,7 @@ fn invocation_context_from_request(
             .extensions
             .get::<auth::Principal>()
             .map(auth::actor_from_principal),
+        source: ToolInvocationSource::Mcp,
     }
 }
 
