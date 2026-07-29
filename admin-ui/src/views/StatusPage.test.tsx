@@ -30,11 +30,9 @@ describe('StatusPage', () => {
     expect(screen.getByText('NAT64 prefixes')).toBeTruthy();
     expect(screen.getByText('Deny non-global IPs')).toBeTruthy();
 
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/v1/admin/status',
-      expect.objectContaining({
-        headers: expect.objectContaining({ Accept: 'application/json' }),
-      }),
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/v1/admin/status');
+    expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get('Accept')).toBe(
+      'application/json',
     );
   });
 

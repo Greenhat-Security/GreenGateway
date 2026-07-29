@@ -428,8 +428,11 @@ h3 {
 .expand-button:focus-visible,
 .endpoint-detail-link:focus-visible,
 .filter-toggle:focus-visible,
+.connection-action-link:focus-visible,
+.capability-detail-link:focus-visible,
 input:focus-visible,
-select:focus-visible {
+select:focus-visible,
+textarea:focus-visible {
   outline: 2px solid var(--gh-sys-focus-ring);
   outline-offset: 2px;
 }
@@ -802,6 +805,305 @@ select:focus-visible {
   background: var(--gh-sys-danger-subtle);
 }
 
+.connections-page,
+.connection-detail-page,
+.connection-editor-page,
+.capability-inventory-page,
+.capability-detail-page {
+  width: min(1440px, 100%);
+}
+
+.connections-panel,
+.connection-detail-panel,
+.connection-editor-panel,
+.capability-inventory-panel,
+.capability-detail-panel {
+  min-width: 0;
+}
+
+.connections-filter-form,
+.connection-form,
+.connection-detail-section,
+.capability-detail-section {
+  display: grid;
+  gap: var(--gh-ref-space-3);
+}
+
+.connections-filter-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.connections-table,
+.capability-inventory-table,
+.capability-table,
+.connection-test-stages {
+  min-width: 1040px;
+}
+
+.connection-test-stages {
+  min-width: 720px;
+}
+
+.connection-primary-cell,
+.capability-primary-cell {
+  display: grid;
+  gap: 3px;
+}
+
+.connection-primary-cell a,
+.capability-primary-cell a,
+.connection-action-link,
+.capability-detail-link {
+  color: var(--gh-sys-primary-text);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+
+.connection-primary-cell a:hover,
+.capability-primary-cell a:hover,
+.connection-action-link:hover,
+.capability-detail-link:hover {
+  text-decoration: underline;
+}
+
+.connection-primary-cell small,
+.capability-primary-cell small,
+.connection-detail-section small,
+.capability-detail-section small {
+  color: var(--gh-sys-fg-muted);
+  font-size: var(--gh-type-caption);
+  line-height: var(--gh-lh-caption);
+}
+
+.connection-actions,
+.capability-actions,
+.connection-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gh-ref-space-2);
+}
+
+.connection-refresh-counts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--gh-ref-space-2);
+}
+
+.connection-summary-grid,
+.capability-summary-grid,
+.capability-detail-state-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--gh-ref-space-3);
+  margin: 0;
+}
+
+.capability-detail-state-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.connection-summary-grid > div,
+.capability-summary-grid > div,
+.capability-detail-state-grid > div,
+.connection-refresh-counts > div {
+  min-width: 0;
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-ref-radius-md);
+  padding: var(--gh-ref-space-3);
+  background: var(--gh-sys-bg-raised);
+}
+
+.connection-summary-grid dt,
+.capability-summary-grid dt,
+.capability-detail-state-grid dt,
+.connection-refresh-counts dt {
+  color: var(--gh-sys-fg-subtle);
+  font-size: var(--gh-type-caption);
+  font-weight: 700;
+  line-height: var(--gh-lh-caption);
+  text-transform: uppercase;
+}
+
+.connection-summary-grid dd,
+.capability-summary-grid dd,
+.capability-detail-state-grid dd,
+.connection-refresh-counts dd {
+  margin: var(--gh-ref-space-1) 0 0;
+  color: var(--gh-sys-fg);
+  overflow-wrap: anywhere;
+}
+
+.connection-detail-section,
+.capability-detail-section,
+.connection-form-section {
+  min-width: 0;
+  border-top: 1px solid var(--gh-sys-border);
+  padding-top: var(--gh-ref-space-4);
+}
+
+.capability-detail-section {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.connection-detail-section:first-of-type,
+.capability-detail-section:first-of-type,
+.connection-form-section:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.connection-detail-section h3,
+.capability-detail-section h3,
+.connection-form-section h3,
+.capability-detail-state-grid h4 {
+  margin: 0;
+  font-size: var(--gh-type-h5);
+  line-height: var(--gh-lh-h5);
+}
+
+.capability-schema,
+.capability-mapping {
+  color: var(--gh-sys-fg);
+  font-family: var(--gh-ref-font-mono);
+  font-size: var(--gh-type-caption);
+  overflow-wrap: anywhere;
+}
+
+.connection-form {
+  gap: var(--gh-ref-space-5);
+}
+
+.connection-form-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.connection-form label,
+.connection-form-section label {
+  display: grid;
+  gap: var(--gh-ref-space-2);
+  color: var(--gh-sys-fg);
+  font-size: var(--gh-type-body-sm);
+  font-weight: 650;
+}
+
+.connection-form label.rule-check-row,
+.connection-form label.connection-enable-confirmation {
+  display: flex;
+}
+
+.connection-form .rule-check-row input[type="checkbox"] {
+  width: 20px;
+  min-width: 20px;
+  height: 20px;
+  min-height: 20px;
+  padding: 0;
+}
+
+.connection-form input,
+.connection-form select,
+.connection-form textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-comp-input-radius);
+  padding: 0 var(--gh-ref-space-3);
+  color: var(--gh-sys-fg);
+  background: var(--gh-sys-bg-canvas);
+  font: inherit;
+}
+
+.connection-form input,
+.connection-form select {
+  min-height: 40px;
+}
+
+.connection-form textarea {
+  min-height: 112px;
+  resize: vertical;
+  padding-block: var(--gh-ref-space-3);
+  font-family: var(--gh-ref-font-mono);
+  line-height: 1.5;
+}
+
+.connection-form input:hover:not(:disabled),
+.connection-form select:hover:not(:disabled),
+.connection-form textarea:hover:not(:disabled) {
+  border-color: var(--gh-sys-border-hover);
+}
+
+.connection-form input:focus,
+.connection-form select:focus,
+.connection-form textarea:focus {
+  outline: none;
+  border-color: var(--gh-sys-primary);
+  box-shadow: 0 0 0 2px
+    color-mix(in srgb, var(--gh-sys-primary) 25%, transparent);
+}
+
+.connection-form input:disabled,
+.connection-form select:disabled,
+.connection-form textarea:disabled,
+.connection-form [aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.connection-secret-control,
+.connection-enable-confirmation {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gh-ref-space-2);
+}
+
+.connection-enable-confirmation {
+  align-items: flex-start;
+  border: 1px solid var(--gh-sys-warning);
+  border-radius: var(--gh-ref-radius-md);
+  padding: var(--gh-ref-space-3);
+  background: var(--gh-sys-warning-subtle);
+}
+
+.connection-enable-confirmation input {
+  width: auto;
+  min-height: auto;
+  margin-top: 3px;
+}
+
+.connection-live-region,
+.capability-live-region {
+  min-height: 1.5em;
+}
+
+.capability-filter-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.capability-description {
+  max-width: 54ch;
+  color: var(--gh-sys-fg-muted);
+  font-size: var(--gh-type-body-sm);
+  line-height: var(--gh-lh-body-sm);
+  overflow-wrap: anywhere;
+}
+
+.capability-schema {
+  width: 100%;
+  max-width: 100%;
+  max-height: 520px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-ref-radius-md);
+  padding: var(--gh-ref-space-4);
+  color: var(--gh-sys-fg);
+  background: var(--gh-sys-bg-surface);
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
 .live-summary {
   display: flex;
   flex-wrap: wrap;
@@ -979,6 +1281,7 @@ select:focus-visible {
 .traffic-audit-grid,
 .traffic-warning-list {
   display: grid;
+  min-width: 0;
   gap: var(--gh-ref-space-4);
 }
 
@@ -1011,6 +1314,9 @@ select:focus-visible {
 
 .traffic-metadata-grid {
   display: grid;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0 var(--gh-ref-space-4);
   margin: 0;
@@ -1018,6 +1324,15 @@ select:focus-visible {
   border-radius: var(--gh-comp-card-radius);
   padding: 0 var(--gh-ref-space-4);
   background: var(--gh-sys-bg-canvas);
+}
+
+.traffic-metadata-grid > div,
+.traffic-metadata-grid dd,
+.traffic-metadata-grid code {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .traffic-chart-heading,
@@ -2270,11 +2585,18 @@ select:focus-visible {
   .traffic-metadata-grid,
   .traffic-summary-grid,
   .status-stat-grid,
-  .status-card-grid {
+  .status-card-grid,
+  .connection-summary-grid,
+  .capability-summary-grid,
+  .capability-detail-state-grid,
+  .connection-refresh-counts {
     grid-template-columns: 1fr;
   }
 
-  .filter-grid {
+  .filter-grid,
+  .connections-filter-grid,
+  .connection-form-grid,
+  .capability-filter-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -2333,7 +2655,10 @@ select:focus-visible {
   .action-choice-grid,
   .filter-grid,
   .traffic-filter-grid,
-  .signal-filter-grid {
+  .signal-filter-grid,
+  .connections-filter-grid,
+  .connection-form-grid,
+  .capability-filter-grid {
     grid-template-columns: 1fr;
   }
 
@@ -2366,7 +2691,10 @@ select:focus-visible {
   }
 
   .rule-panel .table-scroll,
-  .traffic-panel .table-scroll {
+  .traffic-panel .table-scroll,
+  .connections-panel .table-scroll,
+  .connection-detail-panel .table-scroll,
+  .capability-inventory-panel .table-scroll {
     display: grid;
     gap: var(--gh-ref-space-3);
     overflow-x: visible;
@@ -2375,7 +2703,11 @@ select:focus-visible {
   }
 
   .rule-table,
-  .traffic-table {
+  .traffic-table,
+  .connections-table,
+  .capability-inventory-table,
+  .capability-table,
+  .connection-test-stages {
     display: block;
     width: 100%;
     min-width: 0;
@@ -2384,7 +2716,11 @@ select:focus-visible {
   }
 
   .rule-table thead,
-  .traffic-table thead {
+  .traffic-table thead,
+  .connections-table thead,
+  .capability-inventory-table thead,
+  .capability-table thead,
+  .connection-test-stages thead {
     position: absolute;
     width: 1px;
     height: 1px;
@@ -2394,13 +2730,21 @@ select:focus-visible {
   }
 
   .rule-table tbody,
-  .traffic-table tbody {
+  .traffic-table tbody,
+  .connections-table tbody,
+  .capability-inventory-table tbody,
+  .capability-table tbody,
+  .connection-test-stages tbody {
     display: grid;
     gap: var(--gh-ref-space-3);
   }
 
   .rule-table tr,
-  .traffic-table tr {
+  .traffic-table tr,
+  .connections-table tr,
+  .capability-inventory-table tr,
+  .capability-table tr,
+  .connection-test-stages tr {
     display: block;
     overflow: hidden;
     border: 1px solid var(--gh-sys-border);
@@ -2410,12 +2754,20 @@ select:focus-visible {
   }
 
   .rule-table th,
-  .traffic-table th {
+  .traffic-table th,
+  .connections-table th,
+  .capability-inventory-table th,
+  .capability-table th,
+  .connection-test-stages th {
     display: none;
   }
 
   .rule-table td,
   .traffic-table td,
+  .connections-table td,
+  .capability-inventory-table td,
+  .capability-table td,
+  .connection-test-stages td,
   .rule-table td.rule-priority-cell {
     display: block;
     width: auto;
@@ -2425,17 +2777,29 @@ select:focus-visible {
   }
 
   .rule-table td:nth-child(n),
-  .traffic-table td:nth-child(n) {
+  .traffic-table td:nth-child(n),
+  .connections-table td:nth-child(n),
+  .capability-inventory-table td:nth-child(n),
+  .capability-table td:nth-child(n),
+  .connection-test-stages td:nth-child(n) {
     width: auto;
   }
 
   .rule-table td:last-child,
-  .traffic-table td:last-child {
+  .traffic-table td:last-child,
+  .connections-table td:last-child,
+  .capability-inventory-table td:last-child,
+  .capability-table td:last-child,
+  .connection-test-stages td:last-child {
     border-bottom: 0;
   }
 
   .rule-table td::before,
-  .traffic-table td::before {
+  .traffic-table td::before,
+  .connections-table td::before,
+  .capability-inventory-table td::before,
+  .capability-table td::before,
+  .connection-test-stages td::before {
     content: attr(data-label);
     display: block;
     margin-bottom: var(--gh-ref-space-1);
@@ -2448,8 +2812,16 @@ select:focus-visible {
 
   .rule-table .event-row.is-even td,
   .traffic-table .event-row.is-even td,
+  .connections-table .event-row.is-even td,
+  .capability-inventory-table .event-row.is-even td,
+  .capability-table .event-row.is-even td,
+  .connection-test-stages .event-row.is-even td,
   .rule-table .event-row:hover td,
-  .traffic-table .event-row:hover td {
+  .traffic-table .event-row:hover td,
+  .connections-table .event-row:hover td,
+  .capability-inventory-table .event-row:hover td,
+  .capability-table .event-row:hover td,
+  .connection-test-stages .event-row:hover td {
     background: transparent;
   }
 
@@ -2469,7 +2841,23 @@ select:focus-visible {
 
   .rule-toggle,
   .rule-danger-button,
-  .row-action-button {
+  .row-action-button,
+  .connection-actions .primary-button,
+  .connection-actions .secondary-button,
+  .capability-actions .primary-button,
+  .capability-actions .secondary-button {
     width: 100%;
   }
+
+  .capability-detail-panel .table-scroll {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    overflow-x: auto;
+    border: 1px solid var(--gh-sys-border);
+    background: var(--gh-sys-bg-canvas);
+  }
+
 }

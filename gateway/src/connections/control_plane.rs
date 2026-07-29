@@ -359,6 +359,14 @@ impl ConnectionControlPlane {
             .ok_or(LocalSecretMutationUnavailable)
     }
 
+    pub fn secret_alias_metadata(&self) -> Vec<SecretAliasMetadata> {
+        self.secret_resolver.aliases()
+    }
+
+    pub fn is_local_secret_manager_configured(&self) -> bool {
+        self.local_secret_manager.is_some()
+    }
+
     pub fn runtime_snapshot(&self) -> Arc<ConnectionRuntimeSnapshot> {
         self.runtime.load_full()
     }

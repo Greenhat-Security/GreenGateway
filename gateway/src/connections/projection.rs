@@ -23,6 +23,7 @@ const MAX_NORMALIZED_MCP_NAME_BYTES: usize = 80;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LegacyConnectionProjection {
     summary: SafeConnectionSummary,
+    sanitized_origin: Option<String>,
     legacy_mcp_server_name: Option<String>,
 }
 
@@ -39,6 +40,7 @@ struct LegacyProjectionSpec {
     source: ConnectionManagementSource,
     authentication: SafeAuthenticationKind,
     endpoint_count: usize,
+    sanitized_origin: Option<String>,
     legacy_mcp_server_name: Option<String>,
 }
 
@@ -49,6 +51,10 @@ impl LegacyConnectionProjection {
 
     pub fn safe_summary(&self) -> SafeConnectionSummary {
         self.summary.clone()
+    }
+
+    pub fn sanitized_origin(&self) -> Option<&str> {
+        self.sanitized_origin.as_deref()
     }
 
     pub fn legacy_mcp_server_name(&self) -> Option<&str> {
@@ -106,6 +112,7 @@ pub fn project_legacy_connections(
                 source: ConnectionManagementSource::LegacyDefaultHttp,
                 authentication: SafeAuthenticationKind::None,
                 endpoint_count: 1,
+                sanitized_origin: config.upstream_url.as_deref().and_then(sanitized_origin),
                 legacy_mcp_server_name: None,
             },
         )?;
@@ -136,6 +143,7 @@ pub fn project_legacy_connections(
                 source: ConnectionManagementSource::LegacyRoute,
                 authentication,
                 endpoint_count,
+                sanitized_origin: legacy_route_sanitized_origin(route),
                 legacy_mcp_server_name: None,
             },
         )?;
@@ -153,6 +161,7 @@ pub fn project_legacy_connections(
                 source: ConnectionManagementSource::LegacyMcp,
                 authentication: SafeAuthenticationKind::None,
                 endpoint_count: 1,
+                sanitized_origin: sanitized_origin(&server.url),
                 legacy_mcp_server_name: Some(server.name.clone()),
             },
         )?;
@@ -190,6 +199,7 @@ fn push_projection(
         source,
         authentication,
         endpoint_count,
+        sanitized_origin,
         legacy_mcp_server_name,
     } = spec;
     if !ids.insert(id.clone()) {
@@ -217,9 +227,25 @@ fn push_projection(
                 catalog_entry_count: None,
             },
         },
+        sanitized_origin,
         legacy_mcp_server_name,
     });
     Ok(())
+}
+
+fn legacy_route_sanitized_origin(route: &UpstreamRouteConfig) -> Option<String> {
+    if route.upstreams.len() == 1 {
+        return sanitized_origin(&route.upstreams[0].url);
+    }
+    if route.upstreams.is_empty() {
+        return sanitized_origin(&route.upstream_url);
+    }
+    None
+}
+
+fn sanitized_origin(value: &str) -> Option<String> {
+    let parsed = url::Url::parse(value).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.origin().ascii_serialization())
 }
 
 fn projected_route_id(route: &UpstreamRouteConfig) -> String {

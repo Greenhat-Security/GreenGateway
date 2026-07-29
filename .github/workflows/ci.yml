@@ -91,6 +91,52 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  admin-ui:
+    name: admin-ui
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: admin-ui/package-lock.json
+
+      - name: Install admin UI dependencies
+        working-directory: admin-ui
+        run: npm ci
+
+      - name: Test admin UI
+        working-directory: admin-ui
+        run: npm test
+
+      - name: Build admin UI
+        working-directory: admin-ui
+        run: npm run build
+
+      - name: Install Chromium
+        working-directory: admin-ui
+        run: npx playwright install --with-deps chromium
+
+      - name: Test admin UI screenshots
+        working-directory: admin-ui
+        run: npm run screenshots
+
+      - name: Retain admin UI test artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-ui-test-artifacts
+          path: |
+            admin-ui/.screenshots/
+            admin-ui/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
   dev-traffic-smoke:
     name: dev-traffic-smoke
     runs-on: ubuntu-latest

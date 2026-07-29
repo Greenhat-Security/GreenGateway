@@ -106,6 +106,8 @@ pub struct SecretAliasMetadata {
     pub label: String,
     pub provider: SecretProviderKind,
     pub configured: bool,
+    #[serde(skip_serializing)]
+    pub purpose: Option<SecretPurpose>,
     pub version: Option<u64>,
     pub rotated_at: Option<String>,
 }
@@ -438,6 +440,7 @@ impl SecretResolver for OperatorAliasResolver {
                     OperatorSecretAliasSource::File { .. } => SecretProviderKind::OperatorFile,
                 },
                 configured: true,
+                purpose: None,
                 version: None,
                 rotated_at: None,
             })
@@ -611,7 +614,8 @@ fn is_windows_reserved_file_key(value: &str) -> bool {
             .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SecretPurpose {
     HeaderApiKey,
     StaticBearer,

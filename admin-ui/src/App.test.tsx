@@ -445,6 +445,66 @@ describe('AdminShell', () => {
     expect(screen.getByText('Review OpenAPI tools before registration')).toBeTruthy();
   });
 
+  it('links to connections and tool inventory from navigation and the dashboard', () => {
+    vi.stubGlobal('fetch', versionFetchMock(false));
+
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    const navigation = within(
+      screen.getByRole('navigation', { name: 'Admin sections' }),
+    );
+    expect(
+      navigation.getByRole('link', { name: 'Connections' }).getAttribute('href'),
+    ).toBe('/connections');
+    expect(
+      navigation
+        .getByRole('link', { name: 'Tool inventory' })
+        .getAttribute('href'),
+    ).toBe('/tools');
+    expect(
+      screen.getByText('Configure, test, and refresh upstream connections'),
+    ).toBeTruthy();
+    expect(
+      screen.getByText('Review registered tools and connection health'),
+    ).toBeTruthy();
+  });
+
+  it('registers connection and tool inventory routes with specific page titles', () => {
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => undefined)));
+
+    const routes = [
+      ['/connections', 'Connections'],
+      ['/connections/new', 'New connection'],
+      ['/connections/connection-a', 'Connection details'],
+      ['/connections/connection-a/edit', 'Edit connection'],
+      ['/tools', 'Tool inventory'],
+      ['/tools/tool-a', 'Tool details'],
+    ] as const;
+
+    for (const [path, title] of routes) {
+      render(
+        <MemoryRouter initialEntries={[path]}>
+          <AdminShell />
+        </MemoryRouter>,
+      );
+
+      expect(
+        screen.getByRole('heading', { level: 1, name: title }),
+      ).toBeTruthy();
+      expect(
+        screen.queryByRole('heading', {
+          level: 2,
+          name: 'Admin route not found',
+        }),
+      ).toBeNull();
+      cleanup();
+    }
+  });
+
   it('registers the identity directory route and navigation entry', async () => {
     vi.stubGlobal(
       'fetch',

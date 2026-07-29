@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::model::{ConnectionId, ConnectionKind, ConnectionManagementSource};
 
@@ -12,7 +12,7 @@ pub enum SafeAuthenticationKind {
     LegacyConfigured,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionOperationalState {
     Unknown,

@@ -38,6 +38,7 @@ use tracing_subscriber::{
 };
 #[cfg(test)]
 use url::Url;
+use zeroize::{Zeroize, Zeroizing};
 
 mod audit;
 mod auth;
@@ -99,7 +100,10 @@ const CONNECTION_REFRESH_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/refresh
 const CONNECTION_TEST_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/test";
 const CONNECTION_OPENAPI_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/openapi/preview";
 const CONNECTION_OPENAPI_REGISTER_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/openapi/register";
+const CONNECTION_SECRETS_ADMIN_ROUTE: &str = "/v1/admin/connection-secrets";
+const CONNECTION_SECRET_ADMIN_ROUTE: &str = "/v1/admin/connection-secrets/{id}";
 const CONNECTION_COLLECTION_ETAG_HEADER: &str = "x-greengateway-connections-etag";
+const CONNECTION_SECRET_COLLECTION_ETAG_HEADER: &str = "x-greengateway-connection-secrets-etag";
 const MANAGED_OPENAPI_JSON_ENVELOPE_OVERHEAD_BYTES: usize = 64 * 1024;
 const TOOLS_ADMIN_ROUTE: &str = "/v1/admin/tools";
 const TOOL_ADMIN_ROUTE: &str = "/v1/admin/tools/{id}";
@@ -176,6 +180,8 @@ struct AppState {
     routes: GatewayRoutes,
     client_ip_policy: client_ip::ClientIpPolicy,
     admin_login_configured: bool,
+    csrf_cookie_name: String,
+    csrf_header_name: String,
     max_body_size: usize,
     mcp: mcp::McpState,
     protected_resource_metadata: Option<auth::protected_resource::ProtectedResourceMetadataConfig>,
@@ -227,6 +233,8 @@ struct AdminRoutes {
     connection_test_route: String,
     connection_openapi_preview_route: String,
     connection_openapi_register_route: String,
+    connection_secrets_route: String,
+    connection_secret_route: String,
     tools_route: String,
     tool_route: String,
     tools_openapi_preview_route: String,
@@ -360,6 +368,8 @@ impl AdminRoutes {
             connection_openapi_register_route: format!(
                 "{api_prefix}/connections/{{id}}/openapi/register"
             ),
+            connection_secrets_route: format!("{api_prefix}/connection-secrets"),
+            connection_secret_route: format!("{api_prefix}/connection-secrets/{{id}}"),
             tools_route: format!("{api_prefix}/tools"),
             tool_route: format!("{api_prefix}/tools/{{id}}"),
             tools_openapi_preview_route: format!("{api_prefix}/tools/openapi/preview"),
@@ -425,6 +435,7 @@ struct TokenAdminState {
 #[derive(Clone)]
 struct ConnectionAdminState {
     control_plane: connections::control_plane::ConnectionControlPlane,
+    inventory: tools::inventory::CapabilityInventory,
     mcp_catalogs: connections::mcp::McpConnectionCatalogService,
     openapi_catalogs: connections::openapi::OpenApiConnectionCatalogService,
     tests: connections::test::ConnectionTestService,
@@ -432,6 +443,9 @@ struct ConnectionAdminState {
     audit: audit::AuditLog,
     client_ip_policy: client_ip::ClientIpPolicy,
     max_body_size: usize,
+    // Serializes the HTTP precondition snapshot with its mutation. This is
+    // intentionally distinct from the control plane's secret/activation lock.
+    secret_precondition_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -1187,6 +1201,35 @@ struct ConnectionDeletedResponse {
     deleted_connection_id: connections::model::ConnectionId,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectionSecretCreateRequest {
+    label: String,
+    purpose: connections::secret::SecretPurpose,
+    #[serde(deserialize_with = "deserialize_secret_value")]
+    value: Zeroizing<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectionSecretRotateRequest {
+    purpose: connections::secret::SecretPurpose,
+    #[serde(deserialize_with = "deserialize_secret_value")]
+    value: Zeroizing<String>,
+}
+
+fn deserialize_secret_value<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Zeroizing::new)
+}
+
+#[derive(Serialize)]
+struct ConnectionSecretDeletedResponse {
+    deleted_secret_id: String,
+}
+
 #[derive(Serialize)]
 struct SchemaNotConfiguredResponse {
     error: String,
@@ -1715,8 +1758,13 @@ fn gateway_app_with_process_started_at_and_overrides(
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
     };
+    let capability_inventory = tools::inventory::CapabilityInventory::new(
+        tool_registry.clone(),
+        connection_control_plane.clone(),
+    );
     let connection_admin_state = ConnectionAdminState {
         control_plane: connection_control_plane.clone(),
+        inventory: capability_inventory.clone(),
         mcp_catalogs: mcp_catalog_service,
         openapi_catalogs: openapi_catalog_service,
         tests: connections::test::ConnectionTestService::new(connection_http_runtime.clone()),
@@ -1724,14 +1772,12 @@ fn gateway_app_with_process_started_at_and_overrides(
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
+        secret_precondition_lock: Arc::new(Mutex::new(())),
     };
     let tool_admin_state = ToolAdminState {
         tools_file: config.tools_file.as_ref().map(PathBuf::from),
         registry: tool_registry.clone(),
-        inventory: tools::inventory::CapabilityInventory::new(
-            tool_registry,
-            connection_control_plane.clone(),
-        ),
+        inventory: capability_inventory,
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
@@ -1780,6 +1826,8 @@ fn gateway_app_with_process_started_at_and_overrides(
         routes: routes.clone(),
         client_ip_policy: client_ip_policy.clone(),
         admin_login_configured: admin_auth_state.is_some(),
+        csrf_cookie_name: config.csrf_cookie_name.clone(),
+        csrf_header_name: config.csrf_header_name.clone(),
         max_body_size: config.max_body_size,
         mcp: mcp_state,
         protected_resource_metadata,
@@ -2475,6 +2523,15 @@ fn add_admin_api_routes(
                     routes.admin.connection_openapi_register_route.as_str(),
                     post(connection_openapi_register_endpoint),
                 )
+                .route(
+                    routes.admin.connection_secrets_route.as_str(),
+                    get(connection_secret_list_endpoint).post(connection_secret_create_endpoint),
+                )
+                .route(
+                    routes.admin.connection_secret_route.as_str(),
+                    put(connection_secret_rotate_endpoint)
+                        .delete(connection_secret_delete_endpoint),
+                )
                 .with_state(admin_api_states.connections),
         )
         .merge(
@@ -3031,6 +3088,463 @@ async fn status_endpoint(
     Json(StatusResponse::from_state(&state).await).into_response()
 }
 
+async fn connection_secret_list_endpoint(
+    State(state): State<ConnectionAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_SECRETS_ADMIN_ROUTE);
+
+    let (parts, _body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_connection_state(
+        &state,
+        &principal,
+        ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
+    ) {
+        return match error {
+            ConnectionAdminAuthzError::Forbidden => connection_permission_forbidden(
+                &state,
+                &parts,
+                &principal,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
+                "list",
+            ),
+            error => connection_admin_authz_error_response(error),
+        };
+    }
+
+    let metadata = state.control_plane.secret_alias_metadata();
+    let dependency_counts =
+        connection_secret_dependency_counts(&state.control_plane.runtime_snapshot());
+    let local_encrypted = state.control_plane.is_local_secret_manager_configured();
+    let operator_aliases = metadata
+        .iter()
+        .any(|item| item.provider != connections::secret::SecretProviderKind::LocalEncrypted);
+    let collection_etag = connections::admin::secret_collection_etag(&metadata);
+    let secrets = metadata
+        .iter()
+        .cloned()
+        .map(|item| {
+            let dependency_count = dependency_counts
+                .get(item.id.as_str())
+                .copied()
+                .unwrap_or_default();
+            connections::admin::SafeSecretAliasView::from_metadata(item, true, dependency_count)
+        })
+        .collect();
+    let response_body = connections::admin::SecretAliasListResponse {
+        secrets,
+        actions: connections::admin::SecretCollectionActions {
+            can_create: local_encrypted,
+        },
+        providers: connections::admin::SecretProviderAvailability {
+            operator_aliases,
+            local_encrypted,
+        },
+    };
+    let response_etag = match serialized_response_etag(&response_body) {
+        Ok(etag) => etag,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to hash connection-secret list response");
+            return internal_server_error("connection-secret list response could not be encoded");
+        }
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::ETAG, etag_header_value(&response_etag)),
+            (
+                HeaderName::from_static(CONNECTION_SECRET_COLLECTION_ETAG_HEADER),
+                etag_header_value(&collection_etag),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        Json(response_body),
+    )
+        .into_response()
+}
+
+async fn connection_secret_create_endpoint(
+    State(state): State<ConnectionAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_SECRETS_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_connection_state(
+        &state,
+        &principal,
+        ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
+    ) {
+        return match error {
+            ConnectionAdminAuthzError::Forbidden => connection_permission_forbidden(
+                &state,
+                &parts,
+                &principal,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
+                "create",
+            ),
+            error => connection_admin_authz_error_response(error),
+        };
+    }
+
+    let current_metadata = state.control_plane.secret_alias_metadata();
+    let current_collection_etag = connections::admin::secret_collection_etag(&current_metadata);
+    match if_match_matches(&parts.headers, &current_collection_etag) {
+        Ok(true) => {}
+        Ok(false) => {
+            return with_etag(
+                precondition_failed(
+                    "If-Match does not match the current connection-secret collection ETag",
+                ),
+                &current_collection_etag,
+            );
+        }
+        Err(error) => {
+            return with_etag(if_match_error_response(error), &current_collection_etag);
+        }
+    }
+    if !state.control_plane.is_local_secret_manager_configured() {
+        return connection_secret_store_not_configured();
+    }
+
+    let body =
+        match read_connection_secret_body(body, connection_secret_admin_body_limit(&state)).await {
+            Ok(body) => body,
+            Err(response) => return response,
+        };
+    let ConnectionSecretCreateRequest {
+        label,
+        purpose,
+        mut value,
+    } = match serde_json::from_slice::<ConnectionSecretCreateRequest>(&body) {
+        Ok(requested) => requested,
+        Err(_) => return bad_request("invalid connection-secret JSON"),
+    };
+    drop(body);
+    let secret_value = std::mem::take(&mut *value).into_bytes();
+    let secret = match connections::secret::ResolvedSecret::new(purpose, secret_value) {
+        Ok(secret) => secret,
+        Err(_) => return connection_secret_validation_error(),
+    };
+    let mutation_guard = match connection_secret_mutation_guard(&state) {
+        Ok(guard) => guard,
+        Err(response) => return *response,
+    };
+    let locked_metadata = state.control_plane.secret_alias_metadata();
+    let locked_collection_etag = connections::admin::secret_collection_etag(&locked_metadata);
+    if locked_collection_etag != current_collection_etag {
+        drop(mutation_guard);
+        return with_etag(
+            precondition_failed(
+                "If-Match does not match the current connection-secret collection ETag",
+            ),
+            &locked_collection_etag,
+        );
+    }
+    let manager = match state.control_plane.local_secret_manager() {
+        Ok(manager) => manager,
+        Err(_) => {
+            drop(mutation_guard);
+            return connection_secret_store_not_configured();
+        }
+    };
+    let created = match manager.create(&label, secret) {
+        Ok(created) => created,
+        Err(error) => {
+            drop(mutation_guard);
+            return connection_secret_error_response(error);
+        }
+    };
+    let item_etag = connections::admin::secret_metadata_etag(&created);
+    let new_collection_etag =
+        connections::admin::secret_collection_etag(&state.control_plane.secret_alias_metadata());
+    drop(mutation_guard);
+    emit_connection_secret_changed(&state, &parts, &principal, "created", &created, 0);
+    (
+        StatusCode::CREATED,
+        [
+            (header::ETAG, etag_header_value(&item_etag)),
+            (
+                HeaderName::from_static(CONNECTION_SECRET_COLLECTION_ETAG_HEADER),
+                etag_header_value(&new_collection_etag),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        Json(connections::admin::SafeSecretAliasView::from_metadata(
+            created, true, 0,
+        )),
+    )
+        .into_response()
+}
+
+async fn connection_secret_rotate_endpoint(
+    State(state): State<ConnectionAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_SECRET_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_connection_state(
+        &state,
+        &principal,
+        ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
+    ) {
+        return match error {
+            ConnectionAdminAuthzError::Forbidden => connection_permission_forbidden(
+                &state,
+                &parts,
+                &principal,
+                CONNECTION_SECRET_ADMIN_ROUTE,
+                ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
+                "rotate",
+            ),
+            error => connection_admin_authz_error_response(error),
+        };
+    }
+
+    let current = match local_secret_metadata(&state, &raw_id) {
+        Ok(current) => current,
+        Err(response) => return *response,
+    };
+    let current_etag = connections::admin::secret_metadata_etag(&current);
+    match if_match_matches(&parts.headers, &current_etag) {
+        Ok(true) => {}
+        Ok(false) => {
+            return with_etag(
+                precondition_failed("If-Match does not match the current connection-secret ETag"),
+                &current_etag,
+            );
+        }
+        Err(error) => return with_etag(if_match_error_response(error), &current_etag),
+    }
+    let body =
+        match read_connection_secret_body(body, connection_secret_admin_body_limit(&state)).await {
+            Ok(body) => body,
+            Err(response) => return response,
+        };
+    let ConnectionSecretRotateRequest { purpose, mut value } =
+        match serde_json::from_slice::<ConnectionSecretRotateRequest>(&body) {
+            Ok(requested) => requested,
+            Err(_) => return bad_request("invalid connection-secret JSON"),
+        };
+    drop(body);
+    let secret_value = std::mem::take(&mut *value).into_bytes();
+    let replacement = match connections::secret::ResolvedSecret::new(purpose, secret_value) {
+        Ok(replacement) => replacement,
+        Err(_) => return connection_secret_validation_error(),
+    };
+    let mutation_guard = match connection_secret_mutation_guard(&state) {
+        Ok(guard) => guard,
+        Err(response) => return *response,
+    };
+    let locked_current = match local_secret_metadata(&state, &raw_id) {
+        Ok(current) => current,
+        Err(_) => {
+            let current_collection_etag = connections::admin::secret_collection_etag(
+                &state.control_plane.secret_alias_metadata(),
+            );
+            drop(mutation_guard);
+            return with_etag(
+                precondition_failed("connection secret changed during rotation"),
+                &current_collection_etag,
+            );
+        }
+    };
+    let locked_etag = connections::admin::secret_metadata_etag(&locked_current);
+    if locked_etag != current_etag {
+        drop(mutation_guard);
+        return with_etag(
+            precondition_failed("If-Match does not match the current connection-secret ETag"),
+            &locked_etag,
+        );
+    }
+    let manager = match state.control_plane.local_secret_manager() {
+        Ok(manager) => manager,
+        Err(_) => {
+            drop(mutation_guard);
+            return connection_secret_store_not_configured();
+        }
+    };
+    let rotated = match manager.rotate(&raw_id, replacement) {
+        Ok(rotated) => rotated,
+        Err(error) => {
+            drop(mutation_guard);
+            return connection_secret_error_response(error);
+        }
+    };
+    let dependency_count =
+        connection_secret_dependency_counts(&state.control_plane.runtime_snapshot())
+            .get(raw_id.as_str())
+            .copied()
+            .unwrap_or_default();
+    let item_etag = connections::admin::secret_metadata_etag(&rotated);
+    let new_collection_etag =
+        connections::admin::secret_collection_etag(&state.control_plane.secret_alias_metadata());
+    drop(mutation_guard);
+    emit_connection_secret_changed(
+        &state,
+        &parts,
+        &principal,
+        "rotated",
+        &rotated,
+        dependency_count,
+    );
+    (
+        StatusCode::OK,
+        [
+            (header::ETAG, etag_header_value(&item_etag)),
+            (
+                HeaderName::from_static(CONNECTION_SECRET_COLLECTION_ETAG_HEADER),
+                etag_header_value(&new_collection_etag),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        Json(connections::admin::SafeSecretAliasView::from_metadata(
+            rotated,
+            true,
+            dependency_count,
+        )),
+    )
+        .into_response()
+}
+
+async fn connection_secret_delete_endpoint(
+    State(state): State<ConnectionAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_SECRET_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_connection_state(
+        &state,
+        &principal,
+        ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
+    ) {
+        return match error {
+            ConnectionAdminAuthzError::Forbidden => connection_permission_forbidden(
+                &state,
+                &parts,
+                &principal,
+                CONNECTION_SECRET_ADMIN_ROUTE,
+                ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
+                "delete",
+            ),
+            error => connection_admin_authz_error_response(error),
+        };
+    }
+
+    let current = match local_secret_metadata(&state, &raw_id) {
+        Ok(current) => current,
+        Err(response) if response.status() == StatusCode::NOT_FOUND => {
+            if let Err(error) =
+                if_match_matches(&parts.headers, "\"connection-secret:no-current-version\"")
+            {
+                return if_match_error_response(error);
+            }
+            let current_collection_etag = connections::admin::secret_collection_etag(
+                &state.control_plane.secret_alias_metadata(),
+            );
+            let mut response =
+                precondition_failed("If-Match does not match an existing connection secret");
+            response.headers_mut().insert(
+                HeaderName::from_static(CONNECTION_SECRET_COLLECTION_ETAG_HEADER),
+                etag_header_value(&current_collection_etag),
+            );
+            return response;
+        }
+        Err(response) => return *response,
+    };
+    let current_etag = connections::admin::secret_metadata_etag(&current);
+    match if_match_matches(&parts.headers, &current_etag) {
+        Ok(true) => {}
+        Ok(false) => {
+            return with_etag(
+                precondition_failed("If-Match does not match the current connection-secret ETag"),
+                &current_etag,
+            );
+        }
+        Err(error) => return with_etag(if_match_error_response(error), &current_etag),
+    }
+    let body = match read_connection_secret_body(body, state.max_body_size.min(1024)).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if !body.is_empty() {
+        return bad_request("connection-secret delete does not accept a request body");
+    }
+    drop(body);
+    let mutation_guard = match connection_secret_mutation_guard(&state) {
+        Ok(guard) => guard,
+        Err(response) => return *response,
+    };
+    let locked_current = match local_secret_metadata(&state, &raw_id) {
+        Ok(current) => current,
+        Err(_) => {
+            let current_collection_etag = connections::admin::secret_collection_etag(
+                &state.control_plane.secret_alias_metadata(),
+            );
+            drop(mutation_guard);
+            return with_etag(
+                precondition_failed("connection secret changed during deletion"),
+                &current_collection_etag,
+            );
+        }
+    };
+    let locked_etag = connections::admin::secret_metadata_etag(&locked_current);
+    if locked_etag != current_etag {
+        drop(mutation_guard);
+        return with_etag(
+            precondition_failed("If-Match does not match the current connection-secret ETag"),
+            &locked_etag,
+        );
+    }
+    let manager = match state.control_plane.local_secret_manager() {
+        Ok(manager) => manager,
+        Err(_) => {
+            drop(mutation_guard);
+            return connection_secret_store_not_configured();
+        }
+    };
+    if let Err(error) = manager.delete(&raw_id) {
+        drop(mutation_guard);
+        return connection_secret_error_response(error);
+    }
+    let new_collection_etag =
+        connections::admin::secret_collection_etag(&state.control_plane.secret_alias_metadata());
+    drop(mutation_guard);
+    emit_connection_secret_changed(&state, &parts, &principal, "deleted", &current, 0);
+    (
+        StatusCode::OK,
+        [
+            (
+                HeaderName::from_static(CONNECTION_SECRET_COLLECTION_ETAG_HEADER),
+                etag_header_value(&new_collection_etag),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        Json(ConnectionSecretDeletedResponse {
+            deleted_secret_id: raw_id,
+        }),
+    )
+        .into_response()
+}
+
 async fn connection_list_endpoint(
     State(state): State<ConnectionAdminState>,
     Query(params): Query<connections::admin::ConnectionListParams>,
@@ -3048,17 +3562,23 @@ async fn connection_list_endpoint(
         };
     let permissions = connection_permissions(rbac_state, principal);
     let snapshot = state.control_plane.runtime_snapshot();
-    let (statuses, dependency_counts) = match connection_collection_runtime_data(&state, &snapshot)
+    let runtime = match connection_collection_runtime_data(&state, &snapshot, rbac_state, principal)
     {
         Ok(data) => data,
         Err(response) => return *response,
     };
     let page = match connections::admin::build_connection_list_page(
         &snapshot,
-        &statuses,
-        &dependency_counts,
+        connections::admin::ConnectionListRuntimeData {
+            statuses: &runtime.statuses,
+            dependency_counts: &runtime.dependency_counts,
+            capability_counts: &runtime.capability_counts,
+            activity_times: &runtime.activity_times,
+        },
         &params,
         permissions,
+        state.control_plane.is_managed_store_configured(),
+        state.control_plane.is_local_secret_manager_configured(),
     ) {
         Ok(page) => page,
         Err(connections::admin::ConnectionListError::InvalidLimit) => {
@@ -3075,11 +3595,18 @@ async fn connection_list_endpoint(
         }
     };
 
+    let response_etag = match serialized_response_etag(&page) {
+        Ok(etag) => etag,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to hash connection list response");
+            return internal_server_error("connection list response could not be encoded");
+        }
+    };
     with_connection_collection_etag(
         (
             StatusCode::OK,
             [
-                (header::ETAG, etag_header_value(snapshot.collection_etag())),
+                (header::ETAG, etag_header_value(&response_etag)),
                 (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
             ],
             Json(page),
@@ -3128,6 +3655,7 @@ async fn connection_get_endpoint(
                 status,
                 dependencies,
                 permissions,
+                state.control_plane.is_local_secret_manager_configured(),
             )),
         )
             .into_response();
@@ -3146,6 +3674,8 @@ async fn connection_get_endpoint(
             ],
             Json(connections::admin::legacy_detail_view(
                 projection.safe_summary(),
+                permissions.secrets_write
+                    && state.control_plane.is_local_secret_manager_configured(),
             )),
         )
             .into_response();
@@ -3246,6 +3776,7 @@ async fn connection_create_endpoint(
                 None,
                 Vec::new(),
                 permissions,
+                state.control_plane.is_local_secret_manager_configured(),
             )),
         )
             .into_response(),
@@ -3384,6 +3915,7 @@ async fn connection_put_endpoint(
                 status,
                 dependencies,
                 permissions,
+                state.control_plane.is_local_secret_manager_configured(),
             )),
         )
             .into_response(),
@@ -3578,7 +4110,6 @@ async fn connection_refresh_endpoint(
                 .into_response(),
         )),
     };
-
     match refreshed {
         Ok(result) => {
             let audit_summary = result.audit_summary();
@@ -3805,7 +4336,10 @@ async fn connection_test_endpoint(
             )
                 .into_response();
         }
-        return connection_mutation_error_response(error);
+        return with_etag(
+            connection_mutation_error_response(error),
+            current_etag.as_str(),
+        );
     }
 
     let outcome = if execution.result.ok {
@@ -4753,7 +5287,16 @@ async fn tool_inventory_list_endpoint(
         Ok(page) => page,
         Err(error) => return capability_inventory_error_response(error),
     };
-    let etag = page.collection_etag().to_owned();
+    let etag = match serialized_response_etag(&page) {
+        Ok(etag) => etag,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "failed to hash capability inventory list response"
+            );
+            return internal_server_error("capability inventory response failed");
+        }
+    };
 
     (
         StatusCode::OK,
@@ -5247,7 +5790,11 @@ async fn schema_inferred_endpoint(
 
 async fn admin_ui_index(State(state): State<AppState>) -> Response {
     record_request(ADMIN_UI_ROUTE);
-    admin_ui_index_response(&state.routes.admin)
+    admin_ui_index_response(
+        &state.routes.admin,
+        &state.csrf_cookie_name,
+        &state.csrf_header_name,
+    )
 }
 
 async fn admin_ui_asset(State(state): State<AppState>, Path(path): Path<String>) -> Response {
@@ -5260,19 +5807,32 @@ async fn admin_ui_asset(State(state): State<AppState>, Path(path): Path<String>)
         }
     }
 
-    admin_ui_index_response(&state.routes.admin)
+    admin_ui_index_response(
+        &state.routes.admin,
+        &state.csrf_cookie_name,
+        &state.csrf_header_name,
+    )
 }
 
-fn admin_ui_index_response(routes: &AdminRoutes) -> Response {
+fn admin_ui_index_response(
+    routes: &AdminRoutes,
+    csrf_cookie_name: &str,
+    csrf_header_name: &str,
+) -> Response {
     match AdminUiAssets::get(ADMIN_UI_INDEX) {
-        Some(asset) => admin_ui_html_response(routes, asset),
+        Some(asset) => admin_ui_html_response(routes, csrf_cookie_name, csrf_header_name, asset),
         None => internal_server_error("admin UI index not embedded"),
     }
 }
 
-fn admin_ui_html_response(routes: &AdminRoutes, asset: rust_embed::EmbeddedFile) -> Response {
+fn admin_ui_html_response(
+    routes: &AdminRoutes,
+    csrf_cookie_name: &str,
+    csrf_header_name: &str,
+    asset: rust_embed::EmbeddedFile,
+) -> Response {
     let html = match std::str::from_utf8(asset.data.as_ref()) {
-        Ok(html) => rewrite_admin_ui_index(html, routes),
+        Ok(html) => rewrite_admin_ui_index(html, routes, csrf_cookie_name, csrf_header_name),
         Err(err) => {
             tracing::error!(error = %err, "embedded admin UI index is not UTF-8");
             return internal_server_error("admin UI index is not valid UTF-8");
@@ -5282,6 +5842,7 @@ fn admin_ui_html_response(routes: &AdminRoutes, asset: rust_embed::EmbeddedFile)
     (
         [
             (header::CONTENT_TYPE, content_type_for_path(ADMIN_UI_INDEX)),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
             (
                 HeaderName::from_static("content-security-policy"),
                 HeaderValue::from_static(ADMIN_UI_CONTENT_SECURITY_POLICY),
@@ -5292,15 +5853,24 @@ fn admin_ui_html_response(routes: &AdminRoutes, asset: rust_embed::EmbeddedFile)
         .into_response()
 }
 
-fn rewrite_admin_ui_index(html: &str, routes: &AdminRoutes) -> String {
+fn rewrite_admin_ui_index(
+    html: &str,
+    routes: &AdminRoutes,
+    csrf_cookie_name: &str,
+    csrf_header_name: &str,
+) -> String {
     let admin_base_with_slash = format!("{}/", routes.ui_prefix);
     let html = html.replace("/admin/", &admin_base_with_slash);
     let config_meta = format!(
         r#"    <meta name="greengateway-admin-base" content="{}" />
     <meta name="greengateway-admin-api-base" content="{}" />
+    <meta name="greengateway-csrf-cookie-name" content="{}" />
+    <meta name="greengateway-csrf-header-name" content="{}" />
 "#,
         html_attribute_value(&routes.ui_prefix),
         html_attribute_value(&routes.api_prefix),
+        html_attribute_value(csrf_cookie_name),
+        html_attribute_value(csrf_header_name),
     );
 
     html.replacen("  </head>", &format!("{config_meta}  </head>"), 1)
@@ -7011,6 +7581,30 @@ async fn read_request_body(body: Body, max_body_size: usize) -> Result<Bytes, Re
         })
 }
 
+async fn read_connection_secret_body(
+    body: Body,
+    max_body_size: usize,
+) -> Result<Zeroizing<Vec<u8>>, Response> {
+    let bytes = axum::body::to_bytes(body, max_body_size)
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                reason = "body_rejected",
+                maximum_bytes = max_body_size,
+                "connection-secret request body exceeded its limit or could not be read"
+            );
+            payload_too_large(max_body_size)
+        })?;
+    match bytes.try_into_mut() {
+        Ok(mut mutable) => {
+            let owned = Zeroizing::new(mutable.to_vec());
+            mutable.as_mut().zeroize();
+            Ok(owned)
+        }
+        Err(bytes) => Ok(Zeroizing::new(bytes.as_ref().to_vec())),
+    }
+}
+
 enum TimedBodyReadError {
     DeadlineExceeded,
     Rejected(Response),
@@ -7032,6 +7626,12 @@ fn connection_admin_body_limit(state: &ConnectionAdminState) -> usize {
     state
         .max_body_size
         .min(connections::admin::MAX_CONNECTION_ADMIN_BODY_BYTES)
+}
+
+fn connection_secret_admin_body_limit(state: &ConnectionAdminState) -> usize {
+    state
+        .max_body_size
+        .min(connections::secret::MAX_TLS_CERTIFICATE_BYTES.saturating_add(16 * 1024))
 }
 
 fn managed_openapi_admin_body_limit(state: &ConnectionAdminState) -> usize {
@@ -7275,15 +7875,167 @@ fn validate_connection_write(
     })
 }
 
+fn connection_secret_dependency_counts(
+    snapshot: &connections::control_plane::ConnectionRuntimeSnapshot,
+) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for record in snapshot.managed().values() {
+        let authentication_id = match &record.write.authentication {
+            connections::model::ConnectionAuthentication::HeaderApiKey { secret_id, .. }
+            | connections::model::ConnectionAuthentication::StaticBearer { secret_id } => {
+                secret_id.as_deref()
+            }
+            connections::model::ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id,
+                ..
+            } => client_secret_id.as_deref(),
+            connections::model::ConnectionAuthentication::None => None,
+        };
+        for id in [
+            authentication_id,
+            record.write.tls.ca_bundle_alias.as_deref(),
+            record.write.tls.client_certificate_id.as_deref(),
+            record.write.tls.client_private_key_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *counts.entry(id.to_owned()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+fn connection_secret_mutation_guard(
+    state: &ConnectionAdminState,
+) -> ResponseResult<std::sync::MutexGuard<'_, ()>> {
+    lock_connection_secret_mutations(state.secret_precondition_lock.as_ref())
+}
+
+fn lock_connection_secret_mutations(
+    lock: &std::sync::Mutex<()>,
+) -> ResponseResult<std::sync::MutexGuard<'_, ()>> {
+    match lock.lock() {
+        Ok(guard) => Ok(guard),
+        Err(_) => {
+            tracing::error!(
+                "connection-secret endpoint mutation lock poisoned; rejecting ambiguous mutation"
+            );
+            Err(Box::new(service_unavailable(
+                "connection-secret mutation coordination is unavailable",
+            )))
+        }
+    }
+}
+
+fn local_secret_metadata(
+    state: &ConnectionAdminState,
+    id: &str,
+) -> ResponseResult<connections::secret::SecretAliasMetadata> {
+    let Some(metadata) = state
+        .control_plane
+        .secret_alias_metadata()
+        .into_iter()
+        .find(|metadata| metadata.id == id)
+    else {
+        return Err(Box::new(not_found("connection secret was not found")));
+    };
+    if metadata.provider != connections::secret::SecretProviderKind::LocalEncrypted {
+        return Err(Box::new(conflict(
+            "operator-provisioned secret aliases are read-only",
+        )));
+    }
+    Ok(metadata)
+}
+
+fn connection_secret_validation_error() -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "error": "connection-secret validation failed",
+        })),
+    )
+        .into_response()
+}
+
+fn connection_secret_error_response(
+    error: connections::local_secret::LocalSecretError,
+) -> Response {
+    match error {
+        connections::local_secret::LocalSecretError::InvalidLabel
+        | connections::local_secret::LocalSecretError::InvalidSecret => {
+            connection_secret_validation_error()
+        }
+        connections::local_secret::LocalSecretError::NotFound => {
+            not_found("connection secret was not found")
+        }
+        connections::local_secret::LocalSecretError::LimitExceeded { .. }
+        | connections::local_secret::LocalSecretError::IdentifierCollision => {
+            conflict("connection-secret capacity has been reached")
+        }
+        connections::local_secret::LocalSecretError::DependencyConflict {
+            connection_ids,
+            count,
+        } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "connection secret is referenced by managed connections",
+                "dependency_count": count,
+                "connection_ids": connection_ids,
+            })),
+        )
+            .into_response(),
+        other => {
+            tracing::error!(
+                reason = %other,
+                "encrypted local connection-secret operation failed"
+            );
+            service_unavailable("encrypted local connection-secret storage is unavailable")
+        }
+    }
+}
+
+fn connection_capability_counts(
+    state: &ConnectionAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    principal: &auth::Principal,
+) -> ResponseResult<BTreeMap<connections::model::ConnectionId, usize>> {
+    state
+        .inventory
+        .connection_counts(rbac_state, principal)
+        .map_err(|error| {
+            tracing::error!(
+                reason = ?error,
+                "failed to build bounded connection capability counts"
+            );
+            Box::new(service_unavailable(
+                "connection capability inventory is unavailable",
+            ))
+        })
+}
+
+struct ConnectionCollectionRuntimeData {
+    statuses: BTreeMap<connections::model::ConnectionId, connections::status::SafeConnectionStatus>,
+    dependency_counts: BTreeMap<connections::model::ConnectionId, usize>,
+    capability_counts: BTreeMap<connections::model::ConnectionId, usize>,
+    activity_times:
+        BTreeMap<connections::model::ConnectionId, connections::store::ConnectionActivityTimes>,
+}
+
 fn connection_collection_runtime_data(
     state: &ConnectionAdminState,
     snapshot: &connections::control_plane::ConnectionRuntimeSnapshot,
-) -> ResponseResult<(
-    BTreeMap<connections::model::ConnectionId, connections::status::SafeConnectionStatus>,
-    BTreeMap<connections::model::ConnectionId, usize>,
-)> {
+    rbac_state: &middleware::rbac::RbacState,
+    principal: &auth::Principal,
+) -> ResponseResult<ConnectionCollectionRuntimeData> {
+    let capability_counts = connection_capability_counts(state, rbac_state, principal)?;
     if snapshot.managed().is_empty() {
-        return Ok((BTreeMap::new(), BTreeMap::new()));
+        return Ok(ConnectionCollectionRuntimeData {
+            statuses: BTreeMap::new(),
+            dependency_counts: BTreeMap::new(),
+            capability_counts,
+            activity_times: BTreeMap::new(),
+        });
     }
     let store = state.control_plane.managed_store().map_err(|_| {
         Box::new(service_unavailable(
@@ -7292,6 +8044,12 @@ fn connection_collection_runtime_data(
     })?;
     let dependency_counts = store.dependency_counts().map_err(|error| {
         tracing::error!(error = %error, "failed to load connection dependency counts");
+        Box::new(service_unavailable(
+            "managed connection state is unavailable",
+        ))
+    })?;
+    let activity_times = store.activity_times().map_err(|error| {
+        tracing::error!(error = %error, "failed to load connection activity timestamps");
         Box::new(service_unavailable(
             "managed connection state is unavailable",
         ))
@@ -7314,7 +8072,12 @@ fn connection_collection_runtime_data(
             statuses.insert(id.clone(), status);
         }
     }
-    Ok((statuses, dependency_counts))
+    Ok(ConnectionCollectionRuntimeData {
+        statuses,
+        dependency_counts,
+        capability_counts,
+        activity_times,
+    })
 }
 
 fn connection_detail_runtime_data(
@@ -9047,6 +9810,34 @@ fn emit_connection_changed(
     }
 }
 
+fn emit_connection_secret_changed(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    action: &'static str,
+    metadata: &connections::secret::SecretAliasMetadata,
+    dependency_count: usize,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::CONNECTION_SECRET_CHANGED,
+        request_id,
+        source_ip,
+        Some(auth::actor_from_principal(principal)),
+        json!({
+            "action": action,
+            "resource": "encrypted_local_secret",
+            "secret_id": metadata.id,
+            "provider": metadata.provider,
+            "purpose": metadata.purpose,
+            "version": metadata.version,
+            "dependency_count": dependency_count,
+        }),
+    ));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_connection_refreshed(
     state: &ConnectionAdminState,
@@ -9587,6 +10378,16 @@ fn connection_store_not_configured() -> Response {
         Json(ErrorResponse {
             error: "connection mutations require CONNECTIONS_SQLITE_PATH to be configured"
                 .to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn connection_secret_store_not_configured() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: "encrypted local connection-secret mutations are not configured".to_owned(),
         }),
     )
         .into_response()
@@ -12020,8 +12821,11 @@ mod tests {
             response.headers()["content-security-policy"],
             ADMIN_UI_CONTENT_SECURITY_POLICY
         );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         let body = body_string(response).await;
         assert!(body.contains(r#"<div id="root"></div>"#));
+        assert!(body.contains(r#"greengateway-csrf-cookie-name" content="csrf_token""#));
+        assert!(body.contains(r#"greengateway-csrf-header-name" content="x-csrf-token""#));
     }
 
     #[tokio::test]
@@ -14008,6 +14812,8 @@ mod tests {
         let mut config = proxy_config(upstream_addr);
         let policy = TempPolicyFile::new(&audit_admin_policy_document_string());
         config.admin_prefix = "/ops".to_owned();
+        config.csrf_cookie_name = "ops_csrf".to_owned();
+        config.csrf_header_name = "x-ops-csrf".to_owned();
         config.auth_exempt_paths = vec![
             "/health".to_owned(),
             "/version".to_owned(),
@@ -14035,6 +14841,8 @@ mod tests {
         assert!(admin_body.contains(r#"<div id="root"></div>"#));
         assert!(admin_body.contains(r#"greengateway-admin-base" content="/ops""#));
         assert!(admin_body.contains(r#"greengateway-admin-api-base" content="/v1/ops""#));
+        assert!(admin_body.contains(r#"greengateway-csrf-cookie-name" content="ops_csrf""#));
+        assert!(admin_body.contains(r#"greengateway-csrf-header-name" content="x-ops-csrf""#));
         assert!(admin_body.contains(r#"/ops/assets/"#));
 
         let status_response = router
@@ -20453,6 +21261,16 @@ mod tests {
             .await
             .expect("saved-profile connection test should complete");
         assert_eq!(tested.status(), StatusCode::OK);
+        let tested_etag = tested
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("tested connection should return its post-status ETag")
+            .to_owned();
+        assert_eq!(
+            tested_etag, connection_etag,
+            "test status persistence must not advance the config mutation ETag"
+        );
         assert_eq!(
             tested
                 .headers()
@@ -20478,7 +21296,7 @@ mod tests {
                 &test_uri,
                 Some(test_principal(&["connections-tester"])),
                 None,
-                Some(&connection_etag),
+                Some(&tested_etag),
                 true,
             ))
             .await
@@ -20501,6 +21319,13 @@ mod tests {
             .await
             .expect("tested connection detail should complete");
         assert_eq!(detail.status(), StatusCode::OK);
+        assert_eq!(
+            detail
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(tested_etag.as_str())
+        );
         let detail = json_body(detail).await;
         assert_eq!(detail["status"]["state"], json!("unavailable"));
         assert_eq!(detail["status"]["reason"], json!("egress_denied"));
@@ -21149,6 +21974,1121 @@ mod tests {
         assert!(!serialized_events.contains("credential-material-value-canary"));
         assert!(!serialized_events.contains("credentialed.example.test"));
         assert!(!serialized_events.contains("/credentialed-health"));
+    }
+
+    #[tokio::test]
+    async fn connection_secret_admin_crud_is_safe_permissioned_and_preconditioned() {
+        let connection_db = TempDb::new("connection-secret-admin-crud");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = connection_admin_router(&connection_db, &policy, audit_log);
+        let secret_manager = test_principal(&["connections-secret-manager"]);
+
+        let unauthorized = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                None,
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("unauthorized secret list should complete");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let forbidden = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &format!("{CONNECTION_SECRETS_ADMIN_ROUTE}/invalid@id"),
+                Some(test_principal(&["connections-observer"])),
+                Some("secret-body-canary".repeat(100_000)),
+                Some("\"untrusted-etag\""),
+                true,
+            ))
+            .await
+            .expect("forbidden secret mutation should complete before lookup or body parsing");
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let initial = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(secret_manager.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("secret list should complete");
+        assert_eq!(initial.status(), StatusCode::OK);
+        assert_eq!(initial.headers()[header::CACHE_CONTROL], "no-store");
+        let initial_representation_etag = initial
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("secret list should include a representation ETag")
+            .to_owned();
+        let initial_collection_etag = initial
+            .headers()
+            .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("secret list should include a mutation collection ETag")
+            .to_owned();
+        assert_ne!(initial_representation_etag, initial_collection_etag);
+        let initial_body = json_body(initial).await;
+        assert_eq!(initial_body["actions"]["can_create"], json!(true));
+        assert_eq!(
+            initial_body["providers"],
+            json!({"operator_aliases": true, "local_encrypted": true})
+        );
+        let operator = initial_body["secrets"]
+            .as_array()
+            .and_then(|secrets| {
+                secrets
+                    .iter()
+                    .find(|secret| secret["id"] == json!("credential-secret-id-canary"))
+            })
+            .expect("operator secret alias should be listed");
+        assert_eq!(operator["provider"], json!("operator_file"));
+        assert_eq!(operator["actions"]["can_rotate"], json!(false));
+        assert_eq!(operator["actions"]["can_delete"], json!(false));
+        assert_eq!(
+            operator["compatible_purposes"].as_array().map(Vec::len),
+            Some(6)
+        );
+        let operator_etag = operator["etag"]
+            .as_str()
+            .expect("operator alias should include a safe ETag")
+            .to_owned();
+        let initial_serialized =
+            serde_json::to_string(&initial_body).expect("initial secret list should serialize");
+        assert!(!initial_serialized.contains("credential-material-value-canary"));
+        assert!(!initial_serialized.contains("credential-token"));
+        assert!(!initial_serialized.contains("local-master-key"));
+        assert!(!initial_serialized.contains("\"value\""));
+
+        let wildcard = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-superadmin"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("wildcard secret list should complete");
+        assert_eq!(wildcard.status(), StatusCode::OK);
+
+        let create_body = json!({
+            "label": "Webhook bearer",
+            "purpose": "static_bearer",
+            "value": "created-secret-value-canary"
+        })
+        .to_string();
+        let missing_create_precondition = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(secret_manager.clone()),
+                Some(create_body.clone()),
+                None,
+                true,
+            ))
+            .await
+            .expect("missing create precondition should complete");
+        assert_eq!(
+            missing_create_precondition.status(),
+            StatusCode::PRECONDITION_REQUIRED
+        );
+        let stale_create_precondition = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(secret_manager.clone()),
+                Some(create_body.clone()),
+                Some("\"connection-secrets:stale\""),
+                true,
+            ))
+            .await
+            .expect("stale create precondition should complete");
+        assert_eq!(
+            stale_create_precondition.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+
+        let csrf_denied = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(secret_manager.clone()),
+                Some(create_body.clone()),
+                Some(&initial_collection_etag),
+                false,
+            ))
+            .await
+            .expect("CSRF-denied secret create should complete");
+        assert_eq!(csrf_denied.status(), StatusCode::FORBIDDEN);
+
+        let mut csrf_create = connection_admin_request(
+            Method::POST,
+            CONNECTION_SECRETS_ADMIN_ROUTE,
+            Some(secret_manager.clone()),
+            Some(create_body),
+            Some(&initial_collection_etag),
+            false,
+        );
+        csrf_create.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("csrf_token=secret-admin-csrf"),
+        );
+        csrf_create.headers_mut().insert(
+            HeaderName::from_static("x-csrf-token"),
+            HeaderValue::from_static("secret-admin-csrf"),
+        );
+        let created = router
+            .clone()
+            .oneshot(csrf_create)
+            .await
+            .expect("CSRF-protected secret create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("created secret should include an item ETag")
+            .to_owned();
+        let created_collection_etag = created
+            .headers()
+            .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("created secret should include the new collection ETag")
+            .to_owned();
+        assert_ne!(created_collection_etag, initial_collection_etag);
+        let created_body = json_body(created).await;
+        let secret_id = created_body["id"]
+            .as_str()
+            .expect("created secret should include its opaque ID")
+            .to_owned();
+        assert_eq!(created_body["provider"], json!("local_encrypted"));
+        assert_eq!(
+            created_body["compatible_purposes"],
+            json!(["static_bearer"])
+        );
+        assert_eq!(created_body["version"], json!(1));
+        assert!(created_body.get("value").is_none());
+        assert!(!created_body
+            .to_string()
+            .contains("created-secret-value-canary"));
+
+        let operator_rotate = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &format!("{CONNECTION_SECRETS_ADMIN_ROUTE}/credential-secret-id-canary"),
+                Some(secret_manager.clone()),
+                Some(
+                    json!({
+                        "purpose": "static_bearer",
+                        "value": "operator-replacement-canary"
+                    })
+                    .to_string(),
+                ),
+                Some(&operator_etag),
+                true,
+            ))
+            .await
+            .expect("operator alias rotation should complete safely");
+        assert_eq!(operator_rotate.status(), StatusCode::CONFLICT);
+
+        let local_uri = format!("{CONNECTION_SECRETS_ADMIN_ROUTE}/{secret_id}");
+        let missing_rotate_precondition = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &local_uri,
+                Some(secret_manager.clone()),
+                Some(
+                    json!({
+                        "purpose": "static_bearer",
+                        "value": "missing-rotate-precondition-canary"
+                    })
+                    .to_string(),
+                ),
+                None,
+                true,
+            ))
+            .await
+            .expect("missing rotate precondition should complete");
+        assert_eq!(
+            missing_rotate_precondition.status(),
+            StatusCode::PRECONDITION_REQUIRED
+        );
+        let stale_rotate_precondition = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &local_uri,
+                Some(secret_manager.clone()),
+                Some(
+                    json!({
+                        "purpose": "static_bearer",
+                        "value": "stale-rotate-precondition-canary"
+                    })
+                    .to_string(),
+                ),
+                Some("\"connection-secret:stale\""),
+                true,
+            ))
+            .await
+            .expect("stale rotate precondition should complete");
+        assert_eq!(
+            stale_rotate_precondition.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        let wrong_purpose = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &local_uri,
+                Some(secret_manager.clone()),
+                Some(
+                    json!({
+                        "purpose": "tls_certificate",
+                        "value": "wrong-purpose-value-canary"
+                    })
+                    .to_string(),
+                ),
+                Some(&created_etag),
+                true,
+            ))
+            .await
+            .expect("wrong-purpose rotation should complete");
+        assert_eq!(wrong_purpose.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let oversized_value = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &local_uri,
+                Some(secret_manager.clone()),
+                Some(
+                    json!({
+                        "purpose": "static_bearer",
+                        "value": "x".repeat(connections::secret::MAX_HTTP_CREDENTIAL_BYTES + 1)
+                    })
+                    .to_string(),
+                ),
+                Some(&created_etag),
+                true,
+            ))
+            .await
+            .expect("oversized secret value should complete");
+        assert_eq!(oversized_value.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let rotated = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &local_uri,
+                Some(secret_manager.clone()),
+                Some(
+                    json!({
+                        "purpose": "static_bearer",
+                        "value": "rotated-secret-value-canary"
+                    })
+                    .to_string(),
+                ),
+                Some(&created_etag),
+                true,
+            ))
+            .await
+            .expect("secret rotation should complete");
+        assert_eq!(rotated.status(), StatusCode::OK);
+        let rotated_etag = rotated
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("rotated secret should include a new item ETag")
+            .to_owned();
+        let rotated_collection_etag = rotated
+            .headers()
+            .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("rotated secret should include a new collection ETag")
+            .to_owned();
+        assert_ne!(rotated_etag, created_etag);
+        let rotated_body = json_body(rotated).await;
+        assert_eq!(rotated_body["version"], json!(2));
+        assert!(!rotated_body
+            .to_string()
+            .contains("rotated-secret-value-canary"));
+
+        let oversized_request = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(secret_manager.clone()),
+                Some("x".repeat(connections::secret::MAX_TLS_CERTIFICATE_BYTES + (16 * 1024) + 1)),
+                Some(&rotated_collection_etag),
+                true,
+            ))
+            .await
+            .expect("oversized secret request should complete");
+        assert_eq!(oversized_request.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let secrets_before_binding = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(secret_manager.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("secret list before binding should complete");
+        let pre_binding_representation_etag = secrets_before_binding
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("pre-binding secret list should include a representation ETag")
+            .to_owned();
+        assert_eq!(
+            secrets_before_binding
+                .headers()
+                .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(rotated_collection_etag.as_str())
+        );
+
+        let connection_list = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(secret_manager.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("connection list should complete");
+        let connection_collection_etag = connection_list
+            .headers()
+            .get(CONNECTION_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("connection list should include its mutation ETag")
+            .to_owned();
+        let connection_actions = json_body(connection_list).await["actions"].clone();
+        assert_eq!(connection_actions["can_create"], json!(false));
+        assert_eq!(connection_actions["can_bind_secret"], json!(false));
+        assert_eq!(connection_actions["can_manage_secrets"], json!(true));
+
+        let mut credentialed: Value = serde_json::from_str(&credentialed_connection_body())
+            .expect("credentialed connection should parse");
+        credentialed["authentication"]["secret_id"] = json!(secret_id);
+        let bound_connection = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-superadmin"])),
+                Some(credentialed.to_string()),
+                Some(&connection_collection_etag),
+                true,
+            ))
+            .await
+            .expect("secret-bound connection create should complete");
+        assert_eq!(bound_connection.status(), StatusCode::CREATED);
+        let bound_connection_etag = bound_connection
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("bound connection should include an item ETag")
+            .to_owned();
+        let bound_connection_body = json_body(bound_connection).await;
+        let bound_connection_id = bound_connection_body["id"]
+            .as_str()
+            .expect("bound connection should include an ID")
+            .to_owned();
+
+        let secrets_after_binding = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(secret_manager.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("secret list after binding should complete");
+        let bound_representation_etag = secrets_after_binding
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("bound secret list should include a representation ETag")
+            .to_owned();
+        assert_ne!(
+            bound_representation_etag, pre_binding_representation_etag,
+            "dependency-derived representation changes must change the standard HTTP ETag"
+        );
+        assert_eq!(
+            secrets_after_binding
+                .headers()
+                .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(rotated_collection_etag.as_str())
+        );
+        let bound_secrets = json_body(secrets_after_binding).await;
+        let bound_secret = bound_secrets["secrets"]
+            .as_array()
+            .and_then(|secrets| {
+                secrets
+                    .iter()
+                    .find(|secret| secret["id"] == json!(secret_id))
+            })
+            .expect("bound local secret should remain listed");
+        assert_eq!(bound_secret["dependency_count"], json!(1));
+        assert_eq!(bound_secret["actions"]["can_delete"], json!(false));
+
+        let secret_only_detail = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{bound_connection_id}"),
+                Some(secret_manager.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("secret-manager detail should complete");
+        assert_eq!(secret_only_detail.status(), StatusCode::OK);
+        let detail_actions = json_body(secret_only_detail).await["actions"].clone();
+        assert_eq!(detail_actions["can_update"], json!(false));
+        assert_eq!(detail_actions["can_bind_secret"], json!(false));
+        assert_eq!(detail_actions["can_manage_secrets"], json!(true));
+
+        let missing_delete_precondition = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::DELETE,
+                &local_uri,
+                Some(secret_manager.clone()),
+                None,
+                None,
+                true,
+            ))
+            .await
+            .expect("missing delete precondition should complete");
+        assert_eq!(
+            missing_delete_precondition.status(),
+            StatusCode::PRECONDITION_REQUIRED
+        );
+        let stale_delete_precondition = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::DELETE,
+                &local_uri,
+                Some(secret_manager.clone()),
+                None,
+                Some("\"connection-secret:stale\""),
+                true,
+            ))
+            .await
+            .expect("stale delete precondition should complete");
+        assert_eq!(
+            stale_delete_precondition.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        let dependency_conflict = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::DELETE,
+                &local_uri,
+                Some(secret_manager.clone()),
+                None,
+                Some(&rotated_etag),
+                true,
+            ))
+            .await
+            .expect("referenced secret delete should complete");
+        assert_eq!(dependency_conflict.status(), StatusCode::CONFLICT);
+        let dependency_conflict = json_body(dependency_conflict).await;
+        assert_eq!(dependency_conflict["dependency_count"], json!(1));
+        assert_eq!(
+            dependency_conflict["connection_ids"],
+            json!([bound_connection_id])
+        );
+
+        let deleted_connection = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::DELETE,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{bound_connection_id}"),
+                Some(test_principal(&["connections-superadmin"])),
+                None,
+                Some(&bound_connection_etag),
+                true,
+            ))
+            .await
+            .expect("bound connection delete should complete");
+        assert_eq!(deleted_connection.status(), StatusCode::OK);
+
+        let nonempty_delete = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::DELETE,
+                &local_uri,
+                Some(secret_manager.clone()),
+                Some("{}".to_owned()),
+                Some(&rotated_etag),
+                true,
+            ))
+            .await
+            .expect("non-empty secret delete should complete");
+        assert_eq!(nonempty_delete.status(), StatusCode::BAD_REQUEST);
+        let oversized_delete = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::DELETE,
+                &local_uri,
+                Some(secret_manager.clone()),
+                Some("x".repeat(1025)),
+                Some(&rotated_etag),
+                true,
+            ))
+            .await
+            .expect("oversized secret delete should complete");
+        assert_eq!(oversized_delete.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let deleted = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::DELETE,
+                &local_uri,
+                Some(secret_manager),
+                None,
+                Some(&rotated_etag),
+                true,
+            ))
+            .await
+            .expect("secret delete should complete");
+        assert_eq!(deleted.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(deleted).await["deleted_secret_id"],
+            json!(secret_id)
+        );
+
+        let secret_events = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.event_type == audit::event::CONNECTION_SECRET_CHANGED)
+            .collect::<Vec<_>>();
+        assert_eq!(secret_events.len(), 3);
+        assert_eq!(
+            secret_events
+                .iter()
+                .map(|event| event.payload["action"].as_str())
+                .collect::<Vec<_>>(),
+            vec![Some("created"), Some("rotated"), Some("deleted")]
+        );
+        for event in &secret_events {
+            let mut fields = event
+                .payload
+                .as_object()
+                .expect("secret audit payload should be an object")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            fields.sort_unstable();
+            assert_eq!(
+                fields,
+                vec![
+                    "action",
+                    "dependency_count",
+                    "provider",
+                    "purpose",
+                    "resource",
+                    "secret_id",
+                    "version",
+                ]
+            );
+            assert_eq!(event.payload["secret_id"], json!(secret_id));
+            assert_eq!(event.payload["provider"], json!("local_encrypted"));
+            assert_eq!(event.payload["purpose"], json!("static_bearer"));
+        }
+        let serialized_events =
+            serde_json::to_string(&secret_events).expect("secret events should serialize");
+        for forbidden_value in [
+            "created-secret-value-canary",
+            "rotated-secret-value-canary",
+            "wrong-purpose-value-canary",
+            "operator-replacement-canary",
+            "missing-rotate-precondition-canary",
+            "stale-rotate-precondition-canary",
+            "credential-material-value-canary",
+            "credential-token",
+            "local-master-key",
+            "Webhook bearer",
+        ] {
+            assert!(
+                !serialized_events.contains(forbidden_value),
+                "secret audit events must not contain {forbidden_value}"
+            );
+        }
+    }
+
+    #[test]
+    fn poisoned_connection_secret_mutation_lock_fails_closed() {
+        let lock = std::sync::Mutex::new(());
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = lock.lock().expect("fresh mutation lock should acquire");
+            panic!("poison connection-secret mutation lock for regression coverage");
+        });
+        assert!(poisoned.is_err());
+
+        match lock_connection_secret_mutations(&lock) {
+            Ok(_) => panic!("poisoned connection-secret mutation lock must not be recovered"),
+            Err(response) => assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE),
+        };
+    }
+
+    #[tokio::test]
+    async fn connection_secret_mutations_allow_only_one_same_etag_winner() {
+        let connection_db = TempDb::new("connection-secret-admin-races");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let router = connection_admin_router(&connection_db, &policy, audit_log);
+        let principal = test_principal(&["connections-secret-manager"]);
+
+        let initial = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(principal.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("initial secret list should complete");
+        let collection_etag = initial
+            .headers()
+            .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("initial secret list should include collection ETag")
+            .to_owned();
+
+        let create_one = router.clone().oneshot(connection_admin_request(
+            Method::POST,
+            CONNECTION_SECRETS_ADMIN_ROUTE,
+            Some(principal.clone()),
+            Some(
+                json!({
+                    "label": "Race one",
+                    "purpose": "static_bearer",
+                    "value": "race-create-one-canary"
+                })
+                .to_string(),
+            ),
+            Some(&collection_etag),
+            true,
+        ));
+        let create_two = router.clone().oneshot(connection_admin_request(
+            Method::POST,
+            CONNECTION_SECRETS_ADMIN_ROUTE,
+            Some(principal.clone()),
+            Some(
+                json!({
+                    "label": "Race two",
+                    "purpose": "static_bearer",
+                    "value": "race-create-two-canary"
+                })
+                .to_string(),
+            ),
+            Some(&collection_etag),
+            true,
+        ));
+        let (create_one, create_two) = tokio::join!(create_one, create_two);
+        let create_one = create_one.expect("first concurrent create should complete");
+        let create_two = create_two.expect("second concurrent create should complete");
+        let mut create_statuses = [create_one.status(), create_two.status()];
+        create_statuses.sort_by_key(|status| status.as_u16());
+        assert_eq!(
+            create_statuses,
+            [StatusCode::CREATED, StatusCode::PRECONDITION_FAILED]
+        );
+
+        let after_create = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(principal.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("secret list after concurrent create should complete");
+        let after_create = json_body(after_create).await;
+        let locals = after_create["secrets"]
+            .as_array()
+            .expect("secret list should include an array")
+            .iter()
+            .filter(|secret| secret["provider"] == json!("local_encrypted"))
+            .collect::<Vec<_>>();
+        assert_eq!(locals.len(), 1);
+        let secret_id = locals[0]["id"]
+            .as_str()
+            .expect("race winner should have an ID")
+            .to_owned();
+        let item_etag = locals[0]["etag"]
+            .as_str()
+            .expect("race winner should have an ETag")
+            .to_owned();
+        let local_uri = format!("{CONNECTION_SECRETS_ADMIN_ROUTE}/{secret_id}");
+
+        let rotate_one = router.clone().oneshot(connection_admin_request(
+            Method::PUT,
+            &local_uri,
+            Some(principal.clone()),
+            Some(
+                json!({
+                    "purpose": "static_bearer",
+                    "value": "race-rotate-one-canary"
+                })
+                .to_string(),
+            ),
+            Some(&item_etag),
+            true,
+        ));
+        let rotate_two = router.clone().oneshot(connection_admin_request(
+            Method::PUT,
+            &local_uri,
+            Some(principal.clone()),
+            Some(
+                json!({
+                    "purpose": "static_bearer",
+                    "value": "race-rotate-two-canary"
+                })
+                .to_string(),
+            ),
+            Some(&item_etag),
+            true,
+        ));
+        let (rotate_one, rotate_two) = tokio::join!(rotate_one, rotate_two);
+        let rotate_one = rotate_one.expect("first concurrent rotate should complete");
+        let rotate_two = rotate_two.expect("second concurrent rotate should complete");
+        let mut rotate_statuses = [rotate_one.status(), rotate_two.status()];
+        rotate_statuses.sort_by_key(|status| status.as_u16());
+        assert_eq!(
+            rotate_statuses,
+            [StatusCode::OK, StatusCode::PRECONDITION_FAILED]
+        );
+
+        let after_rotate = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(principal.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("secret list after concurrent rotate should complete");
+        let after_rotate = json_body(after_rotate).await;
+        let rotated_etag = after_rotate["secrets"]
+            .as_array()
+            .and_then(|secrets| {
+                secrets
+                    .iter()
+                    .find(|secret| secret["id"] == json!(secret_id))
+            })
+            .and_then(|secret| secret["etag"].as_str())
+            .expect("rotated race winner should have a new ETag")
+            .to_owned();
+
+        let delete_one = router.clone().oneshot(connection_admin_request(
+            Method::DELETE,
+            &local_uri,
+            Some(principal.clone()),
+            None,
+            Some(&rotated_etag),
+            true,
+        ));
+        let delete_two = router.clone().oneshot(connection_admin_request(
+            Method::DELETE,
+            &local_uri,
+            Some(principal),
+            None,
+            Some(&rotated_etag),
+            true,
+        ));
+        let (delete_one, delete_two) = tokio::join!(delete_one, delete_two);
+        let delete_one = delete_one.expect("first concurrent delete should complete");
+        let delete_two = delete_two.expect("second concurrent delete should complete");
+        let mut delete_statuses = [delete_one.status(), delete_two.status()];
+        delete_statuses.sort_by_key(|status| status.as_u16());
+        assert_eq!(
+            delete_statuses,
+            [StatusCode::OK, StatusCode::PRECONDITION_FAILED]
+        );
+
+        let secret_events = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.event_type == audit::event::CONNECTION_SECRET_CHANGED)
+            .collect::<Vec<_>>();
+        assert_eq!(secret_events.len(), 3);
+        let serialized =
+            serde_json::to_string(&secret_events).expect("race audit events should serialize");
+        for secret in [
+            "race-create-one-canary",
+            "race-create-two-canary",
+            "race-rotate-one-canary",
+            "race-rotate-two-canary",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_secret_routes_follow_the_custom_admin_prefix() {
+        let connection_db = TempDb::new("connection-secret-custom-prefix");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let router =
+            connection_admin_router_with_prefix(&connection_db, &policy, test_audit_log(), "/ops");
+        let principal = test_principal(&["connections-secret-manager"]);
+        let custom_route = "/v1/ops/connection-secrets";
+
+        let list = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                custom_route,
+                Some(principal.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("custom-prefix secret list should complete");
+        assert_eq!(list.status(), StatusCode::OK);
+        let collection_etag = list
+            .headers()
+            .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("custom-prefix list should include collection ETag")
+            .to_owned();
+
+        let created = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                custom_route,
+                Some(principal),
+                Some(
+                    json!({
+                        "label": "Custom prefix",
+                        "purpose": "header_api_key",
+                        "value": "custom-prefix-value-canary"
+                    })
+                    .to_string(),
+                ),
+                Some(&collection_etag),
+                true,
+            ))
+            .await
+            .expect("custom-prefix secret create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert!(!json_body(created)
+            .await
+            .to_string()
+            .contains("custom-prefix-value-canary"));
+
+        let default_route = router
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-secret-manager"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("default secret route should complete under custom prefix");
+        assert_ne!(default_route.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn connection_secret_list_stays_safe_when_local_management_is_unconfigured() {
+        let connection_db = TempDb::new("connection-secret-local-unconfigured");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let secret_root = connection_db.path.with_extension("operator-secrets");
+        fs::create_dir_all(&secret_root).expect("operator secret root should create");
+        let operator_file = secret_root.join("operator-token");
+        fs::write(&operator_file, b"unconfigured-local-operator-value-canary")
+            .expect("operator secret fixture should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&secret_root, fs::Permissions::from_mode(0o700))
+                .expect("operator secret root permissions should set");
+            fs::set_permissions(&operator_file, fs::Permissions::from_mode(0o600))
+                .expect("operator secret permissions should set");
+        }
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.connections_sqlite_path = Some(connection_db.path.to_string_lossy().into_owned());
+        config.connection_secrets_root =
+            Some(connections::secret::SecretRootConfig::new(secret_root));
+        config.connection_secret_aliases = vec![connections::secret::OperatorSecretAliasConfig {
+            id: "operator-only-alias".to_owned(),
+            label: "Operator only".to_owned(),
+            source: connections::secret::OperatorSecretAliasSource::File {
+                key: "operator-token".to_owned(),
+            },
+        }];
+        config
+            .rbac_exempt_paths
+            .push(CONNECTIONS_ADMIN_ROUTE.to_owned());
+        config
+            .rbac_exempt_paths
+            .push(CONNECTION_SECRETS_ADMIN_ROUTE.to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("operator-only connection admin app should build");
+        let principal = test_principal(&["connections-secret-manager"]);
+
+        let list = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(principal.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("operator-only secret list should complete");
+        assert_eq!(list.status(), StatusCode::OK);
+        let collection_etag = list
+            .headers()
+            .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("operator-only list should include collection ETag")
+            .to_owned();
+        let list = json_body(list).await;
+        assert_eq!(list["actions"]["can_create"], json!(false));
+        assert_eq!(list["providers"]["operator_aliases"], json!(true));
+        assert_eq!(list["providers"]["local_encrypted"], json!(false));
+        assert_eq!(list["secrets"][0]["id"], json!("operator-only-alias"));
+        assert_eq!(list["secrets"][0]["actions"]["can_rotate"], json!(false));
+        assert_eq!(list["secrets"][0]["actions"]["can_delete"], json!(false));
+        let operator_etag = list["secrets"][0]["etag"]
+            .as_str()
+            .expect("operator alias should include an ETag")
+            .to_owned();
+        let serialized = list.to_string();
+        assert!(!serialized.contains("unconfigured-local-operator-value-canary"));
+        assert!(!serialized.contains("operator-token"));
+
+        let connections = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(principal.clone()),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("operator-only connection list should complete");
+        assert_eq!(connections.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(connections).await["actions"]["can_manage_secrets"],
+            json!(false)
+        );
+
+        let unavailable_create = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                Some(principal.clone()),
+                Some(
+                    json!({
+                        "label": "Unavailable local",
+                        "purpose": "static_bearer",
+                        "value": "unavailable-local-value-canary"
+                    })
+                    .to_string(),
+                ),
+                Some(&collection_etag),
+                true,
+            ))
+            .await
+            .expect("unconfigured local secret create should complete");
+        assert_eq!(unavailable_create.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!body_string(unavailable_create)
+            .await
+            .contains("unavailable-local-value-canary"));
+
+        for method in [Method::PUT, Method::DELETE] {
+            let body = (method == Method::PUT).then(|| {
+                json!({
+                    "purpose": "static_bearer",
+                    "value": "operator-write-value-canary"
+                })
+                .to_string()
+            });
+            let read_only = router
+                .clone()
+                .oneshot(connection_admin_request(
+                    method,
+                    &format!("{CONNECTION_SECRETS_ADMIN_ROUTE}/operator-only-alias"),
+                    Some(principal.clone()),
+                    body,
+                    Some(&operator_etag),
+                    true,
+                ))
+                .await
+                .expect("operator alias mutation should complete");
+            assert_eq!(read_only.status(), StatusCode::CONFLICT);
+            let body = body_string(read_only).await;
+            assert!(!body.contains("operator-write-value-canary"));
+            assert!(!body.contains("operator-token"));
+        }
     }
 
     #[tokio::test]
@@ -21879,6 +23819,12 @@ mod tests {
             .await
             .expect("first capability inventory page should complete");
         assert_eq!(first_response.status(), StatusCode::OK);
+        let first_etag = first_response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("first capability page should include an ETag")
+            .to_owned();
         let first = json_body(first_response).await;
         assert_eq!(first["total_count"], json!(2));
         let first_capability = first["capabilities"]
@@ -21914,6 +23860,16 @@ mod tests {
             .await
             .expect("second capability inventory page should complete");
         assert_eq!(second_response.status(), StatusCode::OK);
+        let second_etag = second_response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("second capability page should include an ETag")
+            .to_owned();
+        assert_ne!(
+            first_etag, second_etag,
+            "different pages must not share a standard HTTP entity ETag"
+        );
         let second = json_body(second_response).await;
         assert_eq!(
             second["total_count"],
@@ -21939,6 +23895,16 @@ mod tests {
             .await
             .expect("filtered capability inventory request should complete");
         assert_eq!(filtered_response.status(), StatusCode::OK);
+        let filtered_etag = filtered_response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("filtered capability page should include an ETag")
+            .to_owned();
+        assert_ne!(
+            first_etag, filtered_etag,
+            "different filtered representations must not share an ETag"
+        );
         let filtered = json_body(filtered_response).await;
         assert_eq!(filtered["total_count"], json!(1));
         assert_eq!(filtered["capabilities"][0]["name"], json!("get_widget"));
@@ -29677,11 +31643,28 @@ paths:
         policy: &TempPolicyFile,
         audit_log: audit::AuditLog,
     ) -> Router {
+        connection_admin_router_with_prefix(
+            connection_db,
+            policy,
+            audit_log,
+            config::DEFAULT_ADMIN_PREFIX,
+        )
+    }
+
+    fn connection_admin_router_with_prefix(
+        connection_db: &TempDb,
+        policy: &TempPolicyFile,
+        audit_log: audit::AuditLog,
+        admin_prefix: &str,
+    ) -> Router {
         let secret_root = connection_db.path.with_extension("secrets");
         fs::create_dir_all(&secret_root).expect("connection test secret root should create");
         let secret_file = secret_root.join("credential-token");
         fs::write(&secret_file, b"credential-material-value-canary")
             .expect("connection test secret should write");
+        let local_master_key_file = secret_root.join("local-master-key");
+        fs::write(&local_master_key_file, [0x42; 32])
+            .expect("connection local-secret master key should write");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -29689,9 +31672,12 @@ paths:
                 .expect("connection test secret root permissions should set");
             fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600))
                 .expect("connection test secret permissions should set");
+            fs::set_permissions(&local_master_key_file, fs::Permissions::from_mode(0o600))
+                .expect("connection local-secret master-key permissions should set");
         }
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
+        config.admin_prefix = admin_prefix.to_owned();
         config.policy_file = Some(policy.path.to_string_lossy().into_owned());
         config.connections_sqlite_path = Some(connection_db.path.to_string_lossy().into_owned());
         config.connection_secrets_root =
@@ -29703,9 +31689,19 @@ paths:
                 key: "credential-token".to_owned(),
             },
         }];
+        config.connection_local_secret_keyring =
+            vec![connections::local_secret::LocalSecretKeyConfig {
+                id: "test-primary-key".to_owned(),
+                file: "local-master-key".to_owned(),
+                role: connections::local_secret::LocalSecretKeyRole::Primary,
+            }];
+        let admin_routes = AdminRoutes::from_prefix(admin_prefix);
         config
             .rbac_exempt_paths
-            .push(CONNECTIONS_ADMIN_ROUTE.to_owned());
+            .push(admin_routes.connections_route);
+        config
+            .rbac_exempt_paths
+            .push(admin_routes.connection_secrets_route);
         let recorder = PrometheusBuilder::new().build_recorder();
 
         app(
@@ -30123,6 +32119,12 @@ paths:
                         ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION
                     ]
                 },
+                "connections-secret-manager": {
+                    "permissions": [
+                        ADMIN_CONNECTIONS_READ_PERMISSION,
+                        ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION
+                    ]
+                },
                 "connections-refresher": {
                     "permissions": [
                         ADMIN_CONNECTIONS_READ_PERMISSION,
@@ -30146,6 +32148,9 @@ paths:
                 },
                 "connections-observer": {
                     "permissions": []
+                },
+                "connections-superadmin": {
+                    "permissions": ["*"]
                 }
             },
             "routes": []
