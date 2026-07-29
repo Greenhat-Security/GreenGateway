@@ -49,7 +49,7 @@ use crate::{
             ResolvedConnectionCredential,
         },
         model::MAX_CATALOG_ENTRIES,
-        status::ConnectionStatusReason,
+        status::{ConnectionOperationalState, ConnectionStatusReason},
         store::{validate_mcp_resource_metadata, StoredMcpResource, StoredMcpResourceTemplate},
         test::{ConnectionTestReason, ConnectionTestStageName},
     },
@@ -261,6 +261,13 @@ impl ConnectionProtocolProbeError {
 
     pub const fn status_reason(self) -> ConnectionStatusReason {
         self.status_reason
+    }
+
+    pub const fn operational_state(self) -> ConnectionOperationalState {
+        match self.status_reason {
+            ConnectionStatusReason::InvalidResponse => ConnectionOperationalState::Degraded,
+            _ => ConnectionOperationalState::Unavailable,
+        }
     }
 
     const fn new(
@@ -2975,9 +2982,7 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::*;
 
-    use crate::connections::{
-        status::ConnectionOperationalState, test::connection_failure_classification,
-    };
+    use crate::connections::test::connection_failure_classification;
 
     use std::{
         collections::HashSet,
@@ -3026,6 +3031,10 @@ mod tests {
 
             assert_eq!(http_stage, ConnectionTestStageName::SecretAvailable);
             assert_eq!(http_state, ConnectionOperationalState::Unavailable);
+            assert_eq!(
+                mcp.operational_state(),
+                ConnectionOperationalState::Unavailable
+            );
             assert_eq!(
                 (http_stage, http_status_reason),
                 (mcp.stage(), mcp.status_reason())
@@ -3258,6 +3267,11 @@ mod tests {
             assert_eq!(
                 error.safe_reason(),
                 ConnectionTestReason::AuthenticationFailed
+            );
+            assert_eq!(
+                error.operational_state(),
+                ConnectionOperationalState::Degraded,
+                "an actual upstream authentication rejection is degraded, not a missing dependency"
             );
             upstream.join().await;
         }

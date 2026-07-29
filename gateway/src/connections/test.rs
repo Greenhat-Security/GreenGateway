@@ -711,7 +711,7 @@ impl ConnectionTestService {
             ),
             Err(error) => failed_execution(
                 started,
-                ConnectionOperationalState::Unavailable,
+                error.operational_state(),
                 error.status_reason(),
                 vec![ConnectionTestStage::failure(
                     error.stage(),
