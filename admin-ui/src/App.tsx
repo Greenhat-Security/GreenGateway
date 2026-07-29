@@ -35,6 +35,7 @@ import { StatusPage } from './views/StatusPage';
 import { TrafficEndpointDetail } from './views/TrafficEndpointDetail';
 import { TrafficInventory } from './views/TrafficInventory';
 import { TokensView } from './views/TokensView';
+import { ToolPlayground } from './views/ToolPlayground';
 
 const THEME_STORAGE_KEY = 'greengateway_admin_theme';
 
@@ -179,6 +180,7 @@ export function AdminShell() {
           <Route path="/connections/:id" element={<ConnectionDetail />} />
           <Route path="/tools/openapi" element={<OpenApiToolsView />} />
           <Route path="/tools" element={<CapabilityInventoryView />} />
+          <Route path="/tools/:id/playground" element={<ToolPlayground />} />
           <Route path="/tools/:id" element={<CapabilityDetail />} />
           <Route path="/identities" element={<IdentitiesView />} />
           <Route path="/identities/detail" element={<PrincipalDetail />} />
@@ -527,6 +529,9 @@ function pageTitleForPath(pathname: string): string {
   }
   if (pathname === '/tools') {
     return 'Tool inventory';
+  }
+  if (/^\/tools\/[^/]+\/playground$/.test(pathname)) {
+    return 'Tool playground';
   }
   if (/^\/tools\/[^/]+$/.test(pathname)) {
     return 'Tool details';

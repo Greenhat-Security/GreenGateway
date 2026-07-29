@@ -391,6 +391,11 @@ describe('CapabilityDetail', () => {
     expect(
       screen.getByRole('link', { name: 'billing-prod' }).getAttribute('href'),
     ).toBe('/connections/billing-prod');
+    expect(
+      screen
+        .getByRole('link', { name: 'Open playground' })
+        .getAttribute('href'),
+    ).toBe(`/tools/${id}/playground`);
     expect(screen.queryByRole('button', { name: /invoke/i })).toBeNull();
 
     const url = requestUrls(fetchMock)[0];
@@ -427,6 +432,32 @@ describe('CapabilityDetail', () => {
       await waitFor(() => expect(document.activeElement).toBe(alert));
     },
   );
+
+  it('omits the playground link and explains the server-derived disabled reason', async () => {
+    const id = `cap_${'e'.repeat(64)}`;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        jsonResponse(
+          200,
+          capabilityDetail({
+            id,
+            actions: {
+              can_execute: false,
+              reason: 'policy_denied',
+            },
+          }),
+          { ETag: '"capability:detail"' },
+        ),
+      ),
+    );
+
+    renderDetail(`/tools/${id}`);
+
+    expect(await screen.findByText('Playground unavailable:')).toBeTruthy();
+    expect(screen.getByText('Policy denied')).toBeTruthy();
+    expect(screen.queryByRole('link', { name: 'Open playground' })).toBeNull();
+  });
 });
 
 function renderInventory(strict = false) {
@@ -521,6 +552,10 @@ function capabilityDetail(
       remote_tool_name: 'widgets.get',
     },
     input_json_schema: { type: 'object' },
+    actions: {
+      can_execute: true,
+      reason: 'allowed',
+    },
     ...overrides,
   };
 }

@@ -321,6 +321,10 @@ test('captures a secret-free capability detail in light, dark, and mobile layout
             eligible: true,
             reason: 'eligible',
           },
+          actions: {
+            can_execute: true,
+            reason: 'allowed',
+          },
           mapping: {
             type: 'http',
             method: 'GET',

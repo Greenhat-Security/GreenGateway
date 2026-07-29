@@ -124,6 +124,20 @@ export type CapabilityMapping =
 export type CapabilityDetail = CapabilitySummary & {
   input_json_schema?: unknown;
   mapping?: CapabilityMapping;
+  actions: CapabilityActions;
+};
+
+export type CapabilityActions = {
+  can_execute: boolean;
+  reason:
+    | 'allowed'
+    | 'permission_denied'
+    | 'metadata_only'
+    | 'disabled'
+    | 'unavailable'
+    | 'stale'
+    | 'policy_denied'
+    | 'executor_unavailable';
 };
 
 export type CapabilityListPage = {
@@ -181,7 +195,7 @@ export async function getCapability(
 ): Promise<AdminResource<CapabilityDetail>> {
   const resource = await adminFetchResource<unknown>(
     adminApiUrl(`/tools/${encodeURIComponent(id)}`),
-    { signal },
+    { signal, cache: 'no-store' },
   );
   return {
     ...resource,
@@ -245,6 +259,7 @@ function projectCapabilityDetail(
     source.mapping === undefined
       ? undefined
       : projectCapabilityMapping(source.mapping, summary);
+  const actions = projectCapabilityActions(source.actions);
 
   return {
     ...summary,
@@ -252,7 +267,38 @@ function projectCapabilityDetail(
       ? {}
       : { input_json_schema: inputJsonSchema }),
     ...(mapping === undefined ? {} : { mapping }),
+    actions,
   };
+}
+
+function projectCapabilityActions(value: unknown): CapabilityActions {
+  const source = responseObject(value, 'capability actions');
+  if (
+    typeof source.can_execute !== 'boolean' ||
+    !isCapabilityExecuteReason(source.reason) ||
+    source.can_execute !== (source.reason === 'allowed')
+  ) {
+    throw invalidCapabilityResponse('capability actions');
+  }
+  return {
+    can_execute: source.can_execute,
+    reason: source.reason,
+  };
+}
+
+function isCapabilityExecuteReason(
+  value: unknown,
+): value is CapabilityActions['reason'] {
+  return (
+    value === 'allowed' ||
+    value === 'permission_denied' ||
+    value === 'metadata_only' ||
+    value === 'disabled' ||
+    value === 'unavailable' ||
+    value === 'stale' ||
+    value === 'policy_denied' ||
+    value === 'executor_unavailable'
+  );
 }
 
 function projectCapabilitySummary(value: unknown): CapabilitySummary {

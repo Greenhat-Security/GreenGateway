@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,6 +39,7 @@ const MAX_TEXT_FILTER_BYTES: usize = 512;
 const MAX_PUBLIC_DESCRIPTION_CHARS: usize = 1_024;
 const CAPABILITY_ID_PREFIX: &str = "cap_";
 const CAPABILITY_ID_HEX_BYTES: usize = 64;
+const CAPABILITY_EXECUTION_ETAG_DOMAIN: &str = "greengateway-capability-execution-v1";
 
 #[derive(Clone)]
 pub struct CapabilityInventory {
@@ -206,6 +210,26 @@ pub struct CapabilityDetail {
     pub input_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mapping: Option<CapabilityMapping>,
+    pub actions: CapabilityActions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityActions {
+    pub can_execute: bool,
+    pub reason: &'static str,
+}
+
+#[derive(Clone, Debug)]
+pub struct CapabilityDetailResult {
+    pub detail: CapabilityDetail,
+    execution_etag: String,
+}
+
+impl CapabilityDetailResult {
+    pub fn execution_etag(&self) -> &str {
+        &self.execution_etag
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -237,6 +261,27 @@ struct BuiltCapability {
     summary: CapabilitySummary,
     input_schema: Option<Value>,
     mapping: Option<CapabilityMapping>,
+    registered_definition: Option<ToolDefinition>,
+    execution_revision: Option<CapabilityExecutionRevision>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CapabilityExecutionRevision {
+    Manual {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        connection_etag: Option<String>,
+    },
+    Openapi {
+        connection_etag: String,
+        catalog_revision: u64,
+        spec_revision: u64,
+        spec_digest: String,
+    },
+    Mcp {
+        connection_etag: String,
+        catalog_revision: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -381,7 +426,9 @@ impl CapabilityInventory {
         rbac_state: &RbacState,
         principal: &Principal,
         raw_id: &str,
-    ) -> Result<Option<CapabilityDetail>, CapabilityInventoryError> {
+        has_execute_permission: bool,
+        executor_available: bool,
+    ) -> Result<Option<CapabilityDetailResult>, CapabilityInventoryError> {
         if !valid_capability_id(raw_id) {
             return Ok(None);
         }
@@ -392,15 +439,55 @@ impl CapabilityInventory {
         else {
             return Ok(None);
         };
-        let detail = CapabilityDetail {
-            summary: capability.summary,
-            input_schema: capability.input_schema,
-            mapping: capability.mapping,
-        };
+        let result =
+            capability_detail_result(capability, has_execute_permission, executor_available)?;
+        let detail = &result.detail;
         if serialized_len(&detail)? > MAX_CAPABILITY_DETAIL_RESPONSE_BYTES {
             return Err(CapabilityInventoryError::ResponseTooLarge);
         }
-        Ok(Some(detail))
+        Ok(Some(result))
+    }
+
+    /// Resolves an opaque capability ID only against the active registry.
+    ///
+    /// This deliberately avoids connection, catalog, status, secret-provider,
+    /// DNS, and upstream reads so an admin execution request can complete its
+    /// authorization and normal tool-policy gates before reading target state.
+    pub fn registered_tool(&self, raw_id: &str) -> Option<Arc<ToolDefinition>> {
+        if !valid_capability_id(raw_id) {
+            return None;
+        }
+        self.registry
+            .list()
+            .into_iter()
+            .find(|definition| capability_id(&["tool", definition.name.as_str()]) == raw_id)
+    }
+
+    /// Recomputes the current execution validator for one exact registry
+    /// definition. Callers must invoke this only after normal tool-policy,
+    /// schema, mapping, and direct-rule authorization.
+    pub fn execution_etag_for_definition(
+        &self,
+        rbac_state: &RbacState,
+        principal: &Principal,
+        definition: &ToolDefinition,
+    ) -> Result<Option<String>, CapabilityInventoryError> {
+        let expected_id = capability_id(&["tool", definition.name.as_str()]);
+        let Some(capability) = self
+            .build(rbac_state, principal)?
+            .into_iter()
+            .find(|capability| capability.summary.id == expected_id)
+        else {
+            return Ok(None);
+        };
+        if capability.registered_definition.as_ref() != Some(definition) {
+            return Ok(None);
+        }
+        let result = capability_detail_result(capability, true, true)?;
+        if !result.detail.actions.can_execute {
+            return Ok(None);
+        }
+        Ok(Some(result.execution_etag))
     }
 
     pub fn connection_counts(
@@ -434,18 +521,22 @@ impl CapabilityInventory {
         for (name, durable) in durable_tools {
             let (definition, source, refreshed_at, connection_id, state) =
                 durable_tool_parts(&durable, &connections)?;
-            if let Some(active) = registry.get(&name) {
+            let registered_definition = if let Some(active) = registry.get(&name) {
                 if active.as_ref() != &definition {
                     return Err(CapabilityInventoryError::CorruptState);
                 }
+                Some(active.as_ref().clone())
             } else if state.enabled && !state.stale {
                 return Err(CapabilityInventoryError::CorruptState);
-            }
+            } else {
+                None
+            };
             handled_names.insert(name);
             let connection = connections
                 .get(&connection_id)
                 .map(|context| context.reference.clone());
             let policy = tool_policy(rbac_state, principal, &definition.name);
+            let execution_revision = durable_execution_revision(&durable);
             let capability = tool_capability(
                 definition,
                 source,
@@ -453,6 +544,7 @@ impl CapabilityInventory {
                 Some(refreshed_at),
                 state,
                 policy,
+                (registered_definition, Some(execution_revision)),
             )?;
             insert_capability(&mut built, capability)?;
         }
@@ -470,6 +562,7 @@ impl CapabilityInventory {
             let (source, connection, state) =
                 local_tool_context(&definition, &snapshot, &connections)?;
             let policy = tool_policy(rbac_state, principal, &definition.name);
+            let execution_revision = local_execution_revision(&definition, &snapshot, &connections);
             let capability = tool_capability(
                 definition.as_ref().clone(),
                 source,
@@ -477,6 +570,7 @@ impl CapabilityInventory {
                 None,
                 state,
                 policy,
+                (Some(definition.as_ref().clone()), Some(execution_revision)),
             )?;
             insert_capability(&mut built, capability)?;
         }
@@ -527,6 +621,8 @@ impl CapabilityInventory {
                         }),
                         summary,
                         input_schema: None,
+                        registered_definition: None,
+                        execution_revision: None,
                     },
                 )?;
             }
@@ -566,6 +662,8 @@ impl CapabilityInventory {
                         }),
                         summary,
                         input_schema: None,
+                        registered_definition: None,
+                        execution_revision: None,
                     },
                 )?;
             }
@@ -747,6 +845,21 @@ fn durable_tool_parts(
     }
 }
 
+fn durable_execution_revision(durable: &DurableToolCatalog<'_>) -> CapabilityExecutionRevision {
+    match durable {
+        DurableToolCatalog::Openapi { catalog, .. } => CapabilityExecutionRevision::Openapi {
+            connection_etag: catalog.observed_etag.to_string(),
+            catalog_revision: catalog.catalog_revision,
+            spec_revision: catalog.spec_revision,
+            spec_digest: catalog.spec_digest.clone(),
+        },
+        DurableToolCatalog::Mcp { catalog, .. } => CapabilityExecutionRevision::Mcp {
+            connection_etag: catalog.observed_etag.to_string(),
+            catalog_revision: catalog.catalog_revision,
+        },
+    }
+}
+
 fn connection_contexts(
     snapshot: &ConnectionRuntimeSnapshot,
     statuses: &BTreeMap<ConnectionId, SafeConnectionStatus>,
@@ -784,6 +897,39 @@ fn connection_contexts(
         );
     }
     contexts
+}
+
+fn local_execution_revision(
+    definition: &ToolDefinition,
+    snapshot: &ConnectionRuntimeSnapshot,
+    connections: &BTreeMap<ConnectionId, ConnectionContext>,
+) -> CapabilityExecutionRevision {
+    let context = match &definition.target {
+        Some(ToolTarget::Http { connection_id, .. })
+        | Some(ToolTarget::Mcp { connection_id, .. }) => ConnectionId::parse(connection_id.clone())
+            .ok()
+            .and_then(|id| connections.get(&id)),
+        None => {
+            if let Some(proxy) = definition.upstream.mcp_proxy_mapping() {
+                snapshot
+                    .legacy()
+                    .iter()
+                    .find(|projection| {
+                        projection.legacy_mcp_server_name() == Some(proxy.server_name.as_str())
+                    })
+                    .and_then(|projection| connections.get(projection.id()))
+            } else {
+                connections.values().find(|context| {
+                    context.reference.kind == ConnectionKind::HttpApi
+                        && context.reference.management_source
+                            == ConnectionManagementSource::LegacyDefaultHttp
+                })
+            }
+        }
+    };
+    CapabilityExecutionRevision::Manual {
+        connection_etag: context.and_then(|context| context.etag.clone()),
+    }
 }
 
 fn managed_catalog_state(
@@ -974,7 +1120,9 @@ fn tool_capability(
     refreshed_at: Option<String>,
     state: CapabilityState,
     policy: CapabilityPolicyEligibility,
+    execution_binding: (Option<ToolDefinition>, Option<CapabilityExecutionRevision>),
 ) -> Result<BuiltCapability, CapabilityInventoryError> {
+    let (registered_definition, execution_revision) = execution_binding;
     let schema_digest = schema_digest(&definition.input_schema)?;
     let (description, description_truncated) =
         bounded_description(Some(definition.description.as_str()));
@@ -1013,6 +1161,8 @@ fn tool_capability(
         },
         input_schema: Some(definition.input_schema),
         mapping,
+        registered_definition,
+        execution_revision,
     })
 }
 
@@ -1157,6 +1307,72 @@ fn collection_etag(capabilities: &[BuiltCapability]) -> Result<String, Capabilit
         "\"capabilities:sha256:{}\"",
         hex::encode(Sha256::digest(bytes))
     ))
+}
+
+fn capability_detail_result(
+    capability: BuiltCapability,
+    has_execute_permission: bool,
+    executor_available: bool,
+) -> Result<CapabilityDetailResult, CapabilityInventoryError> {
+    let actions = capability_actions(&capability, has_execute_permission, executor_available);
+    let BuiltCapability {
+        summary,
+        input_schema,
+        mapping,
+        registered_definition,
+        execution_revision,
+    } = capability;
+    let detail = CapabilityDetail {
+        summary,
+        input_schema,
+        mapping,
+        actions,
+    };
+    let binding = serde_json::to_vec(&(
+        CAPABILITY_EXECUTION_ETAG_DOMAIN,
+        &detail,
+        &registered_definition,
+        &execution_revision,
+    ))
+    .map_err(|_| CapabilityInventoryError::CorruptState)?;
+    let execution_etag = format!(
+        "\"capability-execution:sha256:{}\"",
+        hex::encode(Sha256::digest(binding))
+    );
+    Ok(CapabilityDetailResult {
+        detail,
+        execution_etag,
+    })
+}
+
+fn capability_actions(
+    capability: &BuiltCapability,
+    has_execute_permission: bool,
+    executor_available: bool,
+) -> CapabilityActions {
+    let reason = if capability.summary.kind != CapabilityKind::Tool {
+        "metadata_only"
+    } else if capability.registered_definition.is_none() {
+        "stale"
+    } else if !has_execute_permission {
+        "permission_denied"
+    } else if !executor_available {
+        "executor_unavailable"
+    } else if !capability.summary.state.enabled {
+        "disabled"
+    } else if capability.summary.state.stale {
+        "stale"
+    } else if !capability.summary.state.available {
+        "unavailable"
+    } else if !capability.summary.policy.eligible {
+        "policy_denied"
+    } else {
+        "allowed"
+    };
+    CapabilityActions {
+        can_execute: reason == "allowed",
+        reason,
+    }
 }
 
 fn capability_id(parts: &[&str]) -> String {
@@ -1587,6 +1803,196 @@ mod tests {
     }
 
     #[test]
+    fn capability_actions_use_only_the_stable_public_reason_vocabulary() {
+        let definition = ToolDefinition {
+            name: "playground_action_test".to_owned(),
+            description: "Action-state test tool".to_owned(),
+            input_schema: json!({"type": "object"}),
+            target: None,
+            source: ToolSource::Manual,
+            upstream: HttpToolMapping {
+                method: "GET".to_owned(),
+                path_template: "/action-test".to_owned(),
+                query_params: Vec::new(),
+                body: None,
+            },
+        };
+        let mut capability = BuiltCapability {
+            summary: CapabilitySummary {
+                id: capability_id(&["tool", definition.name.as_str()]),
+                kind: CapabilityKind::Tool,
+                name: definition.name.clone(),
+                title: None,
+                uri: None,
+                uri_template: None,
+                description: Some(definition.description.clone()),
+                description_truncated: false,
+                source: CapabilitySource::ManualFile,
+                connection: None,
+                schema_digest: None,
+                discovered_at: None,
+                last_success_at: None,
+                state: CapabilityState {
+                    enabled: true,
+                    available: true,
+                    stale: false,
+                    reason: "internal-state-reason-must-not-leak",
+                },
+                policy: CapabilityPolicyEligibility {
+                    eligible: true,
+                    reason: "internal-policy-reason-must-not-leak",
+                },
+            },
+            input_schema: Some(definition.input_schema.clone()),
+            mapping: None,
+            registered_definition: Some(definition),
+            execution_revision: Some(CapabilityExecutionRevision::Manual {
+                connection_etag: None,
+            }),
+        };
+
+        assert_eq!(
+            capability_actions(&capability, true, true),
+            CapabilityActions {
+                can_execute: true,
+                reason: "allowed",
+            }
+        );
+        assert_eq!(
+            capability_actions(&capability, false, true).reason,
+            "permission_denied"
+        );
+        assert_eq!(
+            capability_actions(&capability, true, false).reason,
+            "executor_unavailable"
+        );
+
+        capability.summary.state.enabled = false;
+        assert_eq!(
+            capability_actions(&capability, true, true).reason,
+            "disabled"
+        );
+        capability.summary.state.enabled = true;
+        capability.summary.state.stale = true;
+        assert_eq!(capability_actions(&capability, true, true).reason, "stale");
+        capability.summary.state.stale = false;
+        capability.summary.state.available = false;
+        assert_eq!(
+            capability_actions(&capability, true, true).reason,
+            "unavailable"
+        );
+        capability.summary.state.available = true;
+        capability.summary.policy.eligible = false;
+        assert_eq!(
+            capability_actions(&capability, true, true).reason,
+            "policy_denied"
+        );
+        capability.summary.policy.eligible = true;
+        capability.registered_definition = None;
+        assert_eq!(capability_actions(&capability, true, true).reason, "stale");
+        capability.summary.kind = CapabilityKind::Resource;
+        assert_eq!(
+            capability_actions(&capability, true, true).reason,
+            "metadata_only"
+        );
+    }
+
+    #[test]
+    fn execution_etag_binds_detail_action_definition_and_managed_revisions() {
+        let fixture = ManagedInventoryFixture::new("execution-etag-binding");
+        let built = fixture
+            .inventory
+            .build(&fixture.rbac_state, &fixture.principal)
+            .expect("managed inventory should build")
+            .into_iter()
+            .find(|capability| capability.summary.name == fixture.openapi_tool_name)
+            .expect("OpenAPI tool should exist");
+        let capability_id = built.summary.id.clone();
+        let definition = built
+            .registered_definition
+            .as_ref()
+            .expect("OpenAPI tool should be registered")
+            .clone();
+        let detail = fixture
+            .inventory
+            .detail(
+                &fixture.rbac_state,
+                &fixture.principal,
+                &capability_id,
+                true,
+                true,
+            )
+            .expect("detail should build")
+            .expect("detail should exist");
+        let recomputed = fixture
+            .inventory
+            .execution_etag_for_definition(&fixture.rbac_state, &fixture.principal, &definition)
+            .expect("execution ETag should recompute")
+            .expect("registered tool should remain executable");
+        assert_eq!(detail.execution_etag(), recomputed);
+
+        let permission_denied =
+            capability_detail_result(built.clone(), false, true).expect("detail should hash");
+        assert_ne!(
+            detail.execution_etag(),
+            permission_denied.execution_etag(),
+            "action changes must change the validator"
+        );
+
+        let mut changed_definition = built.clone();
+        changed_definition
+            .registered_definition
+            .as_mut()
+            .expect("definition should exist")
+            .description
+            .push_str(" changed");
+        let changed_definition =
+            capability_detail_result(changed_definition, true, true).expect("detail should hash");
+        assert_ne!(
+            detail.execution_etag(),
+            changed_definition.execution_etag(),
+            "the exact full registered definition must be bound"
+        );
+
+        let mut changed_revision = built;
+        let Some(CapabilityExecutionRevision::Openapi {
+            connection_etag,
+            catalog_revision,
+            spec_revision,
+            spec_digest,
+        }) = changed_revision.execution_revision.as_mut()
+        else {
+            panic!("OpenAPI execution revision should exist");
+        };
+        connection_etag.push_str("-changed");
+        *catalog_revision = catalog_revision.saturating_add(1);
+        *spec_revision = spec_revision.saturating_add(1);
+        spec_digest.push_str("-changed");
+        let changed_revision =
+            capability_detail_result(changed_revision, true, true).expect("detail should hash");
+        assert_ne!(
+            detail.execution_etag(),
+            changed_revision.execution_etag(),
+            "connection, catalog, and spec revisions must be bound"
+        );
+
+        let mut stale_definition = definition;
+        stale_definition.description.push_str(" stale");
+        assert_eq!(
+            fixture
+                .inventory
+                .execution_etag_for_definition(
+                    &fixture.rbac_state,
+                    &fixture.principal,
+                    &stale_definition,
+                )
+                .expect("stale definition check should complete"),
+            None,
+            "an exact definition not present in the current registry must fail closed"
+        );
+    }
+
+    #[test]
     fn omitted_legacy_mcp_projection_keeps_safe_available_attribution() {
         let omitted_server_name = format!("server-{MAX_CONNECTIONS}");
         let mut config = Config::test_defaults();
@@ -1745,9 +2151,16 @@ mod tests {
         assert_eq!(resource.policy.reason, "metadata_only");
         let detail = fixture
             .inventory
-            .detail(&fixture.rbac_state, &fixture.principal, &resource.id)
+            .detail(
+                &fixture.rbac_state,
+                &fixture.principal,
+                &resource.id,
+                true,
+                true,
+            )
             .expect("resource detail should build")
-            .expect("resource detail should exist");
+            .expect("resource detail should exist")
+            .detail;
         assert!(detail.input_schema.is_none());
         assert!(matches!(
             detail.mapping,
@@ -1876,6 +2289,8 @@ mod tests {
                     },
                     input_schema: None,
                     mapping: None,
+                    registered_definition: None,
+                    execution_revision: None,
                 },
             )
             .expect("capability at the exact bound should insert");
@@ -1910,6 +2325,8 @@ mod tests {
                 },
                 input_schema: None,
                 mapping: None,
+                registered_definition: None,
+                execution_revision: None,
             },
         );
         assert_eq!(overflow, Err(CapabilityInventoryError::CardinalityExceeded));

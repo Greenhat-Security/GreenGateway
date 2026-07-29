@@ -64,10 +64,11 @@ describe('capability inventory API client', () => {
   it('loads a capability detail by encoded opaque ID', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn((input: RequestInfo | URL) => {
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
         expect(new URL(String(input), 'http://localhost').pathname).toBe(
           '/v1/admin/tools/cap_abc%2Fdef',
         );
+        expect(init?.cache).toBe('no-store');
         return Promise.resolve(
           jsonResponse(200, {
             ...capabilitySummary(),
@@ -77,6 +78,7 @@ describe('capability inventory API client', () => {
               type: 'mcp',
               remote_tool_name: 'billing.get',
             },
+            actions: capabilityActions(),
           }),
         );
       }),
@@ -141,6 +143,10 @@ describe('capability inventory API client', () => {
           ],
           body: { mode: 'whole_args_json', locator: canary },
           private_key_value: canary,
+        },
+        actions: {
+          ...capabilityActions(),
+          ciphertext: canary,
         },
       }),
     ];
@@ -242,12 +248,30 @@ describe('capability inventory API client', () => {
         body: {
           ...capabilitySummary(),
           id: 'different-capability',
+          actions: capabilityActions(),
         },
       },
       {
         id: 'cap_abc',
         body: {
           ...capabilitySummary(),
+        },
+      },
+      {
+        id: 'cap_abc',
+        body: {
+          ...capabilitySummary(),
+          actions: {
+            can_execute: true,
+            reason: 'stale',
+          },
+        },
+      },
+      {
+        id: 'cap_abc',
+        body: {
+          ...capabilitySummary(),
+          actions: capabilityActions(),
           mapping: {
             type: 'http',
             method: 'BREW',
@@ -260,6 +284,7 @@ describe('capability inventory API client', () => {
         id: 'cap_abc',
         body: {
           ...capabilitySummary(),
+          actions: capabilityActions(),
           input_json_schema: deepSchema,
         },
       },
@@ -332,6 +357,13 @@ function capabilitySummary() {
       eligible: true,
       reason: 'eligible',
     },
+  };
+}
+
+function capabilityActions() {
+  return {
+    can_execute: true,
+    reason: 'allowed',
   };
 }
 

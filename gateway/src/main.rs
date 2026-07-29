@@ -107,6 +107,7 @@ const CONNECTION_SECRET_COLLECTION_ETAG_HEADER: &str = "x-greengateway-connectio
 const MANAGED_OPENAPI_JSON_ENVELOPE_OVERHEAD_BYTES: usize = 64 * 1024;
 const TOOLS_ADMIN_ROUTE: &str = "/v1/admin/tools";
 const TOOL_ADMIN_ROUTE: &str = "/v1/admin/tools/{id}";
+const TOOL_EXECUTE_ADMIN_ROUTE: &str = "/v1/admin/tools/{id}/execute";
 const TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/preview";
 const TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/register";
 const OPENAPI_TOOLS_UNSUPPORTED_AUTH_REQUIREMENTS_ERROR: &str = "cannot register selected OpenAPI tools: upstream API-key header injection is not yet supported; see issue #36's known limitation";
@@ -140,6 +141,7 @@ const ADMIN_CONNECTIONS_REFRESH_PERMISSION: &str =
     connections::permissions::ADMIN_CONNECTIONS_REFRESH;
 const ADMIN_TOOLS_READ_PERMISSION: &str = connections::permissions::ADMIN_TOOLS_READ;
 const ADMIN_TOOLS_WRITE_PERMISSION: &str = connections::permissions::ADMIN_TOOLS_WRITE;
+const ADMIN_TOOLS_EXECUTE_PERMISSION: &str = connections::permissions::ADMIN_TOOLS_EXECUTE;
 const ADMIN_SCHEMA_READ_PERMISSION: &str = "admin:schema:read";
 const ADMIN_SIGNALS_READ_PERMISSION: &str = "admin:signals:read";
 const ADMIN_SIGNALS_WRITE_PERMISSION: &str = "admin:signals:write";
@@ -237,6 +239,7 @@ struct AdminRoutes {
     connection_secret_route: String,
     tools_route: String,
     tool_route: String,
+    tool_execute_route: String,
     tools_openapi_preview_route: String,
     tools_openapi_register_route: String,
     schema_coverage_route: String,
@@ -372,6 +375,7 @@ impl AdminRoutes {
             connection_secret_route: format!("{api_prefix}/connection-secrets/{{id}}"),
             tools_route: format!("{api_prefix}/tools"),
             tool_route: format!("{api_prefix}/tools/{{id}}"),
+            tool_execute_route: format!("{api_prefix}/tools/{{id}}/execute"),
             tools_openapi_preview_route: format!("{api_prefix}/tools/openapi/preview"),
             tools_openapi_register_route: format!("{api_prefix}/tools/openapi/register"),
             schema_coverage_route: format!("{api_prefix}/schema/coverage"),
@@ -453,6 +457,7 @@ struct ToolAdminState {
     tools_file: Option<PathBuf>,
     registry: tools::definitions::ToolRegistry,
     inventory: tools::inventory::CapabilityInventory,
+    executor: tools::executor::ToolExecutor,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
     client_ip_policy: client_ip::ClientIpPolicy,
@@ -1179,6 +1184,12 @@ enum IfMatchError {
     InvalidHeader,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolPlaygroundIfMatchError {
+    Missing,
+    Invalid,
+}
+
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
@@ -1712,18 +1723,30 @@ fn gateway_app_with_process_started_at_and_overrides(
         audit_log.clone(),
         rbac_state.clone(),
     );
+    let tool_connection_runtimes = tools::executor::ToolConnectionRuntimes {
+        http: Some(connection_http_runtime.clone()),
+        mcp_catalog: mcp_catalog_runtime,
+        openapi_catalog: openapi_catalog_runtime,
+    };
     let mcp_executor = mcp::mcp_executor_from_config(
         &config,
         tool_registry.clone(),
-        tool_runtime,
+        tool_runtime.clone(),
         Arc::clone(&egress_client),
-        tools::executor::ToolConnectionRuntimes {
-            http: Some(connection_http_runtime.clone()),
-            mcp_catalog: mcp_catalog_runtime,
-            openapi_catalog: openapi_catalog_runtime,
-        },
+        tool_connection_runtimes.clone(),
         audit_log.clone(),
     )?;
+    let tool_executor = match mcp_executor.as_ref() {
+        Some(executor) => executor.clone(),
+        None => tools::executor::ToolExecutor::from_config(
+            &config,
+            tool_registry.clone(),
+            tool_runtime,
+            Arc::clone(&egress_client),
+            tool_connection_runtimes,
+            audit_log.clone(),
+        )?,
+    };
     let client_ip_policy = client_ip::ClientIpPolicy::from_config(&config);
     let mcp_state = mcp::McpState::new(
         tool_registry.clone(),
@@ -1778,6 +1801,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         tools_file: config.tools_file.as_ref().map(PathBuf::from),
         registry: tool_registry.clone(),
         inventory: capability_inventory,
+        executor: tool_executor,
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
@@ -2545,6 +2569,10 @@ fn add_admin_api_routes(
                     get(tool_inventory_detail_endpoint),
                 )
                 .route(
+                    routes.admin.tool_execute_route.as_str(),
+                    post(tool_playground_execute_endpoint),
+                )
+                .route(
                     routes.admin.tools_openapi_preview_route.as_str(),
                     post(tools_openapi_preview_endpoint),
                 )
@@ -2707,9 +2735,20 @@ fn is_capability_inventory_path(path: &str, collection_route: &str) -> bool {
         return true;
     }
 
-    path.strip_prefix(collection_route)
+    let Some(remainder) = path
+        .strip_prefix(collection_route)
         .and_then(|remainder| remainder.strip_prefix('/'))
-        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    else {
+        return false;
+    };
+    if !remainder.is_empty() && !remainder.contains('/') {
+        return true;
+    }
+    let mut segments = remainder.split('/');
+    matches!(
+        (segments.next(), segments.next(), segments.next()),
+        (Some(id), Some("execute"), None) if !id.is_empty()
+    )
 }
 
 async fn proxy_dispatch_context_middleware(
@@ -5325,6 +5364,7 @@ async fn tool_inventory_list_endpoint(
 
 async fn tool_inventory_detail_endpoint(
     State(state): State<ToolAdminState>,
+    Path(raw_id): Path<String>,
     request: AxumRequest,
 ) -> Response {
     record_request(TOOL_ADMIN_ROUTE);
@@ -5337,31 +5377,18 @@ async fn tool_inventory_detail_endpoint(
             Ok(rbac_state) => rbac_state,
             Err(error) => return tool_admin_authz_error_response(error),
         };
-    let Some(raw_id) = request
-        .uri()
-        .path()
-        .rsplit('/')
-        .next()
-        .filter(|raw_id| !raw_id.is_empty())
-    else {
-        return not_found("capability was not found");
-    };
-
-    let detail = match state.inventory.detail(rbac_state, principal, raw_id) {
+    let detail = match state.inventory.detail(
+        rbac_state,
+        principal,
+        &raw_id,
+        rbac_state.principal_has_permission(principal, ADMIN_TOOLS_EXECUTE_PERMISSION),
+        true,
+    ) {
         Ok(Some(detail)) => detail,
         Ok(None) => return not_found("capability was not found"),
         Err(error) => return capability_inventory_error_response(error),
     };
-    let etag = match serialized_response_etag(&detail) {
-        Ok(etag) => etag,
-        Err(error) => {
-            tracing::error!(
-                error = %error,
-                "failed to compute capability inventory detail ETag"
-            );
-            return internal_server_error("capability inventory response failed");
-        }
-    };
+    let etag = detail.execution_etag().to_owned();
 
     (
         StatusCode::OK,
@@ -5369,7 +5396,139 @@ async fn tool_inventory_detail_endpoint(
             (header::ETAG, etag_header_value(&etag)),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
         ],
-        Json(detail),
+        Json(detail.detail),
+    )
+        .into_response()
+}
+
+async fn tool_playground_execute_endpoint(
+    State(state): State<ToolAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(TOOL_EXECUTE_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    let rbac_state =
+        match authorized_tool_rbac_state(&state, &principal, ADMIN_TOOLS_EXECUTE_PERMISSION) {
+            Ok(rbac_state) => rbac_state.clone(),
+            Err(ToolAdminAuthzError::Forbidden) => {
+                return tool_playground_permission_forbidden(&state, &parts, &principal);
+            }
+            Err(error) => return tool_admin_authz_error_response(error),
+        };
+
+    let supplied_etag = match exact_strong_if_match(&parts.headers) {
+        Ok(etag) => etag,
+        Err(ToolPlaygroundIfMatchError::Missing) => {
+            return precondition_required("If-Match header is required");
+        }
+        Err(ToolPlaygroundIfMatchError::Invalid) => {
+            return bad_request("If-Match must contain exactly one strong entity tag");
+        }
+    };
+    // Opaque IDs are resolved only against the active registry. This does not
+    // inspect connection/catalog/provider/DNS state.
+    let Some(definition) = state.inventory.registered_tool(&raw_id) else {
+        return not_found("capability was not found");
+    };
+    let body = match read_request_body(
+        body,
+        state
+            .max_body_size
+            .min(tools::playground::TOOL_PLAYGROUND_REQUEST_LIMIT_BYTES),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let request = match serde_json::from_slice::<tools::playground::ToolPlaygroundRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return bad_request("tool execution request is invalid"),
+    };
+
+    let inventory = state.inventory.clone();
+    let precondition_rbac_state = rbac_state.clone();
+    let precondition_principal = principal.clone();
+    let expected_etag = supplied_etag.clone();
+    let precondition = tools::executor::ToolExecutionPrecondition::new(move |current_definition| {
+        if !precondition_rbac_state
+            .principal_has_permission(&precondition_principal, ADMIN_TOOLS_EXECUTE_PERMISSION)
+        {
+            return Err(tools::executor::ToolExecutionPreconditionError::Failed);
+        }
+        match inventory.execution_etag_for_definition(
+            &precondition_rbac_state,
+            &precondition_principal,
+            current_definition,
+        ) {
+            Ok(Some(current_etag)) if current_etag == expected_etag => Ok(()),
+            Ok(_) => Err(tools::executor::ToolExecutionPreconditionError::Failed),
+            Err(_) => Err(tools::executor::ToolExecutionPreconditionError::Unavailable),
+        }
+    });
+    let context = tools::runtime::ToolInvocationContext {
+        request_id: client_ip::request_id(&parts.headers, &parts.extensions),
+        source_ip: client_ip::canonical_client_ip(
+            &parts.headers,
+            &parts.extensions,
+            &state.client_ip_policy,
+        ),
+        actor: Some(auth::actor_from_principal(&principal)),
+        source: tools::runtime::ToolInvocationSource::AdminPlayground,
+    };
+
+    let result = match state
+        .executor
+        .execute_with_precondition(
+            &definition.name,
+            Value::Object(request.arguments),
+            context,
+            tokio_util::sync::CancellationToken::new(),
+            precondition,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return tool_playground_runtime_error_response(error),
+    };
+    let projected = match tools::playground::project_tool_execution_result(result) {
+        Ok(projected) => projected,
+        Err(error) => {
+            state.audit.emit(audit::AuditEvent::new(
+                audit::event::TOOL_PLAYGROUND_OUTPUT_REJECTED,
+                client_ip::request_id(&parts.headers, &parts.extensions),
+                client_ip::canonical_client_ip(
+                    &parts.headers,
+                    &parts.extensions,
+                    &state.client_ip_policy,
+                ),
+                Some(auth::actor_from_principal(&principal)),
+                json!({
+                    "tool_name": definition.name.as_str(),
+                    "reason": error.reason(),
+                    "invocation_source": "admin_playground",
+                }),
+            ));
+            return tool_playground_error_response(
+                StatusCode::BAD_GATEWAY,
+                "tool execution output was rejected",
+                error.reason(),
+            );
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::ETAG, etag_header_value(&supplied_etag)),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        Json(projected),
     )
         .into_response()
 }
@@ -7364,6 +7523,29 @@ fn authorized_tool_rbac_state<'a>(
     Ok(rbac_state)
 }
 
+fn tool_playground_permission_forbidden(
+    state: &ToolAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+) -> Response {
+    state.audit.emit(audit::AuditEvent::new(
+        "authz.denied",
+        client_ip::request_id(&parts.headers, &parts.extensions),
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy),
+        Some(auth::actor_from_principal(principal)),
+        json!({
+            "path": TOOL_EXECUTE_ADMIN_ROUTE,
+            "method": parts.method.as_str(),
+            "reason": "missing_permission",
+            "permission": ADMIN_TOOLS_EXECUTE_PERMISSION,
+            "authorization_layer": "tool_playground_endpoint",
+            "operation": "execute",
+            "invocation_source": "admin_playground",
+        }),
+    ));
+    forbidden()
+}
+
 fn authorized_schema_reader(state: &SchemaAdminState, principal: &auth::Principal) -> bool {
     state.rbac_state.as_ref().is_some_and(|rbac_state| {
         rbac_state.principal_has_permission(principal, ADMIN_SCHEMA_READ_PERMISSION)
@@ -7556,6 +7738,113 @@ fn capability_inventory_error_response(
             internal_server_error("capability inventory response failed")
         }
     }
+}
+
+fn tool_playground_runtime_error_response(error: tools::runtime::ToolRuntimeError) -> Response {
+    use tools::runtime::ToolRuntimeError;
+
+    match error {
+        ToolRuntimeError::UnknownTool { .. } => tool_playground_error_response(
+            StatusCode::NOT_FOUND,
+            "tool was not found",
+            "unknown_tool",
+        ),
+        ToolRuntimeError::Disabled { .. } => tool_playground_error_response(
+            StatusCode::CONFLICT,
+            "tool execution is unavailable",
+            "disabled",
+        ),
+        ToolRuntimeError::RoleDenied { .. } => tool_playground_error_response(
+            StatusCode::FORBIDDEN,
+            "tool execution was denied",
+            "policy_denied",
+        ),
+        ToolRuntimeError::Rejected { reason, .. } => match reason.as_str() {
+            "precondition_failed" => tool_playground_error_response(
+                StatusCode::PRECONDITION_FAILED,
+                "tool execution precondition failed",
+                "precondition_failed",
+            ),
+            "queue_full" => tool_playground_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "tool execution admission is full",
+                "queue_full",
+            ),
+            "runtime_closed" => tool_playground_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "tool executor is unavailable",
+                "execution_state_unavailable",
+            ),
+            _ => tool_playground_error_response(
+                StatusCode::FORBIDDEN,
+                "tool execution was denied",
+                "policy_denied",
+            ),
+        },
+        ToolRuntimeError::QueueTimeout { .. } => tool_playground_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "tool execution admission timed out",
+            "queue_timeout",
+        ),
+        ToolRuntimeError::Timeout { .. } => tool_playground_error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "tool execution timed out",
+            "timeout",
+        ),
+        ToolRuntimeError::Cancelled { .. } => tool_playground_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tool execution was cancelled",
+            "cancelled",
+        ),
+        ToolRuntimeError::WorkFailed { reason, .. } => match reason.as_deref() {
+            Some("invalid_params") => tool_playground_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "tool arguments were rejected",
+                "invalid_params",
+            ),
+            Some("unknown_tool") => tool_playground_error_response(
+                StatusCode::NOT_FOUND,
+                "tool was not found",
+                "unknown_tool",
+            ),
+            Some("execution_state_unavailable") => tool_playground_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "tool execution state is unavailable",
+                "execution_state_unavailable",
+            ),
+            Some(
+                "connection_disabled"
+                | "connection_not_found"
+                | "connection_kind_mismatch"
+                | "catalog_stale"
+                | "catalog_not_registered",
+            ) => tool_playground_error_response(
+                StatusCode::CONFLICT,
+                "tool execution is unavailable",
+                "unavailable",
+            ),
+            _ => tool_playground_error_response(
+                StatusCode::BAD_GATEWAY,
+                "tool execution failed",
+                "execution_failed",
+            ),
+        },
+    }
+}
+
+fn tool_playground_error_response(
+    status: StatusCode,
+    error: &'static str,
+    reason: &'static str,
+) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": error,
+            "reason": reason,
+        })),
+    )
+        .into_response()
 }
 
 fn traffic_admin_authz_error_response(error: TrafficAdminAuthzError) -> Response {
@@ -9700,6 +9989,31 @@ fn if_match_matches(headers: &HeaderMap, current_etag: &str) -> Result<bool, IfM
     } else {
         Err(IfMatchError::Missing)
     }
+}
+
+fn exact_strong_if_match(headers: &HeaderMap) -> Result<String, ToolPlaygroundIfMatchError> {
+    let mut values = headers.get_all(header::IF_MATCH).iter();
+    let Some(value) = values.next() else {
+        return Err(ToolPlaygroundIfMatchError::Missing);
+    };
+    if values.next().is_some() {
+        return Err(ToolPlaygroundIfMatchError::Invalid);
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| ToolPlaygroundIfMatchError::Invalid)?
+        .trim();
+    if value.len() > 1_024
+        || value.len() < 2
+        || !value.starts_with('"')
+        || !value.ends_with('"')
+        || !value.as_bytes()[1..value.len() - 1]
+            .iter()
+            .all(|byte| *byte == b'!' || (b'#'..=b'~').contains(byte))
+    {
+        return Err(ToolPlaygroundIfMatchError::Invalid);
+    }
+    Ok(value.to_owned())
 }
 
 fn if_match_error_response(error: IfMatchError) -> Response {
@@ -12413,6 +12727,7 @@ mod tests {
         );
         assert_eq!(default_routes.tools_route, TOOLS_ADMIN_ROUTE);
         assert_eq!(default_routes.tool_route, TOOL_ADMIN_ROUTE);
+        assert_eq!(default_routes.tool_execute_route, TOOL_EXECUTE_ADMIN_ROUTE);
         assert_eq!(
             default_routes.tools_openapi_preview_route,
             TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE
@@ -12518,6 +12833,10 @@ mod tests {
         assert_eq!(custom_routes.tools_route, "/v1/ops/tools");
         assert_eq!(custom_routes.tool_route, "/v1/ops/tools/{id}");
         assert_eq!(
+            custom_routes.tool_execute_route,
+            "/v1/ops/tools/{id}/execute"
+        );
+        assert_eq!(
             custom_routes.tools_openapi_preview_route,
             "/v1/ops/tools/openapi/preview"
         );
@@ -12563,15 +12882,23 @@ mod tests {
     }
 
     #[test]
-    fn capability_inventory_cache_control_matches_only_collection_and_detail_paths() {
+    fn capability_inventory_cache_control_matches_inventory_and_exact_execute_paths() {
         for (collection_route, matching_paths) in [
             (
                 "/v1/admin/tools",
-                ["/v1/admin/tools", "/v1/admin/tools/cap_123"],
+                [
+                    "/v1/admin/tools",
+                    "/v1/admin/tools/cap_123",
+                    "/v1/admin/tools/cap_123/execute",
+                ],
             ),
             (
                 "/v1/ops/tools",
-                ["/v1/ops/tools", "/v1/ops/tools/not-yet-valid"],
+                [
+                    "/v1/ops/tools",
+                    "/v1/ops/tools/not-yet-valid",
+                    "/v1/ops/tools/not-yet-valid/execute",
+                ],
             ),
         ] {
             for path in matching_paths {
@@ -12587,8 +12914,12 @@ mod tests {
             "/v1/admin/toolsmith",
             "/v1/admin/tools/",
             "/v1/admin/tools/cap_123/extra",
+            "/v1/admin/tools/cap_123/execute/",
+            "/v1/admin/tools/cap_123/execute/extra",
+            "/v1/admin/tools//execute",
             "/v1/admin/tools/openapi/preview",
             "/v1/ops/tools/cap_123/extra",
+            "/v1/ops/tools/cap_123/run",
         ] {
             assert!(
                 !is_capability_inventory_path(path, "/v1/admin/tools")
@@ -12596,6 +12927,51 @@ mod tests {
                 "{path} must not change unrelated cache behavior"
             );
         }
+    }
+
+    #[test]
+    fn playground_if_match_requires_exactly_one_strong_entity_tag() {
+        let mut headers = HeaderMap::new();
+        assert!(matches!(
+            exact_strong_if_match(&headers),
+            Err(ToolPlaygroundIfMatchError::Missing)
+        ));
+
+        headers.insert(
+            header::IF_MATCH,
+            HeaderValue::from_static("\"execution-tag\""),
+        );
+        assert_eq!(
+            exact_strong_if_match(&headers).expect("one strong tag should parse"),
+            "\"execution-tag\""
+        );
+
+        for invalid in [
+            "*",
+            "W/\"execution-tag\"",
+            "\"first\", \"second\"",
+            "execution-tag",
+            "\"contains space\"",
+        ] {
+            headers.insert(
+                header::IF_MATCH,
+                HeaderValue::from_str(invalid).expect("test header should build"),
+            );
+            assert!(
+                matches!(
+                    exact_strong_if_match(&headers),
+                    Err(ToolPlaygroundIfMatchError::Invalid)
+                ),
+                "{invalid} must not be accepted"
+            );
+        }
+
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("\"first\""));
+        headers.append(header::IF_MATCH, HeaderValue::from_static("\"second\""));
+        assert!(matches!(
+            exact_strong_if_match(&headers),
+            Err(ToolPlaygroundIfMatchError::Invalid)
+        ));
     }
 
     #[tokio::test]
@@ -24007,7 +24383,10 @@ mod tests {
         );
         assert_eq!(first_capability["state"]["available"], json!(true));
         assert_eq!(first_capability["policy"]["eligible"], json!(false));
-        assert_eq!(first_capability["policy"]["reason"], json!("not_in_policy"));
+        assert_eq!(
+            first_capability["policy"]["reason"],
+            json!("principal_not_eligible")
+        );
         let first_id = first_capability["id"]
             .as_str()
             .expect("capability should have an opaque id")
@@ -24164,6 +24543,719 @@ mod tests {
         assert_eq!(authorized_malformed_status, StatusCode::NOT_FOUND);
         assert_eq!(authorized_unknown_status, StatusCode::NOT_FOUND);
         assert_eq!(authorized_malformed_body, authorized_unknown_body);
+    }
+
+    #[tokio::test]
+    async fn tool_playground_enforces_permission_validator_and_strict_body_before_upstream() {
+        const REJECTED_OUTPUT_CANARY: &str = "Bearer playground-reflected-credential-output-canary";
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&upstream_calls);
+        let upstream = Router::new().route(
+            "/v1/echo",
+            post(move |Json(arguments): Json<Value>| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if arguments["message"] == json!("emit-unsafe-binary-output") {
+                        let mut body = format!(
+                            "authorization={REJECTED_OUTPUT_CANARY}; api_key=reflected-key"
+                        )
+                        .into_bytes();
+                        body.push(0xff);
+                        return (
+                            [(
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("application/octet-stream"),
+                            )],
+                            body,
+                        )
+                            .into_response();
+                    }
+                    Json(json!({ "echoed": arguments })).into_response()
+                }
+            }),
+        );
+        let upstream_addr = spawn_router(upstream).await;
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let harness = tools_admin_harness_with_policy_and_upstream(
+            mcp_tools_document(),
+            audit_log,
+            format!("http://{upstream_addr}"),
+            tools_policy_document_with_execute_route_permission(ADMIN_TOOLS_READ_PERMISSION),
+        )
+        .await;
+
+        let list_response = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.admin_token),
+                &format!("{TOOLS_ADMIN_ROUTE}?text=echo"),
+            ))
+            .await
+            .expect("tool inventory request should complete");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list = json_body(list_response).await;
+        let capability_id = list["capabilities"][0]["id"]
+            .as_str()
+            .expect("echo should have an opaque capability ID")
+            .to_owned();
+
+        let detail_response = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.admin_token),
+                &format!("{TOOLS_ADMIN_ROUTE}/{capability_id}"),
+            ))
+            .await
+            .expect("tool detail request should complete");
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let execution_etag = detail_response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("tool detail should include an execution ETag")
+            .to_owned();
+        assert!(execution_etag.starts_with("\"capability-execution:sha256:"));
+        let detail = json_body(detail_response).await;
+        assert_eq!(detail["actions"]["can_execute"], json!(true));
+        assert_eq!(detail["actions"]["reason"], json!("allowed"));
+
+        let argument_canary = "playground-argument-canary";
+        let unauthenticated = harness
+            .router
+            .clone()
+            .oneshot(tool_playground_request(
+                Some("invalid-service-token"),
+                &capability_id,
+                None,
+                Body::from("not-json"),
+            ))
+            .await
+            .expect("unauthenticated playground request should complete");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        assert_capability_inventory_no_store(&unauthenticated);
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+
+        let csrf_denied = harness
+            .router
+            .clone()
+            .oneshot(tool_playground_request(
+                None,
+                &capability_id,
+                None,
+                Body::from("not-json"),
+            ))
+            .await
+            .expect("CSRF-denied playground request should complete");
+        assert_eq!(csrf_denied.status(), StatusCode::FORBIDDEN);
+        assert_capability_inventory_no_store(&csrf_denied);
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+
+        let forbidden = harness
+            .router
+            .clone()
+            .oneshot(tool_playground_request(
+                Some(&harness.reader_token),
+                &capability_id,
+                None,
+                Body::from(format!(
+                    r#"{{"arguments":{{"message":"{argument_canary}"}}}}"#
+                )),
+            ))
+            .await
+            .expect("permission-denied playground request should complete");
+        assert_eq!(
+            forbidden.status(),
+            StatusCode::FORBIDDEN,
+            "admin execution authorization must precede If-Match and body validation"
+        );
+        assert_capability_inventory_no_store(&forbidden);
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+
+        let missing_if_match = harness
+            .router
+            .clone()
+            .oneshot(tool_playground_request(
+                Some(&harness.admin_token),
+                &capability_id,
+                None,
+                Body::from(r#"{"arguments":{"message":"hello"}}"#),
+            ))
+            .await
+            .expect("missing If-Match request should complete");
+        assert_eq!(missing_if_match.status(), StatusCode::PRECONDITION_REQUIRED);
+        assert_capability_inventory_no_store(&missing_if_match);
+
+        let weak_if_match = harness
+            .router
+            .clone()
+            .oneshot(tool_playground_request(
+                Some(&harness.admin_token),
+                &capability_id,
+                Some("W/\"stale\""),
+                Body::from(r#"{"arguments":{"message":"hello"}}"#),
+            ))
+            .await
+            .expect("weak If-Match request should complete");
+        assert_eq!(weak_if_match.status(), StatusCode::BAD_REQUEST);
+        assert_capability_inventory_no_store(&weak_if_match);
+
+        let invalid_body = harness
+            .router
+            .clone()
+            .oneshot(tool_playground_request(
+                Some(&harness.admin_token),
+                &capability_id,
+                Some(&execution_etag),
+                Body::from(r#"{"arguments":{"message":"hello"},"url":"https://override.invalid"}"#),
+            ))
+            .await
+            .expect("override-field request should complete");
+        assert_eq!(invalid_body.status(), StatusCode::BAD_REQUEST);
+        assert_capability_inventory_no_store(&invalid_body);
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+
+        let oversized_body = harness
+            .router
+            .clone()
+            .oneshot(tool_playground_request(
+                Some(&harness.admin_token),
+                &capability_id,
+                Some(&execution_etag),
+                Body::from(vec![
+                    b' ';
+                    tools::playground::TOOL_PLAYGROUND_REQUEST_LIMIT_BYTES
+                        + 1
+                ]),
+            ))
+            .await
+            .expect("oversized playground request should complete");
+        assert_eq!(oversized_body.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_capability_inventory_no_store(&oversized_body);
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            0,
+            "oversized bodies must fail before tool execution"
+        );
+
+        let stale = harness
+            .router
+            .clone()
+            .oneshot(tool_playground_request(
+                Some(&harness.admin_token),
+                &capability_id,
+                Some("\"capability-execution:sha256:stale\""),
+                Body::from(r#"{"arguments":{"message":"hello"}}"#),
+            ))
+            .await
+            .expect("stale-validator request should complete");
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+        assert_capability_inventory_no_store(&stale);
+        assert_eq!(
+            json_body(stale).await["reason"],
+            json!("precondition_failed")
+        );
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            0,
+            "stale validators must fail before upstream I/O"
+        );
+
+        let rejected_output = harness
+            .router
+            .clone()
+            .oneshot(tool_playground_request(
+                Some(&harness.admin_token),
+                &capability_id,
+                Some(&execution_etag),
+                Body::from(r#"{"arguments":{"message":"emit-unsafe-binary-output"}}"#),
+            ))
+            .await
+            .expect("unsafe-output playground request should complete");
+        assert_eq!(rejected_output.status(), StatusCode::BAD_GATEWAY);
+        assert_capability_inventory_no_store(&rejected_output);
+        let rejected_output_body = json_body(rejected_output).await;
+        assert_eq!(rejected_output_body["reason"], json!("unsupported_output"));
+        assert!(
+            !rejected_output_body
+                .to_string()
+                .contains(REJECTED_OUTPUT_CANARY),
+            "rejected upstream output must not be reflected to the administrator"
+        );
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+
+        let success = harness
+            .router
+            .clone()
+            .oneshot(tool_playground_request(
+                Some(&harness.admin_token),
+                &capability_id,
+                Some(&execution_etag),
+                Body::from(format!(
+                    r#"{{"arguments":{{"message":"{argument_canary}"}}}}"#
+                )),
+            ))
+            .await
+            .expect("valid playground request should complete");
+        assert_eq!(success.status(), StatusCode::OK);
+        assert_capability_inventory_no_store(&success);
+        assert_eq!(
+            success.headers().get(header::ETAG),
+            Some(&HeaderValue::from_str(&execution_etag).expect("execution ETag should be valid"))
+        );
+        let success_body = json_body(success).await;
+        assert_eq!(success_body["kind"], json!("http"));
+        assert_eq!(success_body["status"], json!(200));
+        assert_eq!(
+            success_body["body"]["value"]["echoed"]["message"],
+            json!(argument_canary)
+        );
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 2);
+
+        assert_eventually(Duration::from_secs(1), || {
+            let events = capture.events();
+            events.iter().any(|event| {
+                event.event_type == "authz.denied"
+                    && event.payload["authorization_layer"] == json!("tool_playground_endpoint")
+            }) && events.iter().any(|event| {
+                event.event_type == audit::event::TOOL_INVOKE_SUCCESS
+                    && event.payload["invocation_source"] == json!("admin_playground")
+            }) && events.iter().any(|event| {
+                event.event_type == audit::event::TOOL_PLAYGROUND_OUTPUT_REJECTED
+                    && event.payload["invocation_source"] == json!("admin_playground")
+                    && event.payload["reason"] == json!("unsupported_output")
+            })
+        });
+        let events = capture.events();
+        let permission_denial = events
+            .iter()
+            .find(|event| {
+                event.event_type == "authz.denied"
+                    && event.payload["authorization_layer"] == json!("tool_playground_endpoint")
+            })
+            .expect("execute-permission denial should be audited");
+        assert_eq!(
+            permission_denial.payload["invocation_source"],
+            json!("admin_playground")
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == audit::event::TOOL_INVOKE_SUCCESS
+                    && event.payload["invocation_source"] == json!("admin_playground")
+            }),
+            "normal execution audit events should retain playground provenance: {events:#?}"
+        );
+        let output_rejection = events
+            .iter()
+            .find(|event| {
+                event.event_type == audit::event::TOOL_PLAYGROUND_OUTPUT_REJECTED
+                    && event.payload["invocation_source"] == json!("admin_playground")
+            })
+            .expect("the post-execution playground output gate should emit a rejection event");
+        assert_eq!(
+            output_rejection.payload,
+            json!({
+                "tool_name": "echo",
+                "reason": "unsupported_output",
+                "invocation_source": "admin_playground",
+            })
+        );
+        let serialized_events =
+            serde_json::to_string(&events).expect("audit events should serialize");
+        assert!(
+            !serialized_events.contains(argument_canary),
+            "arguments and results must never enter playground audit payloads"
+        );
+        assert!(
+            !serialized_events.contains(REJECTED_OUTPUT_CANARY),
+            "rejected output bytes must never enter playground audit payloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_playground_queued_execution_rechecks_live_execute_permission() {
+        const FIRST_REQUEST_ID: &str = "playground-live-revocation-first";
+        const SECOND_REQUEST_ID: &str = "playground-live-revocation-second";
+        const SECOND_ARGUMENT_CANARY: &str = "playground-live-revocation-argument-canary";
+
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let upstream = Router::new().route(
+            "/v1/echo",
+            post({
+                let upstream_calls = Arc::clone(&upstream_calls);
+                let first_started = Arc::clone(&first_started);
+                let release_first = Arc::clone(&release_first);
+                move |Json(arguments): Json<Value>| {
+                    let upstream_calls = Arc::clone(&upstream_calls);
+                    let first_started = Arc::clone(&first_started);
+                    let release_first = Arc::clone(&release_first);
+                    async move {
+                        let call_index = upstream_calls.fetch_add(1, Ordering::SeqCst);
+                        if call_index == 0 {
+                            first_started.notify_one();
+                            release_first.notified().await;
+                        }
+                        Json(json!({ "echoed": arguments }))
+                    }
+                }
+            }),
+        );
+        let upstream_addr = spawn_router(upstream).await;
+
+        let mut initial_policy: Value = serde_json::from_str(
+            &tools_policy_document_with_execute_route_permission(ADMIN_TOOLS_READ_PERMISSION),
+        )
+        .expect("initial playground policy should parse");
+        initial_policy["tools"]["echo"]["max_concurrent"] = json!(1);
+        initial_policy["rules"] = json!([{
+            "id": "allow-admin-playground-echo",
+            "tool_name": "echo",
+            "principal": {
+                "roles": ["admin"]
+            },
+            "action": "allow"
+        }]);
+        let mut revoked_policy = initial_policy.clone();
+        revoked_policy["roles"]["admin"]["permissions"]
+            .as_array_mut()
+            .expect("admin permissions should be an array")
+            .retain(|permission| permission.as_str() != Some(ADMIN_TOOLS_EXECUTE_PERMISSION));
+
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let resolver = Arc::new(CountingDnsResolver {
+            calls: AtomicUsize::new(0),
+            address_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        });
+        let resolver_trait: Arc<dyn egress::DnsResolver> = resolver.clone();
+        let harness = tools_admin_harness_with_options(
+            mcp_tools_document(),
+            audit_log,
+            format!("http://playground.test:{}", upstream_addr.port()),
+            initial_policy.to_string(),
+            |config| {
+                config.egress_allowed_hosts = vec!["playground.test".to_owned()];
+                config.tool_runtime_queue_depth = 8;
+                config.tool_runtime_global_concurrency = 1;
+                config.tool_runtime_queue_timeout_ms = 5_000;
+            },
+            GatewayAppBuildOverrides {
+                egress_resolver: Some(resolver_trait),
+                disable_proxy_health_checks: true,
+                ..GatewayAppBuildOverrides::default()
+            },
+        )
+        .await;
+
+        let list_response = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.admin_token),
+                &format!("{TOOLS_ADMIN_ROUTE}?text=echo"),
+            ))
+            .await
+            .expect("tool inventory request should complete");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list = json_body(list_response).await;
+        let capability_id = list["capabilities"][0]["id"]
+            .as_str()
+            .expect("echo should have an opaque capability ID")
+            .to_owned();
+        let detail_response = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.admin_token),
+                &format!("{TOOLS_ADMIN_ROUTE}/{capability_id}"),
+            ))
+            .await
+            .expect("tool detail request should complete");
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let execution_etag = detail_response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("tool detail should include an execution ETag")
+            .to_owned();
+
+        let mut first_request = tool_playground_request(
+            Some(&harness.admin_token),
+            &capability_id,
+            Some(&execution_etag),
+            Body::from(r#"{"arguments":{"message":"occupy-runtime-permit"}}"#),
+        );
+        first_request.headers_mut().insert(
+            HeaderName::from_static(REQUEST_ID_HEADER),
+            HeaderValue::from_static(FIRST_REQUEST_ID),
+        );
+        let first = tokio::spawn({
+            let router = harness.router.clone();
+            async move {
+                router
+                    .oneshot(first_request)
+                    .await
+                    .expect("first playground request should complete")
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), first_started.notified())
+            .await
+            .expect("first request should occupy the runtime permit");
+        let dns_calls_after_first = resolver.calls.load(Ordering::SeqCst);
+        assert!(
+            dns_calls_after_first > 0,
+            "the first request should prove DNS and upstream work are instrumented"
+        );
+
+        let mut second_request = tool_playground_request(
+            Some(&harness.admin_token),
+            &capability_id,
+            Some(&execution_etag),
+            Body::from(format!(
+                r#"{{"arguments":{{"message":"{SECOND_ARGUMENT_CANARY}"}}}}"#
+            )),
+        );
+        second_request.headers_mut().insert(
+            HeaderName::from_static(REQUEST_ID_HEADER),
+            HeaderValue::from_static(SECOND_REQUEST_ID),
+        );
+        let second = tokio::spawn({
+            let router = harness.router.clone();
+            async move {
+                router
+                    .oneshot(second_request)
+                    .await
+                    .expect("queued playground request should complete")
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if capture.events().iter().any(|event| {
+                    event.request_id == SECOND_REQUEST_ID
+                        && event.event_type == "authz.allowed"
+                        && event.payload["matched_rule_id"] == json!("allow-admin-playground-echo")
+                        && event.payload["invocation_source"] == json!("admin_playground")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second request should pass normal tool policy before queueing");
+        assert!(
+            !second.is_finished(),
+            "the second request must still be queued behind the first"
+        );
+
+        harness._policy.write(&revoked_policy.to_string());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let probe = harness
+                    .router
+                    .clone()
+                    .oneshot(tool_playground_request(
+                        Some(&harness.admin_token),
+                        &capability_id,
+                        None,
+                        Body::from("not-json"),
+                    ))
+                    .await
+                    .expect("permission reload probe should complete");
+                assert_capability_inventory_no_store(&probe);
+                if probe.status() == StatusCode::FORBIDDEN {
+                    break;
+                }
+                assert_eq!(
+                    probe.status(),
+                    StatusCode::PRECONDITION_REQUIRED,
+                    "the probe may only observe the old or revoked permission state"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("live policy should revoke the execute permission");
+
+        release_first.notify_one();
+        let first_response = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first playground task should finish")
+            .expect("first playground task should join");
+        assert_eq!(first_response.status(), StatusCode::OK);
+        assert_capability_inventory_no_store(&first_response);
+        let second_response = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("queued playground task should finish")
+            .expect("queued playground task should join");
+        assert_eq!(
+            second_response.status(),
+            StatusCode::PRECONDITION_FAILED,
+            "permission revoked while queued must fail the final execution precondition"
+        );
+        assert_capability_inventory_no_store(&second_response);
+        assert_eq!(
+            json_body(second_response).await["reason"],
+            json!("precondition_failed")
+        );
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            1,
+            "the revoked queued request must not reach the upstream"
+        );
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            dns_calls_after_first,
+            "the revoked queued request must not start another DNS resolution"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if capture.events().iter().any(|event| {
+                    event.request_id == SECOND_REQUEST_ID
+                        && event.event_type == audit::event::TOOL_INVOKE_REJECTED
+                        && event.payload["reason"] == json!("precondition_failed")
+                        && event.payload["invocation_source"] == json!("admin_playground")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("queued permission revocation should emit a safe rejection audit");
+        let second_events = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.request_id == SECOND_REQUEST_ID)
+            .collect::<Vec<_>>();
+        assert!(second_events.iter().all(|event| {
+            event.event_type != audit::event::TOOL_UPSTREAM_REQUEST
+                && event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
+        }));
+        let serialized_events =
+            serde_json::to_string(&second_events).expect("audit events should serialize");
+        assert!(
+            !serialized_events.contains(SECOND_ARGUMENT_CANARY),
+            "queued request arguments must not enter audit payloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_playground_preserves_arbitrary_precision_numbers_to_http_upstream() {
+        const INPUT_ARGUMENTS: &str = r#"{"beyond_u64":18446744073709551616,"high_precision_decimal":0.123456789012345678901234567890123456789,"huge_exponent":1e400}"#;
+        const EXPECTED_UPSTREAM_BODY: &str = r#"{"beyond_u64":18446744073709551616,"high_precision_decimal":0.123456789012345678901234567890123456789,"huge_exponent":1e+400}"#;
+
+        let captured_body = Arc::new(Mutex::new(None::<String>));
+        let upstream = Router::new().route(
+            "/v1/echo",
+            post({
+                let captured_body = Arc::clone(&captured_body);
+                move |body: Bytes| {
+                    let captured_body = Arc::clone(&captured_body);
+                    async move {
+                        let body = String::from_utf8(body.to_vec())
+                            .expect("playground upstream body should be UTF-8 JSON");
+                        *captured_body
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(body);
+                        Json(json!({ "accepted": true }))
+                    }
+                }
+            }),
+        );
+        let upstream_addr = spawn_router(upstream).await;
+        let tools_document = json!({
+            "schema_version": "0.1.0",
+            "tools": [{
+                "name": "echo",
+                "description": "Preserves arbitrary-precision numeric arguments.",
+                "input_json_schema": {
+                    "type": "object",
+                    "required": ["beyond_u64", "high_precision_decimal", "huge_exponent"],
+                    "properties": {
+                        "beyond_u64": { "type": "integer" },
+                        "high_precision_decimal": { "type": "number" },
+                        "huge_exponent": { "type": "number" }
+                    },
+                    "additionalProperties": false
+                },
+                "upstream": {
+                    "method": "POST",
+                    "path_template": "/v1/echo",
+                    "body": {
+                        "mode": "whole_args_json"
+                    }
+                }
+            }]
+        })
+        .to_string();
+        let harness = tools_admin_harness_with_upstream(
+            tools_document,
+            test_audit_log(),
+            format!("http://{upstream_addr}"),
+        )
+        .await;
+
+        let list_response = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.admin_token),
+                &format!("{TOOLS_ADMIN_ROUTE}?text=echo"),
+            ))
+            .await
+            .expect("tool inventory request should complete");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list = json_body(list_response).await;
+        let capability_id = list["capabilities"][0]["id"]
+            .as_str()
+            .expect("echo should have an opaque capability ID")
+            .to_owned();
+        let detail_response = harness
+            .router
+            .clone()
+            .oneshot(tools_inventory_request(
+                Some(&harness.admin_token),
+                &format!("{TOOLS_ADMIN_ROUTE}/{capability_id}"),
+            ))
+            .await
+            .expect("tool detail request should complete");
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let execution_etag = detail_response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("tool detail should include an execution ETag")
+            .to_owned();
+
+        let response = harness
+            .router
+            .oneshot(tool_playground_request(
+                Some(&harness.admin_token),
+                &capability_id,
+                Some(&execution_etag),
+                Body::from(format!(r#"{{"arguments":{INPUT_ARGUMENTS}}}"#)),
+            ))
+            .await
+            .expect("arbitrary-precision playground request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_capability_inventory_no_store(&response);
+        assert_eq!(
+            captured_body
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_deref(),
+            Some(EXPECTED_UPSTREAM_BODY),
+            "the endpoint parser and whole-args HTTP mapping must preserve exact numeric values; serde_json may normalize the positive exponent sign"
+        );
     }
 
     #[tokio::test]
@@ -32408,13 +33500,60 @@ paths:
         tools_document: String,
         audit_log: audit::AuditLog,
     ) -> ToolsAdminTestHarness {
+        tools_admin_harness_with_upstream(
+            tools_document,
+            audit_log,
+            "http://127.0.0.1:65535".to_owned(),
+        )
+        .await
+    }
+
+    async fn tools_admin_harness_with_upstream(
+        tools_document: String,
+        audit_log: audit::AuditLog,
+        upstream_url: String,
+    ) -> ToolsAdminTestHarness {
+        tools_admin_harness_with_policy_and_upstream(
+            tools_document,
+            audit_log,
+            upstream_url,
+            tools_policy_document(),
+        )
+        .await
+    }
+
+    async fn tools_admin_harness_with_policy_and_upstream(
+        tools_document: String,
+        audit_log: audit::AuditLog,
+        upstream_url: String,
+        policy_document: String,
+    ) -> ToolsAdminTestHarness {
+        tools_admin_harness_with_options(
+            tools_document,
+            audit_log,
+            upstream_url,
+            policy_document,
+            |_| {},
+            GatewayAppBuildOverrides::default(),
+        )
+        .await
+    }
+
+    async fn tools_admin_harness_with_options(
+        tools_document: String,
+        audit_log: audit::AuditLog,
+        upstream_url: String,
+        policy_document: String,
+        configure: impl FnOnce(&mut config::Config),
+        build_overrides: GatewayAppBuildOverrides,
+    ) -> ToolsAdminTestHarness {
         let token_db = TempDb::new("tools-admin-service-tokens");
         let token_store =
             auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
         let admin_token = create_service_token(&token_store, &["admin"]);
         let reader_token = create_service_token(&token_store, &["tools-reader"]);
         let blocked_token = create_service_token(&token_store, &["blocked"]);
-        let policy = TempPolicyFile::new(&tools_policy_document());
+        let policy = TempPolicyFile::new(&policy_document);
         let tools = TempToolsFile::new(&tools_document);
 
         let mut config = test_config(Vec::new());
@@ -32422,18 +33561,25 @@ paths:
         config.tools_file = Some(tools.path.to_string_lossy().into_owned());
         config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
         config.service_token_cache_ttl_ms = 20;
-        config.upstream_url = Some("http://127.0.0.1:65535".to_owned());
+        config.upstream_url = Some(upstream_url);
         config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
         config.egress_deny_private_ips = false;
+        configure(&mut config);
 
         let recorder = PrometheusBuilder::new().build_recorder();
-        let router = app(
+        let app = gateway_app_with_process_started_at_and_overrides(
             config,
             recorder.handle(),
             audit_log,
             test_audit_event_sender(),
+            Instant::now(),
+            build_overrides,
         )
         .expect("tools admin test app should build");
+        let router = match app {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("tools admin test app should be unified"),
+        };
 
         ToolsAdminTestHarness {
             router,
@@ -32454,6 +33600,27 @@ paths:
         builder
             .body(Body::empty())
             .expect("capability inventory request should build")
+    }
+
+    fn tool_playground_request(
+        token: Option<&str>,
+        capability_id: &str,
+        if_match: Option<&str>,
+        body: impl Into<Body>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{TOOLS_ADMIN_ROUTE}/{capability_id}/execute"))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if let Some(if_match) = if_match {
+            builder = builder.header(header::IF_MATCH, if_match);
+        }
+        builder
+            .body(body.into())
+            .expect("tool playground request should build")
     }
 
     fn assert_capability_inventory_no_store(response: &Response) {
@@ -32510,6 +33677,12 @@ paths:
     }
 
     fn tools_policy_document() -> String {
+        tools_policy_document_with_execute_route_permission(ADMIN_TOOLS_EXECUTE_PERMISSION)
+    }
+
+    fn tools_policy_document_with_execute_route_permission(
+        route_permission: &'static str,
+    ) -> String {
         json!({
             "schema_version": "0.1.0",
             "id": "tools-admin-policy",
@@ -32520,6 +33693,7 @@ paths:
                     "permissions": [
                         ADMIN_TOOLS_READ_PERMISSION,
                         ADMIN_TOOLS_WRITE_PERMISSION,
+                        ADMIN_TOOLS_EXECUTE_PERMISSION,
                         ADMIN_MCP_USE_PERMISSION
                     ]
                 },
@@ -32545,11 +33719,26 @@ paths:
                 },
                 {
                     "methods": ["POST"],
+                    "path_prefix": TOOLS_ADMIN_ROUTE,
+                    "permission": route_permission
+                },
+                {
+                    "methods": ["POST"],
                     "path_prefix": MCP_ROUTE,
                     "permission": ADMIN_MCP_USE_PERMISSION
                 }
             ],
             "tools": {
+                "echo": {
+                    "allowed_roles": ["admin"],
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                },
+                "get_widget": {
+                    "allowed_roles": ["admin"],
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                },
                 "createWidget": {
                     "allowed_roles": ["admin"],
                     "timeout_ms": 5000,

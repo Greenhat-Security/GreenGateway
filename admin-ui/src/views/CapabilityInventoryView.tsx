@@ -628,9 +628,19 @@ export function CapabilityDetail() {
             <p className="eyebrow">Capability</p>
             <h2 id="capability-detail-heading">{heading}</h2>
           </div>
-          <Link className="secondary-button" to="/tools">
-            Back to inventory
-          </Link>
+          <div className="capability-actions">
+            {detail?.actions.can_execute ? (
+              <Link
+                className="primary-button"
+                to={`/tools/${encodeURIComponent(detail.id)}/playground`}
+              >
+                Open playground
+              </Link>
+            ) : null}
+            <Link className="secondary-button" to="/tools">
+              Back to inventory
+            </Link>
+          </div>
         </div>
 
         {loadError ? (
@@ -650,6 +660,12 @@ export function CapabilityDetail() {
 
         {!isLoading && detail !== null ? (
           <>
+            {!detail.actions.can_execute ? (
+              <div className="alert info" role="status">
+                <strong>Playground unavailable:</strong>{' '}
+                {humanizeIdentifier(detail.actions.reason)}
+              </div>
+            ) : null}
             <CapabilitySummarySection detail={detail} />
             <CapabilityProvenanceSection detail={detail} />
             <CapabilityMappingSection detail={detail} />
