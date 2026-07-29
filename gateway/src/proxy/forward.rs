@@ -4531,7 +4531,9 @@ mod tests {
     }
 
     async fn wait_for_stream_audit(sink: &CaptureSink, request_id: &str) -> audit::AuditEvent {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        // Audit dispatch is asynchronous, and loaded CI runners can delay it after
+        // the stream finishes. Keep the wait bounded without testing scheduler speed.
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(event) = sink.events().into_iter().find(|event| {
                     event.event_type == audit::event::UPSTREAM_STREAM_TERMINATED

@@ -3316,6 +3316,20 @@ async fn connection_secret_rotate_endpoint(
 
     let current = match local_secret_metadata(&state, &raw_id) {
         Ok(current) => current,
+        Err(response) if response.status() == StatusCode::NOT_FOUND => {
+            if let Err(error) =
+                if_match_matches(&parts.headers, "\"connection-secret:no-current-version\"")
+            {
+                return if_match_error_response(error);
+            }
+            let current_collection_etag = connections::admin::secret_collection_etag(
+                &state.control_plane.secret_alias_metadata(),
+            );
+            return with_connection_secret_collection_etag(
+                precondition_failed("If-Match does not match an existing connection secret"),
+                &current_collection_etag,
+            );
+        }
         Err(response) => return *response,
     };
     let current_etag = connections::admin::secret_metadata_etag(&current);
@@ -22891,6 +22905,36 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("a disappeared item should return the current secret collection validator")
             .to_owned();
+        let missing_rotate = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &local_uri,
+                Some(principal.clone()),
+                Some(
+                    json!({
+                        "purpose": "static_bearer",
+                        "value": "missing-rotate-after-delete-canary"
+                    })
+                    .to_string(),
+                ),
+                Some(&rotated_etag),
+                true,
+            ))
+            .await
+            .expect("rotate of an already-deleted secret should complete");
+        assert_eq!(missing_rotate.status(), StatusCode::PRECONDITION_FAILED);
+        assert!(
+            !missing_rotate.headers().contains_key(header::ETAG),
+            "an already-deleted item has no current item validator"
+        );
+        let missing_rotate_collection_etag = missing_rotate
+            .headers()
+            .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("an already-deleted item should return the current collection validator")
+            .to_owned();
+
         let after_delete = router
             .clone()
             .oneshot(connection_admin_request(
@@ -22910,6 +22954,13 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(delete_loser_collection_etag.as_str())
         );
+        assert_eq!(
+            after_delete
+                .headers()
+                .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(missing_rotate_collection_etag.as_str())
+        );
 
         let secret_events = capture
             .events()
@@ -22924,6 +22975,7 @@ mod tests {
             "race-create-two-canary",
             "race-rotate-one-canary",
             "race-rotate-two-canary",
+            "missing-rotate-after-delete-canary",
         ] {
             assert!(!serialized.contains(secret));
         }
