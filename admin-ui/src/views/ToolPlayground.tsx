@@ -19,7 +19,9 @@ import {
   isStrongExecutionEtag,
 } from '../lib/toolPlayground';
 
-const MAX_ARGUMENT_INPUT_BYTES = 65_536;
+// The backend's 64 KiB request limit includes the fixed
+// `{"arguments":...}` envelope added by the API client.
+const MAX_ARGUMENT_INPUT_BYTES = 65_536 - 14;
 const EMPTY_ARGUMENTS = '{}';
 
 type PlaygroundFeedback = {
@@ -144,7 +146,6 @@ export function ToolPlayground() {
     argumentsRef.current = EMPTY_ARGUMENTS;
     setArgumentsText(EMPTY_ARGUMENTS);
 
-    let submittedArguments: Record<string, unknown> | null = null;
     try {
       if (utf8Length(submittedText) > MAX_ARGUMENT_INPUT_BYTES) {
         throw new Error('too large');
@@ -160,8 +161,6 @@ export function ToolPlayground() {
         });
         return;
       }
-      submittedArguments = parsed;
-      submittedText = '';
     } catch {
       submittedText = '';
       setRunFeedback({
@@ -178,7 +177,7 @@ export function ToolPlayground() {
       !detail.actions.can_execute ||
       etag === null
     ) {
-      submittedArguments = null;
+      submittedText = '';
       setRunFeedback({
         tone: 'warning',
         title: 'Tool execution unavailable',
@@ -196,13 +195,14 @@ export function ToolPlayground() {
     setAnnouncement('Tool execution started. Submitted arguments were cleared.');
 
     try {
-      const resource = await executeCapability(
+      const execution = executeCapability(
         detail.id,
-        submittedArguments,
+        submittedText,
         etag,
         controller.signal,
       );
-      submittedArguments = null;
+      submittedText = '';
+      const resource = await execution;
       if (controller.signal.aborted) {
         return;
       }
@@ -210,7 +210,7 @@ export function ToolPlayground() {
       setRunFeedback(null);
       setAnnouncement('Tool execution completed.');
     } catch (error) {
-      submittedArguments = null;
+      submittedText = '';
       if (controller.signal.aborted) {
         return;
       }
@@ -226,7 +226,7 @@ export function ToolPlayground() {
       setRunFeedback(playgroundRunError(error));
       setAnnouncement('Tool execution failed. No result was retained.');
     } finally {
-      submittedArguments = null;
+      submittedText = '';
       if (executionController.current === controller) {
         executionController.current = null;
       }

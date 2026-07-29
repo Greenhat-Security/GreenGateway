@@ -5494,6 +5494,21 @@ async fn tool_playground_execute_endpoint(
     let projected = match tools::playground::project_tool_execution_result(result) {
         Ok(projected) => projected,
         Err(error) => {
+            state.audit.emit(audit::AuditEvent::new(
+                audit::event::TOOL_PLAYGROUND_OUTPUT_REJECTED,
+                client_ip::request_id(&parts.headers, &parts.extensions),
+                client_ip::canonical_client_ip(
+                    &parts.headers,
+                    &parts.extensions,
+                    &state.client_ip_policy,
+                ),
+                Some(auth::actor_from_principal(&principal)),
+                json!({
+                    "tool_name": definition.name.as_str(),
+                    "reason": error.reason(),
+                    "invocation_source": "admin_playground",
+                }),
+            ));
             return tool_playground_error_response(
                 StatusCode::BAD_GATEWAY,
                 "tool execution output was rejected",
@@ -24527,6 +24542,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_playground_enforces_permission_validator_and_strict_body_before_upstream() {
+        const REJECTED_OUTPUT_CANARY: &str = "Bearer playground-reflected-credential-output-canary";
         let upstream_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&upstream_calls);
         let upstream = Router::new().route(
@@ -24535,7 +24551,22 @@ mod tests {
                 let calls = Arc::clone(&calls);
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    Json(json!({ "echoed": arguments }))
+                    if arguments["message"] == json!("emit-unsafe-binary-output") {
+                        let mut body = format!(
+                            "authorization={REJECTED_OUTPUT_CANARY}; api_key=reflected-key"
+                        )
+                        .into_bytes();
+                        body.push(0xff);
+                        return (
+                            [(
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("application/octet-stream"),
+                            )],
+                            body,
+                        )
+                            .into_response();
+                    }
+                    Json(json!({ "echoed": arguments })).into_response()
                 }
             }),
         );
@@ -24729,6 +24760,29 @@ mod tests {
             "stale validators must fail before upstream I/O"
         );
 
+        let rejected_output = harness
+            .router
+            .clone()
+            .oneshot(tool_playground_request(
+                Some(&harness.admin_token),
+                &capability_id,
+                Some(&execution_etag),
+                Body::from(r#"{"arguments":{"message":"emit-unsafe-binary-output"}}"#),
+            ))
+            .await
+            .expect("unsafe-output playground request should complete");
+        assert_eq!(rejected_output.status(), StatusCode::BAD_GATEWAY);
+        assert_capability_inventory_no_store(&rejected_output);
+        let rejected_output_body = json_body(rejected_output).await;
+        assert_eq!(rejected_output_body["reason"], json!("unsupported_output"));
+        assert!(
+            !rejected_output_body
+                .to_string()
+                .contains(REJECTED_OUTPUT_CANARY),
+            "rejected upstream output must not be reflected to the administrator"
+        );
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+
         let success = harness
             .router
             .clone()
@@ -24755,7 +24809,7 @@ mod tests {
             success_body["body"]["value"]["echoed"]["message"],
             json!(argument_canary)
         );
-        assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 2);
 
         assert_eventually(Duration::from_secs(1), || {
             let events = capture.events();
@@ -24765,6 +24819,10 @@ mod tests {
             }) && events.iter().any(|event| {
                 event.event_type == audit::event::TOOL_INVOKE_SUCCESS
                     && event.payload["invocation_source"] == json!("admin_playground")
+            }) && events.iter().any(|event| {
+                event.event_type == audit::event::TOOL_PLAYGROUND_OUTPUT_REJECTED
+                    && event.payload["invocation_source"] == json!("admin_playground")
+                    && event.payload["reason"] == json!("unsupported_output")
             })
         });
         let events = capture.events();
@@ -24786,11 +24844,30 @@ mod tests {
             }),
             "normal execution audit events should retain playground provenance: {events:#?}"
         );
+        let output_rejection = events
+            .iter()
+            .find(|event| {
+                event.event_type == audit::event::TOOL_PLAYGROUND_OUTPUT_REJECTED
+                    && event.payload["invocation_source"] == json!("admin_playground")
+            })
+            .expect("the post-execution playground output gate should emit a rejection event");
+        assert_eq!(
+            output_rejection.payload,
+            json!({
+                "tool_name": "echo",
+                "reason": "unsupported_output",
+                "invocation_source": "admin_playground",
+            })
+        );
+        let serialized_events =
+            serde_json::to_string(&events).expect("audit events should serialize");
         assert!(
-            !serde_json::to_string(&events)
-                .expect("audit events should serialize")
-                .contains(argument_canary),
+            !serialized_events.contains(argument_canary),
             "arguments and results must never enter playground audit payloads"
+        );
+        assert!(
+            !serialized_events.contains(REJECTED_OUTPUT_CANARY),
+            "rejected output bytes must never enter playground audit payloads"
         );
     }
 

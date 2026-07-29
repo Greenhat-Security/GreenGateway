@@ -48,7 +48,7 @@ describe('tool playground API client', () => {
 
     const resource = await executeCapability(
       'cap_abc/def',
-      { invoice_id: 'inv-1' },
+      '{"invoice_id":"inv-1"}',
       '"capability:v7"',
     );
 
@@ -130,7 +130,7 @@ describe('tool playground API client', () => {
 
     const resource = await executeCapability(
       'cap_abc',
-      {},
+      '{}',
       '"capability:v1"',
     );
 
@@ -160,7 +160,7 @@ describe('tool playground API client', () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
     await expect(
-      executeCapability('cap_abc', {}, 'W/"weak"'),
+      executeCapability('cap_abc', '{}', 'W/"weak"'),
     ).rejects.toBeInstanceOf(ToolExecutionContractError);
     expect(fetchMock).not.toHaveBeenCalled();
 
@@ -179,7 +179,7 @@ describe('tool playground API client', () => {
       );
       const error = await executeCapability(
         'cap_abc',
-        {},
+        '{}',
         '"capability:v1"',
       ).catch((caught: unknown) => caught);
       expect(error).toMatchObject({
@@ -219,8 +219,58 @@ describe('tool playground API client', () => {
       ),
     );
     await expect(
-      executeCapability('cap_abc', {}, '"capability:v1"'),
+      executeCapability('cap_abc', '{}', '"capability:v1"'),
     ).rejects.toBeInstanceOf(ToolExecutionContractError);
+  });
+
+  it('preserves large integers and overflowing exponents exactly on the wire', async () => {
+    const argumentsJson =
+      '{"large":9007199254740993,"exponent":1e400}';
+    const fetchMock = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) => {
+        expect(init?.body).toBe(`{"arguments":${argumentsJson}}`);
+        return Promise.resolve(
+          jsonResponse(
+            200,
+            {
+              kind: 'http',
+              status: 200,
+              body: { type: 'text', value: 'ok' },
+            },
+            { ETag: '"capability:v1"' },
+          ),
+        );
+      },
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await executeCapability(
+      'cap_abc',
+      argumentsJson,
+      '"capability:v1"',
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['malformed JSON', '{"value":'],
+    ['an array', '[1,2]'],
+    ['a scalar', '"value"'],
+    ['null', 'null'],
+    ['an oversized object', `{"value":"${'x'.repeat(65_536)}"}`],
+  ])('does not request execution for %s', async (_label, argumentsJson) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      executeCapability(
+        'cap_abc',
+        argumentsJson,
+        '"capability:v1"',
+      ),
+    ).rejects.toBeInstanceOf(ToolExecutionContractError);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

@@ -9,6 +9,8 @@ use crate::{egress::EgressResponse, tools::executor::ToolExecutionResult};
 
 pub const TOOL_PLAYGROUND_REQUEST_LIMIT_BYTES: usize = 64 * 1024;
 pub const TOOL_PLAYGROUND_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
+const HTTP_NON_SUCCESS_BODY_MESSAGE: &str =
+    "Upstream returned a non-success status; response body was withheld.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +67,17 @@ pub fn project_tool_execution_result(
 }
 
 fn project_http_response(response: EgressResponse) -> Result<Value, ToolPlaygroundOutputError> {
+    if !response.status.is_success() {
+        return Ok(json!({
+            "kind": "http",
+            "status": response.status.as_u16(),
+            "body": {
+                "type": "text",
+                "value": HTTP_NON_SUCCESS_BODY_MESSAGE,
+            },
+        }));
+    }
+
     let body = if response_is_json(&response.headers) {
         match serde_json::from_slice::<Value>(&response.body) {
             Ok(value) => json!({
@@ -325,6 +338,64 @@ mod tests {
     }
 
     #[test]
+    fn non_success_json_http_projection_withholds_credential_reflecting_body() {
+        let authorization_canary = "Bearer reflected-authorization-canary";
+        let api_key_canary = "reflected-api-key-canary";
+        let projected = project_tool_execution_result(http_result_with_status(
+            StatusCode::UNAUTHORIZED,
+            Some("application/problem+json"),
+            serde_json::to_vec(&json!({
+                "authorization": authorization_canary,
+                "api_key": api_key_canary,
+            }))
+            .expect("credential canary fixture should serialize"),
+        ))
+        .expect("non-success JSON output should use the safe projection");
+
+        assert_eq!(
+            projected,
+            json!({
+                "kind": "http",
+                "status": 401,
+                "body": {
+                    "type": "text",
+                    "value": HTTP_NON_SUCCESS_BODY_MESSAGE,
+                }
+            })
+        );
+        let serialized = projected.to_string();
+        assert!(!serialized.contains(authorization_canary));
+        assert!(!serialized.contains(api_key_canary));
+    }
+
+    #[test]
+    fn non_success_text_http_projection_withholds_credential_reflecting_body() {
+        let authorization_canary = "Basic reflected-authorization-canary";
+        let api_key_canary = "reflected-api-key-canary";
+        let projected = project_tool_execution_result(http_result_with_status(
+            StatusCode::BAD_GATEWAY,
+            Some("text/plain"),
+            format!("authorization={authorization_canary}; api_key={api_key_canary}").into_bytes(),
+        ))
+        .expect("non-success text output should use the safe projection");
+
+        assert_eq!(
+            projected,
+            json!({
+                "kind": "http",
+                "status": 502,
+                "body": {
+                    "type": "text",
+                    "value": HTTP_NON_SUCCESS_BODY_MESSAGE,
+                }
+            })
+        );
+        let serialized = projected.to_string();
+        assert!(!serialized.contains(authorization_canary));
+        assert!(!serialized.contains(api_key_canary));
+    }
+
+    #[test]
     fn binary_http_output_is_rejected_with_stable_reason() {
         let error = project_tool_execution_result(http_result(None, vec![0xff, 0xfe, 0xfd]))
             .expect_err("non-UTF-8 HTTP output must fail closed");
@@ -495,6 +566,14 @@ mod tests {
     }
 
     fn http_result(content_type: Option<&str>, body: Vec<u8>) -> ToolExecutionResult {
+        http_result_with_status(StatusCode::OK, content_type, body)
+    }
+
+    fn http_result_with_status(
+        status: StatusCode,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> ToolExecutionResult {
         let mut headers = HeaderMap::new();
         if let Some(content_type) = content_type {
             headers.insert(
@@ -504,7 +583,7 @@ mod tests {
             );
         }
         ToolExecutionResult::Http(EgressResponse {
-            status: StatusCode::OK,
+            status,
             headers,
             body,
         })

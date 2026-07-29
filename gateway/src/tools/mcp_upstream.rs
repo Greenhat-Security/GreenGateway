@@ -971,6 +971,7 @@ fn discovery_shutdown_completed_cleanly<E>(close_result: &Result<Option<QuitReas
     )
 }
 
+#[cfg(test)]
 pub async fn call_connection_tool(
     runtime: &ConnectionHttpRuntime,
     connection_id: &str,
@@ -986,6 +987,15 @@ pub async fn call_connection_tool(
             reason: "catalog_stale",
         });
     }
+    call_connection_tool_at_target(runtime, target, remote_tool_name, args).await
+}
+
+pub async fn call_connection_tool_at_target(
+    runtime: &ConnectionHttpRuntime,
+    target: ConnectionHttpTarget,
+    remote_tool_name: &str,
+    args: Value,
+) -> Result<CallToolResult, McpUpstreamCallError> {
     let runtime_config = McpUpstreamRuntimeConfig::from_connection_target(&target);
     let arguments = match args {
         Value::Object(arguments) => arguments,

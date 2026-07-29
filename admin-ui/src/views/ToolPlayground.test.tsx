@@ -26,6 +26,9 @@ describe('ToolPlayground', () => {
       '<img src=x onerror=PLAYGROUND_RESULT_CANARY><script>bad()</script>';
     const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
     const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const argumentsJson =
+      `{"value":"${argumentCanary}",` +
+      '"large":9007199254740993,"exponent":1e400}';
     const requests: RequestInit[] = [];
     vi.stubGlobal(
       'fetch',
@@ -60,7 +63,7 @@ describe('ToolPlayground', () => {
     ) as HTMLTextAreaElement;
     expect(editor.value).toBe('{}');
     fireEvent.change(editor, {
-      target: { value: JSON.stringify({ value: argumentCanary }) },
+      target: { value: argumentsJson },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Run tool' }));
 
@@ -75,9 +78,9 @@ describe('ToolPlayground', () => {
     expect(new Headers(requests[0].headers).get('If-Match')).toBe(
       '"capability:v1"',
     );
-    expect(JSON.parse(String(requests[0].body))).toEqual({
-      arguments: { value: argumentCanary },
-    });
+    expect(String(requests[0].body)).toBe(
+      `{"arguments":${argumentsJson}}`,
+    );
     expect(String(requests[0].body)).not.toContain('url');
     expect(String(requests[0].body)).not.toContain('headers');
     expect(JSON.stringify(window.localStorage)).not.toContain(argumentCanary);
@@ -131,6 +134,15 @@ describe('ToolPlayground', () => {
     expect(await screen.findByText('JSON object required')).toBeTruthy();
     expect(editor.value).toBe('{}');
     expect(screen.queryByText('old result')).toBeNull();
+    expect(executions).toBe(1);
+
+    fireEvent.change(editor, { target: { value: '{"value":' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run tool' }));
+
+    expect(
+      await screen.findByText('Valid JSON object required'),
+    ).toBeTruthy();
+    expect(editor.value).toBe('{}');
     expect(executions).toBe(1);
   });
 

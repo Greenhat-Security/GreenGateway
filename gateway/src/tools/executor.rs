@@ -677,8 +677,21 @@ impl ToolExecutor {
                 &tool,
                 duration_millis(validation_started.elapsed()),
             )?;
+            let captured_connection_target = self.capture_mcp_connection_target(&tool, &mapping);
             self.enforce_execution_precondition(context, &tool, precondition)?;
-            return self.execute_mcp_proxy(context, &tool, mapping, args).await;
+            if precondition.is_some()
+                && captured_connection_target
+                    .as_ref()
+                    .and_then(|target| target.as_ref().ok())
+                    .is_some_and(|target| !self.mcp_connection_target_is_current(target))
+            {
+                return Err(ToolExecutorError::PreconditionFailed {
+                    tool_name: tool.name.clone(),
+                });
+            }
+            return self
+                .execute_mcp_proxy(context, &tool, mapping, args, captured_connection_target)
+                .await;
         }
 
         let request_build_started = Instant::now();
@@ -709,10 +722,15 @@ impl ToolExecutor {
             &tool,
             duration_millis(request_build_started.elapsed()),
         )?;
-        self.enforce_execution_precondition(context, &tool, precondition)?;
         let started = Instant::now();
         let request_method = request.method.clone();
-        let (result, connection_id) = match (&tool.target, &tool.source) {
+        // Capture an immutable Connection target before evaluating the final
+        // execution precondition. The precondition may read the old revision
+        // immediately before a concurrent update publishes a new one; the
+        // post-check below detects that race, while successful execution keeps
+        // using only this captured target instead of rebuilding it from mutable
+        // control-plane state.
+        let captured_connection_target = match (&tool.target, &tool.source) {
             (
                 Some(ToolTarget::Http { connection_id, .. }),
                 ToolSource::OpenApi {
@@ -748,9 +766,55 @@ impl ToolExecutor {
                 return Err(error);
             }
             (Some(ToolTarget::Http { connection_id, .. }), _) => {
-                let result = self
-                    .execute_connection_http(context, &tool, connection_id, request)
-                    .await;
+                let target = self
+                    .connection_http
+                    .as_ref()
+                    .ok_or_else(|| ToolExecutorError::Connection {
+                        tool_name: tool.name.clone(),
+                        reason: "connection_runtime_unavailable",
+                    })
+                    .and_then(|runtime| {
+                        runtime
+                            .target(connection_id, &request.path_and_query)
+                            .map_err(|error| connection_tool_error(&tool, error))
+                    });
+                Some(target)
+            }
+            (Some(ToolTarget::Mcp { .. }), _) => None,
+            (None, _) => None,
+        };
+        self.enforce_execution_precondition(context, &tool, precondition)?;
+        if precondition.is_some()
+            && captured_connection_target
+                .as_ref()
+                .and_then(|target| target.as_ref().ok())
+                .is_some_and(|target| {
+                    !self
+                        .connection_http
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.target_is_current(target))
+                })
+        {
+            return Err(ToolExecutorError::PreconditionFailed {
+                tool_name: tool.name.clone(),
+            });
+        }
+
+        let (result, connection_id) = match (&tool.target, captured_connection_target) {
+            (Some(ToolTarget::Http { connection_id, .. }), target) => {
+                let target = target.unwrap_or_else(|| {
+                    Err(ToolExecutorError::Connection {
+                        tool_name: tool.name.clone(),
+                        reason: "connection_runtime_unavailable",
+                    })
+                });
+                let result = match target {
+                    Ok(target) => {
+                        self.execute_connection_http(context, &tool, target, request)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
                 (result, Some(connection_id.as_str()))
             }
             (Some(ToolTarget::Mcp { .. }), _) => {
@@ -895,11 +959,63 @@ impl ToolExecutor {
         Err(error)
     }
 
+    fn capture_mcp_connection_target(
+        &self,
+        tool: &ToolDefinition,
+        mapping: &McpProxyMapping,
+    ) -> Option<Result<ConnectionHttpTarget, &'static str>> {
+        let Some(ToolTarget::Mcp {
+            connection_id,
+            remote_tool_name,
+        }) = &tool.target
+        else {
+            return None;
+        };
+        if connection_id != &mapping.server_name || remote_tool_name != &mapping.tool_name {
+            return None;
+        }
+        let Some(runtime) = self.connection_http.as_ref() else {
+            return Some(Err("connection_runtime_unavailable"));
+        };
+        let Some(expected_etag) = self
+            .mcp_catalog_runtime
+            .as_ref()
+            .and_then(|catalog| catalog.expected_connection_etag(connection_id))
+        else {
+            return Some(Err("catalog_stale"));
+        };
+        Some(
+            runtime
+                .mcp_target(connection_id)
+                .map_err(|error| error.safe_reason())
+                .and_then(|target| {
+                    if target.connection_etag() == expected_etag {
+                        Ok(target)
+                    } else {
+                        Err("catalog_stale")
+                    }
+                }),
+        )
+    }
+
+    fn mcp_connection_target_is_current(&self, target: &ConnectionHttpTarget) -> bool {
+        self.connection_http
+            .as_ref()
+            .is_some_and(|runtime| runtime.target_is_current(target))
+            && self
+                .mcp_catalog_runtime
+                .as_ref()
+                .and_then(|catalog| {
+                    catalog.expected_connection_etag(target.connection_id().as_str())
+                })
+                .is_some_and(|etag| etag == target.connection_etag())
+    }
+
     async fn execute_connection_http(
         &self,
         context: &ToolInvocationContext,
         tool: &ToolDefinition,
-        connection_id: &str,
+        target: ConnectionHttpTarget,
         mut request: ToolUpstreamRequest,
     ) -> Result<EgressResponse, ToolExecutorError> {
         let runtime =
@@ -909,9 +1025,6 @@ impl ToolExecutor {
                     tool_name: tool.name.clone(),
                     reason: "connection_runtime_unavailable",
                 })?;
-        let target = runtime
-            .target(connection_id, &request.path_and_query)
-            .map_err(|error| connection_tool_error(tool, error))?;
         if matches!(tool.source, ToolSource::OpenApi { .. })
             && !self
                 .openapi_catalog_runtime
@@ -1026,6 +1139,7 @@ impl ToolExecutor {
         tool: &ToolDefinition,
         mapping: McpProxyMapping,
         args: Value,
+        captured_connection_target: Option<Result<ConnectionHttpTarget, &'static str>>,
     ) -> Result<ToolExecutionResult, ToolExecutorError> {
         let started = Instant::now();
         let managed_connection_id = match &tool.target {
@@ -1048,17 +1162,24 @@ impl ToolExecutor {
                     "connection_runtime_unavailable",
                 );
             };
-            let Some(expected_etag) = self
-                .mcp_catalog_runtime
-                .as_ref()
-                .and_then(|runtime| runtime.expected_connection_etag(connection_id))
-            else {
-                return self.mcp_proxy_preflight_error(context, tool, &mapping, "catalog_stale");
+            let target = match captured_connection_target {
+                Some(Ok(target)) => target,
+                Some(Err(reason)) => {
+                    return self.mcp_proxy_preflight_error(context, tool, &mapping, reason);
+                }
+                None => {
+                    return self.mcp_proxy_preflight_error(
+                        context,
+                        tool,
+                        &mapping,
+                        "catalog_stale",
+                    );
+                }
             };
-            mcp_upstream::call_connection_tool(
+            debug_assert_eq!(target.connection_id().as_str(), connection_id);
+            mcp_upstream::call_connection_tool_at_target(
                 connection_http,
-                connection_id,
-                &expected_etag,
+                target,
                 &mapping.tool_name,
                 args,
             )
@@ -1358,6 +1479,7 @@ impl ToolExecutor {
                 "consumer_id": tool.name,
                 "outcome": "failure",
                 "reason": reason,
+                "invocation_source": context.source.as_str(),
             }),
         ));
     }
@@ -3046,6 +3168,7 @@ mod tests {
 
     #[tokio::test]
     async fn connection_tool_secret_failure_is_safe_and_audited_without_upstream_bytes() {
+        const ARGUMENT_CANARY: &str = "admin-playground-argument-canary";
         let (addr, ca_pem, server) = one_request_tls_server().await;
         let connection =
             TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"never-log-this");
@@ -3063,12 +3186,14 @@ mod tests {
             runtime,
             audit,
         );
+        let mut context = invocation_context();
+        context.source = ToolInvocationSource::AdminPlayground;
 
         let error = executor
             .execute(
                 "get_charge",
-                json!({ "charge_id": "ch_secret_failure" }),
-                invocation_context(),
+                json!({ "charge_id": ARGUMENT_CANARY }),
+                context,
                 CancellationToken::new(),
             )
             .await
@@ -3091,14 +3216,115 @@ mod tests {
         assert_eq!(failure.payload["consumer_id"], json!("get_charge"));
         assert_eq!(failure.payload["auth_type"], json!("header_api_key"));
         assert_eq!(failure.payload["reason"], json!("credential_unavailable"));
-        let rendered_events = format!("{events:?}");
+        assert_eq!(
+            failure.payload["invocation_source"],
+            json!("admin_playground")
+        );
+        assert!(failure.payload.get("arguments").is_none());
+        let rendered_events =
+            serde_json::to_string(&events).expect("audit events should serialize");
         assert!(!rendered_events.contains("never-log-this"));
+        assert!(!rendered_events.contains(ARGUMENT_CANARY));
         assert!(!rendered_events.contains(&format!("https://127.0.0.1:{}", addr.port())));
         assert!(
             tokio::time::timeout(Duration::from_millis(100), server)
                 .await
                 .is_err(),
             "credential resolution failure must happen before upstream bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_change_during_execution_precondition_fails_before_secret_or_upstream_io() {
+        const ARGUMENT_CANARY: &str = "connection-race-argument-canary";
+        const SECRET_CANARY: &str = "connection-race-secret-canary";
+
+        let (addr, ca_pem, server) = one_request_tls_server().await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, SECRET_CANARY.as_bytes());
+        let record = connection
+            .control_plane
+            .runtime_snapshot()
+            .managed()
+            .values()
+            .find(|record| record.id.as_str() == connection.connection_id)
+            .cloned()
+            .expect("test Connection should be present");
+        let connection_id = record.id.clone();
+        let expected_etag = record.etag();
+        let mut edited = record.write.clone();
+        edited.endpoint.base_path = "/edited".to_owned();
+
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new(
+            runtime_config([("get_charge", enabled_tool(500, 1))], 2, 1, 100),
+            audit.clone(),
+        );
+        let executor = executor_for_connection_tool(
+            connection_charge_tool(&connection.connection_id),
+            &connection,
+            runtime,
+            audit,
+        );
+        let control_plane = connection.control_plane.clone();
+        let secret_path = connection.secret_path.clone();
+        let mut context = invocation_context();
+        context.source = ToolInvocationSource::AdminPlayground;
+
+        let error = executor
+            .execute_with_precondition(
+                "get_charge",
+                json!({ "charge_id": ARGUMENT_CANARY }),
+                context,
+                CancellationToken::new(),
+                ToolExecutionPrecondition::new(move |_| {
+                    let observed = control_plane
+                        .runtime_snapshot()
+                        .managed()
+                        .get(&connection_id)
+                        .cloned()
+                        .expect("Connection should still exist before the racing edit");
+                    assert_eq!(
+                        observed.etag(),
+                        expected_etag,
+                        "the validator must first observe the expected old revision"
+                    );
+                    control_plane
+                        .replace_managed(&connection_id, &expected_etag, edited.clone())
+                        .expect("racing Connection edit should publish");
+                    fs::remove_file(&secret_path)
+                        .expect("secret canary should disappear after the validator read");
+                    Ok(())
+                }),
+            )
+            .await
+            .expect_err("a Connection edit during validation must fail closed");
+
+        assert!(matches!(
+            error,
+            ToolRuntimeError::Rejected { ref reason, .. }
+                if reason == TOOL_PRECONDITION_FAILED_REASON
+        ));
+        let events = audit_events(&capture, 3).await;
+        assert!(events.iter().any(|event| {
+            event.event_type == audit::event::TOOL_INVOKE_REJECTED
+                && event.payload["reason"] == json!(TOOL_PRECONDITION_FAILED_REASON)
+                && event.payload["invocation_source"] == json!("admin_playground")
+        }));
+        assert!(events.iter().all(|event| {
+            event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
+                && event.event_type != audit::event::TOOL_UPSTREAM_REQUEST
+        }));
+        let rendered_events =
+            serde_json::to_string(&events).expect("race audit events should serialize");
+        assert!(!rendered_events.contains(ARGUMENT_CANARY));
+        assert!(!rendered_events.contains(SECRET_CANARY));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "the edited target must not receive upstream bytes"
         );
     }
 

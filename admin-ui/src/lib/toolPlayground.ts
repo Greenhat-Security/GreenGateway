@@ -2,6 +2,7 @@ import { adminFetchResource, type AdminResource } from './api';
 import { adminApiUrl } from './config';
 
 const MAX_EXECUTION_ETAG_BYTES = 1_024;
+const MAX_EXECUTION_REQUEST_BYTES = 65_536;
 const MAX_EXECUTION_OUTPUT_BYTES = 65_536;
 const MAX_EXECUTION_OUTPUT_DEPTH = 64;
 const MAX_EXECUTION_OUTPUT_NODES = 32_768;
@@ -58,18 +59,19 @@ export class ToolExecutionContractError extends Error {
 
 export async function executeCapability(
   capabilityId: string,
-  args: Record<string, unknown>,
+  argumentsJson: string,
   etag: string,
   signal?: AbortSignal,
 ): Promise<AdminResource<ToolExecutionResult>> {
   if (
     capabilityId.trim().length === 0 ||
     !isStrongExecutionEtag(etag) ||
-    !isPlainJsonObject(args)
+    typeof argumentsJson !== 'string'
   ) {
     throw invalidExecutionResponse('request contract');
   }
 
+  const body = toolExecutionRequestBody(argumentsJson);
   const resource = await adminFetchResource<unknown>(
     adminApiUrl(
       `/tools/${encodeURIComponent(capabilityId)}/execute`,
@@ -82,7 +84,7 @@ export async function executeCapability(
         'Content-Type': 'application/json',
         'If-Match': etag,
       },
-      body: JSON.stringify({ arguments: args }),
+      body,
     },
   );
 
@@ -95,6 +97,27 @@ export async function executeCapability(
     etag: resource.etag,
     collectionEtag: null,
   };
+}
+
+function toolExecutionRequestBody(argumentsJson: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(argumentsJson) as unknown;
+  } catch {
+    throw invalidExecutionResponse('request contract');
+  }
+  if (!isPlainJsonObject(parsed)) {
+    throw invalidExecutionResponse('request contract');
+  }
+
+  // Keep the operator's validated JSON text intact. Re-stringifying the parsed
+  // value would silently round large integers and turn overflowing exponents
+  // into null before a potentially non-idempotent tool invocation.
+  const body = `{"arguments":${argumentsJson}}`;
+  if (utf8Length(body) > MAX_EXECUTION_REQUEST_BYTES) {
+    throw invalidExecutionResponse('request contract');
+  }
+  return body;
 }
 
 export function isStrongExecutionEtag(value: string | null): value is string {

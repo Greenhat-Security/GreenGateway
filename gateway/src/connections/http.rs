@@ -368,6 +368,22 @@ impl ConnectionHttpRuntime {
         self.target(connection_id, "/").map(|_| ())
     }
 
+    /// Returns whether the exact managed Connection revision captured by
+    /// `target` is still current.
+    ///
+    /// Callers can use this after evaluating an execution precondition to
+    /// close the window where that evaluation observed the old revision while
+    /// a concurrent update published a new target. This check reads only the
+    /// in-memory control-plane snapshot; it performs no DNS, egress, TLS, OAuth,
+    /// or secret-provider work.
+    pub fn target_is_current(&self, target: &ConnectionHttpTarget) -> bool {
+        self.control_plane
+            .runtime_snapshot()
+            .managed()
+            .get(target.connection_id())
+            .is_some_and(|record| record.etag().as_str() == target.connection_etag())
+    }
+
     pub fn replace_dependencies(
         &self,
         kind: ConnectionDependencyKind,
