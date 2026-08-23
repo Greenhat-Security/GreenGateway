@@ -2331,7 +2331,7 @@ mod tests {
             .without_time()
             .with_writer(logs.clone())
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = crate::tracing_test_guard(subscriber);
         let upstream_body: egress::EgressBodyStream = Box::pin(stream::once(async {
             Err(egress::EgressError::DnsResolutionFailed(
                 "https://secret.example/private?token=secret-query at 10.0.0.1".to_owned(),
@@ -3489,10 +3489,13 @@ mod tests {
     async fn total_deadline_bounds_attempts() {
         let first_requests = Arc::new(Mutex::new(Vec::new()));
         let second_requests = Arc::new(Mutex::new(Vec::new()));
+        // The upstream delay is deliberately far beyond the gateway timeout, so
+        // the assertion below has room to absorb scheduler latency while still
+        // failing loudly if the total deadline stops bounding the attempt.
         let (first_addr, first_server) = spawn_status_upstream_after(
             StatusCode::SERVICE_UNAVAILABLE,
             Arc::clone(&first_requests),
-            Duration::from_millis(500),
+            Duration::from_secs(3),
         )
         .await;
         let (second_addr, second_server) =
@@ -3529,7 +3532,10 @@ mod tests {
         assert_eq!(outcome.attempts.len(), 1);
         assert_eq!(outcome.attempts[0].result, "request_timeout");
         assert!(outcome.retry_exhausted);
-        assert!(elapsed < Duration::from_millis(350));
+        // Anchored to the timeout rather than to the upstream delay: three times
+        // the 225ms budget absorbs scheduler latency, and is still an order of
+        // magnitude below the 3s the upstream would take to answer.
+        assert!(elapsed < Duration::from_millis(225 * 3));
         assert!(second_requests.lock().expect("second captures").is_empty());
         assert!(!health_states[0].eligible());
         assert_eq!(

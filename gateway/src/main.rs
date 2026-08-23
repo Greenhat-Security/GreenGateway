@@ -1105,6 +1105,65 @@ where
     })
 }
 
+/// Serializes tests that install a `tracing` subscriber, and keeps the
+/// process-wide callsite-interest cache consistent across them.
+///
+/// `tracing` caches per-callsite interest globally. With only thread-local
+/// defaults in play a rebuild stamps the *calling* thread's subscriber onto that
+/// shared cache, so without serialization two tests overwrite each other's
+/// filters.
+///
+/// Do NOT add a rebuild when a guard is released: with the subscriber already
+/// uninstalled it evaluates against `NoSubscriber`, stamping every callsite
+/// `never` and the global max level `OFF` for the rest of the process. Leaking
+/// one test's filter is the lesser evil, and the next guard's entry rebuild
+/// repairs it. See [`TracingTestGuard::drop`].
+///
+/// Every test that installs a subscriber must serialize on this lock and rebuild
+/// the interest cache while its subscriber is live -- a single non-participant is
+/// enough to defeat it for all of them. Use [`tracing_test_guard`] for the
+/// `set_default` form; the closure form must take this lock itself and rebuild
+/// *inside* the closure (see `discovery::suggestions`).
+#[cfg(test)]
+pub(crate) static TRACING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct TracingTestGuard {
+    dispatch: Option<tracing::subscriber::DefaultGuard>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TracingTestGuard {
+    fn drop(&mut self) {
+        // Deliberately does NOT rebuild on the way out. With the subscriber
+        // already uninstalled a rebuild would evaluate every callsite against
+        // `NoSubscriber` and stamp the shared cache as "never" -- globally
+        // disabling tracing until something rebuilt it again. Each guard
+        // rebuilds on entry instead, which is what actually matters, and every
+        // test that asserts on log output goes through this guard.
+        drop(self.dispatch.take());
+    }
+}
+
+/// Installs `subscriber` as the thread-local default for the rest of the scope,
+/// serialized against every other subscriber-installing test.
+#[cfg(test)]
+pub(crate) fn tracing_test_guard<S>(subscriber: S) -> TracingTestGuard
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    let lock = TRACING_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dispatch = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+    TracingTestGuard {
+        dispatch: Some(dispatch),
+        _lock: lock,
+    }
+}
+
 type ResponseResult<T> = Result<T, Box<Response>>;
 
 struct PolicyMutationCommitResult {
@@ -3260,7 +3319,7 @@ async fn connection_secret_create_endpoint(
     let body =
         match read_connection_secret_body(body, connection_secret_admin_body_limit(&state)).await {
             Ok(body) => body,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
     let ConnectionSecretCreateRequest {
         label,
@@ -3388,7 +3447,7 @@ async fn connection_secret_rotate_endpoint(
     let body =
         match read_connection_secret_body(body, connection_secret_admin_body_limit(&state)).await {
             Ok(body) => body,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
     let ConnectionSecretRotateRequest { purpose, mut value } =
         match serde_json::from_slice::<ConnectionSecretRotateRequest>(&body) {
@@ -3536,7 +3595,7 @@ async fn connection_secret_delete_endpoint(
     }
     let body = match read_connection_secret_body(body, state.max_body_size.min(1024)).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if !body.is_empty() {
         return bad_request("connection-secret delete does not accept a request body");
@@ -3758,7 +3817,7 @@ async fn connection_create_endpoint(
 
     let body = match read_request_body(body, connection_admin_body_limit(&state)).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let candidate = match parse_connection_create_body(&body) {
         Ok(candidate) => candidate,
@@ -3874,7 +3933,7 @@ async fn connection_put_endpoint(
 
     let body = match read_request_body(body, connection_admin_body_limit(&state)).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let has_secrets_write =
         rbac_state.principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION);
@@ -3997,7 +4056,7 @@ async fn connection_delete_endpoint(
     }
     let body = match read_request_body(body, connection_admin_body_limit(&state)).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if !body.is_empty() {
         return bad_request("connection delete does not accept a request body");
@@ -4096,7 +4155,7 @@ async fn connection_refresh_endpoint(
     }
     let body = match read_request_body(body, connection_admin_body_limit(&state)).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if !body.is_empty() {
         return bad_request("connection refresh does not accept a request body");
@@ -4331,7 +4390,7 @@ async fn connection_test_endpoint(
                     duration_millis(probe_started.elapsed()),
                     None,
                 );
-                return with_etag(response, current_etag.as_str());
+                return with_etag(*response, current_etag.as_str());
             }
         };
     if !body.is_empty() {
@@ -4448,7 +4507,7 @@ async fn connection_openapi_preview_endpoint(
     }
     let body = match read_request_body(body, managed_openapi_admin_body_limit(&state)).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let requested = match serde_json::from_slice::<ManagedOpenApiPreviewRequest>(&body) {
         Ok(requested) => requested,
@@ -4524,7 +4583,7 @@ async fn connection_openapi_register_endpoint(
     }
     let body = match read_request_body(body, managed_openapi_admin_body_limit(&state)).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let requested = match serde_json::from_slice::<ManagedOpenApiRegisterRequest>(&body) {
         Ok(requested) => requested,
@@ -4632,7 +4691,7 @@ async fn policy_put_endpoint(
 
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let candidate = match parse_policy_body(&body) {
         Ok(policy) => policy,
@@ -4849,7 +4908,7 @@ async fn policy_validate_endpoint(
 
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     match parse_policy_body(&body) {
@@ -4879,7 +4938,7 @@ async fn policy_rule_post_endpoint(
 
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let rule = match parse_rule_body(&body) {
         Ok(rule) => rule,
@@ -4916,7 +4975,7 @@ async fn policy_rule_patch_endpoint(
 
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let patch = match parse_rule_patch_body(&body) {
         Ok(patch) => patch,
@@ -5080,7 +5139,7 @@ async fn policy_rules_order_put_endpoint(
 
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let requested_order = match parse_rule_order_body(&body) {
         Ok(order) => order,
@@ -5159,7 +5218,7 @@ async fn token_create_endpoint(
     };
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let requested = match parse_create_token_body(&body) {
         Ok(requested) => requested,
@@ -5444,7 +5503,7 @@ async fn tool_playground_execute_endpoint(
     .await
     {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let request = match serde_json::from_slice::<tools::playground::ToolPlaygroundRequest>(&body) {
         Ok(request) => request,
@@ -5564,7 +5623,7 @@ async fn tools_openapi_preview_endpoint(
 
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let spec = match std::str::from_utf8(&body) {
         Ok(spec) => spec,
@@ -5601,7 +5660,7 @@ async fn tools_openapi_register_endpoint(
 
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let requested = match parse_openapi_tools_register_body(&body) {
         Ok(requested) => requested,
@@ -5773,7 +5832,7 @@ async fn policy_rule_preview_endpoint(
 
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let preview_request = match parse_rule_preview_body(&body) {
         Ok(request) => request,
@@ -6859,7 +6918,7 @@ async fn traffic_endpoint_review_endpoint(
     };
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let request = match serde_json::from_slice::<TrafficEndpointReviewRequest>(&body) {
         Ok(request) => request,
@@ -7875,19 +7934,19 @@ fn suggestions_admin_authz_error_response(error: SuggestionsAdminAuthzError) -> 
     }
 }
 
-async fn read_request_body(body: Body, max_body_size: usize) -> Result<Bytes, Response> {
+async fn read_request_body(body: Body, max_body_size: usize) -> ResponseResult<Bytes> {
     axum::body::to_bytes(body, max_body_size)
         .await
         .map_err(|err| {
             tracing::warn!(error = %err, "request body exceeded the configured limit or could not be read");
-            payload_too_large(max_body_size)
+            Box::new(payload_too_large(max_body_size))
         })
 }
 
 async fn read_connection_secret_body(
     body: Body,
     max_body_size: usize,
-) -> Result<Zeroizing<Vec<u8>>, Response> {
+) -> ResponseResult<Zeroizing<Vec<u8>>> {
     let bytes = axum::body::to_bytes(body, max_body_size)
         .await
         .map_err(|_| {
@@ -7896,7 +7955,7 @@ async fn read_connection_secret_body(
                 maximum_bytes = max_body_size,
                 "connection-secret request body exceeded its limit or could not be read"
             );
-            payload_too_large(max_body_size)
+            Box::new(payload_too_large(max_body_size))
         })?;
     match bytes.try_into_mut() {
         Ok(mut mutable) => {
@@ -7910,7 +7969,7 @@ async fn read_connection_secret_body(
 
 enum TimedBodyReadError {
     DeadlineExceeded,
-    Rejected(Response),
+    Rejected(Box<Response>),
 }
 
 async fn read_request_body_before(
@@ -12201,7 +12260,9 @@ mod tests {
             match index {
                 0 => Some((Ok::<_, Infallible>(bytes::Bytes::from_static(b"first")), 1)),
                 1 => {
-                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    // Wide enough that the negative "not buffered" check below is
+                    // still inside the gap even when the earlier awaits are slow.
+                    tokio::time::sleep(Duration::from_millis(2_000)).await;
                     Some((Ok::<_, Infallible>(bytes::Bytes::from_static(b"second")), 2))
                 }
                 _ => None,
@@ -14817,6 +14878,10 @@ mod tests {
             spawn_router(Router::new().route("/stream", get(delayed_stream_upstream))).await;
         let router = proxy_router(proxy_config(upstream_addr), test_audit_log());
 
+        // These two guards must sum to well under the upstream's 2s inter-chunk
+        // gap, so the negative "not buffered" check below still lands inside the
+        // gap on a slow run. Buffering would delay headers to ~2s, so 500ms is
+        // ample to detect it.
         let response = tokio::time::timeout(
             Duration::from_millis(500),
             router.oneshot(
@@ -14832,7 +14897,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let mut body = response.into_body().into_data_stream();
-        let first = tokio::time::timeout(Duration::from_millis(200), body.next())
+        let first = tokio::time::timeout(Duration::from_millis(500), body.next())
             .await
             .expect("first proxied chunk should arrive")
             .expect("body should yield first chunk")
@@ -14846,7 +14911,7 @@ mod tests {
             "second chunk should not be buffered before upstream sends it"
         );
 
-        let second = tokio::time::timeout(Duration::from_secs(1), body.next())
+        let second = tokio::time::timeout(Duration::from_secs(3), body.next())
             .await
             .expect("second proxied chunk should arrive")
             .expect("body should yield second chunk")

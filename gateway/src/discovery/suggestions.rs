@@ -2675,7 +2675,15 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
 
+        // Must participate in the same serialization as every other
+        // subscriber-installing test; see `crate::tracing_test_guard`.
+        let _tracing_lock = crate::TRACING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (run, suggestions) = tracing::subscriber::with_default(subscriber, || {
+            // Inside the closure: outside it this subscriber is not yet the
+            // thread default, so the rebuild would stamp `NoSubscriber`.
+            tracing::callsite::rebuild_interest_cache();
             let discovery_db = TempDb::new("anomaly-tool-slash-discovery");
             seed_discovery_endpoint(&discovery_db.path, "MCP", "/mcp/tools/foo/bar");
             seed_signal(

@@ -197,7 +197,7 @@ mod tests {
             .without_time()
             .with_writer(logs.clone())
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = crate::tracing_test_guard(subscriber);
         let client = EgressClient::new(EgressConfig::default())
             .expect("OIDC test egress client should build");
 

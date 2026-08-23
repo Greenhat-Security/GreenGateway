@@ -2721,9 +2721,18 @@ mod tests {
             .without_time()
             .with_writer(logs.clone())
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = crate::tracing_test_guard(subscriber);
         let client = EgressClient::new(EgressConfig::default())
             .expect("scheme log test client should build");
+
+        // Touch the rejection callsite once while our subscriber is installed.
+        // `rebuild_interest_cache` only revisits callsites that have already
+        // registered, and this one is reached by many other egress tests -- if
+        // one of them registers it first with no subscriber in place, tracing
+        // caches `Interest::never` for every thread and the assertion below
+        // fails for reasons that have nothing to do with the rejection path.
+        let _ = client.checked_url("warmup-scheme://warmup.invalid/warmup");
+        logs.clear();
 
         let error = client
             .checked_url("secret-scheme://secret-host.example/private?token=secret-query")
@@ -4591,6 +4600,13 @@ mod tests {
     }
 
     impl CapturedLogs {
+        fn clear(&self) {
+            self.buffer
+                .lock()
+                .expect("captured logs should not be poisoned")
+                .clear();
+        }
+
         fn contents(&self) -> String {
             String::from_utf8(
                 self.buffer
