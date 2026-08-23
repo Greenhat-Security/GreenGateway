@@ -32,6 +32,18 @@ const MAX_FILE_KEY_BYTES: usize = 255;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
+/// Permission policy applied to a bounded on-disk secret read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileSecretPermissions {
+    /// Operator-provisioned material that must grant no group or other
+    /// permission at all.
+    Exclusive,
+    /// Platform-projected workload identity material that the container runtime
+    /// publishes world readable, such as a Kubernetes projected service-account
+    /// token. Group and other *write* permissions remain rejected.
+    PlatformProjected,
+}
+
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorSecretAliasConfig {
@@ -98,6 +110,7 @@ pub enum SecretProviderKind {
     OperatorEnvironment,
     OperatorFile,
     LocalEncrypted,
+    VaultKvV2,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -454,6 +467,28 @@ fn read_file_secret(
     key: &str,
     purpose: SecretPurpose,
 ) -> Result<ResolvedSecret, SecretResolveError> {
+    read_bounded_file_secret(
+        alias_id,
+        root,
+        key,
+        purpose,
+        FileSecretPermissions::Exclusive,
+    )
+}
+
+/// Reads one bounded secret file beneath an already validated capability root.
+///
+/// The leaf is opened without following links and in nonblocking mode, the
+/// opened handle is revalidated as a regular file, and the read is capped before
+/// any material is parsed. Providers that consume platform-projected identity
+/// material relax only the group/other *read* rule through `permissions`.
+pub(crate) fn read_bounded_file_secret(
+    alias_id: &str,
+    root: &Dir,
+    key: &str,
+    purpose: SecretPurpose,
+    permissions: FileSecretPermissions,
+) -> Result<ResolvedSecret, SecretResolveError> {
     let initial_metadata = root
         .symlink_metadata(key)
         .map_err(|error| map_file_error(alias_id, error, false))?;
@@ -474,7 +509,7 @@ fn read_file_secret(
             SecretResolveErrorKind::UnsafeSource,
         ));
     }
-    validate_file_permissions(alias_id, &metadata)?;
+    validate_file_permissions(alias_id, &metadata, permissions)?;
 
     let maximum = purpose.max_bytes();
     if u64::try_from(maximum).is_ok_and(|maximum| metadata.len() > maximum) {
@@ -549,9 +584,14 @@ fn validate_root_permissions(_: &fs::Metadata) -> Result<(), SecretProviderConfi
 fn validate_file_permissions(
     alias_id: &str,
     metadata: &fs::Metadata,
+    permissions: FileSecretPermissions,
 ) -> Result<(), SecretResolveError> {
     use std::os::unix::fs::MetadataExt;
-    if metadata.mode() & 0o077 == 0 {
+    let forbidden = match permissions {
+        FileSecretPermissions::Exclusive => 0o077,
+        FileSecretPermissions::PlatformProjected => 0o022,
+    };
+    if metadata.mode() & forbidden == 0 {
         Ok(())
     } else {
         Err(SecretResolveError::new(
@@ -562,7 +602,11 @@ fn validate_file_permissions(
 }
 
 #[cfg(not(unix))]
-fn validate_file_permissions(_: &str, _: &fs::Metadata) -> Result<(), SecretResolveError> {
+fn validate_file_permissions(
+    _: &str,
+    _: &fs::Metadata,
+    _: FileSecretPermissions,
+) -> Result<(), SecretResolveError> {
     Ok(())
 }
 
