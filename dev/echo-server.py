@@ -275,13 +275,12 @@ def retry_probe_header_boundary_violation(headers, expected_request_id):
     """
     if headers.get("authorization") or headers.get("cookie"):
         return True
-    request_id = headers.get("x-request-id", "")
     forwarded_for = headers.get("x-forwarded-for", "")
     real_ip = headers.get("x-real-ip", "")
     forwarding = f"{forwarded_for},{real_ip}"
     return (
         not expected_request_id
-        or bool(request_id)
+        or "x-request-id" in headers
         or not forwarded_for
         or real_ip != forwarded_for
         or "198.51.100.10" in forwarding

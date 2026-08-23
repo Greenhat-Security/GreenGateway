@@ -3104,7 +3104,7 @@ fn normalize_route_add_request_headers(
         }
         if header_name.as_str() == REQUEST_ID_HEADER {
             problems.push(format!(
-                "{name}.{raw_name} must not configure {REQUEST_ID_HEADER}; the gateway owns request-id propagation"
+                "{name}.{raw_name} must not configure {REQUEST_ID_HEADER}; the gateway owns this header and removes it before dispatching upstream"
             ));
             continue;
         }
@@ -3146,7 +3146,7 @@ fn normalize_route_strip_request_headers(
 
         if header_name.as_str() == REQUEST_ID_HEADER {
             problems.push(format!(
-                "{name} must not include {REQUEST_ID_HEADER}; the gateway owns request-id propagation"
+                "{name} must not include {REQUEST_ID_HEADER}; the gateway owns this header and removes it before dispatching upstream"
             ));
             continue;
         }

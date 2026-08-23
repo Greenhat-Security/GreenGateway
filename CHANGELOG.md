@@ -9,6 +9,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Security
 
+- Caller-supplied `x-request-id` headers are now removed before a request is
+  dispatched to an upstream, and the gateway does not substitute one of its
+  own. Previously the caller's value was forwarded verbatim, which let a client
+  choose the correlation identifier that appeared in upstream access logs. The
+  request ID is still returned to the caller on the response and still
+  correlates GreenGateway's own audit events. **Behaviour change:** upstreams
+  that relied on receiving `x-request-id` from the gateway no longer see it, so
+  cross-system correlation on that header must be re-established from the audit
+  stream instead.
+
 - Added OAuth 2.0 client-credentials authentication for Connection-bound proxy
   routes and manual HTTP tools. Token endpoints are independently egress
   checked and DNS pinned before client-secret resolution, token responses are
