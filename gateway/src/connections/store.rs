@@ -7640,15 +7640,19 @@ mod tests {
         let commit_error = transaction
             .commit()
             .expect_err("the blocked commit must not persist after its deadline");
-        assert!(matches!(
-            status_sqlite_error(
-                &path,
-                "status transaction commit",
-                commit_error,
-                Some(deadline),
+        // Assert the raw lock failure rather than the mapped variant. SQLite's
+        // busy handler returns at approximately -- not strictly after -- the
+        // deadline it was given, so mapping against `deadline` here is a coin
+        // flip between DeadlineExceeded and Busy. The mapping is covered without
+        // any timing dependence by
+        // `busy_errors_map_to_deadline_exceeded_only_once_the_deadline_has_passed`.
+        assert!(
+            matches!(
+                commit_error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
             ),
-            ConnectionStoreError::DeadlineExceeded { .. }
-        ));
+            "the blocked commit must fail on the reader's lock"
+        );
         assert!(
             started.elapsed() < Duration::from_millis(700),
             "commit must not reuse the stale initial 500ms busy timeout"
@@ -7665,6 +7669,56 @@ mod tests {
         assert_eq!(
             persisted, 0,
             "the timed-out commit must roll back synchronously"
+        );
+    }
+
+    #[test]
+    fn busy_errors_map_to_deadline_exceeded_only_once_the_deadline_has_passed() {
+        fn busy() -> rusqlite::Error {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )
+        }
+
+        let path = std::path::Path::new("status-error-mapping");
+        let now = Instant::now();
+
+        assert!(
+            matches!(
+                status_sqlite_error(
+                    path,
+                    "status transaction commit",
+                    busy(),
+                    Some(
+                        now.checked_sub(Duration::from_millis(1))
+                            .expect("test clock should be past process start")
+                    ),
+                ),
+                ConnectionStoreError::DeadlineExceeded { .. }
+            ),
+            "a lock failure at or after the deadline is a deadline overrun"
+        );
+
+        assert!(
+            matches!(
+                status_sqlite_error(
+                    path,
+                    "status transaction commit",
+                    busy(),
+                    Some(now + Duration::from_secs(60)),
+                ),
+                ConnectionStoreError::Busy { .. }
+            ),
+            "a lock failure with budget remaining is contention, not an overrun"
+        );
+
+        assert!(
+            matches!(
+                status_sqlite_error(path, "status transaction commit", busy(), None),
+                ConnectionStoreError::Busy { .. }
+            ),
+            "an unbounded caller can never see a deadline overrun"
         );
     }
 

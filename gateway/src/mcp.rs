@@ -77,7 +77,7 @@ pub(crate) async fn mcp_endpoint(
     let (parts, body) = request.into_parts();
     let body = match crate::read_request_body(body, app.max_body_size).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let request = AxumRequest::from_parts(parts, Body::from(body));
 

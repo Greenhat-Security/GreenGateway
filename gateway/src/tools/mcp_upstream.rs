@@ -3200,17 +3200,21 @@ mod tests {
         ] {
             let upstream = RawProtocolProbeUpstream::spawn(scenario).await;
             let started = Instant::now();
-            let error = run_raw_protocol_probe(&upstream.url, Duration::from_millis(150))
+            // The probe deadline must outlast request delivery. At 150ms the
+            // deadline could fire mid-request, so the upstream never reached its
+            // stall path, never observed a disconnect, and never notified --
+            // which reads as "the request was not dropped" rather than a slow test.
+            let error = run_raw_protocol_probe(&upstream.url, Duration::from_millis(1_000))
                 .await
                 .expect_err("stalled probe I/O must hit the shared absolute deadline");
 
             assert_eq!(error.safe_reason(), ConnectionTestReason::DeadlineExceeded);
             assert!(
-                started.elapsed() < Duration::from_secs(1),
+                started.elapsed() < Duration::from_secs(3),
                 "probe worker must be aborted and joined within its hard deadline"
             );
             tokio::time::timeout(
-                Duration::from_secs(1),
+                Duration::from_secs(5),
                 upstream.stalled_disconnect.notified(),
             )
             .await
@@ -3244,7 +3248,7 @@ mod tests {
             "cleanup reserve should join the timed-out worker before the endpoint deadline"
         );
         tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(5),
             upstream.stalled_disconnect.notified(),
         )
         .await
@@ -3466,7 +3470,7 @@ mod tests {
                     .with_writer(logs.clone()),
             )
             .with(crate::production_tracing_filter());
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = crate::tracing_test_guard(subscriber);
 
         tracing::info!(target: "gateway::mcp_filter_test", "green-gateway-marker");
         tracing::error!(
@@ -3784,7 +3788,7 @@ mod tests {
             .without_time()
             .with_writer(logs.clone())
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = crate::tracing_test_guard(subscriber);
 
         let error = match client
             .get_stream(
@@ -3831,7 +3835,7 @@ mod tests {
             .without_time()
             .with_writer(logs.clone())
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = crate::tracing_test_guard(subscriber);
 
         let auth_error = post_message_against_raw_response(
             "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"secret-auth-challenge\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

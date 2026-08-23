@@ -1137,7 +1137,7 @@ mod tests {
             .without_time()
             .with_writer(logs.clone())
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = crate::tracing_test_guard(subscriber);
         let client = egress::EgressClient::new(egress::EgressConfig::default())
             .expect("egress client should build");
         let (sleeps_tx, _sleeps_rx) = mpsc::unbounded_channel();

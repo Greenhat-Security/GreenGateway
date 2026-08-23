@@ -4423,10 +4423,14 @@ mod tests {
     async fn execution_timeout_after_work_started_feeds_inventory_observation() {
         let server = gated_server().await;
         let (audit, capture, db) = inventory_audit("tool-execution-timeout-inventory");
+        // The tool timeout must outlast the arrival-wait budget below. If it fires
+        // first the executor drops the connection mid-request, `read_http_request`
+        // panics on the truncated head, the request is never recorded, and the
+        // wait then fails -- so "after work started" is never actually exercised.
         let executor = executor_for_tools_with_audit(
             server.addr,
             [widget_tool(false, true)],
-            runtime_config([("get_widget", enabled_tool(100, 1))], 2, 1, 100),
+            runtime_config([("get_widget", enabled_tool(2_000, 1))], 2, 1, 100),
             audit,
         );
 
