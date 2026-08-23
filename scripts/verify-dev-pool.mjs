@@ -260,10 +260,7 @@ function assertAttemptHeaderBoundary(results) {
     assert(headers && typeof headers === "object", "echo response omitted upstream headers");
     assert(!("authorization" in headers), "gateway bearer authorization reached an upstream");
     assert(!("cookie" in headers), "client cookie reached an upstream");
-    assert(
-      headers["x-request-id"] === result.requestId,
-      "gateway request ID was not preserved across the upstream attempt",
-    );
+    assert(!("x-request-id" in headers), "caller request ID reached an upstream");
     const forwarding = JSON.stringify({
       forwardedFor: headers["x-forwarded-for"],
       realIp: headers["x-real-ip"],

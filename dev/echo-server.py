@@ -265,6 +265,14 @@ def bounded_query_int(query, name, minimum, maximum, default=None):
 
 
 def retry_probe_header_boundary_violation(headers, expected_request_id):
+    """Detect a header-boundary breach on a retried upstream attempt.
+
+    `expected_request_id` is the request ID the *caller* sent to the gateway. The
+    gateway strips `x-request-id` before dispatching upstream and does not
+    substitute one of its own, so any `x-request-id` reaching here is a breach.
+    The parameter is still required so a harness that forgets to send it is
+    reported rather than silently passing.
+    """
     if headers.get("authorization") or headers.get("cookie"):
         return True
     request_id = headers.get("x-request-id", "")
@@ -273,7 +281,7 @@ def retry_probe_header_boundary_violation(headers, expected_request_id):
     forwarding = f"{forwarded_for},{real_ip}"
     return (
         not expected_request_id
-        or request_id != expected_request_id
+        or bool(request_id)
         or not forwarded_for
         or real_ip != forwarded_for
         or "198.51.100.10" in forwarding

@@ -72,15 +72,41 @@ impl AcceptanceRoot {
             uuid::Uuid::new_v4()
         ));
         fs::create_dir(&path).expect("acceptance-test root should create");
+        // The operator secret provider rejects a group/other-writable secrets root
+        // and a group/other-accessible secret file. Both checks are `#[cfg(unix)]`,
+        // so a default-permission temp tree silently passes on Windows (0o600 is
+        // not enforced) and fails on Linux, where `fs::write` yields 0o644.
+        set_directory_permissions(&path, 0o700);
         Self { path }
     }
 
     fn write(&self, relative: &str, contents: impl AsRef<[u8]>) -> PathBuf {
         let path = self.path.join(relative);
         fs::write(&path, contents).expect("acceptance-test secret should write");
+        set_file_permissions(&path, 0o600);
         path
     }
 }
+
+#[cfg(unix)]
+fn set_directory_permissions(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .expect("directory permissions should set");
+}
+
+#[cfg(not(unix))]
+fn set_directory_permissions(_: &std::path::Path, _: u32) {}
+
+#[cfg(unix)]
+fn set_file_permissions(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .expect("file permissions should set");
+}
+
+#[cfg(not(unix))]
+fn set_file_permissions(_: &std::path::Path, _: u32) {}
 
 impl Drop for AcceptanceRoot {
     fn drop(&mut self) {
