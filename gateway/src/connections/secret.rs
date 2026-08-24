@@ -291,6 +291,12 @@ pub trait SecretResolver: Send + Sync {
     ) -> Result<ResolvedSecret, SecretResolveError>;
 
     fn aliases(&self) -> Vec<SecretAliasMetadata>;
+
+    /// Whether this provider owns the alias. Providers with an alias index
+    /// should override the metadata-scan default.
+    fn contains_alias(&self, alias_id: &str) -> bool {
+        self.aliases().iter().any(|alias| alias.id == alias_id)
+    }
 }
 
 type EnvironmentReader = dyn Fn(&str) -> Result<String, ()> + Send + Sync;
@@ -371,7 +377,7 @@ impl OperatorAliasResolver {
     }
 
     pub fn contains_alias(&self, alias_id: &str) -> bool {
-        self.aliases.contains_key(alias_id)
+        <Self as SecretResolver>::contains_alias(self, alias_id)
     }
 
     pub(crate) fn resolve_blocking(
@@ -438,6 +444,10 @@ impl SecretResolver for OperatorAliasResolver {
         .map_err(|_| {
             SecretResolveError::new(join_alias_id, SecretResolveErrorKind::ProviderFailure)
         })?
+    }
+
+    fn contains_alias(&self, alias_id: &str) -> bool {
+        self.aliases.contains_key(alias_id)
     }
 
     fn aliases(&self) -> Vec<SecretAliasMetadata> {

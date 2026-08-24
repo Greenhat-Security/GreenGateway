@@ -850,10 +850,6 @@ impl VaultKvV2SecretProvider {
         })
     }
 
-    pub fn contains_alias(&self, alias_id: &str) -> bool {
-        self.aliases.contains_key(alias_id)
-    }
-
     pub fn alias_ids(&self) -> BTreeSet<String> {
         self.aliases.keys().cloned().collect()
     }
@@ -1261,6 +1257,10 @@ impl SecretResolver for VaultKvV2SecretProvider {
         };
         record_resolution(&outcome, started.elapsed());
         outcome.map_err(|failure| SecretResolveError::new(&alias_id, failure.kind()))
+    }
+
+    fn contains_alias(&self, alias_id: &str) -> bool {
+        self.aliases.contains_key(alias_id)
     }
 
     fn aliases(&self) -> Vec<SecretAliasMetadata> {
