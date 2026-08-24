@@ -15,6 +15,10 @@ use zeroize::Zeroizing;
 use crate::config::Config;
 
 use super::{
+    azure_secret::{
+        AzureKeyVaultSecretProvider, AzureProviderConfig, AzureProviderConfigError, AzureTransport,
+        EgressAzureTransport,
+    },
     gcp_secret::{
         EgressGcpTransport, GcpProviderConfig, GcpProviderConfigError, GcpSecretManagerProvider,
         GcpTransport,
@@ -57,6 +61,7 @@ pub struct ConnectionControlPlane {
     local_secret_manager: Option<Arc<CoordinatedLocalSecretManager>>,
     vault_config: VaultProviderConfig,
     gcp_config: GcpProviderConfig,
+    azure_config: AzureProviderConfig,
 }
 
 #[derive(Clone)]
@@ -270,6 +275,13 @@ impl ConnectionControlPlane {
                 });
             }
         }
+        for alias in &config.connection_azure_provider.aliases {
+            if !network_alias_ids.insert(alias.id.clone()) {
+                return Err(ConnectionControlPlaneError::NetworkAliasIdCollision {
+                    id: alias.id.clone(),
+                });
+            }
+        }
         let mut network_alias_metadata: Vec<SecretAliasMetadata> = config
             .connection_vault_provider
             .aliases
@@ -295,6 +307,19 @@ impl ConnectionControlPlane {
                 rotated_at: None,
             }
         }));
+        network_alias_metadata.extend(config.connection_azure_provider.aliases.iter().map(
+            |alias| SecretAliasMetadata {
+                id: alias.id.clone(),
+                label: alias.label.clone(),
+                provider: SecretProviderKind::AzureKeyVault,
+                configured: true,
+                purpose: None,
+                // Key Vault versions are opaque locator-like identifiers;
+                // they are never surfaced through metadata.
+                version: None,
+                rotated_at: None,
+            },
+        ));
         let local_secret_provider = if let Some(keyring) = local_secret_keyring {
             let store = managed
                 .as_ref()
@@ -381,6 +406,7 @@ impl ConnectionControlPlane {
             local_secret_manager,
             vault_config: config.connection_vault_provider.clone(),
             gcp_config: config.connection_gcp_provider.clone(),
+            azure_config: config.connection_azure_provider.clone(),
         })
     }
 
@@ -471,6 +497,23 @@ impl ConnectionControlPlane {
                 GcpSecretManagerProvider::from_config(&self.gcp_config, &reserved_ids, transport)?;
             providers.push(Arc::new(provider));
             reserved_ids.extend(self.gcp_config.aliases.iter().map(|alias| alias.id.clone()));
+        }
+        if !self.azure_config.is_empty() {
+            let transport: Arc<dyn AzureTransport> =
+                Arc::new(EgressAzureTransport::new(Arc::clone(egress)));
+            let provider = AzureKeyVaultSecretProvider::from_config(
+                &self.azure_config,
+                &reserved_ids,
+                transport,
+                bootstrap.clone(),
+            )?;
+            providers.push(Arc::new(provider));
+            reserved_ids.extend(
+                self.azure_config
+                    .aliases
+                    .iter()
+                    .map(|alias| alias.id.clone()),
+            );
         }
         self.install_network_secret_providers(providers);
         Ok(())
@@ -783,7 +826,7 @@ impl From<ConnectionStoreError> for ConnectionMutationError {
 struct ConnectionSecretResolver {
     operator: Arc<OperatorAliasResolver>,
     local: Option<Arc<LocalSecretProvider>>,
-    /// Network-backed providers (Vault today) activated once the egress client
+    /// Network-backed providers activated once the egress client
     /// exists. Their aliases are deferred: known from configuration at startup
     /// but resolvable only after activation, and validated on first use.
     network: OnceLock<Vec<Arc<dyn SecretResolver>>>,
@@ -1209,6 +1252,7 @@ pub enum ConnectionControlPlaneError {
     SecretProvider(SecretProviderConfigError),
     VaultProvider(VaultProviderConfigError),
     GcpProvider(GcpProviderConfigError),
+    AzureProvider(AzureProviderConfigError),
     LocalSecretKeyring(LocalSecretKeyringConfigError),
     LocalSecret(LocalSecretError),
     LocalSecretKeyringRequired,
@@ -1226,6 +1270,7 @@ impl fmt::Display for ConnectionControlPlaneError {
             Self::SecretProvider(error) => error.fmt(formatter),
             Self::VaultProvider(error) => error.fmt(formatter),
             Self::GcpProvider(error) => error.fmt(formatter),
+            Self::AzureProvider(error) => error.fmt(formatter),
             Self::LocalSecretKeyring(error) => error.fmt(formatter),
             Self::LocalSecret(error) => error.fmt(formatter),
             Self::LocalSecretKeyringRequired => formatter.write_str(
@@ -1259,6 +1304,7 @@ impl Error for ConnectionControlPlaneError {
             Self::SecretProvider(error) => Some(error),
             Self::VaultProvider(error) => Some(error),
             Self::GcpProvider(error) => Some(error),
+            Self::AzureProvider(error) => Some(error),
             Self::LocalSecretKeyring(error) => Some(error),
             Self::LocalSecret(error) => Some(error),
             _ => None,
@@ -1293,6 +1339,12 @@ impl From<VaultProviderConfigError> for ConnectionControlPlaneError {
 impl From<GcpProviderConfigError> for ConnectionControlPlaneError {
     fn from(error: GcpProviderConfigError) -> Self {
         Self::GcpProvider(error)
+    }
+}
+
+impl From<AzureProviderConfigError> for ConnectionControlPlaneError {
+    fn from(error: AzureProviderConfigError) -> Self {
+        Self::AzureProvider(error)
     }
 }
 
@@ -1473,6 +1525,64 @@ mod tests {
             .await
             .expect_err("alias owned by no provider must fail");
         assert_eq!(unknown.kind(), SecretResolveErrorKind::UnknownAlias);
+    }
+
+    #[test]
+    fn an_alias_id_claimed_by_two_network_providers_fails_closed_at_startup() {
+        use crate::connections::{
+            azure_secret::{AzureAuthConfig, AzureProfileConfig, AzureSecretAliasConfig},
+            vault_secret::{VaultAuthConfig, VaultProfileConfig, VaultSecretAliasConfig},
+        };
+
+        let mut config = config();
+        config.connection_vault_provider = VaultProviderConfig {
+            profiles: vec![VaultProfileConfig {
+                id: "vault-primary".to_owned(),
+                address: "https://vault.internal.example".to_owned(),
+                namespace: None,
+                auth: VaultAuthConfig::Token {
+                    secret_alias: "bootstrap-token".to_owned(),
+                },
+            }],
+            aliases: vec![VaultSecretAliasConfig {
+                id: "shared-alias".to_owned(),
+                label: "Vault shared alias".to_owned(),
+                profile: "vault-primary".to_owned(),
+                mount: "secret".to_owned(),
+                path: "billing".to_owned(),
+                key: "api-key".to_owned(),
+                version: None,
+            }],
+        };
+        config.connection_azure_provider = AzureProviderConfig {
+            profiles: vec![AzureProfileConfig {
+                id: "azure-primary".to_owned(),
+                authority_host: None,
+                tenant_id: "11111111-2222-3333-4444-555566667777".to_owned(),
+                client_id: "88888888-9999-aaaa-bbbb-ccccddddeeee".to_owned(),
+                scope: None,
+                auth: AzureAuthConfig::ClientSecret {
+                    secret_alias: "bootstrap-client-secret".to_owned(),
+                },
+            }],
+            aliases: vec![AzureSecretAliasConfig {
+                id: "shared-alias".to_owned(),
+                label: "Azure shared alias".to_owned(),
+                profile: "azure-primary".to_owned(),
+                vault: "https://myvault.vault.azure.net".to_owned(),
+                name: "billing-api-key".to_owned(),
+                version: None,
+            }],
+        };
+
+        let error = match ConnectionControlPlane::from_config(&config) {
+            Ok(_) => panic!("an alias id claimed by two network providers must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConnectionControlPlaneError::NetworkAliasIdCollision { ref id } if id == "shared-alias"
+        ));
     }
 
     struct TemporaryLocalControlPlane {

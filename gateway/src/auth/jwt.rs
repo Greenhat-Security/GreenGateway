@@ -1689,6 +1689,8 @@ RowSUZV5FSmOGJ7JyROZ80k=
             connection_vault_provider:
                 crate::connections::vault_secret::VaultProviderConfig::default(),
             connection_gcp_provider: crate::connections::gcp_secret::GcpProviderConfig::default(),
+            connection_azure_provider:
+                crate::connections::azure_secret::AzureProviderConfig::default(),
             connection_secret_aliases: Vec::new(),
             connection_secrets_root: None,
             payload_capture_enabled: false,
