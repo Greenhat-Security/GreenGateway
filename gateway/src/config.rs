@@ -2476,7 +2476,14 @@ fn parse_vault_provider_config(
         return VaultProviderConfig::default();
     }
     serde_json::from_str(value).unwrap_or_else(|error| {
-        problems.push(format!("{name} must be a valid provider document: {error}"));
+        // Position only. serde echoes the offending scalar in its message, and
+        // this string reaches stderr at startup, so interpolating the error
+        // would print operator secret locators into container logs.
+        problems.push(format!(
+            "{name} must be a JSON object with profiles and aliases arrays (invalid shape at line {} column {})",
+            error.line(),
+            error.column()
+        ));
         VaultProviderConfig::default()
     })
 }

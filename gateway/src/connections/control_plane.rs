@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
-    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError},
     time::Instant,
 };
 
@@ -26,12 +26,16 @@ use super::{
     projection::{project_legacy_connections, LegacyConnectionProjection, LegacyProjectionError},
     secret::{
         OperatorAliasResolver, ResolvedSecret, SecretAliasMetadata, SecretProviderConfigError,
-        SecretPurpose, SecretResolveError, SecretResolveErrorKind, SecretResolver,
+        SecretProviderKind, SecretPurpose, SecretResolveError, SecretResolveErrorKind,
+        SecretResolver,
     },
     status::SafeConnectionStatus,
     store::{
         ConnectionDependencyKind, ConnectionEtag, ConnectionStatusUpdate, ConnectionStore,
         ConnectionStoreError, SqliteConnectionStore, StoredConnection,
+    },
+    vault_secret::{
+        VaultKvV2SecretProvider, VaultProviderConfig, VaultProviderConfigError, VaultTransport,
     },
 };
 
@@ -46,6 +50,7 @@ pub struct ConnectionControlPlane {
     secret_resolver: Arc<ConnectionSecretResolver>,
     local_secret_versions: Arc<ArcSwap<BTreeMap<String, u64>>>,
     local_secret_manager: Option<Arc<CoordinatedLocalSecretManager>>,
+    vault_config: VaultProviderConfig,
 }
 
 #[derive(Clone)]
@@ -239,6 +244,26 @@ impl ConnectionControlPlane {
         if local_secret_count > 0 && local_secret_keyring.is_none() {
             return Err(ConnectionControlPlaneError::LocalSecretKeyringRequired);
         }
+        let vault_alias_ids: BTreeSet<String> = config
+            .connection_vault_provider
+            .aliases
+            .iter()
+            .map(|alias| alias.id.clone())
+            .collect();
+        let vault_alias_metadata: Vec<SecretAliasMetadata> = config
+            .connection_vault_provider
+            .aliases
+            .iter()
+            .map(|alias| SecretAliasMetadata {
+                id: alias.id.clone(),
+                label: alias.label.clone(),
+                provider: SecretProviderKind::VaultKvV2,
+                configured: true,
+                purpose: None,
+                version: alias.version,
+                rotated_at: None,
+            })
+            .collect();
         let local_secret_provider = if let Some(keyring) = local_secret_keyring {
             let store = managed
                 .as_ref()
@@ -247,6 +272,7 @@ impl ConnectionControlPlane {
                 .connection_secret_aliases
                 .iter()
                 .map(|alias| alias.id.clone())
+                .chain(vault_alias_ids.iter().cloned())
                 .collect();
             Some(Arc::new(LocalSecretProvider::open(
                 store,
@@ -259,6 +285,9 @@ impl ConnectionControlPlane {
         let secret_resolver = Arc::new(ConnectionSecretResolver {
             operator: secret_resolver,
             local: local_secret_provider.clone(),
+            vault: OnceLock::new(),
+            vault_alias_ids,
+            vault_alias_metadata,
         });
         for record in &managed_records {
             if secret_resolver
@@ -319,6 +348,7 @@ impl ConnectionControlPlane {
             secret_resolver,
             local_secret_versions,
             local_secret_manager,
+            vault_config: config.connection_vault_provider.clone(),
         })
     }
 
@@ -361,6 +391,32 @@ impl ConnectionControlPlane {
 
     pub fn secret_alias_metadata(&self) -> Vec<SecretAliasMetadata> {
         self.secret_resolver.aliases()
+    }
+
+    pub fn activate_vault_provider(
+        &self,
+        transport: Arc<dyn VaultTransport>,
+    ) -> Result<(), ConnectionControlPlaneError> {
+        if self.vault_config.is_empty() {
+            return Ok(());
+        }
+        let reserved_ids: BTreeSet<String> = self
+            .secret_resolver
+            .operator
+            .aliases()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        let bootstrap: Option<Arc<dyn SecretResolver>> =
+            Some(Arc::clone(&self.secret_resolver.operator) as Arc<dyn SecretResolver>);
+        let provider = VaultKvV2SecretProvider::from_config(
+            &self.vault_config,
+            &reserved_ids,
+            transport,
+            bootstrap,
+        )?;
+        let _ = self.secret_resolver.vault.set(Arc::new(provider));
+        Ok(())
     }
 
     pub fn is_local_secret_manager_configured(&self) -> bool {
@@ -660,10 +716,12 @@ impl From<ConnectionStoreError> for ConnectionMutationError {
     }
 }
 
-#[derive(Clone)]
 struct ConnectionSecretResolver {
     operator: Arc<OperatorAliasResolver>,
     local: Option<Arc<LocalSecretProvider>>,
+    vault: OnceLock<Arc<VaultKvV2SecretProvider>>,
+    vault_alias_ids: BTreeSet<String>,
+    vault_alias_metadata: Vec<SecretAliasMetadata>,
 }
 
 #[derive(Debug)]
@@ -678,11 +736,17 @@ impl fmt::Debug for ConnectionSecretResolver {
             .debug_struct("ConnectionSecretResolver")
             .field("operator_alias_count", &self.operator.aliases().len())
             .field("local_provider_enabled", &self.local.is_some())
+            .field("vault_alias_count", &self.vault_alias_ids.len())
+            .field("vault_provider_activated", &self.vault.get().is_some())
             .finish()
     }
 }
 
 impl ConnectionSecretResolver {
+    fn is_deferred_alias(&self, alias_id: &str) -> bool {
+        self.vault_alias_ids.contains(alias_id)
+    }
+
     fn resolve_blocking(
         &self,
         alias_id: &str,
@@ -690,6 +754,12 @@ impl ConnectionSecretResolver {
     ) -> Result<ResolvedSecret, SecretResolveError> {
         if self.operator.contains_alias(alias_id) {
             return self.operator.resolve_blocking(alias_id, purpose);
+        }
+        if self.is_deferred_alias(alias_id) {
+            return Err(SecretResolveError::new(
+                alias_id,
+                SecretResolveErrorKind::SourceUnavailable,
+            ));
         }
         if let Some(local) = self.local.as_ref() {
             return local.resolve_blocking(alias_id, purpose);
@@ -721,7 +791,7 @@ impl ConnectionSecretResolver {
             ConnectionAuthentication::HeaderApiKey {
                 secret_id: Some(secret_id),
                 ..
-            } => {
+            } if !self.is_deferred_alias(secret_id) => {
                 self.resolve_required(
                     "authentication.secret_id",
                     secret_id,
@@ -730,7 +800,7 @@ impl ConnectionSecretResolver {
             }
             ConnectionAuthentication::StaticBearer {
                 secret_id: Some(secret_id),
-            } => {
+            } if !self.is_deferred_alias(secret_id) => {
                 self.resolve_required(
                     "authentication.secret_id",
                     secret_id,
@@ -740,27 +810,21 @@ impl ConnectionSecretResolver {
             ConnectionAuthentication::OAuth2ClientCredentials {
                 client_secret_id: Some(secret_id),
                 ..
-            } => {
+            } if !self.is_deferred_alias(secret_id) => {
                 self.resolve_required(
                     "authentication.client_secret_id",
                     secret_id,
                     SecretPurpose::OAuthClientSecret,
                 )?;
             }
-            ConnectionAuthentication::HeaderApiKey {
-                secret_id: None, ..
-            }
-            | ConnectionAuthentication::StaticBearer { secret_id: None }
-            | ConnectionAuthentication::OAuth2ClientCredentials {
-                client_secret_id: None,
-                ..
-            } => {}
+            _ => {}
         }
 
         let ca_bundle = candidate
             .tls
             .ca_bundle_alias
             .as_deref()
+            .filter(|id| !self.is_deferred_alias(id))
             .map(|id| self.resolve_required("tls.ca_bundle_alias", id, SecretPurpose::TlsCaBundle))
             .transpose()?;
         if ca_bundle
@@ -776,6 +840,7 @@ impl ConnectionSecretResolver {
             .tls
             .client_certificate_id
             .as_deref()
+            .filter(|id| !self.is_deferred_alias(id))
             .map(|id| {
                 self.resolve_required(
                     "tls.client_certificate_id",
@@ -788,6 +853,7 @@ impl ConnectionSecretResolver {
             .tls
             .client_private_key_id
             .as_deref()
+            .filter(|id| !self.is_deferred_alias(id))
             .map(|id| {
                 self.resolve_required(
                     "tls.client_private_key_id",
@@ -858,12 +924,14 @@ impl ConnectionSecretResolver {
                     .ok_or_else(|| BindingActivationError::Invalid {
                         fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
                     })?;
-            let private_key = self.resolve_required(
-                "tls.client_private_key_id",
-                private_key_id,
-                SecretPurpose::TlsPrivateKey,
-            )?;
-            validate_client_identity_material(replacement.expose(), private_key.expose())?;
+            if !self.is_deferred_alias(private_key_id) {
+                let private_key = self.resolve_required(
+                    "tls.client_private_key_id",
+                    private_key_id,
+                    SecretPurpose::TlsPrivateKey,
+                )?;
+                validate_client_identity_material(replacement.expose(), private_key.expose())?;
+            }
         }
 
         if candidate.tls.client_private_key_id.as_deref() == Some(rotated_id) {
@@ -880,12 +948,14 @@ impl ConnectionSecretResolver {
                     .ok_or_else(|| BindingActivationError::Invalid {
                         fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
                     })?;
-            let certificate = self.resolve_required(
-                "tls.client_certificate_id",
-                certificate_id,
-                SecretPurpose::TlsCertificate,
-            )?;
-            validate_client_identity_material(certificate.expose(), replacement.expose())?;
+            if !self.is_deferred_alias(certificate_id) {
+                let certificate = self.resolve_required(
+                    "tls.client_certificate_id",
+                    certificate_id,
+                    SecretPurpose::TlsCertificate,
+                )?;
+                validate_client_identity_material(certificate.expose(), replacement.expose())?;
+            }
         }
 
         Ok(())
@@ -938,6 +1008,11 @@ impl SecretResolver for ConnectionSecretResolver {
         if self.operator.contains_alias(alias_id) {
             return self.operator.resolve(alias_id, purpose).await;
         }
+        if let Some(vault) = self.vault.get() {
+            if vault.contains_alias(alias_id) {
+                return vault.resolve(alias_id, purpose).await;
+            }
+        }
         if let Some(local) = self.local.as_ref() {
             return local.resolve(alias_id, purpose).await;
         }
@@ -946,6 +1021,11 @@ impl SecretResolver for ConnectionSecretResolver {
 
     fn aliases(&self) -> Vec<SecretAliasMetadata> {
         let mut aliases = self.operator.aliases();
+        if let Some(vault) = self.vault.get() {
+            aliases.extend(vault.aliases());
+        } else {
+            aliases.extend(self.vault_alias_metadata.iter().cloned());
+        }
         if let Some(local) = self.local.as_ref() {
             aliases.extend(local.aliases());
         }
@@ -1054,6 +1134,7 @@ pub enum ConnectionControlPlaneError {
     Store(ConnectionStoreError),
     Projection(LegacyProjectionError),
     SecretProvider(SecretProviderConfigError),
+    VaultProvider(VaultProviderConfigError),
     LocalSecretKeyring(LocalSecretKeyringConfigError),
     LocalSecret(LocalSecretError),
     LocalSecretKeyringRequired,
@@ -1068,6 +1149,7 @@ impl fmt::Display for ConnectionControlPlaneError {
             Self::Store(error) => error.fmt(formatter),
             Self::Projection(error) => error.fmt(formatter),
             Self::SecretProvider(error) => error.fmt(formatter),
+            Self::VaultProvider(error) => error.fmt(formatter),
             Self::LocalSecretKeyring(error) => error.fmt(formatter),
             Self::LocalSecret(error) => error.fmt(formatter),
             Self::LocalSecretKeyringRequired => formatter.write_str(
@@ -1095,6 +1177,7 @@ impl Error for ConnectionControlPlaneError {
             Self::Store(error) => Some(error),
             Self::Projection(error) => Some(error),
             Self::SecretProvider(error) => Some(error),
+            Self::VaultProvider(error) => Some(error),
             Self::LocalSecretKeyring(error) => Some(error),
             Self::LocalSecret(error) => Some(error),
             _ => None,
@@ -1117,6 +1200,12 @@ impl From<LegacyProjectionError> for ConnectionControlPlaneError {
 impl From<SecretProviderConfigError> for ConnectionControlPlaneError {
     fn from(error: SecretProviderConfigError) -> Self {
         Self::SecretProvider(error)
+    }
+}
+
+impl From<VaultProviderConfigError> for ConnectionControlPlaneError {
+    fn from(error: VaultProviderConfigError) -> Self {
+        Self::VaultProvider(error)
     }
 }
 
