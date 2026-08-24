@@ -38,7 +38,7 @@ use std::{
     fmt,
     fs::{self},
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -716,6 +716,12 @@ enum AzureAuth {
     ClientCertificate {
         key_alias: String,
         x5t: String,
+        /// The parsed signing key, built exactly once from the bootstrap
+        /// alias and held for the provider lifetime so the private key PEM is
+        /// not re-resolved and re-decoded on every login. `EncodingKey` keeps
+        /// an internal DER copy that is not zeroization-aware; that residual
+        /// is accepted until a zeroize-capable RSA path is available.
+        key: OnceLock<EncodingKey>,
     },
 }
 
@@ -863,6 +869,7 @@ impl AzureKeyVaultSecretProvider {
                     AzureAuth::ClientCertificate {
                         key_alias: key_alias.clone(),
                         x5t: BASE64_URL_SAFE_NO_PAD.encode(thumbprint),
+                        key: OnceLock::new(),
                     }
                 }
             };
@@ -974,7 +981,10 @@ impl AzureKeyVaultSecretProvider {
         Some(entry.value.clone())
     }
 
-    fn store_value(&self, key: AzureValueCacheKey, value: &[u8]) {
+    fn store_value(&self, key: AzureValueCacheKey, value: &[u8], ttl: Duration) {
+        if ttl.is_zero() {
+            return;
+        }
         let now = self.clock.now();
         let mut cache = self.value_guard();
         cache.retain(|_, entry| entry.expires_at > now);
@@ -985,7 +995,7 @@ impl AzureKeyVaultSecretProvider {
             key,
             CachedAzureValue {
                 value: Zeroizing::new(value.to_vec()),
-                expires_at: now + self.value_cache_ttl,
+                expires_at: now + ttl,
             },
         );
     }
@@ -1069,12 +1079,21 @@ impl AzureKeyVaultSecretProvider {
         if result.is_err() {
             self.purge_alias(&alias.id);
         }
-        let (value, identity_generation) = result?;
-        let secret = ResolvedSecret::new(purpose, value.to_vec())
+        let (fetched, identity_generation) = result?;
+        let secret = ResolvedSecret::new(purpose, fetched.value.to_vec())
             .map_err(|_| AzureFailure::InvalidMaterial)?;
+        // A secret carrying a Key Vault expiry inside the cache window must
+        // stop being served the moment it expires, so the cache lifetime is
+        // clamped to the remaining validity instead of the flat TTL.
+        let mut cache_ttl = self.value_cache_ttl;
+        if let Some(expires_at) = fetched.expires_at_unix {
+            let remaining = expires_at.saturating_sub(self.clock.now_unix());
+            cache_ttl = cache_ttl.min(Duration::from_secs(remaining));
+        }
         self.store_value(
             self.cache_key(alias, purpose, identity_generation),
             secret.expose(),
+            cache_ttl,
         );
         Ok(secret)
     }
@@ -1084,7 +1103,7 @@ impl AzureKeyVaultSecretProvider {
         alias: &AzureAliasBinding,
         profile: &AzureProfile,
         purpose: SecretPurpose,
-    ) -> Result<(Zeroizing<Vec<u8>>, u64), AzureFailure> {
+    ) -> Result<(FetchedSecretValue, u64), AzureFailure> {
         let (token, generation) = self.token(profile, 0).await?;
         match self.read_once(alias, purpose, &token).await {
             Err(AzureFailure::ProviderDenied) => {
@@ -1146,9 +1165,13 @@ impl AzureKeyVaultSecretProvider {
                     .map(|secret| LoginCredential::Secret(Zeroizing::new(secret.to_owned())))
                     .map_err(|_| AzureFailure::IdentityInvalid)?
             }
-            AzureAuth::ClientCertificate { key_alias, x5t } => {
+            AzureAuth::ClientCertificate {
+                key_alias,
+                x5t,
+                key,
+            } => {
                 let assertion = self
-                    .client_certificate_assertion(profile, key_alias, x5t)
+                    .client_certificate_assertion(profile, key_alias, x5t, key)
                     .await?;
                 LoginCredential::Assertion(Zeroizing::new(assertion))
             }
@@ -1199,16 +1222,27 @@ impl AzureKeyVaultSecretProvider {
         profile: &AzureProfile,
         key_alias: &str,
         x5t: &str,
+        key_slot: &OnceLock<EncodingKey>,
     ) -> Result<String, AzureFailure> {
-        let key_material = self
-            .bootstrap_material(
-                key_alias,
-                SecretPurpose::TlsPrivateKey,
-                MAX_TLS_PRIVATE_KEY_BYTES,
-            )
-            .await?;
-        let key =
-            EncodingKey::from_rsa_pem(&key_material).map_err(|_| AzureFailure::IdentityInvalid)?;
+        // The signing key is built exactly once per provider lifetime; later
+        // logins reuse it instead of re-resolving and re-decoding the PEM. A
+        // rotated bootstrap key therefore takes effect on restart, matching
+        // every other startup-fixed identity input.
+        let key = match key_slot.get() {
+            Some(key) => key,
+            None => {
+                let key_material = self
+                    .bootstrap_material(
+                        key_alias,
+                        SecretPurpose::TlsPrivateKey,
+                        MAX_TLS_PRIVATE_KEY_BYTES,
+                    )
+                    .await?;
+                let key = EncodingKey::from_rsa_pem(&key_material)
+                    .map_err(|_| AzureFailure::IdentityInvalid)?;
+                key_slot.get_or_init(|| key)
+            }
+        };
         let now = self.clock.now_unix();
         let claims = ClientAssertionClaims {
             aud: profile.token_url.clone(),
@@ -1221,7 +1255,7 @@ impl AzureKeyVaultSecretProvider {
         };
         let mut header = JwtHeader::new(Algorithm::RS256);
         header.x5t = Some(x5t.to_owned());
-        encode_client_assertion(&header, &claims, &key).map_err(|_| AzureFailure::IdentityInvalid)
+        encode_client_assertion(&header, &claims, key).map_err(|_| AzureFailure::IdentityInvalid)
     }
 
     async fn bootstrap_material(
@@ -1283,7 +1317,7 @@ impl AzureKeyVaultSecretProvider {
         alias: &AzureAliasBinding,
         purpose: SecretPurpose,
         token: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, AzureFailure> {
+    ) -> Result<FetchedSecretValue, AzureFailure> {
         let headers = data_request_headers(token);
         let response = self
             .send_with_bounded_retries(Method::GET, &alias.read_url, headers, None, false)
@@ -1638,7 +1672,9 @@ fn identity_request_headers() -> HeaderMap {
 fn data_request_headers(token: &[u8]) -> Result<HeaderMap, AzureFailure> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    let mut bearer = Vec::with_capacity("Bearer ".len() + token.len());
+    // The intermediate credential buffer is zeroized on drop; the resulting
+    // header value is marked sensitive so it is excluded from debug output.
+    let mut bearer = Zeroizing::new(Vec::with_capacity("Bearer ".len() + token.len()));
     bearer.extend_from_slice(b"Bearer ");
     bearer.extend_from_slice(token);
     let mut value = HeaderValue::from_bytes(&bearer).map_err(|_| AzureFailure::IdentityInvalid)?;
@@ -1732,13 +1768,20 @@ struct AzureSecretAttributes {
     exp: Option<u64>,
 }
 
+/// One validated data-plane value plus the temporal bound that must also cap
+/// how long the value may be cached.
+struct FetchedSecretValue {
+    value: Zeroizing<Vec<u8>>,
+    expires_at_unix: Option<u64>,
+}
+
 impl AzureSecretGetResponse {
     fn into_value(
         mut self,
         alias: &AzureAliasBinding,
         purpose: SecretPurpose,
         now_unix: u64,
-    ) -> Result<Zeroizing<Vec<u8>>, AzureFailure> {
+    ) -> Result<FetchedSecretValue, AzureFailure> {
         validate_secret_identity(&self.id, alias)?;
         // A secret without `enabled: true` is treated as disabled rather than
         // usable-by-default, and the temporal window is enforced with the
@@ -1765,7 +1808,10 @@ impl AzureSecretGetResponse {
         if bytes.is_empty() || bytes.len() > purpose.max_bytes() || bytes.contains(&0) {
             return Err(AzureFailure::InvalidMaterial);
         }
-        Ok(bytes)
+        Ok(FetchedSecretValue {
+            value: bytes,
+            expires_at_unix: self.attributes.exp,
+        })
     }
 }
 
@@ -2727,6 +2773,50 @@ mod tests {
             assert_eq!(error.kind(), expected);
             assert!(fixture.provider.value_guard().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn values_expiring_inside_the_cache_window_stop_being_served_at_exp() {
+        let expiring = read_body_with_attributes(
+            VALUE_CANARY,
+            VERSION_CANARY,
+            &format!(r#"{{"enabled":true,"exp":{}}}"#, START_UNIX + 30),
+        );
+        let fixture = provider(vec![alias("billing", None)]);
+        fixture
+            .azure
+            .push_login(json_response(200, &token_body(TOKEN_CANARY, 3600)));
+        fixture.azure.push_read(json_response(200, &expiring));
+
+        let first = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect("a not-yet-expired secret should resolve");
+        assert_eq!(first.expose(), VALUE_CANARY.as_bytes());
+        let cached = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect("a not-yet-expired secret should serve from cache");
+        assert_eq!(cached.expose(), VALUE_CANARY.as_bytes());
+        assert_eq!(fixture.azure.reads().len(), 1);
+
+        // Past the secret's exp but still inside the flat value-cache TTL:
+        // the clamped cache entry must be gone, and the refetched (still
+        // expired) value must fail closed instead of serving stale material.
+        fixture.clock.advance(Duration::from_secs(31));
+        assert!(Duration::from_secs(31) < AZURE_VALUE_CACHE_TTL);
+
+        let error = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect_err("an expired secret must fail closed even inside the cache TTL");
+
+        assert_eq!(error.kind(), SecretResolveErrorKind::SourceDenied);
+        assert_eq!(fixture.azure.reads().len(), 2);
+        assert!(fixture.provider.value_guard().is_empty());
     }
 
     #[tokio::test]
