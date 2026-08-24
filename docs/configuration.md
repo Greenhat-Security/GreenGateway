@@ -257,6 +257,18 @@ Format and validation: a valid Unicode filesystem path that exists and canonical
 
 Use atomic replacement within the same protected root for file rotation. Do not point this setting at a general configuration, home, host-root, or service-account directory. Cloudflare container deployments must provide an explicit durable secret mount; forwarding the path alone does not create or persist that mount.
 
+### CONNECTION_VAULT_PROVIDER
+
+Optional Vault KV v2 secret provider. Profiles define how to authenticate to one or more HashiCorp Vault clusters; aliases map opaque IDs to individual KV v2 data keys.
+
+Default: `{}` (Vault secret provider disabled).
+
+Format: a JSON object of at most `256 KiB` with a `profiles` array (at most `8` entries) and an `aliases` array (at most `512` entries). Each profile has a safe opaque `id`, an `address` (scheme + authority), an optional `namespace`, and an `auth` object. Auth types are `workload_jwt` (mount, role, token_root, token_file), `token` (secret_alias referencing another provider), and `app_role` (mount, role_id, secret_id_alias referencing another provider). Each alias has a safe opaque `id`, a non-control-character `label` of at most `128` characters, a `profile` referencing a configured profile ID, a KV v2 `mount`, `path`, `key`, and an optional pinned `version`.
+
+Alias and profile IDs share the same namespace as operator aliases (`CONNECTION_SECRET_ALIASES`) and encrypted-local secrets (`CONNECTION_LOCAL_SECRET_KEYRING`). Duplicate IDs across any provider are rejected at startup. Vault aliases are resolved asynchronously at request time and are validated on first use, not at startup. The synchronous `resolve_blocking` path returns `SourceUnavailable` for Vault aliases, so connections that reference Vault secrets skip material validation during startup binding checks.
+
+Configuration `Debug`, startup errors, metadata, and provider errors redact addresses, namespaces, mounts, paths, keys, token roots, token files, and all auth locators. The JSON is an operator trust boundary: ordinary connection APIs accept and expose only alias IDs and safe labels. Alias metadata reports the Vault provider kind and configured alias record but has no secret reveal operation.
+
 ### SCHEMA_MISMATCH_SIGNAL_THRESHOLD
 
 Cumulative schema mismatch count that opens a `schema_mismatch` discovery signal for an endpoint.
