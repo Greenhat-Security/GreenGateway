@@ -397,7 +397,7 @@ impl ConnectionControlPlane {
         &self,
         transport: Arc<dyn VaultTransport>,
     ) -> Result<(), ConnectionControlPlaneError> {
-        if self.vault_config.is_empty() {
+        if self.vault_config.is_empty() || self.secret_resolver.vault.get().is_some() {
             return Ok(());
         }
         let reserved_ids: BTreeSet<String> = self
@@ -817,7 +817,9 @@ impl ConnectionSecretResolver {
                     SecretPurpose::OAuthClientSecret,
                 )?;
             }
-            _ => {}
+            ConnectionAuthentication::HeaderApiKey { .. }
+            | ConnectionAuthentication::StaticBearer { .. }
+            | ConnectionAuthentication::OAuth2ClientCredentials { .. } => {}
         }
 
         let ca_bundle = candidate
