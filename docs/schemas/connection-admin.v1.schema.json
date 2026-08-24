@@ -977,7 +977,8 @@
         "operator_file",
         "local_encrypted",
         "vault_kv_v2",
-        "gcp_secret_manager"
+        "gcp_secret_manager",
+        "azure_key_vault"
       ]
     },
     "SecretActions": {
