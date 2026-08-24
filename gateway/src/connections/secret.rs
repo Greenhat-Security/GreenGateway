@@ -117,6 +117,7 @@ pub enum SecretProviderKind {
     VaultKvV2,
     GcpSecretManager,
     AzureKeyVault,
+    AwsSecretsManager,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
