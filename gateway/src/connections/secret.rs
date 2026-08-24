@@ -377,7 +377,7 @@ impl OperatorAliasResolver {
     }
 
     pub fn contains_alias(&self, alias_id: &str) -> bool {
-        self.aliases.contains_key(alias_id)
+        <Self as SecretResolver>::contains_alias(self, alias_id)
     }
 
     pub(crate) fn resolve_blocking(

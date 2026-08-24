@@ -247,13 +247,17 @@ impl ConnectionControlPlane {
         }
         // Aliases owned by network secret providers, which are activated after
         // the egress client exists and are validated on first use. Additional
-        // network providers extend both collections here.
-        let network_alias_ids: BTreeSet<String> = config
-            .connection_vault_provider
-            .aliases
-            .iter()
-            .map(|alias| alias.id.clone())
-            .collect();
+        // network providers extend both collections here; an id claimed by two
+        // network providers is rejected so one provider cannot silently shadow
+        // another during resolution.
+        let mut network_alias_ids: BTreeSet<String> = BTreeSet::new();
+        for alias in &config.connection_vault_provider.aliases {
+            if !network_alias_ids.insert(alias.id.clone()) {
+                return Err(ConnectionControlPlaneError::NetworkAliasIdCollision {
+                    id: alias.id.clone(),
+                });
+            }
+        }
         let network_alias_metadata: Vec<SecretAliasMetadata> = config
             .connection_vault_provider
             .aliases
@@ -399,7 +403,9 @@ impl ConnectionControlPlane {
 
     /// Build and install every configured network secret provider. Called once
     /// after the egress client exists; later calls are no-ops. Additional
-    /// network providers add their construction block here.
+    /// network providers add their construction block here and must extend
+    /// `reserved_ids` with their own alias ids afterwards, so each successive
+    /// provider rejects ids already claimed by an earlier one.
     pub fn activate_network_secret_providers(
         &self,
         egress: &Arc<crate::egress::EgressClient>,
@@ -407,7 +413,7 @@ impl ConnectionControlPlane {
         if self.secret_resolver.network.get().is_some() {
             return Ok(());
         }
-        let reserved_ids: BTreeSet<String> = self
+        let mut reserved_ids: BTreeSet<String> = self
             .secret_resolver
             .operator
             .aliases()
@@ -427,9 +433,22 @@ impl ConnectionControlPlane {
                 bootstrap.clone(),
             )?;
             providers.push(Arc::new(provider));
+            reserved_ids.extend(
+                self.vault_config
+                    .aliases
+                    .iter()
+                    .map(|alias| alias.id.clone()),
+            );
         }
-        let _ = self.secret_resolver.network.set(providers);
+        self.install_network_secret_providers(providers);
         Ok(())
+    }
+
+    /// Install pre-built network providers directly. Production activation goes
+    /// through [`Self::activate_network_secret_providers`]; this seam lets
+    /// integration tests substitute fake providers without real transports.
+    pub(crate) fn install_network_secret_providers(&self, providers: Vec<Arc<dyn SecretResolver>>) {
+        let _ = self.secret_resolver.network.set(providers);
     }
 
     pub fn is_local_secret_manager_configured(&self) -> bool {
@@ -1162,6 +1181,7 @@ pub enum ConnectionControlPlaneError {
     LocalSecretKeyringRequired,
     LimitExceeded { count: usize, maximum: usize },
     IdCollision { id: String },
+    NetworkAliasIdCollision { id: String },
     UnresolvableBindings { id: String },
 }
 
@@ -1184,6 +1204,10 @@ impl fmt::Display for ConnectionControlPlaneError {
             Self::IdCollision { id } => write!(
                 formatter,
                 "managed connection ID '{id}' collides with a reserved legacy projection"
+            ),
+            Self::NetworkAliasIdCollision { id } => write!(
+                formatter,
+                "secret alias '{id}' is claimed by more than one network secret provider"
             ),
             Self::UnresolvableBindings { id } => write!(
                 formatter,
@@ -1390,6 +1414,18 @@ mod tests {
         let live = resolver.aliases();
         assert_eq!(live.len(), 2);
         assert!(live.iter().all(|alias| alias.label.ends_with("live")));
+
+        // The synchronous validation path must keep deferring network aliases
+        // even after activation: deferral keys off the configured alias set,
+        // never the activated providers, so startup binding validation can
+        // never fetch network secret material.
+        let still_blocked = resolver
+            .resolve_blocking("alpha", SecretPurpose::HeaderApiKey)
+            .expect_err("network alias must stay deferred on the blocking path after activation");
+        assert_eq!(
+            still_blocked.kind(),
+            SecretResolveErrorKind::SourceUnavailable
+        );
 
         let unknown = resolver
             .resolve("gamma", SecretPurpose::HeaderApiKey)

@@ -850,10 +850,6 @@ impl VaultKvV2SecretProvider {
         })
     }
 
-    pub fn contains_alias(&self, alias_id: &str) -> bool {
-        self.aliases.contains_key(alias_id)
-    }
-
     pub fn alias_ids(&self) -> BTreeSet<String> {
         self.aliases.keys().cloned().collect()
     }
