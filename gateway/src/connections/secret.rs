@@ -759,6 +759,64 @@ mod tests {
 
     use super::*;
 
+    /// Every provider kind, kept exhaustive by the match below: adding a
+    /// variant breaks compilation here until this list and the published
+    /// admin schema are both updated.
+    const ALL_SECRET_PROVIDER_KINDS: [SecretProviderKind; 4] = [
+        SecretProviderKind::OperatorEnvironment,
+        SecretProviderKind::OperatorFile,
+        SecretProviderKind::LocalEncrypted,
+        SecretProviderKind::VaultKvV2,
+    ];
+
+    #[allow(dead_code)]
+    fn assert_secret_provider_kinds_exhaustive(kind: SecretProviderKind) {
+        match kind {
+            SecretProviderKind::OperatorEnvironment
+            | SecretProviderKind::OperatorFile
+            | SecretProviderKind::LocalEncrypted
+            | SecretProviderKind::VaultKvV2 => {}
+        }
+    }
+
+    #[test]
+    fn published_admin_schema_lists_every_secret_provider_kind() {
+        let schema_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("gateway crate should live inside the workspace")
+            .join("docs/schemas/connection-admin.v1.schema.json");
+        let schema: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(schema_path).expect("published admin schema should read"),
+        )
+        .expect("published admin schema should parse");
+        let listed: std::collections::BTreeSet<String> = schema
+            .pointer("/$defs/SecretProvider/enum")
+            .and_then(serde_json::Value::as_array)
+            .expect("schema should define the SecretProvider enum")
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("SecretProvider enum entries should be strings")
+                    .to_owned()
+            })
+            .collect();
+        let expected: std::collections::BTreeSet<String> = ALL_SECRET_PROVIDER_KINDS
+            .iter()
+            .map(|kind| {
+                serde_json::to_value(kind)
+                    .expect("provider kind should serialize")
+                    .as_str()
+                    .expect("provider kind should serialize as a string")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            listed, expected,
+            "docs/schemas/connection-admin.v1.schema.json SecretProvider enum must list exactly the serialized SecretProviderKind variants"
+        );
+    }
+
     const CANARY: &[u8] = b"greengateway-secret-canary";
 
     struct TemporarySecrets {

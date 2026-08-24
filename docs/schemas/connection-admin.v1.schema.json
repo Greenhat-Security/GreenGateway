@@ -975,7 +975,8 @@
       "enum": [
         "operator_environment",
         "operator_file",
-        "local_encrypted"
+        "local_encrypted",
+        "vault_kv_v2"
       ]
     },
     "SecretActions": {
