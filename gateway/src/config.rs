@@ -16,6 +16,9 @@ use serde::Deserialize;
 use crate::{
     auth::principal::{canonical_issuer, provider_issuer, PROVIDER_ISSUER_PREFIX},
     connections::{
+        azure_secret::{
+            validate_azure_provider_config, AzureProviderConfig, MAX_AZURE_PROVIDER_CONFIG_BYTES,
+        },
         gcp_secret::{
             validate_gcp_provider_config, GcpProviderConfig, MAX_GCP_PROVIDER_CONFIG_BYTES,
         },
@@ -133,6 +136,7 @@ const CSRF_ENABLED: &str = "CSRF_ENABLED";
 const CSRF_EXEMPT_PATHS: &str = "CSRF_EXEMPT_PATHS";
 const CSRF_HEADER_NAME: &str = "CSRF_HEADER_NAME";
 const CONNECTIONS_SQLITE_PATH: &str = "CONNECTIONS_SQLITE_PATH";
+const CONNECTION_AZURE_PROVIDER: &str = "CONNECTION_AZURE_PROVIDER";
 const CONNECTION_GCP_PROVIDER: &str = "CONNECTION_GCP_PROVIDER";
 const CONNECTION_LOCAL_SECRET_KEYRING: &str = "CONNECTION_LOCAL_SECRET_KEYRING";
 const CONNECTION_SECRET_ALIASES: &str = "CONNECTION_SECRET_ALIASES";
@@ -217,6 +221,7 @@ pub struct Config {
     pub connection_secret_aliases: Vec<OperatorSecretAliasConfig>,
     pub connection_vault_provider: VaultProviderConfig,
     pub connection_gcp_provider: GcpProviderConfig,
+    pub connection_azure_provider: AzureProviderConfig,
     pub connection_secrets_root: Option<SecretRootConfig>,
     pub payload_capture_enabled: bool,
     pub payload_capture_sample_rate: f64,
@@ -936,6 +941,19 @@ impl Config {
         {
             problems.push(format!("{CONNECTION_GCP_PROVIDER}: {error}"));
         }
+        let connection_azure_provider = parse_azure_provider_config(
+            CONNECTION_AZURE_PROVIDER,
+            get_var(CONNECTION_AZURE_PROVIDER),
+            &mut problems,
+        );
+        // Azure aliases share the same namespace as the operator aliases. IDs
+        // claimed by other network providers are additionally rejected by the
+        // control plane's cross-provider collision guard.
+        if let Err(error) =
+            validate_azure_provider_config(&connection_azure_provider, &reserved_alias_ids)
+        {
+            problems.push(format!("{CONNECTION_AZURE_PROVIDER}: {error}"));
+        }
         let payload_capture_enabled = parse_var(
             PAYLOAD_CAPTURE_ENABLED,
             get_var(PAYLOAD_CAPTURE_ENABLED),
@@ -1395,6 +1413,7 @@ impl Config {
                 connection_local_secret_keyring,
                 connection_vault_provider,
                 connection_gcp_provider,
+                connection_azure_provider,
                 connection_secret_aliases,
                 connection_secrets_root,
                 payload_capture_enabled,
@@ -2540,6 +2559,42 @@ fn parse_gcp_provider_config(
             error.column()
         ));
         GcpProviderConfig::default()
+    })
+}
+
+fn parse_azure_provider_config(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> AzureProviderConfig {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return AzureProviderConfig::default(),
+        Err(VarError::NotUnicode(_)) => {
+            problems.push(format!("{name} must be valid Unicode"));
+            return AzureProviderConfig::default();
+        }
+    };
+    if value.len() > MAX_AZURE_PROVIDER_CONFIG_BYTES {
+        problems.push(format!(
+            "{name} must contain at most {MAX_AZURE_PROVIDER_CONFIG_BYTES} bytes"
+        ));
+        return AzureProviderConfig::default();
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return AzureProviderConfig::default();
+    }
+    serde_json::from_str(value).unwrap_or_else(|error| {
+        // Position only. serde echoes the offending scalar in its message, and
+        // this string reaches stderr at startup, so interpolating the error
+        // would print operator secret locators into container logs.
+        problems.push(format!(
+            "{name} must be a JSON object with profiles and aliases arrays (invalid shape at line {} column {})",
+            error.line(),
+            error.column()
+        ));
+        AzureProviderConfig::default()
     })
 }
 
