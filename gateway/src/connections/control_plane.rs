@@ -15,6 +15,10 @@ use zeroize::Zeroizing;
 use crate::config::Config;
 
 use super::{
+    gcp_secret::{
+        EgressGcpTransport, GcpProviderConfig, GcpProviderConfigError, GcpSecretManagerProvider,
+        GcpTransport,
+    },
     local_secret::{
         LocalSecretError, LocalSecretKeyring, LocalSecretKeyringConfigError, LocalSecretManager,
         LocalSecretProvider, MasterKeyRotationProgress,
@@ -52,6 +56,7 @@ pub struct ConnectionControlPlane {
     local_secret_versions: Arc<ArcSwap<BTreeMap<String, u64>>>,
     local_secret_manager: Option<Arc<CoordinatedLocalSecretManager>>,
     vault_config: VaultProviderConfig,
+    gcp_config: GcpProviderConfig,
 }
 
 #[derive(Clone)]
@@ -258,7 +263,14 @@ impl ConnectionControlPlane {
                 });
             }
         }
-        let network_alias_metadata: Vec<SecretAliasMetadata> = config
+        for alias in &config.connection_gcp_provider.aliases {
+            if !network_alias_ids.insert(alias.id.clone()) {
+                return Err(ConnectionControlPlaneError::NetworkAliasIdCollision {
+                    id: alias.id.clone(),
+                });
+            }
+        }
+        let mut network_alias_metadata: Vec<SecretAliasMetadata> = config
             .connection_vault_provider
             .aliases
             .iter()
@@ -272,6 +284,17 @@ impl ConnectionControlPlane {
                 rotated_at: None,
             })
             .collect();
+        network_alias_metadata.extend(config.connection_gcp_provider.aliases.iter().map(|alias| {
+            SecretAliasMetadata {
+                id: alias.id.clone(),
+                label: alias.label.clone(),
+                provider: SecretProviderKind::GcpSecretManager,
+                configured: true,
+                purpose: None,
+                version: alias.version,
+                rotated_at: None,
+            }
+        }));
         let local_secret_provider = if let Some(keyring) = local_secret_keyring {
             let store = managed
                 .as_ref()
@@ -357,6 +380,7 @@ impl ConnectionControlPlane {
             local_secret_versions,
             local_secret_manager,
             vault_config: config.connection_vault_provider.clone(),
+            gcp_config: config.connection_gcp_provider.clone(),
         })
     }
 
@@ -439,6 +463,14 @@ impl ConnectionControlPlane {
                     .iter()
                     .map(|alias| alias.id.clone()),
             );
+        }
+        if !self.gcp_config.is_empty() {
+            let transport: Arc<dyn GcpTransport> =
+                Arc::new(EgressGcpTransport::new(Arc::clone(egress)));
+            let provider =
+                GcpSecretManagerProvider::from_config(&self.gcp_config, &reserved_ids, transport)?;
+            providers.push(Arc::new(provider));
+            reserved_ids.extend(self.gcp_config.aliases.iter().map(|alias| alias.id.clone()));
         }
         self.install_network_secret_providers(providers);
         Ok(())
@@ -1176,6 +1208,7 @@ pub enum ConnectionControlPlaneError {
     Projection(LegacyProjectionError),
     SecretProvider(SecretProviderConfigError),
     VaultProvider(VaultProviderConfigError),
+    GcpProvider(GcpProviderConfigError),
     LocalSecretKeyring(LocalSecretKeyringConfigError),
     LocalSecret(LocalSecretError),
     LocalSecretKeyringRequired,
@@ -1192,6 +1225,7 @@ impl fmt::Display for ConnectionControlPlaneError {
             Self::Projection(error) => error.fmt(formatter),
             Self::SecretProvider(error) => error.fmt(formatter),
             Self::VaultProvider(error) => error.fmt(formatter),
+            Self::GcpProvider(error) => error.fmt(formatter),
             Self::LocalSecretKeyring(error) => error.fmt(formatter),
             Self::LocalSecret(error) => error.fmt(formatter),
             Self::LocalSecretKeyringRequired => formatter.write_str(
@@ -1224,6 +1258,7 @@ impl Error for ConnectionControlPlaneError {
             Self::Projection(error) => Some(error),
             Self::SecretProvider(error) => Some(error),
             Self::VaultProvider(error) => Some(error),
+            Self::GcpProvider(error) => Some(error),
             Self::LocalSecretKeyring(error) => Some(error),
             Self::LocalSecret(error) => Some(error),
             _ => None,
@@ -1252,6 +1287,12 @@ impl From<SecretProviderConfigError> for ConnectionControlPlaneError {
 impl From<VaultProviderConfigError> for ConnectionControlPlaneError {
     fn from(error: VaultProviderConfigError) -> Self {
         Self::VaultProvider(error)
+    }
+}
+
+impl From<GcpProviderConfigError> for ConnectionControlPlaneError {
+    fn from(error: GcpProviderConfigError) -> Self {
+        Self::GcpProvider(error)
     }
 }
 

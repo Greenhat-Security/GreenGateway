@@ -976,7 +976,8 @@
         "operator_environment",
         "operator_file",
         "local_encrypted",
-        "vault_kv_v2"
+        "vault_kv_v2",
+        "gcp_secret_manager"
       ]
     },
     "SecretActions": {
