@@ -288,6 +288,52 @@ Least privilege: grant the federated identity (or the impersonated service accou
 Alias IDs share the same namespace as operator aliases (`CONNECTION_SECRET_ALIASES`), encrypted-local secrets (`CONNECTION_LOCAL_SECRET_KEYRING`), and other network secret providers, and duplicate alias IDs are rejected at startup; profile IDs must be unique within this provider. Aliases are resolved asynchronously at request time and are validated on first use, not at startup. The synchronous `resolve_blocking` path returns `SourceUnavailable` for these aliases, so connections that reference them skip material validation during startup binding checks.
 
 Configuration `Debug`, startup errors, metadata, and provider errors redact audiences, token roots, token files, service accounts, projects, locations, secret IDs, tokens, and payloads. The JSON is an operator trust boundary: ordinary connection APIs accept and expose only alias IDs and safe labels. Alias metadata reports the provider kind and configured alias record but has no secret reveal operation.
+### CONNECTION_KUBERNETES_PROVIDER
+
+Optional read-only Kubernetes Secrets API provider. Profiles define how to authenticate to one or more API servers; aliases map opaque IDs to exactly one namespace, Secret name, and `data` key.
+
+Default: `{}` (Kubernetes secret provider disabled).
+
+Format: a JSON object of at most `256 KiB` with a `profiles` array (at most `8` entries) and an `aliases` array (at most `512` entries). Each profile has a safe opaque `id`, a `server`, an optional `ca_bundle_alias`, and an `auth` object. `server` is an explicit absolute `https` URL of scheme and authority only (no credentials, path, query, or fragment); the provider never derives an endpoint from `KUBERNETES_SERVICE_HOST`, a kubeconfig, or any other ambient in-cluster environment. Auth types are `projected_token` (`token_root`, `token_file`: an audience-bound short-lived ServiceAccount token projected by the kubelet into a pinned directory, re-read on a bounded interval so rotation is observed within about a minute and immediately after a `401`) and `bearer_alias` (`secret_alias`: a static bearer token taken from an already configured alias of another provider, never from an inline value). There is no anonymous mode, no kubeconfig discovery or parsing, no exec/credential plugin, no external command, and no proxy support. Each alias has a safe opaque `id`, a non-control-character `label` of at most `128` characters, a `profile` referencing a configured profile ID, a `namespace` (RFC 1123 DNS label), a Secret `name` (RFC 1123 DNS subdomain), and a `key` restricted to ASCII alphanumerics, `-`, `_`, and `.`. Every path segment is validated against these rules at startup and defensively percent-encoded when the fixed request URL is assembled, so no request URL ever contains a caller-supplied byte.
+
+The provider implements exactly one operation, `GET /api/v1/namespaces/{namespace}/secrets/{name}` with `Accept: application/json`; there is no discovery, list, watch, write, rotate, delete, or administration path. The returned object must be `kind: Secret` at `apiVersion: v1` with `metadata.namespace` and `metadata.name` exactly matching the alias binding, the configured `data` key is selected exactly, and its value must be canonical Base64 (whitespace-laced, unpadded, over-padded, or trailing-bit-bearing encodings are rejected). A missing Secret, missing key, object identity mismatch, malformed document, oversized response, or decoded value outside the purpose byte bounds fails closed; a failed resolution purges any cached value for that alias and never returns a previous value, retries anonymously, or switches credential sources. A `401` earns exactly one re-read of the fixed identity source; an RBAC `403` never retries. Resolutions are bounded by an `8`-way concurrency cap, a total deadline, one transient retry with backoff, a `2 MiB` response cap, and a bounded short-TTL value cache keyed by provider configuration, egress generation, identity generation, alias, and purpose.
+
+Egress admission is explicit. Every request travels through the standard egress client (HTTPS only, strict certificate and hostname verification, all-answer DNS validation with exact address pinning, no redirects), and the API-server host must be present in `EGRESS_ALLOWED_HOSTS`; nothing is ever allowed implicitly, including `.svc` names, cluster-local suffixes, and private ranges. When the API server resolves to a private or otherwise non-global address (the usual case for in-cluster endpoints such as `kubernetes.default.svc` or a ClusterIP), the default `EGRESS_DENY_PRIVATE_IPS=true` still blocks the connection unless the deployment's egress policy allowlists that address range through an explicit policy CIDR; prefer that scoped CIDR over disabling `EGRESS_DENY_PRIVATE_IPS` globally, and remember that a non-`443` API-server port (commonly `6443`) must also be admitted wherever the egress policy restricts ports. TLS trust for API servers issued by a private cluster CA comes from `ca_bundle_alias`: an alias of another provider (typically an operator file alias pointing at the projected `ca.crt`) whose PEM bundle is added to the verification trust set of a derived egress client for that profile only. Trust is only ever added through that explicit validated bundle, hostname verification still applies, and there is no insecure-skip-verify option; without `ca_bundle_alias` the API-server certificate must chain to the platform trust store.
+
+Alias and profile IDs share the same namespace as operator aliases (`CONNECTION_SECRET_ALIASES`), encrypted-local secrets (`CONNECTION_LOCAL_SECRET_KEYRING`), and other network providers such as `CONNECTION_VAULT_PROVIDER`. Duplicate IDs across any provider are rejected at startup. Kubernetes aliases are resolved asynchronously at request time and are validated on first use, not at startup. The synchronous `resolve_blocking` path returns `SourceUnavailable` for Kubernetes aliases, so connections that reference them skip material validation during startup binding checks.
+
+Configuration `Debug`, startup errors, metadata, and provider errors redact servers, namespaces, Secret names, data keys, token roots, token files, and all auth locators; tokens, request headers, and response bodies are never logged, and secret material is zeroized on drop. The JSON is an operator trust boundary: ordinary connection APIs accept and expose only alias IDs and safe labels. Alias metadata reports the Kubernetes provider kind and configured alias record but has no secret reveal operation.
+
+Grant the gateway's ServiceAccount the least privilege the provider needs: a namespaced Role with only the `get` verb on `secrets`, restricted with `resourceNames` to exactly the Secrets that aliases bind, and a RoleBinding in that namespace. Do not grant `list` or `watch`; the provider never issues them, and their absence keeps the identity unable to enumerate. Placeholder values only:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: greengateway-secret-reader
+  namespace: your-namespace
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["your-secret-name"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: greengateway-secret-reader
+  namespace: your-namespace
+subjects:
+  - kind: ServiceAccount
+    name: your-gateway-serviceaccount
+    namespace: your-gateway-namespace
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: greengateway-secret-reader
+```
+
+For `projected_token`, project a dedicated audience-bound token rather than mounting the ServiceAccount's default credential: a `projected` volume with a `serviceAccountToken` source, an explicit `audience` the API server accepts (for self-hosted authentication this is typically `https://kubernetes.default.svc`; keep it distinct from tokens minted for other services), and a short `expirationSeconds` (the Kubernetes minimum is `600`; keep it at or near that minimum so a leaked token ages out quickly). The kubelet rotates the projected file automatically and the provider re-reads it on a bounded interval, so no restart is needed on rotation. Encryption of Secret data at rest (for example KMS-backed `EncryptionConfiguration` for the `secrets` resource in etcd) is the cluster operator's responsibility and is not something this provider can observe or enforce.
 
 ### CONNECTION_AZURE_PROVIDER
 
