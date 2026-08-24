@@ -27,6 +27,10 @@ use super::{
         EgressGcpTransport, GcpProviderConfig, GcpProviderConfigError, GcpSecretManagerProvider,
         GcpTransport,
     },
+    kubernetes_secret::{
+        EgressKubernetesTransport, KubernetesProviderConfig, KubernetesProviderConfigError,
+        KubernetesSecretProvider, KubernetesTransport,
+    },
     local_secret::{
         LocalSecretError, LocalSecretKeyring, LocalSecretKeyringConfigError, LocalSecretManager,
         LocalSecretProvider, MasterKeyRotationProgress,
@@ -67,6 +71,7 @@ pub struct ConnectionControlPlane {
     gcp_config: GcpProviderConfig,
     azure_config: AzureProviderConfig,
     aws_config: AwsProviderConfig,
+    kubernetes_config: KubernetesProviderConfig,
 }
 
 #[derive(Clone)]
@@ -294,6 +299,13 @@ impl ConnectionControlPlane {
                 });
             }
         }
+        for alias in &config.connection_kubernetes_provider.aliases {
+            if !network_alias_ids.insert(alias.id.clone()) {
+                return Err(ConnectionControlPlaneError::NetworkAliasIdCollision {
+                    id: alias.id.clone(),
+                });
+            }
+        }
         let mut network_alias_metadata: Vec<SecretAliasMetadata> = config
             .connection_vault_provider
             .aliases
@@ -343,6 +355,17 @@ impl ConnectionControlPlane {
                 rotated_at: None,
             }
         }));
+        network_alias_metadata.extend(config.connection_kubernetes_provider.aliases.iter().map(
+            |alias| SecretAliasMetadata {
+                id: alias.id.clone(),
+                label: alias.label.clone(),
+                provider: SecretProviderKind::KubernetesSecrets,
+                configured: true,
+                purpose: None,
+                version: None,
+                rotated_at: None,
+            },
+        ));
         let local_secret_provider = if let Some(keyring) = local_secret_keyring {
             let store = managed
                 .as_ref()
@@ -431,6 +454,7 @@ impl ConnectionControlPlane {
             gcp_config: config.connection_gcp_provider.clone(),
             azure_config: config.connection_azure_provider.clone(),
             aws_config: config.connection_aws_provider.clone(),
+            kubernetes_config: config.connection_kubernetes_provider.clone(),
         })
     }
 
@@ -550,6 +574,25 @@ impl ConnectionControlPlane {
             )?;
             providers.push(Arc::new(provider));
             reserved_ids.extend(self.aws_config.aliases.iter().map(|alias| alias.id.clone()));
+        }
+        if !self.kubernetes_config.is_empty() {
+            let transport: Arc<dyn KubernetesTransport> = Arc::new(
+                EgressKubernetesTransport::bounded(egress)
+                    .map_err(|_| KubernetesProviderConfigError::TransportBounds)?,
+            );
+            let provider = KubernetesSecretProvider::from_config(
+                &self.kubernetes_config,
+                &reserved_ids,
+                transport,
+                bootstrap.clone(),
+            )?;
+            providers.push(Arc::new(provider));
+            reserved_ids.extend(
+                self.kubernetes_config
+                    .aliases
+                    .iter()
+                    .map(|alias| alias.id.clone()),
+            );
         }
         self.install_network_secret_providers(providers);
         Ok(())
@@ -1290,6 +1333,7 @@ pub enum ConnectionControlPlaneError {
     GcpProvider(GcpProviderConfigError),
     AzureProvider(AzureProviderConfigError),
     AwsProvider(AwsProviderConfigError),
+    KubernetesProvider(KubernetesProviderConfigError),
     LocalSecretKeyring(LocalSecretKeyringConfigError),
     LocalSecret(LocalSecretError),
     LocalSecretKeyringRequired,
@@ -1309,6 +1353,7 @@ impl fmt::Display for ConnectionControlPlaneError {
             Self::GcpProvider(error) => error.fmt(formatter),
             Self::AzureProvider(error) => error.fmt(formatter),
             Self::AwsProvider(error) => error.fmt(formatter),
+            Self::KubernetesProvider(error) => error.fmt(formatter),
             Self::LocalSecretKeyring(error) => error.fmt(formatter),
             Self::LocalSecret(error) => error.fmt(formatter),
             Self::LocalSecretKeyringRequired => formatter.write_str(
@@ -1344,6 +1389,7 @@ impl Error for ConnectionControlPlaneError {
             Self::GcpProvider(error) => Some(error),
             Self::AzureProvider(error) => Some(error),
             Self::AwsProvider(error) => Some(error),
+            Self::KubernetesProvider(error) => Some(error),
             Self::LocalSecretKeyring(error) => Some(error),
             Self::LocalSecret(error) => Some(error),
             _ => None,
@@ -1390,6 +1436,12 @@ impl From<AzureProviderConfigError> for ConnectionControlPlaneError {
 impl From<AwsProviderConfigError> for ConnectionControlPlaneError {
     fn from(error: AwsProviderConfigError) -> Self {
         Self::AwsProvider(error)
+    }
+}
+
+impl From<KubernetesProviderConfigError> for ConnectionControlPlaneError {
+    fn from(error: KubernetesProviderConfigError) -> Self {
+        Self::KubernetesProvider(error)
     }
 }
 

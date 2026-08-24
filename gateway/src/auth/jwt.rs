@@ -1692,6 +1692,8 @@ RowSUZV5FSmOGJ7JyROZ80k=
             connection_azure_provider:
                 crate::connections::azure_secret::AzureProviderConfig::default(),
             connection_aws_provider: crate::connections::aws_secret::AwsProviderConfig::default(),
+            connection_kubernetes_provider:
+                crate::connections::kubernetes_secret::KubernetesProviderConfig::default(),
             connection_secret_aliases: Vec::new(),
             connection_secrets_root: None,
             payload_capture_enabled: false,

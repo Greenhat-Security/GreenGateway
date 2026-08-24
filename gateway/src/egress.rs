@@ -965,6 +965,39 @@ impl EgressClient {
         )
     }
 
+    /// Derives a client that additionally trusts the given PEM CA bundle when
+    /// verifying server certificates (for providers whose endpoints chain to a
+    /// private CA) and/or presents the given combined certificate-chain and
+    /// private-key PEM as its mutual-TLS client identity. Host allowlisting,
+    /// DNS pinning, redirect refusal, hostname verification, timeouts, and
+    /// size bounds are inherited unchanged; oversized, unparsable, or empty
+    /// material fails closed.
+    pub(crate) fn with_tls_material(
+        &self,
+        ca_bundle_pem: Option<&[u8]>,
+        client_identity_pem: Option<&[u8]>,
+    ) -> Result<Self, EgressError> {
+        let mut config = self.config.clone();
+        if let Some(pem_bundle) = ca_bundle_pem {
+            config.apply_tls_ca_bundle_pem(pem_bundle)?;
+        }
+        if let Some(pem_identity) = client_identity_pem {
+            config.apply_tls_client_identity_pem(pem_identity)?;
+        }
+        self.reconfigured(config)
+    }
+
+    /// Derives a client whose maximum response size is clamped to `maximum`
+    /// when that is tighter than the deployment egress bound. The cap is
+    /// enforced while the response is being received, never after buffering.
+    /// A deployment bound that is already tighter is kept, so a caller can
+    /// only narrow the limit.
+    pub(crate) fn with_response_cap(&self, maximum: usize) -> Result<Self, EgressError> {
+        let mut config = self.config.clone();
+        config.max_response_bytes = config.max_response_bytes.min(maximum);
+        self.reconfigured(config)
+    }
+
     pub async fn request(&self, method: Method, url: &str) -> Result<EgressResponse, EgressError> {
         self.request_with_headers(method, url, HeaderMap::new(), None)
             .await
@@ -4709,6 +4742,8 @@ mod tests {
             connection_azure_provider:
                 crate::connections::azure_secret::AzureProviderConfig::default(),
             connection_aws_provider: crate::connections::aws_secret::AwsProviderConfig::default(),
+            connection_kubernetes_provider:
+                crate::connections::kubernetes_secret::KubernetesProviderConfig::default(),
             connection_secret_aliases: Vec::new(),
             connection_secrets_root: None,
             payload_capture_enabled: false,
