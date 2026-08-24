@@ -3,6 +3,8 @@
 target/
 admin-ui/node_modules/
 admin-ui/dist/
+var/greengateway/
+secrets/greengateway/
 
 Dockerfile
 docker-compose.yml

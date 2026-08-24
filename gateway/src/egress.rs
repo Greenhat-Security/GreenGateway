@@ -1288,6 +1288,25 @@ impl EgressClient {
             return Err(EgressError::InvalidUrl("missing host".to_owned()));
         }
 
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            tracing::warn!(
+                error_category = "invalid_url",
+                "egress blocked URL containing userinfo"
+            );
+            return Err(EgressError::InvalidUrl(
+                "URL userinfo is not allowed".to_owned(),
+            ));
+        }
+        if parsed.fragment().is_some() {
+            tracing::warn!(
+                error_category = "invalid_url",
+                "egress blocked URL containing a fragment"
+            );
+            return Err(EgressError::InvalidUrl(
+                "URL fragments are not allowed".to_owned(),
+            ));
+        }
+
         match parsed.scheme() {
             "http" | "https" => Ok(parsed),
             scheme => {
@@ -3793,6 +3812,21 @@ mod tests {
             .expect_err("URL without host should be invalid");
 
         assert!(matches!(error, EgressError::InvalidUrl(_)));
+    }
+
+    #[test]
+    fn url_userinfo_and_fragments_are_invalid() {
+        let client = EgressClient::new(EgressConfig::default()).expect("client should build");
+        for unsafe_url in [
+            "https://operator:credential-canary@api.example.test/resource",
+            "https://api.example.test/resource#fragment",
+        ] {
+            let error = client
+                .checked_url(unsafe_url)
+                .expect_err("unsafe URL components should be rejected");
+            assert!(matches!(error, EgressError::InvalidUrl(_)));
+            assert!(!error.to_string().contains("credential-canary"));
+        }
     }
 
     #[tokio::test]

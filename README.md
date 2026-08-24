@@ -202,6 +202,9 @@ This gives security, engineering, platform, and compliance teams a clearer view 
 | Shadow mode | Test deny rules without blocking traffic, then promote them when ready |
 | Audit logs | Queryable audit trail for requests, identities, policy decisions, and outcomes |
 | Traffic discovery | Endpoint inventory, observed principals, traffic history, review state, and active rule coverage |
+| Connections | Shared, revisioned HTTP/MCP destinations with opaque credential bindings, independent TLS profiles, safe tests, and managed discovery |
+| Capability inventory | Policy-filtered, read-only view of manual, legacy, OpenAPI, and MCP capabilities with provenance and availability |
+| Tool playground | Constrained execution of registered tools through the same policy, Connection, credential, TLS, egress, and audit path used at runtime |
 | Rule suggestions | Suggested allow, deny, and shadow rules based on observed traffic and anomaly signals |
 | Identity directory | Directory of humans, bots, and service accounts that have traversed the gateway |
 | MCP support | Native `/mcp` endpoint, tool registry, upstream MCP proxying, OpenAPI-to-tools, and MCP audit/discovery |
@@ -228,6 +231,8 @@ Current MCP capabilities include:
 - MCP traffic discovery
 - Rule-builder integration for MCP tool calls
 - Audit coverage for MCP activity
+- Managed streamable-HTTP MCP Connections with last-known-good catalogs
+- Policy-filtered capability inventory and constrained playground execution
 
 This lets you apply the same identity, policy, audit, and traffic-review model to MCP tools that you use for HTTP APIs.
 
@@ -357,7 +362,10 @@ Current status:
 | Admin UI | Implemented |
 | JWT/OIDC-style auth | Implemented |
 | Service tokens | Implemented |
-| Managed connection metadata CRUD | Implemented; protocol credential injection and discovery land in later #240 slices |
+| Managed Connections | Implemented for HTTP API and streamable-HTTP MCP destinations, including conditional CRUD, immutable runtime snapshots, and read-only legacy projections |
+| Connection credentials and TLS | Implemented for operator environment/file aliases, encrypted local secrets, header API keys, static bearer tokens, OAuth client credentials, custom roots, and mTLS |
+| Connection discovery and tests | Implemented for bounded stored tests plus last-known-good OpenAPI and MCP catalog refresh |
+| Capability inventory and playground | Implemented with policy-filtered read-only inventory, strong execution preconditions, bounded requests/results, and no arbitrary URL/header/TLS overrides |
 | RBAC and direct firewall rules | Implemented |
 | Visual rule builder | Implemented |
 | Shadow-mode review | Implemented |
@@ -378,6 +386,14 @@ https://github.com/Greenhat-Security/GreenGateway/issues/44
 ```
 
 For setup, zero-trust rollout guidance, use cases, and operator reference docs, read the [GreenGateway wiki](https://greenhatsec.com/green-gateway/wiki).
+
+Managed Connections are an authority boundary, not an authorization grant.
+Every invocation is still authenticated and policy-checked before Connection
+provider, DNS, or upstream work. The destination is then validated and
+exact-pinned, TLS is prepared, the credential is resolved, and the configured
+credential is injected only after caller credentials have been stripped. See
+[the architecture](docs/architecture.md#managed-connection-boundary) for the
+per-lane order and queued-revocation semantics.
 
 ## Run with Cargo
 
@@ -607,6 +623,7 @@ Common configuration areas include:
 | RBAC | `POLICY_FILE`, `RBAC_EXEMPT_PATHS` |
 | Proxy | `UPSTREAM_URL`, `UPSTREAM_ROUTES`, pool/health/retry/circuit/SSE/mTLS settings |
 | MCP | `GATEWAY_PUBLIC_URL`, `TOOLS_FILE`, `MCP_UPSTREAM_SERVERS`, `TOOL_RUNTIME_*` |
+| Connections | `CONNECTIONS_SQLITE_PATH`, `CONNECTION_SECRET_ALIASES`, `CONNECTION_SECRETS_ROOT`, `CONNECTION_LOCAL_SECRET_KEYRING` |
 | Audit | `AUDIT_LOG_FILE`, `AUDIT_SQLITE_PATH`, `AUDIT_SQLITE_RETENTION_DAYS` |
 | Discovery | `DISCOVERY_SQLITE_PATH`, schema and payload capture settings |
 | Egress | `EGRESS_ALLOWED_HOSTS`, `EGRESS_DENY_PRIVATE_IPS` |
@@ -640,6 +657,13 @@ The `docs/configuration.md` file and `.env.example` are kept in sync with the co
 Cloudflare's supported environment forwarding list is checked against the same
 runtime reads, excluding only the forced `LISTEN_ADDR` and unsupported split
 `ADMIN_LISTEN_ADDR`.
+
+Connection setup, safe migration, and control-plane operation are documented in:
+
+- [Connection operator guide](docs/connections/operator-guide.md)
+- [Connection migration and rollback](docs/connections/migration.md)
+- [Connections and capability admin guide](docs/connections/admin-guide.md)
+- [Issue #240 acceptance evidence](docs/testing/issue-240-acceptance.md)
 
 ## Repository Structure
 

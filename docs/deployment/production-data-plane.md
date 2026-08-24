@@ -191,8 +191,9 @@ smoke sequence verifies:
 1. a slow upload reaches its endpoint before the client finishes, and a delayed
    multi-chunk response reaches the client incrementally;
 2. all three healthy endpoints receive weighted traffic;
-3. bearer/cookie and untrusted forwarding metadata are stripped while the
-   gateway request ID and canonical forwarding address are preserved;
+3. bearer/cookie, untrusted forwarding metadata, and the caller's
+   `x-request-id` are stripped, while the canonical forwarding address is
+   preserved;
 4. a retryable GET reaches a second endpoint in exactly two attempts;
 5. the equivalent POST is attempted once;
 6. stopping `dev-echo-b` makes it unhealthy while `/readyz` stays `200`;

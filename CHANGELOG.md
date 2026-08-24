@@ -9,6 +9,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Security
 
+- Caller-supplied `x-request-id` headers are now removed before a request is
+  dispatched to an upstream, and the gateway does not substitute one of its
+  own. Previously the caller's value was forwarded verbatim, which let a client
+  choose the correlation identifier that appeared in upstream access logs. The
+  request ID is still returned to the caller on the response and still
+  correlates GreenGateway's own audit events. **Behaviour change:** upstreams
+  that relied on receiving `x-request-id` from the gateway no longer see it, so
+  cross-system correlation on that header must be re-established from the audit
+  stream instead.
+
 - Added OAuth 2.0 client-credentials authentication for Connection-bound proxy
   routes and manual HTTP tools. Token endpoints are independently egress
   checked and DNS pinned before client-secret resolution, token responses are
@@ -83,6 +93,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   actions, cursor pagination, conditional collection/resource ETags, bounded
   request bodies, dependency-safe deletion, atomic runtime publication, and
   payload-safe connection and credential-change audit events.
+- Completed issue #240's first-class Connection control plane: trusted
+  environment/file aliases, write-only encrypted local secrets with bounded
+  resumable master-key rotation, static and OAuth 2.0 client-credentials
+  authentication, custom CA and mTLS bindings, Connection-bound proxy/HTTP
+  tool/OpenAPI/MCP execution, constrained tests and catalog refresh with
+  last-known-good retention, unified capability inventory, and the
+  permission-gated tool playground.
+- Added operator, admin, migration, backup/restore, key-rotation, and rollback
+  guides for Connections. External provider adapters remain separately
+  tracked in [Vault #271](https://github.com/Greenhat-Security/GreenGateway/issues/271),
+  [AWS Secrets Manager #272](https://github.com/Greenhat-Security/GreenGateway/issues/272),
+  [Azure Key Vault #273](https://github.com/Greenhat-Security/GreenGateway/issues/273),
+  [Google Cloud Secret Manager #274](https://github.com/Greenhat-Security/GreenGateway/issues/274),
+  and [Kubernetes Secrets API #275](https://github.com/Greenhat-Security/GreenGateway/issues/275).
 - Expanded the Docker development stack to three controllable weighted
   upstreams and added CI smoke scenarios for incremental upload/download,
   forwarding and credential boundaries, healthy distribution, safe GET retry,
@@ -101,6 +125,33 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   low-concurrency Python HTTP/1.1 comparison regressed in throughput and
   latency; Linux release-runner investigation remains a manual gate and this
   release makes no performance-improvement claim.
+
+### Deprecated
+
+- Literal credentials in `UPSTREAM_ROUTES[].add_request_headers` are
+  deprecated as a secret-delivery mechanism; use an opaque Connection binding
+  after following the documented staged migration. GreenGateway does not
+  auto-detect, extract, rewrite, or remove those values.
+- `UPSTREAM_URL`, legacy `UPSTREAM_ROUTES` destinations,
+  `MCP_UPSTREAM_SERVERS`, `OPENAPI_SPEC_PATH`, and legacy-compatible tool
+  definitions remain supported for mixed-mode rollout throughout the current
+  major release. Issue #240 assigns no removal version. Any removal requires a
+  future major release, advance release-note notice, a supported migration
+  path, and published rollback guidance.
+
+### Migration
+
+- Enabling `CONNECTIONS_SQLITE_PATH` does not convert or disable legacy
+  configuration. Legacy upstreams remain read-only projections until each
+  route, tool, OpenAPI catalog, or MCP server is explicitly rebound to a
+  managed Connection. Preserve old deployment settings and policy until the
+  managed lane passes its acceptance window.
+- Traffic rollback restores the prior legacy route/tool/MCP configuration and
+  disables the managed Connection; it does not require deleting Connection
+  metadata, clearing protected bindings, or restoring an older database.
+  Database disaster recovery must restore the consistent SQLite/WAL boundary
+  together with every master key still referenced by its encrypted rows. See
+  [the Connections migration guide](docs/connections/migration.md).
 
 ### Fixed
 

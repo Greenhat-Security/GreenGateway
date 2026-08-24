@@ -3104,7 +3104,7 @@ fn normalize_route_add_request_headers(
         }
         if header_name.as_str() == REQUEST_ID_HEADER {
             problems.push(format!(
-                "{name}.{raw_name} must not configure {REQUEST_ID_HEADER}; the gateway owns request-id propagation"
+                "{name}.{raw_name} must not configure {REQUEST_ID_HEADER}; the gateway owns this header and removes it before dispatching upstream"
             ));
             continue;
         }
@@ -3146,7 +3146,7 @@ fn normalize_route_strip_request_headers(
 
         if header_name.as_str() == REQUEST_ID_HEADER {
             problems.push(format!(
-                "{name} must not include {REQUEST_ID_HEADER}; the gateway owns request-id propagation"
+                "{name} must not include {REQUEST_ID_HEADER}; the gateway owns this header and removes it before dispatching upstream"
             ));
             continue;
         }
@@ -3316,6 +3316,13 @@ fn validate_upstream_url(name: &str, value: &str, problems: &mut Vec<String>) ->
     if parsed.host_str().is_none() {
         problems.push(format!(
             "{name} must be a valid http or https URL with a host, got '{value}'"
+        ));
+        return None;
+    }
+
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
+        problems.push(format!(
+            "{name} must not contain URL userinfo or a fragment"
         ));
         return None;
     }
@@ -4954,10 +4961,10 @@ mod tests {
 
         let message = error.to_string();
         assert!(
-            message.contains("GATEWAY_PUBLIC_URL must not include a URL fragment"),
+            message.contains("GATEWAY_PUBLIC_URL must not contain URL userinfo or a fragment"),
             "{message}"
         );
-        assert!(message.contains("https://gateway.example.test/#metadata"));
+        assert!(!message.contains("https://gateway.example.test/#metadata"));
         assert_eq!(error.problems.len(), 1);
     }
 
@@ -6168,17 +6175,20 @@ mod tests {
     }
 
     #[test]
-    fn upstream_url_still_accepts_fragment() {
-        let config = Config::from_env_vars(|name| match name {
-            "UPSTREAM_URL" => Ok("https://upstream.example.test/base/path#allowed".to_owned()),
-            _ => Err(VarError::NotPresent),
-        })
-        .expect("shared upstream URL validation should still accept fragments");
-
-        assert_eq!(
-            config.upstream_url,
-            Some("https://upstream.example.test/base/path#allowed".to_owned())
-        );
+    fn upstream_url_rejects_userinfo_and_fragments_without_echoing_credentials() {
+        for value in [
+            "https://operator:credential-canary@upstream.example.test/base",
+            "https://upstream.example.test/base/path#fragment",
+        ] {
+            let error = Config::from_env_vars(|name| match name {
+                "UPSTREAM_URL" => Ok(value.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect_err("shared upstream URL validation should reject unsafe components");
+            let message = error.to_string();
+            assert!(message.contains("must not contain URL userinfo or a fragment"));
+            assert!(!message.contains("credential-canary"));
+        }
     }
 
     #[test]
@@ -6800,7 +6810,7 @@ mod tests {
             ".id must be 1-64 ASCII",
             "must set exactly one of connection_id, upstream_url, or a non-empty upstreams pool",
             ".id duplicates",
-            "must not contain userinfo, query, or fragment",
+            "must not contain URL userinfo or a fragment",
             ".weight must be between 1 and 1000",
             ".limits.max_in_flight must be between 1 and 4096",
             ".limits.queue_depth must be at most 16384",

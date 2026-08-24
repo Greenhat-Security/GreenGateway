@@ -48,10 +48,27 @@ Secrets such as OIDC client secrets should be configured as Worker secrets or em
 
 These values are passed to the container when it starts. If you change a Worker variable after the container is already running, redeploy or restart the container before relying on the new value.
 
+### Connections storage and secret providers
+
+The wrapper recognizes all four Connections storage and secret settings:
+
+- `CONNECTIONS_SQLITE_PATH`
+- `CONNECTION_SECRETS_ROOT`
+- `CONNECTION_SECRET_ALIASES`
+- `CONNECTION_LOCAL_SECRET_KEYRING`
+
+It forwards each setting unchanged only when the corresponding Worker binding is a non-empty string. Unset, empty, whitespace-only, and non-string bindings are omitted, so GreenGateway's fail-closed startup validation and disabled defaults remain authoritative.
+
+Forwarding a path does not create storage or a mount. The one-click deployment provides neither a durable filesystem location for `CONNECTIONS_SQLITE_PATH` nor a secure secret mount for `CONNECTION_SECRETS_ROOT`. Therefore, leave `CONNECTIONS_SQLITE_PATH`, `CONNECTION_SECRETS_ROOT`, and `CONNECTION_LOCAL_SECRET_KEYRING` unset on the standard one-click deployment. In that state, managed Connection mutations and encrypted-local-secret operations remain unavailable, while legacy upstream configuration is exposed only through its read-only Connection projections. Do not enable managed mutations until the deployment supplies a durable SQLite location whose database, WAL, and SHM files survive container replacement. Do not enable encrypted local secrets until it also supplies a private mount for every keyring file and a tested backup/restore procedure.
+
+`CONNECTION_SECRET_ALIASES` contains locators, not secret values. File aliases have the same secure-mount requirement. Environment aliases have an additional wrapper limitation: the forwarding allowlist is exact and does not dynamically forward an arbitrary variable named by an alias, such as `GGW_BILLING_TOKEN`. Setting that Worker secret alongside the alias does not make it available inside the container. Keep environment aliases disabled on this wrapper unless a future deployment integration explicitly and safely maps the referenced secret binding into the container. Never place the resolved secret value inside `CONNECTION_SECRET_ALIASES`, `wrangler.jsonc`, a public Worker variable, an image layer, or source control.
+
+If a custom Cloudflare deployment supplies durable storage or a secure mount outside this repository's one-click wrapper, validate its lifecycle against container replacement and rollback before configuring the corresponding paths. A redeploy, restart, eviction, platform replacement, or the configured automatic sleep after 10 minutes of idleness starts the next container with a fresh writable disk. Losing `connections.sqlite` loses managed configuration; losing a keyring file while encrypted rows remain causes startup or secret resolution to fail closed.
+
 ## Important Limitations
 
-- Cloudflare Containers use an ephemeral container filesystem by default. GreenGateway settings such as `AUDIT_SQLITE_PATH`, `DISCOVERY_SQLITE_PATH`, `PRINCIPAL_SQLITE_PATH`, and `SERVICE_TOKEN_SQLITE_PATH` can work for evaluation, but they are not durable storage across container replacement.
-- File-backed settings such as `POLICY_FILE`, `TOOLS_FILE`, `OPENAPI_SPEC_PATH`, CA bundles, and mTLS client identities must point at files that exist inside the image or are otherwise created at runtime. A plain Worker variable is not a secure mounted private-key file; do not put PEM key material inline in `UPSTREAM_ROUTES`.
+- Cloudflare Containers use an ephemeral container filesystem by default. GreenGateway settings such as `AUDIT_SQLITE_PATH`, `DISCOVERY_SQLITE_PATH`, `PRINCIPAL_SQLITE_PATH`, `SERVICE_TOKEN_SQLITE_PATH`, and `CONNECTIONS_SQLITE_PATH` can work for evaluation, but their contents are lost on container replacement unless the deployment explicitly supplies durable storage. A redeploy must be treated as potential state loss, not as a persistence mechanism.
+- File-backed settings such as `POLICY_FILE`, `TOOLS_FILE`, `OPENAPI_SPEC_PATH`, `CONNECTION_SECRETS_ROOT`, CA bundles, and mTLS client identities must point at files that exist inside the image or are otherwise created at runtime. The one-click wrapper does not create a secure mount. A plain or secret Worker variable is not a mounted private-key file; do not put PEM key material, local encryption keys, or resolved Connection secrets in `wrangler.jsonc`, public variables, image layers, or inline route JSON.
 - The one-click wrapper does not expose `ADMIN_LISTEN_ADDR`; use the shared `ADMIN_PREFIX` surface with normal authentication/RBAC.
 - This project is still alpha software. Treat the one-click deploy path as a fast evaluation path, not a production hardening guide.
 - The first container deploy may return Worker errors for several minutes while Cloudflare finishes provisioning container capacity.
@@ -59,7 +76,7 @@ These values are passed to the container when it starts. If you change a Worker 
 ## Manual Deploy
 
 ```sh
-npm install
+npm ci
 npx wrangler login
 npm run deploy
 ```
@@ -89,3 +106,5 @@ https://<worker-name>.<your-workers-subdomain>.workers.dev/admin
 - [Cloudflare Deploy buttons](https://developers.cloudflare.com/workers/platform/deploy-buttons/)
 - [Cloudflare Containers getting started](https://developers.cloudflare.com/containers/get-started/)
 - [Cloudflare Container interface](https://developers.cloudflare.com/containers/container-class/)
+- [Cloudflare container environment variables and secrets](https://developers.cloudflare.com/containers/examples/env-vars-and-secrets/)
+- [Cloudflare Container lifecycle and ephemeral disk](https://developers.cloudflare.com/containers/platform-details/architecture/)

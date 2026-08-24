@@ -5,6 +5,10 @@ export default defineConfig({
   plugins: [react()],
   test: {
     environment: 'jsdom',
-    exclude: [...configDefaults.exclude, 'tests/**/*.screenshot.spec.ts'],
+    exclude: [
+      ...configDefaults.exclude,
+      'tests/**/*.screenshot.spec.ts',
+      'tests/**/*-live.spec.ts',
+    ],
   },
 });

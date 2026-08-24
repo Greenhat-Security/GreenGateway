@@ -544,10 +544,11 @@ describe('connections API client', () => {
     }
   });
 
-  it('uses the exact collection or item ETag for every mutation', async () => {
+  it('uses exact ETags and valid media types for every mutation', async () => {
     const calls: Array<{
       path: string;
       method: string | undefined;
+      contentType: string | null;
       ifMatch: string | null;
       body: string | null;
     }> = [];
@@ -558,6 +559,7 @@ describe('connections API client', () => {
         calls.push({
           path: url.pathname,
           method: init?.method,
+          contentType: new Headers(init?.headers).get('Content-Type'),
           ifMatch: new Headers(init?.headers).get('If-Match'),
           body: typeof init?.body === 'string' ? init.body : null,
         });
@@ -648,6 +650,13 @@ describe('connections API client', () => {
         method: 'POST',
         ifMatch: '"connection:v2"',
       },
+    ]);
+    expect(calls.map((call) => call.contentType)).toEqual([
+      'application/json',
+      'application/json',
+      null,
+      'application/json',
+      'application/json',
     ]);
     expect(JSON.parse(calls[0].body ?? '')).toEqual(write);
     expect(JSON.parse(calls[1].body ?? '')).toEqual(write);

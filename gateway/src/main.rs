@@ -44,6 +44,7 @@ mod audit;
 mod auth;
 mod client_ip;
 mod config;
+mod connection_secret_maintenance;
 mod connections;
 mod discovery;
 mod egress;
@@ -1352,8 +1353,10 @@ struct MiddlewareStack {
 }
 
 #[derive(Clone)]
-struct CapabilityInventoryCacheControlState {
-    collection_route: String,
+struct ManagedAdminCacheControlState {
+    connections_route: String,
+    connection_secrets_route: String,
+    tools_route: String,
 }
 
 #[derive(Default)]
@@ -1383,6 +1386,14 @@ fn egress_client_for_build(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(output) = connection_secret_maintenance::run_if_requested(
+        std::env::args_os().skip(1),
+        config::Config::from_env,
+    )? {
+        println!("{output}");
+        return Ok(());
+    }
+
     let process_started_at = Instant::now();
 
     tracing_subscriber::registry()
@@ -2766,20 +2777,23 @@ fn apply_middleware(
     let router = router.layer(axum::middleware::from_fn(audit_extension_probe_middleware));
 
     let router = router.layer(Extension(stack.audit_log.clone()));
+    let admin_routes = AdminRoutes::from_prefix(&stack.config.admin_prefix);
     router.layer(axum::middleware::from_fn_with_state(
-        CapabilityInventoryCacheControlState {
-            collection_route: AdminRoutes::from_prefix(&stack.config.admin_prefix).tools_route,
+        ManagedAdminCacheControlState {
+            connections_route: admin_routes.connections_route,
+            connection_secrets_route: admin_routes.connection_secrets_route,
+            tools_route: admin_routes.tools_route,
         },
-        capability_inventory_cache_control_middleware,
+        managed_admin_cache_control_middleware,
     ))
 }
 
-async fn capability_inventory_cache_control_middleware(
-    State(state): State<CapabilityInventoryCacheControlState>,
+async fn managed_admin_cache_control_middleware(
+    State(state): State<ManagedAdminCacheControlState>,
     request: AxumRequest,
     next: axum::middleware::Next,
 ) -> Response {
-    let no_store = is_capability_inventory_path(request.uri().path(), &state.collection_route);
+    let no_store = is_managed_admin_path(request.uri().path(), &state);
     let mut response = next.run(request).await;
     if no_store {
         response
@@ -2787,6 +2801,69 @@ async fn capability_inventory_cache_control_middleware(
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
     response
+}
+
+fn is_managed_admin_path(path: &str, state: &ManagedAdminCacheControlState) -> bool {
+    is_managed_connection_path(path, &state.connections_route)
+        || is_connection_secret_path(path, &state.connection_secrets_route)
+        || is_managed_tools_path(path, &state.tools_route)
+}
+
+fn is_managed_connection_path(path: &str, collection_route: &str) -> bool {
+    if path == collection_route {
+        return true;
+    }
+
+    let Some(remainder) = path
+        .strip_prefix(collection_route)
+        .and_then(|remainder| remainder.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let mut segments = remainder.split('/');
+    match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some(id), None, None, None) => !id.is_empty(),
+        (Some(id), Some("refresh" | "test"), None, None) => !id.is_empty(),
+        (Some(id), Some("openapi"), Some("preview" | "register"), None) => !id.is_empty(),
+        _ => false,
+    }
+}
+
+fn is_connection_secret_path(path: &str, collection_route: &str) -> bool {
+    if path == collection_route {
+        return true;
+    }
+
+    let Some(remainder) = path
+        .strip_prefix(collection_route)
+        .and_then(|remainder| remainder.strip_prefix('/'))
+    else {
+        return false;
+    };
+    !remainder.is_empty() && !remainder.contains('/')
+}
+
+fn is_managed_tools_path(path: &str, collection_route: &str) -> bool {
+    if is_capability_inventory_path(path, collection_route) {
+        return true;
+    }
+
+    let Some(remainder) = path
+        .strip_prefix(collection_route)
+        .and_then(|remainder| remainder.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let mut segments = remainder.split('/');
+    matches!(
+        (segments.next(), segments.next(), segments.next()),
+        (Some("openapi"), Some("preview" | "register"), None)
+    )
 }
 
 fn is_capability_inventory_path(path: &str, collection_route: &str) -> bool {
@@ -12991,6 +13068,71 @@ mod tests {
     }
 
     #[test]
+    fn managed_admin_cache_control_matches_only_managed_routes() {
+        let state = ManagedAdminCacheControlState {
+            connections_route: "/v1/admin/connections".to_owned(),
+            connection_secrets_route: "/v1/admin/connection-secrets".to_owned(),
+            tools_route: "/v1/admin/tools".to_owned(),
+        };
+
+        for path in [
+            "/v1/admin/connections",
+            "/v1/admin/connections/connection-id",
+            "/v1/admin/connections/connection-id/refresh",
+            "/v1/admin/connections/connection-id/test",
+            "/v1/admin/connections/connection-id/openapi/preview",
+            "/v1/admin/connections/connection-id/openapi/register",
+            "/v1/admin/connection-secrets",
+            "/v1/admin/connection-secrets/secret-id",
+            "/v1/admin/tools",
+            "/v1/admin/tools/capability-id",
+            "/v1/admin/tools/capability-id/execute",
+            "/v1/admin/tools/openapi/preview",
+            "/v1/admin/tools/openapi/register",
+        ] {
+            assert!(
+                is_managed_admin_path(path, &state),
+                "{path} should receive Cache-Control: no-store"
+            );
+        }
+
+        for path in [
+            "/v1/admin/connections/",
+            "/v1/admin/connections/connection-id/refresh/",
+            "/v1/admin/connections/connection-id/openapi/delete",
+            "/v1/admin/connection-secrets/",
+            "/v1/admin/connection-secrets/secret-id/extra",
+            "/v1/admin/tools/",
+            "/v1/admin/tools/capability-id/extra",
+            "/v1/admin/tools/openapi/preview/extra",
+            "/v1/admin/tokens",
+        ] {
+            assert!(
+                !is_managed_admin_path(path, &state),
+                "{path} must not change unrelated cache behavior"
+            );
+        }
+
+        let custom = ManagedAdminCacheControlState {
+            connections_route: "/v1/ops/connections".to_owned(),
+            connection_secrets_route: "/v1/ops/connection-secrets".to_owned(),
+            tools_route: "/v1/ops/tools".to_owned(),
+        };
+        for path in [
+            "/v1/ops/connections",
+            "/v1/ops/connections/connection-id/test",
+            "/v1/ops/connection-secrets/secret-id",
+            "/v1/ops/tools/capability-id/execute",
+            "/v1/ops/tools/openapi/register",
+        ] {
+            assert!(
+                is_managed_admin_path(path, &custom),
+                "{path} should follow the configured admin prefix"
+            );
+        }
+    }
+
+    #[test]
     fn playground_if_match_requires_exactly_one_strong_entity_tag() {
         let mut headers = HeaderMap::new();
         assert!(matches!(
@@ -13603,11 +13745,7 @@ mod tests {
                     "proxied response should strip {stripped}"
                 );
             }
-            let response_request_id = response
-                .headers()
-                .get(REQUEST_ID_HEADER)
-                .cloned()
-                .expect("response should contain gateway request id");
+            assert!(response.headers().contains_key(REQUEST_ID_HEADER));
             let response_body = body_string(response).await;
             assert_eq!(
                 response_body,
@@ -13634,9 +13772,9 @@ mod tests {
                     "upstream request should not forward the stale client content-length"
                 );
             }
-            assert_eq!(
-                upstream.headers.get(REQUEST_ID_HEADER),
-                Some(&response_request_id)
+            assert!(
+                !upstream.headers.contains_key(REQUEST_ID_HEADER),
+                "caller or gateway request IDs must not cross the upstream boundary"
             );
             for stripped in [
                 header::CONNECTION.as_str(),
@@ -14364,7 +14502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routing_table_strips_configured_request_headers_without_breaking_request_id() {
+    async fn routing_table_strips_configured_and_request_id_headers() {
         let (upstream_addr, mut captured) = spawn_capture_upstream().await;
         let mut route = path_route("/api", upstream_addr);
         route.strip_request_headers = vec!["x-client-secret".to_owned()];
@@ -14388,7 +14526,7 @@ mod tests {
         let upstream =
             next_proxied_request(&mut captured, "upstream should receive proxied request").await;
         assert!(!upstream.headers.contains_key("x-client-secret"));
-        assert_eq!(upstream.headers.get(REQUEST_ID_HEADER), Some(&request_id));
+        assert!(!upstream.headers.contains_key(REQUEST_ID_HEADER));
     }
 
     #[tokio::test]
@@ -21962,6 +22100,7 @@ mod tests {
             .await
             .expect("stale create should complete");
         assert_eq!(stale_create.status(), StatusCode::PRECONDITION_FAILED);
+        assert_managed_admin_no_store(&stale_create);
 
         let detail = router
             .clone()
@@ -23610,6 +23749,7 @@ mod tests {
             .await
             .expect("operator-only secret list should complete");
         assert_eq!(list.status(), StatusCode::OK);
+        assert_managed_admin_no_store(&list);
         let collection_etag = list
             .headers()
             .get(CONNECTION_SECRET_COLLECTION_ETAG_HEADER)
@@ -23644,6 +23784,7 @@ mod tests {
             .await
             .expect("operator-only connection list should complete");
         assert_eq!(connections.status(), StatusCode::OK);
+        assert_managed_admin_no_store(&connections);
         assert_eq!(
             json_body(connections).await["actions"]["can_manage_secrets"],
             json!(false)
@@ -23669,6 +23810,7 @@ mod tests {
             .await
             .expect("unconfigured local secret create should complete");
         assert_eq!(unavailable_create.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_managed_admin_no_store(&unavailable_create);
         assert!(!body_string(unavailable_create)
             .await
             .contains("unavailable-local-value-canary"));
@@ -23694,6 +23836,7 @@ mod tests {
                 .await
                 .expect("operator alias mutation should complete");
             assert_eq!(read_only.status(), StatusCode::CONFLICT);
+            assert_managed_admin_no_store(&read_only);
             let body = body_string(read_only).await;
             assert!(!body.contains("operator-write-value-canary"));
             assert!(!body.contains("operator-token"));
@@ -23719,6 +23862,7 @@ mod tests {
             .await
             .expect("missing principal request should complete");
         assert_eq!(missing_principal.status(), StatusCode::UNAUTHORIZED);
+        assert_managed_admin_no_store(&missing_principal);
 
         let forbidden_lookup = router
             .clone()
@@ -23733,6 +23877,7 @@ mod tests {
             .await
             .expect("forbidden lookup should complete");
         assert_eq!(forbidden_lookup.status(), StatusCode::FORBIDDEN);
+        assert_managed_admin_no_store(&forbidden_lookup);
 
         let list = router
             .clone()
@@ -23746,6 +23891,8 @@ mod tests {
             ))
             .await
             .expect("list request should complete");
+        assert_eq!(list.status(), StatusCode::OK);
+        assert_managed_admin_no_store(&list);
         let collection_etag = list
             .headers()
             .get(CONNECTION_COLLECTION_ETAG_HEADER)
@@ -23769,6 +23916,7 @@ mod tests {
             .await
             .expect("unknown enabled binding should complete");
         assert_eq!(unknown_binding.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_managed_admin_no_store(&unknown_binding);
         assert_eq!(
             json_body(unknown_binding).await["problems"][0]["code"],
             json!("unresolvable_binding")
@@ -23787,6 +23935,7 @@ mod tests {
             .await
             .expect("CSRF denial should complete");
         assert_eq!(csrf_denied.status(), StatusCode::FORBIDDEN);
+        assert_managed_admin_no_store(&csrf_denied);
         assert_eq!(
             json_body(csrf_denied).await["error"],
             json!("csrf token missing or invalid")
@@ -23812,6 +23961,7 @@ mod tests {
             .await
             .expect("disabled draft create should complete");
         assert_eq!(disabled_draft.status(), StatusCode::CREATED);
+        assert_managed_admin_no_store(&disabled_draft);
         assert_eq!(json_body(disabled_draft).await["enabled"], json!(false));
 
         let oversized = router
@@ -23826,6 +23976,7 @@ mod tests {
             .await
             .expect("oversized connection body should complete");
         assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_managed_admin_no_store(&oversized);
     }
 
     #[tokio::test]
@@ -25453,6 +25604,7 @@ mod tests {
             .await
             .expect("read-forbidden OpenAPI tools preview request should complete");
         assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert_managed_admin_no_store(&forbidden);
 
         let policy = TempPolicyFile::new(&tools_policy_document());
         let token_db = TempDb::new("tools-preview-no-tools-file-token");
@@ -25479,6 +25631,7 @@ mod tests {
             .await
             .expect("tools-file-unconfigured OpenAPI tools preview request should complete");
         assert_eq!(not_configured.status(), StatusCode::NOT_FOUND);
+        assert_managed_admin_no_store(&not_configured);
         assert_eq!(
             body_string(not_configured).await,
             r#"{"error":"tools API requires TOOLS_FILE to be configured"}"#
@@ -33688,12 +33841,16 @@ paths:
             .expect("tool playground request should build")
     }
 
-    fn assert_capability_inventory_no_store(response: &Response) {
+    fn assert_managed_admin_no_store(response: &Response) {
         assert_eq!(
             response.headers().get(header::CACHE_CONTROL),
             Some(&HeaderValue::from_static("no-store")),
-            "capability inventory responses must never be cached"
+            "managed Connection, secret, OpenAPI, and capability responses must never be cached"
         );
+    }
+
+    fn assert_capability_inventory_no_store(response: &Response) {
+        assert_managed_admin_no_store(response);
     }
 
     fn tools_openapi_preview_request(token: &str, spec: &str) -> Request<Body> {
@@ -37856,4 +38013,9 @@ O2gecI9QwDJNpm29J9wJB2F8
             "condition did not become true within {timeout:?}"
         );
     }
+
+    mod issue_240_acceptance_security;
+
+    #[path = "issue_240_acceptance_core.rs"]
+    mod issue_240_acceptance_core;
 }
