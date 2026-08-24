@@ -787,6 +787,7 @@ mod tests {
             connection_gcp_provider: crate::connections::gcp_secret::GcpProviderConfig::default(),
             connection_azure_provider:
                 crate::connections::azure_secret::AzureProviderConfig::default(),
+            connection_aws_provider: crate::connections::aws_secret::AwsProviderConfig::default(),
             connection_secret_aliases: Vec::new(),
             connection_secrets_root: None,
             payload_capture_enabled: false,

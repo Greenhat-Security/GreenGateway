@@ -15,6 +15,10 @@ use zeroize::Zeroizing;
 use crate::config::Config;
 
 use super::{
+    aws_secret::{
+        AwsProviderConfig, AwsProviderConfigError, AwsSecretsManagerProvider, AwsTransport,
+        EgressAwsTransport,
+    },
     azure_secret::{
         AzureKeyVaultSecretProvider, AzureProviderConfig, AzureProviderConfigError, AzureTransport,
         EgressAzureTransport,
@@ -62,6 +66,7 @@ pub struct ConnectionControlPlane {
     vault_config: VaultProviderConfig,
     gcp_config: GcpProviderConfig,
     azure_config: AzureProviderConfig,
+    aws_config: AwsProviderConfig,
 }
 
 #[derive(Clone)]
@@ -282,6 +287,13 @@ impl ConnectionControlPlane {
                 });
             }
         }
+        for alias in &config.connection_aws_provider.aliases {
+            if !network_alias_ids.insert(alias.id.clone()) {
+                return Err(ConnectionControlPlaneError::NetworkAliasIdCollision {
+                    id: alias.id.clone(),
+                });
+            }
+        }
         let mut network_alias_metadata: Vec<SecretAliasMetadata> = config
             .connection_vault_provider
             .aliases
@@ -320,6 +332,17 @@ impl ConnectionControlPlane {
                 rotated_at: None,
             },
         ));
+        network_alias_metadata.extend(config.connection_aws_provider.aliases.iter().map(|alias| {
+            SecretAliasMetadata {
+                id: alias.id.clone(),
+                label: alias.label.clone(),
+                provider: SecretProviderKind::AwsSecretsManager,
+                configured: true,
+                purpose: None,
+                version: None,
+                rotated_at: None,
+            }
+        }));
         let local_secret_provider = if let Some(keyring) = local_secret_keyring {
             let store = managed
                 .as_ref()
@@ -407,6 +430,7 @@ impl ConnectionControlPlane {
             vault_config: config.connection_vault_provider.clone(),
             gcp_config: config.connection_gcp_provider.clone(),
             azure_config: config.connection_azure_provider.clone(),
+            aws_config: config.connection_aws_provider.clone(),
         })
     }
 
@@ -514,6 +538,18 @@ impl ConnectionControlPlane {
                     .iter()
                     .map(|alias| alias.id.clone()),
             );
+        }
+        if !self.aws_config.is_empty() {
+            let transport: Arc<dyn AwsTransport> =
+                Arc::new(EgressAwsTransport::new(Arc::clone(egress)));
+            let provider = AwsSecretsManagerProvider::from_config(
+                &self.aws_config,
+                &reserved_ids,
+                transport,
+                bootstrap.clone(),
+            )?;
+            providers.push(Arc::new(provider));
+            reserved_ids.extend(self.aws_config.aliases.iter().map(|alias| alias.id.clone()));
         }
         self.install_network_secret_providers(providers);
         Ok(())
@@ -1253,6 +1289,7 @@ pub enum ConnectionControlPlaneError {
     VaultProvider(VaultProviderConfigError),
     GcpProvider(GcpProviderConfigError),
     AzureProvider(AzureProviderConfigError),
+    AwsProvider(AwsProviderConfigError),
     LocalSecretKeyring(LocalSecretKeyringConfigError),
     LocalSecret(LocalSecretError),
     LocalSecretKeyringRequired,
@@ -1271,6 +1308,7 @@ impl fmt::Display for ConnectionControlPlaneError {
             Self::VaultProvider(error) => error.fmt(formatter),
             Self::GcpProvider(error) => error.fmt(formatter),
             Self::AzureProvider(error) => error.fmt(formatter),
+            Self::AwsProvider(error) => error.fmt(formatter),
             Self::LocalSecretKeyring(error) => error.fmt(formatter),
             Self::LocalSecret(error) => error.fmt(formatter),
             Self::LocalSecretKeyringRequired => formatter.write_str(
@@ -1305,6 +1343,7 @@ impl Error for ConnectionControlPlaneError {
             Self::VaultProvider(error) => Some(error),
             Self::GcpProvider(error) => Some(error),
             Self::AzureProvider(error) => Some(error),
+            Self::AwsProvider(error) => Some(error),
             Self::LocalSecretKeyring(error) => Some(error),
             Self::LocalSecret(error) => Some(error),
             _ => None,
@@ -1345,6 +1384,12 @@ impl From<GcpProviderConfigError> for ConnectionControlPlaneError {
 impl From<AzureProviderConfigError> for ConnectionControlPlaneError {
     fn from(error: AzureProviderConfigError) -> Self {
         Self::AzureProvider(error)
+    }
+}
+
+impl From<AwsProviderConfigError> for ConnectionControlPlaneError {
+    fn from(error: AwsProviderConfigError) -> Self {
+        Self::AwsProvider(error)
     }
 }
 

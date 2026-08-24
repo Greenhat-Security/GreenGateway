@@ -16,6 +16,7 @@ chacha20poly1305.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+hmac.workspace = true
 http.workspace = true
 ipnet.workspace = true
 jsonschema.workspace = true

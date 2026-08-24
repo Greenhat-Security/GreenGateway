@@ -117,6 +117,7 @@ pub enum SecretProviderKind {
     VaultKvV2,
     GcpSecretManager,
     AzureKeyVault,
+    AwsSecretsManager,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -789,13 +790,14 @@ mod tests {
     /// Every provider kind, kept exhaustive by the match below: adding a
     /// variant breaks compilation here until this list and the published
     /// admin schema are both updated.
-    const ALL_SECRET_PROVIDER_KINDS: [SecretProviderKind; 6] = [
+    const ALL_SECRET_PROVIDER_KINDS: [SecretProviderKind; 7] = [
         SecretProviderKind::OperatorEnvironment,
         SecretProviderKind::OperatorFile,
         SecretProviderKind::LocalEncrypted,
         SecretProviderKind::VaultKvV2,
         SecretProviderKind::GcpSecretManager,
         SecretProviderKind::AzureKeyVault,
+        SecretProviderKind::AwsSecretsManager,
     ];
 
     #[allow(dead_code)]
@@ -806,7 +808,8 @@ mod tests {
             | SecretProviderKind::LocalEncrypted
             | SecretProviderKind::VaultKvV2
             | SecretProviderKind::GcpSecretManager
-            | SecretProviderKind::AzureKeyVault => {}
+            | SecretProviderKind::AzureKeyVault
+            | SecretProviderKind::AwsSecretsManager => {}
         }
     }
 

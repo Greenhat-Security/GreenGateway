@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod admin;
+pub mod aws_secret;
 pub mod azure_secret;
 pub mod control_plane;
 pub mod gcp_secret;
