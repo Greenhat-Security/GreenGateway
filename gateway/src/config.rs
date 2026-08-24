@@ -25,6 +25,10 @@ use crate::{
         gcp_secret::{
             validate_gcp_provider_config, GcpProviderConfig, MAX_GCP_PROVIDER_CONFIG_BYTES,
         },
+        kubernetes_secret::{
+            validate_kubernetes_provider_config, KubernetesProviderConfig,
+            MAX_KUBERNETES_PROVIDER_CONFIG_BYTES,
+        },
         local_secret::{
             validate_local_secret_keyring_config, LocalSecretKeyConfig,
             MAX_LOCAL_SECRET_KEYRING_CONFIG_BYTES,
@@ -142,6 +146,7 @@ const CONNECTIONS_SQLITE_PATH: &str = "CONNECTIONS_SQLITE_PATH";
 const CONNECTION_AZURE_PROVIDER: &str = "CONNECTION_AZURE_PROVIDER";
 const CONNECTION_GCP_PROVIDER: &str = "CONNECTION_GCP_PROVIDER";
 const CONNECTION_AWS_PROVIDER: &str = "CONNECTION_AWS_PROVIDER";
+const CONNECTION_KUBERNETES_PROVIDER: &str = "CONNECTION_KUBERNETES_PROVIDER";
 const CONNECTION_LOCAL_SECRET_KEYRING: &str = "CONNECTION_LOCAL_SECRET_KEYRING";
 const CONNECTION_SECRET_ALIASES: &str = "CONNECTION_SECRET_ALIASES";
 const CONNECTION_VAULT_PROVIDER: &str = "CONNECTION_VAULT_PROVIDER";
@@ -227,6 +232,7 @@ pub struct Config {
     pub connection_gcp_provider: GcpProviderConfig,
     pub connection_azure_provider: AzureProviderConfig,
     pub connection_aws_provider: AwsProviderConfig,
+    pub connection_kubernetes_provider: KubernetesProviderConfig,
     pub connection_secrets_root: Option<SecretRootConfig>,
     pub payload_capture_enabled: bool,
     pub payload_capture_sample_rate: f64,
@@ -972,6 +978,20 @@ impl Config {
         {
             problems.push(format!("{CONNECTION_AWS_PROVIDER}: {error}"));
         }
+        let connection_kubernetes_provider = parse_kubernetes_provider_config(
+            CONNECTION_KUBERNETES_PROVIDER,
+            get_var(CONNECTION_KUBERNETES_PROVIDER),
+            &mut problems,
+        );
+        // Kubernetes aliases share the same namespace as the operator aliases;
+        // duplicates against the other network providers are rejected by the
+        // control plane's network-alias collision guard.
+        if let Err(error) = validate_kubernetes_provider_config(
+            &connection_kubernetes_provider,
+            &reserved_alias_ids,
+        ) {
+            problems.push(format!("{CONNECTION_KUBERNETES_PROVIDER}: {error}"));
+        }
         let payload_capture_enabled = parse_var(
             PAYLOAD_CAPTURE_ENABLED,
             get_var(PAYLOAD_CAPTURE_ENABLED),
@@ -1433,6 +1453,7 @@ impl Config {
                 connection_gcp_provider,
                 connection_azure_provider,
                 connection_aws_provider,
+                connection_kubernetes_provider,
                 connection_secret_aliases,
                 connection_secrets_root,
                 payload_capture_enabled,
@@ -2650,6 +2671,42 @@ fn parse_aws_provider_config(
             error.column()
         ));
         AwsProviderConfig::default()
+    })
+}
+
+fn parse_kubernetes_provider_config(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> KubernetesProviderConfig {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return KubernetesProviderConfig::default(),
+        Err(VarError::NotUnicode(_)) => {
+            problems.push(format!("{name} must be valid Unicode"));
+            return KubernetesProviderConfig::default();
+        }
+    };
+    if value.len() > MAX_KUBERNETES_PROVIDER_CONFIG_BYTES {
+        problems.push(format!(
+            "{name} must contain at most {MAX_KUBERNETES_PROVIDER_CONFIG_BYTES} bytes"
+        ));
+        return KubernetesProviderConfig::default();
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return KubernetesProviderConfig::default();
+    }
+    serde_json::from_str(value).unwrap_or_else(|error| {
+        // Position only. serde echoes the offending scalar in its message, and
+        // this string reaches stderr at startup, so interpolating the error
+        // would print operator secret locators into container logs.
+        problems.push(format!(
+            "{name} must be a JSON object with profiles and aliases arrays (invalid shape at line {} column {})",
+            error.line(),
+            error.column()
+        ));
+        KubernetesProviderConfig::default()
     })
 }
 
