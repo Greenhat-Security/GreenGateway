@@ -979,7 +979,8 @@
         "vault_kv_v2",
         "gcp_secret_manager",
         "azure_key_vault",
-        "aws_secrets_manager"
+        "aws_secrets_manager",
+        "kubernetes_secrets"
       ]
     },
     "SecretActions": {

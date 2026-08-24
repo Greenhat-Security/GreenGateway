@@ -15,6 +15,7 @@ pub mod azure_secret;
 pub mod control_plane;
 pub mod gcp_secret;
 pub mod http;
+pub mod kubernetes_secret;
 pub mod local_secret;
 pub mod mcp;
 pub mod model;
