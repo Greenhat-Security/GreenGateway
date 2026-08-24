@@ -16,6 +16,9 @@ use serde::Deserialize;
 use crate::{
     auth::principal::{canonical_issuer, provider_issuer, PROVIDER_ISSUER_PREFIX},
     connections::{
+        gcp_secret::{
+            validate_gcp_provider_config, GcpProviderConfig, MAX_GCP_PROVIDER_CONFIG_BYTES,
+        },
         local_secret::{
             validate_local_secret_keyring_config, LocalSecretKeyConfig,
             MAX_LOCAL_SECRET_KEYRING_CONFIG_BYTES,
@@ -130,6 +133,7 @@ const CSRF_ENABLED: &str = "CSRF_ENABLED";
 const CSRF_EXEMPT_PATHS: &str = "CSRF_EXEMPT_PATHS";
 const CSRF_HEADER_NAME: &str = "CSRF_HEADER_NAME";
 const CONNECTIONS_SQLITE_PATH: &str = "CONNECTIONS_SQLITE_PATH";
+const CONNECTION_GCP_PROVIDER: &str = "CONNECTION_GCP_PROVIDER";
 const CONNECTION_LOCAL_SECRET_KEYRING: &str = "CONNECTION_LOCAL_SECRET_KEYRING";
 const CONNECTION_SECRET_ALIASES: &str = "CONNECTION_SECRET_ALIASES";
 const CONNECTION_VAULT_PROVIDER: &str = "CONNECTION_VAULT_PROVIDER";
@@ -212,6 +216,7 @@ pub struct Config {
     pub connection_local_secret_keyring: Vec<LocalSecretKeyConfig>,
     pub connection_secret_aliases: Vec<OperatorSecretAliasConfig>,
     pub connection_vault_provider: VaultProviderConfig,
+    pub connection_gcp_provider: GcpProviderConfig,
     pub connection_secrets_root: Option<SecretRootConfig>,
     pub payload_capture_enabled: bool,
     pub payload_capture_sample_rate: f64,
@@ -918,6 +923,19 @@ impl Config {
         {
             problems.push(format!("{CONNECTION_VAULT_PROVIDER}: {error}"));
         }
+        let connection_gcp_provider = parse_gcp_provider_config(
+            CONNECTION_GCP_PROVIDER,
+            get_var(CONNECTION_GCP_PROVIDER),
+            &mut problems,
+        );
+        // Google Cloud aliases share the same namespace; duplicates across the
+        // operator aliases fail closed at startup here, and duplicates across
+        // other network providers fail closed in the connection control plane.
+        if let Err(error) =
+            validate_gcp_provider_config(&connection_gcp_provider, &reserved_alias_ids)
+        {
+            problems.push(format!("{CONNECTION_GCP_PROVIDER}: {error}"));
+        }
         let payload_capture_enabled = parse_var(
             PAYLOAD_CAPTURE_ENABLED,
             get_var(PAYLOAD_CAPTURE_ENABLED),
@@ -1376,6 +1394,7 @@ impl Config {
                 connections_sqlite_path,
                 connection_local_secret_keyring,
                 connection_vault_provider,
+                connection_gcp_provider,
                 connection_secret_aliases,
                 connection_secrets_root,
                 payload_capture_enabled,
@@ -2485,6 +2504,42 @@ fn parse_vault_provider_config(
             error.column()
         ));
         VaultProviderConfig::default()
+    })
+}
+
+fn parse_gcp_provider_config(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> GcpProviderConfig {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return GcpProviderConfig::default(),
+        Err(VarError::NotUnicode(_)) => {
+            problems.push(format!("{name} must be valid Unicode"));
+            return GcpProviderConfig::default();
+        }
+    };
+    if value.len() > MAX_GCP_PROVIDER_CONFIG_BYTES {
+        problems.push(format!(
+            "{name} must contain at most {MAX_GCP_PROVIDER_CONFIG_BYTES} bytes"
+        ));
+        return GcpProviderConfig::default();
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return GcpProviderConfig::default();
+    }
+    serde_json::from_str(value).unwrap_or_else(|error| {
+        // Position only. serde echoes the offending scalar in its message, and
+        // this string reaches stderr at startup, so interpolating the error
+        // would print operator secret locators into container logs.
+        problems.push(format!(
+            "{name} must be a JSON object with profiles and aliases arrays (invalid shape at line {} column {})",
+            error.line(),
+            error.column()
+        ));
+        GcpProviderConfig::default()
     })
 }
 
