@@ -1645,6 +1645,9 @@ fn gateway_app_with_process_started_at_and_overrides(
         egress_config.clone(),
         &build_overrides,
     )?);
+    connection_control_plane.activate_vault_provider(Arc::new(
+        connections::vault_secret::EgressVaultTransport::new(Arc::clone(&egress_client)),
+    ))?;
     let connection_http_runtime = connections::http::ConnectionHttpRuntime::new(
         connection_control_plane.clone(),
         egress_config,
@@ -11302,6 +11305,8 @@ mod tests {
             principal_sqlite_path: None,
             connections_sqlite_path: None,
             connection_local_secret_keyring: Vec::new(),
+            connection_vault_provider:
+                crate::connections::vault_secret::VaultProviderConfig::default(),
             connection_secret_aliases: Vec::new(),
             connection_secrets_root: None,
             payload_capture_enabled: false,

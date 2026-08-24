@@ -1686,6 +1686,8 @@ RowSUZV5FSmOGJ7JyROZ80k=
             principal_sqlite_path: None,
             connections_sqlite_path: None,
             connection_local_secret_keyring: Vec::new(),
+            connection_vault_provider:
+                crate::connections::vault_secret::VaultProviderConfig::default(),
             connection_secret_aliases: Vec::new(),
             connection_secrets_root: None,
             payload_capture_enabled: false,

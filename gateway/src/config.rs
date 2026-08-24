@@ -24,6 +24,9 @@ use crate::{
             validate_operator_secret_alias_config, OperatorSecretAliasConfig, SecretRootConfig,
             MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES,
         },
+        vault_secret::{
+            validate_vault_provider_config, VaultProviderConfig, MAX_VAULT_PROVIDER_CONFIG_BYTES,
+        },
     },
     discovery::{
         signals::{
@@ -129,6 +132,7 @@ const CSRF_HEADER_NAME: &str = "CSRF_HEADER_NAME";
 const CONNECTIONS_SQLITE_PATH: &str = "CONNECTIONS_SQLITE_PATH";
 const CONNECTION_LOCAL_SECRET_KEYRING: &str = "CONNECTION_LOCAL_SECRET_KEYRING";
 const CONNECTION_SECRET_ALIASES: &str = "CONNECTION_SECRET_ALIASES";
+const CONNECTION_VAULT_PROVIDER: &str = "CONNECTION_VAULT_PROVIDER";
 const CONNECTION_SECRETS_ROOT: &str = "CONNECTION_SECRETS_ROOT";
 const DISCOVERY_SQLITE_PATH: &str = "DISCOVERY_SQLITE_PATH";
 const DISCOVERY_ENDPOINT_LIMIT: &str = "DISCOVERY_ENDPOINT_LIMIT";
@@ -207,6 +211,7 @@ pub struct Config {
     pub connections_sqlite_path: Option<String>,
     pub connection_local_secret_keyring: Vec<LocalSecretKeyConfig>,
     pub connection_secret_aliases: Vec<OperatorSecretAliasConfig>,
+    pub connection_vault_provider: VaultProviderConfig,
     pub connection_secrets_root: Option<SecretRootConfig>,
     pub payload_capture_enabled: bool,
     pub payload_capture_sample_rate: f64,
@@ -896,6 +901,23 @@ impl Config {
         ) {
             problems.push(format!("{CONNECTION_LOCAL_SECRET_KEYRING}: {error}"));
         }
+        let connection_vault_provider = parse_vault_provider_config(
+            CONNECTION_VAULT_PROVIDER,
+            get_var(CONNECTION_VAULT_PROVIDER),
+            &mut problems,
+        );
+        // Vault aliases share one namespace with the operator aliases, so a
+        // duplicate id must fail closed at startup rather than let resolution
+        // order decide which provider answers.
+        let reserved_alias_ids = connection_secret_aliases
+            .iter()
+            .map(|alias| alias.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Err(error) =
+            validate_vault_provider_config(&connection_vault_provider, &reserved_alias_ids)
+        {
+            problems.push(format!("{CONNECTION_VAULT_PROVIDER}: {error}"));
+        }
         let payload_capture_enabled = parse_var(
             PAYLOAD_CAPTURE_ENABLED,
             get_var(PAYLOAD_CAPTURE_ENABLED),
@@ -1353,6 +1375,7 @@ impl Config {
                 principal_sqlite_path,
                 connections_sqlite_path,
                 connection_local_secret_keyring,
+                connection_vault_provider,
                 connection_secret_aliases,
                 connection_secrets_root,
                 payload_capture_enabled,
@@ -2426,6 +2449,42 @@ fn parse_operator_secret_aliases(
             error.column()
         ));
         Vec::new()
+    })
+}
+
+fn parse_vault_provider_config(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> VaultProviderConfig {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return VaultProviderConfig::default(),
+        Err(VarError::NotUnicode(_)) => {
+            problems.push(format!("{name} must be valid Unicode"));
+            return VaultProviderConfig::default();
+        }
+    };
+    if value.len() > MAX_VAULT_PROVIDER_CONFIG_BYTES {
+        problems.push(format!(
+            "{name} must contain at most {MAX_VAULT_PROVIDER_CONFIG_BYTES} bytes"
+        ));
+        return VaultProviderConfig::default();
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return VaultProviderConfig::default();
+    }
+    serde_json::from_str(value).unwrap_or_else(|error| {
+        // Position only. serde echoes the offending scalar in its message, and
+        // this string reaches stderr at startup, so interpolating the error
+        // would print operator secret locators into container logs.
+        problems.push(format!(
+            "{name} must be a JSON object with profiles and aliases arrays (invalid shape at line {} column {})",
+            error.line(),
+            error.column()
+        ));
+        VaultProviderConfig::default()
     })
 }
 

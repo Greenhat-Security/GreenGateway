@@ -23,3 +23,4 @@ pub mod secret;
 pub mod status;
 pub mod store;
 pub mod test;
+pub mod vault_secret;
