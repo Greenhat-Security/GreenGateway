@@ -16,6 +16,9 @@ use serde::Deserialize;
 use crate::{
     auth::principal::{canonical_issuer, provider_issuer, PROVIDER_ISSUER_PREFIX},
     connections::{
+        aws_secret::{
+            validate_aws_provider_config, AwsProviderConfig, MAX_AWS_PROVIDER_CONFIG_BYTES,
+        },
         azure_secret::{
             validate_azure_provider_config, AzureProviderConfig, MAX_AZURE_PROVIDER_CONFIG_BYTES,
         },
@@ -138,6 +141,7 @@ const CSRF_HEADER_NAME: &str = "CSRF_HEADER_NAME";
 const CONNECTIONS_SQLITE_PATH: &str = "CONNECTIONS_SQLITE_PATH";
 const CONNECTION_AZURE_PROVIDER: &str = "CONNECTION_AZURE_PROVIDER";
 const CONNECTION_GCP_PROVIDER: &str = "CONNECTION_GCP_PROVIDER";
+const CONNECTION_AWS_PROVIDER: &str = "CONNECTION_AWS_PROVIDER";
 const CONNECTION_LOCAL_SECRET_KEYRING: &str = "CONNECTION_LOCAL_SECRET_KEYRING";
 const CONNECTION_SECRET_ALIASES: &str = "CONNECTION_SECRET_ALIASES";
 const CONNECTION_VAULT_PROVIDER: &str = "CONNECTION_VAULT_PROVIDER";
@@ -222,6 +226,7 @@ pub struct Config {
     pub connection_vault_provider: VaultProviderConfig,
     pub connection_gcp_provider: GcpProviderConfig,
     pub connection_azure_provider: AzureProviderConfig,
+    pub connection_aws_provider: AwsProviderConfig,
     pub connection_secrets_root: Option<SecretRootConfig>,
     pub payload_capture_enabled: bool,
     pub payload_capture_sample_rate: f64,
@@ -954,6 +959,19 @@ impl Config {
         {
             problems.push(format!("{CONNECTION_AZURE_PROVIDER}: {error}"));
         }
+        let connection_aws_provider = parse_aws_provider_config(
+            CONNECTION_AWS_PROVIDER,
+            get_var(CONNECTION_AWS_PROVIDER),
+            &mut problems,
+        );
+        // AWS aliases share the same namespace; duplicates against operator
+        // aliases fail closed here, and duplicates against other network
+        // providers fail closed in the control plane's collision guard.
+        if let Err(error) =
+            validate_aws_provider_config(&connection_aws_provider, &reserved_alias_ids)
+        {
+            problems.push(format!("{CONNECTION_AWS_PROVIDER}: {error}"));
+        }
         let payload_capture_enabled = parse_var(
             PAYLOAD_CAPTURE_ENABLED,
             get_var(PAYLOAD_CAPTURE_ENABLED),
@@ -1414,6 +1432,7 @@ impl Config {
                 connection_vault_provider,
                 connection_gcp_provider,
                 connection_azure_provider,
+                connection_aws_provider,
                 connection_secret_aliases,
                 connection_secrets_root,
                 payload_capture_enabled,
@@ -2595,6 +2614,42 @@ fn parse_azure_provider_config(
             error.column()
         ));
         AzureProviderConfig::default()
+    })
+}
+
+fn parse_aws_provider_config(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> AwsProviderConfig {
+    let value = match value {
+        Ok(value) => value,
+        Err(VarError::NotPresent) => return AwsProviderConfig::default(),
+        Err(VarError::NotUnicode(_)) => {
+            problems.push(format!("{name} must be valid Unicode"));
+            return AwsProviderConfig::default();
+        }
+    };
+    if value.len() > MAX_AWS_PROVIDER_CONFIG_BYTES {
+        problems.push(format!(
+            "{name} must contain at most {MAX_AWS_PROVIDER_CONFIG_BYTES} bytes"
+        ));
+        return AwsProviderConfig::default();
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return AwsProviderConfig::default();
+    }
+    serde_json::from_str(value).unwrap_or_else(|error| {
+        // Position only. serde echoes the offending scalar in its message, and
+        // this string reaches stderr at startup, so interpolating the error
+        // would print operator secret locators into container logs.
+        problems.push(format!(
+            "{name} must be a JSON object with profiles and aliases arrays (invalid shape at line {} column {})",
+            error.line(),
+            error.column()
+        ));
+        AwsProviderConfig::default()
     })
 }
 
