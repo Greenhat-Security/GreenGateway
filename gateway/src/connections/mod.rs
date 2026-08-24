@@ -11,6 +11,7 @@
 
 pub mod admin;
 pub mod control_plane;
+pub mod gcp_secret;
 pub mod http;
 pub mod local_secret;
 pub mod mcp;

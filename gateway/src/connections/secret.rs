@@ -111,6 +111,7 @@ pub enum SecretProviderKind {
     OperatorFile,
     LocalEncrypted,
     VaultKvV2,
+    GcpSecretManager,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
