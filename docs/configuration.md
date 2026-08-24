@@ -305,6 +305,73 @@ Every identity and data-plane request travels through the gateway egress client,
 
 Rotation, revocation, disablement, deletion, temporal (`nbf`/`exp`) violations, malformed data, provider outage, and newly denied access fail closed and purge any cached value; the provider never returns a stale value, retries anonymously, or falls back to a weaker credential. Resolutions are bounded by a per-read deadline, a single transient retry with backoff, a fixed concurrency cap, bounded response sizes, and bounded token/value caches keyed by provider configuration, egress generation, identity generation, alias, purpose, and pinned version; token and value material is zeroized on eviction and drop. Configuration `Debug`, startup errors, metadata, and provider errors redact authority hosts, tenant and client IDs, scopes, vault authorities, secret names, versions, token roots, token files, and all auth locators; observability carries only the bounded provider kind, outcome, safe reason, and latency. The JSON is an operator trust boundary: ordinary connection APIs accept and expose only alias IDs and safe labels, and alias metadata has no secret reveal operation.
 
+### CONNECTION_AWS_PROVIDER
+
+Optional read-only AWS Secrets Manager secret provider. Profiles fix one region-independent AWS identity each; aliases map opaque IDs to complete Secrets Manager secret ARNs. Only the `GetSecretValue` operation is implemented: there is no list, discovery, write, rotate, delete, or administration operation, and callers, tool arguments, and ordinary Connection mutations can never select ARNs, regions, versions, stages, JSON members, or endpoints.
+
+Default: `{}` (AWS Secrets Manager secret provider disabled).
+
+Format: a JSON object of at most `256 KiB` with a `profiles` array (at most `8` entries) and an `aliases` array (at most `512` entries). Each profile has a safe opaque `id`, an explicit `sts_endpoint` (absolute `https` URL with no credentials, path, query, or fragment), and an `auth` object. Auth types are `web_identity` (a fixed `role_arn`, plus `token_root` and `token_file` naming a platform-projected workload identity token, exchanged through unsigned `AssumeRoleWithWebIdentity` at the configured STS endpoint for bounded session credentials) and `static_keys` (`access_key_id_alias` and `secret_access_key_alias` referencing aliases of another provider, used directly as SigV4 signing credentials; no STS request is issued in this mode, and the endpoint is still validated as part of the fixed profile shape). There is no SDK default credential chain, no instance metadata service, no shared configuration or credentials file, and no process or CLI credential source; a denied or unavailable identity fails closed without any fallback.
+
+Each alias has a safe opaque `id`, a non-control-character `label` of at most `128` characters, a `profile` referencing a configured profile ID, the complete secret `arn`, at most one of `version_id` or `version_stage`, and an optional `json_key` naming one fixed top-level JSON member to extract from `SecretString`. The ARN must be the full `arn:aws:secretsmanager:<region>:<account-id>:secret:<name>-<6-character-suffix>` form (partitions `aws` and `aws-us-gov`); partial ARNs without the random creation suffix are rejected because Secrets Manager treats them as ambiguous name lookups. When neither selector is pinned the provider explicitly requests `VersionStage=AWSCURRENT`; pinning `AWSPREVIOUS` is rejected outright, and the provider never falls back to `AWSPREVIOUS`, another stage, or a stale cached value. Responses are accepted only when they are bounded JSON whose `ARN` matches the alias binding, whose version or stage matches the pinned selector, and which carry exactly one of `SecretString` or `SecretBinary` (base64) within the purpose byte bounds.
+
+The data-plane endpoint is derived deterministically from each alias ARN as `secretsmanager.<region>.amazonaws.com`; nothing about the endpoint is request-derived or caller-selectable. Every identity and data-plane request is SigV4 signed (the unsigned `AssumeRoleWithWebIdentity` exchange excepted, which is unsigned by protocol) and travels through the standard egress controls, so operators must add the configured STS host and every derived `secretsmanager.<region>.amazonaws.com` host to `EGRESS_ALLOWED_HOSTS` or policy `egress.hosts`; nothing is auto-seeded into the allowlist. Session credentials are cached per profile with a safety margin before the STS expiration, resolved values are cached for at most `60` seconds keyed by provider, egress, and identity generation plus alias, purpose, and pinned selector, and rotation of `AWSCURRENT` therefore becomes visible after bounded cache expiry. A denied read purges the cache and re-authenticates through the same fixed identity source exactly once; resolutions are bounded by an admission semaphore and a total deadline and fail fast when saturated.
+
+Alias and profile IDs share the same namespace as operator aliases (`CONNECTION_SECRET_ALIASES`), encrypted-local secrets (`CONNECTION_LOCAL_SECRET_KEYRING`), and other network providers such as `CONNECTION_VAULT_PROVIDER`. Duplicate IDs across any provider are rejected at startup. AWS aliases are resolved asynchronously at request time and are validated on first use, not at startup; the synchronous `resolve_blocking` path returns `SourceUnavailable` for AWS aliases, so connections that reference AWS secrets skip material validation during startup binding checks.
+
+Configuration `Debug`, startup errors, metadata, and provider errors redact ARNs, endpoints, role ARNs, token roots, token files, JSON member names, and all credential material; observability carries only the bounded provider kind, outcome, safe reason, and latency. The JSON is an operator trust boundary: ordinary connection APIs accept and expose only alias IDs and safe labels. Alias metadata reports the AWS provider kind and configured alias record but has no secret reveal operation.
+
+Grant the identity exactly one permission per secret, naming the full ARN. Add `kms:Decrypt` only when the secret is encrypted with a customer managed key, and only for that exact key. Placeholder values only:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GreenGatewayReadOneSecret",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/billing-AbCdEf"
+    },
+    {
+      "Sid": "GreenGatewayDecryptExactCustomerKey",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:us-east-1:123456789012:key/11111111-2222-3333-4444-555555555555",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "secretsmanager.us-east-1.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+```
+
+Scope the web-identity trust policy to the exact OIDC provider, audience, and subject so no other workload can assume the role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GreenGatewayWorkloadIdentityOnly",
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE0123456789"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE0123456789:aud": "sts.amazonaws.com",
+          "oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE0123456789:sub": "system:serviceaccount:greengateway:greengateway"
+        }
+      }
+    }
+  ]
+}
+```
+
 ### SCHEMA_MISMATCH_SIGNAL_THRESHOLD
 
 Cumulative schema mismatch count that opens a `schema_mismatch` discovery signal for an endpoint.
