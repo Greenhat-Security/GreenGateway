@@ -979,6 +979,17 @@ impl EgressClient {
         self.reconfigured(config)
     }
 
+    /// Derives a client whose maximum response size is clamped to `maximum`
+    /// when that is tighter than the deployment egress bound. The cap is
+    /// enforced while the response is being received, never after buffering.
+    /// A deployment bound that is already tighter is kept, so a caller can
+    /// only narrow the limit.
+    pub(crate) fn with_response_cap(&self, maximum: usize) -> Result<Self, EgressError> {
+        let mut config = self.config.clone();
+        config.max_response_bytes = config.max_response_bytes.min(maximum);
+        self.reconfigured(config)
+    }
+
     pub async fn request(&self, method: Method, url: &str) -> Result<EgressResponse, EgressError> {
         self.request_with_headers(method, url, HeaderMap::new(), None)
             .await

@@ -21,15 +21,19 @@
 //! Every provider request travels through [`EgressClient`], so the deployment
 //! egress policy (HTTPS, allowlisted host and port, strict CA, hostname and SNI
 //! validation, all-answer DNS validation with exact address pinning, and a
-//! disabled redirect policy) applies unchanged. A profile may add one
-//! operator-provisioned PEM CA bundle (for API servers issued by a private
-//! cluster CA) to the verification trust set of a derived egress client; trust
-//! is only ever added through that explicit, validated bundle and hostname
-//! verification still applies, so TLS is never weakened or skipped. Rotation,
-//! revocation, deletion, malformed data, provider outage, and newly denied
-//! access all fail closed: a failed resolution purges any cached value for that
-//! alias and never returns a previous value, retries anonymously, or switches
-//! credential sources.
+//! disabled redirect policy) applies unchanged, and the provider derives its
+//! transport with this module's response cap clamped in so the read bound is
+//! enforced while a response is received. A profile may add one PEM CA bundle
+//! (for API servers issued by a private cluster CA) to the verification trust
+//! set of a derived egress client, read either from a platform-projected file
+//! such as the kubelet-projected `ca.crt` or from an operator-provisioned
+//! non-reveal alias; trust is only ever added through that explicit, validated
+//! bundle and hostname verification still applies, so TLS is never weakened or
+//! skipped. Rotation, revocation, deletion, malformed data, provider outage,
+//! unavailable or invalid trust material, and newly denied access all fail
+//! closed: a failed resolution purges any cached value for that alias and
+//! never returns a previous value, retries anonymously, or switches credential
+//! sources.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -136,9 +140,16 @@ impl KubernetesProviderConfig {
 ///
 /// `server` is always an explicit `https` scheme-plus-authority URL. The
 /// provider never derives an endpoint from `KUBERNETES_SERVICE_HOST`, a
-/// kubeconfig, or any other ambient in-cluster environment. `ca_bundle_alias`
-/// optionally names an already configured non-reveal alias of another provider
-/// whose PEM bundle is added to TLS verification trust for this profile only.
+/// kubeconfig, or any other ambient in-cluster environment.
+///
+/// TLS trust for an API server issued by a private cluster CA comes from at
+/// most one of two sources, each adding to (never replacing or bypassing)
+/// certificate verification for this profile only: `ca_bundle_root` plus
+/// `ca_bundle_file` read a platform-projected PEM bundle (typically the
+/// kubelet-projected `ca.crt`, which is world readable) beneath a pinned
+/// directory, while `ca_bundle_alias` names an already configured non-reveal
+/// alias of another provider for operators who provision the bundle
+/// themselves.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KubernetesProfileConfig {
@@ -146,6 +157,10 @@ pub struct KubernetesProfileConfig {
     pub server: String,
     #[serde(default)]
     pub ca_bundle_alias: Option<String>,
+    #[serde(default)]
+    pub ca_bundle_root: Option<String>,
+    #[serde(default)]
+    pub ca_bundle_file: Option<String>,
     pub auth: KubernetesAuthConfig,
 }
 
@@ -158,6 +173,14 @@ impl fmt::Debug for KubernetesProfileConfig {
             .field(
                 "ca_bundle_alias",
                 &self.ca_bundle_alias.as_ref().map(|_| REDACTED_LOCATOR),
+            )
+            .field(
+                "ca_bundle_root",
+                &self.ca_bundle_root.as_ref().map(|_| REDACTED_LOCATOR),
+            )
+            .field(
+                "ca_bundle_file",
+                &self.ca_bundle_file.as_ref().map(|_| REDACTED_LOCATOR),
             )
             .field("auth", &self.auth)
             .finish()
@@ -236,6 +259,12 @@ pub enum KubernetesProviderConfigError {
     InvalidServer { index: usize },
     InvalidCaBundleAlias { index: usize },
     CaBundleAliasCycle { index: usize },
+    ConflictingCaBundleSources { index: usize },
+    InvalidCaBundleRoot { index: usize },
+    InvalidCaBundleFile { index: usize },
+    CaBundleRootUnavailable { index: usize },
+    CaBundleRootPermissions { index: usize },
+    TransportBounds,
     InvalidProjectedTokenRoot { index: usize },
     InvalidProjectedTokenFile { index: usize },
     ProjectedTokenRootUnavailable { index: usize },
@@ -284,6 +313,29 @@ impl fmt::Display for KubernetesProviderConfigError {
             Self::CaBundleAliasCycle { index } => write!(
                 formatter,
                 "kubernetes profile at index {index} takes its CA bundle from an alias this provider itself serves"
+            ),
+            Self::ConflictingCaBundleSources { index } => write!(
+                formatter,
+                "kubernetes profile at index {index} must configure at most one CA bundle source, and a projected source requires both ca_bundle_root and ca_bundle_file"
+            ),
+            Self::InvalidCaBundleRoot { index } => write!(
+                formatter,
+                "kubernetes profile at index {index} has an invalid CA bundle root"
+            ),
+            Self::InvalidCaBundleFile { index } => write!(
+                formatter,
+                "kubernetes profile at index {index} has an invalid CA bundle file key"
+            ),
+            Self::CaBundleRootUnavailable { index } => write!(
+                formatter,
+                "kubernetes profile at index {index} has a CA bundle root that is unavailable or cannot be canonicalized"
+            ),
+            Self::CaBundleRootPermissions { index } => write!(
+                formatter,
+                "kubernetes profile at index {index} has a CA bundle root with unsafe write permissions for this platform"
+            ),
+            Self::TransportBounds => formatter.write_str(
+                "kubernetes provider transport response bounds could not be applied",
             ),
             Self::InvalidProjectedTokenRoot { index } => write!(
                 formatter,
@@ -390,12 +442,29 @@ pub fn validate_kubernetes_provider_config(
         if !is_valid_kubernetes_server(&profile.server) {
             return Err(KubernetesProviderConfigError::InvalidServer { index });
         }
+        let projected_ca_configured =
+            profile.ca_bundle_root.is_some() || profile.ca_bundle_file.is_some();
+        if profile.ca_bundle_alias.is_some() && projected_ca_configured
+            || profile.ca_bundle_root.is_some() != profile.ca_bundle_file.is_some()
+        {
+            return Err(KubernetesProviderConfigError::ConflictingCaBundleSources { index });
+        }
         if let Some(ca_alias) = profile.ca_bundle_alias.as_deref() {
             if !is_valid_opaque_id(ca_alias, MAX_SECRET_ID_BYTES) {
                 return Err(KubernetesProviderConfigError::InvalidCaBundleAlias { index });
             }
             if alias_ids.contains(ca_alias) {
                 return Err(KubernetesProviderConfigError::CaBundleAliasCycle { index });
+            }
+        }
+        if let Some(ca_root) = profile.ca_bundle_root.as_deref() {
+            if ca_root.is_empty() || ca_root.len() > MAX_KUBERNETES_TOKEN_ROOT_BYTES {
+                return Err(KubernetesProviderConfigError::InvalidCaBundleRoot { index });
+            }
+        }
+        if let Some(ca_file) = profile.ca_bundle_file.as_deref() {
+            if !super::secret::is_valid_file_key(ca_file) {
+                return Err(KubernetesProviderConfigError::InvalidCaBundleFile { index });
             }
         }
         match &profile.auth {
@@ -557,8 +626,19 @@ pub(crate) struct EgressKubernetesTransport {
 }
 
 impl EgressKubernetesTransport {
-    pub(crate) fn new(client: Arc<EgressClient>) -> Self {
-        Self { client }
+    /// Wraps the deployment egress client with this provider's response cap
+    /// clamped in, so the read bound is enforced while a response is being
+    /// received rather than after the egress layer has buffered it.
+    pub(crate) fn bounded(client: &Arc<EgressClient>) -> Result<Self, EgressError> {
+        let capped = client.with_response_cap(MAX_KUBERNETES_READ_RESPONSE_BYTES)?;
+        Ok(Self {
+            client: Arc::new(capped),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn response_cap(&self) -> usize {
+        self.client.max_response_bytes()
     }
 }
 
@@ -579,7 +659,9 @@ impl KubernetesTransport for EgressKubernetesTransport {
         pem_bundle: &[u8],
     ) -> Result<Arc<dyn KubernetesTransport>, EgressError> {
         let derived = self.client.with_additional_tls_root_ca_pem(pem_bundle)?;
-        Ok(Arc::new(Self::new(Arc::new(derived))))
+        Ok(Arc::new(Self {
+            client: Arc::new(derived),
+        }))
     }
 
     async fn send(
@@ -622,8 +704,21 @@ impl KubernetesClock for SystemKubernetesClock {
 
 struct KubernetesProfile {
     id: String,
-    ca_bundle_alias: Option<String>,
+    ca_bundle: Option<CaBundleSource>,
     auth: KubernetesAuth,
+}
+
+/// Where a profile's additional TLS trust anchors come from. Both sources are
+/// re-read on every resolution, so a rotated bundle is observed promptly and a
+/// missing or unusable bundle fails closed before any connection attempt.
+enum CaBundleSource {
+    /// A non-reveal alias of another provider, for operator-provisioned
+    /// bundles (an exclusive-permission regular file or environment value).
+    Alias(String),
+    /// A platform-projected PEM file beneath a pinned root, matching the
+    /// world-readable `ca.crt` the kubelet projects next to ServiceAccount
+    /// tokens.
+    Projected { root: Arc<Dir>, file: String },
 }
 
 enum KubernetesAuth {
@@ -729,12 +824,39 @@ impl KubernetesSecretProvider {
             if profile.ca_bundle_alias.is_some() && bootstrap.is_none() {
                 return Err(KubernetesProviderConfigError::BootstrapResolverRequired { index });
             }
+            let ca_bundle = if let Some(alias) = profile.ca_bundle_alias.as_deref() {
+                Some(CaBundleSource::Alias(alias.to_owned()))
+            } else if let (Some(root), Some(file)) = (
+                profile.ca_bundle_root.as_deref(),
+                profile.ca_bundle_file.as_deref(),
+            ) {
+                Some(CaBundleSource::Projected {
+                    root: open_projected_root(
+                        index,
+                        root,
+                        |index| KubernetesProviderConfigError::CaBundleRootUnavailable { index },
+                        |index| KubernetesProviderConfigError::CaBundleRootPermissions { index },
+                    )?,
+                    file: file.to_owned(),
+                })
+            } else {
+                None
+            };
             let auth = match &profile.auth {
                 KubernetesAuthConfig::ProjectedToken {
                     token_root,
                     token_file,
                 } => KubernetesAuth::ProjectedToken {
-                    token_root: open_projected_token_root(index, token_root)?,
+                    token_root: open_projected_root(
+                        index,
+                        token_root,
+                        |index| KubernetesProviderConfigError::ProjectedTokenRootUnavailable {
+                            index,
+                        },
+                        |index| KubernetesProviderConfigError::ProjectedTokenRootPermissions {
+                            index,
+                        },
+                    )?,
                     token_file: token_file.clone(),
                 },
                 KubernetesAuthConfig::BearerAlias { secret_alias } => {
@@ -752,7 +874,7 @@ impl KubernetesSecretProvider {
                 profile.id.clone(),
                 KubernetesProfile {
                     id: profile.id.clone(),
-                    ca_bundle_alias: profile.ca_bundle_alias.clone(),
+                    ca_bundle,
                     auth,
                 },
             );
@@ -942,7 +1064,16 @@ impl KubernetesSecretProvider {
             .get(&alias.profile)
             .ok_or(KubernetesFailure::ProviderFailure)?;
 
-        let transport = self.transport_for(profile).await?;
+        // A trust-material failure purges like any other failed resolution,
+        // so a value cached under the previous trust state is never served
+        // across an intervening trust outage.
+        let transport = match self.transport_for(profile).await {
+            Ok(transport) => transport,
+            Err(failure) => {
+                self.purge_alias(&alias.id);
+                return Err(failure);
+            }
+        };
         let identity_generation = self.identity_generation(&profile.id);
         let cache_key = self.cache_key(
             alias,
@@ -984,25 +1115,10 @@ impl KubernetesSecretProvider {
         &self,
         profile: &KubernetesProfile,
     ) -> Result<Arc<dyn KubernetesTransport>, KubernetesFailure> {
-        let Some(ca_alias) = profile.ca_bundle_alias.as_deref() else {
+        let Some(ca_bundle) = profile.ca_bundle.as_ref() else {
             return Ok(Arc::clone(&self.transport));
         };
-        let bootstrap = self
-            .bootstrap
-            .as_ref()
-            .ok_or(KubernetesFailure::ProviderFailure)?;
-        let bundle = bootstrap
-            .resolve(ca_alias, SecretPurpose::TlsCaBundle)
-            .await
-            .map_err(|error| match error.kind() {
-                SecretResolveErrorKind::ProviderBusy
-                | SecretResolveErrorKind::SourceUnavailable
-                | SecretResolveErrorKind::ProviderFailure => KubernetesFailure::TrustUnavailable,
-                SecretResolveErrorKind::UnknownAlias
-                | SecretResolveErrorKind::SourceDenied
-                | SecretResolveErrorKind::UnsafeSource
-                | SecretResolveErrorKind::InvalidMaterial => KubernetesFailure::TrustInvalid,
-            })?;
+        let bundle = self.ca_bundle_material(ca_bundle).await?;
         let mut digest = Sha256::new();
         digest.update(b"kubernetes-profile-ca-bundle-v1");
         digest.update(bundle.expose());
@@ -1024,6 +1140,62 @@ impl KubernetesSecretProvider {
             },
         );
         Ok(derived)
+    }
+
+    async fn ca_bundle_material(
+        &self,
+        source: &CaBundleSource,
+    ) -> Result<ResolvedSecret, KubernetesFailure> {
+        match source {
+            CaBundleSource::Alias(alias) => {
+                let bootstrap = self
+                    .bootstrap
+                    .as_ref()
+                    .ok_or(KubernetesFailure::ProviderFailure)?;
+                bootstrap
+                    .resolve(alias, SecretPurpose::TlsCaBundle)
+                    .await
+                    .map_err(|error| match error.kind() {
+                        SecretResolveErrorKind::ProviderBusy
+                        | SecretResolveErrorKind::SourceUnavailable
+                        | SecretResolveErrorKind::ProviderFailure => {
+                            KubernetesFailure::TrustUnavailable
+                        }
+                        SecretResolveErrorKind::UnknownAlias
+                        | SecretResolveErrorKind::SourceDenied
+                        | SecretResolveErrorKind::UnsafeSource
+                        | SecretResolveErrorKind::InvalidMaterial => {
+                            KubernetesFailure::TrustInvalid
+                        }
+                    })
+            }
+            CaBundleSource::Projected { root, file } => {
+                let root = Arc::clone(root);
+                let key = file.clone();
+                tokio::task::spawn_blocking(move || {
+                    read_bounded_file_secret(
+                        "kubernetes-projected-ca-bundle",
+                        &root,
+                        &key,
+                        SecretPurpose::TlsCaBundle,
+                        FileSecretPermissions::PlatformProjected,
+                    )
+                })
+                .await
+                .map_err(|_| KubernetesFailure::ProviderFailure)?
+                .map_err(|error| match error.kind() {
+                    SecretResolveErrorKind::ProviderBusy
+                    | SecretResolveErrorKind::SourceUnavailable
+                    | SecretResolveErrorKind::ProviderFailure => {
+                        KubernetesFailure::TrustUnavailable
+                    }
+                    SecretResolveErrorKind::UnknownAlias
+                    | SecretResolveErrorKind::SourceDenied
+                    | SecretResolveErrorKind::UnsafeSource
+                    | SecretResolveErrorKind::InvalidMaterial => KubernetesFailure::TrustInvalid,
+                })
+            }
+        }
     }
 
     async fn read_authenticated(
@@ -1276,42 +1448,50 @@ fn validate_token_bytes(token: &[u8]) -> Result<(), KubernetesFailure> {
     Ok(())
 }
 
-fn open_projected_token_root(
+/// Opens one platform-projected root directory as a pinned capability handle,
+/// used for both the projected ServiceAccount token root and a projected CA
+/// bundle root. `unavailable` and `permissions` name the per-field
+/// configuration errors so failures stay attributable without leaking the
+/// path.
+fn open_projected_root(
     index: usize,
     path: &str,
+    unavailable: fn(usize) -> KubernetesProviderConfigError,
+    permissions: fn(usize) -> KubernetesProviderConfigError,
 ) -> Result<Arc<Dir>, KubernetesProviderConfigError> {
-    let canonical = fs::canonicalize(PathBuf::from(path))
-        .map_err(|_| KubernetesProviderConfigError::ProjectedTokenRootUnavailable { index })?;
-    let directory = Dir::open_ambient_dir(&canonical, ambient_authority())
-        .map_err(|_| KubernetesProviderConfigError::ProjectedTokenRootUnavailable { index })?;
+    let canonical = fs::canonicalize(PathBuf::from(path)).map_err(|_| unavailable(index))?;
+    let directory =
+        Dir::open_ambient_dir(&canonical, ambient_authority()).map_err(|_| unavailable(index))?;
     let metadata = directory
         .try_clone()
         .and_then(|directory| directory.into_std_file().metadata())
-        .map_err(|_| KubernetesProviderConfigError::ProjectedTokenRootUnavailable { index })?;
+        .map_err(|_| unavailable(index))?;
     if !metadata.is_dir() {
-        return Err(KubernetesProviderConfigError::ProjectedTokenRootUnavailable { index });
+        return Err(unavailable(index));
     }
-    validate_token_root_permissions(index, &metadata)?;
+    validate_projected_root_permissions(index, &metadata, permissions)?;
     Ok(Arc::new(directory))
 }
 
 #[cfg(unix)]
-fn validate_token_root_permissions(
+fn validate_projected_root_permissions(
     index: usize,
     metadata: &fs::Metadata,
+    permissions: fn(usize) -> KubernetesProviderConfigError,
 ) -> Result<(), KubernetesProviderConfigError> {
     use std::os::unix::fs::MetadataExt;
     if metadata.mode() & 0o022 == 0 {
         Ok(())
     } else {
-        Err(KubernetesProviderConfigError::ProjectedTokenRootPermissions { index })
+        Err(permissions(index))
     }
 }
 
 #[cfg(not(unix))]
-fn validate_token_root_permissions(
+fn validate_projected_root_permissions(
     _: usize,
     _: &fs::Metadata,
+    _: fn(usize) -> KubernetesProviderConfigError,
 ) -> Result<(), KubernetesProviderConfigError> {
     Ok(())
 }
@@ -1324,14 +1504,14 @@ fn provider_generation(config: &KubernetesProviderConfig) -> [u8; 32] {
         digest.update([0]);
         digest.update(profile.server.as_bytes());
         digest.update([0]);
-        digest.update(
-            profile
-                .ca_bundle_alias
-                .as_deref()
-                .unwrap_or_default()
-                .as_bytes(),
-        );
-        digest.update([0]);
+        for ca_field in [
+            profile.ca_bundle_alias.as_deref(),
+            profile.ca_bundle_root.as_deref(),
+            profile.ca_bundle_file.as_deref(),
+        ] {
+            digest.update(ca_field.unwrap_or_default().as_bytes());
+            digest.update([0]);
+        }
         match &profile.auth {
             KubernetesAuthConfig::ProjectedToken {
                 token_root,
@@ -1927,6 +2107,8 @@ mod tests {
             id: id.to_owned(),
             server: SERVER_CANARY.to_owned(),
             ca_bundle_alias: None,
+            ca_bundle_root: None,
+            ca_bundle_file: None,
             auth: KubernetesAuthConfig::BearerAlias {
                 secret_alias: secret_alias.to_owned(),
             },
@@ -1938,6 +2120,8 @@ mod tests {
             id: id.to_owned(),
             server: SERVER_CANARY.to_owned(),
             ca_bundle_alias: None,
+            ca_bundle_root: None,
+            ca_bundle_file: None,
             auth: KubernetesAuthConfig::ProjectedToken {
                 token_root: token_root.to_owned(),
                 token_file: "token".to_owned(),
@@ -1977,6 +2161,13 @@ mod tests {
                 .lock()
                 .expect("bootstrap fixture should lock")
                 .insert(alias_id.to_owned(), value.to_vec());
+        }
+
+        fn remove(&self, alias_id: &str) {
+            self.values
+                .lock()
+                .expect("bootstrap fixture should lock")
+                .remove(alias_id);
         }
 
         fn resolutions(&self) -> u64 {
@@ -2852,6 +3043,210 @@ mod tests {
         assert!(fixture.cluster.requests().is_empty());
     }
 
+    #[test]
+    fn configuration_rejects_conflicting_or_invalid_ca_bundle_sources() {
+        let base = |profile: KubernetesProfileConfig| {
+            validate_kubernetes_provider_config(
+                &KubernetesProviderConfig {
+                    profiles: vec![profile],
+                    aliases: Vec::new(),
+                },
+                &BTreeSet::new(),
+            )
+        };
+        let mut both_sources = bearer_profile("primary", "bootstrap-token");
+        both_sources.ca_bundle_alias = Some("cluster-ca".to_owned());
+        both_sources.ca_bundle_root =
+            Some("/var/run/secrets/kubernetes.io/serviceaccount".to_owned());
+        both_sources.ca_bundle_file = Some("ca.crt".to_owned());
+        assert!(matches!(
+            base(both_sources),
+            Err(KubernetesProviderConfigError::ConflictingCaBundleSources { .. })
+        ));
+        let mut root_without_file = bearer_profile("primary", "bootstrap-token");
+        root_without_file.ca_bundle_root = Some("/var/run/secrets".to_owned());
+        assert!(matches!(
+            base(root_without_file),
+            Err(KubernetesProviderConfigError::ConflictingCaBundleSources { .. })
+        ));
+        let mut file_without_root = bearer_profile("primary", "bootstrap-token");
+        file_without_root.ca_bundle_file = Some("ca.crt".to_owned());
+        assert!(matches!(
+            base(file_without_root),
+            Err(KubernetesProviderConfigError::ConflictingCaBundleSources { .. })
+        ));
+        let mut empty_root = bearer_profile("primary", "bootstrap-token");
+        empty_root.ca_bundle_root = Some(String::new());
+        empty_root.ca_bundle_file = Some("ca.crt".to_owned());
+        assert!(matches!(
+            base(empty_root),
+            Err(KubernetesProviderConfigError::InvalidCaBundleRoot { .. })
+        ));
+        for file in ["../escape", "nested/ca.crt", "..", "NUL"] {
+            let mut invalid_file = bearer_profile("primary", "bootstrap-token");
+            invalid_file.ca_bundle_root = Some("/var/run/secrets".to_owned());
+            invalid_file.ca_bundle_file = Some(file.to_owned());
+            assert!(
+                matches!(
+                    base(invalid_file),
+                    Err(KubernetesProviderConfigError::InvalidCaBundleFile { .. })
+                ),
+                "{file:?} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_projected_ca_bundle_derives_trust_and_observes_rotation() {
+        let root = std::env::temp_dir().join(format!(
+            "greengateway-kubernetes-projected-ca-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).expect("projected CA root should create");
+        set_directory_permissions(&root, 0o755);
+        fs::write(root.join("ca.crt"), CA_PEM_CANARY.as_bytes()).expect("CA bundle should write");
+        set_file_permissions(&root.join("ca.crt"), 0o644);
+
+        let mut profile = bearer_profile("primary", "bootstrap-token");
+        profile.ca_bundle_root = Some(
+            root.to_str()
+                .expect("CA root path should be Unicode")
+                .to_owned(),
+        );
+        profile.ca_bundle_file = Some("ca.crt".to_owned());
+        let fixture = provider_with_config(KubernetesProviderConfig {
+            profiles: vec![profile],
+            aliases: vec![alias("billing")],
+        });
+        fixture
+            .cluster
+            .push_read(json_response(200, &secret_body(KEY_CANARY, VALUE_CANARY)));
+
+        let secret = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect("a projected-CA profile should resolve");
+        assert_eq!(secret.expose(), VALUE_CANARY.as_bytes());
+        let requests = fixture.cluster.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].derived_ca.as_deref(), Some(CA_PEM_CANARY));
+
+        // A rotated projected bundle re-derives the transport and invalidates
+        // the value cached under the previous trust generation.
+        fs::write(
+            root.join("ca.crt"),
+            b"-----BEGIN CERTIFICATE-----\nrotated-projected\n-----END CERTIFICATE-----\n",
+        )
+        .expect("CA bundle should rewrite");
+        set_file_permissions(&root.join("ca.crt"), 0o644);
+        fixture
+            .cluster
+            .push_read(json_response(200, &secret_body(KEY_CANARY, "second-value")));
+
+        let rotated = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect("a rotated projected CA bundle should re-derive the transport");
+        assert_eq!(rotated.expose(), b"second-value");
+        let requests = fixture.cluster.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]
+            .derived_ca
+            .as_deref()
+            .is_some_and(|ca| ca.contains("rotated-projected")));
+
+        // A missing projected bundle fails closed before any request.
+        fs::remove_file(root.join("ca.crt")).expect("CA bundle should remove");
+        fixture.provider.purge_alias("billing");
+        let error = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect_err("a missing projected CA bundle must fail closed");
+        assert_eq!(error.kind(), SecretResolveErrorKind::SourceUnavailable);
+        assert_eq!(fixture.cluster.requests().len(), 2);
+
+        drop(fixture);
+        fs::remove_dir_all(&root).expect("projected CA root should remove");
+    }
+
+    #[tokio::test]
+    async fn a_trust_outage_purges_previously_cached_values() {
+        let mut profile = bearer_profile("primary", "bootstrap-token");
+        profile.ca_bundle_alias = Some("cluster-ca".to_owned());
+        let fixture = provider_with_config(KubernetesProviderConfig {
+            profiles: vec![profile],
+            aliases: vec![alias("billing")],
+        });
+        fixture
+            .bootstrap
+            .set("cluster-ca", CA_PEM_CANARY.as_bytes());
+        fixture
+            .cluster
+            .push_read(json_response(200, &secret_body(KEY_CANARY, "first-value")));
+        let first = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect("first read should resolve");
+        assert_eq!(first.expose(), b"first-value");
+        assert_eq!(fixture.provider.value_guard().len(), 1);
+
+        // Trust material becomes unresolvable: the resolution fails closed
+        // and the previously cached value is purged, not preserved.
+        fixture.bootstrap.remove("cluster-ca");
+        let error = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect_err("a trust outage must fail closed");
+        assert_eq!(error.kind(), SecretResolveErrorKind::UnsafeSource);
+        assert!(fixture.provider.value_guard().is_empty());
+        assert_eq!(fixture.cluster.requests().len(), 1);
+
+        // After trust recovers, the next resolution re-reads the provider
+        // instead of serving the pre-outage value, even inside the value TTL.
+        fixture
+            .bootstrap
+            .set("cluster-ca", CA_PEM_CANARY.as_bytes());
+        fixture
+            .cluster
+            .push_read(json_response(200, &secret_body(KEY_CANARY, "second-value")));
+        let recovered = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect("a recovered trust source should resolve");
+        assert_eq!(recovered.expose(), b"second-value");
+        assert_eq!(fixture.cluster.requests().len(), 2);
+    }
+
+    #[test]
+    fn the_transport_response_cap_is_clamped_into_the_derived_client() {
+        let client = Arc::new(
+            crate::egress::EgressClient::new(crate::egress::EgressConfig::default())
+                .expect("egress client should build"),
+        );
+        let transport =
+            EgressKubernetesTransport::bounded(&client).expect("bounded transport should build");
+        assert_eq!(transport.response_cap(), MAX_KUBERNETES_READ_RESPONSE_BYTES);
+
+        let mut tighter_config = crate::egress::EgressConfig::default();
+        tighter_config.max_response_bytes = 1024;
+        let tighter = Arc::new(
+            crate::egress::EgressClient::new(tighter_config).expect("egress client should build"),
+        );
+        let transport =
+            EgressKubernetesTransport::bounded(&tighter).expect("bounded transport should build");
+        assert_eq!(
+            transport.response_cap(),
+            1024,
+            "a tighter deployment bound must never be widened"
+        );
+    }
+
     #[tokio::test]
     async fn a_provider_without_a_bootstrap_resolver_rejects_bootstrap_profiles() {
         let cluster = FakeCluster::new();
@@ -2906,11 +3301,12 @@ mod tests {
             .expect_err("unknown alias must fail");
         let mut ca_profile = bearer_profile("primary", "bootstrap-token");
         ca_profile.ca_bundle_alias = Some("cluster-ca".to_owned());
+        let mut projected_ca_profile =
+            projected_profile("secondary", "/var/run/secrets/tokens-canary");
+        projected_ca_profile.ca_bundle_root = Some("/var/run/secrets/ca-root-canary".to_owned());
+        projected_ca_profile.ca_bundle_file = Some("ca-file-canary.crt".to_owned());
         let configuration = KubernetesProviderConfig {
-            profiles: vec![
-                ca_profile,
-                projected_profile("secondary", "/var/run/secrets/tokens-canary"),
-            ],
+            profiles: vec![ca_profile, projected_ca_profile],
             aliases: vec![alias("billing")],
         };
 
@@ -2939,6 +3335,8 @@ mod tests {
                 NAME_CANARY,
                 KEY_CANARY,
                 "tokens-canary",
+                "ca-root-canary",
+                "ca-file-canary",
             ] {
                 assert!(
                     !output.contains(canary),

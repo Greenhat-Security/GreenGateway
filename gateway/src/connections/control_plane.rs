@@ -576,8 +576,10 @@ impl ConnectionControlPlane {
             reserved_ids.extend(self.aws_config.aliases.iter().map(|alias| alias.id.clone()));
         }
         if !self.kubernetes_config.is_empty() {
-            let transport: Arc<dyn KubernetesTransport> =
-                Arc::new(EgressKubernetesTransport::new(Arc::clone(egress)));
+            let transport: Arc<dyn KubernetesTransport> = Arc::new(
+                EgressKubernetesTransport::bounded(egress)
+                    .map_err(|_| KubernetesProviderConfigError::TransportBounds)?,
+            );
             let provider = KubernetesSecretProvider::from_config(
                 &self.kubernetes_config,
                 &reserved_ids,
