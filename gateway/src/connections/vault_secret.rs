@@ -1263,6 +1263,10 @@ impl SecretResolver for VaultKvV2SecretProvider {
         outcome.map_err(|failure| SecretResolveError::new(&alias_id, failure.kind()))
     }
 
+    fn contains_alias(&self, alias_id: &str) -> bool {
+        self.aliases.contains_key(alias_id)
+    }
+
     fn aliases(&self) -> Vec<SecretAliasMetadata> {
         self.aliases
             .values()
