@@ -40,7 +40,11 @@ pub(crate) enum FileSecretPermissions {
     Exclusive,
     /// Platform-projected workload identity material that the container runtime
     /// publishes world readable, such as a Kubernetes projected service-account
-    /// token. Group and other *write* permissions remain rejected.
+    /// token. Group and other *write* permissions remain rejected. The kubelet
+    /// atomic writer publishes each projected file as a relative symlink into a
+    /// timestamped `..data` directory, so the leaf may be a symlink; resolution
+    /// stays confined beneath the capability root and the opened handle must
+    /// still be a regular file.
     PlatformProjected,
 }
 
@@ -489,10 +493,14 @@ fn read_file_secret(
 
 /// Reads one bounded secret file beneath an already validated capability root.
 ///
-/// The leaf is opened without following links and in nonblocking mode, the
-/// opened handle is revalidated as a regular file, and the read is capped before
-/// any material is parsed. Providers that consume platform-projected identity
-/// material relax only the group/other *read* rule through `permissions`.
+/// The leaf is opened in nonblocking mode, the opened handle is revalidated as
+/// a regular file, and the read is capped before any material is parsed.
+/// Operator material never follows links. Platform-projected identity material
+/// may be reached through the kubelet atomic writer's relative symlinks
+/// (`token -> ..data/token`); the capability root confines that resolution, so
+/// a link that escapes the root fails closed. Providers that consume
+/// platform-projected material also relax only the group/other *read* rule
+/// through `permissions`.
 pub(crate) fn read_bounded_file_secret(
     alias_id: &str,
     root: &Dir,
@@ -503,14 +511,22 @@ pub(crate) fn read_bounded_file_secret(
     let initial_metadata = root
         .symlink_metadata(key)
         .map_err(|error| map_file_error(alias_id, error, false))?;
-    if !initial_metadata.is_file() || initial_metadata.is_symlink() {
+    let leaf_acceptable = match permissions {
+        FileSecretPermissions::Exclusive => {
+            initial_metadata.is_file() && !initial_metadata.is_symlink()
+        }
+        FileSecretPermissions::PlatformProjected => {
+            initial_metadata.is_file() || initial_metadata.is_symlink()
+        }
+    };
+    if !leaf_acceptable {
         return Err(SecretResolveError::new(
             alias_id,
             SecretResolveErrorKind::UnsafeSource,
         ));
     }
-    let file =
-        open_file_beneath(root, key).map_err(|error| map_file_error(alias_id, error, true))?;
+    let file = open_file_beneath(root, key, permissions)
+        .map_err(|error| map_file_error(alias_id, error, true))?;
     let metadata = file
         .metadata()
         .map_err(|error| map_file_error(alias_id, error, false))?;
@@ -557,10 +573,19 @@ fn map_file_error(alias_id: &str, error: io::Error, unsafe_on_other: bool) -> Se
     SecretResolveError::new(alias_id, kind)
 }
 
-fn open_file_beneath(root: &Dir, key: &str) -> io::Result<File> {
+fn open_file_beneath(
+    root: &Dir,
+    key: &str,
+    permissions: FileSecretPermissions,
+) -> io::Result<File> {
     let mut options = CapabilityOpenOptions::new();
     options.read(true);
-    options.follow(FollowSymlinks::No);
+    options.follow(match permissions {
+        FileSecretPermissions::Exclusive => FollowSymlinks::No,
+        // Symlink resolution is confined beneath the capability root; absolute
+        // targets and traversal above the root fail instead of escaping.
+        FileSecretPermissions::PlatformProjected => FollowSymlinks::Yes,
+    });
     options.nonblock(true);
     root.open_with(key, &options).map(|file| file.into_std())
 }
@@ -1376,6 +1401,89 @@ mod tests {
                 .kind(),
             SecretResolveErrorKind::UnsafeSource
         );
+        fs::remove_file(outside).expect("outside fixture should remove");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_platform_projected_reads_kubelet_symlink_layout() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TemporarySecrets::new("projected-layout");
+        let data_dir = temporary.root.join("..2026_08_24_10_00_00.0000000001");
+        fs::create_dir(&data_dir).expect("timestamped data directory should create");
+        set_directory_permissions(&data_dir, 0o755);
+        let token_path = data_dir.join("token");
+        fs::write(&token_path, b"projected-token-material").expect("projected token should write");
+        set_file_permissions(&token_path, 0o644);
+        symlink(
+            "..2026_08_24_10_00_00.0000000001",
+            temporary.root.join("..data"),
+        )
+        .expect("..data symlink should create");
+        symlink("..data/token", temporary.root.join("token")).expect("leaf symlink should create");
+        let root = Dir::open_ambient_dir(&temporary.root, ambient_authority())
+            .expect("capability root should open");
+
+        let projected = read_bounded_file_secret(
+            "projected",
+            &root,
+            "token",
+            SecretPurpose::StaticBearer,
+            FileSecretPermissions::PlatformProjected,
+        )
+        .expect("projected read should follow the kubelet atomic-writer layout");
+        assert_eq!(projected.expose(), b"projected-token-material");
+
+        let exclusive = read_bounded_file_secret(
+            "projected",
+            &root,
+            "token",
+            SecretPurpose::StaticBearer,
+            FileSecretPermissions::Exclusive,
+        )
+        .expect_err("operator material must still refuse symlink leaves");
+        assert_eq!(exclusive.kind(), SecretResolveErrorKind::UnsafeSource);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_platform_projected_symlink_escaping_the_root_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TemporarySecrets::new("projected-escape");
+        let outside = temporary.root.with_extension("outside-token");
+        fs::write(&outside, b"outside-token-material").expect("outside fixture should write");
+        set_file_permissions(&outside, 0o644);
+        symlink(&outside, temporary.root.join("absolute")).expect("absolute symlink should create");
+        let relative_target = PathBuf::from("..").join(
+            outside
+                .file_name()
+                .expect("outside fixture should have a file name"),
+        );
+        symlink(&relative_target, temporary.root.join("relative"))
+            .expect("relative symlink should create");
+        let root = Dir::open_ambient_dir(&temporary.root, ambient_authority())
+            .expect("capability root should open");
+
+        for key in ["absolute", "relative"] {
+            let error = read_bounded_file_secret(
+                "projected",
+                &root,
+                key,
+                SecretPurpose::StaticBearer,
+                FileSecretPermissions::PlatformProjected,
+            )
+            .expect_err("a link that escapes the root must fail closed");
+            assert!(
+                matches!(
+                    error.kind(),
+                    SecretResolveErrorKind::UnsafeSource | SecretResolveErrorKind::SourceDenied
+                ),
+                "escaping link must map to a fail-closed kind, got {:?}",
+                error.kind()
+            );
+        }
         fs::remove_file(outside).expect("outside fixture should remove");
     }
 
