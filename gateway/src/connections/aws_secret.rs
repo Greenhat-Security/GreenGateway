@@ -1208,9 +1208,14 @@ impl AwsSecretsManagerProvider {
         };
 
         let token = self.workload_identity_token(token_root, token_file).await?;
-        let token = std::str::from_utf8(token.expose())
-            .map_err(|_| AwsFailure::IdentityInvalid)?
-            .to_owned();
+        // The decoded token copy zeroizes on drop; the percent encoder streams
+        // straight into the request body, which the transport contract takes
+        // as a plain `Vec<u8>` exactly like the Vault login body.
+        let token = Zeroizing::new(
+            std::str::from_utf8(token.expose())
+                .map_err(|_| AwsFailure::IdentityInvalid)?
+                .to_owned(),
+        );
         let body = format!(
             "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={role}&RoleSessionName={session}&WebIdentityToken={token}",
             role = utf8_percent_encode(role_arn, STS_FORM_ENCODE),
@@ -1357,32 +1362,37 @@ impl AwsSecretsManagerProvider {
         let now = OffsetDateTime::from(self.clock.wall());
         let (date, amz_date) = amz_timestamps(&now);
         let payload_hash = sha256_hex(body);
-        let mut canonical: Vec<(String, String)> = vec![
-            ("content-type".to_owned(), AWS_JSON_CONTENT_TYPE.to_owned()),
-            ("host".to_owned(), alias.host.clone()),
-            (AMZ_DATE_HEADER.to_owned(), amz_date.clone()),
+        // Canonical header values are kept in zeroizing storage and hashed
+        // incrementally, so no concatenated plaintext copy of the session
+        // token ever materializes outside the sensitive header value itself.
+        let mut canonical: Vec<(String, Zeroizing<String>)> = vec![
+            (
+                "content-type".to_owned(),
+                Zeroizing::new(AWS_JSON_CONTENT_TYPE.to_owned()),
+            ),
+            ("host".to_owned(), Zeroizing::new(alias.host.clone())),
+            (AMZ_DATE_HEADER.to_owned(), Zeroizing::new(amz_date.clone())),
             (
                 AMZ_TARGET_HEADER.to_owned(),
-                AWS_GET_SECRET_VALUE_TARGET.to_owned(),
+                Zeroizing::new(AWS_GET_SECRET_VALUE_TARGET.to_owned()),
             ),
         ];
         if let Some(token) = credentials.session_token.as_ref() {
             canonical.push((
                 AMZ_SECURITY_TOKEN_HEADER.to_owned(),
-                token.as_str().to_owned(),
+                Zeroizing::new(token.as_str().to_owned()),
             ));
         }
-        canonical.sort();
+        canonical.sort_by(|left, right| left.0.cmp(&right.0));
         let signed_headers = canonical
             .iter()
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>()
             .join(";");
-        let canonical_request =
-            canonical_request_text("POST", "/", "", &canonical, &signed_headers, &payload_hash);
+        let canonical_hash =
+            canonical_request_hash("POST", "/", "", &canonical, &signed_headers, &payload_hash);
         let scope = credential_scope(&date, &alias.region, AWS_SECRETS_MANAGER_SERVICE);
-        let string_to_sign =
-            signing_string(&amz_date, &scope, &sha256_hex(canonical_request.as_bytes()));
+        let string_to_sign = signing_string(&amz_date, &scope, &canonical_hash);
         let signing_key = derive_signing_key(
             credentials.secret_access_key.as_bytes(),
             &date,
@@ -1732,7 +1742,17 @@ fn classify_status(
             Some("ResourceNotFoundException" | "InvalidRequestException") if !identity => {
                 AwsFailure::SecretAbsent
             }
-            Some("ThrottlingException" | "TooManyRequestsException" | "LimitExceededException") => {
+            // JSON-protocol services throttle as `ThrottlingException`;
+            // Query-protocol services such as STS report `Error.Code`
+            // "Throttling" ("Rate exceeded") plus the older throttle spellings.
+            Some(
+                "ThrottlingException"
+                | "TooManyRequestsException"
+                | "LimitExceededException"
+                | "Throttling"
+                | "ThrottledException"
+                | "RequestThrottled",
+            ) => {
                 if identity {
                     AwsFailure::IdentityUnavailable
                 } else {
@@ -1826,19 +1846,31 @@ fn amz_timestamps(now: &OffsetDateTime) -> (String, String) {
     (date, stamp)
 }
 
-fn canonical_request_text(
+/// Hashes the SigV4 canonical request incrementally, so the sensitive header
+/// values (the session token in particular) are never concatenated into one
+/// unmanaged plaintext buffer.
+fn canonical_request_hash(
     method: &str,
     path: &str,
     query: &str,
-    canonical_headers: &[(String, String)],
+    canonical_headers: &[(String, Zeroizing<String>)],
     signed_headers: &str,
     payload_hash: &str,
 ) -> String {
-    let headers = canonical_headers
-        .iter()
-        .map(|(name, value)| format!("{name}:{}\n", value.trim()))
-        .collect::<String>();
-    format!("{method}\n{path}\n{query}\n{headers}\n{signed_headers}\n{payload_hash}")
+    let mut digest = Sha256::new();
+    for piece in [method, "\n", path, "\n", query, "\n"] {
+        digest.update(piece.as_bytes());
+    }
+    for (name, value) in canonical_headers {
+        digest.update(name.as_bytes());
+        digest.update(b":");
+        digest.update(value.trim().as_bytes());
+        digest.update(b"\n");
+    }
+    for piece in ["\n", signed_headers, "\n", payload_hash] {
+        digest.update(piece.as_bytes());
+    }
+    hex::encode(digest.finalize())
 }
 
 fn credential_scope(date: &str, region: &str, service: &str) -> String {
@@ -2379,6 +2411,11 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("test wall clock should be after the epoch")
                 .as_secs_f64()
+        }
+
+        fn pin_wall(&self, epoch_seconds: u64) {
+            *self.wall.lock().expect("test clock should lock") =
+                UNIX_EPOCH + Duration::from_secs(epoch_seconds);
         }
     }
 
@@ -3141,6 +3178,60 @@ mod tests {
         fs::remove_dir_all(&root).expect("workload root should remove");
     }
 
+    /// STS is a Query-protocol service: it throttles with `Error.Code`
+    /// "Throttling" ("Rate exceeded") rather than a JSON-protocol
+    /// `ThrottlingException`. That spelling must classify as transient (one
+    /// bounded retry), never as a permanent identity denial.
+    #[tokio::test]
+    async fn sts_query_protocol_throttling_is_transient_and_retried_once() {
+        for spelling in ["Throttling", "ThrottledException", "RequestThrottled"] {
+            assert_eq!(
+                classify_status(StatusCode::BAD_REQUEST, Some(spelling), true),
+                Some(AwsFailure::IdentityUnavailable),
+                "{spelling} must classify as a transient identity failure"
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "greengateway-aws-throttle-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).expect("workload root should create");
+        set_projected_permissions(&root);
+        fs::write(root.join("token"), b"projected.jwt.canary").expect("token should write");
+        set_projected_file_permissions(&root.join("token"));
+        let fixture = provider_with_bootstrap(
+            AwsProviderConfig {
+                profiles: vec![web_identity_profile(
+                    "primary",
+                    root.to_str().expect("root path should be Unicode"),
+                )],
+                aliases: vec![alias("billing")],
+            },
+            None,
+        );
+        fixture.aws.push_identity(sts_response(
+            400,
+            r#"{"Error":{"Code":"Throttling","Message":"Rate exceeded","Type":"Sender"},"RequestId":"abc"}"#,
+        ));
+
+        let error = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect_err("a persistently throttled identity must fail closed");
+
+        assert_eq!(error.kind(), SecretResolveErrorKind::SourceUnavailable);
+        assert_eq!(
+            fixture.aws.identities().len(),
+            usize::try_from(MAX_AWS_TRANSIENT_RETRIES).expect("retry bound should fit") + 1
+        );
+        assert!(fixture.aws.reads().is_empty());
+
+        drop(fixture);
+        fs::remove_dir_all(&root).expect("workload root should remove");
+    }
+
     #[tokio::test]
     async fn awscurrent_rotation_becomes_visible_after_cache_expiry() {
         let fixture = provider(vec![alias("billing")]);
@@ -3548,13 +3639,19 @@ mod tests {
         let canonical_headers = vec![
             (
                 "content-type".to_owned(),
-                "application/x-www-form-urlencoded; charset=utf-8".to_owned(),
+                Zeroizing::new("application/x-www-form-urlencoded; charset=utf-8".to_owned()),
             ),
-            ("host".to_owned(), "iam.amazonaws.com".to_owned()),
-            ("x-amz-date".to_owned(), "20150830T123600Z".to_owned()),
+            (
+                "host".to_owned(),
+                Zeroizing::new("iam.amazonaws.com".to_owned()),
+            ),
+            (
+                "x-amz-date".to_owned(),
+                Zeroizing::new("20150830T123600Z".to_owned()),
+            ),
         ];
         let signed_headers = "content-type;host;x-amz-date";
-        let canonical = canonical_request_text(
+        let canonical_hash = canonical_request_hash(
             "GET",
             "/",
             "Action=ListUsers&Version=2010-05-08",
@@ -3562,7 +3659,6 @@ mod tests {
             signed_headers,
             &sha256_hex(b""),
         );
-        let canonical_hash = sha256_hex(canonical.as_bytes());
         assert_eq!(
             canonical_hash,
             "f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59"
@@ -3580,6 +3676,115 @@ mod tests {
             signature,
             "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"
         );
+    }
+
+    /// End-to-end known-answer test for the dynamically assembled data-plane
+    /// signature: `signed_read_headers` itself is driven with a pinned wall
+    /// clock and fixed credentials, in both the session-token and no-token
+    /// shapes. The expected values are derived independently of the production
+    /// helpers — the canonical request, string to sign, and signing key are
+    /// recomputed inline with raw SHA-256/HMAC steps laid out per the SigV4
+    /// specification, and the final signatures are additionally pinned to
+    /// literals computed outside this codebase — so an assembly regression
+    /// (header order, payload-hash binding, date/scope skew) cannot
+    /// self-verify.
+    #[test]
+    fn signed_read_headers_produces_the_reference_signature_end_to_end() {
+        const REFERENCE_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        for (session_token, pinned_signature) in [
+            (
+                Some(SESSION_TOKEN_CANARY),
+                "348dac126bacb6c6d1c6b34ba73b88ddbb94b51ac22d86fd8725174b47cac24a",
+            ),
+            (
+                None,
+                "d678892ed5e0f6bae346a7271fb56ba8214998281ef5a4f4e63b3ec4b6ff94b6",
+            ),
+        ] {
+            let fixture = provider(vec![alias("billing")]);
+            fixture.clock.pin_wall(1_440_938_160); // 20150830T123600Z
+            let binding = fixture
+                .provider
+                .aliases
+                .get("billing")
+                .expect("alias binding should exist");
+            let credentials = AwsSessionCredentials {
+                access_key_id: Zeroizing::new("AKIDEXAMPLE".to_owned()),
+                secret_access_key: Zeroizing::new(REFERENCE_SECRET_KEY.to_owned()),
+                session_token: session_token.map(|token| Zeroizing::new(token.to_owned())),
+            };
+            let body = binding.request_body().expect("request body should build");
+            assert_eq!(
+                String::from_utf8_lossy(&body),
+                format!(r#"{{"SecretId":"{ARN_CANARY}","VersionStage":"AWSCURRENT"}}"#),
+                "the signed payload must be the deterministic request body"
+            );
+
+            let headers = fixture
+                .provider
+                .signed_read_headers(binding, &credentials, &body)
+                .expect("signing should succeed");
+
+            // Independent reference computation, step by step per the SigV4
+            // specification, without the production signing helpers.
+            let reference_hmac = |key: &[u8], data: &[u8]| -> Vec<u8> {
+                let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+                    .expect("reference HMAC accepts any key length");
+                mac.update(data);
+                mac.finalize().into_bytes().to_vec()
+            };
+            let payload_hash = hex::encode(Sha256::digest(&body));
+            let mut canonical = String::from(
+                "POST\n/\n\ncontent-type:application/x-amz-json-1.1\nhost:secretsmanager.us-east-1.amazonaws.com\nx-amz-date:20150830T123600Z\n",
+            );
+            let mut signed = String::from("content-type;host;x-amz-date");
+            if let Some(token) = session_token {
+                canonical.push_str(&format!("x-amz-security-token:{token}\n"));
+                signed.push_str(";x-amz-security-token");
+            }
+            canonical.push_str("x-amz-target:secretsmanager.GetSecretValue\n");
+            signed.push_str(";x-amz-target");
+            canonical.push_str(&format!("\n{signed}\n{payload_hash}"));
+            let string_to_sign = format!(
+                "AWS4-HMAC-SHA256\n20150830T123600Z\n20150830/us-east-1/secretsmanager/aws4_request\n{}",
+                hex::encode(Sha256::digest(canonical.as_bytes()))
+            );
+            let key = reference_hmac(
+                format!("AWS4{REFERENCE_SECRET_KEY}").as_bytes(),
+                b"20150830",
+            );
+            let key = reference_hmac(&key, b"us-east-1");
+            let key = reference_hmac(&key, b"secretsmanager");
+            let key = reference_hmac(&key, b"aws4_request");
+            let reference_signature = hex::encode(reference_hmac(&key, string_to_sign.as_bytes()));
+            assert_eq!(
+                reference_signature, pinned_signature,
+                "the inline reference derivation must match the externally computed literal"
+            );
+
+            let authorization = headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .expect("authorization header should be set");
+            assert_eq!(
+                authorization,
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/secretsmanager/aws4_request, SignedHeaders={signed}, Signature={pinned_signature}"
+                )
+            );
+            assert_eq!(
+                headers
+                    .get(AMZ_DATE_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("20150830T123600Z")
+            );
+            assert_eq!(
+                headers
+                    .get(AMZ_SECURITY_TOKEN_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                session_token
+            );
+        }
     }
 
     #[test]
