@@ -193,9 +193,13 @@ impl fmt::Debug for KubernetesProfileConfig {
 /// from a kubelet-projected file beneath a pinned root and observes kubelet
 /// rotation on a bounded interval. `bearer_alias` takes a static bearer token
 /// from an already configured alias of another provider, never from an inline
-/// value. Anonymous access, kubeconfig discovery, exec/auth plugins, external
-/// commands, and proxies are rejected by construction: no such mechanism
-/// exists in this configuration surface.
+/// value. `client_certificate` authenticates with mutual TLS: the certificate
+/// chain and private key come from already configured non-reveal aliases of
+/// another provider, are combined into one client identity on the derived
+/// egress transport, and no `Authorization` header is sent. Anonymous access,
+/// kubeconfig discovery, exec/auth plugins, external commands, and proxies are
+/// rejected by construction: no such mechanism exists in this configuration
+/// surface.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum KubernetesAuthConfig {
@@ -205,6 +209,10 @@ pub enum KubernetesAuthConfig {
     },
     BearerAlias {
         secret_alias: String,
+    },
+    ClientCertificate {
+        certificate_alias: String,
+        private_key_alias: String,
     },
 }
 
@@ -219,6 +227,14 @@ impl fmt::Debug for KubernetesAuthConfig {
             Self::BearerAlias { secret_alias } => formatter
                 .debug_struct("BearerAlias")
                 .field("secret_alias", secret_alias)
+                .finish(),
+            Self::ClientCertificate {
+                certificate_alias,
+                private_key_alias,
+            } => formatter
+                .debug_struct("ClientCertificate")
+                .field("certificate_alias", certificate_alias)
+                .field("private_key_alias", private_key_alias)
                 .finish(),
         }
     }
@@ -487,6 +503,19 @@ pub fn validate_kubernetes_provider_config(
                     return Err(KubernetesProviderConfigError::BootstrapAliasCycle { index });
                 }
             }
+            KubernetesAuthConfig::ClientCertificate {
+                certificate_alias,
+                private_key_alias,
+            } => {
+                for bootstrap_alias in [certificate_alias, private_key_alias] {
+                    if !is_valid_opaque_id(bootstrap_alias, MAX_SECRET_ID_BYTES) {
+                        return Err(KubernetesProviderConfigError::InvalidBootstrapAlias { index });
+                    }
+                    if alias_ids.contains(bootstrap_alias.as_str()) {
+                        return Err(KubernetesProviderConfigError::BootstrapAliasCycle { index });
+                    }
+                }
+            }
         }
     }
 
@@ -605,11 +634,14 @@ pub(crate) trait KubernetesTransport: Send + Sync {
     fn egress_generation(&self) -> [u8; 32];
 
     /// Derives a transport that additionally trusts the given PEM CA bundle
-    /// when verifying the API server certificate. All other egress policy is
-    /// inherited unchanged; an invalid bundle fails closed.
-    fn with_ca_bundle(
+    /// when verifying the API server certificate and/or presents the given
+    /// combined certificate-chain-plus-private-key PEM as its mutual-TLS
+    /// client identity. All other egress policy is inherited unchanged;
+    /// invalid material fails closed.
+    fn with_tls_material(
         &self,
-        pem_bundle: &[u8],
+        ca_bundle_pem: Option<&[u8]>,
+        client_identity_pem: Option<&[u8]>,
     ) -> Result<Arc<dyn KubernetesTransport>, EgressError>;
 
     async fn send(
@@ -654,11 +686,14 @@ impl KubernetesTransport for EgressKubernetesTransport {
         self.client.configuration_generation()
     }
 
-    fn with_ca_bundle(
+    fn with_tls_material(
         &self,
-        pem_bundle: &[u8],
+        ca_bundle_pem: Option<&[u8]>,
+        client_identity_pem: Option<&[u8]>,
     ) -> Result<Arc<dyn KubernetesTransport>, EgressError> {
-        let derived = self.client.with_additional_tls_root_ca_pem(pem_bundle)?;
+        let derived = self
+            .client
+            .with_tls_material(ca_bundle_pem, client_identity_pem)?;
         Ok(Arc::new(Self {
             client: Arc::new(derived),
         }))
@@ -729,6 +764,10 @@ enum KubernetesAuth {
     BearerAlias {
         secret_alias: String,
     },
+    ClientCertificate {
+        certificate_alias: String,
+        private_key_alias: String,
+    },
 }
 
 struct KubernetesAliasBinding {
@@ -768,7 +807,7 @@ struct KubernetesIdentityState {
 }
 
 struct DerivedProfileTransport {
-    ca_fingerprint: [u8; 32],
+    material_fingerprint: [u8; 32],
     transport: Arc<dyn KubernetesTransport>,
 }
 
@@ -867,6 +906,20 @@ impl KubernetesSecretProvider {
                     }
                     KubernetesAuth::BearerAlias {
                         secret_alias: secret_alias.clone(),
+                    }
+                }
+                KubernetesAuthConfig::ClientCertificate {
+                    certificate_alias,
+                    private_key_alias,
+                } => {
+                    if bootstrap.is_none() {
+                        return Err(KubernetesProviderConfigError::BootstrapResolverRequired {
+                            index,
+                        });
+                    }
+                    KubernetesAuth::ClientCertificate {
+                        certificate_alias: certificate_alias.clone(),
+                        private_key_alias: private_key_alias.clone(),
                     }
                 }
             };
@@ -1109,37 +1162,115 @@ impl KubernetesSecretProvider {
 
     /// Returns the transport for one profile, deriving (and re-deriving on
     /// rotation) a client whose TLS trust additionally accepts the profile's
-    /// operator-provisioned CA bundle. Missing or invalid trust material fails
+    /// CA bundle and whose mutual-TLS client identity carries the profile's
+    /// certificate material. Both sources are re-resolved per resolution and
+    /// fingerprinted, so rotated material re-derives the transport and, via
+    /// the egress generation in the value-cache key, invalidates values
+    /// cached under the previous material. Missing or invalid material fails
     /// closed before any connection is attempted.
     async fn transport_for(
         &self,
         profile: &KubernetesProfile,
     ) -> Result<Arc<dyn KubernetesTransport>, KubernetesFailure> {
-        let Some(ca_bundle) = profile.ca_bundle.as_ref() else {
-            return Ok(Arc::clone(&self.transport));
+        let ca_bundle = match profile.ca_bundle.as_ref() {
+            Some(source) => Some(self.ca_bundle_material(source).await?),
+            None => None,
         };
-        let bundle = self.ca_bundle_material(ca_bundle).await?;
+        let client_identity = match &profile.auth {
+            KubernetesAuth::ClientCertificate {
+                certificate_alias,
+                private_key_alias,
+            } => Some(
+                self.client_identity_material(certificate_alias, private_key_alias)
+                    .await?,
+            ),
+            KubernetesAuth::ProjectedToken { .. } | KubernetesAuth::BearerAlias { .. } => None,
+        };
+        if ca_bundle.is_none() && client_identity.is_none() {
+            return Ok(Arc::clone(&self.transport));
+        }
         let mut digest = Sha256::new();
-        digest.update(b"kubernetes-profile-ca-bundle-v1");
-        digest.update(bundle.expose());
-        let ca_fingerprint: [u8; 32] = digest.finalize().into();
+        digest.update(b"kubernetes-profile-tls-material-v1");
+        if let Some(bundle) = ca_bundle.as_ref() {
+            digest.update([1]);
+            digest.update(bundle.expose());
+        }
+        digest.update([0]);
+        if let Some(identity) = client_identity.as_ref() {
+            digest.update([1]);
+            digest.update(identity.as_slice());
+        }
+        let material_fingerprint: [u8; 32] = digest.finalize().into();
         if let Some(entry) = self.transport_guard().get(&profile.id) {
-            if entry.ca_fingerprint == ca_fingerprint {
+            if entry.material_fingerprint == material_fingerprint {
                 return Ok(Arc::clone(&entry.transport));
             }
         }
         let derived = self
             .transport
-            .with_ca_bundle(bundle.expose())
-            .map_err(|_| KubernetesFailure::TrustInvalid)?;
+            .with_tls_material(
+                ca_bundle.as_ref().map(|bundle| bundle.expose()),
+                client_identity.as_deref().map(Vec::as_slice),
+            )
+            .map_err(|error| match error {
+                EgressError::InvalidTlsClientIdentity => KubernetesFailure::IdentityInvalid,
+                _ => KubernetesFailure::TrustInvalid,
+            })?;
         self.transport_guard().insert(
             profile.id.clone(),
             DerivedProfileTransport {
-                ca_fingerprint,
+                material_fingerprint,
                 transport: Arc::clone(&derived),
             },
         );
         Ok(derived)
+    }
+
+    /// Resolves and combines the mutual-TLS certificate chain and private key
+    /// from their bootstrap aliases into one PEM identity, per the egress
+    /// client-identity convention (certificate chain first, then the key).
+    async fn client_identity_material(
+        &self,
+        certificate_alias: &str,
+        private_key_alias: &str,
+    ) -> Result<Zeroizing<Vec<u8>>, KubernetesFailure> {
+        let bootstrap = self
+            .bootstrap
+            .as_ref()
+            .ok_or(KubernetesFailure::ProviderFailure)?;
+        let map_identity_error = |error: SecretResolveError| match error.kind() {
+            SecretResolveErrorKind::SourceDenied | SecretResolveErrorKind::UnsafeSource => {
+                KubernetesFailure::IdentityDenied
+            }
+            SecretResolveErrorKind::UnknownAlias | SecretResolveErrorKind::InvalidMaterial => {
+                KubernetesFailure::IdentityInvalid
+            }
+            SecretResolveErrorKind::ProviderBusy
+            | SecretResolveErrorKind::SourceUnavailable
+            | SecretResolveErrorKind::ProviderFailure => KubernetesFailure::IdentityUnavailable,
+        };
+        let certificate = bootstrap
+            .resolve(certificate_alias, SecretPurpose::TlsCertificate)
+            .await
+            .map_err(map_identity_error)?;
+        let private_key = bootstrap
+            .resolve(private_key_alias, SecretPurpose::TlsPrivateKey)
+            .await
+            .map_err(map_identity_error)?;
+        let separator_len = usize::from(!certificate.expose().ends_with(b"\n"));
+        let identity_len = certificate
+            .expose()
+            .len()
+            .checked_add(separator_len)
+            .and_then(|length| length.checked_add(private_key.expose().len()))
+            .ok_or(KubernetesFailure::IdentityInvalid)?;
+        let mut identity = Zeroizing::new(Vec::with_capacity(identity_len));
+        identity.extend_from_slice(certificate.expose());
+        if separator_len == 1 {
+            identity.push(b'\n');
+        }
+        identity.extend_from_slice(private_key.expose());
+        Ok(identity)
     }
 
     async fn ca_bundle_material(
@@ -1205,15 +1336,29 @@ impl KubernetesSecretProvider {
         transport: &dyn KubernetesTransport,
         purpose: SecretPurpose,
     ) -> Result<(Zeroizing<Vec<u8>>, u64), KubernetesFailure> {
+        if matches!(profile.auth, KubernetesAuth::ClientCertificate { .. }) {
+            // Mutual TLS carries the identity at the transport layer; no
+            // bearer token exists and no `Authorization` header is sent. The
+            // identity material was freshly resolved for this resolution when
+            // the transport was derived, so a `401` means the current
+            // material is rejected and fails closed with no retry.
+            return match self.read_once(alias, transport, purpose, None).await {
+                Err(KubernetesFailure::TokenRejected) => Err(KubernetesFailure::IdentityDenied),
+                other => other.map(|value| (value, 0)),
+            };
+        }
         let (token, generation) = self.token(profile, 0).await?;
-        match self.read_once(alias, transport, purpose, &token).await {
+        match self
+            .read_once(alias, transport, purpose, Some(&token))
+            .await
+        {
             Err(KubernetesFailure::TokenRejected) => {
                 // A rotated or expired bearer token is the only condition that
                 // earns a second attempt, and only after a fresh re-read of
                 // the same fixed identity source. An RBAC denial (`403`) never
                 // retries.
                 let (token, generation) = self.token(profile, generation.saturating_add(1)).await?;
-                self.read_once(alias, transport, purpose, &token)
+                self.read_once(alias, transport, purpose, Some(&token))
                     .await
                     .map(|value| (value, generation))
             }
@@ -1241,6 +1386,12 @@ impl KubernetesSecretProvider {
             } => self.projected_token(token_root, token_file).await?,
             KubernetesAuth::BearerAlias { secret_alias } => {
                 self.bootstrap_material(secret_alias).await?
+            }
+            // Mutual-TLS profiles never mint a bearer token; the identity
+            // lives on the derived transport and the read path returns before
+            // requesting one.
+            KubernetesAuth::ClientCertificate { .. } => {
+                return Err(KubernetesFailure::ProviderFailure)
             }
         };
         validate_token_bytes(&token)?;
@@ -1306,7 +1457,7 @@ impl KubernetesSecretProvider {
         alias: &KubernetesAliasBinding,
         transport: &dyn KubernetesTransport,
         purpose: SecretPurpose,
-        token: &[u8],
+        token: Option<&[u8]>,
     ) -> Result<Zeroizing<Vec<u8>>, KubernetesFailure> {
         let headers = request_headers(token)?;
         let response = self
@@ -1425,16 +1576,18 @@ fn record_resolution(outcome: &Result<ResolvedSecret, KubernetesFailure>, elapse
     }
 }
 
-fn request_headers(token: &[u8]) -> Result<HeaderMap, KubernetesFailure> {
+fn request_headers(token: Option<&[u8]>) -> Result<HeaderMap, KubernetesFailure> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    let mut bearer = Zeroizing::new(Vec::with_capacity(b"Bearer ".len() + token.len()));
-    bearer.extend_from_slice(b"Bearer ");
-    bearer.extend_from_slice(token);
-    let mut value = HeaderValue::from_bytes(bearer.as_slice())
-        .map_err(|_| KubernetesFailure::IdentityInvalid)?;
-    value.set_sensitive(true);
-    headers.insert(AUTHORIZATION, value);
+    if let Some(token) = token {
+        let mut bearer = Zeroizing::new(Vec::with_capacity(b"Bearer ".len() + token.len()));
+        bearer.extend_from_slice(b"Bearer ");
+        bearer.extend_from_slice(token);
+        let mut value = HeaderValue::from_bytes(bearer.as_slice())
+            .map_err(|_| KubernetesFailure::IdentityInvalid)?;
+        value.set_sensitive(true);
+        headers.insert(AUTHORIZATION, value);
+    }
     Ok(headers)
 }
 
@@ -1527,6 +1680,16 @@ fn provider_generation(config: &KubernetesProviderConfig) -> [u8; 32] {
                 digest.update(b"bearer_alias");
                 digest.update(secret_alias.as_bytes());
                 digest.update([0]);
+            }
+            KubernetesAuthConfig::ClientCertificate {
+                certificate_alias,
+                private_key_alias,
+            } => {
+                digest.update(b"client_certificate");
+                for field in [certificate_alias, private_key_alias] {
+                    digest.update(field.as_bytes());
+                    digest.update([0]);
+                }
             }
         }
     }
@@ -1862,6 +2025,13 @@ mod tests {
     const KEY_CANARY: &str = "data-key-locator-canary";
     const CA_PEM_CANARY: &str =
         "-----BEGIN CERTIFICATE-----\nca-material-canary\n-----END CERTIFICATE-----\n";
+    const CERT_PEM_CANARY: &str = "-----BEGIN CERTIFICATE-----
+client-cert-material-canary
+-----END CERTIFICATE-----";
+    const KEY_PEM_CANARY: &str = "-----BEGIN PRIVATE KEY-----
+client-key-material-canary
+-----END PRIVATE KEY-----
+";
 
     type Responder = dyn Fn() -> Result<KubernetesHttpResponse, EgressError> + Send + Sync;
 
@@ -1873,6 +2043,7 @@ mod tests {
         accept: Option<String>,
         body: Option<String>,
         derived_ca: Option<String>,
+        derived_identity: Option<String>,
     }
 
     /// Scripted responses for the read channel.
@@ -1942,12 +2113,14 @@ mod tests {
         }
     }
 
-    /// A transport view over the shared fake cluster. The base view has no CA
-    /// bundle; `with_ca_bundle` returns a derived view that records the bundle
-    /// on every request and reports a distinct egress generation.
+    /// A transport view over the shared fake cluster. The base view has no
+    /// TLS material; `with_tls_material` returns a derived view that records
+    /// the material on every request and reports a distinct egress
+    /// generation.
     struct FakeTransport {
         cluster: Arc<FakeCluster>,
         derived_ca: Option<String>,
+        derived_identity: Option<String>,
     }
 
     impl FakeTransport {
@@ -1955,6 +2128,7 @@ mod tests {
             Arc::new(Self {
                 cluster,
                 derived_ca: None,
+                derived_identity: None,
             })
         }
     }
@@ -1965,19 +2139,27 @@ mod tests {
             let generation = self.cluster.generation.load(Ordering::SeqCst);
             let mut bytes = [0_u8; 32];
             bytes[..8].copy_from_slice(&generation.to_be_bytes());
-            if let Some(ca) = self.derived_ca.as_deref() {
+            if self.derived_ca.is_some() || self.derived_identity.is_some() {
                 let mut digest = Sha256::new();
                 digest.update(b"fake-derived");
-                digest.update(ca.as_bytes());
+                digest.update(self.derived_ca.as_deref().unwrap_or_default().as_bytes());
+                digest.update([0]);
+                digest.update(
+                    self.derived_identity
+                        .as_deref()
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
                 let fingerprint: [u8; 32] = digest.finalize().into();
                 bytes[8..16].copy_from_slice(&fingerprint[..8]);
             }
             bytes
         }
 
-        fn with_ca_bundle(
+        fn with_tls_material(
             &self,
-            pem_bundle: &[u8],
+            ca_bundle_pem: Option<&[u8]>,
+            client_identity_pem: Option<&[u8]>,
         ) -> Result<Arc<dyn KubernetesTransport>, EgressError> {
             if *self
                 .cluster
@@ -1992,7 +2174,9 @@ mod tests {
             }
             Ok(Arc::new(Self {
                 cluster: Arc::clone(&self.cluster),
-                derived_ca: Some(String::from_utf8_lossy(pem_bundle).into_owned()),
+                derived_ca: ca_bundle_pem.map(|pem| String::from_utf8_lossy(pem).into_owned()),
+                derived_identity: client_identity_pem
+                    .map(|pem| String::from_utf8_lossy(pem).into_owned()),
             }))
         }
 
@@ -2020,6 +2204,7 @@ mod tests {
                     accept: header_text(ACCEPT),
                     body: body.map(|body| String::from_utf8_lossy(&body).into_owned()),
                     derived_ca: self.derived_ca.clone(),
+                    derived_identity: self.derived_identity.clone(),
                 });
             let delay = *self.cluster.delay.lock().expect("fake delay should lock");
             if !delay.is_zero() {
@@ -2125,6 +2310,20 @@ mod tests {
             auth: KubernetesAuthConfig::ProjectedToken {
                 token_root: token_root.to_owned(),
                 token_file: "token".to_owned(),
+            },
+        }
+    }
+
+    fn client_certificate_profile(id: &str) -> KubernetesProfileConfig {
+        KubernetesProfileConfig {
+            id: id.to_owned(),
+            server: SERVER_CANARY.to_owned(),
+            ca_bundle_alias: None,
+            ca_bundle_root: None,
+            ca_bundle_file: None,
+            auth: KubernetesAuthConfig::ClientCertificate {
+                certificate_alias: "tls-cert".to_owned(),
+                private_key_alias: "tls-key".to_owned(),
             },
         }
     }
@@ -3224,6 +3423,183 @@ mod tests {
     }
 
     #[test]
+    fn configuration_rejects_invalid_client_certificate_bootstrap() {
+        let base = |profile: KubernetesProfileConfig, aliases: Vec<KubernetesSecretAliasConfig>| {
+            validate_kubernetes_provider_config(
+                &KubernetesProviderConfig {
+                    profiles: vec![profile],
+                    aliases,
+                },
+                &BTreeSet::new(),
+            )
+        };
+        let mut invalid_certificate = client_certificate_profile("primary");
+        if let KubernetesAuthConfig::ClientCertificate {
+            certificate_alias, ..
+        } = &mut invalid_certificate.auth
+        {
+            *certificate_alias = "../escape".to_owned();
+        }
+        assert!(matches!(
+            base(invalid_certificate, Vec::new()),
+            Err(KubernetesProviderConfigError::InvalidBootstrapAlias { .. })
+        ));
+        let mut key_cycle = client_certificate_profile("primary");
+        if let KubernetesAuthConfig::ClientCertificate {
+            private_key_alias, ..
+        } = &mut key_cycle.auth
+        {
+            *private_key_alias = "billing".to_owned();
+        }
+        assert!(matches!(
+            base(key_cycle, vec![alias("billing")]),
+            Err(KubernetesProviderConfigError::BootstrapAliasCycle { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_certificate_profiles_authenticate_with_mutual_tls_only() {
+        let fixture = provider_with_config(KubernetesProviderConfig {
+            profiles: vec![client_certificate_profile("primary")],
+            aliases: vec![alias("billing")],
+        });
+        fixture
+            .bootstrap
+            .set("tls-cert", CERT_PEM_CANARY.as_bytes());
+        fixture.bootstrap.set("tls-key", KEY_PEM_CANARY.as_bytes());
+        fixture
+            .cluster
+            .push_read(json_response(200, &secret_body(KEY_CANARY, VALUE_CANARY)));
+
+        let secret = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect("a mutual-TLS profile should resolve");
+
+        assert_eq!(secret.expose(), VALUE_CANARY.as_bytes());
+        let requests = fixture.cluster.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].authorization, None,
+            "mutual TLS must not send a bearer header"
+        );
+        let expected_identity = format!(
+            "{CERT_PEM_CANARY}
+{KEY_PEM_CANARY}"
+        );
+        assert_eq!(
+            requests[0].derived_identity.as_deref(),
+            Some(expected_identity.as_str()),
+            "the derived transport must carry the combined identity PEM"
+        );
+        assert_eq!(requests[0].derived_ca, None);
+    }
+
+    #[tokio::test]
+    async fn rotated_client_identity_material_re_derives_and_invalidates_cached_values() {
+        let fixture = provider_with_config(KubernetesProviderConfig {
+            profiles: vec![client_certificate_profile("primary")],
+            aliases: vec![alias("billing")],
+        });
+        fixture
+            .bootstrap
+            .set("tls-cert", CERT_PEM_CANARY.as_bytes());
+        fixture.bootstrap.set("tls-key", KEY_PEM_CANARY.as_bytes());
+        fixture
+            .cluster
+            .push_read(json_response(200, &secret_body(KEY_CANARY, "first-value")));
+        let first = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect("first read should resolve");
+        assert_eq!(first.expose(), b"first-value");
+
+        fixture.bootstrap.set(
+            "tls-key",
+            b"-----BEGIN PRIVATE KEY-----
+rotated-key
+-----END PRIVATE KEY-----
+",
+        );
+        fixture
+            .cluster
+            .push_read(json_response(200, &secret_body(KEY_CANARY, "second-value")));
+
+        let rotated = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect("rotated identity material should re-derive the transport");
+
+        assert_eq!(rotated.expose(), b"second-value");
+        let requests = fixture.cluster.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "rotation must invalidate the cached value without waiting for the TTL"
+        );
+        assert!(requests[1]
+            .derived_identity
+            .as_deref()
+            .is_some_and(|identity| identity.contains("rotated-key")));
+    }
+
+    #[tokio::test]
+    async fn missing_client_identity_material_fails_closed_before_any_request() {
+        let fixture = provider_with_config(KubernetesProviderConfig {
+            profiles: vec![client_certificate_profile("primary")],
+            aliases: vec![alias("billing")],
+        });
+        fixture
+            .bootstrap
+            .set("tls-cert", CERT_PEM_CANARY.as_bytes());
+        fixture
+            .cluster
+            .push_read(json_response(200, &secret_body(KEY_CANARY, VALUE_CANARY)));
+
+        let error = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect_err("missing client identity material must fail closed");
+
+        assert_eq!(error.kind(), SecretResolveErrorKind::InvalidMaterial);
+        assert!(fixture.cluster.requests().is_empty());
+        assert!(fixture.provider.value_guard().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_401_under_mutual_tls_fails_closed_without_retry() {
+        let fixture = provider_with_config(KubernetesProviderConfig {
+            profiles: vec![client_certificate_profile("primary")],
+            aliases: vec![alias("billing")],
+        });
+        fixture
+            .bootstrap
+            .set("tls-cert", CERT_PEM_CANARY.as_bytes());
+        fixture.bootstrap.set("tls-key", KEY_PEM_CANARY.as_bytes());
+        fixture.cluster.push_read(json_response(
+            401,
+            r#"{"kind":"Status","apiVersion":"v1","reason":"Unauthorized","code":401}"#,
+        ));
+
+        let error = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect_err("a rejected client identity must fail closed");
+
+        assert_eq!(error.kind(), SecretResolveErrorKind::SourceDenied);
+        assert_eq!(
+            fixture.cluster.requests().len(),
+            1,
+            "mutual TLS has no token re-read and must not retry"
+        );
+    }
+
+    #[test]
     fn the_transport_response_cap_is_clamped_into_the_derived_client() {
         let client = Arc::new(
             crate::egress::EgressClient::new(crate::egress::EgressConfig::default())
@@ -3233,8 +3609,10 @@ mod tests {
             EgressKubernetesTransport::bounded(&client).expect("bounded transport should build");
         assert_eq!(transport.response_cap(), MAX_KUBERNETES_READ_RESPONSE_BYTES);
 
-        let mut tighter_config = crate::egress::EgressConfig::default();
-        tighter_config.max_response_bytes = 1024;
+        let tighter_config = crate::egress::EgressConfig {
+            max_response_bytes: 1024,
+            ..Default::default()
+        };
         let tighter = Arc::new(
             crate::egress::EgressClient::new(tighter_config).expect("egress client should build"),
         );
@@ -3277,6 +3655,22 @@ mod tests {
             None,
         )
         .expect_err("a CA-bundle profile without a bootstrap resolver must fail");
+        assert!(matches!(
+            error,
+            KubernetesProviderConfigError::BootstrapResolverRequired { .. }
+        ));
+
+        let cluster = FakeCluster::new();
+        let error = KubernetesSecretProvider::from_config(
+            &KubernetesProviderConfig {
+                profiles: vec![client_certificate_profile("primary")],
+                aliases: vec![alias("billing")],
+            },
+            &BTreeSet::new(),
+            FakeTransport::new(cluster) as Arc<dyn KubernetesTransport>,
+            None,
+        )
+        .expect_err("a client-certificate profile without a bootstrap resolver must fail");
         assert!(matches!(
             error,
             KubernetesProviderConfigError::BootstrapResolverRequired { .. }

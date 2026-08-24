@@ -966,16 +966,24 @@ impl EgressClient {
     }
 
     /// Derives a client that additionally trusts the given PEM CA bundle when
-    /// verifying server certificates, for providers whose endpoints chain to a
-    /// private CA. Host allowlisting, DNS pinning, redirect refusal, hostname
-    /// verification, timeouts, and size bounds are inherited unchanged; an
-    /// oversized, unparsable, or empty bundle fails closed.
-    pub(crate) fn with_additional_tls_root_ca_pem(
+    /// verifying server certificates (for providers whose endpoints chain to a
+    /// private CA) and/or presents the given combined certificate-chain and
+    /// private-key PEM as its mutual-TLS client identity. Host allowlisting,
+    /// DNS pinning, redirect refusal, hostname verification, timeouts, and
+    /// size bounds are inherited unchanged; oversized, unparsable, or empty
+    /// material fails closed.
+    pub(crate) fn with_tls_material(
         &self,
-        pem_bundle: &[u8],
+        ca_bundle_pem: Option<&[u8]>,
+        client_identity_pem: Option<&[u8]>,
     ) -> Result<Self, EgressError> {
         let mut config = self.config.clone();
-        config.apply_tls_ca_bundle_pem(pem_bundle)?;
+        if let Some(pem_bundle) = ca_bundle_pem {
+            config.apply_tls_ca_bundle_pem(pem_bundle)?;
+        }
+        if let Some(pem_identity) = client_identity_pem {
+            config.apply_tls_client_identity_pem(pem_identity)?;
+        }
         self.reconfigured(config)
     }
 
