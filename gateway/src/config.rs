@@ -4521,7 +4521,7 @@ mod tests {
         let raw = format!(
             "{}[]{}",
             " ".repeat(MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES),
-            " ".repeat(1)
+            " "
         );
         let error = Config::from_env_vars(|name| match name {
             "CONNECTION_SECRET_ALIASES" => Ok(raw.clone()),

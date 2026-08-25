@@ -2723,7 +2723,7 @@ mod tests {
             Some(&json!("/mcp/tools/foo/bar"))
         );
 
-        let logs = logs.to_string();
+        let logs = logs.contents();
         assert!(
             logs.contains("MCP tool observation path contains slash in tool-name position"),
             "missing slash invariant warning in logs: {logs}"
@@ -3387,7 +3387,7 @@ mod tests {
     }
 
     impl CapturedLogs {
-        fn to_string(&self) -> String {
+        fn contents(&self) -> String {
             let bytes = self
                 .buffer
                 .lock()

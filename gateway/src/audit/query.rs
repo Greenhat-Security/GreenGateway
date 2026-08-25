@@ -1397,7 +1397,11 @@ fn sorted_actor_roles(actor: &Actor) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, time::Instant};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::Instant,
+    };
 
     use rusqlite::{params, Connection};
     use serde_json::json;
@@ -2097,10 +2101,10 @@ mod tests {
         elapsed
     }
 
-    fn create_schema(path: &PathBuf) {
+    fn create_schema(path: &Path) {
         drop(
             SqliteSink::new(SqliteSinkConfig {
-                path: path.clone(),
+                path: path.to_path_buf(),
                 retention_days: None,
             })
             .expect("SQLite sink should create schema"),
