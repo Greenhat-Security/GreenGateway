@@ -265,7 +265,15 @@ Default: `{}` (Vault secret provider disabled).
 
 Format: a JSON object of at most `256 KiB` with a `profiles` array (at most `8` entries) and an `aliases` array (at most `512` entries). Each profile has a safe opaque `id`, an `address` (scheme + authority), an optional `namespace`, and an `auth` object. Auth types are `workload_jwt` (mount, role, token_root, token_file), `token` (secret_alias referencing another provider), and `app_role` (mount, role_id, secret_id_alias referencing another provider). Each alias has a safe opaque `id`, a non-control-character `label` of at most `128` characters, a `profile` referencing a configured profile ID, a KV v2 `mount`, `path`, `key`, and an optional pinned `version`.
 
-Alias and profile IDs share the same namespace as operator aliases (`CONNECTION_SECRET_ALIASES`) and encrypted-local secrets (`CONNECTION_LOCAL_SECRET_KEYRING`). Duplicate IDs across any provider are rejected at startup. Vault aliases are resolved asynchronously at request time and are validated on first use, not at startup. The synchronous `resolve_blocking` path returns `SourceUnavailable` for Vault aliases, so connections that reference Vault secrets skip material validation during startup binding checks.
+The `auth` mount is the mount name alone, without the `auth/` prefix that Vault's own CLI paths carry: the login request is built as `{address}/v1/auth/{mount}/login`, so a Kubernetes auth backend mounted at `auth/kubernetes` is configured as `"mount": "kubernetes"`.
+
+Alias IDs share the same namespace as operator aliases (`CONNECTION_SECRET_ALIASES`), encrypted-local secrets (`CONNECTION_LOCAL_SECRET_KEYRING`), and other network secret providers, and duplicate alias IDs are rejected at startup; profile IDs must be unique within this provider. Vault aliases are resolved asynchronously at request time and are validated on first use, not at startup. The synchronous `resolve_blocking` path returns `SourceUnavailable` for Vault aliases, so connections that reference Vault secrets skip material validation during startup binding checks.
+
+Every identity and data-plane request travels through the gateway egress client, so HTTPS, strict CA/hostname/SNI validation, all-answer DNS validation with exact pinning, and the disabled redirect policy apply unchanged. Operators must add each configured Vault `address` host to `EGRESS_ALLOWED_HOSTS`; the allowlist is never expanded automatically.
+
+A resolved value is cached for at most 60 seconds, so a revocation or deletion at the Vault side becomes visible on the next resolution after that window rather than immediately; pinned aliases stay pinned, and unpinned aliases observe the next valid version after the same bounded expiry.
+
+The [Vault KV v2 operator guide](secrets/vault-kv-v2.md) carries the full worked example, the least-privilege policy granting only `read` on each `.../data/...` path, and the short-TTL auth-role binding.
 
 Configuration `Debug`, startup errors, metadata, and provider errors redact addresses, namespaces, mounts, paths, keys, token roots, token files, and all auth locators. The JSON is an operator trust boundary: ordinary connection APIs accept and expose only alias IDs and safe labels. Alias metadata reports the Vault provider kind and configured alias record but has no secret reveal operation.
 
