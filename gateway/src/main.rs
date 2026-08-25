@@ -11427,12 +11427,12 @@ mod tests {
     }
 
     fn audit_log_with_sqlite_and_broadcast(
-        sqlite_path: &PathBuf,
+        sqlite_path: &FsPath,
     ) -> (audit::AuditLog, audit::AuditEventSender) {
         let (sender, _) = tokio::sync::broadcast::channel(16);
         let sqlite_sink = Arc::new(
             audit::sqlite_sink::SqliteSink::new(audit::sqlite_sink::SqliteSinkConfig {
-                path: sqlite_path.clone(),
+                path: sqlite_path.to_path_buf(),
                 retention_days: None,
             })
             .expect("SQLite sink should create audit schema"),
@@ -27393,7 +27393,7 @@ paths:
         .await;
 
         assert!(body.contains("event: audit.sse.direct"));
-        assert!(body.contains(&format!(r#""path":"/direct""#)));
+        assert!(body.contains(r#""path":"/direct""#));
     }
 
     #[tokio::test]
@@ -36434,21 +36434,21 @@ O2gecI9QwDJNpm29J9wJB2F8
         .expect("test token should sign")
     }
 
-    fn create_audit_schema(path: &PathBuf) {
+    fn create_audit_schema(path: &FsPath) {
         drop(
             audit::sqlite_sink::SqliteSink::new(audit::sqlite_sink::SqliteSinkConfig {
-                path: path.clone(),
+                path: path.to_path_buf(),
                 retention_days: None,
             })
             .expect("SQLite sink should create audit schema"),
         );
     }
 
-    fn create_discovery_schema(path: &PathBuf) {
+    fn create_discovery_schema(path: &FsPath) {
         drop(
             discovery::aggregator::EndpointAggregatorSink::new(
                 discovery::aggregator::EndpointAggregatorSinkConfig {
-                    path: path.clone(),
+                    path: path.to_path_buf(),
                     payload_capture_enabled: false,
                     endpoint_limit: config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
                     signal_event_sender: None,
@@ -37316,13 +37316,13 @@ O2gecI9QwDJNpm29J9wJB2F8
     }
 
     fn emit_observed_events_to_discovery_and_audit(
-        discovery_path: &PathBuf,
-        audit_path: &PathBuf,
+        discovery_path: &FsPath,
+        audit_path: &FsPath,
         events: &[audit::AuditEvent],
     ) {
         let discovery_sink = discovery::aggregator::EndpointAggregatorSink::new(
             discovery::aggregator::EndpointAggregatorSinkConfig {
-                path: discovery_path.clone(),
+                path: discovery_path.to_path_buf(),
                 payload_capture_enabled: false,
                 endpoint_limit: config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
                 signal_event_sender: None,
@@ -37332,7 +37332,7 @@ O2gecI9QwDJNpm29J9wJB2F8
         .expect("discovery aggregator should build");
         let audit_sink =
             audit::sqlite_sink::SqliteSink::new(audit::sqlite_sink::SqliteSinkConfig {
-                path: audit_path.clone(),
+                path: audit_path.to_path_buf(),
                 retention_days: None,
             })
             .expect("audit SQLite sink should build");

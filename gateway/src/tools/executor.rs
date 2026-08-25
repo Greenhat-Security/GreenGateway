@@ -4886,7 +4886,7 @@ mod tests {
             })
             .expect("test egress client should build"),
         );
-        let executor = ToolExecutor::new_inner(
+        ToolExecutor::new_inner(
             registry,
             runtime,
             egress_client,
@@ -4906,9 +4906,7 @@ mod tests {
                 },
             },
         )
-        .expect("tool executor should build");
-
-        executor
+        .expect("tool executor should build")
     }
 
     fn executor_for_connection_tool(
