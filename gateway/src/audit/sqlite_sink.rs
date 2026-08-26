@@ -552,9 +552,21 @@ fn epoch_micros(timestamp: &str) -> Option<i64> {
 }
 
 fn retention_cutoff_epoch_us(retention_days: u32) -> i64 {
-    let cutoff = OffsetDateTime::now_utc() - TimeDuration::days(i64::from(retention_days));
-    // `OffsetDateTime`'s supported range fits comfortably in epoch microseconds.
-    (cutoff.unix_timestamp_nanos() / 1_000) as i64
+    // `OffsetDateTime`'s `Sub` is `checked_sub(..).expect(..)`, and `time` is
+    // built without `large-dates`, so its floor is year -9999. Subtracting a
+    // window wider than that panicked -- on the flusher thread, which also owns
+    // periodic flushing, so a single out-of-range setting stopped pruning and
+    // buffered-event flushing together and stayed broken until restart.
+    //
+    // A window reaching past the earliest representable instant cannot select
+    // any stored event, so saturating to the floor prunes nothing. For an audit
+    // store that is the safe direction: retain more than intended rather than
+    // delete, and never take the writer down.
+    match OffsetDateTime::now_utc().checked_sub(TimeDuration::days(i64::from(retention_days))) {
+        // `OffsetDateTime`'s supported range fits comfortably in epoch microseconds.
+        Some(cutoff) => (cutoff.unix_timestamp_nanos() / 1_000) as i64,
+        None => i64::MIN,
+    }
 }
 
 fn prune_retained_events(connection: &Connection, cutoff_epoch_us: i64) -> rusqlite::Result<usize> {
@@ -819,6 +831,25 @@ mod tests {
         assert_eventually(StdDuration::from_secs(1), || {
             event_ids(&db.path) == vec!["new-event".to_owned()]
         });
+    }
+
+    #[test]
+    fn a_retention_window_past_the_representable_range_prunes_nothing_instead_of_panicking() {
+        // `SqliteSinkConfig` is publicly constructible, so config validation is
+        // not the only way this value arrives. Before this was checked, the
+        // subtraction panicked on the flusher thread -- taking periodic
+        // flushing down with pruning.
+        let cutoff = retention_cutoff_epoch_us(u32::MAX);
+
+        assert_eq!(
+            cutoff,
+            i64::MIN,
+            "an unrepresentable window must saturate to a cutoff that selects nothing"
+        );
+        assert!(
+            cutoff < retention_cutoff_epoch_us(1),
+            "the saturated cutoff must still be older than any ordinary window"
+        );
     }
 
     #[test]

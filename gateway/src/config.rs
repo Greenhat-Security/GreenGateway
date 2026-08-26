@@ -830,6 +830,7 @@ impl Config {
                 "day count",
                 &mut problems,
             ),
+            &mut problems,
         );
         let shutdown_drain_delay_ms = validate_maximum_u64(
             SHUTDOWN_DRAIN_DELAY_MS,
@@ -1664,6 +1665,15 @@ fn validate_optional_positive_timeout_ms(
     }
 }
 
+/// The widest audit retention window that is a real setting rather than a typo.
+///
+/// A hundred years. Beyond this the window reaches past the earliest instant
+/// `time` can represent, and the prune cutoff cannot be computed at all. No
+/// working deployment is rejected by this bound: a value above it already took
+/// the audit flusher thread down sixty seconds after startup, so any
+/// configuration it refuses is one that was already failing.
+pub const MAX_AUDIT_SQLITE_RETENTION_DAYS: u32 = 36_500;
+
 /// Fold `AUDIT_SQLITE_RETENTION_DAYS=0` into the same "no pruning" state an
 /// empty value produces.
 ///
@@ -1674,7 +1684,19 @@ fn validate_optional_positive_timeout_ms(
 /// written to mean "no retention limit", which is what leaving the variable
 /// empty already does. Reinterpreting is also the safe upgrade: rejecting `0`
 /// would abort the boot of a deployment that is running with the value today.
-fn normalize_audit_sqlite_retention_days(name: &str, value: Option<u32>) -> Option<u32> {
+fn normalize_audit_sqlite_retention_days(
+    name: &str,
+    value: Option<u32>,
+    problems: &mut Vec<String>,
+) -> Option<u32> {
+    if let Some(days) = value {
+        if days > MAX_AUDIT_SQLITE_RETENTION_DAYS {
+            problems.push(format!(
+                "{name} must be at most {MAX_AUDIT_SQLITE_RETENTION_DAYS}, got '{days}'"
+            ));
+            return None;
+        }
+    }
     match value {
         Some(0) => {
             tracing::warn!(
@@ -4414,6 +4436,37 @@ mod tests {
             config.audit_sqlite_retention_days, None,
             "0 must mean disabled pruning, not a prune cutoff at the current instant"
         );
+    }
+
+    #[test]
+    fn audit_sqlite_retention_beyond_the_representable_range_is_rejected_at_startup() {
+        let error = Config::from_env_vars(|name| match name {
+            "AUDIT_SQLITE_PATH" => Ok("/var/lib/greengateway/audit.sqlite".to_owned()),
+            // Comfortably past year -9999 once subtracted from now, which is
+            // where computing the prune cutoff stops being possible at all.
+            "AUDIT_SQLITE_RETENTION_DAYS" => Ok("4000000000".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("a retention window that cannot be represented must fail startup");
+
+        assert!(
+            error
+                .to_string()
+                .contains("AUDIT_SQLITE_RETENTION_DAYS must be at most 36500"),
+            "the failure must name the setting and its bound: {error}"
+        );
+    }
+
+    #[test]
+    fn the_widest_supported_audit_retention_window_still_starts() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUDIT_SQLITE_PATH" => Ok("/var/lib/greengateway/audit.sqlite".to_owned()),
+            "AUDIT_SQLITE_RETENTION_DAYS" => Ok("36500".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("the documented maximum must remain a usable setting");
+
+        assert_eq!(config.audit_sqlite_retention_days, Some(36_500));
     }
 
     #[test]
