@@ -27,6 +27,12 @@ const TOOLS_FILE_SCHEMA_VERSION: &str = "0.1.0";
 const MAX_TOOL_NAME_LENGTH: usize = 128;
 const MAX_OPENAPI_REFERENCE_DEPTH: usize = 64;
 const MAX_OPENAPI_SCHEMA_EXPANSION_NODES: usize = 65_536;
+/// Total recursive descent allowed while expanding a single schema, counting
+/// both structural nesting and resolved references. The parser bounds how deep
+/// one document may nest, but reference expansion splices independent subtrees
+/// together, so the expanded depth needs a bound of its own to keep
+/// `dereference_schema` off the end of the worker stack.
+const MAX_OPENAPI_SCHEMA_EXPANSION_DEPTH: usize = 256;
 const MAX_OPENAPI_SECURITY_SIZE_CACHE_ENTRIES: usize = MAX_CATALOG_ENTRIES * 2;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -234,6 +240,7 @@ pub enum OpenApiToolGenerationLimit {
     CumulativeDefinitionBytes,
     SchemaExpansionNodes,
     SchemaExpansionBytes,
+    SchemaExpansionDepth,
     SecurityMetadataBytes,
     SecurityMetadataCacheEntries,
 }
@@ -255,6 +262,41 @@ enum GeneratedParameterLocation {
 struct OpenApiSchemaExpansionBudget {
     remaining_nodes: usize,
     remaining_bytes: usize,
+}
+
+/// Depth accounting for one root-to-leaf path through `dereference_schema`.
+///
+/// `references` is the documented `$ref` chain length, and it has to survive
+/// descent into `properties`/`items`/any other wrapper: a real chain reaches its
+/// next `$ref` through an intervening object, so resetting the count per level
+/// leaves `MAX_OPENAPI_REFERENCE_DEPTH` bounding only bare alias chains.
+/// `nesting` counts every frame, which is what bounds stack use once reference
+/// expansion has spliced several documents' worth of nesting onto one path.
+#[derive(Clone, Copy, Debug, Default)]
+struct SchemaExpansionDepth {
+    references: usize,
+    nesting: usize,
+}
+
+impl SchemaExpansionDepth {
+    fn child(self) -> Result<Self, OpenApiToolGenerationError> {
+        let nesting = self.nesting.saturating_add(1);
+        if nesting > MAX_OPENAPI_SCHEMA_EXPANSION_DEPTH {
+            return Err(OpenApiToolGenerationError::GenerationLimit {
+                limit: OpenApiToolGenerationLimit::SchemaExpansionDepth,
+                maximum: MAX_OPENAPI_SCHEMA_EXPANSION_DEPTH,
+            });
+        }
+        Ok(Self { nesting, ..self })
+    }
+
+    fn resolved_reference(self) -> Result<Self, OpenApiToolGenerationError> {
+        let child = self.child()?;
+        Ok(Self {
+            references: child.references.saturating_add(1),
+            ..child
+        })
+    }
 }
 
 struct OpenApiSecurityMetadataBudget {
@@ -545,6 +587,10 @@ impl fmt::Display for OpenApiToolGenerationError {
                 OpenApiToolGenerationLimit::SchemaExpansionBytes => write!(
                     formatter,
                     "expanded OpenAPI schemas exceed the cumulative byte maximum of {maximum}"
+                ),
+                OpenApiToolGenerationLimit::SchemaExpansionDepth => write!(
+                    formatter,
+                    "expanded OpenAPI schemas exceed the nesting depth maximum of {maximum}"
                 ),
                 OpenApiToolGenerationLimit::SecurityMetadataBytes => write!(
                     formatter,
@@ -1335,9 +1381,13 @@ fn generated_parameter(
     };
 
     let schema = match object.get("schema") {
-        Some(schema) => {
-            dereference_schema(document, schema, &mut BTreeSet::new(), 0, expansion_budget)?
-        }
+        Some(schema) => dereference_schema(
+            document,
+            schema,
+            &mut BTreeSet::new(),
+            SchemaExpansionDepth::default(),
+            expansion_budget,
+        )?,
         None => json!({}),
     };
 
@@ -1478,7 +1528,7 @@ fn json_request_body_schema(
         document,
         schema,
         &mut BTreeSet::new(),
-        0,
+        SchemaExpansionDepth::default(),
         expansion_budget,
     )?))
 }
@@ -1487,12 +1537,12 @@ fn dereference_schema(
     document: &Value,
     schema: &Value,
     reference_ancestry: &mut BTreeSet<usize>,
-    reference_depth: usize,
+    depth: SchemaExpansionDepth,
     expansion_budget: &mut OpenApiSchemaExpansionBudget,
 ) -> Result<Value, OpenApiToolGenerationError> {
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         expansion_budget.consume_reference(reference)?;
-        if reference_depth >= MAX_OPENAPI_REFERENCE_DEPTH {
+        if depth.references >= MAX_OPENAPI_REFERENCE_DEPTH {
             return Err(OpenApiToolGenerationError::Reference {
                 reference: reference.to_owned(),
                 message: format!("reference depth exceeds {MAX_OPENAPI_REFERENCE_DEPTH}"),
@@ -1522,7 +1572,7 @@ fn dereference_schema(
             document,
             resolved,
             reference_ancestry,
-            reference_depth + 1,
+            depth.resolved_reference()?,
             expansion_budget,
         );
         let removed = reference_ancestry.remove(&target_identity);
@@ -1533,24 +1583,32 @@ fn dereference_schema(
     expansion_budget.consume_node(schema)?;
     match schema {
         Value::Array(values) => {
+            let child_depth = depth.child()?;
             let mut dereferenced = Vec::with_capacity(values.len());
             for value in values {
                 dereferenced.push(dereference_schema(
                     document,
                     value,
                     reference_ancestry,
-                    0,
+                    child_depth,
                     expansion_budget,
                 )?);
             }
             Ok(Value::Array(dereferenced))
         }
         Value::Object(object) => {
+            let child_depth = depth.child()?;
             let mut dereferenced = Map::new();
             for (key, value) in object {
                 dereferenced.insert(
                     key.clone(),
-                    dereference_schema(document, value, reference_ancestry, 0, expansion_budget)?,
+                    dereference_schema(
+                        document,
+                        value,
+                        reference_ancestry,
+                        child_depth,
+                        expansion_budget,
+                    )?,
                 );
             }
             Ok(Value::Object(dereferenced))
@@ -2377,6 +2435,79 @@ paths:
                 .iter()
                 .all(|definition| definition.name != "updateWidget"),
             "colliding operation must not be emitted as a broken tool"
+        );
+    }
+
+    #[test]
+    fn rejects_indirect_request_body_reference_chain() {
+        // A real reference chain reaches its next `$ref` through a wrapper
+        // object, which is the shape the bare-alias fixture below never builds.
+        let spec = indirect_request_body_reference_chain_spec(MAX_OPENAPI_REFERENCE_DEPTH + 1);
+        let error = generate_tools_from_openapi_str("indirect-refs.json", &spec)
+            .expect_err("indirect reference chains must respect the reference depth limit");
+
+        let OpenApiToolGenerationError::Reference { reference, message } = error else {
+            panic!("deep indirect references should return a reference error: {error}");
+        };
+        assert!(
+            reference.starts_with("#/components/schemas/S"),
+            "unexpected reference: {reference}"
+        );
+        assert!(
+            message.contains("reference depth exceeds"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn expands_indirect_request_body_reference_chain_within_the_depth_limit() {
+        let spec = indirect_request_body_reference_chain_spec(8);
+        let generation = generate_tools_from_openapi_str("indirect-refs.json", &spec)
+            .expect("an indirect chain inside the depth limit should still expand");
+
+        let definition = generation
+            .definitions
+            .iter()
+            .find(|definition| definition.name == "createWidget")
+            .expect("createWidget should be generated");
+        let mut schema = definition
+            .input_schema
+            .pointer("/properties/next")
+            .expect("the first hop should be expanded in place");
+        for _ in 1..8 {
+            schema = schema
+                .pointer("/properties/next")
+                .expect("every hop should be expanded in place");
+        }
+        assert_eq!(
+            schema.pointer("/properties/name/type"),
+            Some(&json!("string")),
+            "the terminal schema should survive expansion: {schema}"
+        );
+    }
+
+    #[test]
+    fn rejects_request_body_schema_nested_beyond_the_expansion_depth_limit() {
+        // Few enough hops to stay inside the reference limit, but each hop
+        // splices in its own nesting, so the expanded schema is far deeper than
+        // any single parsed document may be.
+        let spec = nested_request_body_reference_chain_spec(32, 10);
+        let error = generate_tools_from_openapi_str("nested-refs.json", &spec)
+            .expect_err("expanded schema nesting must be bounded");
+
+        assert!(
+            matches!(
+                &error,
+                OpenApiToolGenerationError::GenerationLimit {
+                    limit: OpenApiToolGenerationLimit::SchemaExpansionDepth,
+                    maximum: MAX_OPENAPI_SCHEMA_EXPANSION_DEPTH,
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("nesting depth maximum of 256"),
+            "the limit should be named: {error}"
         );
     }
 
@@ -3624,6 +3755,79 @@ paths:
       operationId: getStatus
       summary: Read status
 "#
+    }
+
+    fn reference_chain_spec(schemas: serde_json::Map<String, Value>) -> String {
+        json!({
+            "openapi": "3.0.3",
+            "info": {
+                "title": "Chained Ref API",
+                "version": "1.0.0"
+            },
+            "paths": {
+                "/widgets": {
+                    "post": {
+                        "operationId": "createWidget",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/S0" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": schemas
+            }
+        })
+        .to_string()
+    }
+
+    fn terminal_chain_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" }
+            }
+        })
+    }
+
+    /// `S{i}` reaches `S{i+1}` through a `properties` wrapper, so the reference
+    /// depth counter has to survive an intervening object to bound it.
+    fn indirect_request_body_reference_chain_spec(depth: usize) -> String {
+        let mut schemas = serde_json::Map::new();
+        for index in 0..depth {
+            schemas.insert(
+                format!("S{index}"),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "next": { "$ref": format!("#/components/schemas/S{}", index + 1) }
+                    }
+                }),
+            );
+        }
+        schemas.insert(format!("S{depth}"), terminal_chain_schema());
+
+        reference_chain_spec(schemas)
+    }
+
+    /// Every hop buries its `$ref` under `nesting` plain object levels, so a
+    /// short reference chain still expands into a very deep schema.
+    fn nested_request_body_reference_chain_spec(hops: usize, nesting: usize) -> String {
+        let mut schemas = serde_json::Map::new();
+        for index in 0..hops {
+            let mut schema = json!({ "$ref": format!("#/components/schemas/S{}", index + 1) });
+            for _ in 0..nesting {
+                schema = json!({ "type": "object", "properties": { "next": schema } });
+            }
+            schemas.insert(format!("S{index}"), schema);
+        }
+        schemas.insert(format!("S{hops}"), terminal_chain_schema());
+
+        reference_chain_spec(schemas)
     }
 
     fn deep_request_body_reference_chain_spec(depth: usize) -> String {
