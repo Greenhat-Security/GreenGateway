@@ -53,8 +53,13 @@ pub(crate) struct UpstreamEndpointHealthAdminResponse {
     state: &'static str,
     last_checked: Option<String>,
     last_failure_category: Option<String>,
+    /// Active-probe streaks. `consecutive_successes`/`consecutive_failures` keep their
+    /// names for existing consumers and now report the active probe alone, alongside
+    /// `last_checked`, which has always been active-only.
     consecutive_successes: u32,
     consecutive_failures: u32,
+    passive_consecutive_successes: u32,
+    passive_consecutive_failures: u32,
 }
 
 #[derive(Clone)]
@@ -79,6 +84,16 @@ pub(super) struct UpstreamHealthState {
 struct UpstreamHealthSnapshot {
     last_checked: Option<OffsetDateTime>,
     last_failure_category: Option<String>,
+    active: UpstreamHealthStreak,
+    passive: UpstreamHealthStreak,
+}
+
+/// Consecutive successes and failures for one observation source. The active probe and
+/// passive response observations keep independent streaks: a shared pair let a single
+/// passive success cancel the active probe's failure streak, which made
+/// `unhealthy_threshold > 1` unreachable on any endpoint that was still serving traffic.
+#[derive(Clone, Copy, Debug, Default)]
+struct UpstreamHealthStreak {
     consecutive_successes: u32,
     consecutive_failures: u32,
 }
@@ -136,26 +151,46 @@ impl UpstreamHealthState {
             snapshot.last_checked = Some(observed_at);
         }
         let previous = self.eligibility.load(Ordering::Acquire);
+        let mut streak = if active_check {
+            snapshot.active
+        } else {
+            snapshot.passive
+        };
         let transition = if succeeded {
-            snapshot.consecutive_failures = 0;
-            snapshot.consecutive_successes = snapshot.consecutive_successes.saturating_add(1);
-            if snapshot.consecutive_successes >= healthy_threshold {
+            streak.consecutive_failures = 0;
+            streak.consecutive_successes = streak.consecutive_successes.saturating_add(1);
+            if streak.consecutive_successes >= healthy_threshold {
                 snapshot.last_failure_category = None;
-                (previous != HEALTHY).then_some(HealthTransition::Healthy)
+                // Only the active probe readmits an endpoint. Passive successes are the
+                // in-flight tail of requests that were dispatched before exclusion, so
+                // letting them promote would immediately undo an active-probe drain.
+                (active_check && previous != HEALTHY).then_some(HealthTransition::Healthy)
             } else {
                 None
             }
         } else {
             snapshot.last_failure_category = failure_category.map(str::to_owned);
-            snapshot.consecutive_successes = 0;
-            snapshot.consecutive_failures = snapshot.consecutive_failures.saturating_add(1);
-            if snapshot.consecutive_failures >= unhealthy_threshold {
+            streak.consecutive_successes = 0;
+            streak.consecutive_failures = streak.consecutive_failures.saturating_add(1);
+            if streak.consecutive_failures >= unhealthy_threshold {
                 (previous != UNHEALTHY).then_some(HealthTransition::Unhealthy)
             } else {
                 None
             }
         };
+        if active_check {
+            snapshot.active = streak;
+        } else {
+            snapshot.passive = streak;
+        }
         if let Some(transition) = transition {
+            // The other source's streak describes the state we just left, so clear it
+            // instead of letting stale evidence re-trigger the opposite transition.
+            if active_check {
+                snapshot.passive = UpstreamHealthStreak::default();
+            } else {
+                snapshot.active = UpstreamHealthStreak::default();
+            }
             let next = match transition {
                 HealthTransition::Healthy => HEALTHY,
                 HealthTransition::Unhealthy => UNHEALTHY,
@@ -238,6 +273,11 @@ impl UpstreamHealthState {
     #[cfg(test)]
     pub(super) fn mark_healthy_for_test(&self) {
         self.eligibility.store(HEALTHY, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_unhealthy_for_test(&self) {
+        self.eligibility.store(UNHEALTHY, Ordering::Release);
     }
 
     fn emit_transition(
@@ -368,8 +408,10 @@ pub(super) async fn upstream_health_admin_response(
             state: target.health.state_name(),
             last_checked: snapshot.last_checked.map(rfc3339_timestamp),
             last_failure_category: snapshot.last_failure_category,
-            consecutive_successes: snapshot.consecutive_successes,
-            consecutive_failures: snapshot.consecutive_failures,
+            consecutive_successes: snapshot.active.consecutive_successes,
+            consecutive_failures: snapshot.active.consecutive_failures,
+            passive_consecutive_successes: snapshot.passive.consecutive_successes,
+            passive_consecutive_failures: snapshot.passive.consecutive_failures,
         });
     }
     let mut pools = pools.into_values().collect::<Vec<_>>();
@@ -718,6 +760,79 @@ mod tests {
             .update(true, now, true, &config, "active", None)
             .await;
         assert!(health.eligible());
+    }
+
+    #[tokio::test]
+    async fn active_probe_failures_exclude_an_endpoint_that_keeps_serving_traffic() {
+        let health = UpstreamHealthState::new("payments", "primary", None);
+        let mut config = test_health_config();
+        config.unhealthy_threshold = 3;
+        let now = OffsetDateTime::UNIX_EPOCH;
+
+        health
+            .update(true, now, true, &config, "active", None)
+            .await;
+        health
+            .update(true, now, true, &config, "active", None)
+            .await;
+        assert!(health.eligible());
+
+        // `/ready` is failing while the endpoint still answers proxied traffic with
+        // non-5xx statuses, which is exactly how a drained-but-serving backend behaves.
+        for probe in 1..=3 {
+            health.record_passive_status(200, &config).await;
+            health.record_passive_status(404, &config).await;
+            health
+                .update(false, now, true, &config, "active", Some("http_connect"))
+                .await;
+            assert_eq!(
+                health.eligible(),
+                probe < 3,
+                "the active probe must reach unhealthy_threshold despite passive successes"
+            );
+        }
+
+        // A passive success stream must not readmit an endpoint the active probe drained.
+        health.record_passive_status(200, &config).await;
+        health.record_passive_status(200, &config).await;
+        assert!(!health.eligible());
+
+        health
+            .update(true, now, true, &config, "active", None)
+            .await;
+        health
+            .update(true, now, true, &config, "active", None)
+            .await;
+        assert!(health.eligible());
+    }
+
+    #[tokio::test]
+    async fn passive_failures_after_readmission_start_from_a_clean_streak() {
+        let health = UpstreamHealthState::new("payments", "primary", None);
+        let mut config = test_health_config();
+        config.healthy_threshold = 1;
+        config.unhealthy_threshold = 2;
+        let now = OffsetDateTime::UNIX_EPOCH;
+
+        health
+            .update(true, now, true, &config, "active", None)
+            .await;
+        assert!(health.eligible());
+        health.record_passive_status(503, &config).await;
+        health.record_passive_status(503, &config).await;
+        assert!(!health.eligible());
+
+        health
+            .update(true, now, true, &config, "active", None)
+            .await;
+        assert!(health.eligible());
+        health.record_passive_status(503, &config).await;
+        assert!(
+            health.eligible(),
+            "a readmitted endpoint must need a fresh passive failure streak"
+        );
+        health.record_passive_status(503, &config).await;
+        assert!(!health.eligible());
     }
 
     #[test]

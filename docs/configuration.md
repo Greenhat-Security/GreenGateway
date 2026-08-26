@@ -1267,8 +1267,8 @@ When both active work and queue capacity are exhausted, or a queued request time
 - `interval_ms`: interval between checks, default `10000`, range 100-3600000.
 - `jitter_ms`: centered per-check jitter, default `0`, and less than `interval_ms`.
 - `timeout_ms`: per-check timeout, default `1000`, range 10-60000 and no greater than `interval_ms`.
-- `healthy_threshold`: consecutive successes required for eligibility, default `2`, range 1-1000.
-- `unhealthy_threshold`: consecutive failures required for exclusion, default `3`, range 1-1000.
+- `healthy_threshold`: consecutive successes required for eligibility, default `2`, range 1-1000. Only active-check successes readmit an endpoint, so the in-flight tail of requests that were dispatched before an exclusion cannot undo it.
+- `unhealthy_threshold`: consecutive failures required for exclusion, default `3`, range 1-1000. The active check and passive observations keep independent streaks, so a proxied success never cancels an active-probe failure streak and either streak reaching the threshold excludes the endpoint; a state change clears the other source's streak so pre-transition evidence cannot immediately re-trigger.
 - `expected_statuses`: unique active-check success statuses, default `[200,204]`, at most 32 values in 100-599.
 - `passive_failure_statuses`: unique proxied response statuses counted as failures, default `[500,502,503,504]`, at most 32 values in 500-599. Connection, DNS-resolution, request, and response-idle timeout failures also count; client/configuration and request-body errors do not.
 - `required_for_readiness`: whether this pool contributes to cached readiness, default `false`.
@@ -1278,7 +1278,7 @@ Each logical route and endpoint has independent health state even if multiple en
 
 The compatibility public `/health` response exposes only aggregate `configured` and `reachable` state; it never returns endpoint origins, IPs, paths, or identifiers. Detailed cached pool and endpoint state is part of the authenticated admin status response and requires `admin:status:read`.
 
-`request_body.mode` accepts `buffered` (default) or `stream`. Buffered mode preserves complete bounded validation before upstream forwarding. Stream mode is non-replayable, enforces the actual byte count with backpressure, and can send a bounded prefix before an unknown-length overflow is discovered.
+`request_body.mode` accepts `buffered` (default) or `stream`. Buffered mode preserves complete bounded validation before upstream forwarding. The buffered read runs while the request holds an in-flight admission permit, so it is bounded by the route's effective `timeout_ms`: a client that opens a request and stops sending receives `408 Request Timeout` with `{"error":"request_timeout"}` and releases its permit. A body over `EGRESS_MAX_REQUEST_BODY_BYTES` returns `413` with `{"error":"payload too large"}`, while a body stream that fails mid-upload (client reset, malformed chunked framing) returns `400` with `{"error":"invalid_request_body"}`, matching the streaming mode. Stream mode is non-replayable, enforces the actual byte count with backpressure, and can send a bounded prefix before an unknown-length overflow is discovered.
 
 `sse` explicitly enables production Server-Sent Events behavior for a route. When omitted, the ordinary compatibility path still waits for the first response body chunk before committing downstream headers, so eligible pre-commit failures can retain their existing retry and sanitized `502`/`504` behavior. When `sse` is present, GreenGateway commits upstream status and headers as soon as they arrive, without waiting for the first event. The route's effective `timeout_ms` remains the bounded deadline for admission, attempts, backoff, connection setup, and response headers; it no longer limits the committed SSE lifetime.
 

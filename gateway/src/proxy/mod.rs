@@ -286,26 +286,27 @@ impl UpstreamPool {
     ) -> Option<SelectedEndpoint> {
         let mut unavailable_circuits = HashSet::new();
         loop {
-            let health_eligible = |endpoint: &&ProxyEndpoint| {
+            // Endpoint health lives in an `AtomicU8` that health probes and proxied
+            // responses store into from other tasks. Re-reading it once per pass let an
+            // endpoint contribute weight to the total and then disappear before the
+            // cumulative walk, which left the walk with no endpoint to return. Snapshot
+            // the eligible set exactly once per attempt and drive every pass from it.
+            let mut eligible = Vec::with_capacity(self.endpoints.len());
+            eligible.extend(self.endpoints.iter().filter(|endpoint| {
                 endpoint
                     .health_config
                     .as_ref()
                     .is_none_or(|_| endpoint.health.eligible())
                     && !unavailable_circuits.contains(&endpoint.id)
-            };
-            let has_fresh_endpoint = self
-                .endpoints
+            }));
+            let has_fresh_endpoint = eligible
                 .iter()
-                .filter(health_eligible)
                 .any(|endpoint| !attempted_endpoint_ids.contains(&endpoint.id));
-            let eligible = |endpoint: &&ProxyEndpoint| {
-                health_eligible(endpoint)
-                    && (!has_fresh_endpoint || !attempted_endpoint_ids.contains(&endpoint.id))
-            };
-            let total_weight = self
-                .endpoints
+            if has_fresh_endpoint {
+                eligible.retain(|endpoint| !attempted_endpoint_ids.contains(&endpoint.id));
+            }
+            let total_weight = eligible
                 .iter()
-                .filter(eligible)
                 .map(|endpoint| u64::from(endpoint.weight))
                 .sum::<u64>();
             if total_weight == 0 {
@@ -313,16 +314,25 @@ impl UpstreamPool {
             }
             let ticket = self.next_selection.fetch_add(1, Ordering::Relaxed) % total_weight;
             let mut cumulative = 0_u64;
-            let endpoint = self
-                .endpoints
-                .iter()
-                .filter(eligible)
-                .find(|endpoint| {
-                    cumulative = cumulative.saturating_add(u64::from(endpoint.weight));
-                    ticket < cumulative
-                })
-                .expect("positive eligible weight must select an endpoint")
-                .clone();
+            let selected = eligible.iter().copied().find(|endpoint| {
+                cumulative = cumulative.saturating_add(u64::from(endpoint.weight));
+                ticket < cumulative
+            });
+            let endpoint = match selected {
+                Some(endpoint) => endpoint,
+                None => {
+                    // Unreachable while the ticket is drawn from this snapshot's own
+                    // weight total. Degrade to the last eligible endpoint rather than
+                    // panicking the request task and dropping the client connection.
+                    tracing::warn!(
+                        pool_id = self.id.as_ref(),
+                        error_category = "endpoint_selection_fell_through",
+                        "weighted endpoint selection found no ticket holder; using the last eligible endpoint"
+                    );
+                    eligible.last().copied()?
+                }
+            }
+            .clone();
             let circuit_permit = match endpoint.circuit.as_ref() {
                 Some(circuit) => match circuit.try_acquire() {
                     Some(permit) => Some(permit),
@@ -1082,6 +1092,96 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(selected, ["a", "a", "a", "b", "a", "a", "a", "b"]);
+    }
+
+    #[test]
+    fn endpoint_selection_survives_health_flipping_concurrently_with_selection() {
+        let client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::default())
+                .expect("test client should build"),
+        );
+        let health_config = Arc::new(config::UpstreamHealthCheckConfig {
+            method: "GET".to_owned(),
+            path: "/ready".to_owned(),
+            interval_ms: 1_000,
+            jitter_ms: 0,
+            timeout_ms: 100,
+            healthy_threshold: 1,
+            unhealthy_threshold: 1,
+            expected_statuses: vec![200],
+            passive_failure_statuses: vec![503],
+            required_for_readiness: false,
+            minimum_healthy: 1,
+        });
+        let flapping = health::UpstreamHealthState::new("payments", "flapping", None);
+        let stable = health::UpstreamHealthState::new("payments", "stable", None);
+        flapping.mark_healthy_for_test();
+        stable.mark_healthy_for_test();
+        // The flapping endpoint carries almost all of the pool weight, so a health flip
+        // between the weight total and the cumulative walk vacates almost every ticket.
+        let pool = Arc::new(UpstreamPool::new(
+            "payments".to_owned(),
+            vec![
+                ProxyEndpoint {
+                    id: Arc::from("flapping"),
+                    upstream_origin: "https://flapping.example.test".to_owned(),
+                    weight: 1_000,
+                    egress_client: Arc::clone(&client),
+                    health: flapping.clone(),
+                    health_config: Some(Arc::clone(&health_config)),
+                    circuit: None,
+                },
+                ProxyEndpoint {
+                    id: Arc::from("stable"),
+                    upstream_origin: "https://stable.example.test".to_owned(),
+                    weight: 1,
+                    egress_client: client,
+                    health: stable,
+                    health_config: Some(health_config),
+                    circuit: None,
+                },
+            ],
+            &config::UpstreamPoolLimitsConfig::default(),
+            None,
+        ));
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flipper = {
+            let flapping = flapping.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    flapping.mark_unhealthy_for_test();
+                    flapping.mark_healthy_for_test();
+                }
+            })
+        };
+        let selectors = (0..4)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                std::thread::spawn(move || {
+                    for _ in 0..200_000 {
+                        assert!(
+                            pool.select_endpoint().is_some(),
+                            "an always-healthy endpoint must keep the pool selectable"
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let outcomes = selectors
+            .into_iter()
+            .map(std::thread::JoinHandle::join)
+            .collect::<Vec<_>>();
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().expect("health flipper should not panic");
+
+        for outcome in outcomes {
+            assert!(
+                outcome.is_ok(),
+                "endpoint selection must not panic when endpoint health changes concurrently"
+            );
+        }
     }
 
     #[test]
