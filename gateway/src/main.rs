@@ -31999,7 +31999,11 @@ paths:
             .await
             .expect("request should complete");
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // The egress guard makes the key set unfetchable, so the token is never
+        // judged: the answer is "could not verify", not "credential rejected".
+        // The property this test defends is that the blocked JWKS host is never
+        // contacted, asserted below.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             discovery_server
                 .join()
