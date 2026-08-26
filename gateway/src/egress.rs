@@ -1790,6 +1790,33 @@ pub(crate) fn tls_ca_bundle_pem_is_valid(pem_bundle: &[u8]) -> bool {
         .is_ok()
 }
 
+/// Joins a client certificate and private key into the single PEM document the
+/// TLS stack expects.
+///
+/// PEM parsing is line-oriented: a `-----BEGIN` marker must start a line, so a
+/// certificate that does not end in a newline would run straight into the key's
+/// header and the key would silently not parse. Preflight validation and the
+/// request path must therefore build the identity the same way — validating one
+/// byte sequence and then transmitting a different one means a valid pair can be
+/// rejected at write time, or an invalid one accepted. Both call this.
+pub(crate) fn join_tls_client_identity_pem(
+    certificate: &[u8],
+    private_key: &[u8],
+) -> Option<Zeroizing<Vec<u8>>> {
+    let separator_len = usize::from(!certificate.ends_with(b"\n"));
+    let identity_len = certificate
+        .len()
+        .checked_add(separator_len)
+        .and_then(|length| length.checked_add(private_key.len()))?;
+    let mut identity = Zeroizing::new(Vec::with_capacity(identity_len));
+    identity.extend_from_slice(certificate);
+    if separator_len == 1 {
+        identity.push(b'\n');
+    }
+    identity.extend_from_slice(private_key);
+    Some(identity)
+}
+
 pub(crate) fn tls_client_identity_pem_is_valid(pem_identity: &[u8]) -> bool {
     if !tls_client_identity_pem_shape_is_valid(pem_identity) {
         return false;
@@ -2668,6 +2695,41 @@ mod tests {
                 | "http_status"
                 | "http_other"
         ));
+    }
+
+    #[test]
+    fn a_certificate_without_a_trailing_newline_still_joins_into_a_parsable_identity() {
+        let key = rcgen::KeyPair::generate().expect("test identity key should generate");
+        let certificate = rcgen::CertificateParams::new(vec!["client.example.test".to_owned()])
+            .expect("test identity parameters should build")
+            .self_signed(&key)
+            .expect("test identity certificate should build");
+        let certificate_pem = certificate.pem();
+        let key_pem = key.serialize_pem();
+
+        // Both certificate shapes must yield a parsable identity. The preflight
+        // check and the request path build this document from the same helper,
+        // so the bytes a write validates are the bytes the transport later
+        // sends; while they had separate assemblers only newline-terminated
+        // fixtures were ever exercised, so a divergence could not be caught.
+        let unterminated = certificate_pem.trim_end_matches('\n');
+        assert!(!unterminated.ends_with('\n'));
+        let joined = join_tls_client_identity_pem(unterminated.as_bytes(), key_pem.as_bytes())
+            .expect("joining a bounded pair should succeed");
+        assert!(tls_client_identity_pem_is_valid(joined.as_slice()));
+        assert_eq!(joined.len(), unterminated.len() + 1 + key_pem.len());
+
+        // A certificate that already ends in a newline gains no second one.
+        let already_terminated =
+            join_tls_client_identity_pem(certificate_pem.as_bytes(), key_pem.as_bytes())
+                .expect("joining a bounded pair should succeed");
+        assert!(tls_client_identity_pem_is_valid(
+            already_terminated.as_slice()
+        ));
+        assert_eq!(
+            already_terminated.len(),
+            certificate_pem.len() + key_pem.len()
+        );
     }
 
     #[test]

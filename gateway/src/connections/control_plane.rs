@@ -10,7 +10,6 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use zeroize::Zeroizing;
 
 use crate::config::Config;
 
@@ -831,12 +830,18 @@ impl ConnectionControlPlane {
             }
         }
 
-        let certificate = match candidate
-            .tls
-            .client_certificate_id
-            .as_deref()
-            .filter(|id| resolver.is_deferred_alias(id))
-        {
+        // A client identity is only meaningful as a pair, so if *either* half is
+        // deferred this pass owns the whole pair and resolves both halves —
+        // `resolve` reaches operator, encrypted-local, and network aliases
+        // alike. Splitting the work by which half is deferred would leave a
+        // mixed pair validated by nobody: the synchronous path applies the
+        // mirror-image filter, so its own cross-check is skipped for exactly the
+        // pairs this one would skip.
+        let certificate_id = candidate.tls.client_certificate_id.as_deref();
+        let private_key_id = candidate.tls.client_private_key_id.as_deref();
+        let pair_is_deferred = certificate_id.is_some_and(|id| resolver.is_deferred_alias(id))
+            || private_key_id.is_some_and(|id| resolver.is_deferred_alias(id));
+        let certificate = match certificate_id.filter(|_| pair_is_deferred) {
             Some(alias) => Some(
                 resolve_deferred(
                     &resolver,
@@ -848,12 +853,7 @@ impl ConnectionControlPlane {
             ),
             None => None,
         };
-        let private_key = match candidate
-            .tls
-            .client_private_key_id
-            .as_deref()
-            .filter(|id| resolver.is_deferred_alias(id))
-        {
+        let private_key = match private_key_id.filter(|_| pair_is_deferred) {
             Some(alias) => Some(
                 resolve_deferred(
                     &resolver,
@@ -865,9 +865,6 @@ impl ConnectionControlPlane {
             ),
             None => None,
         };
-        // Cross-validate only when this pass resolved both halves. A pair split
-        // across a network provider and another provider is left to the
-        // synchronous path, which already resolves its half.
         if let (Some(certificate), Some(private_key)) = (certificate, private_key) {
             validate_client_identity_material(certificate.expose(), private_key.expose()).map_err(
                 |error| match error {
@@ -1311,9 +1308,12 @@ fn validate_client_identity_material(
     certificate: &[u8],
     private_key: &[u8],
 ) -> Result<(), BindingActivationError> {
-    let mut identity = Zeroizing::new(Vec::with_capacity(certificate.len() + private_key.len()));
-    identity.extend_from_slice(certificate);
-    identity.extend_from_slice(private_key);
+    let Some(identity) = crate::egress::join_tls_client_identity_pem(certificate, private_key)
+    else {
+        return Err(BindingActivationError::Invalid {
+            fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
+        });
+    };
     if crate::egress::tls_client_identity_pem_is_valid(identity.as_slice()) {
         Ok(())
     } else {
