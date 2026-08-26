@@ -296,22 +296,57 @@ async fn forward_to_upstream(
     }
     let mut body = match upstream.request_body_mode {
         RequestBodyMode::Buffered => {
+            // The admission permit is already held here, so an unbounded read let a
+            // client that opens a request and then stops writing pin pool capacity for
+            // as long as it kept the socket open. Bound the read with the route's own
+            // request timeout; the streaming mode already inherits that bound from the
+            // egress send.
+            let body_read_deadline = tokio::time::Instant::now() + upstream.pool.request_timeout();
             let buffered = tokio::select! {
                 biased;
                 () = forced_shutdown.cancelled() => {
                     return admission_unavailable_response(&upstream.pool.id, request_id);
                 }
-                buffered = axum::body::to_bytes(body, proxy.max_request_body_bytes) => buffered,
+                buffered = tokio::time::timeout_at(
+                    body_read_deadline,
+                    read_buffered_request_body(body, proxy.max_request_body_bytes),
+                ) => buffered,
             };
             match buffered {
-                Ok(body) => {
+                Ok(Ok(body)) => {
                     if let Some(payload_capture) = payload_capture.as_ref() {
                         payload_capture.capture_json_body(&parts.headers, &body);
                     }
                     if body.is_empty() {
                         PreparedRequestBody::Empty
                     } else {
-                        PreparedRequestBody::Buffered(Arc::from(body.to_vec()))
+                        PreparedRequestBody::Buffered(Arc::from(body))
+                    }
+                }
+                Ok(Err(error)) => {
+                    if let Some(payload_capture) = payload_capture.as_ref() {
+                        payload_capture.mark_body_capture_incomplete();
+                    }
+                    // A stream failure and a size-limit violation are different client
+                    // errors; reporting a truncated upload as 413 tells the client to
+                    // shrink a payload that was never too large.
+                    match error {
+                        BufferedRequestBodyError::TooLarge => {
+                            tracing::warn!(
+                                error_category = "request_body_too_large",
+                                max = proxy.max_request_body_bytes,
+                                "proxied request body exceeded the configured limit"
+                            );
+                            return crate::payload_too_large(proxy.max_request_body_bytes);
+                        }
+                        BufferedRequestBodyError::ReadFailed => {
+                            tracing::warn!(
+                                error_category = "request_body_read_failed",
+                                max = proxy.max_request_body_bytes,
+                                "failed to read proxied request body"
+                            );
+                            return invalid_request_body();
+                        }
                     }
                 }
                 Err(_) => {
@@ -319,11 +354,11 @@ async fn forward_to_upstream(
                         payload_capture.mark_body_capture_incomplete();
                     }
                     tracing::warn!(
-                        error_category = "request_body_read_failed",
-                        max = proxy.max_request_body_bytes,
-                        "failed to read proxied request body"
+                        pool_id = upstream.pool.id.as_ref(),
+                        error_category = "request_body_read_timeout",
+                        "proxied request body was not received before the route deadline"
                     );
-                    return crate::payload_too_large(proxy.max_request_body_bytes);
+                    return request_body_timeout_response(request_id);
                 }
             }
         }
@@ -1999,6 +2034,50 @@ fn invalid_request_body() -> Response {
         Json(json!({ "error": "invalid_request_body" })),
     )
         .into_response()
+}
+
+fn request_body_timeout_response(request_id: Option<HeaderValue>) -> Response {
+    let mut response = (
+        StatusCode::REQUEST_TIMEOUT,
+        Json(json!({ "error": "request_timeout" })),
+    )
+        .into_response();
+    if let Some(request_id) = request_id {
+        response
+            .headers_mut()
+            .insert(request_id_header(), request_id);
+    }
+    response
+}
+
+/// Why a buffered client request body could not be read.
+///
+/// `axum::body::to_bytes` collapses both conditions into one opaque error, which made
+/// the proxy answer a truncated or malformed upload with `413 payload_too_large`.
+#[derive(Debug, PartialEq, Eq)]
+enum BufferedRequestBodyError {
+    TooLarge,
+    ReadFailed,
+}
+
+/// Reads a client request body into memory, refusing anything longer than `limit`.
+///
+/// Matches `http_body_util::Limited`'s accounting (a body of exactly `limit` bytes is
+/// accepted) while keeping the two failure modes distinguishable.
+async fn read_buffered_request_body(
+    body: Body,
+    limit: usize,
+) -> Result<Vec<u8>, BufferedRequestBodyError> {
+    let mut chunks = body.into_data_stream();
+    let mut collected = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|_| BufferedRequestBodyError::ReadFailed)?;
+        if collected.len().saturating_add(chunk.len()) > limit {
+            return Err(BufferedRequestBodyError::TooLarge);
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    Ok(collected)
 }
 
 struct StreamingCapture {
@@ -3787,6 +3866,130 @@ mod tests {
 
         first_server.abort();
         second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_buffered_upload_releases_admission_at_the_route_deadline() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (addr, server) = spawn_status_upstream(StatusCode::OK, Arc::clone(&requests)).await;
+        let (proxy, _, _) = retry_proxy_with_options(
+            [addr, addr],
+            RetryProxyOptions {
+                timeout: Duration::from_millis(200),
+                limits: config::UpstreamPoolLimitsConfig {
+                    max_in_flight: 1,
+                    queue_depth: 1,
+                    queue_timeout_ms: 1_500,
+                },
+                ..RetryProxyOptions::default()
+            },
+        );
+        let proxy = Arc::new(proxy);
+        let stalled = tokio::spawn({
+            let proxy = Arc::clone(&proxy);
+            async move {
+                proxy
+                    .forward_request(
+                        Request::builder()
+                            .method(http::Method::POST)
+                            .uri("/items")
+                            .header(REQUEST_ID_HEADER, "stalled-upload")
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from_stream(stream::pending::<
+                                Result<bytes::Bytes, Infallible>,
+                            >()))
+                            .expect("request"),
+                        "203.0.113.8",
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let served = tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy.forward_request(
+                Request::builder()
+                    .method(http::Method::GET)
+                    .uri("/items")
+                    .header(REQUEST_ID_HEADER, "behind-stalled-upload")
+                    .body(Body::empty())
+                    .expect("request"),
+                "203.0.113.8",
+            ),
+        )
+        .await
+        .expect("the queued request must resolve within the pool queue timeout");
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "a client that stops sending its body must not pin the pool's only in-flight permit"
+        );
+
+        let stalled = tokio::time::timeout(Duration::from_secs(5), stalled)
+            .await
+            .expect("the stalled upload must be bounded by the route request timeout")
+            .expect("stalled upload task should not panic");
+        assert_eq!(stalled.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(requests.lock().expect("request captures").len(), 1);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn buffered_request_body_failures_separate_read_errors_from_the_size_limit() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (addr, server) = spawn_status_upstream(StatusCode::OK, Arc::clone(&requests)).await;
+        let (proxy, _, _) = retry_proxy_with_options([addr, addr], RetryProxyOptions::default());
+
+        let truncated = proxy
+            .forward_request(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/items")
+                    .header(REQUEST_ID_HEADER, "truncated-upload")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from_stream(stream::iter(vec![
+                        Ok(bytes::Bytes::from_static(b"{\"a\":1}")),
+                        Err(io::Error::other("client reset mid-upload")),
+                    ])))
+                    .expect("request"),
+                "203.0.113.8",
+            )
+            .await;
+        assert_eq!(
+            truncated.status(),
+            StatusCode::BAD_REQUEST,
+            "a body stream failure is not a payload-size violation"
+        );
+        let truncated_body = axum::body::to_bytes(truncated.into_body(), 1024)
+            .await
+            .expect("client error body should read");
+        assert_eq!(
+            truncated_body.as_ref(),
+            br#"{"error":"invalid_request_body"}"#
+        );
+
+        let oversized = proxy
+            .forward_request(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/items")
+                    .header(REQUEST_ID_HEADER, "oversized-upload")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![b'x'; 2048]))
+                    .expect("request"),
+                "203.0.113.8",
+            )
+            .await;
+        assert_eq!(
+            oversized.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a body over the configured limit must still be rejected as too large"
+        );
+
+        assert!(requests.lock().expect("request captures").is_empty());
+        server.abort();
     }
 
     #[tokio::test]
