@@ -48,6 +48,7 @@ use crate::{
             self, EndpointSignalObservation, ErrorRateSpikeSignalObservation, NewSignal,
             PrincipalNewToEndpointSignalObservation, SchemaMismatchSignalObservation,
             SignalDetectorConfig, SignalEvaluator, VolumeOutlierSignalObservation,
+            ENDPOINT_TARGET_KIND, PRINCIPAL_ENDPOINT_TARGET_KIND,
         },
         suggestions,
     },
@@ -1446,8 +1447,20 @@ impl AggregatorState {
         for (_, key) in by_access.into_iter().take(count) {
             self.aggregates.remove(&key);
             self.dirty_keys.remove(&key);
+            self.forget_queued_signals(&key);
             self.deleted_keys.insert(key);
         }
+    }
+
+    /// Signal dedupe identities are derived state, so they have to share the
+    /// lifetime of the aggregate they were derived from. Retaining them past
+    /// eviction is what lets a caller-driven key stay resident for the lifetime
+    /// of the process even though the aggregate map itself is capped.
+    fn forget_queued_signals(&mut self, key: &EndpointKey) {
+        let endpoint_target = signals::endpoint_target_key(&key.method, &key.endpoint_template);
+        let principal_prefix = format!("{endpoint_target} ");
+        self.queued_signal_identities
+            .retain(|identity| !identity.targets_endpoint(&endpoint_target, &principal_prefix));
     }
 
     fn observe(&mut self, observation: ObservedRequest) -> bool {
@@ -1616,6 +1629,7 @@ impl AggregatorState {
                 continue;
             };
             target.merge_from(source);
+            self.forget_queued_signals(&source_key);
             self.deleted_keys.insert(source_key.clone());
             self.dirty_keys.remove(&source_key);
         }
@@ -1665,6 +1679,18 @@ struct SignalIdentity {
     signal_type: String,
     target_kind: String,
     target_key: String,
+}
+
+impl SignalIdentity {
+    /// `endpoint` signals key on `"{method} {template}"` exactly;
+    /// `principal_endpoint` signals append the principal to that same prefix.
+    fn targets_endpoint(&self, endpoint_target: &str, principal_prefix: &str) -> bool {
+        match self.target_kind.as_str() {
+            ENDPOINT_TARGET_KIND => self.target_key == endpoint_target,
+            PRINCIPAL_ENDPOINT_TARGET_KIND => self.target_key.starts_with(principal_prefix),
+            _ => false,
+        }
+    }
 }
 
 impl From<&NewSignal> for SignalIdentity {
@@ -2499,7 +2525,31 @@ fn write_flush(
         upsert_aggregate(&transaction, aggregate, payload_capture_enabled)?;
     }
 
-    let opened_signals = signals::insert_signals(&transaction, pending_signals)?;
+    // A key admitted and evicted inside the same flush window has already had
+    // its (not yet written) rows deleted above, so writing its queued signal
+    // now would leave a row no eviction can ever reach again.
+    let deleted_targets = deleted_keys
+        .iter()
+        .map(|key| {
+            let endpoint_target = signals::endpoint_target_key(&key.method, &key.endpoint_template);
+            let principal_prefix = format!("{endpoint_target} ");
+            (endpoint_target, principal_prefix)
+        })
+        .collect::<Vec<_>>();
+    let pending_signals = pending_signals
+        .iter()
+        .filter(|signal| {
+            !deleted_targets
+                .iter()
+                .any(|(endpoint_target, principal_prefix)| {
+                    SignalIdentity::from(*signal)
+                        .targets_endpoint(endpoint_target, principal_prefix)
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let opened_signals = signals::insert_signals(&transaction, &pending_signals)?;
 
     transaction.commit()?;
     Ok(opened_signals)
@@ -2583,6 +2633,27 @@ fn delete_key(
         WHERE method = ?1 AND endpoint_template = ?2
         "#,
         params![key.method.as_str(), key.endpoint_template.as_str()],
+    )?;
+
+    // Signals derived from this aggregate outlive it otherwise, so an evicted
+    // key keeps its row forever and the endpoint cap bounds nothing. `substr`
+    // rather than `LIKE` so a template containing `%` or `_` is matched
+    // literally.
+    let endpoint_target = signals::endpoint_target_key(&key.method, &key.endpoint_template);
+    let principal_prefix = format!("{endpoint_target} ");
+    connection.execute(
+        r#"
+        DELETE FROM discovery_signals
+        WHERE (target_kind = ?1 AND target_key = ?3)
+           OR (target_kind = ?2 AND substr(target_key, 1, ?4) = ?5)
+        "#,
+        params![
+            ENDPOINT_TARGET_KIND,
+            PRINCIPAL_ENDPOINT_TARGET_KIND,
+            endpoint_target.as_str(),
+            i64_from_usize(principal_prefix.chars().count()),
+            principal_prefix.as_str(),
+        ],
     )?;
     Ok(())
 }
@@ -4725,6 +4796,66 @@ mod tests {
         assert_eq!(
             payload_shape_observation_count(&db.path, "POST", "/bounded/{id}"),
             total as i64
+        );
+    }
+
+    #[test]
+    fn evicting_an_endpoint_deletes_its_signal_rows() {
+        let db = TempDb::new("endpoint-eviction-signals");
+        let sink = aggregator_sink_with_endpoint_limit(&db.path, 8);
+
+        for index in 0..8 {
+            sink.emit(&observed_event(
+                "GET",
+                &format!("/settled-{index}"),
+                200,
+                1,
+                None,
+                timestamp_at(index),
+            ));
+        }
+        sink.flush_for_test();
+        assert!(
+            !signal_rows(&db.path).is_empty(),
+            "the settled endpoints should have opened signals to evict"
+        );
+
+        for index in 0..100 {
+            sink.emit(&observed_event(
+                "GET",
+                &format!("/rnd-{index}"),
+                404,
+                1,
+                None,
+                timestamp_at(100 + index),
+            ));
+        }
+        sink.flush_for_test();
+
+        let aggregates = aggregate_counts(&db.path);
+        assert!(aggregates.len() <= 8, "aggregates: {aggregates:?}");
+
+        let signals = signal_rows(&db.path);
+        for signal in &signals {
+            assert!(
+                aggregates.iter().any(|(method, endpoint_template, _)| {
+                    let endpoint_target = format!("{method} {endpoint_template}");
+                    signal.target_key == endpoint_target
+                        || signal
+                            .target_key
+                            .starts_with(&format!("{endpoint_target} "))
+                }),
+                "signal {} outlived its aggregate: {:?}",
+                signal.target_key,
+                aggregates
+            );
+        }
+
+        let queued_identities = sink.shared.state_guard().queued_signal_identities.len();
+        assert!(
+            queued_identities <= aggregates.len(),
+            "queued signal identities ({queued_identities}) outlived their aggregates ({})",
+            aggregates.len()
         );
     }
 
