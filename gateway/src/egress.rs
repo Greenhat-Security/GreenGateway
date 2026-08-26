@@ -830,10 +830,6 @@ pub struct EgressStreamResponse {
 /// upgrade whose body must never reach the client, and a 101 has no body. The
 /// caller inspects `status` and `headers`, and on acceptance consumes
 /// `into_upgraded` to take the raw bidirectional stream.
-// Lands ahead of its consumer. The tests below exercise it end to end, but the
-// plain binary has no caller until the WebSocket data plane in #256 lands, so
-// the binary build alone sees it as dead.
-#[allow(dead_code)]
 pub struct EgressUpgradeResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
@@ -850,7 +846,6 @@ impl fmt::Debug for EgressUpgradeResponse {
     }
 }
 
-#[allow(dead_code)]
 impl EgressUpgradeResponse {
     /// Takes the upgraded bidirectional stream.
     ///
@@ -1172,7 +1167,6 @@ impl EgressClient {
     /// body must not reach the client, and a 101 has none. Deliberately does
     /// not retry: an upgrade attempt is not replayable once the upstream has
     /// begun switching protocols.
-    #[allow(dead_code)]
     pub(crate) async fn upgrade_request_at_checked_destination(
         &self,
         destination: &CheckedEgressDestination,

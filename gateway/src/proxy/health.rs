@@ -252,6 +252,29 @@ impl UpstreamHealthState {
         }
     }
 
+    /// Records a passive failure whose category is already a bounded string.
+    ///
+    /// The WebSocket handshake can fail on a response that is a perfectly good
+    /// HTTP response -- a 101 whose `Sec-WebSocket-Accept` does not match --
+    /// which no `EgressError` describes. Passive health still has to see it as
+    /// a failed attempt against that endpoint.
+    pub(super) async fn record_passive_failure(
+        &self,
+        failure_category: &'static str,
+        config: &config::UpstreamHealthCheckConfig,
+    ) {
+        let _ = self
+            .update(
+                false,
+                OffsetDateTime::now_utc(),
+                false,
+                config,
+                "passive",
+                Some(failure_category),
+            )
+            .await;
+    }
+
     pub(super) async fn record_passive_timeout(&self, config: &config::UpstreamHealthCheckConfig) {
         let _ = self
             .update(

@@ -26,7 +26,7 @@ use crate::{
     egress, middleware,
 };
 
-const REQUEST_ID_HEADER: &str = "x-request-id";
+pub(super) const REQUEST_ID_HEADER: &str = "x-request-id";
 const STREAMING_DISCOVERY_CAPTURE_MAX_BYTES: usize = 64 * 1024;
 const X_FORWARDED_FOR_HEADER: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_REAL_IP_HEADER: HeaderName = HeaderName::from_static("x-real-ip");
@@ -224,6 +224,22 @@ async fn forward_to_upstream(
     source_ip: &str,
 ) -> Response {
     let (parts, body) = request.into_parts();
+    // The WebSocket data plane hooks in here, after the whole middleware chain
+    // -- authentication, rate limiting, RBAC, direct policy, route
+    // classification, CSRF -- has already run and after the route has been
+    // matched, so an upgrade is subject to exactly the decisions an ordinary
+    // request is. A request that is not upgrade-shaped, or a route without a
+    // WebSocket policy, continues down the ordinary path unchanged.
+    if let Some(websocket) = upstream.websocket.clone() {
+        if super::websocket::is_websocket_upgrade(&parts) {
+            // An upgrade request carries no body, and none is forwarded.
+            drop(body);
+            return super::websocket::handle_upgrade(
+                proxy, parts, &upstream, &websocket, source_ip,
+            )
+            .await;
+        }
+    }
     let request_id = parts.headers.get(REQUEST_ID_HEADER).cloned();
     let Some(response_stream_registration) = proxy.lifecycle.try_register_response_stream() else {
         tracing::info!(
@@ -1179,7 +1195,7 @@ impl PreparedRequestBody {
     }
 }
 
-fn attempt_headers(
+pub(super) fn attempt_headers(
     inbound: &HeaderMap,
     source_ip: &str,
     policy: &RouteRequestHeaderPolicy,
@@ -1270,13 +1286,13 @@ fn circuit_failure_reason(error: &egress::EgressError) -> &'static str {
     }
 }
 
-fn record_circuit_success(permit: &mut Option<super::circuit::CircuitPermit>) {
+pub(super) fn record_circuit_success(permit: &mut Option<super::circuit::CircuitPermit>) {
     if let Some(permit) = permit.take() {
         permit.success();
     }
 }
 
-fn record_circuit_failure(
+pub(super) fn record_circuit_failure(
     permit: &mut Option<super::circuit::CircuitPermit>,
     reason: &'static str,
 ) {
@@ -1620,7 +1636,7 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
     }
 }
 
-async fn sleep_until_optional(deadline: Option<tokio::time::Instant>) {
+pub(super) async fn sleep_until_optional(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending::<()>().await,
@@ -1901,11 +1917,11 @@ fn unavailable_response_with_outcome(
     response
 }
 
-fn request_id_header() -> HeaderName {
+pub(super) fn request_id_header() -> HeaderName {
     HeaderName::from_static(REQUEST_ID_HEADER)
 }
 
-fn proxy_target_url(upstream_origin: &str, uri: &http::Uri) -> String {
+pub(super) fn proxy_target_url(upstream_origin: &str, uri: &http::Uri) -> String {
     let path_and_query = uri.path_and_query().map_or("/", |value| value.as_str());
     format!("{upstream_origin}{path_and_query}")
 }
@@ -4605,6 +4621,7 @@ mod tests {
         limits: config::UpstreamPoolLimitsConfig,
         request_body_mode: RequestBodyMode,
         sse: Option<config::UpstreamSseConfig>,
+        websocket: Option<Arc<super::super::websocket::RouteWebSocketRuntime>>,
         health_config: Option<config::UpstreamHealthCheckConfig>,
         allow_loopback_host: bool,
     }
@@ -4619,6 +4636,7 @@ mod tests {
                 limits: config::UpstreamPoolLimitsConfig::default(),
                 request_body_mode: RequestBodyMode::Buffered,
                 sse: None,
+                websocket: None,
                 health_config: None,
                 allow_loopback_host: true,
             }
@@ -4714,6 +4732,7 @@ mod tests {
                         pool,
                         request_body_mode: options.request_body_mode,
                         sse,
+                        websocket: options.websocket.clone(),
                     }],
                 },
                 connection_http: None,

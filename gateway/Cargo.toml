@@ -36,6 +36,7 @@ sha2.workspace = true
 sse-stream = "0.2"
 time.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 tower.workspace = true
 tower-http.workspace = true

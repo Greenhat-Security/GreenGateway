@@ -88,6 +88,22 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Added an opt-in, per-route WebSocket proxy transport. The gateway terminates
+  both sides and re-originates the upgrade rather than tunnelling bytes, so
+  frame, assembled-message, and write-buffer bounds, the subprotocol allowlist,
+  and close-code propagation are all enforceable. Authentication, rate
+  limiting, RBAC, direct policy, route classification, CSRF, and admission all
+  complete before the upgrade is considered, and every rejection reachable
+  before the egress step produces no DNS lookup, no connection, and no upstream
+  byte. The upstream handshake is rebuilt from validated state -- a freshly
+  generated `Sec-WebSocket-Key`, the negotiated subprotocol, and the normalized
+  allowlisted `Origin` -- and the upstream answer is checked fail-closed for its
+  status, `Sec-WebSocket-Accept`, subprotocol, and the absence of any
+  extension. Upgraded connections use a dedicated admission pool and
+  per-endpoint slots so an hour-long socket cannot starve the route's HTTP
+  traffic, survive drain, and end at forced shutdown with `1001`. RFC 8441
+  extended `CONNECT` over HTTP/2 and compression negotiation remain out of
+  scope.
 - Added permission-separated managed Connection CRUD under
   `/v1{ADMIN_PREFIX}/connections`, with redacted read models, server-derived
   actions, cursor pagination, conditional collection/resource ETags, bounded
