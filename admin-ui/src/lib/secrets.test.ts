@@ -58,6 +58,69 @@ describe('connection secrets API client', () => {
     expect(JSON.stringify(result.value)).not.toContain(canary);
   });
 
+  it('keeps the inventory usable when the gateway reports a provider this build does not know', async () => {
+    // The gateway's SecretProviderKind has eight variants and every network
+    // provider alias is listed unconditionally, so a deployment with one Vault
+    // alias serves `provider: "vault_kv_v2"` here. Rejecting the row used to
+    // abort the whole `secrets.map(...)`, which failed the entire request and
+    // disabled every bind, create, rotate, and delete -- including for the
+    // local secrets in the same response.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(
+            200,
+            {
+              secrets: [
+                secretMetadata({
+                  id: 'billing-api-key',
+                  etag: '"connection-secret:billing-api-key:v1"',
+                  label: 'Billing API key',
+                  provider: 'vault_kv_v2',
+                  actions: { can_rotate: false, can_delete: false },
+                }),
+                secretMetadata(),
+                secretMetadata({
+                  id: 'future-provider-secret',
+                  etag: '"connection-secret:future-provider-secret:v1"',
+                  label: 'Some later provider',
+                  provider: 'provider_added_after_this_build',
+                  actions: { can_rotate: false, can_delete: false },
+                }),
+              ],
+              actions: { can_create: true },
+              providers: {
+                operator_aliases: true,
+                local_encrypted: true,
+              },
+            },
+            {
+              ETag: '"connection-secrets:representation:v1"',
+              'x-greengateway-connection-secrets-etag':
+                '"connection-secrets:mutation:v1"',
+            },
+          ),
+        ),
+      ),
+    );
+
+    const result = await listConnectionSecrets();
+
+    expect(result.value.secrets.map((secret) => secret.provider)).toEqual([
+      'vault_kv_v2',
+      'local_encrypted',
+      'provider_added_after_this_build',
+    ]);
+    // The local secret in the same response stays fully manageable, which is
+    // what the old behaviour took away.
+    expect(result.value.secrets[1].actions).toEqual({
+      can_rotate: true,
+      can_delete: true,
+    });
+    expect(result.value.actions.can_create).toBe(true);
+  });
+
   it('uses exact collection/item ETags and never expects plaintext in responses', async () => {
     const calls: Array<{
       path: string;

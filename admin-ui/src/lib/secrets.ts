@@ -9,10 +9,28 @@ export type ConnectionSecretPurpose =
   | 'tls_certificate'
   | 'tls_ca_bundle';
 
-export type ConnectionSecretProvider =
+// Provider kinds this build knows how to name. The gateway's
+// `SecretProviderKind` is the authority; see the `SecretProvider` enum in
+// docs/schemas/connection-admin.v1.schema.json.
+export type KnownConnectionSecretProvider =
   | 'operator_environment'
   | 'operator_file'
-  | 'local_encrypted';
+  | 'local_encrypted'
+  | 'vault_kv_v2'
+  | 'gcp_secret_manager'
+  | 'azure_key_vault'
+  | 'aws_secrets_manager'
+  | 'kubernetes_secrets';
+
+// Deliberately not a closed union. `provider` is display metadata plus one
+// exact `=== 'local_encrypted'` test, so a kind this build does not recognize
+// is inherently harmless: it simply is not the local store. Rejecting the
+// response instead discards the entire secret inventory over a label, which is
+// how a gateway configured with any network provider previously disabled every
+// secret bind, create, rotate, and delete in this UI.
+export type ConnectionSecretProvider =
+  | KnownConnectionSecretProvider
+  | (string & {});
 
 export type ConnectionSecretActions = {
   can_rotate: boolean;
@@ -354,14 +372,14 @@ function responseObject(
   return value as Record<string, unknown>;
 }
 
+// Validated to the strength the field is actually used at: a non-empty string.
+// A closed-set check here would fail the whole collection whenever the gateway
+// gains a provider ahead of the UI, and this field never gates an action -- the
+// server decides that through `actions.can_rotate` and `actions.can_delete`.
 function isSecretProvider(
   value: unknown,
 ): value is ConnectionSecretProvider {
-  return (
-    value === 'operator_environment' ||
-    value === 'operator_file' ||
-    value === 'local_encrypted'
-  );
+  return typeof value === 'string' && value.length > 0;
 }
 
 function isSecretPurpose(
