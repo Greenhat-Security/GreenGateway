@@ -62,6 +62,73 @@ fn env_example_exempt_paths_are_not_hardcoded() {
     }
 }
 
+/// Every published claim that an explicit `AUTH_EXEMPT_PATHS` /
+/// `RBAC_EXEMPT_PATHS` value replaces the whole default must also disclose the
+/// one pair the code appends anyway.
+///
+/// `append_admin_login_exempt_paths` in gateway/src/config.rs runs
+/// unconditionally after the parse whenever `ADMIN_LOGIN_PROVIDER` is set, so
+/// `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` stay
+/// exempt even for an operator who supplied an explicit list. Both routes have
+/// to be anonymous for the OIDC authorization-code flow to complete, so the
+/// behavior is deliberate; leaving it out of the documented contract is what
+/// made an operator's own configuration audit come to a false conclusion about
+/// their exempt surface.
+#[test]
+fn exempt_path_replacement_claims_disclose_the_forced_admin_login_pair() {
+    const DISCLOSURE: &str = "remain exempt even when";
+
+    let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = gateway_root
+        .parent()
+        .expect("gateway crate should live directly under the repo root");
+
+    for (path, claim) in [
+        (
+            repo_root.join("docs/configuration.md"),
+            "replaces its entire dynamic default",
+        ),
+        (
+            repo_root.join("docs/configuration.md"),
+            "replaces the entire default",
+        ),
+        (
+            repo_root.join(".env.example"),
+            "REPLACES the default entirely",
+        ),
+    ] {
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()))
+            .replace("\r\n", "\n");
+        let blocks: Vec<&str> = contents
+            .split("\n\n")
+            .filter(|block| block.contains(claim))
+            .collect();
+
+        assert!(
+            !blocks.is_empty(),
+            "{} no longer contains the {claim:?} contract this test guards; update the test with the new wording",
+            path.display()
+        );
+
+        for block in blocks {
+            assert!(
+                block.contains(DISCLOSURE),
+                "{} claims {claim:?} without disclosing that \
+                 /v1{{ADMIN_PREFIX}}/auth/login and /v1{{ADMIN_PREFIX}}/auth/callback stay exempt \
+                 while ADMIN_LOGIN_PROVIDER is set. Say so with the phrase {DISCLOSURE:?} or change \
+                 append_admin_login_exempt_paths in gateway/src/config.rs to match the claim.\n\n{block}",
+                path.display()
+            );
+            assert!(
+                block.contains("/auth/login") && block.contains("/auth/callback"),
+                "{} should name both always-appended routes:\n\n{block}",
+                path.display()
+            );
+        }
+    }
+}
+
 #[test]
 fn configuration_doc_matches_gateway_env_reads() {
     let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

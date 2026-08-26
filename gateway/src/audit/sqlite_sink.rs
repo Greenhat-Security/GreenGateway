@@ -197,6 +197,11 @@ impl SqliteSink {
         self.shared.flush_buffer();
     }
 
+    #[cfg(test)]
+    fn prune_for_test(&self) {
+        self.shared.prune_old_events();
+    }
+
     fn shutdown_and_flush(&self) -> Result<(), String> {
         if let Some(shutdown_tx) = take_mutex_value(&self.shutdown_tx, "shutdown_tx", &self.shared)
         {
@@ -291,7 +296,12 @@ impl SqliteSinkShared {
     }
 
     fn prune_old_events(&self) {
-        let Some(retention_days) = self.retention_days else {
+        // A zero-day window puts the prune cutoff at the current instant, which
+        // deletes the whole audit history on every tick rather than retaining
+        // nothing new. `Config` folds `AUDIT_SQLITE_RETENTION_DAYS=0` into
+        // `None` before it reaches here; this guard keeps a directly built
+        // `SqliteSinkConfig` from reintroducing the erase.
+        let Some(retention_days) = self.retention_days.filter(|days| *days > 0) else {
             return;
         };
 
@@ -809,6 +819,27 @@ mod tests {
         assert_eventually(StdDuration::from_secs(1), || {
             event_ids(&db.path) == vec!["new-event".to_owned()]
         });
+    }
+
+    #[test]
+    fn zero_retention_days_disables_pruning_instead_of_erasing_the_store() {
+        let db = TempDb::new("retention-zero");
+        let sink = sqlite_sink_with_intervals(
+            &db.path,
+            Some(0),
+            StdDuration::from_secs(60),
+            StdDuration::from_secs(60),
+        );
+        insert_raw_event(&db.path, "old-event", "2000-01-01T00:00:00Z");
+        insert_raw_event(&db.path, "new-event", "2999-01-01T00:00:00Z");
+
+        sink.prune_for_test();
+
+        assert_eq!(
+            event_ids(&db.path),
+            vec!["new-event".to_owned(), "old-event".to_owned()],
+            "a zero-day retention window must not delete existing audit history"
+        );
     }
 
     #[test]

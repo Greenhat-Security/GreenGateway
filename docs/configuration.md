@@ -45,7 +45,7 @@ When `ADMIN_LOGIN_PROVIDER` is set, the admin OIDC login routes are also registe
 
 The default `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` include the effective `ADMIN_PREFIX` so the static admin UI shell can load before an operator pastes a token. When `ADMIN_LOGIN_PROVIDER` is set, they also include `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` so an unauthenticated browser can complete the login flow. Other admin APIs remain protected by authentication and endpoint-specific authorization checks.
 
-Leave `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` unset to keep these defaults synchronized with `ADMIN_PREFIX`. Setting either variable replaces its entire dynamic default; when changing `ADMIN_PREFIX`, update every explicit exempt list at the same time so a stale former admin prefix is not forwarded upstream without the corresponding security check.
+Leave `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` unset to keep these defaults synchronized with `ADMIN_PREFIX`. Setting either variable replaces its entire dynamic default with one exception: while `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` remain exempt even when either variable is set explicitly, because an unauthenticated browser has to reach both routes for the OIDC authorization-code flow to complete. There is no configuration that removes them while admin SSO login is enabled; unset `ADMIN_LOGIN_PROVIDER` to drop them. When changing `ADMIN_PREFIX`, update every explicit exempt list at the same time so a stale former admin prefix is not forwarded upstream without the corresponding security check.
 
 ### ADMIN_LOGIN_PROVIDER
 
@@ -103,7 +103,7 @@ The protected-resource requirement applies to every credential type that can oth
 
 Optional JSON Lines audit log file path.
 
-Default: empty, which disables the file sink. Audit events are always written to stdout.
+Default: empty, which disables the file sink. Audit events are always written to stdout. A failed stdout write is audit loss, so it increments `audit_events_dropped_total{reason="sink_error"}` and is reported by the shutdown audit drain; the accompanying log line is best effort only, because the default log writer is the same stdout descriptor that failed.
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. The file sink opens lazily on first write, appends one JSON event per line, and logs write/open failures without stopping request handling.
 
@@ -121,7 +121,7 @@ Optional SQLite audit event retention window, in days.
 
 Default: empty, which disables SQLite pruning.
 
-Format and validation: must parse as a `u32` day count when set. This value is only applied when `AUDIT_SQLITE_PATH` is also set; if the path is unset, the parsed retention value is accepted but has no effect. Retention pruning uses the indexed epoch column and runs at most once per minute, independently of the more frequent audit flush cadence. Rows with malformed external timestamps retain a `NULL` epoch and are not deleted automatically.
+Format and validation: must parse as a `u32` day count when set. `0` is accepted and means the same as leaving the variable empty: pruning disabled. A literal zero-day window would place the prune cutoff at the current instant and delete the entire audit history on every prune tick, so GreenGateway reads `0` as the "no retention limit" the value is normally written to mean and logs a warning at startup. Set a positive day count to prune. This value is only applied when `AUDIT_SQLITE_PATH` is also set; if the path is unset, the parsed retention value is accepted but has no effect. Retention pruning uses the indexed epoch column and runs at most once per minute, independently of the more frequent audit flush cadence. Rows with malformed external timestamps retain a `NULL` epoch and are not deleted automatically.
 
 ### SHUTDOWN_DRAIN_DELAY_MS
 
@@ -145,7 +145,7 @@ Maximum time allowed for the asynchronous audit writer to close admission and de
 
 Default: `5000`
 
-Format and validation: must parse as a `u64` between `1` and `60000`. GreenGateway admits lifecycle events through capacity reserved from ordinary request audit traffic, emits one terminal `gateway.shutdown_completed` or `gateway.shutdown_forced` event before closing the audit queue, then waits for the writer and sink-flush acknowledgement. A control-event admission failure, writer panic, drain timeout, or required sink flush failure makes shutdown return an error so the process exits unsuccessfully instead of reporting a clean stop without its terminal audit record.
+Format and validation: must parse as a `u64` between `1` and `60000`. GreenGateway admits lifecycle events through capacity reserved from ordinary request audit traffic, emits one terminal `gateway.shutdown_completed` or `gateway.shutdown_forced` event before closing the audit queue, then waits for the writer and sink-flush acknowledgement. A control-event admission failure, writer panic, drain timeout, or sink flush failure makes shutdown return an error. The always-present stdout sink participates: a failed stdout audit write is counted on `audit_events_dropped_total{reason="sink_error"}` and recorded, so the drain reports it and the process exits unsuccessfully instead of reporting a clean stop without its terminal audit record.
 
 ### DISCOVERY_SQLITE_PATH
 
@@ -920,7 +920,7 @@ Comma-separated paths that bypass RBAC authorization.
 
 Default: `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX` (for example, `/admin` with the default prefix).
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without RBAC permission checks and do not emit authz audit events, except that an exact configured MCP route is never RBAC-exempt. Non-MCP subpaths beneath an MCP alias keep the normal prefix behavior. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without RBAC; this warning is non-fatal because exempting an upstream path may be intentional.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it, except that the admin OIDC login pair `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` remain exempt even when this variable is set explicitly, for as long as `ADMIN_LOGIN_PROVIDER` is set; an unauthenticated browser has to reach both routes for the authorization-code flow to complete, so no explicit list can remove them while admin SSO login is enabled. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without RBAC permission checks and do not emit authz audit events, except that an exact configured MCP route is never RBAC-exempt. Non-MCP subpaths beneath an MCP alias keep the normal prefix behavior. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without RBAC; this warning is non-fatal because exempting an upstream path may be intentional.
 
 ### CORS_ALLOW_ORIGINS
 
@@ -1032,7 +1032,7 @@ Comma-separated paths that bypass authentication.
 
 Default: `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX` (for example, `/admin` with the default prefix).
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without credential extraction and do not emit auth audit events, except that an exact configured MCP route is never authentication-exempt. Non-MCP subpaths beneath an MCP alias keep the normal prefix behavior. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without authentication; this warning is non-fatal because exempting an upstream path may be intentional.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it, except that the admin OIDC login pair `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` remain exempt even when this variable is set explicitly, for as long as `ADMIN_LOGIN_PROVIDER` is set; an unauthenticated browser has to reach both routes for the authorization-code flow to complete, so no explicit list can remove them while admin SSO login is enabled. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. Exempt paths are allowed through without credential extraction and do not emit auth audit events, except that an exact configured MCP route is never authentication-exempt. Non-MCP subpaths beneath an MCP alias keep the normal prefix behavior. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without authentication; this warning is non-fatal because exempting an upstream path may be intentional.
 
 ### AUTH_PROVIDERS
 
@@ -1452,7 +1452,7 @@ Optional total timeout override for configured upstream proxy requests, in milli
 
 Default: empty, which inherits `EGRESS_TIMEOUT_MS`.
 
-Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. This applies only to requests sent to configured upstream proxy targets, including `UPSTREAM_URL`, `UPSTREAM_ROUTES`, and the background upstream reachability checks; other gateway-originated egress, such as JWKS fetches, continues to use `EGRESS_TIMEOUT_MS`.
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. Values must be greater than `0`: startup rejects `0` because a zero millisecond timeout elapses before the first poll, so every request that uses it fails as a timeout. This matches the existing rejection of `0` for the per-route `UPSTREAM_ROUTES[].timeout_ms`, `.response_idle_timeout_ms`, and `.connect_timeout_ms` fields. This applies only to requests sent to configured upstream proxy targets, including `UPSTREAM_URL`, `UPSTREAM_ROUTES`, and the background upstream reachability checks; other gateway-originated egress, such as JWKS fetches, continues to use `EGRESS_TIMEOUT_MS`.
 
 ### UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS
 
@@ -1460,7 +1460,7 @@ Optional idle timeout override between streamed upstream response body chunks, i
 
 Default: empty, which inherits `EGRESS_RESPONSE_IDLE_TIMEOUT_MS`.
 
-Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. This applies only to streaming proxy responses from configured upstream proxy targets.
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. Values must be greater than `0`: startup rejects `0` because a zero millisecond timeout elapses before the first poll, so every request that uses it fails as a timeout. This matches the existing rejection of `0` for the per-route `UPSTREAM_ROUTES[].timeout_ms`, `.response_idle_timeout_ms`, and `.connect_timeout_ms` fields. This applies only to streaming proxy responses from configured upstream proxy targets.
 
 ### UPSTREAM_CONNECT_TIMEOUT_MS
 
@@ -1468,7 +1468,7 @@ Optional TCP/TLS connection timeout override for configured upstream proxy reque
 
 Default: empty, which inherits `EGRESS_CONNECT_TIMEOUT_MS`.
 
-Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. This applies only to requests sent to configured upstream proxy targets, including the background upstream reachability checks.
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must parse as a `u64` millisecond duration. Values must be greater than `0`: startup rejects `0` because a zero millisecond timeout elapses before the first poll, so every request that uses it fails as a timeout. This matches the existing rejection of `0` for the per-route `UPSTREAM_ROUTES[].timeout_ms`, `.response_idle_timeout_ms`, and `.connect_timeout_ms` fields. This applies only to requests sent to configured upstream proxy targets, including the background upstream reachability checks.
 
 ## Gateway-Owned Paths And Proxy Collisions
 
@@ -1511,7 +1511,7 @@ Total timeout for each egress HTTP request, in milliseconds.
 
 Default: `30000`
 
-Format and validation: must parse as a `u64` millisecond duration. The timeout applies to the whole request, including connection, sending, and response body streaming.
+Format and validation: must parse as a `u64` millisecond duration. Values must be greater than `0`: startup rejects `0` because a zero millisecond timeout elapses before the first poll, so every request that uses it fails as a timeout. This matches the existing rejection of `0` for the per-route `UPSTREAM_ROUTES[].timeout_ms`, `.response_idle_timeout_ms`, and `.connect_timeout_ms` fields. The timeout applies to the whole request, including connection, sending, and response body streaming.
 
 ### EGRESS_RESPONSE_IDLE_TIMEOUT_MS
 
@@ -1519,7 +1519,7 @@ Idle timeout between streamed egress response body chunks, in milliseconds.
 
 Default: `30000`
 
-Format and validation: must parse as a `u64` millisecond duration. For streaming proxy responses, this timeout starts before the first body chunk and resets after every successfully received chunk. If the upstream response body is idle for longer than this window, the stream is aborted and treated as a gateway timeout.
+Format and validation: must parse as a `u64` millisecond duration. Values must be greater than `0`: startup rejects `0` because a zero millisecond timeout elapses before the first poll, so every request that uses it fails as a timeout. This matches the existing rejection of `0` for the per-route `UPSTREAM_ROUTES[].timeout_ms`, `.response_idle_timeout_ms`, and `.connect_timeout_ms` fields. For streaming proxy responses, this timeout starts before the first body chunk and resets after every successfully received chunk. If the upstream response body is idle for longer than this window, the stream is aborted and treated as a gateway timeout.
 
 ### EGRESS_CONNECT_TIMEOUT_MS
 
@@ -1527,7 +1527,7 @@ TCP/TLS connection timeout for each egress HTTP request, in milliseconds.
 
 Default: `10000`
 
-Format and validation: must parse as a `u64` millisecond duration.
+Format and validation: must parse as a `u64` millisecond duration. Values must be greater than `0`: startup rejects `0` because a zero millisecond timeout elapses before the first poll, so every request that uses it fails as a timeout. This matches the existing rejection of `0` for the per-route `UPSTREAM_ROUTES[].timeout_ms`, `.response_idle_timeout_ms`, and `.connect_timeout_ms` fields.
 
 ### EGRESS_MAX_RESPONSE_BYTES
 

@@ -822,11 +822,14 @@ impl Config {
             parse_optional_string(AUDIT_LOG_FILE, get_var(AUDIT_LOG_FILE), &mut problems);
         let audit_sqlite_path =
             parse_optional_string(AUDIT_SQLITE_PATH, get_var(AUDIT_SQLITE_PATH), &mut problems);
-        let audit_sqlite_retention_days = parse_optional_var(
+        let audit_sqlite_retention_days = normalize_audit_sqlite_retention_days(
             AUDIT_SQLITE_RETENTION_DAYS,
-            get_var(AUDIT_SQLITE_RETENTION_DAYS),
-            "day count",
-            &mut problems,
+            parse_optional_var(
+                AUDIT_SQLITE_RETENTION_DAYS,
+                get_var(AUDIT_SQLITE_RETENTION_DAYS),
+                "day count",
+                &mut problems,
+            ),
         );
         let shutdown_drain_delay_ms = validate_maximum_u64(
             SHUTDOWN_DRAIN_DELAY_MS,
@@ -1357,22 +1360,34 @@ impl Config {
                 "{UPSTREAM_ROUTES} entries with host require {POLICY_FILE} so RBAC can bind authorization to the selected request host"
             ));
         }
-        let upstream_timeout_ms = parse_optional_var(
+        let upstream_timeout_ms = validate_optional_positive_timeout_ms(
             UPSTREAM_TIMEOUT_MS,
-            get_var(UPSTREAM_TIMEOUT_MS),
-            "millisecond duration",
+            parse_optional_var(
+                UPSTREAM_TIMEOUT_MS,
+                get_var(UPSTREAM_TIMEOUT_MS),
+                "millisecond duration",
+                &mut problems,
+            ),
             &mut problems,
         );
-        let upstream_response_idle_timeout_ms = parse_optional_var(
+        let upstream_response_idle_timeout_ms = validate_optional_positive_timeout_ms(
             UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS,
-            get_var(UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS),
-            "millisecond duration",
+            parse_optional_var(
+                UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS,
+                get_var(UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS),
+                "millisecond duration",
+                &mut problems,
+            ),
             &mut problems,
         );
-        let upstream_connect_timeout_ms = parse_optional_var(
+        let upstream_connect_timeout_ms = validate_optional_positive_timeout_ms(
             UPSTREAM_CONNECT_TIMEOUT_MS,
-            get_var(UPSTREAM_CONNECT_TIMEOUT_MS),
-            "millisecond duration",
+            parse_optional_var(
+                UPSTREAM_CONNECT_TIMEOUT_MS,
+                get_var(UPSTREAM_CONNECT_TIMEOUT_MS),
+                "millisecond duration",
+                &mut problems,
+            ),
             &mut problems,
         );
         let egress_allowed_hosts = parse_comma_separated_hostnames(
@@ -1380,25 +1395,40 @@ impl Config {
             get_var(EGRESS_ALLOWED_HOSTS),
             &mut problems,
         );
-        let egress_timeout_ms = parse_var(
+        let egress_timeout_ms = validate_positive_timeout_ms(
             EGRESS_TIMEOUT_MS,
-            get_var(EGRESS_TIMEOUT_MS),
+            parse_var(
+                EGRESS_TIMEOUT_MS,
+                get_var(EGRESS_TIMEOUT_MS),
+                DEFAULT_EGRESS_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
             DEFAULT_EGRESS_TIMEOUT_MS,
-            "millisecond duration",
             &mut problems,
         );
-        let egress_response_idle_timeout_ms = parse_var(
+        let egress_response_idle_timeout_ms = validate_positive_timeout_ms(
             EGRESS_RESPONSE_IDLE_TIMEOUT_MS,
-            get_var(EGRESS_RESPONSE_IDLE_TIMEOUT_MS),
+            parse_var(
+                EGRESS_RESPONSE_IDLE_TIMEOUT_MS,
+                get_var(EGRESS_RESPONSE_IDLE_TIMEOUT_MS),
+                DEFAULT_EGRESS_RESPONSE_IDLE_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
             DEFAULT_EGRESS_RESPONSE_IDLE_TIMEOUT_MS,
-            "millisecond duration",
             &mut problems,
         );
-        let egress_connect_timeout_ms = parse_var(
+        let egress_connect_timeout_ms = validate_positive_timeout_ms(
             EGRESS_CONNECT_TIMEOUT_MS,
-            get_var(EGRESS_CONNECT_TIMEOUT_MS),
+            parse_var(
+                EGRESS_CONNECT_TIMEOUT_MS,
+                get_var(EGRESS_CONNECT_TIMEOUT_MS),
+                DEFAULT_EGRESS_CONNECT_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
             DEFAULT_EGRESS_CONNECT_TIMEOUT_MS,
-            "millisecond duration",
             &mut problems,
         );
         let egress_max_response_bytes = parse_var(
@@ -1586,6 +1616,74 @@ fn validate_positive_u64(name: &str, value: u64, default: u64, problems: &mut Ve
     } else {
         problems.push(format!("{name} must be greater than 0, got '{value}'"));
         default
+    }
+}
+
+/// Shared rejection message for a zero millisecond timeout.
+///
+/// A refused value aborts startup, and that message is often the operator's
+/// only diagnostic, so it names the setting, the accepted range, and the reason.
+fn zero_timeout_problem(name: &str, value: u64) -> String {
+    format!(
+        "{name} must be greater than 0, got '{value}'; a zero millisecond timeout elapses before the first poll, so every request that uses it fails as a timeout"
+    )
+}
+
+/// Reject a zero millisecond timeout for a global setting with a default.
+///
+/// The per-route equivalents (`UPSTREAM_ROUTES[i].timeout_ms` and friends)
+/// already reject `0` through `validate_optional_positive_duration`; this gives
+/// the global settings that override them the same answer instead of booting
+/// clean into a permanent timeout.
+fn validate_positive_timeout_ms(
+    name: &str,
+    value: u64,
+    default: u64,
+    problems: &mut Vec<String>,
+) -> u64 {
+    if value > 0 {
+        value
+    } else {
+        problems.push(zero_timeout_problem(name, value));
+        default
+    }
+}
+
+/// Reject a zero millisecond timeout for an optional global override.
+fn validate_optional_positive_timeout_ms(
+    name: &str,
+    value: Option<u64>,
+    problems: &mut Vec<String>,
+) -> Option<u64> {
+    match value {
+        Some(0) => {
+            problems.push(zero_timeout_problem(name, 0));
+            None
+        }
+        other => other,
+    }
+}
+
+/// Fold `AUDIT_SQLITE_RETENTION_DAYS=0` into the same "no pruning" state an
+/// empty value produces.
+///
+/// Read literally, a zero-day window means "retain nothing": the prune cutoff
+/// becomes the current instant, so the next prune tick deletes every audit row
+/// the database holds, silently and on a 60-second repeat. No operator
+/// configures a SQLite audit store in order to keep nothing in it; `0` is
+/// written to mean "no retention limit", which is what leaving the variable
+/// empty already does. Reinterpreting is also the safe upgrade: rejecting `0`
+/// would abort the boot of a deployment that is running with the value today.
+fn normalize_audit_sqlite_retention_days(name: &str, value: Option<u32>) -> Option<u32> {
+    match value {
+        Some(0) => {
+            tracing::warn!(
+                setting = name,
+                "audit SQLite retention of 0 days is treated as disabled pruning; set a positive day count to prune, or leave the variable empty"
+            );
+            None
+        }
+        other => other,
     }
 }
 
@@ -4304,6 +4402,21 @@ mod tests {
     }
 
     #[test]
+    fn zero_audit_sqlite_retention_disables_pruning_without_aborting_startup() {
+        let config = Config::from_env_vars(|name| match name {
+            "AUDIT_SQLITE_PATH" => Ok("/var/lib/greengateway/audit.sqlite".to_owned()),
+            "AUDIT_SQLITE_RETENTION_DAYS" => Ok("0".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("zero retention must not newly abort startup for an existing deployment");
+
+        assert_eq!(
+            config.audit_sqlite_retention_days, None,
+            "0 must mean disabled pruning, not a prune cutoff at the current instant"
+        );
+    }
+
+    #[test]
     fn empty_audit_sqlite_retention_is_none() {
         let config = Config::from_env_vars(|name| match name {
             "AUDIT_SQLITE_RETENTION_DAYS" => Ok("   ".to_owned()),
@@ -4327,6 +4440,102 @@ mod tests {
         assert!(message.contains("AUDIT_SQLITE_RETENTION_DAYS must be a valid day count"));
         assert!(message.contains("MAX_BODY_SIZE must be a valid byte size"));
         assert_eq!(error.problems.len(), 2);
+    }
+
+    #[test]
+    fn zero_global_upstream_and_egress_timeouts_are_rejected_like_route_timeouts() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_TIMEOUT_MS"
+            | "UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS"
+            | "UPSTREAM_CONNECT_TIMEOUT_MS"
+            | "EGRESS_TIMEOUT_MS"
+            | "EGRESS_RESPONSE_IDLE_TIMEOUT_MS"
+            | "EGRESS_CONNECT_TIMEOUT_MS" => Ok("0".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("zero global timeouts must be rejected the way route timeouts are");
+
+        let message = error.to_string();
+        for name in [
+            "UPSTREAM_TIMEOUT_MS",
+            "UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS",
+            "UPSTREAM_CONNECT_TIMEOUT_MS",
+            "EGRESS_TIMEOUT_MS",
+            "EGRESS_RESPONSE_IDLE_TIMEOUT_MS",
+            "EGRESS_CONNECT_TIMEOUT_MS",
+        ] {
+            assert!(
+                message.contains(&format!("{name} must be greater than 0, got '0'")),
+                "{name} should be rejected with its name and accepted range: {message}"
+            );
+        }
+        assert!(
+            message.contains("fails as a timeout"),
+            "the rejection should explain why zero is refused: {message}"
+        );
+        assert_eq!(error.problems.len(), 6);
+    }
+
+    #[test]
+    fn positive_global_upstream_and_egress_timeouts_are_still_accepted() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_TIMEOUT_MS" => Ok("1".to_owned()),
+            "UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS" => Ok("2".to_owned()),
+            "UPSTREAM_CONNECT_TIMEOUT_MS" => Ok("3".to_owned()),
+            "EGRESS_TIMEOUT_MS" => Ok("4".to_owned()),
+            "EGRESS_RESPONSE_IDLE_TIMEOUT_MS" => Ok("5".to_owned()),
+            "EGRESS_CONNECT_TIMEOUT_MS" => Ok("6".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("positive timeouts should still parse");
+
+        assert_eq!(config.upstream_timeout_ms, Some(1));
+        assert_eq!(config.upstream_response_idle_timeout_ms, Some(2));
+        assert_eq!(config.upstream_connect_timeout_ms, Some(3));
+        assert_eq!(config.egress_timeout_ms, 4);
+        assert_eq!(config.egress_response_idle_timeout_ms, 5);
+        assert_eq!(config.egress_connect_timeout_ms, 6);
+    }
+
+    #[test]
+    fn explicit_exempt_paths_keep_the_admin_login_pair_while_admin_login_is_enabled() {
+        let config = Config::from_env_vars(|name| match name {
+            "ADMIN_LOGIN_PROVIDER" => Ok("primary".to_owned()),
+            "AUTH_PROVIDERS" => Ok(r#"[
+                    {
+                        "name": "primary",
+                        "type": "jwt",
+                        "issuer": "https://issuer.example.test",
+                        "jwks_url": "https://issuer.example.test/.well-known/jwks.json",
+                        "client_id": "admin-ui",
+                        "client_secret": "secret-value",
+                        "redirect_uri": "https://gateway.example.test/v1/admin/auth/callback"
+                    }
+                ]"#
+            .to_owned()),
+            "AUTH_EXEMPT_PATHS" | "RBAC_EXEMPT_PATHS" => {
+                Ok("/health,/livez,/startupz,/readyz,/version,/metrics".to_owned())
+            }
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("config should parse");
+
+        // The admin OIDC login and callback routes must stay anonymous or the
+        // authorization-code flow cannot complete, so they are appended even to
+        // an explicit list. docs/configuration.md and .env.example disclose
+        // this exception to the "setting the variable replaces the default"
+        // rule; the pairing is asserted in gateway/tests/env_example.rs.
+        for paths in [&config.auth_exempt_paths, &config.rbac_exempt_paths] {
+            assert!(
+                paths.contains(&"/v1/admin/auth/login".to_owned()),
+                "{paths:?}"
+            );
+            assert!(
+                paths.contains(&"/v1/admin/auth/callback".to_owned()),
+                "{paths:?}"
+            );
+            assert!(!paths.contains(&"/admin".to_owned()), "{paths:?}");
+        }
     }
 
     #[test]
