@@ -494,19 +494,11 @@ impl ConnectionHttpRuntime {
                 .map_err(|_| ConnectionHttpError::TlsInvalid)?;
         }
         if let Some((certificate, private_key)) = resolved.client_identity.as_ref() {
-            let separator_len = usize::from(!certificate.expose().ends_with(b"\n"));
-            let identity_len = certificate
-                .expose()
-                .len()
-                .checked_add(separator_len)
-                .and_then(|length| length.checked_add(private_key.expose().len()))
-                .ok_or(ConnectionHttpError::TlsInvalid)?;
-            let mut identity = Zeroizing::new(Vec::with_capacity(identity_len));
-            identity.extend_from_slice(certificate.expose());
-            if separator_len == 1 {
-                identity.push(b'\n');
-            }
-            identity.extend_from_slice(private_key.expose());
+            let identity = crate::egress::join_tls_client_identity_pem(
+                certificate.expose(),
+                private_key.expose(),
+            )
+            .ok_or(ConnectionHttpError::TlsInvalid)?;
             config
                 .apply_tls_client_identity_pem(identity.as_slice())
                 .map_err(|_| ConnectionHttpError::TlsInvalid)?;

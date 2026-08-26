@@ -6,8 +6,13 @@ const NO_PROVIDER_ACCEPTED: &str = "no configured auth provider accepted the cre
 
 /// Ordered session validator chain.
 ///
-/// Invalid credentials fall through to later providers, while upstream identity
-/// failures stop immediately so operational failures are not masked.
+/// Invalid credentials fall through to later providers. An upstream identity
+/// failure does not stop the chain, because a credential this provider could not
+/// process may still belong to a later one: a validator is tried against every
+/// credential, so one provider's IdP outage would otherwise deny tokens issued
+/// by every other provider. The failure is remembered and returned only when no
+/// provider accepted the credential, so an operational failure is still
+/// surfaced as such rather than reported as an invalid session.
 pub struct ChainValidator {
     validators: Vec<Arc<dyn SessionValidator>>,
 }
@@ -32,6 +37,7 @@ impl SessionValidator for ChainValidator {
         credential: &SessionCredential,
         resource: Option<&str>,
     ) -> Result<Principal, AuthError> {
+        let mut upstream_failure = None;
         for validator in &self.validators {
             match validator
                 .validate_session_for_resource(credential, resource)
@@ -39,11 +45,20 @@ impl SessionValidator for ChainValidator {
             {
                 Ok(principal) => return Ok(principal),
                 Err(AuthError::InvalidSession(_)) => continue,
-                Err(error @ AuthError::Upstream(_)) => return Err(error),
+                Err(error @ AuthError::Upstream(_)) => {
+                    // Keep the first operational failure and keep going: a later
+                    // provider may own this credential. Nothing is authenticated
+                    // by continuing — only the chance to authenticate correctly
+                    // is preserved.
+                    upstream_failure.get_or_insert(error);
+                }
             }
         }
 
-        Err(AuthError::InvalidSession(NO_PROVIDER_ACCEPTED.to_owned()))
+        match upstream_failure {
+            Some(error) => Err(error),
+            None => Err(AuthError::InvalidSession(NO_PROVIDER_ACCEPTED.to_owned())),
+        }
     }
 
     fn supports_cookie(&self) -> bool {
@@ -164,7 +179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_error_returns_immediately_without_trying_later_validators() {
+    async fn an_upstream_failure_does_not_deny_a_credential_a_later_provider_owns() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let chain = ChainValidator::new(vec![
             validator("first", MockOutcome::InvalidSession("unknown kid"), &calls),
@@ -176,11 +191,32 @@ mod tests {
             ),
         ]);
 
+        // Every validator is tried against every credential, so one provider's
+        // IdP outage must not deny a token another provider issued.
+        let principal = chain
+            .validate_session(&SessionCredential::Bearer("token".to_owned()))
+            .await
+            .expect("a provider that owns the credential should still authenticate it");
+
+        assert_eq!(principal.user_id, "user-third");
+        assert_eq!(logged_calls(&calls), vec!["first", "second", "third"]);
+    }
+
+    #[tokio::test]
+    async fn an_upstream_failure_is_reported_when_no_provider_accepts_the_credential() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let chain = ChainValidator::new(vec![
+            validator("first", MockOutcome::Upstream("JWKS fetch failed"), &calls),
+            validator("second", MockOutcome::InvalidSession("unknown kid"), &calls),
+        ]);
+
         let error = chain
             .validate_session(&SessionCredential::Bearer("token".to_owned()))
             .await
-            .expect_err("upstream error should stop validation");
+            .expect_err("an unauthenticated credential must not yield a principal");
 
+        // The operational failure is surfaced as such rather than collapsing
+        // into a generic invalid-session answer.
         assert!(matches!(
             error,
             AuthError::Upstream(message) if message == "JWKS fetch failed"
