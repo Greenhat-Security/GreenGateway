@@ -51,6 +51,18 @@ pub fn path_prefix_matches(path: &str, path_prefix: &str) -> bool {
 pub fn is_unsafe_request_path(path: &str) -> bool {
     path.contains('%')
         || path.contains('\\')
+        // An empty interior segment desynchronizes this gateway's matching
+        // from the path the upstream resolves. `path_prefix_matches(
+        // "//admin/x", "/admin")` is false, so a rule protecting `/admin`
+        // does not match and the request is authorized under whatever weaker
+        // rule applies, while an upstream that collapses duplicate slashes
+        // serves the protected resource. Each side is individually
+        // reasonable; the disagreement is the bypass.
+        //
+        // Written as a `//` search rather than an empty-segment scan because
+        // every absolute path splits with an empty leading segment, and a
+        // single trailing slash is ordinary traffic that must keep working.
+        || path.contains("//")
         || path
             .split('/')
             .any(|segment| segment == "." || segment == "..")
@@ -108,6 +120,26 @@ mod tests {
         assert!(exempt_path_matches("/public/docs", "/public"));
 
         assert!(!exempt_path_matches("/administrator", "/admin"));
+    }
+
+    #[test]
+    fn empty_interior_segments_are_unsafe_but_ordinary_paths_are_not() {
+        // The bypass shape: this gateway does not match the protected prefix,
+        // while an upstream that collapses `//` does.
+        assert!(!path_prefix_matches("//admin/secrets", "/admin"));
+        assert!(is_unsafe_request_path("//admin/secrets"));
+        assert!(is_unsafe_request_path("/admin//secrets"));
+        assert!(is_unsafe_request_path("//"));
+
+        // Ordinary traffic must keep working. Every absolute path splits with an
+        // empty leading segment, and a trailing slash is not an ambiguity:
+        // `/admin/` already matches the `/admin` prefix the same way `/admin`
+        // does, so both sides agree about it.
+        assert!(!is_unsafe_request_path("/"));
+        assert!(!is_unsafe_request_path("/admin"));
+        assert!(!is_unsafe_request_path("/admin/"));
+        assert!(!is_unsafe_request_path("/v1/orders/42"));
+        assert!(path_prefix_matches("/admin/", "/admin"));
     }
 
     #[test]
