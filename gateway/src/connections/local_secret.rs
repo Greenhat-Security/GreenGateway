@@ -532,6 +532,7 @@ impl LocalSecretProvider {
             provider: SecretProviderKind::LocalEncrypted,
             configured: true,
             purpose: Some(purpose),
+            pinned: false,
             version: Some(version),
             rotated_at: None,
         };
@@ -603,6 +604,7 @@ impl LocalSecretProvider {
             provider: SecretProviderKind::LocalEncrypted,
             configured: true,
             purpose: Some(current.purpose),
+            pinned: false,
             version: Some(next_version),
             rotated_at: Some(now),
         };
@@ -1096,6 +1098,7 @@ impl EncryptedSecretRecord {
             provider: SecretProviderKind::LocalEncrypted,
             configured: true,
             purpose: Some(self.purpose),
+            pinned: false,
             version: Some(self.version),
             rotated_at: self.rotated_at.clone(),
         }

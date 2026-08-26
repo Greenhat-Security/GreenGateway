@@ -1562,6 +1562,7 @@ impl SecretResolver for KubernetesSecretProvider {
                 provider: SecretProviderKind::KubernetesSecrets,
                 configured: true,
                 purpose: None,
+                pinned: false,
                 version: None,
                 rotated_at: None,
             })
@@ -3827,6 +3828,7 @@ rotated-key
         assert_eq!(metadata.len(), 1);
         assert_eq!(metadata[0].provider, SecretProviderKind::KubernetesSecrets);
         assert_eq!(metadata[0].version, None);
+        assert!(!metadata[0].pinned);
         assert!(serde_json::to_string(&metadata)
             .expect("alias metadata should serialize")
             .contains("kubernetes_secrets"));

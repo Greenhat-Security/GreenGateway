@@ -129,6 +129,11 @@ pub struct SecretAliasMetadata {
     pub configured: bool,
     #[serde(skip_serializing)]
     pub purpose: Option<SecretPurpose>,
+    /// Whether resolution is bound to an immutable version and will not observe
+    /// upstream rotation. A movable selector — Vault/GCP `latest`, an AWS
+    /// version stage — reports `false`, because the operationally load-bearing
+    /// question is "will the gateway pick up a rotation?".
+    pub pinned: bool,
     pub version: Option<u64>,
     pub rotated_at: Option<String>,
 }
@@ -472,6 +477,7 @@ impl SecretResolver for OperatorAliasResolver {
                 },
                 configured: true,
                 purpose: None,
+                pinned: false,
                 version: None,
                 rotated_at: None,
             })

@@ -1426,8 +1426,10 @@ impl SecretResolver for AzureKeyVaultSecretProvider {
                 provider: SecretProviderKind::AzureKeyVault,
                 configured: true,
                 purpose: None,
-                // Key Vault versions are opaque locator-like identifiers, not
-                // ordinals; they are never surfaced through metadata.
+                pinned: alias.version.is_some(),
+                // Key Vault versions are opaque fragments of the redacted read
+                // URL, never surfaced through metadata; pinnedness is reported
+                // as the dedicated boolean instead.
                 version: None,
                 rotated_at: None,
             })
@@ -3485,6 +3487,9 @@ O2gecI9QwDJNpm29J9wJB2F8
         assert_eq!(metadata.len(), 1);
         assert_eq!(metadata[0].provider, SecretProviderKind::AzureKeyVault);
         assert_eq!(metadata[0].version, None);
+        // The opaque version identifier stays redacted; only the fact that this
+        // alias will not observe rotation is surfaced.
+        assert!(metadata[0].pinned);
         assert!(serde_json::to_string(&metadata)
             .expect("alias metadata should serialize")
             .contains("azure_key_vault"));

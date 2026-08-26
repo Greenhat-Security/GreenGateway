@@ -1540,6 +1540,10 @@ impl SecretResolver for AwsSecretsManagerProvider {
                 provider: SecretProviderKind::AwsSecretsManager,
                 configured: true,
                 purpose: None,
+                // A version stage is a movable label the provider follows, so
+                // only an explicit VersionId counts as pinned. The id itself is
+                // an opaque request selector and is never surfaced.
+                pinned: alias.version_id.is_some(),
                 version: None,
                 rotated_at: None,
             })
@@ -3613,9 +3617,35 @@ mod tests {
         assert_eq!(metadata.len(), 1);
         assert_eq!(metadata[0].provider, SecretProviderKind::AwsSecretsManager);
         assert_eq!(metadata[0].version, None);
+        // This provider was built from the unpinned alias; the pinned one below
+        // only feeds the Debug-redaction assertions above.
+        assert!(!metadata[0].pinned);
         assert!(serde_json::to_string(&metadata)
             .expect("alias metadata should serialize")
             .contains("aws_secrets_manager"));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_version_id_reports_pinned_without_surfacing_the_identifier() {
+        let mut pinned_alias = alias("billing");
+        pinned_alias.version_id = Some(VERSION_ID_CANARY.to_owned());
+        let pinned_fixture = provider(vec![pinned_alias]);
+        let pinned_metadata = pinned_fixture.provider.aliases();
+        assert!(pinned_metadata[0].pinned);
+        assert_eq!(pinned_metadata[0].version, None);
+
+        // A version stage is a movable label the provider follows, so it is not
+        // a pin: the gateway still observes rotation behind it.
+        let mut staged_alias = alias("billing");
+        staged_alias.version_stage = Some("AWSCURRENT".to_owned());
+        let staged_fixture = provider(vec![staged_alias]);
+        assert!(!staged_fixture.provider.aliases()[0].pinned);
+
+        // The bit is surfaced; the opaque identifier behind it never is.
+        let serialized =
+            serde_json::to_string(&pinned_metadata).expect("alias metadata should serialize");
+        assert!(serialized.contains("\"pinned\":true"));
+        assert!(!serialized.contains(VERSION_ID_CANARY));
     }
 
     #[test]

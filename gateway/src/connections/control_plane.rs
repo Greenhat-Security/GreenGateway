@@ -315,6 +315,7 @@ impl ConnectionControlPlane {
                 provider: SecretProviderKind::VaultKvV2,
                 configured: true,
                 purpose: None,
+                pinned: alias.version.is_some(),
                 version: alias.version,
                 rotated_at: None,
             })
@@ -326,6 +327,7 @@ impl ConnectionControlPlane {
                 provider: SecretProviderKind::GcpSecretManager,
                 configured: true,
                 purpose: None,
+                pinned: alias.version.is_some(),
                 version: alias.version,
                 rotated_at: None,
             }
@@ -337,8 +339,10 @@ impl ConnectionControlPlane {
                 provider: SecretProviderKind::AzureKeyVault,
                 configured: true,
                 purpose: None,
-                // Key Vault versions are opaque locator-like identifiers;
-                // they are never surfaced through metadata.
+                pinned: alias.version.is_some(),
+                // Key Vault versions are opaque fragments of the redacted read
+                // URL, never surfaced through metadata; pinnedness is reported
+                // as the dedicated boolean instead.
                 version: None,
                 rotated_at: None,
             },
@@ -350,6 +354,7 @@ impl ConnectionControlPlane {
                 provider: SecretProviderKind::AwsSecretsManager,
                 configured: true,
                 purpose: None,
+                pinned: alias.version_id.is_some(),
                 version: None,
                 rotated_at: None,
             }
@@ -361,6 +366,7 @@ impl ConnectionControlPlane {
                 provider: SecretProviderKind::KubernetesSecrets,
                 configured: true,
                 purpose: None,
+                pinned: false,
                 version: None,
                 rotated_at: None,
             },
@@ -1831,6 +1837,7 @@ mod tests {
                 provider: SecretProviderKind::VaultKvV2,
                 configured: true,
                 purpose: None,
+                pinned: false,
                 version: None,
                 rotated_at: None,
             }]
@@ -1978,6 +1985,7 @@ mod tests {
                 provider: SecretProviderKind::VaultKvV2,
                 configured: true,
                 purpose: None,
+                pinned: false,
                 version: None,
                 rotated_at: None,
             }]
@@ -1991,6 +1999,7 @@ mod tests {
             provider: SecretProviderKind::VaultKvV2,
             configured: true,
             purpose: None,
+            pinned: false,
             version: None,
             rotated_at: None,
         }
