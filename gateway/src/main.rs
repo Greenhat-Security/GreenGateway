@@ -12483,6 +12483,7 @@ mod tests {
             load_balancing: config::UpstreamLoadBalancingConfig::default(),
             request_body: config::UpstreamRequestBodyConfig::default(),
             sse: None,
+            websocket: None,
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,

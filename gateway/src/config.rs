@@ -328,6 +328,8 @@ pub struct UpstreamRouteConfig {
     #[serde(default)]
     pub sse: Option<UpstreamSseConfig>,
     #[serde(default)]
+    pub websocket: Option<UpstreamWebSocketConfig>,
+    #[serde(default)]
     pub limits: UpstreamPoolLimitsConfig,
     #[serde(default)]
     pub health_check: Option<UpstreamHealthCheckConfig>,
@@ -411,6 +413,171 @@ pub struct UpstreamSseConfig {
 
 fn default_upstream_sse_max_duration_ms() -> u64 {
     DEFAULT_UPSTREAM_SSE_MAX_DURATION_MS
+}
+
+pub const DEFAULT_WEBSOCKET_MAX_CONNECTIONS: usize = 64;
+pub const MAX_WEBSOCKET_MAX_CONNECTIONS: usize = 100_000;
+pub const DEFAULT_WEBSOCKET_QUEUE_DEPTH: usize = 16;
+pub const MAX_WEBSOCKET_QUEUE_DEPTH: usize = 10_000;
+pub const DEFAULT_WEBSOCKET_QUEUE_TIMEOUT_MS: u64 = 100;
+pub const DEFAULT_WEBSOCKET_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+pub const MIN_WEBSOCKET_HANDSHAKE_TIMEOUT_MS: u64 = 100;
+pub const MAX_WEBSOCKET_HANDSHAKE_TIMEOUT_MS: u64 = 60_000;
+pub const DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 300_000;
+pub const MIN_WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 1_000;
+pub const MAX_WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 3_600_000;
+pub const DEFAULT_WEBSOCKET_MAX_DURATION_MS: u64 = 3_600_000;
+pub const DEFAULT_WEBSOCKET_MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub const MIN_WEBSOCKET_MAX_FRAME_BYTES: usize = 1024;
+pub const MAX_WEBSOCKET_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_WEBSOCKET_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_WEBSOCKET_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+pub const DEFAULT_WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 256 * 1024;
+pub const MAX_WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_WEBSOCKET_ORIGINS: usize = 32;
+pub const MAX_WEBSOCKET_ORIGIN_BYTES: usize = 256;
+pub const MAX_WEBSOCKET_SUBPROTOCOLS: usize = 32;
+pub const MAX_WEBSOCKET_SUBPROTOCOL_BYTES: usize = 128;
+
+/// Opt-in, per-route WebSocket proxying.
+///
+/// Absent means the route keeps today's behavior: an `Upgrade` request is
+/// forwarded as an ordinary HTTP request with hop-by-hop headers stripped.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamWebSocketConfig {
+    #[serde(default = "default_websocket_max_connections")]
+    pub max_connections: usize,
+    /// Defaults to `max_connections`, i.e. no separate per-endpoint cap.
+    #[serde(default)]
+    pub max_connections_per_endpoint: Option<usize>,
+    #[serde(default = "default_websocket_queue_depth")]
+    pub queue_depth: usize,
+    #[serde(default = "default_websocket_queue_timeout_ms")]
+    pub queue_timeout_ms: u64,
+    #[serde(default = "default_websocket_handshake_timeout_ms")]
+    pub handshake_timeout_ms: u64,
+    /// Zero disables the idle timeout, matching the SSE convention.
+    #[serde(default = "default_websocket_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+    /// Zero disables the ceiling on total connection duration.
+    #[serde(default = "default_websocket_max_duration_ms")]
+    pub max_duration_ms: u64,
+    #[serde(default = "default_websocket_max_frame_bytes")]
+    pub max_frame_bytes: usize,
+    #[serde(default = "default_websocket_max_message_bytes")]
+    pub max_message_bytes: usize,
+    #[serde(default = "default_websocket_max_write_buffer_bytes")]
+    pub max_write_buffer_bytes: usize,
+    /// Exact origin serializations. An empty list denies every request that
+    /// carries an `Origin`, because a browser-originated upgrade must be
+    /// explicitly allowed rather than allowed by omission.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    /// Reject an upgrade that carries no `Origin` at all.
+    #[serde(default)]
+    pub require_origin: bool,
+    /// Subprotocols this route may negotiate. An empty list denies any client
+    /// that offers one; the upstream may never select one the client did not
+    /// offer and policy does not allow.
+    #[serde(default)]
+    pub allowed_subprotocols: Vec<String>,
+}
+
+fn default_websocket_max_connections() -> usize {
+    DEFAULT_WEBSOCKET_MAX_CONNECTIONS
+}
+
+fn default_websocket_queue_depth() -> usize {
+    DEFAULT_WEBSOCKET_QUEUE_DEPTH
+}
+
+fn default_websocket_queue_timeout_ms() -> u64 {
+    DEFAULT_WEBSOCKET_QUEUE_TIMEOUT_MS
+}
+
+fn default_websocket_handshake_timeout_ms() -> u64 {
+    DEFAULT_WEBSOCKET_HANDSHAKE_TIMEOUT_MS
+}
+
+fn default_websocket_idle_timeout_ms() -> u64 {
+    DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS
+}
+
+fn default_websocket_max_duration_ms() -> u64 {
+    DEFAULT_WEBSOCKET_MAX_DURATION_MS
+}
+
+fn default_websocket_max_frame_bytes() -> usize {
+    DEFAULT_WEBSOCKET_MAX_FRAME_BYTES
+}
+
+fn default_websocket_max_message_bytes() -> usize {
+    DEFAULT_WEBSOCKET_MAX_MESSAGE_BYTES
+}
+
+fn default_websocket_max_write_buffer_bytes() -> usize {
+    DEFAULT_WEBSOCKET_MAX_WRITE_BUFFER_BYTES
+}
+
+/// Whether a string is a valid RFC 7230 token, the grammar RFC 6455 uses for a
+/// subprotocol name.
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Normalizes an allowed origin to the RFC 6454 serialization the request's
+/// `Origin` header is compared against, or returns `None` when it is not a
+/// usable origin.
+///
+/// Scheme and host are lowercased; a default port is dropped so that
+/// `https://app.example:443` and `https://app.example` do not silently fail to
+/// match each other. Anything carrying a path, query, fragment, or credentials
+/// is rejected rather than truncated, since an operator who wrote one is not
+/// describing an origin and should be told so.
+pub fn normalized_websocket_origin(value: &str) -> Option<String> {
+    if value == "null" {
+        return Some(value.to_owned());
+    }
+    let parsed = url::Url::parse(value).ok()?;
+    let scheme = parsed.scheme();
+    if !matches!(scheme, "http" | "https") {
+        return None;
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    Some(match parsed.port() {
+        Some(port) if port != default_port => format!("{scheme}://{host}:{port}"),
+        _ => format!("{scheme}://{host}"),
+    })
 }
 
 pub const DEFAULT_UPSTREAM_RETRY_MAX_ATTEMPTS: u8 = 1;
@@ -3407,6 +3574,136 @@ fn validate_upstream_routes(
             }
         }
 
+        let websocket = route.websocket.map(|mut websocket| {
+            if !(1..=MAX_WEBSOCKET_MAX_CONNECTIONS).contains(&websocket.max_connections) {
+                problems.push(format!(
+                    "{route_name}.websocket.max_connections must be between 1 and {MAX_WEBSOCKET_MAX_CONNECTIONS}"
+                ));
+            }
+            if let Some(per_endpoint) = websocket.max_connections_per_endpoint {
+                if !(1..=websocket.max_connections).contains(&per_endpoint) {
+                    problems.push(format!(
+                        "{route_name}.websocket.max_connections_per_endpoint must be between 1 and websocket.max_connections"
+                    ));
+                }
+            }
+            if websocket.queue_depth > MAX_WEBSOCKET_QUEUE_DEPTH {
+                problems.push(format!(
+                    "{route_name}.websocket.queue_depth must be at most {MAX_WEBSOCKET_QUEUE_DEPTH}"
+                ));
+            }
+            if !(MIN_WEBSOCKET_HANDSHAKE_TIMEOUT_MS..=MAX_WEBSOCKET_HANDSHAKE_TIMEOUT_MS)
+                .contains(&websocket.handshake_timeout_ms)
+            {
+                problems.push(format!(
+                    "{route_name}.websocket.handshake_timeout_ms must be between {MIN_WEBSOCKET_HANDSHAKE_TIMEOUT_MS} and {MAX_WEBSOCKET_HANDSHAKE_TIMEOUT_MS}"
+                ));
+            }
+            if websocket.idle_timeout_ms != 0
+                && !(MIN_WEBSOCKET_IDLE_TIMEOUT_MS..=MAX_WEBSOCKET_IDLE_TIMEOUT_MS)
+                    .contains(&websocket.idle_timeout_ms)
+            {
+                problems.push(format!(
+                    "{route_name}.websocket.idle_timeout_ms must be 0 to disable, or between {MIN_WEBSOCKET_IDLE_TIMEOUT_MS} and {MAX_WEBSOCKET_IDLE_TIMEOUT_MS}"
+                ));
+            }
+            if websocket.max_duration_ms != 0
+                && websocket.max_duration_ms > MAX_UPSTREAM_SSE_MAX_DURATION_MS
+            {
+                problems.push(format!(
+                    "{route_name}.websocket.max_duration_ms must be 0 to disable, or at most {MAX_UPSTREAM_SSE_MAX_DURATION_MS}"
+                ));
+            }
+            if !(MIN_WEBSOCKET_MAX_FRAME_BYTES..=MAX_WEBSOCKET_MAX_FRAME_BYTES)
+                .contains(&websocket.max_frame_bytes)
+            {
+                problems.push(format!(
+                    "{route_name}.websocket.max_frame_bytes must be between {MIN_WEBSOCKET_MAX_FRAME_BYTES} and {MAX_WEBSOCKET_MAX_FRAME_BYTES}"
+                ));
+            }
+            // A message is assembled from frames, so a message cap below the
+            // frame cap could never be satisfied by a single legal frame.
+            if websocket.max_message_bytes < websocket.max_frame_bytes
+                || websocket.max_message_bytes > MAX_WEBSOCKET_MAX_MESSAGE_BYTES
+            {
+                problems.push(format!(
+                    "{route_name}.websocket.max_message_bytes must be at least websocket.max_frame_bytes and at most {MAX_WEBSOCKET_MAX_MESSAGE_BYTES}"
+                ));
+            }
+            if !(1..=MAX_WEBSOCKET_MAX_WRITE_BUFFER_BYTES)
+                .contains(&websocket.max_write_buffer_bytes)
+            {
+                problems.push(format!(
+                    "{route_name}.websocket.max_write_buffer_bytes must be between 1 and {MAX_WEBSOCKET_MAX_WRITE_BUFFER_BYTES}"
+                ));
+            }
+            if websocket.allowed_origins.len() > MAX_WEBSOCKET_ORIGINS {
+                problems.push(format!(
+                    "{route_name}.websocket.allowed_origins must contain at most {MAX_WEBSOCKET_ORIGINS} entries"
+                ));
+            }
+            let mut origins = Vec::with_capacity(websocket.allowed_origins.len());
+            for origin in &websocket.allowed_origins {
+                if origin.len() > MAX_WEBSOCKET_ORIGIN_BYTES {
+                    problems.push(format!(
+                        "{route_name}.websocket.allowed_origins entries must be at most {MAX_WEBSOCKET_ORIGIN_BYTES} bytes"
+                    ));
+                    continue;
+                }
+                match normalized_websocket_origin(origin) {
+                    Some(normalized) => {
+                        if !origins.contains(&normalized) {
+                            origins.push(normalized);
+                        }
+                    }
+                    None => problems.push(format!(
+                        "{route_name}.websocket.allowed_origins entries must be an http or https origin with no path, query, fragment, or credentials"
+                    )),
+                }
+            }
+            websocket.allowed_origins = origins;
+
+            if websocket.allowed_subprotocols.len() > MAX_WEBSOCKET_SUBPROTOCOLS {
+                problems.push(format!(
+                    "{route_name}.websocket.allowed_subprotocols must contain at most {MAX_WEBSOCKET_SUBPROTOCOLS} entries"
+                ));
+            }
+            let mut subprotocols = Vec::with_capacity(websocket.allowed_subprotocols.len());
+            for subprotocol in &websocket.allowed_subprotocols {
+                if subprotocol.len() > MAX_WEBSOCKET_SUBPROTOCOL_BYTES {
+                    problems.push(format!(
+                        "{route_name}.websocket.allowed_subprotocols entries must be at most {MAX_WEBSOCKET_SUBPROTOCOL_BYTES} bytes"
+                    ));
+                    continue;
+                }
+                if !is_http_token(subprotocol) {
+                    problems.push(format!(
+                        "{route_name}.websocket.allowed_subprotocols entries must be a valid HTTP token"
+                    ));
+                    continue;
+                }
+                if !subprotocols.contains(subprotocol) {
+                    subprotocols.push(subprotocol.clone());
+                }
+            }
+            websocket.allowed_subprotocols = subprotocols;
+
+            if has_legacy_url {
+                problems.push(format!(
+                    "{route_name}.websocket requires an upstreams pool and cannot be used with upstream_url"
+                ));
+            }
+            // A Connection-bound route injects a managed credential per request.
+            // Doing that once for a connection that then lives for an hour is a
+            // different security question, deferred rather than assumed safe.
+            if connection_id.is_some() {
+                problems.push(format!(
+                    "{route_name}.websocket cannot be combined with connection_id"
+                ));
+            }
+            websocket
+        });
+
         validated.push(UpstreamRouteConfig {
             id,
             connection_id,
@@ -3417,6 +3714,7 @@ fn validate_upstream_routes(
             load_balancing: route.load_balancing,
             request_body: route.request_body,
             sse: route.sse,
+            websocket,
             limits: route.limits,
             health_check: route.health_check,
             retry: route.retry,
@@ -6777,6 +7075,7 @@ mod tests {
                     load_balancing: UpstreamLoadBalancingConfig::default(),
                     request_body: UpstreamRequestBodyConfig::default(),
                     sse: None,
+                    websocket: None,
                     limits: UpstreamPoolLimitsConfig::default(),
                     health_check: None,
                     retry: None,
@@ -6802,6 +7101,7 @@ mod tests {
                     load_balancing: UpstreamLoadBalancingConfig::default(),
                     request_body: UpstreamRequestBodyConfig::default(),
                     sse: None,
+                    websocket: None,
                     limits: UpstreamPoolLimitsConfig::default(),
                     health_check: None,
                     retry: None,
@@ -6842,6 +7142,121 @@ mod tests {
         assert_eq!(
             route.add_request_headers.get("x-route-label"),
             Some(&"billing".to_owned())
+        );
+    }
+
+    #[test]
+    fn websocket_routes_reject_incoherent_bounds_and_unusable_policy() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[
+                {
+                    "id":"bounds",
+                    "path_prefix":"/bounds",
+                    "upstreams":[{"id":"a","url":"https://a.example.test"}],
+                    "websocket":{
+                        "max_connections":4,
+                        "max_connections_per_endpoint":9,
+                        "handshake_timeout_ms":1,
+                        "idle_timeout_ms":10,
+                        "max_frame_bytes":1048576,
+                        "max_message_bytes":1024
+                    }
+                },
+                {
+                    "id":"policy",
+                    "path_prefix":"/policy",
+                    "upstreams":[{"id":"b","url":"https://b.example.test"}],
+                    "websocket":{
+                        "allowed_origins":["https://ok.example.test/path","ftp://nope.example.test"],
+                        "allowed_subprotocols":["bad protocol"]
+                    }
+                },
+                {
+                    "id":"legacy",
+                    "path_prefix":"/legacy",
+                    "upstream_url":"https://legacy.example.test",
+                    "websocket":{}
+                }
+            ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("incoherent websocket settings must fail startup");
+        let message = error.to_string();
+
+        for expected in [
+            // A per-endpoint cap above the route cap can never bind.
+            "[0].websocket.max_connections_per_endpoint must be between 1 and websocket.max_connections",
+            "[0].websocket.handshake_timeout_ms must be between",
+            "[0].websocket.idle_timeout_ms must be 0 to disable",
+            // A message cap below the frame cap could not be met by one legal frame.
+            "[0].websocket.max_message_bytes must be at least websocket.max_frame_bytes",
+            "[1].websocket.allowed_origins entries must be an http or https origin",
+            "[1].websocket.allowed_subprotocols entries must be a valid HTTP token",
+            "[2].websocket requires an upstreams pool and cannot be used with upstream_url",
+        ] {
+            assert!(
+                message.contains(expected),
+                "aggregated validation should contain '{expected}': {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_origins_normalize_to_one_comparable_serialization() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[{
+                "id":"origins",
+                "path_prefix":"/origins",
+                "upstreams":[{"id":"a","url":"https://a.example.test"}],
+                "websocket":{
+                    "allowed_origins":[
+                        "https://App.Example.Test:443",
+                        "https://app.example.test",
+                        "http://Other.Example.Test:8080"
+                    ],
+                    "allowed_subprotocols":["chat","chat","echo"]
+                }
+            }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("valid websocket route should parse");
+        let websocket = config.upstream_routes[0]
+            .websocket
+            .as_ref()
+            .expect("websocket config should be present");
+
+        // Case and a default port must not decide whether an origin matches, and
+        // the same origin written two ways collapses to one entry.
+        assert_eq!(
+            websocket.allowed_origins,
+            vec![
+                "https://app.example.test".to_owned(),
+                "http://other.example.test:8080".to_owned(),
+            ]
+        );
+        assert_eq!(
+            websocket.allowed_subprotocols,
+            vec!["chat".to_owned(), "echo".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_route_without_websocket_configuration_keeps_ordinary_forwarding() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[{
+                "id":"plain",
+                "path_prefix":"/plain",
+                "upstreams":[{"id":"a","url":"https://a.example.test"}]
+            }]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("plain route should parse");
+        assert!(
+            config.upstream_routes[0].websocket.is_none(),
+            "websocket proxying must stay opt-in"
         );
     }
 
