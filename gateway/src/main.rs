@@ -14020,6 +14020,59 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn policy_can_bind_the_derived_route_id_of_an_unnamed_route() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let unnamed_route = path_route("/api", upstream_addr);
+        assert!(
+            unnamed_route.id.is_none(),
+            "fixture must exercise a route with no explicit id"
+        );
+        // The id the gateway derives for this route, reports as
+        // `upstream_route_id` on every observation event, and compares against
+        // in the dispatch matcher.
+        let route_id = crate::proxy::legacy_route_id(&unnamed_route);
+        let policy = TempPolicyFile::new(
+            &json!({
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "rules": [{
+                    "methods": ["GET"],
+                    "path": "/api/**",
+                    "dispatch": {
+                        "kind": "route",
+                        "route_id": route_id
+                    },
+                    "action": "deny"
+                }]
+            })
+            .to_string(),
+        );
+        let mut config = routing_proxy_config(vec![unnamed_route]);
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+
+        // Building the app runs policy dispatch validation, which previously
+        // refused this rule and aborted startup.
+        let router = proxy_router(config, test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/orders")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route-bound denial should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "a rule bound to the derived route id must deny before proxying",
+        )
+        .await;
+    }
+
     #[test]
     fn catch_all_pool_migration_rejects_stale_legacy_origin_policy() {
         let upstream_addr: SocketAddr = "127.0.0.1:41001".parse().expect("test address");

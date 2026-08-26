@@ -941,7 +941,12 @@ pub(crate) fn logical_pool_origin(route_id: &str) -> String {
     format!("pool:{route_id}")
 }
 
-fn legacy_route_id(route: &config::UpstreamRouteConfig) -> String {
+/// The effective route ID for a route that carries no explicit `id`.
+///
+/// This is the identity the classifier, the dispatch matcher, and the
+/// `upstream_route_id` audit dimension all use, so policy validation derives it
+/// through this same function rather than reimplementing the digest.
+pub(crate) fn legacy_route_id(route: &config::UpstreamRouteConfig) -> String {
     let mut digest = Sha256::new();
     digest.update(b"greengateway:legacy-route-id:v1\0");
     if let Some(host) = route.host.as_deref() {
