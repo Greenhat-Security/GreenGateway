@@ -767,7 +767,11 @@ mod tests {
             json!(TOOL_POLICY_DENIED_CODE.0),
             "{body}"
         );
-        assert_eq!(body["error"]["data"]["reason"], json!("role_denied"), "{body}");
+        assert_eq!(
+            body["error"]["data"]["reason"],
+            json!("role_denied"),
+            "{body}"
+        );
         assert_eq!(
             body["error"]["data"]["tool_name"],
             json!(RESTRICTED_TOOL),
