@@ -3538,6 +3538,17 @@ async fn connection_secret_rotate_endpoint(
         Ok(replacement) => replacement,
         Err(_) => return connection_secret_validation_error(),
     };
+    // When this secret is one half of a client identity whose other half lives
+    // behind a network provider, the synchronous preflight inside rotate cannot
+    // fetch that half to match the pair. Do it here, before the mutation guard,
+    // so the network I/O happens outside the lock.
+    if let Err(error) = state
+        .control_plane
+        .ensure_rotated_identity_pairs_resolvable(&raw_id, &replacement)
+        .await
+    {
+        return connection_mutation_error_response(error);
+    }
     let mutation_guard = match connection_secret_mutation_guard(&state) {
         Ok(guard) => guard,
         Err(response) => return *response,
