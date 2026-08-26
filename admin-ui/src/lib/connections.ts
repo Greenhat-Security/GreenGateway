@@ -1014,8 +1014,17 @@ function projectConnectionTestProfile(
   value: unknown,
 ): ConnectionTestProfile {
   const source = responseObject(value, 'connection test profile');
+  // `OPTIONS` is refused on writes but deliberately still readable: the managed
+  // store validates persisted records with `allow_legacy_options`, so a record
+  // created under an early release keeps serving it. Rejecting it here rejects
+  // the whole connection response, which leaves the detail page and the editor
+  // permanently unopenable for that connection. The editor already normalizes
+  // any non-HEAD method to GET, so opening and saving migrates the record
+  // forward rather than preserving a value the write path would refuse.
   if (
-    (source.method !== 'GET' && source.method !== 'HEAD') ||
+    (source.method !== 'GET' &&
+      source.method !== 'HEAD' &&
+      source.method !== 'OPTIONS') ||
     !isSafeOriginRelativePath(source.path) ||
     !Array.isArray(source.expected_statuses) ||
     !source.expected_statuses.every(isHttpStatusCode)

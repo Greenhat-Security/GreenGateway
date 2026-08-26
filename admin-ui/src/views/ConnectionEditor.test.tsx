@@ -555,6 +555,79 @@ describe('ConnectionEditor', () => {
     expect(detailReads).toBe(2);
   });
 
+  it('says a created secret was not selected when no field on the form takes its purpose', async () => {
+    // The Purpose selector defaults to `static_bearer` whatever the connection's
+    // authentication type is, so on a header-API-key connection the mismatch is
+    // the default state rather than an edge case. The secret is still created;
+    // only the claim that it was selected was wrong.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (url.pathname === '/v1/admin/connections' && !init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, connectionList(true), {
+              ETag: '"connections-entity"',
+              'X-GreenGateway-Connections-ETag': '"connections-collection"',
+            }),
+          );
+        }
+        if (url.pathname === '/v1/admin/connection-secrets' && !init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, secretList({ canCreate: true }), {
+              ETag: '"secret-representation"',
+              'X-GreenGateway-Connection-Secrets-ETag':
+                '"secret-precondition"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connection-secrets' &&
+          init?.method === 'POST'
+        ) {
+          return Promise.resolve(
+            jsonResponse(
+              201,
+              localSecret({
+                id: 'local-created',
+                etag: '"local-created-etag"',
+                label: 'Billing token',
+                compatible_purposes: ['static_bearer'],
+              }),
+              {
+                ETag: '"local-created-etag"',
+                'X-GreenGateway-Connection-Secrets-ETag':
+                  '"secret-precondition-2"',
+              },
+            ),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+      }),
+    );
+
+    renderEditor('/connections/new');
+    await screen.findByLabelText('Safe label');
+    fireEvent.change(screen.getByLabelText('Authentication type'), {
+      target: { value: 'header_api_key' },
+    });
+    fireEvent.change(await screen.findByLabelText('Safe label'), {
+      target: { value: 'Billing token' },
+    });
+    // Purpose deliberately left at its default, which does not match.
+    fireEvent.change(screen.getByLabelText('Secret value'), {
+      target: { value: 'plaintext-canary' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Create and select' }));
+
+    expect(await screen.findByText('Local secret created')).toBeTruthy();
+    expect(document.body.textContent).toContain('it was not selected');
+    expect(document.body.textContent).not.toContain(
+      'selected for this draft',
+    );
+    expect(document.body.textContent).not.toContain('plaintext-canary');
+  });
+
   it('creates a local secret with the secret collection ETag and never redisplays plaintext', async () => {
     const secretPosts: RequestInit[] = [];
     vi.stubGlobal(
