@@ -108,6 +108,10 @@ pub struct SafeSecretAliasView {
     pub configured: bool,
     pub compatible_purposes: Vec<SecretPurpose>,
     pub dependency_count: usize,
+    /// Whether resolution is bound to an immutable provider version. Always
+    /// emitted so consumers never face a tri-state; opaque provider version
+    /// identifiers stay redacted and only this bit is surfaced.
+    pub pinned: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,6 +147,7 @@ impl SafeSecretAliasView {
             configured: metadata.configured,
             compatible_purposes,
             dependency_count,
+            pinned: metadata.pinned,
             version: metadata.version,
             rotated_at: metadata.rotated_at,
             actions: SecretAliasActions {

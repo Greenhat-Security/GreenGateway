@@ -1134,6 +1134,7 @@ impl SecretResolver for GcpSecretManagerProvider {
                 provider: SecretProviderKind::GcpSecretManager,
                 configured: true,
                 purpose: None,
+                pinned: alias.version.is_some(),
                 version: alias.version,
                 rotated_at: None,
             })
@@ -3085,6 +3086,7 @@ mod tests {
         assert_eq!(metadata.len(), 1);
         assert_eq!(metadata[0].provider, SecretProviderKind::GcpSecretManager);
         assert_eq!(metadata[0].version, Some(2));
+        assert!(metadata[0].pinned);
         assert!(serde_json::to_string(&metadata)
             .expect("alias metadata should serialize")
             .contains("gcp_secret_manager"));

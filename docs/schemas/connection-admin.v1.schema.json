@@ -1010,6 +1010,7 @@
         "configured",
         "compatible_purposes",
         "dependency_count",
+        "pinned",
         "actions"
       ],
       "properties": {
@@ -1042,6 +1043,9 @@
         "dependency_count": {
           "type": "integer",
           "minimum": 0
+        },
+        "pinned": {
+          "type": "boolean"
         },
         "version": {
           "type": "integer",
