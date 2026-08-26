@@ -38265,4 +38265,7 @@ O2gecI9QwDJNpm29J9wJB2F8
 
     #[path = "issue_240_acceptance_core.rs"]
     mod issue_240_acceptance_core;
+
+    #[path = "issue_256_acceptance_websocket.rs"]
+    mod issue_256_acceptance_websocket;
 }
