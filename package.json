@@ -10,7 +10,7 @@
     "load:soak": "node scripts/run-load-suite.mjs",
     "load:resilience": "node scripts/run-resilience-load.mjs",
     "load:resilience:quick": "node scripts/run-resilience-load.mjs --quick",
-    "test": "vitest run cloudflare/src/config.test.ts",
+    "test": "vitest run cloudflare/src",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
