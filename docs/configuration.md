@@ -1267,8 +1267,8 @@ When both active work and queue capacity are exhausted, or a queued request time
 - `interval_ms`: interval between checks, default `10000`, range 100-3600000.
 - `jitter_ms`: centered per-check jitter, default `0`, and less than `interval_ms`.
 - `timeout_ms`: per-check timeout, default `1000`, range 10-60000 and no greater than `interval_ms`.
-- `healthy_threshold`: consecutive successes required for eligibility, default `2`, range 1-1000.
-- `unhealthy_threshold`: consecutive failures required for exclusion, default `3`, range 1-1000.
+- `healthy_threshold`: consecutive successes required for eligibility, default `2`, range 1-1000. Only active-check successes readmit an endpoint, so the in-flight tail of requests that were dispatched before an exclusion cannot undo it.
+- `unhealthy_threshold`: consecutive failures required for exclusion, default `3`, range 1-1000. The active check and passive observations keep independent streaks, so a proxied success never cancels an active-probe failure streak and either streak reaching the threshold excludes the endpoint; a state change clears the other source's streak so pre-transition evidence cannot immediately re-trigger.
 - `expected_statuses`: unique active-check success statuses, default `[200,204]`, at most 32 values in 100-599.
 - `passive_failure_statuses`: unique proxied response statuses counted as failures, default `[500,502,503,504]`, at most 32 values in 500-599. Connection, DNS-resolution, request, and response-idle timeout failures also count; client/configuration and request-body errors do not.
 - `required_for_readiness`: whether this pool contributes to cached readiness, default `false`.
