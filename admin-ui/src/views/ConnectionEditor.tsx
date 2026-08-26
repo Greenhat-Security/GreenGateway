@@ -572,7 +572,14 @@ export function ConnectionEditor() {
   const editorBusy =
     saveState.kind === 'saving' || secretMutationInFlight;
 
-  function bindSecret(purpose: ConnectionSecretPurpose, secretId: string) {
+  // Returns whether a field on this form actually took the secret. A secret
+  // whose purpose is neither the current authentication purpose nor one of the
+  // TLS purposes has nowhere to go, and the caller must not report it as
+  // selected.
+  function bindSecret(
+    purpose: ConnectionSecretPurpose,
+    secretId: string,
+  ): boolean {
     const replacement: BindingDraft = {
       configured: false,
       intent: 'replace',
@@ -580,15 +587,21 @@ export function ConnectionEditor() {
     };
     if (purpose === authenticationPurpose(form.authenticationType)) {
       updateForm({ authenticationBinding: replacement });
-      return;
+      return true;
     }
     if (purpose === 'tls_ca_bundle') {
       updateForm({ caBundleBinding: replacement });
-    } else if (purpose === 'tls_certificate') {
-      updateForm({ clientCertificateBinding: replacement });
-    } else if (purpose === 'tls_private_key') {
-      updateForm({ clientPrivateKeyBinding: replacement });
+      return true;
     }
+    if (purpose === 'tls_certificate') {
+      updateForm({ clientCertificateBinding: replacement });
+      return true;
+    }
+    if (purpose === 'tls_private_key') {
+      updateForm({ clientPrivateKeyBinding: replacement });
+      return true;
+    }
+    return false;
   }
 
   function removeDeletedSecret(secretId: string) {
@@ -1394,7 +1407,7 @@ function LocalSecretManager({
   resetKey: string;
   contextKey: string;
   onInventoryChange: (next: SecretInventoryState) => void;
-  onBind: (purpose: ConnectionSecretPurpose, secretId: string) => void;
+  onBind: (purpose: ConnectionSecretPurpose, secretId: string) => boolean;
   onDelete: (secretId: string) => void;
   onMutatingChange: (isMutating: boolean) => void;
   onDraftChange: (hasDraft: boolean) => void;
@@ -1619,18 +1632,23 @@ function LocalSecretManager({
         },
         collectionEtag: resource.collectionEtag,
       });
-      if (canBindSecret) {
-        onBind(purpose, created.id);
-      }
+      // `canBindSecret` only says the operator may bind; whether this secret's
+      // purpose matches a field on the draft is a separate question, and the
+      // notice has to answer the one that actually happened. The purpose
+      // selector defaults to `static_bearer` regardless of the connection's
+      // authentication type, so a mismatch is the default state for a
+      // header-API-key or OAuth connection rather than an edge case.
+      const bound = canBindSecret && onBind(purpose, created.id);
       setSelectedSecretId(created.id);
       setLabel('');
       setMode('manage');
       setNotice({
-        tone: 'success',
+        tone: bound || !canBindSecret ? 'success' : 'warning',
         title: 'Local secret created',
-        message:
-          canBindSecret
-            ? 'The value was accepted, selected for this draft, and cleared from this page. It cannot be revealed again.'
+        message: bound
+          ? 'The value was accepted, selected for this draft, and cleared from this page. It cannot be revealed again.'
+          : canBindSecret
+            ? `The value was accepted and cleared from this page, but nothing on this form takes a ${formatSecretPurpose(purpose)} secret, so it was not selected. Choose a matching purpose, or bind it from the field that needs it.`
             : 'The value was accepted and cleared from this page. It cannot be revealed again.',
       });
     } catch (error) {

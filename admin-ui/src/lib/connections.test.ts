@@ -544,6 +544,41 @@ describe('connections API client', () => {
     }
   });
 
+  it('opens a connection whose persisted test profile uses the legacy OPTIONS method', async () => {
+    // The managed store validates persisted records with `allow_legacy_options`,
+    // so a connection created under an early release keeps serving
+    // `test_profile.method: "OPTIONS"` on read even though writes refuse it.
+    // Rejecting it here rejected the entire connection response, which left the
+    // detail page and the editor permanently unopenable for that connection.
+    const detail = {
+      ...connectionDetailWithCanary('UNEXPECTED_FIELD_CANARY'),
+      id: 'connection-1',
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(200, {
+            ...detail,
+            configuration: {
+              ...detail.configuration,
+              test_profile: {
+                ...detail.configuration.test_profile,
+                method: 'OPTIONS',
+              },
+            },
+          }),
+        ),
+      ),
+    );
+
+    const result = await getConnection('connection-1');
+
+    expect(result.value.configuration?.test_profile?.method).toBe(
+      'OPTIONS',
+    );
+  });
+
   it('uses exact ETags and valid media types for every mutation', async () => {
     const calls: Array<{
       path: string;
