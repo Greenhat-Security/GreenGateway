@@ -288,6 +288,7 @@ pub enum KubernetesProviderConfigError {
     InvalidBootstrapAlias { index: usize },
     BootstrapAliasCycle { index: usize },
     BootstrapResolverRequired { index: usize },
+    UnknownBootstrapAlias { index: usize },
     InvalidAliasId { index: usize },
     InvalidLabel { index: usize },
     DuplicateAliasId { index: usize, previous: usize },
@@ -381,6 +382,10 @@ impl fmt::Display for KubernetesProviderConfigError {
                 formatter,
                 "kubernetes profile at index {index} references an alias of another provider but no other provider is configured"
             ),
+            Self::UnknownBootstrapAlias { index } => write!(
+                formatter,
+                "kubernetes profile at index {index} bootstraps from an alias that no configured provider owns"
+            ),
             Self::InvalidAliasId { index } => write!(
                 formatter,
                 "kubernetes alias at index {index} has an invalid opaque ID"
@@ -424,6 +429,28 @@ impl Error for KubernetesProviderConfigError {}
 
 /// Validates trusted startup configuration without touching the filesystem,
 /// DNS, or the provider.
+/// Requires that the resolver which will actually serve a profile's bootstrap
+/// material both exists and owns the named alias.
+///
+/// Checking the alias against the live bootstrap resolver rather than against a
+/// reserved-id set keeps this correct however the resolver is composed: an id
+/// that no resolver owns is a permanent configuration error, and catching it here
+/// turns it into a startup failure instead of an authentication failure on every
+/// request for the life of the process.
+fn require_bootstrap_alias(
+    index: usize,
+    alias: &str,
+    bootstrap: Option<&Arc<dyn SecretResolver>>,
+) -> Result<(), KubernetesProviderConfigError> {
+    let Some(resolver) = bootstrap else {
+        return Err(KubernetesProviderConfigError::BootstrapResolverRequired { index });
+    };
+    if !resolver.contains_alias(alias) {
+        return Err(KubernetesProviderConfigError::UnknownBootstrapAlias { index });
+    }
+    Ok(())
+}
+
 pub fn validate_kubernetes_provider_config(
     config: &KubernetesProviderConfig,
     reserved_alias_ids: &BTreeSet<String>,
@@ -860,8 +887,8 @@ impl KubernetesSecretProvider {
         validate_kubernetes_provider_config(config, reserved_alias_ids)?;
         let mut profiles = BTreeMap::new();
         for (index, profile) in config.profiles.iter().enumerate() {
-            if profile.ca_bundle_alias.is_some() && bootstrap.is_none() {
-                return Err(KubernetesProviderConfigError::BootstrapResolverRequired { index });
+            if let Some(alias) = profile.ca_bundle_alias.as_deref() {
+                require_bootstrap_alias(index, alias, bootstrap.as_ref())?;
             }
             let ca_bundle = if let Some(alias) = profile.ca_bundle_alias.as_deref() {
                 Some(CaBundleSource::Alias(alias.to_owned()))
@@ -899,11 +926,7 @@ impl KubernetesSecretProvider {
                     token_file: token_file.clone(),
                 },
                 KubernetesAuthConfig::BearerAlias { secret_alias } => {
-                    if bootstrap.is_none() {
-                        return Err(KubernetesProviderConfigError::BootstrapResolverRequired {
-                            index,
-                        });
-                    }
+                    require_bootstrap_alias(index, secret_alias, bootstrap.as_ref())?;
                     KubernetesAuth::BearerAlias {
                         secret_alias: secret_alias.clone(),
                     }
@@ -912,11 +935,8 @@ impl KubernetesSecretProvider {
                     certificate_alias,
                     private_key_alias,
                 } => {
-                    if bootstrap.is_none() {
-                        return Err(KubernetesProviderConfigError::BootstrapResolverRequired {
-                            index,
-                        });
-                    }
+                    require_bootstrap_alias(index, certificate_alias, bootstrap.as_ref())?;
+                    require_bootstrap_alias(index, private_key_alias, bootstrap.as_ref())?;
                     KubernetesAuth::ClientCertificate {
                         certificate_alias: certificate_alias.clone(),
                         private_key_alias: private_key_alias.clone(),
@@ -1632,8 +1652,7 @@ fn validate_projected_root_permissions(
     metadata: &fs::Metadata,
     permissions: fn(usize) -> KubernetesProviderConfigError,
 ) -> Result<(), KubernetesProviderConfigError> {
-    use std::os::unix::fs::MetadataExt;
-    if metadata.mode() & 0o022 == 0 {
+    if crate::connections::secret::projected_root_permissions_are_safe(metadata) {
         Ok(())
     } else {
         Err(permissions(index))
@@ -2287,6 +2306,52 @@ client-key-material-canary
         }
     }
 
+    #[test]
+    fn a_bootstrap_alias_no_resolver_owns_is_rejected_at_construction() {
+        let bootstrap = FakeBootstrap::with_token(TOKEN_CANARY.as_bytes());
+        let cluster = FakeCluster::new();
+        let build = |profile: KubernetesProfileConfig| {
+            KubernetesSecretProvider::from_config(
+                &KubernetesProviderConfig {
+                    profiles: vec![profile],
+                    aliases: vec![alias("billing")],
+                },
+                &BTreeSet::new(),
+                FakeTransport::new(Arc::clone(&cluster)) as Arc<dyn KubernetesTransport>,
+                Some(Arc::clone(&bootstrap) as Arc<dyn SecretResolver>),
+            )
+            .map(|_| ())
+        };
+
+        // A bearer alias nothing owns must fail here, not on every request for
+        // the life of the process.
+        assert!(matches!(
+            build(bearer_profile("primary", "no-such-alias")),
+            Err(KubernetesProviderConfigError::UnknownBootstrapAlias { index: 0 })
+        ));
+
+        // Same rule for trust material and for each half of a client identity.
+        let mut ca = bearer_profile("primary", "bootstrap-token");
+        ca.ca_bundle_alias = Some("no-such-alias".to_owned());
+        assert!(matches!(
+            build(ca),
+            Err(KubernetesProviderConfigError::UnknownBootstrapAlias { index: 0 })
+        ));
+
+        let mut identity = client_certificate_profile("primary");
+        identity.auth = KubernetesAuthConfig::ClientCertificate {
+            certificate_alias: "tls-cert".to_owned(),
+            private_key_alias: "no-such-alias".to_owned(),
+        };
+        assert!(matches!(
+            build(identity),
+            Err(KubernetesProviderConfigError::UnknownBootstrapAlias { index: 0 })
+        ));
+
+        // An owned alias still builds.
+        assert!(build(bearer_profile("primary", "bootstrap-token")).is_ok());
+    }
+
     fn bearer_profile(id: &str, secret_alias: &str) -> KubernetesProfileConfig {
         KubernetesProfileConfig {
             id: id.to_owned(),
@@ -2345,12 +2410,22 @@ client-key-material-canary
     }
 
     impl FakeBootstrap {
+        /// Seeds every alias the test profiles reference.
+        ///
+        /// Production's bootstrap resolver is the operator alias resolver, whose
+        /// id set is fixed from configuration before any provider is built, so a
+        /// fixture that only gains its aliases after construction does not model
+        /// reality — and provider construction now (correctly) rejects a profile
+        /// whose bootstrap alias no resolver owns. Tests that need material to be
+        /// absent at *request* time call `remove`.
         fn with_token(token: &[u8]) -> Arc<Self> {
             Arc::new(Self {
-                values: Mutex::new(BTreeMap::from([(
-                    "bootstrap-token".to_owned(),
-                    token.to_vec(),
-                )])),
+                values: Mutex::new(BTreeMap::from([
+                    ("bootstrap-token".to_owned(), token.to_vec()),
+                    ("cluster-ca".to_owned(), CA_PEM_CANARY.as_bytes().to_vec()),
+                    ("tls-cert".to_owned(), CERT_PEM_CANARY.as_bytes().to_vec()),
+                    ("tls-key".to_owned(), KEY_PEM_CANARY.as_bytes().to_vec()),
+                ])),
                 resolutions: AtomicU64::new(0),
             })
         }
@@ -2394,6 +2469,13 @@ client-key-material-canary
             ResolvedSecret::new(purpose, value).map_err(|_| {
                 SecretResolveError::new(alias_id, SecretResolveErrorKind::InvalidMaterial)
             })
+        }
+
+        fn contains_alias(&self, alias_id: &str) -> bool {
+            self.values
+                .lock()
+                .expect("bootstrap fixture should lock")
+                .contains_key(alias_id)
         }
 
         fn aliases(&self) -> Vec<SecretAliasMetadata> {
@@ -3211,6 +3293,8 @@ client-key-material-canary
             profiles: vec![profile.clone()],
             aliases: vec![alias("billing")],
         });
+        // Configured and resolvable at construction, gone by request time.
+        fixture.bootstrap.remove("cluster-ca");
         fixture
             .cluster
             .push_read(json_response(200, &secret_body(KEY_CANARY, VALUE_CANARY)));
@@ -3552,9 +3636,10 @@ rotated-key
             profiles: vec![client_certificate_profile("primary")],
             aliases: vec![alias("billing")],
         });
-        fixture
-            .bootstrap
-            .set("tls-cert", CERT_PEM_CANARY.as_bytes());
+        // The private key disappears after startup: the alias is configured and
+        // was resolvable when the provider was built, so this exercises the
+        // runtime fail-closed path rather than the construction-time check.
+        fixture.bootstrap.remove("tls-key");
         fixture
             .cluster
             .push_read(json_response(200, &secret_body(KEY_CANARY, VALUE_CANARY)));

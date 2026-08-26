@@ -3934,6 +3934,16 @@ async fn connection_create_endpoint(
         }
     }
 
+    // Bindings owned by a network secret provider cannot be resolved on the
+    // synchronous path inside create_managed, so they are validated here, before
+    // the mutation lock is taken and before anything is persisted.
+    if let Err(error) = state
+        .control_plane
+        .ensure_deferred_bindings_resolvable(&candidate)
+        .await
+    {
+        return connection_mutation_error_response(error);
+    }
     let created = match state
         .control_plane
         .create_managed(snapshot.collection_etag(), candidate)
@@ -4065,6 +4075,14 @@ async fn connection_put_endpoint(
         Ok(data) => data,
         Err(response) => return *response,
     };
+    // See the create handler: deferred bindings are resolved before the lock.
+    if let Err(error) = state
+        .control_plane
+        .ensure_deferred_bindings_resolvable(&candidate)
+        .await
+    {
+        return connection_mutation_error_response(error);
+    }
     let updated = match state
         .control_plane
         .replace_managed(&id, &current_etag, candidate)
