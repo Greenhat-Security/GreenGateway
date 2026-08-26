@@ -17184,19 +17184,27 @@ mod tests {
         assert_eq!(body["error"]["code"], json!(-32601));
         assert_eq!(body["error"]["data"]["tool_name"], json!("missing_tool"));
 
+        // The call is still inventoried, but under the shared unknown-tool
+        // template: a caller-supplied name may not mint an inventory key.
         let row = wait_for_mcp_tool_inventory_row(
             &harness.router,
             &harness.admin_token,
-            "missing_tool",
+            "{tool}",
             |row| row["call_count"] == json!(1) && status_count(row, 404) == Some(1),
         )
         .await;
         assert_eq!(row["method"], json!("MCP"));
-        assert_eq!(row["endpoint_template"], json!("/mcp/tools/missing_tool"));
+        assert_eq!(row["endpoint_template"], json!("/mcp/tools/{tool}"));
         assert_eq!(row["call_count"], json!(1));
         assert_eq!(row["schema_mismatch_count"], json!(0));
         assert_eq!(row["distinct_principal_count"], json!(1));
         assert_eq!(status_count(&row, 404), Some(1));
+        assert!(
+            inventory_rows_for_tool(&harness.router, &harness.admin_token, "missing_tool")
+                .await
+                .is_empty(),
+            "the caller-supplied name must not become its own inventory row"
+        );
     }
 
     #[tokio::test]
@@ -17310,12 +17318,12 @@ mod tests {
         let row = wait_for_mcp_tool_inventory_row(
             &harness.router,
             &harness.admin_token,
-            "missing_tool",
+            "{tool}",
             |row| row["call_count"] == json!(1) && status_count(row, 404) == Some(1),
         )
         .await;
         assert_eq!(row["method"], json!("MCP"));
-        assert_eq!(row["endpoint_template"], json!("/mcp/tools/missing_tool"));
+        assert_eq!(row["endpoint_template"], json!("/mcp/tools/{tool}"));
         assert_eq!(row["call_count"], json!(1));
         assert_eq!(row["schema_mismatch_count"], json!(0));
         assert_eq!(status_count(&row, 404), Some(1));
@@ -35320,8 +35328,10 @@ paths:
 
     async fn inventory_rows_for_tool(router: &Router, token: &str, tool_name: &str) -> Vec<Value> {
         let endpoint_template = format!("/mcp/tools/{tool_name}");
+        // Query on the shared prefix and filter exactly, so a template holding
+        // URI-hostile characters (the unknown-tool placeholder) still resolves.
         let uri = format!(
-            "{TRAFFIC_ENDPOINTS_ADMIN_ROUTE}?method=MCP&endpoint_template_prefix={endpoint_template}"
+            "{TRAFFIC_ENDPOINTS_ADMIN_ROUTE}?method=MCP&endpoint_template_prefix=/mcp/tools/"
         );
         let response = router
             .clone()

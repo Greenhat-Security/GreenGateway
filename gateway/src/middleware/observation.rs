@@ -1,7 +1,8 @@
 //! Per-request observation audit event middleware.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    fmt,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -44,6 +45,14 @@ pub(crate) const MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT: u64 = 5;
 /// this window without scanning SQLite or reparsing historical samples on every
 /// request.
 const INFERRED_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(5);
+/// A captured payload shape carries one entry per distinct query parameter and
+/// per top-level JSON body key, and every retained sample of it is stored whole.
+/// The request body itself is only bounded by `EGRESS_MAX_REQUEST_BODY_BYTES`,
+/// so without these caps a single wide body decides how much memory and SQLite
+/// one endpoint consumes. A capture past the cap is truncated and marked, never
+/// silently dropped.
+const MAX_CAPTURED_QUERY_PARAMS: usize = 64;
+const MAX_CAPTURED_JSON_BODY_KEYS: usize = 64;
 
 #[derive(Clone)]
 pub struct ObservationState {
@@ -139,6 +148,8 @@ impl BodyCaptureStatus {
 pub struct CapturedPayloadShape {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     query_params: Vec<CapturedQueryParam>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    query_params_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     json_body: Option<CapturedJsonBodyShape>,
 }
@@ -153,6 +164,12 @@ pub struct CapturedQueryParam {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct CapturedJsonBodyShape {
     top_level_keys: Vec<CapturedFieldName>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    top_level_keys_truncated: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -676,7 +693,12 @@ impl PreparedSchemaConformanceCheck {
             Self::Expected {
                 expected,
                 observed_shape,
-            } => Some(expected.mismatches(captured_shape.unwrap_or(observed_shape))),
+            } => {
+                let observed = captured_shape.unwrap_or(observed_shape);
+                // Same reasoning as an incomplete body capture: decline the
+                // verdict rather than report a mismatch the cap manufactured.
+                (!observed.is_truncated()).then(|| expected.mismatches(observed))
+            }
         }
     }
 }
@@ -883,10 +905,22 @@ impl PayloadCaptureHandle {
 
 impl CapturedPayloadShape {
     fn from_query(query: Option<&str>) -> Self {
+        let (query_params, query_params_truncated) = captured_query_params(query);
         Self {
-            query_params: captured_query_params(query),
+            query_params,
+            query_params_truncated,
             json_body: None,
         }
+    }
+
+    /// A truncated capture has seen only part of the request, so it can never
+    /// prove a documented field absent.
+    fn is_truncated(&self) -> bool {
+        self.query_params_truncated
+            || self
+                .json_body
+                .as_ref()
+                .is_some_and(|json_body| json_body.top_level_keys_truncated)
     }
 
     fn has_captured_data(&self) -> bool {
@@ -936,11 +970,12 @@ pub(crate) fn captured_payload_shape(
     shape.has_captured_data().then_some(shape)
 }
 
-fn captured_query_params(query: Option<&str>) -> Vec<CapturedQueryParam> {
+fn captured_query_params(query: Option<&str>) -> (Vec<CapturedQueryParam>, bool) {
     let Some(query) = query else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let mut params = BTreeMap::<String, &'static str>::new();
+    let mut truncated = false;
 
     for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
         let name = name.trim();
@@ -948,19 +983,71 @@ fn captured_query_params(query: Option<&str>) -> Vec<CapturedQueryParam> {
             continue;
         }
         let value_type = query_value_type(value.trim());
-        params
-            .entry(name.to_owned())
-            .and_modify(|existing| *existing = merge_query_value_type(existing, value_type))
-            .or_insert(value_type);
+        if let Some(existing) = params.get_mut(name) {
+            *existing = merge_query_value_type(existing, value_type);
+            continue;
+        }
+        if params.len() >= MAX_CAPTURED_QUERY_PARAMS {
+            truncated = true;
+            continue;
+        }
+        params.insert(name.to_owned(), value_type);
     }
 
-    params
+    let params = params
         .into_iter()
         .map(|(name, value_type)| CapturedQueryParam {
             name: captured_field_name(&name),
             value_type: value_type.to_owned(),
         })
-        .collect()
+        .collect();
+
+    (params, truncated)
+}
+
+/// Top-level object keys read without materializing the body: values are
+/// discarded as they are parsed and keys stop being retained at the cap, so
+/// neither the body's size nor its key count drives an allocation here.
+struct TopLevelJsonObjectKeys {
+    keys: BTreeSet<String>,
+    truncated: bool,
+}
+
+impl<'de> Deserialize<'de> for TopLevelJsonObjectKeys {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(TopLevelJsonObjectKeysVisitor)
+    }
+}
+
+struct TopLevelJsonObjectKeysVisitor;
+
+impl<'de> serde::de::Visitor<'de> for TopLevelJsonObjectKeysVisitor {
+    type Value = TopLevelJsonObjectKeys;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        let mut truncated = false;
+        while let Some(key) = map.next_key::<String>()? {
+            map.next_value::<serde::de::IgnoredAny>()?;
+            if keys.len() < MAX_CAPTURED_JSON_BODY_KEYS || keys.contains(&key) {
+                keys.insert(key);
+            } else {
+                truncated = true;
+            }
+        }
+
+        Ok(TopLevelJsonObjectKeys { keys, truncated })
+    }
 }
 
 fn captured_json_body_shape(
@@ -971,18 +1058,15 @@ fn captured_json_body_shape(
         return None;
     }
 
-    let value = serde_json::from_slice::<Value>(body).ok()?;
-    let Value::Object(object) = value else {
-        return None;
-    };
+    let object = serde_json::from_slice::<TopLevelJsonObjectKeys>(body).ok()?;
 
-    let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
-    keys.sort_unstable();
     Some(CapturedJsonBodyShape {
-        top_level_keys: keys
-            .into_iter()
-            .map(captured_field_name)
+        top_level_keys: object
+            .keys
+            .iter()
+            .map(|key| captured_field_name(key))
             .collect::<Vec<_>>(),
+        top_level_keys_truncated: object.truncated,
     })
 }
 
@@ -1303,6 +1387,85 @@ mod tests {
                 "sensitive key name leaked verbatim: {serialized}"
             );
         }
+    }
+
+    #[test]
+    fn payload_capture_caps_query_parameter_and_body_key_counts() {
+        let query = (0..MAX_CAPTURED_QUERY_PARAMS * 4)
+            .map(|index| format!("q{index}=1"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let body = format!(
+            "{{{}}}",
+            (0..MAX_CAPTURED_JSON_BODY_KEYS * 4)
+                .map(|index| format!("\"k{index}\":1"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        let shape = captured_payload_shape(
+            Some(&query),
+            Some("application/json"),
+            Some(body.as_bytes()),
+        )
+        .expect("shape should be captured");
+
+        assert_eq!(shape.query_params.len(), MAX_CAPTURED_QUERY_PARAMS);
+        assert!(shape.query_params_truncated);
+        let json_body = shape.json_body.as_ref().expect("body shape should capture");
+        assert_eq!(json_body.top_level_keys.len(), MAX_CAPTURED_JSON_BODY_KEYS);
+        assert!(json_body.top_level_keys_truncated);
+        assert!(shape.is_truncated());
+    }
+
+    #[test]
+    fn payload_capture_keeps_every_field_below_the_cap() {
+        let shape = captured_payload_shape(
+            Some("page=1&filter=alpha"),
+            Some("application/json"),
+            Some(br#"{"name":"Alice","city":"Portland"}"#),
+        )
+        .expect("shape should be captured");
+
+        assert_eq!(shape.query_params.len(), 2);
+        let json_body = shape.json_body.as_ref().expect("body shape should capture");
+        assert_eq!(json_body.top_level_keys.len(), 2);
+        assert!(!shape.is_truncated());
+
+        let serialized = serde_json::to_string(&shape).expect("shape should serialize");
+        assert!(
+            !serialized.contains("truncated"),
+            "an untruncated capture must serialize exactly as before: {serialized}"
+        );
+    }
+
+    #[test]
+    fn truncated_capture_declines_a_schema_conformance_verdict() {
+        let expected = ExpectedRequestShape {
+            required_query_params: vec![captured_field_name("beyond-the-cap")],
+            required_json_body_keys: Vec::new(),
+        };
+        let query = (0..MAX_CAPTURED_QUERY_PARAMS * 2)
+            .map(|index| format!("q{index}=1"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let observed_shape = CapturedPayloadShape::from_query(Some(&query));
+        assert!(observed_shape.is_truncated());
+        assert!(
+            expected.mismatches(&observed_shape),
+            "the required field is genuinely absent from the truncated capture"
+        );
+
+        let check = PreparedSchemaConformanceCheck::Expected {
+            expected,
+            observed_shape,
+        };
+
+        assert_eq!(
+            check.schema_mismatch(None, BodyCaptureStatus::NotObserved),
+            None,
+            "a capped capture must not manufacture a schema mismatch"
+        );
     }
 
     #[test]

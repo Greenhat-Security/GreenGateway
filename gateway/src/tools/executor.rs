@@ -59,6 +59,11 @@ const PATH_SEGMENT_ARGUMENT_ENCODE_SET: &AsciiSet = &CONTROLS
 
 const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
 const MCP_TOOL_OBSERVATION_METHOD: &str = "MCP";
+/// Discovery keys endpoint aggregates and signals by `endpoint_template`, so a
+/// template may only ever hold values the gateway itself controls. Tool names
+/// that do not resolve in the registry are caller supplied and unbounded in
+/// cardinality, so they all share this one template instead.
+const UNKNOWN_TOOL_OBSERVATION_TEMPLATE: &str = "/mcp/tools/{tool}";
 const TOOL_INPUT_VALIDATION_STATUS: u16 = 400;
 const TOOL_INPUT_VALIDATION_REASON: &str = "input_validation";
 const TOOL_EXECUTOR_CONFIGURATION_ERROR_STATUS: u16 = 520;
@@ -1568,7 +1573,14 @@ impl ToolExecutor {
         outcome: ToolObservationOutcome,
     ) {
         let path = tool_observation_path(tool_name);
-        let endpoint_template = path.clone();
+        // Fail closed: only a name the registry resolves earns its own
+        // discovery endpoint template. The raw name is still reported in `path`
+        // and `tool_name`, neither of which is an aggregate key.
+        let endpoint_template = if self.registry.get(tool_name).is_some() {
+            path.clone()
+        } else {
+            UNKNOWN_TOOL_OBSERVATION_TEMPLATE.to_owned()
+        };
         let mut payload = json!({
                 "method": MCP_TOOL_OBSERVATION_METHOD,
                 "path": path,
@@ -4048,9 +4060,11 @@ mod tests {
         assert_eq!(events[1].payload["tool_name"], json!("missing_tool"));
         assert_eq!(events[1].payload["method"], json!("MCP"));
         assert_eq!(events[1].payload["path"], json!("/mcp/tools/missing_tool"));
+        // The raw name stays in the event, but it must not become a discovery
+        // aggregate key: `endpoint_template` is caller controlled otherwise.
         assert_eq!(
             events[1].payload["endpoint_template"],
-            json!("/mcp/tools/missing_tool")
+            json!(UNKNOWN_TOOL_OBSERVATION_TEMPLATE)
         );
         assert_eq!(events[1].payload["status"], json!(404));
         assert_eq!(events[1].payload["schema_mismatch"], json!(false));
@@ -4061,16 +4075,109 @@ mod tests {
         );
 
         wait_until(Duration::from_secs(2), || {
-            discovery_aggregate_snapshot(&db.path, "MCP", "/mcp/tools/missing_tool").is_some_and(
-                |aggregate| aggregate.call_count == 1 && aggregate.schema_mismatch_count == 0,
-            )
+            discovery_aggregate_snapshot(&db.path, "MCP", UNKNOWN_TOOL_OBSERVATION_TEMPLATE)
+                .is_some_and(|aggregate| {
+                    aggregate.call_count == 1 && aggregate.schema_mismatch_count == 0
+                })
         })
         .await;
 
-        let aggregate = discovery_aggregate_snapshot(&db.path, "MCP", "/mcp/tools/missing_tool")
-            .expect("unknown tool inventory aggregate should be present");
+        let aggregate =
+            discovery_aggregate_snapshot(&db.path, "MCP", UNKNOWN_TOOL_OBSERVATION_TEMPLATE)
+                .expect("unknown tool inventory aggregate should be present");
         assert_eq!(aggregate.call_count, 1);
         assert_eq!(aggregate.schema_mismatch_count, 0);
+        assert!(
+            discovery_aggregate_snapshot(&db.path, "MCP", "/mcp/tools/missing_tool").is_none(),
+            "a caller-supplied tool name must not create its own aggregate"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_names_share_one_discovery_endpoint_template() {
+        let db = TempDiscoveryDb::new("tool-unknown-tool-cardinality");
+        let aggregator = Arc::new(
+            EndpointAggregatorSink::new(EndpointAggregatorSinkConfig {
+                path: db.path.clone(),
+                payload_capture_enabled: false,
+                endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
+                signal_event_sender: None,
+                signal_detector_config: Default::default(),
+            })
+            .expect("discovery aggregator sink should build"),
+        ) as Arc<dyn AuditSink>;
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(CompositeSink::new(vec![
+            Arc::new(capture.clone()) as Arc<dyn AuditSink>,
+            aggregator,
+        ])) as Arc<dyn AuditSink>);
+        let executor = executor_for_tools_with_audit(
+            socket_addr(1),
+            [echo_tool()],
+            runtime_config_without_tools(DefaultToolPolicy::Allow),
+            audit,
+        );
+
+        for index in 0..4 {
+            executor.record_unknown_tool_call(
+                &invocation_context(),
+                &format!("attacker_chosen_name_{index}"),
+                Duration::from_millis(1),
+            );
+        }
+
+        let events = audit_events(&capture, 4).await;
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.event_type, HTTP_REQUEST_OBSERVED);
+            assert_eq!(
+                event.payload["tool_name"],
+                json!(format!("attacker_chosen_name_{index}"))
+            );
+            assert_eq!(
+                event.payload["endpoint_template"],
+                json!(UNKNOWN_TOOL_OBSERVATION_TEMPLATE),
+                "every unknown name must collapse onto one aggregate key"
+            );
+        }
+
+        wait_until(Duration::from_secs(2), || {
+            discovery_aggregate_snapshot(&db.path, "MCP", UNKNOWN_TOOL_OBSERVATION_TEMPLATE)
+                .is_some_and(|aggregate| aggregate.call_count == 4)
+        })
+        .await;
+
+        for index in 0..4 {
+            assert!(
+                discovery_aggregate_snapshot(
+                    &db.path,
+                    "MCP",
+                    &format!("/mcp/tools/attacker_chosen_name_{index}")
+                )
+                .is_none(),
+                "no per-name aggregate may be created"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn known_tool_keeps_its_own_discovery_endpoint_template() {
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let executor = executor_for_tools_with_audit(
+            socket_addr(1),
+            [echo_tool()],
+            runtime_config_without_tools(DefaultToolPolicy::Allow),
+            audit,
+        );
+
+        executor.record_unknown_tool_call(&invocation_context(), "echo", Duration::from_millis(1));
+
+        let events = audit_events(&capture, 1).await;
+        assert_eq!(
+            events[0].payload["endpoint_template"],
+            json!("/mcp/tools/echo"),
+            "a registered tool keeps its own aggregate key"
+        );
     }
 
     #[tokio::test]

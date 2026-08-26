@@ -48,6 +48,7 @@ use crate::{
             self, EndpointSignalObservation, ErrorRateSpikeSignalObservation, NewSignal,
             PrincipalNewToEndpointSignalObservation, SchemaMismatchSignalObservation,
             SignalDetectorConfig, SignalEvaluator, VolumeOutlierSignalObservation,
+            ENDPOINT_TARGET_KIND, PRINCIPAL_ENDPOINT_TARGET_KIND,
         },
         suggestions,
     },
@@ -63,6 +64,13 @@ const LATENCY_SAMPLE_LIMIT: usize = 1024;
 /// on every observation.
 const ENDPOINT_EVICTION_BATCH_DIVISOR: usize = 16;
 const PAYLOAD_SHAPE_SAMPLE_LIMIT: usize = 128;
+/// `PAYLOAD_SHAPE_SAMPLE_LIMIT` bounds how many shapes are retained per
+/// endpoint, not how large each retained shape is, and every dirty flush
+/// rewrites all of them. The capture middleware caps the field count it emits,
+/// so this is the aggregator refusing to store what it did not shape itself:
+/// audit events reach this sink over a channel, and a shape past this size is
+/// counted but never admitted to the reservoir.
+const MAX_PAYLOAD_SHAPE_SAMPLE_BYTES: usize = 16 * 1024;
 const ID_PLACEHOLDER: &str = "{id}";
 const PARAM_PLACEHOLDER: &str = "{param}";
 
@@ -825,6 +833,15 @@ impl EndpointAggregate {
     fn record_payload_shape(&mut self, observed_at: &str, shape: Value) {
         self.payload_shape_observation_count =
             self.payload_shape_observation_count.saturating_add(1);
+        if !payload_shape_fits_sample_budget(&shape) {
+            tracing::debug!(
+                method = %self.key.method,
+                endpoint_template = %self.key.endpoint_template,
+                maximum_bytes = MAX_PAYLOAD_SHAPE_SAMPLE_BYTES,
+                "discarding an oversized discovery payload shape sample"
+            );
+            return;
+        }
         offer_payload_shape_sample(
             self.payload_shape_observation_count,
             PayloadShapeSample::new(observed_at, shape),
@@ -1446,8 +1463,20 @@ impl AggregatorState {
         for (_, key) in by_access.into_iter().take(count) {
             self.aggregates.remove(&key);
             self.dirty_keys.remove(&key);
+            self.forget_queued_signals(&key);
             self.deleted_keys.insert(key);
         }
+    }
+
+    /// Signal dedupe identities are derived state, so they have to share the
+    /// lifetime of the aggregate they were derived from. Retaining them past
+    /// eviction is what lets a caller-driven key stay resident for the lifetime
+    /// of the process even though the aggregate map itself is capped.
+    fn forget_queued_signals(&mut self, key: &EndpointKey) {
+        let endpoint_target = signals::endpoint_target_key(&key.method, &key.endpoint_template);
+        let principal_prefix = format!("{endpoint_target} ");
+        self.queued_signal_identities
+            .retain(|identity| !identity.targets_endpoint(&endpoint_target, &principal_prefix));
     }
 
     fn observe(&mut self, observation: ObservedRequest) -> bool {
@@ -1616,6 +1645,7 @@ impl AggregatorState {
                 continue;
             };
             target.merge_from(source);
+            self.forget_queued_signals(&source_key);
             self.deleted_keys.insert(source_key.clone());
             self.dirty_keys.remove(&source_key);
         }
@@ -1665,6 +1695,18 @@ struct SignalIdentity {
     signal_type: String,
     target_kind: String,
     target_key: String,
+}
+
+impl SignalIdentity {
+    /// `endpoint` signals key on `"{method} {template}"` exactly;
+    /// `principal_endpoint` signals append the principal to that same prefix.
+    fn targets_endpoint(&self, endpoint_target: &str, principal_prefix: &str) -> bool {
+        match self.target_kind.as_str() {
+            ENDPOINT_TARGET_KIND => self.target_key == endpoint_target,
+            PRINCIPAL_ENDPOINT_TARGET_KIND => self.target_key.starts_with(principal_prefix),
+            _ => false,
+        }
+    }
 }
 
 impl From<&NewSignal> for SignalIdentity {
@@ -2499,7 +2541,31 @@ fn write_flush(
         upsert_aggregate(&transaction, aggregate, payload_capture_enabled)?;
     }
 
-    let opened_signals = signals::insert_signals(&transaction, pending_signals)?;
+    // A key admitted and evicted inside the same flush window has already had
+    // its (not yet written) rows deleted above, so writing its queued signal
+    // now would leave a row no eviction can ever reach again.
+    let deleted_targets = deleted_keys
+        .iter()
+        .map(|key| {
+            let endpoint_target = signals::endpoint_target_key(&key.method, &key.endpoint_template);
+            let principal_prefix = format!("{endpoint_target} ");
+            (endpoint_target, principal_prefix)
+        })
+        .collect::<Vec<_>>();
+    let pending_signals = pending_signals
+        .iter()
+        .filter(|signal| {
+            !deleted_targets
+                .iter()
+                .any(|(endpoint_target, principal_prefix)| {
+                    SignalIdentity::from(*signal)
+                        .targets_endpoint(endpoint_target, principal_prefix)
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let opened_signals = signals::insert_signals(&transaction, &pending_signals)?;
 
     transaction.commit()?;
     Ok(opened_signals)
@@ -2583,6 +2649,27 @@ fn delete_key(
         WHERE method = ?1 AND endpoint_template = ?2
         "#,
         params![key.method.as_str(), key.endpoint_template.as_str()],
+    )?;
+
+    // Signals derived from this aggregate outlive it otherwise, so an evicted
+    // key keeps its row forever and the endpoint cap bounds nothing. `substr`
+    // rather than `LIKE` so a template containing `%` or `_` is matched
+    // literally.
+    let endpoint_target = signals::endpoint_target_key(&key.method, &key.endpoint_template);
+    let principal_prefix = format!("{endpoint_target} ");
+    connection.execute(
+        r#"
+        DELETE FROM discovery_signals
+        WHERE (target_kind = ?1 AND target_key = ?3)
+           OR (target_kind = ?2 AND substr(target_key, 1, ?4) = ?5)
+        "#,
+        params![
+            ENDPOINT_TARGET_KIND,
+            PRINCIPAL_ENDPOINT_TARGET_KIND,
+            endpoint_target.as_str(),
+            i64_from_usize(principal_prefix.chars().count()),
+            principal_prefix.as_str(),
+        ],
     )?;
     Ok(())
 }
@@ -3073,6 +3160,35 @@ fn offer_latency_sample(
     if slot < sample_limit as u64 {
         samples[slot as usize] = latency_ms;
     }
+}
+
+/// Measure the serialized shape without ever materializing it, so an oversized
+/// value costs the size of one write buffer rather than its own length.
+fn payload_shape_fits_sample_budget(shape: &Value) -> bool {
+    struct BudgetedByteCounter {
+        remaining: usize,
+    }
+
+    impl io::Write for BudgetedByteCounter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.remaining = self.remaining.checked_sub(buffer.len()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "payload shape exceeds the sample byte budget",
+                )
+            })?;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = BudgetedByteCounter {
+        remaining: MAX_PAYLOAD_SHAPE_SAMPLE_BYTES,
+    };
+    serde_json::to_writer(&mut counter, shape).is_ok()
 }
 
 fn offer_payload_shape_sample(
@@ -4725,6 +4841,112 @@ mod tests {
         assert_eq!(
             payload_shape_observation_count(&db.path, "POST", "/bounded/{id}"),
             total as i64
+        );
+    }
+
+    #[test]
+    fn oversized_payload_shapes_are_counted_but_never_stored() {
+        let db = TempDb::new("payload-reservoir-bytes");
+        let sink = aggregator_sink_with_payload_capture(&db.path);
+        let wide_keys = (0..2_000)
+            .map(|index| json!({ "name": format!("field_{index}"), "redacted": false }))
+            .collect::<Vec<_>>();
+        let wide_shape = json!({ "json_body": { "top_level_keys": wide_keys } });
+        assert!(
+            serde_json::to_string(&wide_shape)
+                .expect("fixture should serialize")
+                .len()
+                > MAX_PAYLOAD_SHAPE_SAMPLE_BYTES,
+            "fixture must exceed the per-sample byte budget"
+        );
+
+        for index in 0..3 {
+            sink.emit(&observed_event_with_payload_shape(
+                "POST",
+                "/wide",
+                200,
+                10,
+                Some("user-1"),
+                timestamp(index),
+                wide_shape.clone(),
+            ));
+        }
+        sink.flush_for_test();
+
+        let rows = payload_shape_rows(&db.path);
+        assert!(
+            rows.is_empty(),
+            "a shape past the byte budget must never reach the reservoir, got {} rows of up to {} bytes",
+            rows.len(),
+            rows.iter()
+                .map(|row| row.shape_json.len())
+                .max()
+                .unwrap_or_default()
+        );
+        assert_eq!(
+            payload_shape_observation_count(&db.path, "POST", "/wide"),
+            3,
+            "the observation itself is still counted"
+        );
+    }
+
+    #[test]
+    fn evicting_an_endpoint_deletes_its_signal_rows() {
+        let db = TempDb::new("endpoint-eviction-signals");
+        let sink = aggregator_sink_with_endpoint_limit(&db.path, 8);
+
+        for index in 0..8 {
+            sink.emit(&observed_event(
+                "GET",
+                &format!("/settled-{index}"),
+                200,
+                1,
+                None,
+                timestamp_at(index),
+            ));
+        }
+        sink.flush_for_test();
+        assert!(
+            !signal_rows(&db.path).is_empty(),
+            "the settled endpoints should have opened signals to evict"
+        );
+
+        for index in 0..100 {
+            sink.emit(&observed_event(
+                "GET",
+                &format!("/rnd-{index}"),
+                404,
+                1,
+                None,
+                timestamp_at(100 + index),
+            ));
+        }
+        sink.flush_for_test();
+
+        let aggregates = aggregate_counts(&db.path);
+        assert!(aggregates.len() <= 8, "aggregates: {aggregates:?}");
+
+        let signals = signal_rows(&db.path);
+        for signal in &signals {
+            assert!(
+                aggregates.iter().any(|(method, endpoint_template, _)| {
+                    let endpoint_target = format!("{method} {endpoint_template}");
+                    signal.target_key == endpoint_target
+                        || signal
+                            .target_key
+                            .starts_with(&format!("{endpoint_target} "))
+                }),
+                "signal {} outlived its aggregate: {:?}",
+                signal.target_key,
+                aggregates
+            );
+        }
+
+        let queued_identities = sink.shared.state_guard().queued_signal_identities.len();
+        assert!(
+            queued_identities <= aggregates.len(),
+            "queued signal identities ({queued_identities}) outlived their aggregates ({})",
+            aggregates.len()
         );
     }
 
