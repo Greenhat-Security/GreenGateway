@@ -6023,6 +6023,13 @@ async fn policy_rule_shadow_review_endpoint(
         Ok(rbac_state) => rbac_state,
         Err(error) => return policy_admin_authz_error_response(error),
     };
+    // The response carries audit-history samples and the actor identities
+    // behind them, which is the data class `admin:audit:read` gates. This is
+    // the same second check the rule-preview endpoint applies for the same
+    // reason; `admin:policy:read` alone covers only aggregate rule counts.
+    if !rbac_state.principal_has_permission(principal, ADMIN_AUDIT_READ_PERMISSION) {
+        return forbidden();
+    }
     let policy = rbac_state.current_policy();
     let shadow_rules = policy
         .rules
@@ -26890,6 +26897,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_rule_shadow_review_requires_audit_read_permission() {
+        let db = TempDb::new("shadow-review-audit-forbidden");
+        create_audit_schema(&db.path);
+        let policy = TempPolicyFile::new(&shadow_review_policy_document());
+        let router =
+            policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+
+        let response = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy shadow review should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn policy_rule_shadow_review_returns_zero_counts_when_sqlite_is_unset() {
         let policy = TempPolicyFile::new(&shadow_review_policy_document());
         let router = policy_admin_router(Some(&policy), test_audit_log());
@@ -35532,7 +35561,8 @@ paths:
                 "admin": {
                     "permissions": [
                         ADMIN_POLICY_READ_PERMISSION,
-                        ADMIN_POLICY_WRITE_PERMISSION
+                        ADMIN_POLICY_WRITE_PERMISSION,
+                        ADMIN_AUDIT_READ_PERMISSION
                     ]
                 },
                 "policy-reader": {
