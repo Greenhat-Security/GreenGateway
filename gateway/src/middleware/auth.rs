@@ -12,7 +12,7 @@ use axum::{
     Json,
 };
 use http::{
-    header::{COOKIE, USER_AGENT, WWW_AUTHENTICATE},
+    header::{COOKIE, RETRY_AFTER, USER_AGENT, WWW_AUTHENTICATE},
     HeaderMap, HeaderValue, StatusCode,
 };
 use serde::Serialize;
@@ -26,7 +26,7 @@ use crate::{
     },
     client_ip::{canonical_client_ip, request_id, ClientIpPolicy},
     config::{AuthMode, Config},
-    path_match::path_prefix_matches,
+    path_match::exempt_path_matches,
 };
 
 use super::{bearer::bearer_token, decision::AuthOutcome};
@@ -51,6 +51,27 @@ pub struct AuthState {
 #[derive(Serialize)]
 struct UnauthorizedBody {
     error: &'static str,
+}
+
+#[derive(Serialize)]
+struct ServiceUnavailableBody {
+    error: &'static str,
+}
+
+/// Why authentication did not produce a principal.
+///
+/// The validators separate a credential that was judged and not accepted from
+/// one that could not be judged at all, and `ChainValidator` carries that
+/// distinction through the chain. These are different answers and they need
+/// different wire encodings: a rejected credential is the caller's problem and
+/// permanent, an identity dependency that failed is the gateway's and
+/// transient.
+#[derive(Clone, Copy)]
+enum AuthFailureKind {
+    /// The credential was evaluated and not accepted.
+    Rejected,
+    /// An identity dependency failed, so the credential was never judged.
+    Unverifiable,
 }
 
 struct AuditContext {
@@ -125,7 +146,7 @@ pub async fn auth_middleware(
         && state
             .exempt_paths
             .iter()
-            .any(|exempt_path| path_prefix_matches(&path, exempt_path))
+            .any(|exempt_path| exempt_path_matches(&path, exempt_path))
     {
         return next.run(req).await;
     }
@@ -133,21 +154,51 @@ pub async fn auth_middleware(
     let resource = state.mcp_resource_for_path(&path);
     let audit = audit_context(&req, path, &state.client_ip_policy);
     let Some(credential) = extract_credential(req.headers(), &state.cookie_name) else {
-        return auth_failure_response(&state, &audit, "missing_credential", req, next).await;
+        return auth_failure_response(
+            &state,
+            &audit,
+            AuthFailureKind::Rejected,
+            "missing_credential",
+            req,
+            next,
+        )
+        .await;
     };
 
     let Some(validator) = state.validator.as_ref().map(Arc::clone) else {
-        return auth_failure_response(&state, &audit, "no_validator_configured", req, next).await;
+        return auth_failure_response(
+            &state,
+            &audit,
+            AuthFailureKind::Rejected,
+            "no_validator_configured",
+            req,
+            next,
+        )
+        .await;
     };
 
     match &credential {
         SessionCredential::Cookie(_) if !validator.supports_cookie() => {
-            return auth_failure_response(&state, &audit, "cookie_auth_unsupported", req, next)
-                .await;
+            return auth_failure_response(
+                &state,
+                &audit,
+                AuthFailureKind::Rejected,
+                "cookie_auth_unsupported",
+                req,
+                next,
+            )
+            .await;
         }
         SessionCredential::Bearer(_) if !validator.supports_bearer() => {
-            return auth_failure_response(&state, &audit, "bearer_auth_unsupported", req, next)
-                .await;
+            return auth_failure_response(
+                &state,
+                &audit,
+                AuthFailureKind::Rejected,
+                "bearer_auth_unsupported",
+                req,
+                next,
+            )
+            .await;
         }
         _ => {}
     }
@@ -169,11 +220,20 @@ pub async fn auth_middleware(
             response
         }
         Err(AuthError::InvalidSession(reason)) => {
-            auth_failure_response(&state, &audit, reason, req, next).await
+            auth_failure_response(&state, &audit, AuthFailureKind::Rejected, reason, req, next)
+                .await
         }
         Err(AuthError::Upstream(reason)) => {
             let reason = format!("upstream_error: {reason}");
-            auth_failure_response(&state, &audit, reason, req, next).await
+            auth_failure_response(
+                &state,
+                &audit,
+                AuthFailureKind::Unverifiable,
+                reason,
+                req,
+                next,
+            )
+            .await
         }
     }
 }
@@ -254,6 +314,7 @@ fn emit_failure(state: &AuthState, context: &AuditContext, reason: &str) {
 async fn auth_failure_response(
     state: &AuthState,
     context: &AuditContext,
+    kind: AuthFailureKind,
     reason: impl Into<String>,
     req: Request,
     next: Next,
@@ -261,12 +322,23 @@ async fn auth_failure_response(
     let reason = reason.into();
     emit_failure(state, context, &reason);
 
-    match state.mode {
-        AuthMode::Required => unauthorized_with_auth_outcome(
+    match (state.mode, kind) {
+        (AuthMode::Required, AuthFailureKind::Rejected) => unauthorized_with_auth_outcome(
             reason,
             state.mcp_resource_metadata_url_for_path(&context.path),
         ),
-        AuthMode::Observe => forward_with_auth_outcome(req, next, reason).await,
+        // No credential was judged, so no bearer challenge is sent: telling a
+        // caller to re-authenticate would make it discard a token that may well
+        // be valid and re-mint it against the identity provider that is already
+        // failing. The response carries no reason and no credential-derived
+        // detail, and every `AuthError::Upstream` producer raises this on a
+        // dependency fault evaluated without consulting who the credential
+        // belongs to, so it cannot report whether a credential exists, is
+        // known, or is correctly signed.
+        (AuthMode::Required, AuthFailureKind::Unverifiable) => {
+            identity_unavailable_with_auth_outcome(reason)
+        }
+        (AuthMode::Observe, _) => forward_with_auth_outcome(req, next, reason).await,
     }
 }
 
@@ -305,6 +377,35 @@ fn unauthorized(resource_metadata_url: Option<&str>) -> Response {
     response
         .headers_mut()
         .insert(WWW_AUTHENTICATE, bearer_challenge(resource_metadata_url));
+    response
+}
+
+/// `503` for a credential the gateway could not verify.
+///
+/// Deliberately not a `401`: `401` plus `WWW-Authenticate` is the wire encoding
+/// of "your credential is bad, get a new one", which inverts the caller's
+/// recovery path when the truth is that the identity provider is unreachable.
+fn identity_unavailable() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ServiceUnavailableBody {
+            error: "service unavailable",
+        }),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("5"));
+    response
+}
+
+fn identity_unavailable_with_auth_outcome(reason: impl Into<String>) -> Response {
+    let mut response = identity_unavailable();
+    response.extensions_mut().insert(AuthOutcome {
+        principal: None,
+        authenticated: false,
+        reason: Some(reason.into()),
+    });
     response
 }
 
@@ -955,12 +1056,100 @@ mod tests {
             .await
             .expect("request should complete");
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let event = captured_event(&capture, AUTH_FAILURE).await;
         assert_eq!(
             event.payload["reason"],
             json!("upstream_error: jwks fetch failed")
         );
+    }
+
+    #[tokio::test]
+    async fn unverifiable_credential_answers_service_unavailable_without_a_challenge() {
+        let (state, _capture) =
+            test_state(Some(validator(MockOutcome::Upstream("jwks fetch failed"))));
+
+        let response = test_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header(AUTHORIZATION, "Bearer token-123")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // The credential was never judged, so nothing tells the caller to
+        // discard it and re-mint against the provider that is already failing.
+        assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("5")
+        );
+        assert_eq!(
+            body_string(response).await,
+            json!({ "error": "service unavailable" }).to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn unverifiable_and_rejected_credentials_are_told_apart_only_by_failure_class() {
+        // The 503 branch is selected by the validator's failure class alone. A
+        // credential the gateway judged and refused still gets the permanent
+        // answer, so the split never becomes an oracle for whether a particular
+        // credential exists or is well formed.
+        for (outcome, expected_status) in [
+            (
+                MockOutcome::InvalidSession("expired"),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                MockOutcome::Upstream("introspection timed out"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            for token in ["Bearer well-formed-token", "Bearer ~~~"] {
+                let (state, _capture) = test_state(Some(validator(outcome.clone())));
+                let response = test_router(state)
+                    .oneshot(
+                        Request::builder()
+                            .uri("/protected")
+                            .header(AUTHORIZATION, token)
+                            .body(Body::empty())
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("request should complete");
+
+                assert_eq!(response.status(), expected_status, "{token}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unverifiable_credential_is_forwarded_in_observe_mode() {
+        let (state, _capture) = test_state_with_mode(
+            AuthMode::Observe,
+            Some(validator(MockOutcome::Upstream("jwks fetch failed"))),
+        );
+
+        let response = test_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/administrator")
+                    .header(AUTHORIZATION, "Bearer token-123")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     async fn captured_event(capture: &CaptureSink, event_type: &str) -> AuditEvent {

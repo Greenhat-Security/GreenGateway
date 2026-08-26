@@ -156,14 +156,7 @@ const ADMIN_MCP_USE_PERMISSION: &str = "admin:mcp:use";
 #[cfg(test)]
 const MCP_ROUTE: &str = auth::protected_resource::MCP_RESOURCE_PATH;
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
-const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &[
-    "/health",
-    "/livez",
-    "/startupz",
-    "/readyz",
-    "/version",
-    "/metrics",
-];
+const GATEWAY_OWNED_EXACT_PATHS: &[&str] = path_match::GATEWAY_EXACT_ROUTE_PATHS;
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
 const MAX_AUDIT_QUERY_LIMIT: usize = 500;
 const DEFAULT_TRAFFIC_RECENT_EVENTS_LIMIT: usize = 20;
@@ -328,7 +321,7 @@ fn mcp_route_covering_exempt_prefix<'a>(
         .iter()
         .find(|exempt_path| {
             exempt_path.as_str() != mcp_path
-                && path_match::path_prefix_matches(mcp_path, exempt_path)
+                && path_match::exempt_path_matches(mcp_path, exempt_path)
         })
         .map(String::as_str)
 }
@@ -6030,6 +6023,13 @@ async fn policy_rule_shadow_review_endpoint(
         Ok(rbac_state) => rbac_state,
         Err(error) => return policy_admin_authz_error_response(error),
     };
+    // The response carries audit-history samples and the actor identities
+    // behind them, which is the data class `admin:audit:read` gates. This is
+    // the same second check the rule-preview endpoint applies for the same
+    // reason; `admin:policy:read` alone covers only aggregate rule counts.
+    if !rbac_state.principal_has_permission(principal, ADMIN_AUDIT_READ_PERMISSION) {
+        return forbidden();
+    }
     let policy = rbac_state.current_policy();
     let shadow_rules = policy
         .rules
@@ -14020,6 +14020,59 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn policy_can_bind_the_derived_route_id_of_an_unnamed_route() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let unnamed_route = path_route("/api", upstream_addr);
+        assert!(
+            unnamed_route.id.is_none(),
+            "fixture must exercise a route with no explicit id"
+        );
+        // The id the gateway derives for this route, reports as
+        // `upstream_route_id` on every observation event, and compares against
+        // in the dispatch matcher.
+        let route_id = crate::proxy::legacy_route_id(&unnamed_route);
+        let policy = TempPolicyFile::new(
+            &json!({
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "rules": [{
+                    "methods": ["GET"],
+                    "path": "/api/**",
+                    "dispatch": {
+                        "kind": "route",
+                        "route_id": route_id
+                    },
+                    "action": "deny"
+                }]
+            })
+            .to_string(),
+        );
+        let mut config = routing_proxy_config(vec![unnamed_route]);
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+
+        // Building the app runs policy dispatch validation, which previously
+        // refused this rule and aborted startup.
+        let router = proxy_router(config, test_audit_log());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/orders")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route-bound denial should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "a rule bound to the derived route id must deny before proxying",
+        )
+        .await;
+    }
+
     #[test]
     fn catch_all_pool_migration_rejects_stale_legacy_origin_policy() {
         let upstream_addr: SocketAddr = "127.0.0.1:41001".parse().expect("test address");
@@ -18553,6 +18606,104 @@ mod tests {
         assert_upstream_receives_no_request(
             &mut captured,
             "fixed probe routes should not be proxied with custom admin prefix",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn probe_path_subtrees_are_not_exempt_from_authentication() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut config = proxy_config(upstream_addr);
+        config.auth_enabled = true;
+        config.auth_mode = config::AuthMode::Required;
+        let router = proxy_router(config, test_audit_log());
+
+        // The probe route itself stays exempt and is still served locally.
+        let probe = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("probe request should build"),
+            )
+            .await
+            .expect("probe request should complete");
+        assert_eq!(probe.status(), StatusCode::OK);
+
+        // Anything below a probe route is proxy space, so it must be
+        // authenticated exactly like any other proxied path.
+        for uri in [
+            "/health/v1/orders",
+            "/livez/v1/orders",
+            "/startupz/v1/orders",
+            "/readyz/v1/orders",
+            "/version/v1/orders",
+            "/metrics/jvm.memory.used",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "probe path subtrees must not reach the upstream unauthenticated",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn probe_path_subtrees_are_not_exempt_from_authorization() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "deny",
+                "enforcement_mode": "enforce",
+                "roles": {},
+                "routes": []
+            }"#,
+        );
+        let mut config = proxy_config(upstream_addr);
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        let router = proxy_router(config, test_audit_log());
+
+        let probe = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("probe request should build"),
+            )
+            .await
+            .expect("probe request should complete");
+        assert_eq!(probe.status(), StatusCode::OK);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health/v1/orders")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "probe path subtrees must be evaluated against policy before proxying",
         )
         .await;
     }
@@ -26799,6 +26950,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_rule_shadow_review_requires_audit_read_permission() {
+        let db = TempDb::new("shadow-review-audit-forbidden");
+        create_audit_schema(&db.path);
+        let policy = TempPolicyFile::new(&shadow_review_policy_document());
+        let router =
+            policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+
+        let response = router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy shadow review should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn policy_rule_shadow_review_returns_zero_counts_when_sqlite_is_unset() {
         let policy = TempPolicyFile::new(&shadow_review_policy_document());
         let router = policy_admin_router(Some(&policy), test_audit_log());
@@ -31826,7 +31999,11 @@ paths:
             .await
             .expect("request should complete");
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // The egress guard makes the key set unfetchable, so the token is never
+        // judged: the answer is "could not verify", not "credential rejected".
+        // The property this test defends is that the blocked JWKS host is never
+        // contacted, asserted below.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             discovery_server
                 .join()
@@ -35441,7 +35618,8 @@ paths:
                 "admin": {
                     "permissions": [
                         ADMIN_POLICY_READ_PERMISSION,
-                        ADMIN_POLICY_WRITE_PERMISSION
+                        ADMIN_POLICY_WRITE_PERMISSION,
+                        ADMIN_AUDIT_READ_PERMISSION
                     ]
                 },
                 "policy-reader": {

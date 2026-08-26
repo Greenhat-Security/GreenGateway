@@ -1,5 +1,36 @@
 //! Shared request path matching helpers.
 
+/// Request paths the gateway router serves as fixed, exact routes.
+///
+/// The proxy fallback reserves these by exact comparison, so anything below
+/// them (`/health/v1/orders`) is not gateway-owned and is forwarded upstream.
+pub const GATEWAY_EXACT_ROUTE_PATHS: &[&str] = &[
+    "/health",
+    "/livez",
+    "/startupz",
+    "/readyz",
+    "/version",
+    "/metrics",
+];
+
+/// Matches a request path against an auth or RBAC exempt-list entry.
+///
+/// Exempt entries are segment-boundary prefixes so a single entry can cover a
+/// subtree the gateway itself serves, such as the admin UI and its assets.
+/// Entries naming a fixed probe route are the exception: the router serves
+/// those paths exactly and the proxy fallback reserves them exactly, so a
+/// prefix exemption there would hand `/health/<anything>` to the upstream with
+/// authentication and authorization skipped. Matching those entries exactly
+/// keeps every exemption a gateway-owned entry grants inside gateway-owned
+/// space, where it can never reach the proxy.
+pub fn exempt_path_matches(path: &str, exempt_path: &str) -> bool {
+    if GATEWAY_EXACT_ROUTE_PATHS.contains(&exempt_path) {
+        return path == exempt_path;
+    }
+
+    path_prefix_matches(path, exempt_path)
+}
+
 pub fn path_prefix_matches(path: &str, path_prefix: &str) -> bool {
     if !path_prefix.starts_with('/') {
         return false;
@@ -49,6 +80,34 @@ mod tests {
         assert!(!path_prefix_matches("/healthz", "/health"));
         assert!(!path_prefix_matches("/versions", "/version"));
         assert!(!path_prefix_matches("/metrics.json", "/metrics"));
+    }
+
+    #[test]
+    fn probe_exempt_entries_cover_only_themselves() {
+        for probe in GATEWAY_EXACT_ROUTE_PATHS {
+            assert!(exempt_path_matches(probe, probe), "{probe}");
+
+            for suffix in ["/x", "/v1/orders", "/"] {
+                let path = format!("{probe}{suffix}");
+                assert!(
+                    !exempt_path_matches(&path, probe),
+                    "{path} must not be exempt via {probe}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_probe_exempt_entries_keep_subtree_semantics() {
+        assert!(exempt_path_matches("/admin", "/admin"));
+        assert!(exempt_path_matches("/admin/assets/app.js", "/admin"));
+        assert!(exempt_path_matches(
+            "/v1/admin/auth/callback",
+            "/v1/admin/auth/callback"
+        ));
+        assert!(exempt_path_matches("/public/docs", "/public"));
+
+        assert!(!exempt_path_matches("/administrator", "/admin"));
     }
 
     #[test]
