@@ -16,7 +16,7 @@ The axum middleware stack and gateway-owned handlers enforce this logical order:
 | 2 | CORS and response hardening | Enforce configured origins and security headers. |
 | 3 | Observation | Record one bounded terminal request observation and the inner auth/authz outcome that was reached. |
 | 4 | Logical classification | Identify a stable route or gateway-owned surface using data only; no endpoint, DNS, client, provider, or socket work is available here. |
-| 5 | IP/global rate limit and request validation | Bound pre-auth work, body size, and content type. Trusted forwarding headers are accepted only from configured proxy CIDRs. |
+| 5 | IP/global rate limit and request validation | Bound pre-auth work, body size, and content type, and refuse `CONNECT` outright. Trusted forwarding headers are accepted only from configured proxy CIDRs. |
 | 6 | CSRF | Protect cookie-authenticated control-plane writes; bearer-authenticated requests do not use the browser CSRF flow. |
 | 7 | Authentication | Run the configured JWT/OIDC, service-token, or cookie-session validators and fail closed outside explicit exemptions. |
 | 8 | Principal/policy rate limit | Apply identity-aware limits without changing the classified route. |
