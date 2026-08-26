@@ -766,6 +766,71 @@ impl ConnectionControlPlane {
     ///
     /// Deliberately runs before the mutation lock is taken: it performs network
     /// I/O, and the lock must not be held across it.
+    /// Cross-validates a rotated TLS client-identity half against a counterpart
+    /// that lives behind a network secret provider.
+    ///
+    /// [`LocalSecretManager::rotate`] is synchronous and runs under the secret
+    /// mutation lock, so when the counterpart half is a deferred alias it can
+    /// only check that the replacement is the right *kind* of PEM — it cannot
+    /// fetch the other half to confirm the two actually match. This runs on the
+    /// async path before the rotation is attempted, where the counterpart can be
+    /// resolved, so a rotation that would break every request through a
+    /// connection is refused at the API instead of committed.
+    ///
+    /// Deliberately performs its network I/O before the caller takes the secret
+    /// mutation guard. Pairs whose counterpart is not deferred are left alone:
+    /// the synchronous preflight already matches those, and repeating the work
+    /// here would only widen the window between check and commit.
+    pub async fn ensure_rotated_identity_pairs_resolvable(
+        &self,
+        rotated_id: &str,
+        replacement: &ResolvedSecret,
+    ) -> Result<(), ConnectionMutationError> {
+        let resolver = Arc::clone(&self.secret_resolver);
+        let snapshot = self.runtime.load_full();
+        for record in snapshot.managed().values() {
+            let candidate = &record.write;
+            if !candidate.enabled {
+                continue;
+            }
+            let certificate_id = candidate.tls.client_certificate_id.as_deref();
+            let private_key_id = candidate.tls.client_private_key_id.as_deref();
+
+            if certificate_id == Some(rotated_id)
+                && replacement.purpose() == SecretPurpose::TlsCertificate
+            {
+                if let Some(partner) = private_key_id.filter(|id| resolver.is_deferred_alias(id)) {
+                    let private_key = resolve_deferred(
+                        &resolver,
+                        "tls.client_private_key_id",
+                        partner,
+                        SecretPurpose::TlsPrivateKey,
+                    )
+                    .await?;
+                    validate_client_identity_material(replacement.expose(), private_key.expose())
+                        .map_err(binding_activation_to_mutation_error)?;
+                }
+            }
+
+            if private_key_id == Some(rotated_id)
+                && replacement.purpose() == SecretPurpose::TlsPrivateKey
+            {
+                if let Some(partner) = certificate_id.filter(|id| resolver.is_deferred_alias(id)) {
+                    let certificate = resolve_deferred(
+                        &resolver,
+                        "tls.client_certificate_id",
+                        partner,
+                        SecretPurpose::TlsCertificate,
+                    )
+                    .await?;
+                    validate_client_identity_material(certificate.expose(), replacement.expose())
+                        .map_err(binding_activation_to_mutation_error)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn ensure_deferred_bindings_resolvable(
         &self,
         candidate: &ConnectionWrite,
@@ -866,16 +931,8 @@ impl ConnectionControlPlane {
             None => None,
         };
         if let (Some(certificate), Some(private_key)) = (certificate, private_key) {
-            validate_client_identity_material(certificate.expose(), private_key.expose()).map_err(
-                |error| match error {
-                    BindingActivationError::Invalid { fields } => {
-                        ConnectionMutationError::UnresolvableBindings { fields }
-                    }
-                    BindingActivationError::Unavailable => {
-                        ConnectionMutationError::BindingUnavailable
-                    }
-                },
-            )?;
+            validate_client_identity_material(certificate.expose(), private_key.expose())
+                .map_err(binding_activation_to_mutation_error)?;
         }
 
         Ok(())
@@ -1248,10 +1305,12 @@ impl ConnectionSecretResolver {
                     })?;
             if self.is_deferred_alias(private_key_id) {
                 // The counterpart lives behind a network provider and this path
-                // is synchronous, so the pair cannot be matched here. Validate
-                // what can be validated rather than accepting anything: without
-                // this, rotating to material that is not a certificate at all is
-                // committed and then fails every request through the connection.
+                // is synchronous, so the pair cannot be matched here. Admin
+                // rotations are matched beforehand by
+                // ensure_rotated_identity_pairs_resolvable; this remains the
+                // last line of defence for any caller that reaches the manager
+                // without that pass, and it still rejects material that is not
+                // a certificate at all.
                 if !crate::egress::tls_client_identity_half_is_valid(replacement.expose(), true) {
                     return Err(BindingActivationError::Invalid {
                         fields: vec!["tls.client_certificate_id"],
@@ -1283,7 +1342,8 @@ impl ConnectionSecretResolver {
                     })?;
             if self.is_deferred_alias(certificate_id) {
                 // See the certificate branch: pair matching needs the network
-                // half, so the replacement is at least checked to be a key.
+                // half and happens on the async path, so this checks the
+                // replacement is at least a key.
                 if !crate::egress::tls_client_identity_half_is_valid(replacement.expose(), false) {
                     return Err(BindingActivationError::Invalid {
                         fields: vec!["tls.client_private_key_id"],
@@ -1339,6 +1399,16 @@ fn validate_client_identity_material(
         Err(BindingActivationError::Invalid {
             fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
         })
+    }
+}
+
+/// Maps a binding-activation outcome onto the admin mutation vocabulary.
+fn binding_activation_to_mutation_error(error: BindingActivationError) -> ConnectionMutationError {
+    match error {
+        BindingActivationError::Invalid { fields } => {
+            ConnectionMutationError::UnresolvableBindings { fields }
+        }
+        BindingActivationError::Unavailable => ConnectionMutationError::BindingUnavailable,
     }
 }
 
@@ -1687,6 +1757,155 @@ mod tests {
 
     fn config() -> Config {
         Config::test_defaults()
+    }
+
+    /// Network provider whose material is produced at runtime, for fixtures
+    /// that need real PEM rather than a literal.
+    struct OwnedNetworkProvider {
+        alias_id: String,
+        value: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl SecretResolver for OwnedNetworkProvider {
+        async fn resolve(
+            &self,
+            alias_id: &str,
+            purpose: SecretPurpose,
+        ) -> Result<ResolvedSecret, SecretResolveError> {
+            if alias_id != self.alias_id {
+                return Err(SecretResolveError::new(
+                    alias_id,
+                    SecretResolveErrorKind::UnknownAlias,
+                ));
+            }
+            ResolvedSecret::new(purpose, self.value.clone()).map_err(|_| {
+                SecretResolveError::new(alias_id, SecretResolveErrorKind::InvalidMaterial)
+            })
+        }
+
+        fn contains_alias(&self, alias_id: &str) -> bool {
+            alias_id == self.alias_id
+        }
+
+        fn aliases(&self) -> Vec<SecretAliasMetadata> {
+            vec![SecretAliasMetadata {
+                id: self.alias_id.clone(),
+                label: format!("{} live", self.alias_id),
+                provider: SecretProviderKind::VaultKvV2,
+                configured: true,
+                purpose: None,
+                version: None,
+                rotated_at: None,
+            }]
+        }
+    }
+
+    /// Minimal well-formed Vault provider config declaring one alias, so the
+    /// control plane treats that alias as deferred without any provider being
+    /// activated against a real cluster.
+    fn vault_config_declaring(
+        alias_id: &str,
+    ) -> crate::connections::vault_secret::VaultProviderConfig {
+        serde_json::from_value(serde_json::json!({
+            "profiles": [{
+                "id": "test-profile",
+                "address": "https://vault.example.test:8200",
+                "auth": {
+                    "type": "workload_jwt",
+                    "mount": "kubernetes",
+                    "role": "gateway",
+                    "token_root": "/var/run/secrets/tokens",
+                    "token_file": "vault-token"
+                }
+            }],
+            "aliases": [{
+                "id": alias_id,
+                "label": "Deferred client certificate",
+                "profile": "test-profile",
+                "mount": "secret",
+                "path": "clients/gateway",
+                "key": "certificate"
+            }]
+        }))
+        .expect("test vault provider config should deserialize")
+    }
+
+    #[tokio::test]
+    async fn rotating_one_half_matches_it_against_a_counterpart_behind_a_network_provider() {
+        let temporary = TemporaryLocalControlPlane::new("tls-rotation-network-pair");
+        let mut config = temporary.config();
+        config.connection_vault_provider = vault_config_declaring("vault-client-cert");
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+
+        let key = rcgen::KeyPair::generate().expect("test identity key should generate");
+        let certificate = rcgen::CertificateParams::new(vec!["client.example.test".to_owned()])
+            .expect("test identity parameters should build")
+            .self_signed(&key)
+            .expect("test identity certificate should build");
+        // The certificate half is served by the network provider; only the
+        // private key is a local secret, so this is the split pair the
+        // synchronous preflight cannot match on its own.
+        control_plane.install_network_secret_providers(vec![Arc::new(OwnedNetworkProvider {
+            alias_id: "vault-client-cert".to_owned(),
+            value: certificate.pem().into_bytes(),
+        })]);
+
+        let manager = control_plane
+            .local_secret_manager()
+            .expect("local manager should exist");
+        let private_key_secret = manager
+            .create(
+                "Client private key",
+                ResolvedSecret::new(
+                    SecretPurpose::TlsPrivateKey,
+                    key.serialize_pem().into_bytes(),
+                )
+                .expect("private-key secret should validate"),
+            )
+            .expect("private-key secret should create");
+
+        let before = control_plane.runtime_snapshot();
+        let mut candidate = managed_candidate();
+        candidate.tls.client_certificate_id = Some("vault-client-cert".to_owned());
+        candidate.tls.client_private_key_id = Some(private_key_secret.id.clone());
+        control_plane
+            .create_managed(before.collection_etag(), candidate)
+            .expect("a split mTLS pair should activate");
+
+        // A key that does not belong to the network-held certificate is refused
+        // before the rotation is attempted. Without this pass the rotation
+        // commits and every request through the connection then fails.
+        let mismatched = rcgen::KeyPair::generate().expect("mismatched key should generate");
+        let error = control_plane
+            .ensure_rotated_identity_pairs_resolvable(
+                &private_key_secret.id,
+                &ResolvedSecret::new(
+                    SecretPurpose::TlsPrivateKey,
+                    mismatched.serialize_pem().into_bytes(),
+                )
+                .expect("mismatched key fixture should construct"),
+            )
+            .await
+            .expect_err("a key that does not match the network certificate must be refused");
+        assert!(matches!(
+            error,
+            ConnectionMutationError::UnresolvableBindings { .. }
+        ));
+
+        // The matching key still rotates.
+        control_plane
+            .ensure_rotated_identity_pairs_resolvable(
+                &private_key_secret.id,
+                &ResolvedSecret::new(
+                    SecretPurpose::TlsPrivateKey,
+                    key.serialize_pem().into_bytes(),
+                )
+                .expect("matching key fixture should construct"),
+            )
+            .await
+            .expect("the matching key should pass the pair check");
     }
 
     struct StaticNetworkProvider {
