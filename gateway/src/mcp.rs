@@ -113,7 +113,11 @@ impl ServerHandler for McpServer {
             .list()
             .into_iter()
             .filter(|definition| {
-                self.executor.as_ref().is_none_or(|executor| {
+                // Fail closed: without an executor there is no runtime to evaluate
+                // `enabled`, allowed_roles/issuers/auth_methods or tool deny rules
+                // against, so advertising the registry would publish tool names,
+                // descriptions and input schemas the policy conceals.
+                self.executor.as_ref().is_some_and(|executor| {
                     executor.can_list_tool(&definition.name, &invocation_context)
                 })
             })
@@ -492,14 +496,15 @@ fn runtime_error_to_mcp_error(error: ToolRuntimeError) -> ErrorData {
         ToolRuntimeError::Disabled { tool_name } => {
             policy_denied_error(tool_name, "tool is disabled by policy", "disabled", None)
         }
-        ToolRuntimeError::RoleDenied {
-            tool_name,
-            allowed_roles,
-        } => policy_denied_error(
+        // `allowed_roles` is deliberately not echoed back: `tools/list` hides
+        // exactly the tools whose role policy the caller fails, so returning the
+        // role names here would hand that caller the policy the filter conceals.
+        // The rejection is still audited with the actor, tool and reason.
+        ToolRuntimeError::RoleDenied { tool_name, .. } => policy_denied_error(
             tool_name,
             "tool invocation is denied by role policy",
             "role_denied",
-            Some(json!({ "allowed_roles": allowed_roles })),
+            None,
         ),
         ToolRuntimeError::Rejected { tool_name, reason } => policy_denied_error(
             tool_name,
@@ -637,13 +642,12 @@ pub(crate) fn mcp_executor_from_config(
     connection_runtimes: ToolConnectionRuntimes,
     audit: crate::audit::AuditLog,
 ) -> Result<Option<ToolExecutor>, ToolExecutorError> {
-    if registry.list().is_empty()
-        && connection_runtimes.mcp_catalog.is_none()
-        && connection_runtimes.openapi_catalog.is_none()
-    {
-        return Ok(None);
-    }
-
+    // The executor is built once and cached in `McpState`, but the registry it
+    // reads is an `ArcSwap` shared with the TOOLS_FILE watcher and the admin
+    // tools API. An empty registry at startup therefore says nothing about what
+    // `/mcp` will serve later, so the executor is always built: skipping it left
+    // `list_tools` with no runtime to check visibility against and made every
+    // `tools/call` fail until the process was restarted.
     ToolExecutor::from_config(
         config,
         registry,
@@ -657,7 +661,7 @@ pub(crate) fn mcp_executor_from_config(
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::{net::SocketAddr, time::Duration};
 
     use super::*;
     use crate::{
@@ -665,11 +669,18 @@ mod tests {
         config,
         discovery::{self, suggestions::DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS},
         egress,
-        tools::runtime::ToolRuntime,
+        tools::{
+            definitions::{ToolSource, UpstreamMapping},
+            runtime::{ToolRuntime, ToolRuntimeConfig, ToolRuntimeToolConfig},
+        },
     };
 
+    const VISIBLE_TOOL: &str = "public_probe";
+    const RESTRICTED_TOOL: &str = "payroll_export";
+    const PRIVILEGED_ROLE: &str = "payroll-admin";
+
     #[test]
-    fn empty_registry_does_not_configure_mcp_executor() {
+    fn empty_registry_still_configures_mcp_executor() {
         let config = test_config();
         let registry = ToolRegistry::disabled();
         let runtime = ToolRuntime::new(Default::default(), test_audit_log());
@@ -686,11 +697,90 @@ mod tests {
             ToolConnectionRuntimes::default(),
             test_audit_log(),
         )
-        .expect("empty registry should be a valid no-executor configuration");
+        .expect("empty registry should still be a valid executor configuration");
 
         assert!(
-            executor.is_none(),
-            "empty registry intentionally skips inventory persistence because no executor/audit path exists"
+            executor.is_some(),
+            "the registry can gain tools through hot reload, so the executor must exist even when startup sees none"
+        );
+    }
+
+    #[tokio::test]
+    async fn hot_reloaded_tools_are_still_filtered_by_visibility_policy() {
+        let (state, registry) = mcp_state_from_empty_registry();
+        registry
+            .merge_definitions(vec![
+                legacy_tool_definition(VISIBLE_TOOL),
+                legacy_tool_definition(RESTRICTED_TOOL),
+            ])
+            .expect("hot-reloaded definitions should register");
+
+        let body = mcp_json_rpc(&state, 1, "tools/list", None).await;
+        let listed = listed_tool_names(&body);
+
+        assert!(
+            listed.iter().any(|name| name == VISIBLE_TOOL),
+            "an unrestricted tool must stay listed, otherwise this test would also pass if the filter hid everything: {listed:?}"
+        );
+        assert!(
+            !listed.iter().any(|name| name == RESTRICTED_TOOL),
+            "a tool restricted to '{PRIVILEGED_ROLE}' must not be advertised to a caller without that role: {listed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_advertises_nothing_without_an_executor() {
+        let registry = ToolRegistry::disabled();
+        registry
+            .merge_definitions(vec![legacy_tool_definition(RESTRICTED_TOOL)])
+            .expect("definitions should register");
+        let state = McpState::new(registry, None, client_ip::ClientIpPolicy::default());
+
+        let body = mcp_json_rpc(&state, 2, "tools/list", None).await;
+
+        assert_eq!(
+            body["result"]["tools"],
+            json!([]),
+            "without an executor there is no runtime to evaluate visibility, so nothing may be advertised"
+        );
+    }
+
+    #[tokio::test]
+    async fn role_denied_tool_call_does_not_disclose_allowed_roles() {
+        let (state, registry) = mcp_state_from_empty_registry();
+        registry
+            .merge_definitions(vec![legacy_tool_definition(RESTRICTED_TOOL)])
+            .expect("definitions should register");
+
+        let body = mcp_json_rpc(
+            &state,
+            3,
+            "tools/call",
+            Some(json!({ "name": RESTRICTED_TOOL, "arguments": {} })),
+        )
+        .await;
+
+        // Pin the denial reason first: without it this test would also pass on an
+        // earlier rejection that never reaches the role check.
+        assert_eq!(
+            body["error"]["code"],
+            json!(TOOL_POLICY_DENIED_CODE.0),
+            "{body}"
+        );
+        assert_eq!(
+            body["error"]["data"]["reason"],
+            json!("role_denied"),
+            "{body}"
+        );
+        assert_eq!(
+            body["error"]["data"]["tool_name"],
+            json!(RESTRICTED_TOOL),
+            "{body}"
+        );
+        assert_eq!(
+            body["error"]["data"]["allowed_roles"],
+            Value::Null,
+            "a role-denied error must not echo the policy role names that tools/list conceals"
         );
     }
 
@@ -701,6 +791,118 @@ mod tests {
             None,
             client_ip::ClientIpPolicy::default(),
         );
+
+        let body = mcp_json_rpc(
+            &state,
+            1,
+            "tools/call",
+            Some(json!({ "name": "missing_tool", "arguments": {} })),
+        )
+        .await;
+
+        assert_eq!(body["error"]["code"], json!(ErrorCode::METHOD_NOT_FOUND.0));
+        assert_eq!(
+            body["error"]["message"],
+            json!("tool 'missing_tool' is not defined")
+        );
+        assert_eq!(body["error"]["data"]["tool_name"], json!("missing_tool"));
+    }
+
+    /// Builds the MCP surface the way startup does when TOOLS_FILE is present but
+    /// still empty, and hands back the shared registry so a test can hot-reload
+    /// definitions into it afterwards.
+    fn mcp_state_from_empty_registry() -> (McpState, ToolRegistry) {
+        let config = test_config();
+        let registry = ToolRegistry::disabled();
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::from_config(&config))
+                .expect("test egress client should build"),
+        );
+        let executor = mcp_executor_from_config(
+            &config,
+            registry.clone(),
+            tool_visibility_runtime(),
+            egress_client,
+            ToolConnectionRuntimes::default(),
+            test_audit_log(),
+        )
+        .expect("MCP executor should build");
+
+        let state = McpState::new(
+            registry.clone(),
+            executor,
+            client_ip::ClientIpPolicy::default(),
+        );
+
+        (state, registry)
+    }
+
+    fn tool_visibility_runtime() -> ToolRuntime {
+        let tools = [
+            (VISIBLE_TOOL.to_owned(), tool_policy(Vec::new())),
+            (
+                RESTRICTED_TOOL.to_owned(),
+                tool_policy(vec![PRIVILEGED_ROLE.to_owned()]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        ToolRuntime::new(
+            ToolRuntimeConfig {
+                tools,
+                ..Default::default()
+            },
+            test_audit_log(),
+        )
+    }
+
+    fn tool_policy(allowed_roles: Vec<String>) -> ToolRuntimeToolConfig {
+        ToolRuntimeToolConfig {
+            enabled: true,
+            allowed_roles,
+            issuers: Vec::new(),
+            auth_methods: Vec::new(),
+            timeout: Duration::from_secs(5),
+            max_concurrent: 2,
+        }
+    }
+
+    fn legacy_tool_definition(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_owned(),
+            description: format!("{name} fixture"),
+            input_schema: json!({ "type": "object" }),
+            target: None,
+            source: ToolSource::default(),
+            upstream: UpstreamMapping {
+                method: "GET".to_owned(),
+                path_template: format!("/{name}"),
+                query_params: Vec::new(),
+                body: None,
+            },
+        }
+    }
+
+    fn listed_tool_names(body: &Value) -> Vec<String> {
+        body["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tools/list should return a tools array: {body}"))
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    async fn mcp_json_rpc(state: &McpState, id: u64, method: &str, params: Option<Value>) -> Value {
+        let mut payload = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+        });
+        if let Some(params) = params {
+            payload["params"] = params;
+        }
+
         let request = AxumRequest::builder()
             .method(http::Method::POST)
             .uri("/mcp")
@@ -708,18 +910,7 @@ mod tests {
             .header(header::CONTENT_TYPE, JSON_MIME)
             .header(header::ACCEPT, "application/json, text/event-stream")
             .header("MCP-Protocol-Version", "2025-11-25")
-            .body(Body::from(
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "missing_tool",
-                        "arguments": {}
-                    }
-                })
-                .to_string(),
-            ))
+            .body(Body::from(payload.to_string()))
             .expect("MCP request should build");
 
         let response = state
@@ -732,20 +923,14 @@ mod tests {
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .expect("MCP error body should be readable");
-        let body: Value = serde_json::from_slice(&body).unwrap_or_else(|err| {
+            .expect("MCP response body should be readable");
+
+        serde_json::from_slice(&body).unwrap_or_else(|err| {
             panic!(
                 "MCP response body should be JSON, status={status}, body={:?}: {err}",
                 String::from_utf8_lossy(&body)
             )
-        });
-
-        assert_eq!(body["error"]["code"], json!(ErrorCode::METHOD_NOT_FOUND.0));
-        assert_eq!(
-            body["error"]["message"],
-            json!("tool 'missing_tool' is not defined")
-        );
-        assert_eq!(body["error"]["data"]["tool_name"], json!("missing_tool"));
+        })
     }
 
     #[derive(Clone)]
