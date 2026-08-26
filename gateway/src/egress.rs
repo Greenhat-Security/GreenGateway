@@ -1755,19 +1755,31 @@ fn tls_client_identity_fingerprint(pem_identity: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Counts the certificate and private-key blocks in a PEM document.
+///
+/// The block labels live here only, so the several shape checks cannot drift
+/// apart on which key encodings they recognise. Returns `None` when the bytes
+/// are not UTF-8, which no PEM document is.
+fn count_pem_blocks(pem: &[u8]) -> Option<(usize, usize)> {
+    const CERTIFICATE_LABEL: &str = "-----BEGIN CERTIFICATE-----";
+    const PRIVATE_KEY_LABELS: [&str; 3] = [
+        concat!("-----BEGIN ", "PRIVATE KEY-----"),
+        concat!("-----BEGIN ", "RSA PRIVATE KEY-----"),
+        concat!("-----BEGIN ", "EC PRIVATE KEY-----"),
+    ];
+    let text = std::str::from_utf8(pem).ok()?;
+    let certificates = text.matches(CERTIFICATE_LABEL).count();
+    let private_keys = PRIVATE_KEY_LABELS
+        .into_iter()
+        .map(|label| text.matches(label).count())
+        .sum::<usize>();
+    Some((certificates, private_keys))
+}
+
 fn tls_client_identity_pem_shape_is_valid(pem_identity: &[u8]) -> bool {
-    let Ok(pem_identity) = std::str::from_utf8(pem_identity) else {
+    let Some((certificate_count, private_key_count)) = count_pem_blocks(pem_identity) else {
         return false;
     };
-    let certificate_count = pem_identity.matches("-----BEGIN CERTIFICATE-----").count();
-    let private_key_count = [
-        "-----BEGIN PRIVATE KEY-----",
-        "-----BEGIN RSA PRIVATE KEY-----",
-        "-----BEGIN EC PRIVATE KEY-----",
-    ]
-    .into_iter()
-    .map(|label| pem_identity.matches(label).count())
-    .sum::<usize>();
 
     certificate_count >= 1 && private_key_count == 1
 }
@@ -1817,7 +1829,47 @@ pub(crate) fn join_tls_client_identity_pem(
     Some(identity)
 }
 
+/// Validates one half of a client identity on its own.
+///
+/// Deliberately weaker than [`tls_client_identity_pem_is_valid`], which is the
+/// real check because a certificate and key are only meaningful as a matched
+/// pair. This exists for the synchronous rotation preflight, which cannot reach
+/// a network provider to fetch the counterpart half: rejecting material that is
+/// not even the right kind of PEM is worth more than accepting anything, and it
+/// is the difference between a rotation failing at the API and a connection
+/// failing on every subsequent request. A pair mismatch still surfaces when the
+/// transport assembles the identity.
+pub(crate) fn tls_client_identity_half_is_valid(pem_half: &[u8], is_certificate: bool) -> bool {
+    if pem_half.len() > MAX_TLS_CLIENT_IDENTITY_PEM_BYTES {
+        return false;
+    }
+    let Some((certificate_count, private_key_count)) = count_pem_blocks(pem_half) else {
+        return false;
+    };
+
+    if is_certificate {
+        // The certificate half must carry no key material, and every entry has
+        // to parse as real X.509 DER rather than merely look like a PEM block.
+        certificate_count >= 1 && private_key_count == 0 && tls_ca_bundle_pem_is_valid(pem_half)
+    } else {
+        certificate_count == 0 && private_key_count == 1
+    }
+}
+
+/// Validates a joined client identity exactly as the transport will.
+///
+/// The size gate matters as much as the parse: the certificate and key are
+/// bounded separately by their purposes, whose sum exceeds what
+/// `apply_tls_client_identity_pem` accepts, so without it a preflight can bless
+/// an identity the transport later refuses.
 pub(crate) fn tls_client_identity_pem_is_valid(pem_identity: &[u8]) -> bool {
+    if pem_identity.len() > MAX_TLS_CLIENT_IDENTITY_PEM_BYTES {
+        return false;
+    }
+    tls_client_identity_pem_parses(pem_identity)
+}
+
+fn tls_client_identity_pem_parses(pem_identity: &[u8]) -> bool {
     if !tls_client_identity_pem_shape_is_valid(pem_identity) {
         return false;
     }

@@ -267,6 +267,17 @@ impl JwtValidator {
             }
         }
 
+        // A document that parses but yields no usable key is an IdP fault, not a
+        // successful fetch: committing it would replace a working key set with an
+        // empty one and stamp it fresh, so every token would then be rejected as
+        // an unknown kid — an outage reported as bad credentials. Refusing to
+        // commit keeps the previous keys inside their remaining trust window and
+        // leaves the set stale, so the next request retries rather than settling
+        // into the failure. Classified like an unparseable body.
+        if refreshed.is_empty() {
+            return Err(AuthError::Upstream("invalid JWKS response".to_owned()));
+        }
+
         *self.keys.write().await = refreshed;
         *self.keys_fetched_at.write().await = Some(Instant::now());
         Ok(())
@@ -1560,6 +1571,43 @@ RowSUZV5FSmOGJ7JyROZ80k=
             configured.principal_issuer.as_deref(),
             Some("https://idp.example")
         );
+    }
+
+    #[tokio::test]
+    async fn a_jwks_with_no_usable_keys_never_replaces_a_working_key_set() {
+        let validator = validator(
+            jwt_cfg("https://unreachable.invalid/.well-known/jwks.json"),
+            Arc::new(NoopRevocationStore),
+            TEST_PUBLIC_KEY,
+        );
+        let token = signed_token(base_claims(), TEST_PRIVATE_KEY);
+        validator
+            .decode(&token)
+            .await
+            .expect("the seeded key set should decode");
+        let seeded = validator.keys.read().await.len();
+        assert_eq!(seeded, 1);
+
+        // A JWKS that parses but yields nothing usable — an empty `keys` array,
+        // an unsupported key type, entries without a kid — is an IdP fault. It
+        // must not replace the working key set with an empty one, which would
+        // reject every token as an unknown kid while looking freshly fetched.
+        let error = validator
+            .fetch_jwks()
+            .await
+            .expect_err("an unreachable JWKS should fail");
+        assert!(matches!(error, AuthError::Upstream(_)));
+        assert_eq!(
+            validator.keys.read().await.len(),
+            seeded,
+            "a failed fetch must leave the previous keys in place"
+        );
+
+        // Still inside the trust window, so the working keys keep serving.
+        validator
+            .decode(&token)
+            .await
+            .expect("a failed refresh must not revoke keys inside their window");
     }
 
     #[tokio::test]

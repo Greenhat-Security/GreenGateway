@@ -1246,7 +1246,18 @@ impl ConnectionSecretResolver {
                     .ok_or_else(|| BindingActivationError::Invalid {
                         fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
                     })?;
-            if !self.is_deferred_alias(private_key_id) {
+            if self.is_deferred_alias(private_key_id) {
+                // The counterpart lives behind a network provider and this path
+                // is synchronous, so the pair cannot be matched here. Validate
+                // what can be validated rather than accepting anything: without
+                // this, rotating to material that is not a certificate at all is
+                // committed and then fails every request through the connection.
+                if !crate::egress::tls_client_identity_half_is_valid(replacement.expose(), true) {
+                    return Err(BindingActivationError::Invalid {
+                        fields: vec!["tls.client_certificate_id"],
+                    });
+                }
+            } else {
                 let private_key = self.resolve_required(
                     "tls.client_private_key_id",
                     private_key_id,
@@ -1270,7 +1281,15 @@ impl ConnectionSecretResolver {
                     .ok_or_else(|| BindingActivationError::Invalid {
                         fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
                     })?;
-            if !self.is_deferred_alias(certificate_id) {
+            if self.is_deferred_alias(certificate_id) {
+                // See the certificate branch: pair matching needs the network
+                // half, so the replacement is at least checked to be a key.
+                if !crate::egress::tls_client_identity_half_is_valid(replacement.expose(), false) {
+                    return Err(BindingActivationError::Invalid {
+                        fields: vec!["tls.client_private_key_id"],
+                    });
+                }
+            } else {
                 let certificate = self.resolve_required(
                     "tls.client_certificate_id",
                     certificate_id,
@@ -1341,13 +1360,18 @@ async fn resolve_deferred(
         Err(error) => Err(match error.kind() {
             SecretResolveErrorKind::UnknownAlias
             | SecretResolveErrorKind::InvalidMaterial
-            | SecretResolveErrorKind::UnsafeSource
             | SecretResolveErrorKind::SourceDenied => {
                 ConnectionMutationError::UnresolvableBindings {
                     fields: vec![field],
                 }
             }
-            SecretResolveErrorKind::SourceUnavailable
+            // UnsafeSource sits with the availability failures to match
+            // resolve_required and both connection HTTP mappers. This pass now
+            // resolves non-deferred halves too, so an operator file alias whose
+            // permissions are wrong must not report a different status here than
+            // it does on every other path.
+            SecretResolveErrorKind::UnsafeSource
+            | SecretResolveErrorKind::SourceUnavailable
             | SecretResolveErrorKind::ProviderBusy
             | SecretResolveErrorKind::ProviderFailure => {
                 ConnectionMutationError::BindingUnavailable
