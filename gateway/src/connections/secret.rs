@@ -619,6 +619,34 @@ fn validate_root_permissions(_: &fs::Metadata) -> Result<(), SecretProviderConfi
     Ok(())
 }
 
+/// Whether a platform-projected material root carries acceptable permissions.
+///
+/// Container runtimes publish projected volumes as a tmpfs whose mount root is
+/// world-writable with the sticky bit set — `drwxrwxrwt`, mode `1777` — which
+/// is what `ls -ld /var/run/secrets/kubernetes.io/serviceaccount` shows inside
+/// any pod. The sticky bit is precisely what makes that shape safe: a process
+/// that does not own an entry cannot rename or delete it, so the projected leaf
+/// cannot be swapped underneath us. A group/other-writable root *without* the
+/// sticky bit offers no such protection and stays rejected.
+///
+/// This is the projected-root counterpart to the leaf rule in
+/// [`read_bounded_file_secret`]: both must tolerate the shape the kubelet
+/// actually publishes, and neither may tolerate anything looser. Every network
+/// secret provider shares this one predicate so the five cannot drift apart.
+#[cfg(unix)]
+pub(crate) fn projected_root_permissions_are_safe(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    const STICKY: u32 = 0o1000;
+    const GROUP_OTHER_WRITE: u32 = 0o022;
+    let mode = metadata.mode();
+    mode & GROUP_OTHER_WRITE == 0 || mode & STICKY != 0
+}
+
+#[cfg(not(unix))]
+pub(crate) fn projected_root_permissions_are_safe(_: &fs::Metadata) -> bool {
+    true
+}
+
 #[cfg(unix)]
 fn validate_file_permissions(
     alias_id: &str,
@@ -1411,6 +1439,38 @@ mod tests {
             SecretResolveErrorKind::UnsafeSource
         );
         fs::remove_file(outside).expect("outside fixture should remove");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_projected_root_accepts_the_kubelet_tmpfs_mode_and_rejects_plain_world_writable() {
+        let temporary = TemporarySecrets::new("projected-root-mode");
+
+        // What `ls -ld /var/run/secrets/kubernetes.io/serviceaccount` shows in
+        // any pod: drwxrwxrwt. The sticky bit is the protection.
+        set_directory_permissions(&temporary.root, 0o1777);
+        let sticky = fs::metadata(&temporary.root).expect("sticky root should stat");
+        assert!(
+            projected_root_permissions_are_safe(&sticky),
+            "the kubelet publishes projected volume roots as 1777; rejecting that \
+             makes every workload-identity configuration unstartable"
+        );
+
+        // Same write bits, no sticky bit: any process could swap the leaf.
+        set_directory_permissions(&temporary.root, 0o777);
+        let world_writable = fs::metadata(&temporary.root).expect("loose root should stat");
+        assert!(!projected_root_permissions_are_safe(&world_writable));
+
+        set_directory_permissions(&temporary.root, 0o755);
+        let tight = fs::metadata(&temporary.root).expect("tight root should stat");
+        assert!(projected_root_permissions_are_safe(&tight));
+
+        // Group-writable without sticky is rejected just like other-writable.
+        set_directory_permissions(&temporary.root, 0o775);
+        let group_writable = fs::metadata(&temporary.root).expect("group root should stat");
+        assert!(!projected_root_permissions_are_safe(&group_writable));
+
+        set_directory_permissions(&temporary.root, 0o755);
     }
 
     #[cfg(unix)]

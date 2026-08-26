@@ -253,6 +253,7 @@ pub enum AzureProviderConfigError {
     InvalidBootstrapAlias { index: usize },
     BootstrapAliasCycle { index: usize },
     BootstrapResolverRequired { index: usize },
+    UnknownBootstrapAlias { index: usize },
     InvalidCertificateThumbprint { index: usize },
     InvalidAliasId { index: usize },
     InvalidLabel { index: usize },
@@ -328,6 +329,10 @@ impl fmt::Display for AzureProviderConfigError {
                 formatter,
                 "azure profile at index {index} bootstraps from an alias but no other provider is configured"
             ),
+            Self::UnknownBootstrapAlias { index } => write!(
+                formatter,
+                "azure profile at index {index} bootstraps from an alias that no configured provider owns"
+            ),
             Self::InvalidCertificateThumbprint { index } => write!(
                 formatter,
                 "azure profile at index {index} requires a 40-character hex SHA-1 certificate thumbprint"
@@ -375,6 +380,28 @@ impl Error for AzureProviderConfigError {}
 
 /// Validates trusted startup configuration without touching the filesystem,
 /// DNS, or the provider.
+/// Requires that the resolver which will actually serve a profile's bootstrap
+/// material both exists and owns the named alias.
+///
+/// Checking the alias against the live bootstrap resolver rather than against a
+/// reserved-id set keeps this correct however the resolver is composed: an id
+/// that no resolver owns is a permanent configuration error, and catching it here
+/// turns it into a startup failure instead of an authentication failure on every
+/// request for the life of the process.
+fn require_bootstrap_alias(
+    index: usize,
+    alias: &str,
+    bootstrap: Option<&Arc<dyn SecretResolver>>,
+) -> Result<(), AzureProviderConfigError> {
+    let Some(resolver) = bootstrap else {
+        return Err(AzureProviderConfigError::BootstrapResolverRequired { index });
+    };
+    if !resolver.contains_alias(alias) {
+        return Err(AzureProviderConfigError::UnknownBootstrapAlias { index });
+    }
+    Ok(())
+}
+
 pub fn validate_azure_provider_config(
     config: &AzureProviderConfig,
     reserved_alias_ids: &BTreeSet<String>,
@@ -849,9 +876,7 @@ impl AzureKeyVaultSecretProvider {
                     token_file: token_file.clone(),
                 },
                 AzureAuthConfig::ClientSecret { secret_alias } => {
-                    if bootstrap.is_none() {
-                        return Err(AzureProviderConfigError::BootstrapResolverRequired { index });
-                    }
+                    require_bootstrap_alias(index, secret_alias, bootstrap.as_ref())?;
                     AzureAuth::ClientSecret {
                         secret_alias: secret_alias.clone(),
                     }
@@ -860,9 +885,7 @@ impl AzureKeyVaultSecretProvider {
                     key_alias,
                     certificate_thumbprint,
                 } => {
-                    if bootstrap.is_none() {
-                        return Err(AzureProviderConfigError::BootstrapResolverRequired { index });
-                    }
+                    require_bootstrap_alias(index, key_alias, bootstrap.as_ref())?;
                     let thumbprint = hex::decode(certificate_thumbprint).map_err(|_| {
                         AzureProviderConfigError::InvalidCertificateThumbprint { index }
                     })?;
@@ -1463,8 +1486,7 @@ fn validate_token_root_permissions(
     index: usize,
     metadata: &fs::Metadata,
 ) -> Result<(), AzureProviderConfigError> {
-    use std::os::unix::fs::MetadataExt;
-    if metadata.mode() & 0o022 == 0 {
+    if crate::connections::secret::projected_root_permissions_are_safe(metadata) {
         Ok(())
     } else {
         Err(AzureProviderConfigError::WorkloadTokenRootPermissions { index })
@@ -2177,6 +2199,13 @@ mod tests {
             ResolvedSecret::new(purpose, self.value.clone()).map_err(|_| {
                 SecretResolveError::new(alias_id, SecretResolveErrorKind::InvalidMaterial)
             })
+        }
+
+        // This fake answers for any alias, so contains_alias must say so too.
+        // A resolver whose contains_alias disagrees with its resolve is not a
+        // resolver the production seam can be tested against.
+        fn contains_alias(&self, _: &str) -> bool {
+            true
         }
 
         fn aliases(&self) -> Vec<SecretAliasMetadata> {

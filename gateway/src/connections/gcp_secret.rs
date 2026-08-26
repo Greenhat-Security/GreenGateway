@@ -1189,8 +1189,7 @@ fn validate_token_root_permissions(
     index: usize,
     metadata: &fs::Metadata,
 ) -> Result<(), GcpProviderConfigError> {
-    use std::os::unix::fs::MetadataExt;
-    if metadata.mode() & 0o022 == 0 {
+    if crate::connections::secret::projected_root_permissions_are_safe(metadata) {
         Ok(())
     } else {
         Err(GcpProviderConfigError::WorkloadTokenRootPermissions { index })

@@ -750,6 +750,140 @@ impl ConnectionControlPlane {
         )));
     }
 
+    /// Resolves every binding a candidate references that the synchronous path
+    /// had to defer, and parses the TLS material it yields.
+    ///
+    /// [`ConnectionSecretResolver::validate_enabled_candidate`] runs on a
+    /// synchronous path that cannot reach a network provider, so for aliases
+    /// owned by one it verifies only that the ID is configured. That is the
+    /// right answer at startup, before the egress client exists. It is the wrong
+    /// answer for an admin mutation: those happen long after activation, they
+    /// are already async, and `docs/configuration.md` promises that every
+    /// enabled binding is resolved for its exact purpose — and every CA bundle
+    /// and client-identity pair parsed — before persistence or runtime
+    /// publication. Without this pass a Connection whose TLS material comes from
+    /// a network provider is persisted and published unvalidated, and the
+    /// breakage first appears as a per-request data-path failure.
+    ///
+    /// Deliberately runs before the mutation lock is taken: it performs network
+    /// I/O, and the lock must not be held across it.
+    pub async fn ensure_deferred_bindings_resolvable(
+        &self,
+        candidate: &ConnectionWrite,
+    ) -> Result<(), ConnectionMutationError> {
+        if !candidate.enabled {
+            return Ok(());
+        }
+        let resolver = Arc::clone(&self.secret_resolver);
+
+        let deferred_auth = match &candidate.authentication {
+            ConnectionAuthentication::HeaderApiKey {
+                secret_id: Some(secret_id),
+                ..
+            } => Some((
+                "authentication.secret_id",
+                secret_id.clone(),
+                SecretPurpose::HeaderApiKey,
+            )),
+            ConnectionAuthentication::StaticBearer {
+                secret_id: Some(secret_id),
+            } => Some((
+                "authentication.secret_id",
+                secret_id.clone(),
+                SecretPurpose::StaticBearer,
+            )),
+            ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id: Some(secret_id),
+                ..
+            } => Some((
+                "authentication.client_secret_id",
+                secret_id.clone(),
+                SecretPurpose::OAuthClientSecret,
+            )),
+            ConnectionAuthentication::None
+            | ConnectionAuthentication::HeaderApiKey { .. }
+            | ConnectionAuthentication::StaticBearer { .. }
+            | ConnectionAuthentication::OAuth2ClientCredentials { .. } => None,
+        };
+        if let Some((field, secret_id, purpose)) = deferred_auth {
+            if resolver.is_deferred_alias(&secret_id) {
+                resolve_deferred(&resolver, field, &secret_id, purpose).await?;
+            }
+        }
+
+        if let Some(alias) = candidate
+            .tls
+            .ca_bundle_alias
+            .as_deref()
+            .filter(|id| resolver.is_deferred_alias(id))
+        {
+            let material = resolve_deferred(
+                &resolver,
+                "tls.ca_bundle_alias",
+                alias,
+                SecretPurpose::TlsCaBundle,
+            )
+            .await?;
+            if !crate::egress::tls_ca_bundle_pem_is_valid(material.expose()) {
+                return Err(ConnectionMutationError::UnresolvableBindings {
+                    fields: vec!["tls.ca_bundle_alias"],
+                });
+            }
+        }
+
+        let certificate = match candidate
+            .tls
+            .client_certificate_id
+            .as_deref()
+            .filter(|id| resolver.is_deferred_alias(id))
+        {
+            Some(alias) => Some(
+                resolve_deferred(
+                    &resolver,
+                    "tls.client_certificate_id",
+                    alias,
+                    SecretPurpose::TlsCertificate,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        let private_key = match candidate
+            .tls
+            .client_private_key_id
+            .as_deref()
+            .filter(|id| resolver.is_deferred_alias(id))
+        {
+            Some(alias) => Some(
+                resolve_deferred(
+                    &resolver,
+                    "tls.client_private_key_id",
+                    alias,
+                    SecretPurpose::TlsPrivateKey,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        // Cross-validate only when this pass resolved both halves. A pair split
+        // across a network provider and another provider is left to the
+        // synchronous path, which already resolves its half.
+        if let (Some(certificate), Some(private_key)) = (certificate, private_key) {
+            validate_client_identity_material(certificate.expose(), private_key.expose()).map_err(
+                |error| match error {
+                    BindingActivationError::Invalid { fields } => {
+                        ConnectionMutationError::UnresolvableBindings { fields }
+                    }
+                    BindingActivationError::Unavailable => {
+                        ConnectionMutationError::BindingUnavailable
+                    }
+                },
+            )?;
+        }
+
+        Ok(())
+    }
+
     fn ensure_activatable(
         &self,
         candidate: &ConnectionWrite,
@@ -1186,6 +1320,39 @@ fn validate_client_identity_material(
         Err(BindingActivationError::Invalid {
             fields: vec!["tls.client_certificate_id", "tls.client_private_key_id"],
         })
+    }
+}
+
+/// Resolves one deferred binding, mapping the outcome onto the mutation-error
+/// vocabulary the admin API already speaks.
+///
+/// Material that is genuinely wrong for the field — missing, malformed, or
+/// oversized — is an invalid binding the caller can fix by editing the request.
+/// A provider that is merely unreachable is not the caller's fault, so it maps
+/// to the retryable variant instead of rejecting a correct configuration.
+async fn resolve_deferred(
+    resolver: &Arc<ConnectionSecretResolver>,
+    field: &'static str,
+    alias_id: &str,
+    purpose: SecretPurpose,
+) -> Result<ResolvedSecret, ConnectionMutationError> {
+    match resolver.resolve(alias_id, purpose).await {
+        Ok(material) => Ok(material),
+        Err(error) => Err(match error.kind() {
+            SecretResolveErrorKind::UnknownAlias
+            | SecretResolveErrorKind::InvalidMaterial
+            | SecretResolveErrorKind::UnsafeSource
+            | SecretResolveErrorKind::SourceDenied => {
+                ConnectionMutationError::UnresolvableBindings {
+                    fields: vec![field],
+                }
+            }
+            SecretResolveErrorKind::SourceUnavailable
+            | SecretResolveErrorKind::ProviderBusy
+            | SecretResolveErrorKind::ProviderFailure => {
+                ConnectionMutationError::BindingUnavailable
+            }
+        }),
     }
 }
 

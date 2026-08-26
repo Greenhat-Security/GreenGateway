@@ -235,6 +235,7 @@ pub enum VaultProviderConfigError {
     InvalidBootstrapAlias { index: usize },
     BootstrapAliasCycle { index: usize },
     BootstrapResolverRequired { index: usize },
+    UnknownBootstrapAlias { index: usize },
     InvalidAliasId { index: usize },
     InvalidLabel { index: usize },
     DuplicateAliasId { index: usize, previous: usize },
@@ -310,6 +311,10 @@ impl fmt::Display for VaultProviderConfigError {
                 formatter,
                 "vault profile at index {index} bootstraps from an alias but no other provider is configured"
             ),
+            Self::UnknownBootstrapAlias { index } => write!(
+                formatter,
+                "vault profile at index {index} bootstraps from an alias that no configured provider owns"
+            ),
             Self::InvalidAliasId { index } => write!(
                 formatter,
                 "vault alias at index {index} has an invalid opaque ID"
@@ -357,6 +362,28 @@ impl Error for VaultProviderConfigError {}
 
 /// Validates trusted startup configuration without touching the filesystem,
 /// DNS, or the provider.
+/// Requires that the resolver which will actually serve a profile's bootstrap
+/// material both exists and owns the named alias.
+///
+/// Checking the alias against the live bootstrap resolver rather than against a
+/// reserved-id set keeps this correct however the resolver is composed: an id
+/// that no resolver owns is a permanent configuration error, and catching it here
+/// turns it into a startup failure instead of an authentication failure on every
+/// request for the life of the process.
+fn require_bootstrap_alias(
+    index: usize,
+    alias: &str,
+    bootstrap: Option<&Arc<dyn SecretResolver>>,
+) -> Result<(), VaultProviderConfigError> {
+    let Some(resolver) = bootstrap else {
+        return Err(VaultProviderConfigError::BootstrapResolverRequired { index });
+    };
+    if !resolver.contains_alias(alias) {
+        return Err(VaultProviderConfigError::UnknownBootstrapAlias { index });
+    }
+    Ok(())
+}
+
 pub fn validate_vault_provider_config(
     config: &VaultProviderConfig,
     reserved_alias_ids: &BTreeSet<String>,
@@ -767,9 +794,7 @@ impl VaultKvV2SecretProvider {
                     },
                 ),
                 VaultAuthConfig::Token { secret_alias } => {
-                    if bootstrap.is_none() {
-                        return Err(VaultProviderConfigError::BootstrapResolverRequired { index });
-                    }
+                    require_bootstrap_alias(index, secret_alias, bootstrap.as_ref())?;
                     (
                         None,
                         VaultAuth::Token {
@@ -782,9 +807,7 @@ impl VaultKvV2SecretProvider {
                     role_id,
                     secret_id_alias,
                 } => {
-                    if bootstrap.is_none() {
-                        return Err(VaultProviderConfigError::BootstrapResolverRequired { index });
-                    }
+                    require_bootstrap_alias(index, secret_id_alias, bootstrap.as_ref())?;
                     (
                         Some(format!("{address}/v1/auth/{mount}/login")),
                         VaultAuth::AppRole {
@@ -1330,8 +1353,7 @@ fn validate_token_root_permissions(
     index: usize,
     metadata: &fs::Metadata,
 ) -> Result<(), VaultProviderConfigError> {
-    use std::os::unix::fs::MetadataExt;
-    if metadata.mode() & 0o022 == 0 {
+    if crate::connections::secret::projected_root_permissions_are_safe(metadata) {
         Ok(())
     } else {
         Err(VaultProviderConfigError::WorkloadTokenRootPermissions { index })
@@ -2014,6 +2036,13 @@ mod tests {
             ResolvedSecret::new(purpose, self.value.clone()).map_err(|_| {
                 SecretResolveError::new(alias_id, SecretResolveErrorKind::InvalidMaterial)
             })
+        }
+
+        // This fake answers for any alias, so contains_alias must say so too.
+        // A resolver whose contains_alias disagrees with its resolve is not a
+        // resolver the production seam can be tested against.
+        fn contains_alias(&self, _: &str) -> bool {
+            true
         }
 
         fn aliases(&self) -> Vec<SecretAliasMetadata> {

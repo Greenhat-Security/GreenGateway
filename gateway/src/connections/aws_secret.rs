@@ -255,6 +255,7 @@ pub enum AwsProviderConfigError {
     InvalidBootstrapAlias { index: usize },
     BootstrapAliasCycle { index: usize },
     BootstrapResolverRequired { index: usize },
+    UnknownBootstrapAlias { index: usize },
     InvalidAliasId { index: usize },
     InvalidLabel { index: usize },
     DuplicateAliasId { index: usize, previous: usize },
@@ -324,6 +325,10 @@ impl fmt::Display for AwsProviderConfigError {
                 formatter,
                 "aws profile at index {index} bootstraps from an alias but no other provider is configured"
             ),
+            Self::UnknownBootstrapAlias { index } => write!(
+                formatter,
+                "aws profile at index {index} bootstraps from an alias that no configured provider owns"
+            ),
             Self::InvalidAliasId { index } => write!(
                 formatter,
                 "aws alias at index {index} has an invalid opaque ID"
@@ -379,6 +384,28 @@ impl Error for AwsProviderConfigError {}
 
 /// Validates trusted startup configuration without touching the filesystem,
 /// DNS, or the provider.
+/// Requires that the resolver which will actually serve a profile's bootstrap
+/// material both exists and owns the named alias.
+///
+/// Checking the alias against the live bootstrap resolver rather than against a
+/// reserved-id set keeps this correct however the resolver is composed: an id
+/// that no resolver owns is a permanent configuration error, and catching it here
+/// turns it into a startup failure instead of an authentication failure on every
+/// request for the life of the process.
+fn require_bootstrap_alias(
+    index: usize,
+    alias: &str,
+    bootstrap: Option<&Arc<dyn SecretResolver>>,
+) -> Result<(), AwsProviderConfigError> {
+    let Some(resolver) = bootstrap else {
+        return Err(AwsProviderConfigError::BootstrapResolverRequired { index });
+    };
+    if !resolver.contains_alias(alias) {
+        return Err(AwsProviderConfigError::UnknownBootstrapAlias { index });
+    }
+    Ok(())
+}
+
 pub fn validate_aws_provider_config(
     config: &AwsProviderConfig,
     reserved_alias_ids: &BTreeSet<String>,
@@ -924,9 +951,8 @@ impl AwsSecretsManagerProvider {
                     access_key_id_alias,
                     secret_access_key_alias,
                 } => {
-                    if bootstrap.is_none() {
-                        return Err(AwsProviderConfigError::BootstrapResolverRequired { index });
-                    }
+                    require_bootstrap_alias(index, access_key_id_alias, bootstrap.as_ref())?;
+                    require_bootstrap_alias(index, secret_access_key_alias, bootstrap.as_ref())?;
                     AwsAuth::StaticKeys {
                         access_key_id_alias: access_key_id_alias.clone(),
                         secret_access_key_alias: secret_access_key_alias.clone(),
@@ -1569,8 +1595,7 @@ fn validate_token_root_permissions(
     index: usize,
     metadata: &fs::Metadata,
 ) -> Result<(), AwsProviderConfigError> {
-    use std::os::unix::fs::MetadataExt;
-    if metadata.mode() & 0o022 == 0 {
+    if crate::connections::secret::projected_root_permissions_are_safe(metadata) {
         Ok(())
     } else {
         Err(AwsProviderConfigError::WorkloadTokenRootPermissions { index })
@@ -2498,6 +2523,10 @@ mod tests {
             ResolvedSecret::new(purpose, value.clone()).map_err(|_| {
                 SecretResolveError::new(alias_id, SecretResolveErrorKind::InvalidMaterial)
             })
+        }
+
+        fn contains_alias(&self, alias_id: &str) -> bool {
+            self.values.contains_key(alias_id)
         }
 
         fn aliases(&self) -> Vec<SecretAliasMetadata> {
