@@ -3092,6 +3092,20 @@ function formatSecretProvider(
       return 'operator file';
     case 'local_encrypted':
       return 'local encrypted';
+    case 'vault_kv_v2':
+      return 'Vault KV v2';
+    case 'gcp_secret_manager':
+      return 'GCP Secret Manager';
+    case 'azure_key_vault':
+      return 'Azure Key Vault';
+    case 'aws_secrets_manager':
+      return 'AWS Secrets Manager';
+    case 'kubernetes_secrets':
+      return 'Kubernetes Secrets';
+    default:
+      // A kind added to the gateway ahead of this build. Naming it from the
+      // wire value keeps the option readable instead of rendering `undefined`.
+      return provider.replaceAll('_', ' ');
   }
 }
 
