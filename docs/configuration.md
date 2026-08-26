@@ -998,11 +998,11 @@ For reverse-proxy fallback requests, GreenGateway removes inbound proxy metadata
 
 ### VALIDATION_ALLOWED_CONTENT_TYPES
 
-Comma-separated list of `Content-Type` prefixes accepted for mutating requests.
+Comma-separated list of media types accepted for mutating requests.
 
 Default: `application/json`
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a valid HTTP header value. `POST`, `PUT`, and `PATCH` requests are accepted when their `Content-Type` starts with any configured entry, allowing values such as `application/json; charset=utf-8`.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a valid HTTP header value. `POST`, `PUT`, and `PATCH` requests are accepted when the media type of their `Content-Type` matches a configured entry. Matching follows RFC 9110 section 8.3.1: `;`-delimited parameters are not part of the media type, and type and subtype are compared case-insensitively, so `application/json; charset=utf-8`, `application/json;charset=utf-8`, and `Application/JSON` all match a configured `application/json`. The comparison is on the whole media type rather than a prefix of it, so `application/json-patch+json` does not match `application/json` and must be listed explicitly.
 
 ### AUTH_ENABLED
 

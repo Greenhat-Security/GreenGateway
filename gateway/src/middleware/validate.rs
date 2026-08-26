@@ -105,14 +105,29 @@ fn openapi_preview_admin_route(config: &Config) -> String {
     format!("/v1{}/tools/openapi/preview", config.admin_prefix)
 }
 
+/// Whether a request `Content-Type` names the media type of an allow-list entry.
+///
+/// The match is on the whole media type, not a prefix of it, so
+/// `application/json-patch+json` is a different media type from
+/// `application/json` and stays rejected. Within that, RFC 9110 section 8.3.1
+/// governs: type and subtype are case-insensitive, and `;`-delimited
+/// parameters such as `charset` are not part of the media type. Comparing the
+/// parsed media types therefore accepts every RFC-valid spelling of an allowed
+/// type and nothing else.
 fn content_type_matches(content_type: &str, allowed: &str) -> bool {
-    content_type.strip_prefix(allowed).is_some_and(|remainder| {
-        remainder.is_empty()
-            || remainder
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| *byte == b';' || byte.is_ascii_whitespace())
-    })
+    let content_type = media_type(content_type);
+
+    !content_type.is_empty() && content_type.eq_ignore_ascii_case(media_type(allowed))
+}
+
+/// The `type/subtype` portion of a media type value, without its parameters or
+/// the optional whitespace RFC 9110 allows around them.
+fn media_type(value: &str) -> &str {
+    value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|character: char| character.is_ascii_whitespace())
 }
 
 /// 501 rather than 405: 405 is for a method the server implements but the
@@ -408,6 +423,82 @@ mod tests {
 
             assert_eq!(response.status(), expected_status);
         }
+    }
+
+    #[tokio::test]
+    async fn accepts_rfc_valid_media_type_casing() {
+        for content_type in [
+            "Application/JSON",
+            "APPLICATION/JSON",
+            "application/Json",
+            "Application/json; charset=utf-8",
+            "application/json;charset=utf-8",
+            "application/json ; charset=utf-8",
+        ] {
+            let response = test_router(test_config(1024, vec!["application/json"]))
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/")
+                        .header(CONTENT_TYPE, content_type)
+                        .body(Body::from("{}"))
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+        }
+    }
+
+    #[tokio::test]
+    async fn media_type_match_is_not_widened_to_neighbouring_types() {
+        for content_type in [
+            "application/json-patch+json",
+            "application/jsonlines",
+            "application/jsonx",
+            "text/json",
+            "application/xml",
+            "",
+        ] {
+            let mut request = Request::builder().method(Method::POST).uri("/");
+            if !content_type.is_empty() {
+                request = request.header(CONTENT_TYPE, content_type);
+            }
+            let response = test_router(test_config(1024, vec!["application/json"]))
+                .oneshot(
+                    request
+                        .body(Body::from("{}"))
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{content_type}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_preview_media_type_match_is_case_insensitive() {
+        let response = test_router(test_config(1024, vec!["application/json"]))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/admin/tools/openapi/preview")
+                    .header(CONTENT_TYPE, "Application/YAML")
+                    .body(Body::from("openapi: 3.0.3"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        // The test router has no handler for the preview route, so passing the
+        // media-type gate surfaces as the router's own 404 rather than a 415.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
