@@ -156,14 +156,7 @@ const ADMIN_MCP_USE_PERMISSION: &str = "admin:mcp:use";
 #[cfg(test)]
 const MCP_ROUTE: &str = auth::protected_resource::MCP_RESOURCE_PATH;
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
-const GATEWAY_OWNED_EXACT_PATHS: &[&str] = &[
-    "/health",
-    "/livez",
-    "/startupz",
-    "/readyz",
-    "/version",
-    "/metrics",
-];
+const GATEWAY_OWNED_EXACT_PATHS: &[&str] = path_match::GATEWAY_EXACT_ROUTE_PATHS;
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
 const MAX_AUDIT_QUERY_LIMIT: usize = 500;
 const DEFAULT_TRAFFIC_RECENT_EVENTS_LIMIT: usize = 20;
@@ -328,7 +321,7 @@ fn mcp_route_covering_exempt_prefix<'a>(
         .iter()
         .find(|exempt_path| {
             exempt_path.as_str() != mcp_path
-                && path_match::path_prefix_matches(mcp_path, exempt_path)
+                && path_match::exempt_path_matches(mcp_path, exempt_path)
         })
         .map(String::as_str)
 }
@@ -18553,6 +18546,104 @@ mod tests {
         assert_upstream_receives_no_request(
             &mut captured,
             "fixed probe routes should not be proxied with custom admin prefix",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn probe_path_subtrees_are_not_exempt_from_authentication() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let mut config = proxy_config(upstream_addr);
+        config.auth_enabled = true;
+        config.auth_mode = config::AuthMode::Required;
+        let router = proxy_router(config, test_audit_log());
+
+        // The probe route itself stays exempt and is still served locally.
+        let probe = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("probe request should build"),
+            )
+            .await
+            .expect("probe request should complete");
+        assert_eq!(probe.status(), StatusCode::OK);
+
+        // Anything below a probe route is proxy space, so it must be
+        // authenticated exactly like any other proxied path.
+        for uri in [
+            "/health/v1/orders",
+            "/livez/v1/orders",
+            "/startupz/v1/orders",
+            "/readyz/v1/orders",
+            "/version/v1/orders",
+            "/metrics/jvm.memory.used",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "probe path subtrees must not reach the upstream unauthenticated",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn probe_path_subtrees_are_not_exempt_from_authorization() {
+        let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+        let policy = TempPolicyFile::new(
+            r#"{
+                "schema_version": "0.1.0",
+                "default_action": "deny",
+                "enforcement_mode": "enforce",
+                "roles": {},
+                "routes": []
+            }"#,
+        );
+        let mut config = proxy_config(upstream_addr);
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        let router = proxy_router(config, test_audit_log());
+
+        let probe = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("probe request should build"),
+            )
+            .await
+            .expect("probe request should complete");
+        assert_eq!(probe.status(), StatusCode::OK);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health/v1/orders")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_upstream_receives_no_request(
+            &mut captured,
+            "probe path subtrees must be evaluated against policy before proxying",
         )
         .await;
     }

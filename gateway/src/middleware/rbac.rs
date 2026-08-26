@@ -26,7 +26,7 @@ use crate::{
     auth::{self, actor_from_principal, protected_resource},
     client_ip::{canonical_client_ip, request_id, ClientIpPolicy},
     config::Config,
-    path_match::{is_unsafe_request_path, path_prefix_matches},
+    path_match::{exempt_path_matches, is_unsafe_request_path, path_prefix_matches},
     rbac::{
         policy::ToolPolicyEntry, rule::principal_identity_matches, DefaultAction, EgressPolicy,
         EnforcementMode, Policy, PolicyEngine, RouteRule, RuleAction, RuleDecision,
@@ -729,7 +729,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         && state
             .exempt_paths
             .iter()
-            .any(|exempt_path| path_prefix_matches(path, exempt_path))
+            .any(|exempt_path| exempt_path_matches(path, exempt_path))
     {
         return next.run(req).await;
     }

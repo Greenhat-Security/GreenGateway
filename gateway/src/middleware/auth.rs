@@ -26,7 +26,7 @@ use crate::{
     },
     client_ip::{canonical_client_ip, request_id, ClientIpPolicy},
     config::{AuthMode, Config},
-    path_match::path_prefix_matches,
+    path_match::exempt_path_matches,
 };
 
 use super::{bearer::bearer_token, decision::AuthOutcome};
@@ -125,7 +125,7 @@ pub async fn auth_middleware(
         && state
             .exempt_paths
             .iter()
-            .any(|exempt_path| path_prefix_matches(&path, exempt_path))
+            .any(|exempt_path| exempt_path_matches(&path, exempt_path))
     {
         return next.run(req).await;
     }
