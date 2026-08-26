@@ -57,13 +57,20 @@ writer.
 
 Connection documents contain opaque secret bindings, never plaintext values,
 environment-variable names, mounted-file paths, ciphertext, or master-key IDs.
-Three providers are available:
+Eight providers are available:
 
 | Provider | Provisioned by | Rotation |
 |---|---|---|
 | Operator environment | Startup configuration and process environment | Change the deployment environment; usually restart the process |
 | Operator file | Startup configuration and a protected mounted file | Atomically replace the file inside the same protected root |
 | Encrypted local | A write-only admin operation | Rotate in the admin UI or API; the old value is not returned |
+| HashiCorp Vault KV v2 | `CONNECTION_VAULT_PROVIDER` | Rotate in Vault; unpinned aliases pick it up after the bounded cache expires |
+| AWS Secrets Manager | `CONNECTION_AWS_PROVIDER` | Rotate in AWS; `AWSCURRENT` becomes visible after the bounded cache expires |
+| Azure Key Vault | `CONNECTION_AZURE_PROVIDER` | Rotate in Key Vault; unversioned aliases pick it up after the bounded cache expires |
+| Google Cloud Secret Manager | `CONNECTION_GCP_PROVIDER` | Add a version in GCP; `latest` aliases pick it up after the bounded cache expires |
+| Kubernetes Secrets API | `CONNECTION_KUBERNETES_PROVIDER` | Update the Secret; aliases pick it up after the bounded cache expires |
+
+The five network providers are read-only: the gateway never creates, rotates, or deletes material in them, and a pinned version stays pinned until an operator changes the configuration.
 
 Environment and file aliases are resolved for each authorized use. The
 provider does not cache their values. An in-flight request keeps its already

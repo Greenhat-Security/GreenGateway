@@ -1852,8 +1852,48 @@ pub(crate) fn tls_client_identity_half_is_valid(pem_half: &[u8], is_certificate:
         // to parse as real X.509 DER rather than merely look like a PEM block.
         certificate_count >= 1 && private_key_count == 0 && tls_ca_bundle_pem_is_valid(pem_half)
     } else {
-        certificate_count == 0 && private_key_count == 1
+        // Marker counting alone would accept a truncated or corrupt body, which
+        // the transport then rejects on every request. Requiring the section to
+        // close and its body to base64-decode catches that here instead. This
+        // still cannot prove the DER is a loadable key of the labelled type —
+        // only pairing it with its certificate does, which the async rotation
+        // preflight performs when the counterpart is reachable.
+        certificate_count == 0 && private_key_count == 1 && pem_section_body_decodes(pem_half)
     }
+}
+
+/// Whether the single PEM section in `pem` closes and its body is valid base64.
+fn pem_section_body_decodes(pem: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(pem) else {
+        return false;
+    };
+    let Some(begin) = text.find("-----BEGIN ") else {
+        return false;
+    };
+    let Some(header_end) = text[begin..]
+        .find("-----\n")
+        .map(|offset| begin + offset + 6)
+    else {
+        // Tolerate CRLF and a header terminated at end of input.
+        let Some(offset) = text[begin..].find("-----\r\n") else {
+            return false;
+        };
+        return decode_pem_body(&text[begin + offset + 7..]);
+    };
+    decode_pem_body(&text[header_end..])
+}
+
+fn decode_pem_body(rest: &str) -> bool {
+    use base64::Engine as _;
+
+    let Some(end) = rest.find("-----END ") else {
+        return false;
+    };
+    let body: String = rest[..end].chars().filter(|c| !c.is_whitespace()).collect();
+    !body.is_empty()
+        && base64::engine::general_purpose::STANDARD
+            .decode(body.as_bytes())
+            .is_ok()
 }
 
 /// Validates a joined client identity exactly as the transport will.
@@ -2782,6 +2822,48 @@ mod tests {
             already_terminated.len(),
             certificate_pem.len() + key_pem.len()
         );
+    }
+
+    #[test]
+    fn a_half_validator_rejects_material_of_the_wrong_kind_or_a_corrupt_body() {
+        let key = rcgen::KeyPair::generate().expect("test identity key should generate");
+        let certificate = rcgen::CertificateParams::new(vec!["client.example.test".to_owned()])
+            .expect("test identity parameters should build")
+            .self_signed(&key)
+            .expect("test identity certificate should build");
+        let certificate_pem = certificate.pem();
+        let key_pem = key.serialize_pem();
+
+        assert!(tls_client_identity_half_is_valid(
+            certificate_pem.as_bytes(),
+            true
+        ));
+        assert!(tls_client_identity_half_is_valid(key_pem.as_bytes(), false));
+
+        // Each half must reject the other's material, so a rotation cannot put
+        // a certificate where a key belongs.
+        assert!(!tls_client_identity_half_is_valid(key_pem.as_bytes(), true));
+        assert!(!tls_client_identity_half_is_valid(
+            certificate_pem.as_bytes(),
+            false
+        ));
+
+        // Garbage, and a key whose markers are intact but whose body is
+        // truncated or corrupt — marker counting alone accepted the latter.
+        assert!(!tls_client_identity_half_is_valid(
+            b"not-a-private-key",
+            false
+        ));
+        let corrupt = key_pem.replace("-----END", "!!!!!\n-----END");
+        assert!(!tls_client_identity_half_is_valid(
+            corrupt.as_bytes(),
+            false
+        ));
+        let unterminated = key_pem.replace("-----END PRIVATE KEY-----", "");
+        assert!(!tls_client_identity_half_is_valid(
+            unterminated.as_bytes(),
+            false
+        ));
     }
 
     #[test]

@@ -1575,39 +1575,56 @@ RowSUZV5FSmOGJ7JyROZ80k=
 
     #[tokio::test]
     async fn a_jwks_with_no_usable_keys_never_replaces_a_working_key_set() {
-        let validator = validator(
-            jwt_cfg("https://unreachable.invalid/.well-known/jwks.json"),
-            Arc::new(NoopRevocationStore),
-            TEST_PUBLIC_KEY,
-        );
-        let token = signed_token(base_claims(), TEST_PRIVATE_KEY);
-        validator
-            .decode(&token)
-            .await
-            .expect("the seeded key set should decode");
-        let seeded = validator.keys.read().await.len();
-        assert_eq!(seeded, 1);
+        // The document must actually be fetched and parsed for this to exercise
+        // anything: an unreachable host is rejected by the egress allowlist
+        // before any HTTP happens, which reaches the fetch-failure path instead
+        // and would pass with the guard deleted.
+        for degraded in [
+            json!({ "keys": [] }).to_string(),
+            // Parses, but nothing a decoding key can be built from: an
+            // unsupported curve, and an otherwise-fine key with no kid.
+            json!({ "keys": [
+                { "kty": "EC", "kid": KID, "use": "sig", "alg": "ES384",
+                  "crv": "P-384", "x": TEST_EC_PUBLIC_KEY_X, "y": TEST_EC_PUBLIC_KEY_Y },
+                { "kty": "RSA", "use": "sig", "alg": "RS256",
+                  "n": TEST_PUBLIC_KEY_N, "e": TEST_PUBLIC_KEY_E }
+            ] })
+            .to_string(),
+        ] {
+            let (jwks_url, server) = jwks_server(degraded, 1).await;
+            let validator = JwtValidator::new_with_keys(
+                jwt_cfg(&jwks_url),
+                egress_client(HashSet::from(["127.0.0.1".to_owned()]), false),
+                Arc::new(NoopRevocationStore),
+                decoding_keys(TEST_PUBLIC_KEY),
+            )
+            .expect("validator should build");
+            let token = signed_token(base_claims(), TEST_PRIVATE_KEY);
+            validator
+                .decode(&token)
+                .await
+                .expect("the seeded key set should decode");
+            assert_eq!(validator.keys.read().await.len(), 1);
 
-        // A JWKS that parses but yields nothing usable — an empty `keys` array,
-        // an unsupported key type, entries without a kid — is an IdP fault. It
-        // must not replace the working key set with an empty one, which would
-        // reject every token as an unknown kid while looking freshly fetched.
-        let error = validator
-            .fetch_jwks()
-            .await
-            .expect_err("an unreachable JWKS should fail");
-        assert!(matches!(error, AuthError::Upstream(_)));
-        assert_eq!(
-            validator.keys.read().await.len(),
-            seeded,
-            "a failed fetch must leave the previous keys in place"
-        );
-
-        // Still inside the trust window, so the working keys keep serving.
-        validator
-            .decode(&token)
-            .await
-            .expect("a failed refresh must not revoke keys inside their window");
+            // A document that parses to zero usable keys is an IdP fault, not a
+            // successful fetch. Committing it would wipe the working key set and
+            // stamp it fresh, rejecting every token as an unknown kid.
+            let error = validator
+                .fetch_jwks()
+                .await
+                .expect_err("a JWKS with no usable key must not be committed");
+            assert!(matches!(error, AuthError::Upstream(_)));
+            assert_eq!(
+                validator.keys.read().await.len(),
+                1,
+                "the working key set must survive a degraded document"
+            );
+            validator
+                .decode(&token)
+                .await
+                .expect("the retained keys keep serving inside their window");
+            server.await.expect("JWKS test server should finish");
+        }
     }
 
     #[tokio::test]

@@ -746,13 +746,34 @@ impl SecretPurpose {
             Self::TlsCertificate | Self::TlsCaBundle => MAX_TLS_CERTIFICATE_BYTES,
         }
     }
+
+    /// Whether material for this purpose is sent verbatim as an HTTP header
+    /// value.
+    ///
+    /// The OAuth client secret is deliberately excluded: it is URL-encoded and
+    /// then base64-encoded into a Basic credential, so bytes that no header may
+    /// carry survive that transformation harmlessly.
+    pub(crate) const fn is_http_header_value(self) -> bool {
+        matches!(self, Self::HeaderApiKey | Self::StaticBearer)
+    }
+}
+
+/// Mirrors the validity rule `http::HeaderValue::from_bytes` applies: visible
+/// ASCII and above, plus horizontal tab, excluding DEL.
+const fn is_header_safe(byte: u8) -> bool {
+    byte >= 0x20 && byte != 0x7F || byte == b'\t'
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SecretValueError {
     Empty,
-    TooLarge { maximum: usize },
+    TooLarge {
+        maximum: usize,
+    },
     ContainsNul,
+    /// Material for a purpose that is sent as an HTTP header contains a byte no
+    /// header value may carry.
+    NotHeaderSafe,
 }
 
 /// Resolved secret material that cannot be serialized or accidentally logged.
@@ -778,6 +799,15 @@ impl ResolvedSecret {
         }
         if value.contains(&0) {
             return Err(SecretValueError::ContainsNul);
+        }
+        // Credential purposes are sent verbatim as an HTTP header value, and
+        // `HeaderValue::from_bytes` refuses control bytes. Catching that here,
+        // where the material is already in hand, turns it into one clear error
+        // at write or rotation time instead of a 502 on every proxied request
+        // for the life of the binding. A trailing newline is the common case:
+        // `echo 'token' > secret-file` produces one.
+        if purpose.is_http_header_value() && !value.iter().all(|byte| is_header_safe(*byte)) {
+            return Err(SecretValueError::NotHeaderSafe);
         }
 
         Ok(Self { purpose, value })
