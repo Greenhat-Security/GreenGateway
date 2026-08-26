@@ -24,12 +24,31 @@ struct PayloadTooLargeBody {
 }
 
 #[derive(Serialize)]
+struct MethodNotSupportedBody {
+    error: &'static str,
+    method: String,
+}
+
+#[derive(Serialize)]
 struct UnsupportedMediaTypeBody {
     error: &'static str,
     allowed_content_types: Vec<String>,
 }
 
 pub async fn validate_request(State(config): State<Config>, req: Request, next: Next) -> Response {
+    // A reverse proxy has no tunnel to offer, so CONNECT is never legitimate
+    // here. This has to be an explicit method check rather than a routing
+    // concern: the proxy fallback is registered with `any`, which matches every
+    // method, so an unhandled CONNECT would be forwarded like an ordinary
+    // request rather than refused. Today HTTP/1.1 CONNECT carries an
+    // authority-form target that matches no route, but enabling HTTP/2 makes
+    // axum advertise the extended CONNECT protocol (RFC 8441), and those
+    // requests do carry a real `:path`. Rejecting here keeps turning on HTTP/2
+    // from silently turning the gateway into an open tunnel.
+    if req.method() == Method::CONNECT {
+        return method_not_supported(req.method());
+    }
+
     // This early guard rejects declared oversize bodies before downstream
     // handlers apply their streaming byte limits.
     if let Some(content_length) = content_length(req.headers()) {
@@ -96,6 +115,22 @@ fn content_type_matches(content_type: &str, allowed: &str) -> bool {
     })
 }
 
+/// 501 rather than 405: 405 is for a method the server implements but the
+/// target resource does not allow, and it obliges us to send an `Allow` header
+/// enumerating what is permitted. The gateway supports CONNECT on no resource
+/// at all, and the fallback accepts every other method, so there is no honest
+/// `Allow` list to send.
+fn method_not_supported(method: &Method) -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(MethodNotSupportedBody {
+            error: "method not supported",
+            method: method.to_string(),
+        }),
+    )
+        .into_response()
+}
+
 fn payload_too_large(max_body_size: usize) -> Response {
     (
         StatusCode::PAYLOAD_TOO_LARGE,
@@ -125,7 +160,12 @@ fn is_mutating(method: &Method) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, middleware::from_fn_with_state, routing::get, Router};
+    use axum::{
+        body::Body,
+        middleware::from_fn_with_state,
+        routing::{any, get},
+        Router,
+    };
     use tower::ServiceExt;
 
     fn test_config(max_body_size: usize, validation_allowed_content_types: Vec<&str>) -> Config {
@@ -249,6 +289,53 @@ mod tests {
         Router::new()
             .route("/", get(ok).post(ok))
             .layer(from_fn_with_state(config, validate_request))
+    }
+
+    /// Mirrors the production router, which registers the proxy fallback with
+    /// `any` and therefore matches every method including CONNECT.
+    fn test_router_with_any_fallback(config: Config) -> Router {
+        async fn ok() -> &'static str {
+            "ok"
+        }
+
+        Router::new()
+            .fallback(any(ok))
+            .layer(from_fn_with_state(config, validate_request))
+    }
+
+    #[tokio::test]
+    async fn rejects_connect_even_where_the_fallback_would_accept_every_method() {
+        let response = test_router_with_any_fallback(test_config(1024, vec!["application/json"]))
+            .oneshot(
+                Request::builder()
+                    .method(Method::CONNECT)
+                    .uri("/anything")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn the_any_fallback_really_does_accept_other_methods() {
+        // Without this, the CONNECT test above would still pass if the fallback
+        // silently stopped matching arbitrary methods, and the guard it is
+        // meant to pin would go untested.
+        let response = test_router_with_any_fallback(test_config(1024, vec!["application/json"]))
+            .oneshot(
+                Request::builder()
+                    .method(Method::TRACE)
+                    .uri("/anything")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
