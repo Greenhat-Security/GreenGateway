@@ -1,6 +1,7 @@
 import { Container, getContainer } from "@cloudflare/containers";
 import type { StopParams } from "@cloudflare/containers";
 
+import { withForwardedClientIdentity } from "./forwarded";
 import {
   buildGreenGatewayContainerEnv,
   CONTAINER_PING_ENDPOINT,
@@ -39,6 +40,8 @@ export class GreenGatewayContainer extends Container<Env> {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    return getContainer(env.GREENGATEWAY_CONTAINER).fetch(request);
+    return getContainer(env.GREENGATEWAY_CONTAINER).fetch(
+      withForwardedClientIdentity(request),
+    );
   },
 } satisfies ExportedHandler<Env>;

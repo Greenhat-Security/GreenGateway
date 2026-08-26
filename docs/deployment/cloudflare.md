@@ -48,6 +48,20 @@ Secrets such as OIDC client secrets should be configured as Worker secrets or em
 
 These values are passed to the container when it starts. If you change a Worker variable after the container is already running, redeploy or restart the container before relying on the new value.
 
+### Client IP attribution
+
+A caller's connection terminates at Cloudflare's edge, so the connection the container accepts is opened by the Durable Object. Every request therefore reaches the gateway from the same peer address.
+
+The Worker recovers the real caller by translating Cloudflare's `cf-connecting-ip` into `x-forwarded-for` and `x-real-ip` on the container subrequest. It **sets** both rather than appending, and strips them when the edge supplies no address, so a caller-supplied value can never be mistaken for one Cloudflare vouched for.
+
+That is necessary but not sufficient. GreenGateway ignores forwarded headers unless the connection peer is inside a configured trusted CIDR, and `TRUST_PROXY_HEADERS` is `false` by default. **Until you set `TRUST_PROXY_HEADERS=true` and a `TRUSTED_PROXY_CIDRS` value covering the container-runtime peer address, every caller shares one client identity.** The consequences are concrete:
+
+- Pre-auth rate limiting keys on `ip:{client_ip}`, so all callers share a single bucket. One client exceeding `RATE_LIMIT_WRITE_RPS` returns HTTP 429 to everyone else — an unauthenticated, whole-deployment denial of service that the per-IP design exists to prevent.
+- The pending-login store's per-IP cap is likewise shared, so one client can exhaust admin SSO logins for all operators.
+- Audit and observation records attribute every request to the same address.
+
+Both variables are forwarded by the wrapper. Determine the peer CIDR for your deployment rather than copying one: read the `client_ip` recorded in an audit event from a known caller, and confirm it changes per caller once the CIDR is set. Setting `TRUSTED_PROXY_CIDRS` wider than the actual peer range would let a caller that can reach the container directly spoof its own identity, so keep it as narrow as the observed peer address allows.
+
 ### Connections storage and secret providers
 
 The wrapper recognizes all four Connections storage and secret settings:
@@ -70,6 +84,7 @@ If a custom Cloudflare deployment supplies durable storage or a secure mount out
 - Cloudflare Containers use an ephemeral container filesystem by default. GreenGateway settings such as `AUDIT_SQLITE_PATH`, `DISCOVERY_SQLITE_PATH`, `PRINCIPAL_SQLITE_PATH`, `SERVICE_TOKEN_SQLITE_PATH`, and `CONNECTIONS_SQLITE_PATH` can work for evaluation, but their contents are lost on container replacement unless the deployment explicitly supplies durable storage. A redeploy must be treated as potential state loss, not as a persistence mechanism.
 - File-backed settings such as `POLICY_FILE`, `TOOLS_FILE`, `OPENAPI_SPEC_PATH`, `CONNECTION_SECRETS_ROOT`, CA bundles, and mTLS client identities must point at files that exist inside the image or are otherwise created at runtime. The one-click wrapper does not create a secure mount. A plain or secret Worker variable is not a mounted private-key file; do not put PEM key material, local encryption keys, or resolved Connection secrets in `wrangler.jsonc`, public variables, image layers, or inline route JSON.
 - The one-click wrapper does not expose `ADMIN_LISTEN_ADDR`; use the shared `ADMIN_PREFIX` surface with normal authentication/RBAC.
+- Per-IP limits are inert until proxy-header trust is configured. See [Client IP attribution](#client-ip-attribution); without it a single caller can rate-limit the whole deployment.
 - This project is still alpha software. Treat the one-click deploy path as a fast evaluation path, not a production hardening guide.
 - The first container deploy may return Worker errors for several minutes while Cloudflare finishes provisioning container capacity.
 
