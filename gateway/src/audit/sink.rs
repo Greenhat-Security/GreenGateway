@@ -42,12 +42,88 @@ struct DiscoverySinkOptions<'a> {
     payload_capture_enabled: bool,
 }
 
+/// Byte destination for [`StdoutSink`].
+///
+/// Production always writes to process stdout. Tests substitute a failing
+/// target so the sink's drop accounting and sticky-failure reporting can be
+/// exercised without breaking the harness's own stdout.
+trait StdoutWriteTarget: Send + Sync {
+    fn write_line(&self, line: &str) -> io::Result<()>;
+}
+
 #[derive(Debug, Default)]
-pub struct StdoutSink;
+struct ProcessStdout;
+
+impl StdoutWriteTarget for ProcessStdout {
+    fn write_line(&self, line: &str) -> io::Result<()> {
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        writeln!(handle, "{line}")?;
+        handle.flush()
+    }
+}
+
+/// Always-present audit sink writing one JSON event per line to stdout.
+///
+/// Stdout is the only sink every deployment has, so a failed write is audit
+/// loss even when no other sink is configured. Failures are therefore counted
+/// on `audit_events_dropped_total{reason="sink_error"}` and recorded stickily,
+/// so `flush` reports them during the shutdown drain the same way [`FileSink`]
+/// does. The `tracing::error!` companion is best effort only: the default
+/// tracing writer is the same stdout descriptor that just failed.
+pub struct StdoutSink {
+    target: Arc<dyn StdoutWriteTarget>,
+    failure: Mutex<Option<String>>,
+}
 
 impl StdoutSink {
     pub fn new() -> Self {
-        Self
+        Self::with_target(Arc::new(ProcessStdout))
+    }
+
+    fn with_target(target: Arc<dyn StdoutWriteTarget>) -> Self {
+        Self {
+            target,
+            failure: Mutex::new(None),
+        }
+    }
+
+    fn failure_guard(&self) -> MutexGuard<'_, Option<String>> {
+        match self.failure.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                ::metrics::counter!(
+                    LOCK_POISON_RECOVERIES_TOTAL,
+                    "component" => "audit",
+                    "lock" => "stdout_sink"
+                )
+                .increment(1);
+                tracing::error!("audit stdout sink lock poisoned; recovering");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn record_failure(&self, error: impl fmt::Display) {
+        let mut failure = self.failure_guard();
+        if failure.is_none() {
+            *failure = Some(format!("audit stdout sink failed: {error}"));
+        }
+    }
+}
+
+impl Default for StdoutSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for StdoutSink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StdoutSink")
+            .field("failure", &*self.failure_guard())
+            .finish()
     }
 }
 
@@ -56,21 +132,25 @@ impl AuditSink for StdoutSink {
         let line = match serde_json::to_string(event) {
             Ok(line) => line,
             Err(err) => {
+                self.record_failure(&err);
                 tracing::error!(error = %err, "failed to serialize audit event for stdout");
                 return;
             }
         };
 
-        let stdout = std::io::stdout();
-        let mut handle = stdout.lock();
-        if let Err(err) = writeln!(handle, "{line}") {
+        if let Err(err) = self.target.write_line(&line) {
+            self.record_failure(&err);
+            ::metrics::counter!(
+                AUDIT_EVENTS_DROPPED_TOTAL,
+                "reason" => "sink_error"
+            )
+            .increment(1);
             tracing::error!(error = %err, "failed to write audit event to stdout");
-            return;
         }
+    }
 
-        if let Err(err) = handle.flush() {
-            tracing::error!(error = %err, "failed to flush audit event to stdout");
-        }
+    fn flush(&self) -> Result<(), String> {
+        self.failure_guard().clone().map_or(Ok(()), Err)
     }
 }
 
@@ -404,6 +484,187 @@ pub mod tests {
         let sink = StdoutSink::new();
 
         sink.emit(&test_event("audit.stdout"));
+    }
+
+    #[test]
+    fn stdout_sink_flush_is_clean_while_writes_succeed() {
+        let target = Arc::new(RecordingTarget::default());
+        let sink = StdoutSink::with_target(Arc::clone(&target) as Arc<dyn StdoutWriteTarget>);
+
+        sink.emit(&test_event("audit.stdout.ok"));
+
+        assert_eq!(target.lines().len(), 1);
+        assert_eq!(sink.flush(), Ok(()));
+        assert_eq!(sink.flush(), Ok(()));
+    }
+
+    #[test]
+    fn stdout_sink_counts_dropped_event_and_fails_flush_after_write_error() {
+        let target = Arc::new(RecordingTarget::default());
+        target.fail_with(io::ErrorKind::BrokenPipe, "stdout reader went away");
+        let sink = StdoutSink::with_target(Arc::clone(&target) as Arc<dyn StdoutWriteTarget>);
+        let recorder = CountingRecorder::default();
+
+        ::metrics::with_local_recorder(&recorder, || {
+            sink.emit(&test_event("audit.stdout.broken"));
+        });
+
+        assert_eq!(
+            recorder.count("audit_events_dropped_total", &[("reason", "sink_error")]),
+            1,
+            "a dropped stdout audit event must be counted like a dropped file-sink event"
+        );
+
+        let error = sink
+            .flush()
+            .expect_err("a stdout write failure must make the audit drain report unclean");
+        assert!(
+            error.contains("audit stdout sink failed"),
+            "flush error should name the sink: {error}"
+        );
+        assert!(
+            error.contains("stdout reader went away"),
+            "flush error should carry the underlying cause: {error}"
+        );
+        assert_eq!(
+            sink.flush(),
+            Err(error),
+            "the failure must stay sticky across idempotent flushes"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingTarget {
+        lines: Mutex<Vec<String>>,
+        failure: Mutex<Option<(io::ErrorKind, String)>>,
+    }
+
+    impl RecordingTarget {
+        fn fail_with(&self, kind: io::ErrorKind, message: &str) {
+            *self.failure.lock().expect("failure lock") = Some((kind, message.to_owned()));
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.lines.lock().expect("lines lock").clone()
+        }
+    }
+
+    impl StdoutWriteTarget for RecordingTarget {
+        fn write_line(&self, line: &str) -> io::Result<()> {
+            if let Some((kind, message)) = self.failure.lock().expect("failure lock").clone() {
+                return Err(io::Error::new(kind, message));
+            }
+
+            self.lines.lock().expect("lines lock").push(line.to_owned());
+            Ok(())
+        }
+    }
+
+    /// Minimal in-process `metrics` recorder so counter emissions can be
+    /// asserted without adding a test-only dependency.
+    #[derive(Clone, Default)]
+    struct CountingRecorder {
+        counts: Arc<Mutex<Vec<(String, u64)>>>,
+    }
+
+    impl CountingRecorder {
+        fn count(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+            let key = render_counter_key(name, labels);
+            self.counts
+                .lock()
+                .expect("counts lock")
+                .iter()
+                .filter(|(recorded, _)| recorded == &key)
+                .map(|(_, value)| value)
+                .sum()
+        }
+    }
+
+    struct RecordedCounter {
+        key: String,
+        counts: Arc<Mutex<Vec<(String, u64)>>>,
+    }
+
+    impl ::metrics::CounterFn for RecordedCounter {
+        fn increment(&self, value: u64) {
+            self.counts
+                .lock()
+                .expect("counts lock")
+                .push((self.key.clone(), value));
+        }
+
+        fn absolute(&self, value: u64) {
+            self.increment(value);
+        }
+    }
+
+    impl ::metrics::Recorder for CountingRecorder {
+        fn describe_counter(
+            &self,
+            _key: ::metrics::KeyName,
+            _unit: Option<::metrics::Unit>,
+            _description: ::metrics::SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _key: ::metrics::KeyName,
+            _unit: Option<::metrics::Unit>,
+            _description: ::metrics::SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _key: ::metrics::KeyName,
+            _unit: Option<::metrics::Unit>,
+            _description: ::metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(
+            &self,
+            key: &::metrics::Key,
+            _metadata: &::metrics::Metadata<'_>,
+        ) -> ::metrics::Counter {
+            let labels = key
+                .labels()
+                .map(|label| (label.key().to_owned(), label.value().to_owned()))
+                .collect::<Vec<_>>();
+            let borrowed = labels
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            ::metrics::Counter::from_arc(Arc::new(RecordedCounter {
+                key: render_counter_key(key.name(), &borrowed),
+                counts: Arc::clone(&self.counts),
+            }))
+        }
+
+        fn register_gauge(
+            &self,
+            _key: &::metrics::Key,
+            _metadata: &::metrics::Metadata<'_>,
+        ) -> ::metrics::Gauge {
+            ::metrics::Gauge::noop()
+        }
+
+        fn register_histogram(
+            &self,
+            _key: &::metrics::Key,
+            _metadata: &::metrics::Metadata<'_>,
+        ) -> ::metrics::Histogram {
+            ::metrics::Histogram::noop()
+        }
+    }
+
+    fn render_counter_key(name: &str, labels: &[(&str, &str)]) -> String {
+        let mut rendered = name.to_owned();
+        for (label, value) in labels {
+            rendered.push_str(&format!("|{label}={value}"));
+        }
+        rendered
     }
 
     #[test]
