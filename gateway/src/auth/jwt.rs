@@ -29,6 +29,18 @@ use super::{
 const INVALID_TOKEN: &str = "invalid or expired token";
 const MIN_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long a fetched JWKS key set stays trusted.
+///
+/// Without a bound, a cached `kid` is trusted for the life of the process:
+/// `decode` only refreshes on a kid *miss*, so a key the issuer has withdrawn is
+/// never evicted as long as callers keep presenting it. Revoking a compromised
+/// signing key at the IdP would then have no effect on this gateway until it
+/// restarts. This is the same shape as caching a secret past its expiry — the
+/// artifact's validity must survive into the cache rather than being discarded
+/// at fetch time — so the key set carries the instant it was fetched and is
+/// re-fetched once it ages out.
+const MAX_JWKS_KEY_AGE: Duration = Duration::from_secs(300);
+
 /// JWT bearer-token validator configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JwtAuthConfig {
@@ -106,6 +118,10 @@ pub struct JwtValidator {
     principal_issuer: Option<String>,
     egress_client: Arc<EgressClient>,
     keys: Arc<RwLock<HashMap<String, CachedDecodingKey>>>,
+    /// When the current key set was last fetched *successfully*. Distinct from
+    /// `last_jwks_refresh`, which records attempts (including failures) to rate
+    /// limit kid-miss traffic.
+    keys_fetched_at: Arc<RwLock<Option<Instant>>>,
     last_jwks_refresh: Arc<Mutex<Option<Instant>>>,
     revocation: Arc<dyn RevocationStore>,
 }
@@ -192,11 +208,15 @@ impl JwtValidator {
             .map(normalize_configured_issuer)
             .transpose()?;
         let principal_issuer = cfg.issuer.clone().or(fallback_principal_issuer);
+        // Keys handed in at construction are as fresh as a fetch; an empty set
+        // has no fetch instant, so the first decode establishes one.
+        let seeded_at = (!initial_keys.is_empty()).then(Instant::now);
         Ok(Self {
             cfg,
             principal_issuer,
             egress_client,
             keys: Arc::new(RwLock::new(initial_keys)),
+            keys_fetched_at: Arc::new(RwLock::new(seeded_at)),
             last_jwks_refresh: Arc::new(Mutex::new(None)),
             revocation,
         })
@@ -248,7 +268,16 @@ impl JwtValidator {
         }
 
         *self.keys.write().await = refreshed;
+        *self.keys_fetched_at.write().await = Some(Instant::now());
         Ok(())
+    }
+
+    /// Whether the cached key set is still inside its trust window.
+    async fn keys_are_fresh(&self) -> bool {
+        self.keys_fetched_at
+            .read()
+            .await
+            .is_some_and(|fetched_at| fetched_at.elapsed() < MAX_JWKS_KEY_AGE)
     }
 
     async fn decode(&self, token: &str) -> Result<JwtClaims, AuthError> {
@@ -257,8 +286,26 @@ impl JwtValidator {
             .kid
             .ok_or_else(|| AuthError::InvalidSession("unknown kid".to_owned()))?;
 
-        if let Some(key) = self.keys.read().await.get(&kid).cloned() {
-            return self.decode_with_key(token, &key);
+        // A cached kid is only trusted while the key set it came from is inside
+        // its trust window. Past that, the issuer may have withdrawn the key, so
+        // re-fetch before honoring it rather than trusting it for the process
+        // lifetime — a kid hit alone would otherwise never trigger a refresh.
+        if self.keys_are_fresh().await {
+            if let Some(key) = self.keys.read().await.get(&kid).cloned() {
+                return self.decode_with_key(token, &key);
+            }
+        } else {
+            self.refresh_jwks().await?;
+            if !self.keys_are_fresh().await {
+                // The refresh did not land (fetch failed, or the minimum
+                // interval suppressed it). Freshness cannot be established, so
+                // fail closed rather than fall back to the aged key set.
+                return Err(AuthError::Upstream("JWKS refresh failed".to_owned()));
+            }
+            if let Some(key) = self.keys.read().await.get(&kid).cloned() {
+                return self.decode_with_key(token, &key);
+            }
+            return Err(AuthError::InvalidSession("unknown kid".to_owned()));
         }
 
         self.refresh_jwks().await?;
@@ -280,6 +327,10 @@ impl JwtValidator {
     ) -> Result<JwtClaims, AuthError> {
         let mut validation = Validation::new(key.algorithm);
         validation.validate_exp = true;
+        // RFC 7519 4.1.5: a token must not be accepted before its `nbf`. The
+        // library default is off, so an issuer that stamps a future start on a
+        // scheduled-access token would otherwise have that window ignored.
+        validation.validate_nbf = true;
         validation.validate_aud = self.cfg.audience.is_some();
         let mut required = vec!["exp"];
 
@@ -1508,6 +1559,67 @@ RowSUZV5FSmOGJ7JyROZ80k=
         assert_eq!(
             configured.principal_issuer.as_deref(),
             Some("https://idp.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_not_yet_valid_token_is_rejected_until_its_nbf() {
+        let validator = validator(
+            default_cfg(),
+            Arc::new(NoopRevocationStore),
+            TEST_PUBLIC_KEY,
+        );
+        let mut claims = base_claims();
+        // Well outside jsonwebtoken's default 60s leeway.
+        claims["nbf"] = json!(future_timestamp());
+        let token = signed_token(claims, TEST_PRIVATE_KEY);
+
+        let error = validator
+            .decode(&token)
+            .await
+            .expect_err("a token presented before its nbf must be rejected");
+        assert!(matches!(error, AuthError::InvalidSession(_)));
+
+        // The same token, once its window has opened, is accepted.
+        let mut claims = base_claims();
+        claims["nbf"] = json!(past_timestamp());
+        let token = signed_token(claims, TEST_PRIVATE_KEY);
+        validator
+            .decode(&token)
+            .await
+            .expect("a token inside its nbf window should decode");
+    }
+
+    #[tokio::test]
+    async fn an_aged_key_set_is_not_trusted_without_a_successful_refresh() {
+        let validator = validator(
+            jwt_cfg("https://unreachable.invalid/.well-known/jwks.json"),
+            Arc::new(NoopRevocationStore),
+            TEST_PUBLIC_KEY,
+        );
+        let token = signed_token(base_claims(), TEST_PRIVATE_KEY);
+
+        // Seeded keys count as freshly fetched, so this decodes.
+        validator
+            .decode(&token)
+            .await
+            .expect("a fresh key set should decode");
+
+        // Age the key set past its trust window. The kid is still cached, but a
+        // cache hit alone must no longer be enough: without a refresh the
+        // issuer could have withdrawn this key and we would never notice.
+        *validator.keys_fetched_at.write().await =
+            Some(Instant::now() - MAX_JWKS_KEY_AGE - Duration::from_secs(1));
+
+        let error = validator
+            .decode(&token)
+            .await
+            .expect_err("an aged key set must not be trusted when refresh fails");
+        assert!(matches!(error, AuthError::Upstream(_)));
+        assert!(
+            !validator.keys.read().await.is_empty(),
+            "the aged key set is retained for a later successful refresh, it is \
+             simply no longer trusted"
         );
     }
 

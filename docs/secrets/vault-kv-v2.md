@@ -58,7 +58,7 @@ Validation is fail-closed and rejects the whole document on the first problem, r
 
 Alias metadata exposed by the Connections API reports only the alias ID, the safe label, the provider kind `vault_kv_v2`, and the pinned version when one is configured. It never reports the address, namespace, mount, path, or data key.
 
-> Startup binding: this page documents the provider and its document shape. Binding the document to a startup environment variable is a separate change to `gateway/src/config.rs` and the Connections control plane; provision the Vault side from this page now, and the environment variable is documented in `docs/configuration.md` when that binding lands.
+> Startup binding: set this document as [`CONNECTION_VAULT_PROVIDER`](../configuration.md#connection_vault_provider). Aliases are resolved asynchronously at request time and validated on first use, so a Vault outage at startup does not block the gateway from starting.
 
 ## Identity
 
