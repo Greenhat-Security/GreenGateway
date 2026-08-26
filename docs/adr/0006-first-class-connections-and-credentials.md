@@ -311,6 +311,7 @@ reason.
 | Retained dependency rows | 4,096 |
 | Managed OpenAPI document | 2 MiB |
 | Published catalog entries | 4,096 |
+| Tool input-schema precheck nodes | 4,096 per tool; 1,048,576 across the registry |
 | Concurrent refreshes | 4 globally; one catalog mutation per Connection |
 | Stored test concurrency | 4 global / 2 per principal / 1 per Connection |
 | Stored test deadline | 10 seconds |

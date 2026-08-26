@@ -376,6 +376,12 @@ Disabling a managed Connection prevents production use without deleting its
 metadata, status, catalog, dependencies, or protected bindings. It is the
 preferred first containment action when the managed path is suspect.
 
+A disabled Connection withdraws its managed OpenAPI or MCP catalog tools from
+the advertised tool list and reports `disabled/disabled` rather than a catalog
+freshness state, so it never raises the `degraded/catalog_stale` alert above.
+The retained catalog is republished at the next refresh or gateway restart once
+the Connection is re-enabled.
+
 For an operator-visible regression:
 
 1. Stop new managed traffic by restoring the previous route/tool/MCP policy or

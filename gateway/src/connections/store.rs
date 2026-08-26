@@ -1358,7 +1358,7 @@ impl SqliteConnectionStore {
         resources: &[StoredMcpResource],
         resource_templates: &[StoredMcpResourceTemplate],
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
-        let validated = validate_mcp_catalog(entries, resources, resource_templates)?;
+        let validated = validate_mcp_catalog(id, entries, resources, resource_templates)?;
         let now = utc_timestamp()?;
         let mut connection = self.connection_guard();
         let transaction = connection
@@ -1515,7 +1515,7 @@ impl SqliteConnectionStore {
                     ],
                 )
                 .map_err(|source| sqlite_error(&self.path, "MCP catalog entry insert", source))?;
-            let public_name = format!("{}:{}", id.as_str(), entry.remote_tool_name);
+            let public_name = managed_tool_dependency_id(id, &entry.remote_tool_name);
             transaction
                 .execute(
                     r#"
@@ -2824,6 +2824,7 @@ struct ValidatedMcpCatalog {
 }
 
 fn validate_mcp_catalog(
+    id: &ConnectionId,
     entries: &[StoredMcpCatalogEntry],
     resources: &[StoredMcpResource],
     resource_templates: &[StoredMcpResourceTemplate],
@@ -2838,7 +2839,7 @@ fn validate_mcp_catalog(
             maximum: MAX_CATALOG_ENTRIES,
         });
     }
-    let encoded_tool_schemas = validate_mcp_catalog_entries(entries)?;
+    let encoded_tool_schemas = validate_mcp_catalog_entries(id, entries)?;
     validate_mcp_resources(resources)?;
     validate_mcp_resource_templates(resource_templates)?;
 
@@ -2899,6 +2900,7 @@ fn validate_mcp_catalog(
 }
 
 fn validate_mcp_catalog_entries(
+    id: &ConnectionId,
     entries: &[StoredMcpCatalogEntry],
 ) -> Result<Vec<String>, ConnectionStoreError> {
     if entries.len() > MAX_CATALOG_ENTRIES {
@@ -2918,6 +2920,17 @@ fn validate_mcp_catalog_entries(
         {
             problems.push(format!(
                 "MCP catalog entry {index} remote tool name must contain 1-{MAX_MCP_TOOL_NAME_CHARS} characters without NUL"
+            ));
+        }
+        // Every entry also becomes a managed-tool dependency key prefixed with
+        // the Connection ID, and that column is bounded in bytes while the name
+        // limit above counts characters. Bound the derived key here so a
+        // multi-byte name is rejected as invalid input rather than aborting the
+        // whole catalog transaction on a CHECK constraint.
+        if validate_dependency_id(&managed_tool_dependency_id(id, &entry.remote_tool_name)).is_err()
+        {
+            problems.push(format!(
+                "MCP catalog entry {index} remote tool name must keep its managed tool dependency key within {MAX_DEPENDENCY_FIELD_BYTES} UTF-8 bytes"
             ));
         }
         if !seen.insert(entry.remote_tool_name.as_str()) {
@@ -3635,7 +3648,12 @@ fn load_mcp_catalogs(
                     });
                 }
 
-                let _ = validate_mcp_catalog(&entries, &resources, &resource_templates)?;
+                let _ = validate_mcp_catalog(
+                    &connection_id,
+                    &entries,
+                    &resources,
+                    &resource_templates,
+                )?;
                 Ok(StoredMcpCatalog {
                     connection_id,
                     catalog_revision,
@@ -4812,6 +4830,14 @@ fn ensure_etag(
     }
 }
 
+/// Derives the `connection_dependencies` key recorded for one managed MCP tool.
+///
+/// Validation and insertion must agree on the exact string, so both go through
+/// here rather than formatting it independently.
+fn managed_tool_dependency_id(id: &ConnectionId, remote_tool_name: &str) -> String {
+    format!("{}:{remote_tool_name}", id.as_str())
+}
+
 fn validate_dependency_id(value: &str) -> Result<(), ConnectionStoreError> {
     if value.is_empty() || value.len() > MAX_DEPENDENCY_FIELD_BYTES || value.contains('\0') {
         Err(ConnectionStoreError::Validation {
@@ -5946,6 +5972,51 @@ mod tests {
     }
 
     #[test]
+    fn multi_byte_remote_tool_name_rejects_as_invalid_input_not_a_storage_failure() {
+        let (_directory, _path, store) = temporary_store("mcp-multi-byte-tool-name");
+        let created = store
+            .create(mcp_candidate())
+            .expect("MCP connection should create");
+        // 74 CJK characters sit inside the 128-character name limit, but the
+        // derived dependency key is 36 + 1 + 222 bytes.
+        let remote_tool_name = "\u{4e2d}".repeat(74);
+        assert!(remote_tool_name.chars().count() <= MAX_MCP_TOOL_NAME_CHARS);
+        assert!(
+            managed_tool_dependency_id(&created.id, &remote_tool_name).len()
+                > MAX_DEPENDENCY_FIELD_BYTES,
+            "fixture must actually overflow the managed tool dependency key"
+        );
+
+        let error = store
+            .replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                &[mcp_catalog_entry(&remote_tool_name, "Multi-byte tool")],
+                &[],
+                &[],
+            )
+            .expect_err("an unstorable remote tool name must reject the catalog");
+        match error {
+            ConnectionStoreError::Validation { problems } => assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.contains("managed tool dependency key")),
+                "unexpected problems: {problems:?}"
+            ),
+            other => panic!(
+                "an unstorable remote tool name must reject as invalid input rather than a retryable storage failure, got: {other}"
+            ),
+        }
+        assert!(
+            store
+                .mcp_catalog(&created.id)
+                .expect("catalog read should succeed")
+                .is_none(),
+            "a rejected catalog must not persist partial rows"
+        );
+    }
+
+    #[test]
     fn mcp_catalog_combined_count_and_byte_limits_preserve_last_known_good() {
         let (_directory, _path, store) = temporary_store("mcp-catalog-limits");
         let created = store
@@ -6033,7 +6104,7 @@ mod tests {
         let first_entries = (0..MAX_CATALOG_ENTRIES / 2)
             .map(|index| mcp_catalog_entry(&format!("first-{index:04}"), &maximum_description))
             .collect::<Vec<_>>();
-        let first_bytes = validate_mcp_catalog(&first_entries, &[], &[])
+        let first_bytes = validate_mcp_catalog(&first.id, &first_entries, &[], &[])
             .expect("first half-bound catalog should validate")
             .stored_bytes;
         store
@@ -6044,7 +6115,7 @@ mod tests {
         let second_entries = (0..MAX_CATALOG_ENTRIES / 2)
             .map(|index| mcp_catalog_entry(&format!("second-{index:04}"), &maximum_description))
             .collect::<Vec<_>>();
-        let second_bytes = validate_mcp_catalog(&second_entries, &[], &[])
+        let second_bytes = validate_mcp_catalog(&second.id, &second_entries, &[], &[])
             .expect("second half-bound catalog should validate")
             .stored_bytes;
         assert!(first_bytes <= MAX_MANAGED_MCP_CATALOG_BYTES);

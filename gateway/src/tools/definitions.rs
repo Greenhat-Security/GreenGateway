@@ -26,6 +26,13 @@ const TOOL_REGISTRY_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 const MAX_TOOLS_FILE_BYTES: u64 = 1_048_576;
 const MAX_INPUT_SCHEMA_REFERENCE_DEPTH: usize = 64;
 const MAX_INPUT_SCHEMA_PRECHECK_NODES: usize = 4_096;
+/// Ceiling on precheck nodes across every definition in the merged registry.
+///
+/// Sized against the published catalog bound rather than the 1 MiB tools file:
+/// `MAX_CATALOG_ENTRIES` (4,096) entries at 256 nodes each. A merged registry
+/// carries managed OpenAPI and MCP catalogs whose only size bound is an entry
+/// count, so a ceiling sized for one local file would reject ordinary catalogs.
+const MAX_REGISTRY_INPUT_SCHEMA_PRECHECK_NODES: usize = 1_048_576;
 const TOOLS_FILE_SCHEMA_JSON: &str = include_str!("../../../docs/schemas/tools.v0.schema.json");
 const MCP_PROXY_METHOD: &str = "MCP_PROXY";
 
@@ -895,12 +902,30 @@ pub fn reload_tool_registry_from_file_with_mcp_proxy_definitions(
     )
 }
 
-pub fn reload_tool_registry_from_file_with_mcp_proxy_definitions_provider(
+/// Reloads the registry, rediscovering MCP proxy definitions off the runtime.
+///
+/// The provider talks to configured MCP upstreams synchronously, so how long it
+/// runs is the upstream's choice. Calling it inline from a reload task parks a
+/// Tokio worker for that whole time; on a runtime sized from a sub-1-CPU quota
+/// that is the only worker, and the accept loop and health endpoints stop with
+/// it.
+pub async fn reload_tool_registry_from_file_with_mcp_proxy_definitions_provider(
     registry: &ToolRegistry,
     path: impl AsRef<Path>,
     mcp_proxy_definitions_provider: Option<&McpProxyDefinitionsProvider>,
 ) -> Result<(), ToolRegistryError> {
-    let mcp_proxy_definitions = mcp_proxy_definitions_provider.and_then(|provider| provider());
+    let mcp_proxy_definitions = match mcp_proxy_definitions_provider.cloned() {
+        Some(provider) => tokio::task::spawn_blocking(move || provider())
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(
+                    error = %error,
+                    "MCP upstream rediscovery task failed during tool registry reload; preserving existing MCP proxy tools"
+                );
+                None
+            }),
+        None => None,
+    };
     reload_tool_registry_from_file_with_optional_mcp_proxy_definitions(
         registry,
         path,
@@ -1071,7 +1096,8 @@ async fn tool_registry_file_watch_loop(
             &registry,
             &tools_file,
             mcp_proxy_definitions_provider.as_ref(),
-        );
+        )
+        .await;
     }
 }
 
@@ -1143,7 +1169,8 @@ fn spawn_sighup_reload_task(
                 &registry,
                 &tools_file,
                 mcp_proxy_definitions_provider.as_ref(),
-            );
+            )
+            .await;
         }
     }))
 }
@@ -1249,9 +1276,10 @@ fn tools_file_schema_problems(value: &Value) -> Vec<String> {
 fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
     let mut problems = Vec::new();
     let mut seen = BTreeMap::new();
-    let mut input_schema_precheck_budget = MAX_INPUT_SCHEMA_PRECHECK_NODES;
+    let mut input_schema_precheck_budget = InputSchemaPrecheckBudget::new();
 
     for (index, definition) in definitions.iter().enumerate() {
+        input_schema_precheck_budget.begin_definition();
         let is_http_mapping = !definition.upstream.is_mcp_proxy();
 
         if let Some(first_index) = seen.insert(definition.name.as_str(), index) {
@@ -1561,16 +1589,17 @@ fn is_scalar_json_schema_type(schema_type: &str) -> bool {
     matches!(schema_type, "string" | "number" | "integer" | "boolean")
 }
 
-fn input_schema_precheck_problem(schema: &Value, remaining_budget: &mut usize) -> Option<String> {
+fn input_schema_precheck_problem(
+    schema: &Value,
+    budget: &mut InputSchemaPrecheckBudget,
+) -> Option<String> {
     let mut stack = vec![(schema, SchemaPrecheckContext::Schema)];
     let mut local_references = Vec::new();
     let mut anchors = BTreeMap::new();
 
     while let Some((value, context)) = stack.pop() {
-        if !consume_input_schema_precheck_node(remaining_budget) {
-            return Some(format!(
-                "precheck node budget exceeds {MAX_INPUT_SCHEMA_PRECHECK_NODES} across tools file"
-            ));
+        if let Some(problem) = budget.consume_node() {
+            return Some(problem);
         }
 
         if context == SchemaPrecheckContext::Schema {
@@ -1598,14 +1627,52 @@ fn input_schema_precheck_problem(schema: &Value, remaining_budget: &mut usize) -
     }
 
     for reference in local_references {
-        if let Some(problem) =
-            local_reference_chain_problem(schema, &anchors, reference, remaining_budget)
-        {
+        if let Some(problem) = local_reference_chain_problem(schema, &anchors, reference, budget) {
             return Some(problem);
         }
     }
 
     None
+}
+
+/// Two-level node budget for the input-schema precheck.
+///
+/// One ceiling cannot serve both roles: the per-definition ceiling bounds the
+/// traversal a single hostile schema can force, while the registry ceiling
+/// bounds the merged set. Charging every definition against a single ceiling
+/// made a catalog's publishability depend on how many tools preceded it.
+struct InputSchemaPrecheckBudget {
+    definition_remaining: usize,
+    registry_remaining: usize,
+}
+
+impl InputSchemaPrecheckBudget {
+    fn new() -> Self {
+        Self {
+            definition_remaining: MAX_INPUT_SCHEMA_PRECHECK_NODES,
+            registry_remaining: MAX_REGISTRY_INPUT_SCHEMA_PRECHECK_NODES,
+        }
+    }
+
+    fn begin_definition(&mut self) {
+        self.definition_remaining = MAX_INPUT_SCHEMA_PRECHECK_NODES;
+    }
+
+    fn consume_node(&mut self) -> Option<String> {
+        let Some(definition_remaining) = self.definition_remaining.checked_sub(1) else {
+            return Some(format!(
+                "precheck node budget exceeds {MAX_INPUT_SCHEMA_PRECHECK_NODES} nodes for one tool"
+            ));
+        };
+        let Some(registry_remaining) = self.registry_remaining.checked_sub(1) else {
+            return Some(format!(
+                "precheck node budget exceeds {MAX_REGISTRY_INPUT_SCHEMA_PRECHECK_NODES} nodes across the tool registry"
+            ));
+        };
+        self.definition_remaining = definition_remaining;
+        self.registry_remaining = registry_remaining;
+        None
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1619,16 +1686,16 @@ fn local_reference_chain_problem(
     root: &Value,
     anchors: &BTreeMap<String, &Value>,
     first_reference: &str,
-    remaining_budget: &mut usize,
+    budget: &mut InputSchemaPrecheckBudget,
 ) -> Option<String> {
     let mut reference = first_reference.to_owned();
     let mut seen_references = BTreeSet::new();
     let mut depth = 1;
 
     loop {
-        if !consume_input_schema_precheck_node(remaining_budget) {
+        if let Some(problem) = budget.consume_node() {
             return Some(format!(
-                "precheck node budget exceeds {MAX_INPUT_SCHEMA_PRECHECK_NODES} across tools file while following local reference {reference}"
+                "{problem} while following local reference {reference}"
             ));
         }
         if depth > MAX_INPUT_SCHEMA_REFERENCE_DEPTH {
@@ -1713,14 +1780,6 @@ fn schema_child_context(
     }
 }
 
-fn consume_input_schema_precheck_node(remaining_budget: &mut usize) -> bool {
-    let Some(updated_budget) = remaining_budget.checked_sub(1) else {
-        return false;
-    };
-    *remaining_budget = updated_budget;
-    true
-}
-
 fn is_known_http_method(method: &str) -> bool {
     matches!(
         method,
@@ -1747,11 +1806,12 @@ fn emit_registry_failure(audit: Option<&AuditLog>, path: &Path, error: &ToolRegi
 #[cfg(test)]
 mod tests {
     use std::{
+        convert::Infallible,
         fs,
         path::{Path, PathBuf},
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc, Barrier,
+            mpsc as std_mpsc, Arc, Barrier, Mutex as StdMutex,
         },
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -1763,6 +1823,8 @@ mod tests {
     use super::*;
     use crate::audit::sink::tests::CaptureSink;
     use crate::config::{self, AuthMode, Config};
+
+    const BUDGET_CONNECTION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
     #[test]
     fn valid_tools_file_loads_registry_and_exposes_get_and_list() {
@@ -1987,35 +2049,87 @@ mod tests {
 
     #[test]
     fn aggregate_input_schema_precheck_budget_is_shared_across_tools() {
-        let tools = (0..80)
+        let tool_count =
+            MAX_REGISTRY_INPUT_SCHEMA_PRECHECK_NODES / MAX_INPUT_SCHEMA_PRECHECK_NODES + 1;
+        let definitions = (0..tool_count)
             .map(|index| {
-                let mut tool = echo_tool(
-                    &format!("schema_budget_{index}"),
-                    "POST",
-                    &format!("/v1/schema-budget/{index}"),
-                );
-                tool["input_json_schema"] = object_schema_with_properties(64);
-                tool
+                ToolDefinition::mcp_connection(
+                    BUDGET_CONNECTION_ID.to_owned(),
+                    format!("Budget tool {index}."),
+                    schema_with_precheck_nodes(MAX_INPUT_SCHEMA_PRECHECK_NODES),
+                    format!("budget_{index}"),
+                )
             })
             .collect::<Vec<_>>();
 
-        let error = ToolRegistry::from_json_value(json!({
-            "schema_version": "0.1.0",
-            "tools": tools
-        }))
-        .expect_err("aggregate input_json_schema precheck budget should reject");
+        let registry = ToolRegistry::disabled();
+        let error = registry
+            .replace_mcp_connection_catalog(BUDGET_CONNECTION_ID, definitions, || {
+                Ok::<(), Infallible>(())
+            })
+            .expect_err("registry-wide input_json_schema precheck budget should reject");
 
-        let ToolRegistryError::Invalid { problems } = error else {
+        let McpCatalogPublishError::Registry(ToolRegistryError::Invalid { problems }) = error
+        else {
             panic!("budget exhaustion should return ToolRegistryError::Invalid");
         };
         let message = problems.join("; ");
         assert!(
-            message.contains("input_json_schema")
-                && (message.contains("budget")
-                    || message.contains("reference")
-                    || message.contains("node")),
+            message.contains("input_json_schema") && message.contains("across the tool registry"),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn one_oversized_input_schema_exceeds_the_per_tool_precheck_budget() {
+        let registry = ToolRegistry::disabled();
+        let error = registry
+            .replace_mcp_connection_catalog(
+                BUDGET_CONNECTION_ID,
+                vec![ToolDefinition::mcp_connection(
+                    BUDGET_CONNECTION_ID.to_owned(),
+                    "Oversized schema tool.".to_owned(),
+                    schema_with_precheck_nodes(MAX_INPUT_SCHEMA_PRECHECK_NODES + 1),
+                    "oversized".to_owned(),
+                )],
+                || Ok::<(), Infallible>(()),
+            )
+            .expect_err("a single oversized schema should still reject");
+
+        let McpCatalogPublishError::Registry(ToolRegistryError::Invalid { problems }) = error
+        else {
+            panic!("budget exhaustion should return ToolRegistryError::Invalid");
+        };
+        let message = problems.join("; ");
+        assert!(
+            message.contains("input_json_schema") && message.contains("for one tool"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn a_large_managed_mcp_catalog_of_ordinary_tools_publishes() {
+        // A catalog this size is well inside the discovery and catalog-entry
+        // limits, so the precheck must not be what rejects it.
+        let catalog_size = 250;
+        let definitions = (0..catalog_size)
+            .map(|index| {
+                ToolDefinition::mcp_connection(
+                    BUDGET_CONNECTION_ID.to_owned(),
+                    format!("Ordinary managed MCP tool {index}."),
+                    object_schema_with_properties(8),
+                    format!("ordinary_{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let registry = ToolRegistry::disabled();
+        registry
+            .replace_mcp_connection_catalog(BUDGET_CONNECTION_ID, definitions, || {
+                Ok::<(), Infallible>(())
+            })
+            .expect("an ordinary large managed MCP catalog should publish");
+        assert_eq!(registry.list().len(), catalog_size);
     }
 
     #[test]
@@ -2786,8 +2900,49 @@ mod tests {
         );
     }
 
-    #[test]
-    fn provider_backed_reload_preserves_mcp_proxy_tools_when_refresh_is_unavailable() {
+    #[tokio::test]
+    async fn provider_backed_reload_keeps_the_async_runtime_serving_during_rediscovery() {
+        let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
+        let registry = ToolRegistry::from_file(file.path()).expect("initial registry should load");
+
+        // The provider stands in for upstream MCP discovery, which blocks for
+        // as long as the remote server takes. It only completes once another
+        // task on the same runtime has been polled.
+        let (release_sender, release_receiver) = std_mpsc::channel::<()>();
+        let release_receiver = StdMutex::new(release_receiver);
+        let runtime_kept_serving = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&runtime_kept_serving);
+        let blocking_provider: McpProxyDefinitionsProvider = Arc::new(move || {
+            let released = release_receiver
+                .lock()
+                .expect("release receiver should lock")
+                .recv_timeout(Duration::from_secs(2))
+                .is_ok();
+            observed.store(released, Ordering::SeqCst);
+            None
+        });
+        let concurrent = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let _ = release_sender.send(());
+        });
+
+        reload_tool_registry_from_file_with_mcp_proxy_definitions_provider(
+            &registry,
+            file.path(),
+            Some(&blocking_provider),
+        )
+        .await
+        .expect("local reload should apply once rediscovery returns");
+        concurrent.await.expect("concurrent task should not panic");
+
+        assert!(
+            runtime_kept_serving.load(Ordering::SeqCst),
+            "MCP upstream rediscovery must not park the Tokio worker; no other task on the runtime was polled while it ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_backed_reload_preserves_mcp_proxy_tools_when_refresh_is_unavailable() {
         let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
         let registry = ToolRegistry::from_file(file.path()).expect("initial registry should load");
         registry
@@ -2809,6 +2964,7 @@ mod tests {
             file.path(),
             Some(&unavailable_provider),
         )
+        .await
         .expect("local reload should still apply when MCP proxy refresh is unavailable");
 
         assert!(registry.get("echo").is_none());
@@ -3460,6 +3616,20 @@ mod tests {
                     "$ref": "#/$defs/second"
                 }
             }
+        })
+    }
+
+    /// Builds a schema whose precheck traversal visits exactly `node_count`
+    /// values, using annotation entries so the cost lands on the walker rather
+    /// than on JSON Schema compilation.
+    fn schema_with_precheck_nodes(node_count: usize) -> Value {
+        // The walker charges the root, the three keyword values, and every
+        // annotation element.
+        let annotation_count = node_count.saturating_sub(4);
+        json!({
+            "type": "object",
+            "properties": {},
+            "examples": (0..annotation_count).collect::<Vec<_>>()
         })
     }
 
