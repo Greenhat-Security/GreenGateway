@@ -64,6 +64,13 @@ const LATENCY_SAMPLE_LIMIT: usize = 1024;
 /// on every observation.
 const ENDPOINT_EVICTION_BATCH_DIVISOR: usize = 16;
 const PAYLOAD_SHAPE_SAMPLE_LIMIT: usize = 128;
+/// `PAYLOAD_SHAPE_SAMPLE_LIMIT` bounds how many shapes are retained per
+/// endpoint, not how large each retained shape is, and every dirty flush
+/// rewrites all of them. The capture middleware caps the field count it emits,
+/// so this is the aggregator refusing to store what it did not shape itself:
+/// audit events reach this sink over a channel, and a shape past this size is
+/// counted but never admitted to the reservoir.
+const MAX_PAYLOAD_SHAPE_SAMPLE_BYTES: usize = 16 * 1024;
 const ID_PLACEHOLDER: &str = "{id}";
 const PARAM_PLACEHOLDER: &str = "{param}";
 
@@ -826,6 +833,15 @@ impl EndpointAggregate {
     fn record_payload_shape(&mut self, observed_at: &str, shape: Value) {
         self.payload_shape_observation_count =
             self.payload_shape_observation_count.saturating_add(1);
+        if !payload_shape_fits_sample_budget(&shape) {
+            tracing::debug!(
+                method = %self.key.method,
+                endpoint_template = %self.key.endpoint_template,
+                maximum_bytes = MAX_PAYLOAD_SHAPE_SAMPLE_BYTES,
+                "discarding an oversized discovery payload shape sample"
+            );
+            return;
+        }
         offer_payload_shape_sample(
             self.payload_shape_observation_count,
             PayloadShapeSample::new(observed_at, shape),
@@ -3146,6 +3162,35 @@ fn offer_latency_sample(
     }
 }
 
+/// Measure the serialized shape without ever materializing it, so an oversized
+/// value costs the size of one write buffer rather than its own length.
+fn payload_shape_fits_sample_budget(shape: &Value) -> bool {
+    struct BudgetedByteCounter {
+        remaining: usize,
+    }
+
+    impl io::Write for BudgetedByteCounter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.remaining = self.remaining.checked_sub(buffer.len()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "payload shape exceeds the sample byte budget",
+                )
+            })?;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = BudgetedByteCounter {
+        remaining: MAX_PAYLOAD_SHAPE_SAMPLE_BYTES,
+    };
+    serde_json::to_writer(&mut counter, shape).is_ok()
+}
+
 fn offer_payload_shape_sample(
     observation_count: u64,
     sample: PayloadShapeSample,
@@ -4796,6 +4841,52 @@ mod tests {
         assert_eq!(
             payload_shape_observation_count(&db.path, "POST", "/bounded/{id}"),
             total as i64
+        );
+    }
+
+    #[test]
+    fn oversized_payload_shapes_are_counted_but_never_stored() {
+        let db = TempDb::new("payload-reservoir-bytes");
+        let sink = aggregator_sink_with_payload_capture(&db.path);
+        let wide_keys = (0..2_000)
+            .map(|index| json!({ "name": format!("field_{index}"), "redacted": false }))
+            .collect::<Vec<_>>();
+        let wide_shape = json!({ "json_body": { "top_level_keys": wide_keys } });
+        assert!(
+            serde_json::to_string(&wide_shape)
+                .expect("fixture should serialize")
+                .len()
+                > MAX_PAYLOAD_SHAPE_SAMPLE_BYTES,
+            "fixture must exceed the per-sample byte budget"
+        );
+
+        for index in 0..3 {
+            sink.emit(&observed_event_with_payload_shape(
+                "POST",
+                "/wide",
+                200,
+                10,
+                Some("user-1"),
+                timestamp(index),
+                wide_shape.clone(),
+            ));
+        }
+        sink.flush_for_test();
+
+        let rows = payload_shape_rows(&db.path);
+        assert!(
+            rows.is_empty(),
+            "a shape past the byte budget must never reach the reservoir, got {} rows of up to {} bytes",
+            rows.len(),
+            rows.iter()
+                .map(|row| row.shape_json.len())
+                .max()
+                .unwrap_or_default()
+        );
+        assert_eq!(
+            payload_shape_observation_count(&db.path, "POST", "/wide"),
+            3,
+            "the observation itself is still counted"
         );
     }
 
