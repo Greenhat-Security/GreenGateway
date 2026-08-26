@@ -138,7 +138,7 @@ Every identity and provider request travels through GreenGateway egress controls
 | Login response / read response | 16 KiB / 64 KiB, `application/json` only |
 | Vault token | 1 KiB, cached for at most one hour minus a 30 s skew |
 | Resolved value cache | 256 entries, 60 s |
-| Secret value | the credential-purpose byte limit, and empty or NUL-bearing values are rejected |
+| Secret value | the credential-purpose byte limit; empty and NUL-bearing values are rejected, and material for a purpose sent verbatim as an HTTP header must contain no byte a header value cannot carry (a trailing newline is the usual culprit) |
 
 The resolved-value cache is keyed by provider configuration, egress configuration, identity generation, alias, purpose, and pinned version, and entries are zeroized when they are evicted or replaced. A new login changes the identity generation, so values cached under a previous identity are never reused.
 

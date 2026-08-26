@@ -391,12 +391,27 @@ impl ConnectionControlPlane {
             network_alias_metadata,
         });
         for record in &managed_records {
-            if secret_resolver
-                .validate_enabled_candidate(&record.write)
-                .is_err()
-            {
+            if let Err(error) = secret_resolver.validate_enabled_candidate(&record.write) {
+                // This aborts startup, so it is the operator's only diagnostic.
+                // Carry the fields and the kind of failure rather than dropping
+                // them: the connection id is a UUID, the admin API that could
+                // identify it is not running yet, and the causes range from an
+                // unset environment variable to material a header cannot carry.
+                let (fields, reason) = match error {
+                    BindingActivationError::Invalid { fields } => (fields, "invalid material"),
+                    BindingActivationError::Unavailable => (Vec::new(), "source unavailable"),
+                };
+                tracing::error!(
+                    connection_id = %record.id,
+                    display_name = %record.write.display_name,
+                    fields = ?fields,
+                    reason,
+                    "enabled managed connection has an unusable binding; refusing to start"
+                );
                 return Err(ConnectionControlPlaneError::UnresolvableBindings {
                     id: record.id.to_string(),
+                    fields,
+                    reason,
                 });
             }
         }
@@ -764,8 +779,6 @@ impl ConnectionControlPlane {
     /// a network provider is persisted and published unvalidated, and the
     /// breakage first appears as a per-request data-path failure.
     ///
-    /// Deliberately runs before the mutation lock is taken: it performs network
-    /// I/O, and the lock must not be held across it.
     /// Cross-validates a rotated TLS client-identity half against a counterpart
     /// that lives behind a network secret provider.
     ///
@@ -831,6 +844,8 @@ impl ConnectionControlPlane {
         Ok(())
     }
 
+    /// Deliberately runs before the mutation lock is taken: it performs network
+    /// I/O, and the lock must not be held across it.
     pub async fn ensure_deferred_bindings_resolvable(
         &self,
         candidate: &ConnectionWrite,
@@ -1598,10 +1613,21 @@ pub enum ConnectionControlPlaneError {
     LocalSecretKeyring(LocalSecretKeyringConfigError),
     LocalSecret(LocalSecretError),
     LocalSecretKeyringRequired,
-    LimitExceeded { count: usize, maximum: usize },
-    IdCollision { id: String },
-    NetworkAliasIdCollision { id: String },
-    UnresolvableBindings { id: String },
+    LimitExceeded {
+        count: usize,
+        maximum: usize,
+    },
+    IdCollision {
+        id: String,
+    },
+    NetworkAliasIdCollision {
+        id: String,
+    },
+    UnresolvableBindings {
+        id: String,
+        fields: Vec<&'static str>,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for ConnectionControlPlaneError {
@@ -1632,10 +1658,20 @@ impl fmt::Display for ConnectionControlPlaneError {
                 formatter,
                 "secret alias '{id}' is claimed by more than one network secret provider"
             ),
-            Self::UnresolvableBindings { id } => write!(
-                formatter,
-                "enabled managed connection '{id}' references a secret or TLS binding that is not usable"
-            ),
+            Self::UnresolvableBindings { id, fields, reason } => {
+                if fields.is_empty() {
+                    write!(
+                        formatter,
+                        "enabled managed connection '{id}' references a secret or TLS binding that is not usable ({reason})"
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "enabled managed connection '{id}' has unusable bindings [{}] ({reason})",
+                        fields.join(", ")
+                    )
+                }
+            }
         }
     }
 }
@@ -2640,7 +2676,7 @@ mod tests {
 
         assert!(matches!(
             ConnectionControlPlane::from_config(&config),
-            Err(ConnectionControlPlaneError::UnresolvableBindings { id })
+            Err(ConnectionControlPlaneError::UnresolvableBindings { id, .. })
                 if id == created.id.as_str()
         ));
     }
@@ -2960,7 +2996,7 @@ mod tests {
 
         assert!(matches!(
             ConnectionControlPlane::from_config(&config),
-            Err(ConnectionControlPlaneError::UnresolvableBindings { id })
+            Err(ConnectionControlPlaneError::UnresolvableBindings { id, .. })
                 if id == created.id.as_str()
         ));
     }

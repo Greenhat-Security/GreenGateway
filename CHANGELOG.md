@@ -101,8 +101,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   last-known-good retention, unified capability inventory, and the
   permission-gated tool playground.
 - Added operator, admin, migration, backup/restore, key-rotation, and rollback
-  guides for Connections. External provider adapters remain separately
-  tracked in [Vault #271](https://github.com/Greenhat-Security/GreenGateway/issues/271),
+  guides for Connections. All five external provider adapters
+  have since shipped as read-only providers behind the same `SecretResolver`
+  contract: [Vault KV v2 #271](https://github.com/Greenhat-Security/GreenGateway/issues/271),
   [AWS Secrets Manager #272](https://github.com/Greenhat-Security/GreenGateway/issues/272),
   [Azure Key Vault #273](https://github.com/Greenhat-Security/GreenGateway/issues/273),
   [Google Cloud Secret Manager #274](https://github.com/Greenhat-Security/GreenGateway/issues/274),

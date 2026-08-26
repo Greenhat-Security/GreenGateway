@@ -1385,7 +1385,27 @@ fn egress_client_for_build(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            // Rust's Termination impl prints the Debug form, which for a
+            // startup failure is a struct dump rather than the sentence the
+            // error type carefully builds. Startup errors are frequently an
+            // operator's only diagnostic -- the admin API is not up yet -- so
+            // print Display, and the source chain behind it.
+            eprintln!("Error: {error}");
+            let mut source = error.source();
+            while let Some(cause) = source {
+                eprintln!("  caused by: {cause}");
+                source = cause.source();
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(output) = connection_secret_maintenance::run_if_requested(
         std::env::args_os().skip(1),
         config::Config::from_env,
