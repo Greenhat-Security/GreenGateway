@@ -1707,7 +1707,15 @@ async fn an_established_connection_survives_drain_and_dies_at_forced_shutdown() 
         "still alive"
     );
 
-    gateway.lifecycle.force_shutdown_response_streams().await;
+    // Forced shutdown waits on the tracker token every upgraded connection
+    // holds, so a bridge that ignored the cancellation would hang here rather
+    // than fail: bound it so the guard's absence is a failure, not a stall.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        gateway.lifecycle.force_shutdown_response_streams(),
+    )
+    .await
+    .expect("forced shutdown must finish once every bridge has released");
     let message = next_message(&mut socket).await;
     let Message::Close(Some(frame)) = message else {
         panic!("forced shutdown should close the connection, got {message:?}");
@@ -2290,6 +2298,162 @@ async fn an_upgrade_to_a_blocked_egress_destination_never_connects() {
     assert_eq!(event.payload["result"], "failed");
     assert_eq!(event.payload["reason"], "non_global_ip_blocked");
 
+    upstream.finish().await;
+    gateway.finish().await;
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation and backpressure
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_abrupt_client_disconnect_ends_the_bridge_and_releases_capacity() {
+    let upstream = spawn_ws_upstream(UpstreamPlan::default(), silent_handler()).await;
+    let config = websocket_config(UPSTREAM_HOST, upstream.addr, |websocket| {
+        websocket.max_connections = 1;
+        websocket.queue_depth = 0;
+    });
+    let gateway = spawn_gateway(config, upstream_dns()).await;
+
+    let (socket, _) = connect_client(gateway.addr, "/socket/room", &[])
+        .await
+        .expect("the upgrade should succeed");
+    // No closing handshake: the transport simply disappears, which is what a
+    // browser tab closing looks like.
+    drop(socket);
+
+    let closed = gateway
+        .wait_for_event(audit::event::UPSTREAM_WEBSOCKET_CLOSED)
+        .await;
+    let outcome = closed.payload["outcome"]
+        .as_str()
+        .expect("the outcome should be a bounded string")
+        .to_owned();
+    assert!(
+        outcome.starts_with("client_"),
+        "an abrupt client disconnect is attributed to the client, got {outcome}"
+    );
+
+    let readmitted = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok((socket, _)) = connect_client(gateway.addr, "/socket/room", &[]).await {
+                return socket;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("an abandoned connection must release its admission slot");
+
+    drop(readmitted);
+    upstream.finish().await;
+    gateway.finish().await;
+}
+
+#[tokio::test]
+async fn an_abrupt_upstream_disconnect_closes_the_client() {
+    // The handler returns immediately, dropping the upstream socket without a
+    // closing handshake.
+    let upstream = spawn_ws_upstream(
+        UpstreamPlan::default(),
+        Arc::new(|_socket: WebSocketStream<TcpStream>| {
+            Box::pin(async move {}) as BoxFuture<'static, ()>
+        }),
+    )
+    .await;
+    let config = websocket_config(UPSTREAM_HOST, upstream.addr, |_| {});
+    let gateway = spawn_gateway(config, upstream_dns()).await;
+
+    let (mut socket, _) = connect_client(gateway.addr, "/socket/room", &[])
+        .await
+        .expect("the upgrade should succeed");
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(message) = socket.next().await {
+            match message {
+                Ok(Message::Close(_)) | Err(_) => return true,
+                Ok(_) => {}
+            }
+        }
+        true
+    })
+    .await
+    .expect("the client must not be left hanging on a dead upstream");
+    assert!(ended);
+
+    let closed = gateway
+        .wait_for_event(audit::event::UPSTREAM_WEBSOCKET_CLOSED)
+        .await;
+    let outcome = closed.payload["outcome"]
+        .as_str()
+        .expect("the outcome should be a bounded string")
+        .to_owned();
+    assert!(
+        outcome.starts_with("upstream_"),
+        "an abrupt upstream disconnect is attributed to the upstream, got {outcome}"
+    );
+
+    upstream.finish().await;
+    gateway.finish().await;
+}
+
+#[tokio::test]
+async fn a_slow_consumer_gets_backpressure_rather_than_dropped_or_buffered_messages() {
+    const MESSAGES: usize = 24;
+    const PAYLOAD: usize = 900;
+
+    let upstream = spawn_ws_upstream(
+        UpstreamPlan::default(),
+        sending_handler(
+            (0..MESSAGES)
+                .map(|index| {
+                    let mut payload = vec![b'a' + u8::try_from(index % 26).unwrap_or(0); PAYLOAD];
+                    payload[0] = b'0' + u8::try_from(index % 10).unwrap_or(0);
+                    Message::binary(payload)
+                })
+                .collect(),
+        ),
+    )
+    .await;
+    let config = websocket_config(UPSTREAM_HOST, upstream.addr, |websocket| {
+        // A write budget far smaller than the traffic, so anything that
+        // buffered instead of pushing back would overflow it.
+        websocket.max_write_buffer_bytes = 1;
+        websocket.max_frame_bytes = config::MIN_WEBSOCKET_MAX_FRAME_BYTES;
+        websocket.max_message_bytes = config::MIN_WEBSOCKET_MAX_FRAME_BYTES;
+    });
+    let gateway = spawn_gateway(config, upstream_dns()).await;
+
+    let (mut socket, _) = connect_client(gateway.addr, "/socket/room", &[])
+        .await
+        .expect("the upgrade should succeed");
+
+    for index in 0..MESSAGES {
+        // Read deliberately slowly. The gateway awaits each send before it
+        // reads again, so the delay propagates to the upstream rather than
+        // accumulating in the gateway.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let payload = next_message(&mut socket).await.into_data();
+        assert_eq!(
+            payload.len(),
+            PAYLOAD,
+            "message {index} should arrive whole"
+        );
+        assert_eq!(
+            payload[0],
+            b'0' + u8::try_from(index % 10).unwrap_or(0),
+            "messages must arrive in order without loss"
+        );
+    }
+
+    assert!(
+        gateway
+            .events(audit::event::UPSTREAM_WEBSOCKET_CLOSED)
+            .is_empty(),
+        "a slow consumer is backpressure, not a capacity failure"
+    );
+
+    drop(socket);
     upstream.finish().await;
     gateway.finish().await;
 }
