@@ -1214,6 +1214,16 @@ describe('ConnectionEditor', () => {
 
     renderEditor('/connections/new');
     await screen.findByLabelText('Safe label');
+    // Both initial reads must settle before typing. The form's secret bindings
+    // are derived from those lists, and a list that lands mid-edit re-derives
+    // them -- this test is about what submitting does to a draft, not about
+    // surviving initialization.
+    await waitFor(() => {
+      expect(screen.getByLabelText('Secret value')).toBeTruthy();
+      expect(
+        (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length,
+      ).toBeGreaterThanOrEqual(2);
+    });
     const value = screen.getByLabelText('Secret value') as HTMLInputElement;
     fireEvent.change(value, { target: { value: 'one-time-canary' } });
 

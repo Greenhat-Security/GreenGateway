@@ -1502,7 +1502,15 @@ function LocalSecretManager({
       selectedSecretId !== nextSelectedId
     ) {
       setSelectedSecretId(nextSelectedId);
-      clearPlaintext();
+      // Entered material belongs to the selection it was typed against, so a
+      // selection that disappears must take the draft with it. On the first
+      // load there is no prior selection -- the id moves from empty to the
+      // first secret simply because the inventory arrived -- and clearing
+      // there discards what the operator typed while the list was still
+      // loading, with no stale binding to protect against.
+      if (selectedSecretId !== '') {
+        clearPlaintext();
+      }
     }
   }, [inventory.value.secrets, localSecrets, selectedSecretId]);
 
