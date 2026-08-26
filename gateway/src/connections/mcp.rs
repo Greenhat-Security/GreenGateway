@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    convert::Infallible,
     fmt,
     sync::Arc,
     time::{Duration, Instant},
@@ -167,6 +168,10 @@ impl McpConnectionCatalogRuntime {
         });
     }
 
+    fn contains(&self, connection_id: &ConnectionId) -> bool {
+        self.state.load().contains_key(connection_id)
+    }
+
     fn remove(&self, connection_id: &ConnectionId) {
         self.state.rcu(|current| {
             if !current.contains_key(connection_id) {
@@ -221,14 +226,30 @@ impl McpConnectionCatalogService {
         } else {
             Vec::new()
         };
-        let definitions = catalogs
+        // Catalog rows outlive a disable, so a persisted catalog is only
+        // active while its Connection is still enabled and still managed.
+        // Republishing an inactive one would advertise a contained
+        // Connection's tools and report it stale instead of disabled.
+        let snapshot = control_plane.runtime_snapshot();
+        let active_catalogs = catalogs
+            .into_iter()
+            .filter(|catalog| {
+                snapshot
+                    .managed()
+                    .get(&catalog.connection_id)
+                    .is_some_and(|record| {
+                        record.write.enabled && supports_managed_mcp_catalog(record)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let definitions = active_catalogs
             .iter()
             .flat_map(catalog_definitions)
             .collect::<Vec<_>>();
         registry
             .merge_definitions(definitions)
             .map_err(tool_registry_store_error)?;
-        let runtime = McpConnectionCatalogRuntime::new(&catalogs);
+        let runtime = McpConnectionCatalogRuntime::new(&active_catalogs);
         Ok(Self {
             control_plane,
             http,
@@ -260,12 +281,38 @@ impl McpConnectionCatalogService {
     }
 
     pub fn reconcile_connection(&self, record: &StoredConnection) {
-        if !supports_managed_mcp_catalog(record) {
-            self.runtime.remove(&record.id);
+        if !record.write.enabled || !supports_managed_mcp_catalog(record) {
+            self.discard_runtime_catalog(&record.id);
         }
     }
 
     pub fn remove_connection(&self, connection_id: &ConnectionId) {
+        self.discard_runtime_catalog(connection_id);
+    }
+
+    fn discard_runtime_catalog(&self, connection_id: &ConnectionId) {
+        // The registry lane and the runtime map are published together, so an
+        // absent runtime entry means there is nothing to withdraw. Returning
+        // early keeps an unrelated Connection's disable from revalidating the
+        // whole merged registry.
+        if !self.runtime.contains(connection_id) {
+            return;
+        }
+        if let Err(error) =
+            self.registry
+                .replace_mcp_connection_catalog(connection_id.as_str(), Vec::new(), || {
+                    Ok::<(), Infallible>(())
+                })
+        {
+            match error {
+                McpCatalogPublishError::Registry(error) => tracing::error!(
+                    connection_id = %connection_id,
+                    error = %error,
+                    "failed to remove an inactive MCP catalog from the tool registry"
+                ),
+                McpCatalogPublishError::Persist(error) => match error {},
+            }
+        }
         self.runtime.remove(connection_id);
     }
 
@@ -397,7 +444,14 @@ impl McpConnectionCatalogService {
         if let Err(error) = publish {
             let failure = match error {
                 McpCatalogPublishError::Registry(error) => {
-                    drop(error);
+                    // The safe reason cannot carry the rejected definitions, and
+                    // without them an operator has no way to tell an upstream
+                    // schema fault from a registry capacity limit.
+                    tracing::warn!(
+                        connection_id = %connection_id,
+                        error = %error,
+                        "discovered MCP catalog was rejected by the tool registry"
+                    );
                     McpCatalogRefreshError::InvalidResponse
                 }
                 McpCatalogPublishError::Persist(error) => refresh_store_error(&error),
@@ -679,6 +733,17 @@ fn refresh_store_error(error: &ConnectionStoreError) -> McpCatalogRefreshError {
         ConnectionStoreError::Validation { .. } | ConnectionStoreError::LimitExceeded { .. } => {
             McpCatalogRefreshError::InvalidResponse
         }
+        // A rejected constraint is a verdict on the catalog we tried to store,
+        // not a storage outage: retrying the same discovery result reproduces
+        // it exactly, so it must not be reported as retryable.
+        ConnectionStoreError::Sqlite { source, .. }
+            if matches!(
+                source.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::ConstraintViolation)
+            ) =>
+        {
+            McpCatalogRefreshError::InvalidResponse
+        }
         _ => McpCatalogRefreshError::StorageUnavailable,
     }
 }
@@ -954,6 +1019,169 @@ mod tests {
         ));
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn disabling_a_managed_mcp_connection_withdraws_its_catalog_and_reports_disabled() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("disabled catalog test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("disabled catalog test address should be available");
+        let server = tokio::spawn(run_mcp_catalog_server(
+            listener,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ));
+
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        config.egress_allowed_hosts = vec![Ipv4Addr::LOCALHOST.to_string()];
+        config.egress_deny_private_ips = false;
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Managed MCP",
+            "enabled": true,
+            "kind": "mcp_streamable_http",
+            "endpoint": {
+                "base_url": format!("http://{address}"),
+                "base_path": "/mcp"
+            },
+            "authentication": { "type": "none" },
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {
+                "type": "managed_mcp",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed MCP Connection should deserialize");
+        let record = control_plane
+            .create_managed(snapshot.collection_etag(), candidate)
+            .expect("managed MCP Connection should create");
+        let egress_client = Arc::new(
+            EgressClient::new(EgressConfig::from_config(&config))
+                .expect("managed MCP egress client should build"),
+        );
+        let http = ConnectionHttpRuntime::new(
+            control_plane.clone(),
+            EgressConfig::from_config(&config),
+            egress_client,
+        );
+        let registry = ToolRegistry::disabled();
+        let service = McpConnectionCatalogService::load(
+            control_plane.clone(),
+            http.clone(),
+            registry.clone(),
+        )
+        .expect("managed MCP catalog service should load");
+
+        service
+            .refresh(record.id.as_str(), record.etag().as_str())
+            .await
+            .expect("managed MCP catalog should publish");
+        let public_name = format!("{}:alpha", record.id);
+        assert!(registry.get(&public_name).is_some());
+
+        let mut disabled_write = record.write.clone();
+        disabled_write.enabled = false;
+        let disabled = control_plane
+            .replace_managed(&record.id, &record.etag(), disabled_write)
+            .expect("published Connection should be disableable");
+        service.reconcile_connection(&disabled);
+
+        assert!(
+            registry.get(&public_name).is_none(),
+            "disabling a Connection must withdraw its catalog tools from the registry"
+        );
+        let disabled_status = disabled
+            .safe_summary(service.status_fallback(&disabled.id, &disabled.etag(), None))
+            .status;
+        assert_eq!(
+            disabled_status.state,
+            ConnectionOperationalState::Disabled,
+            "a disabled Connection must not report its retained catalog as stale"
+        );
+        assert_eq!(
+            disabled_status.reason,
+            ConnectionStatusReason::Disabled,
+            "a disabled Connection must report the disabled reason"
+        );
+
+        let restarted_registry = ToolRegistry::disabled();
+        let restarted = McpConnectionCatalogService::load(
+            control_plane.clone(),
+            http,
+            restarted_registry.clone(),
+        )
+        .expect("restart should retain but not expose a disabled Connection catalog");
+        assert!(
+            restarted_registry.get(&public_name).is_none(),
+            "disabled persisted catalog tools must not be republished at restart"
+        );
+        let restarted_status = disabled
+            .safe_summary(restarted.status_fallback(&disabled.id, &disabled.etag(), None))
+            .status;
+        assert_eq!(
+            restarted_status.state,
+            ConnectionOperationalState::Disabled,
+            "a disabled persisted catalog must not become stale after restart"
+        );
+        assert_eq!(
+            restarted_status.reason,
+            ConnectionStatusReason::Disabled,
+            "a disabled persisted catalog must retain its disabled reason after restart"
+        );
+        assert!(
+            control_plane
+                .managed_store()
+                .expect("managed store should exist")
+                .mcp_catalog(&disabled.id)
+                .expect("catalog read should succeed")
+                .is_some(),
+            "disabling must retain the last-known-good catalog for re-enablement"
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn a_rejected_storage_constraint_is_not_reported_as_a_retryable_outage() {
+        let constraint = ConnectionStoreError::Sqlite {
+            path: PathBuf::from("connections.sqlite"),
+            operation: "MCP catalog dependency insert",
+            source: rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
+                Some("CHECK constraint failed".to_owned()),
+            ),
+        };
+        assert_eq!(
+            refresh_store_error(&constraint),
+            McpCatalogRefreshError::InvalidResponse,
+            "a constraint rejection is deterministic, so it must not be advertised as retryable storage unavailability"
+        );
+
+        let outage = ConnectionStoreError::Sqlite {
+            path: PathBuf::from("connections.sqlite"),
+            operation: "MCP catalog insert",
+            source: rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                Some("disk I/O error".to_owned()),
+            ),
+        };
+        assert_eq!(
+            refresh_store_error(&outage),
+            McpCatalogRefreshError::StorageUnavailable,
+            "a genuine storage failure must stay retryable"
+        );
     }
 
     #[tokio::test]
