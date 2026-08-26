@@ -562,6 +562,26 @@ pub(crate) fn read_bounded_file_secret(
             SecretResolveErrorKind::InvalidMaterial,
         ));
     }
+    // A platform-projected bearer token is written by a container runtime, and
+    // whether that writer terminates the file is not something an operator
+    // controls — an init container using `echo` adds a newline, the kubelet does
+    // not. Trailing whitespace is never significant in such a token, and every
+    // provider that consumes one already trims it, so normalize here, before the
+    // purpose's header-safety rule would reject it. Scoped narrowly on purpose:
+    // operator-provisioned material keeps its bytes exactly because those bytes
+    // are the credential, and projected TLS material is PEM whose trailing
+    // newline is conventional and feeds a trust fingerprint.
+    if permissions == FileSecretPermissions::PlatformProjected && purpose.is_http_header_value() {
+        while value.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
+            value.pop();
+        }
+        if value.is_empty() {
+            return Err(SecretResolveError::new(
+                alias_id,
+                SecretResolveErrorKind::InvalidMaterial,
+            ));
+        }
+    }
     ResolvedSecret::new(purpose, std::mem::take(&mut *value))
         .map_err(|_| SecretResolveError::new(alias_id, SecretResolveErrorKind::InvalidMaterial))
 }
@@ -1025,6 +1045,42 @@ mod tests {
     }
 
     #[test]
+    fn header_purposes_reject_bytes_no_header_value_can_carry() {
+        // The motivating case: `echo 'token' > secret-file` appends a newline,
+        // which HeaderValue::from_bytes refuses, so the binding would be
+        // accepted at write time and then fail every proxied request.
+        for purpose in [SecretPurpose::HeaderApiKey, SecretPurpose::StaticBearer] {
+            assert_eq!(
+                ResolvedSecret::new(purpose, b"sk_live_abc123\n".to_vec())
+                    .expect_err("a trailing newline must be rejected"),
+                SecretValueError::NotHeaderSafe
+            );
+            assert_eq!(
+                ResolvedSecret::new(purpose, b"token\rwith-cr".to_vec())
+                    .expect_err("an embedded CR must be rejected"),
+                SecretValueError::NotHeaderSafe
+            );
+            assert_eq!(
+                ResolvedSecret::new(purpose, vec![b't', 0x7F]).expect_err("DEL must be rejected"),
+                SecretValueError::NotHeaderSafe
+            );
+            // Tab and high bytes are legal in a header value.
+            ResolvedSecret::new(purpose, b"token\twith-tab".to_vec())
+                .expect("a tab is a valid header byte");
+            ResolvedSecret::new(purpose, vec![b't', 0xC3, 0xA9])
+                .expect("bytes above ASCII are valid header bytes");
+        }
+
+        // The OAuth client secret is URL- then base64-encoded into a Basic
+        // credential, so a newline never reaches a header value verbatim.
+        ResolvedSecret::new(SecretPurpose::OAuthClientSecret, b"secret\n".to_vec())
+            .expect("the OAuth client secret is encoded before it becomes a header");
+        // TLS material is PEM and legitimately full of newlines.
+        ResolvedSecret::new(SecretPurpose::TlsPrivateKey, b"-----BEGIN\nkey\n".to_vec())
+            .expect("PEM material must not be header-checked");
+    }
+
+    #[test]
     fn empty_oversized_and_nul_values_fail_closed() {
         assert_eq!(
             ResolvedSecret::new(SecretPurpose::StaticBearer, Vec::new())
@@ -1469,6 +1525,41 @@ mod tests {
             SecretResolveErrorKind::UnsafeSource
         );
         fs::remove_file(outside).expect("outside fixture should remove");
+    }
+
+    #[test]
+    fn a_projected_token_written_with_a_trailing_newline_still_reads() {
+        let temporary = TemporarySecrets::new("projected-token-newline");
+        // An init container writing the token with `echo` terminates the file;
+        // the kubelet does not. Whether the token is header-safe must not depend
+        // on which one provisioned it.
+        temporary.write("token", b"header.payload.signature\n");
+        set_file_permissions(&temporary.root.join("token"), 0o644);
+        let root = Dir::open_ambient_dir(&temporary.root, ambient_authority())
+            .expect("capability root should open");
+
+        let projected = read_bounded_file_secret(
+            "identity",
+            &root,
+            "token",
+            SecretPurpose::StaticBearer,
+            FileSecretPermissions::PlatformProjected,
+        )
+        .expect("a projected token file may be newline terminated");
+        assert_eq!(projected.expose(), b"header.payload.signature");
+
+        // Operator-provisioned material keeps its bytes exactly, so the same
+        // content under the strict policy is still rejected rather than trimmed.
+        set_file_permissions(&temporary.root.join("token"), 0o600);
+        let operator = read_bounded_file_secret(
+            "identity",
+            &root,
+            "token",
+            SecretPurpose::StaticBearer,
+            FileSecretPermissions::Exclusive,
+        )
+        .expect_err("operator credentials are never trimmed, so this stays invalid");
+        assert_eq!(operator.kind(), SecretResolveErrorKind::InvalidMaterial);
     }
 
     #[cfg(unix)]
