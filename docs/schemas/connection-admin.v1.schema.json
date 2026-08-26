@@ -1066,7 +1066,7 @@
       "properties": {
         "secrets": {
           "type": "array",
-          "maxItems": 512,
+          "maxItems": 3584,
           "items": {
             "$ref": "#/$defs/SafeSecretAlias"
           }

@@ -389,17 +389,18 @@ traffic.
 
 ## External Secret Providers
 
-Issue #240 intentionally ships operator environment/file aliases and the
-encrypted local provider first. Follow-up provider integrations are tracked
-separately so each can receive its own workload-identity, egress, TLS,
-rotation, bounds, and redaction review:
+Issue #240 shipped operator environment/file aliases and the encrypted local
+provider first. All five external providers have since landed, each with its own
+workload-identity, egress, TLS, rotation, bounds, and redaction review:
 
-- [HashiCorp Vault #271](https://github.com/Greenhat-Security/GreenGateway/issues/271)
-- [AWS Secrets Manager #272](https://github.com/Greenhat-Security/GreenGateway/issues/272)
-- [Azure Key Vault #273](https://github.com/Greenhat-Security/GreenGateway/issues/273)
-- [Google Cloud Secret Manager #274](https://github.com/Greenhat-Security/GreenGateway/issues/274)
-- [Kubernetes Secrets API #275](https://github.com/Greenhat-Security/GreenGateway/issues/275)
+- [HashiCorp Vault KV v2](../configuration.md#connection_vault_provider) — `CONNECTION_VAULT_PROVIDER` ([#271](https://github.com/Greenhat-Security/GreenGateway/issues/271), [operator guide](../secrets/vault-kv-v2.md))
+- [AWS Secrets Manager](../configuration.md#connection_aws_provider) — `CONNECTION_AWS_PROVIDER` ([#272](https://github.com/Greenhat-Security/GreenGateway/issues/272))
+- [Azure Key Vault](../configuration.md#connection_azure_provider) — `CONNECTION_AZURE_PROVIDER` ([#273](https://github.com/Greenhat-Security/GreenGateway/issues/273))
+- [Google Cloud Secret Manager](../configuration.md#connection_gcp_provider) — `CONNECTION_GCP_PROVIDER` ([#274](https://github.com/Greenhat-Security/GreenGateway/issues/274))
+- [Kubernetes Secrets API](../configuration.md#connection_kubernetes_provider) — `CONNECTION_KUBERNETES_PROVIDER` ([#275](https://github.com/Greenhat-Security/GreenGateway/issues/275))
 
-Until one of those integrations lands, do not place cloud-provider locators in
-Connection fields or grant a gateway administrator indirect access to an
-arbitrary provider path.
+Every provider is read-only and operator-configured: aliases bind one fixed
+resource each, and neither callers nor ordinary Connection mutations can choose a
+provider locator. Do not place cloud-provider locators in Connection fields
+directly — reference an alias ID instead, which is all the admin API accepts or
+returns.
