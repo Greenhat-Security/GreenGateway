@@ -824,6 +824,55 @@ pub struct EgressStreamResponse {
     pub body: EgressBodyStream,
 }
 
+/// An upstream response to an upgrade attempt, before any protocol switch.
+///
+/// The body is deliberately not exposed: a non-101 response is a failed
+/// upgrade whose body must never reach the client, and a 101 has no body. The
+/// caller inspects `status` and `headers`, and on acceptance consumes
+/// `into_upgraded` to take the raw bidirectional stream.
+// Lands ahead of its consumer. The tests below exercise it end to end, but the
+// plain binary has no caller until the WebSocket data plane in #256 lands, so
+// the binary build alone sees it as dead.
+#[allow(dead_code)]
+pub struct EgressUpgradeResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    response: reqwest::Response,
+}
+
+impl fmt::Debug for EgressUpgradeResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EgressUpgradeResponse")
+            .field("status", &self.status)
+            .field("headers", &"<redacted>")
+            .finish()
+    }
+}
+
+#[allow(dead_code)]
+impl EgressUpgradeResponse {
+    /// Takes the upgraded bidirectional stream.
+    ///
+    /// Only meaningful after the caller has verified the response actually
+    /// switched protocols; calling it otherwise fails rather than handing back
+    /// a half-open connection.
+    pub async fn into_upgraded(self) -> Result<reqwest::Upgraded, EgressError> {
+        if self.status != StatusCode::SWITCHING_PROTOCOLS {
+            return Err(EgressError::InvalidPolicy(
+                "upstream did not switch protocols".to_owned(),
+            ));
+        }
+        self.response.upgrade().await.map_err(|error| {
+            tracing::warn!(
+                error_category = "upgrade_failed",
+                "egress upstream upgrade did not complete"
+            );
+            EgressError::Http(error)
+        })
+    }
+}
+
 impl fmt::Debug for EgressStreamResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1102,8 +1151,52 @@ impl EgressClient {
         destination: &CheckedEgressDestination,
         url: &str,
     ) -> Result<reqwest::Client, EgressError> {
-        let (_, client) = self.client_for_checked_destination(destination, url, true)?;
+        let (_, client) = self.client_for_checked_destination(
+            destination,
+            url,
+            client_cache::ProtocolProfile::Sse,
+        )?;
         Ok(client)
+    }
+
+    /// Sends a bodyless GET that may be answered with a protocol upgrade.
+    ///
+    /// Reuses the same validated-destination path as every other egress call —
+    /// authority, policy port, private-IP rules, and pinned socket address are
+    /// all rechecked against the current configuration generation — so exact
+    /// pinning, SNI, certificate verification, route-local roots, and endpoint
+    /// mTLS identity apply to an upgraded connection exactly as they do to an
+    /// ordinary request.
+    ///
+    /// No response body is read. A non-101 answer is a failed upgrade whose
+    /// body must not reach the client, and a 101 has none. Deliberately does
+    /// not retry: an upgrade attempt is not replayable once the upstream has
+    /// begun switching protocols.
+    #[allow(dead_code)]
+    pub(crate) async fn upgrade_request_at_checked_destination(
+        &self,
+        destination: &CheckedEgressDestination,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<EgressUpgradeResponse, EgressError> {
+        let (parsed, client) = self.client_for_checked_destination(
+            destination,
+            url,
+            client_cache::ProtocolProfile::UpgradeHttp1,
+        )?;
+
+        tracing::debug!("egress upgrade request using previously validated pinned destination");
+
+        let response = client
+            .request(Method::GET, parsed)
+            .headers(headers)
+            .send()
+            .await?;
+        Ok(EgressUpgradeResponse {
+            status: response.status(),
+            headers: response.headers().clone(),
+            response,
+        })
     }
 
     pub(crate) async fn request_with_headers_at_checked_destination(
@@ -1118,7 +1211,11 @@ impl EgressClient {
             body.as_ref().map_or(0, Vec::len),
             self.config.max_request_body_bytes,
         )?;
-        let (parsed, client) = self.client_for_checked_destination(destination, url, false)?;
+        let (parsed, client) = self.client_for_checked_destination(
+            destination,
+            url,
+            client_cache::ProtocolProfile::Http1AndHttp2,
+        )?;
 
         tracing::debug!("egress request using previously validated pinned destination");
 
@@ -1138,7 +1235,11 @@ impl EgressClient {
             body.as_ref().map_or(0, Vec::len),
             self.config.max_request_body_bytes,
         )?;
-        let (parsed, client) = self.client_for_checked_destination(destination, url, false)?;
+        let (parsed, client) = self.client_for_checked_destination(
+            destination,
+            url,
+            client_cache::ProtocolProfile::Http1AndHttp2,
+        )?;
 
         tracing::debug!("sensitive egress request using previously validated pinned destination");
 
@@ -1255,7 +1356,11 @@ impl EgressClient {
         let (parsed, client) = self.client_for_checked_destination(
             destination,
             url,
-            sse_max_response_bytes.is_some(),
+            if sse_max_response_bytes.is_some() {
+                client_cache::ProtocolProfile::Sse
+            } else {
+                client_cache::ProtocolProfile::Http1AndHttp2
+            },
         )?;
 
         tracing::debug!("egress streaming request using previously validated pinned destination");
@@ -1275,7 +1380,7 @@ impl EgressClient {
         &self,
         destination: &CheckedEgressDestination,
         url: &str,
-        sse: bool,
+        profile: client_cache::ProtocolProfile,
     ) -> Result<(Url, reqwest::Client), EgressError> {
         if destination.config_generation != self.config_generation {
             return Err(EgressError::InvalidPolicy(
@@ -1306,7 +1411,7 @@ impl EgressClient {
             &self.config.private_ip_allow_cidrs,
         )?;
         let client =
-            self.pinned_client_with_profile(&parsed, &host, destination.pinned_addr, sse)?;
+            self.pinned_client_with_profile(&parsed, &host, destination.pinned_addr, profile)?;
         Ok((parsed, client))
     }
 
@@ -1357,7 +1462,7 @@ impl EgressClient {
         url: &Url,
         host: &str,
         pinned_addr: SocketAddr,
-        sse: bool,
+        profile: client_cache::ProtocolProfile,
     ) -> Result<reqwest::Client, EgressError> {
         let port = checked_port(url)?;
         let key = client_cache::PinnedClientCacheKey {
@@ -1372,16 +1477,12 @@ impl EgressClient {
             tls_root_set_fingerprint: self.config.tls_root_set_fingerprint,
             client_identity_fingerprint: self.config.client_identity_fingerprint,
             transport_partition: self.config.transport_partition,
-            protocol_profile: if sse {
-                client_cache::ProtocolProfile::Sse
-            } else {
-                client_cache::ProtocolProfile::Http1AndHttp2
-            },
+            protocol_profile: profile,
             outbound_proxy_policy: client_cache::OutboundProxyPolicy::Disabled,
         };
 
         self.client_cache.get_or_build(key, || {
-            Ok(base_client_builder_for_profile(&self.config, sse)
+            Ok(base_client_builder_for_profile(&self.config, profile)
                 .resolve(host, pinned_addr)
                 .build()?)
         })
@@ -1394,7 +1495,12 @@ impl EgressClient {
         host: &str,
         pinned_addr: SocketAddr,
     ) -> Result<reqwest::Client, EgressError> {
-        self.pinned_client_with_profile(url, host, pinned_addr, false)
+        self.pinned_client_with_profile(
+            url,
+            host,
+            pinned_addr,
+            client_cache::ProtocolProfile::Http1AndHttp2,
+        )
     }
 
     async fn resolve_and_check(&self, host: &str, port: u16) -> Result<SocketAddr, EgressError> {
@@ -1710,10 +1816,13 @@ fn extract_rfc6052_ipv4(ip: Ipv6Addr, prefix_len: u8) -> Option<Ipv4Addr> {
 }
 
 fn base_client_builder(config: &EgressConfig) -> reqwest::ClientBuilder {
-    base_client_builder_for_profile(config, false)
+    base_client_builder_for_profile(config, client_cache::ProtocolProfile::Http1AndHttp2)
 }
 
-fn base_client_builder_for_profile(config: &EgressConfig, sse: bool) -> reqwest::ClientBuilder {
+fn base_client_builder_for_profile(
+    config: &EgressConfig,
+    profile: client_cache::ProtocolProfile,
+) -> reqwest::ClientBuilder {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(config.connect_timeout)
@@ -1721,8 +1830,15 @@ fn base_client_builder_for_profile(config: &EgressConfig, sse: bool) -> reqwest:
         .pool_max_idle_per_host(client_cache::CLIENT_POOL_MAX_IDLE_PER_HOST)
         .tcp_keepalive(Some(client_cache::CLIENT_TCP_KEEPALIVE))
         .redirect(reqwest::redirect::Policy::none());
-    if !sse {
+    // A total request timeout would cut a long-lived stream or an upgraded
+    // connection; both bound their lifetime at the caller instead.
+    if matches!(profile, client_cache::ProtocolProfile::Http1AndHttp2) {
         builder = builder.timeout(config.timeout);
+    }
+    if matches!(profile, client_cache::ProtocolProfile::UpgradeHttp1) {
+        // An upgrade is an HTTP/1.1 mechanism. Forcing http1 keeps ALPN from
+        // selecting h2, where this handshake has no meaning.
+        builder = builder.http1_only();
     }
 
     for certificate in &config.tls_root_certificates {
@@ -3216,6 +3332,183 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body, b"direct");
         server.await.expect("direct server should finish");
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_response_yields_a_bidirectional_stream_through_the_pinned_destination() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("upgrade listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("upgrade address should be available");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("upgrade server should accept one connection");
+            read_one_request(&stream).await;
+            write_all(
+                &stream,
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await;
+            // Prove the socket is genuinely bidirectional after the switch.
+            let mut received = [0u8; 4];
+            stream
+                .read_exact(&mut received)
+                .await
+                .expect("upgraded server should read bytes from the gateway");
+            assert_eq!(&received, b"ping");
+            stream
+                .write_all(b"pong")
+                .await
+                .expect("upgraded server should write");
+        });
+
+        let resolver = Arc::new(FakeDnsResolver::with_addresses(vec![addr]));
+        let config = EgressConfig {
+            allowed_hosts: HashSet::from(["upgrade.example.test".to_owned()]),
+            deny_private_ips: false,
+            timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(500),
+            ..EgressConfig::default()
+        };
+        let client = EgressClient::new_with_resolver(config, resolver.clone())
+            .expect("upgrade client should build");
+        let url = format!("http://upgrade.example.test:{}/socket", addr.port());
+        let destination = client
+            .checked_destination(&url)
+            .await
+            .expect("destination should pass policy");
+
+        let response = client
+            .upgrade_request_at_checked_destination(&destination, &url, HeaderMap::new())
+            .await
+            .expect("upgrade request should reach the pinned destination");
+        assert_eq!(response.status, StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            response
+                .headers
+                .get("upgrade")
+                .and_then(|value| value.to_str().ok()),
+            Some("websocket")
+        );
+
+        let mut upgraded = response
+            .into_upgraded()
+            .await
+            .expect("a 101 response should yield the raw stream");
+        upgraded
+            .write_all(b"ping")
+            .await
+            .expect("upgraded stream should be writable");
+        let mut echoed = [0u8; 4];
+        upgraded
+            .read_exact(&mut echoed)
+            .await
+            .expect("upgraded stream should be readable");
+        assert_eq!(&echoed, b"pong");
+
+        // The whole exchange used exactly the one DNS decision already made.
+        assert_eq!(
+            resolver.calls(),
+            vec![("upgrade.example.test".to_owned(), addr.port())]
+        );
+        server.await.expect("upgrade server should finish");
+    }
+
+    #[tokio::test]
+    async fn a_response_that_did_not_switch_protocols_never_yields_a_stream() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("refusing listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("refusing address should be available");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("refusing server should accept one connection");
+            read_one_request(&stream).await;
+            // An upstream that answers an upgrade with an ordinary response,
+            // body and all. None of it may become a tunnel.
+            write_all(
+                &stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nrefused",
+            )
+            .await;
+        });
+
+        let resolver = Arc::new(FakeDnsResolver::with_addresses(vec![addr]));
+        let config = EgressConfig {
+            allowed_hosts: HashSet::from(["refuse.example.test".to_owned()]),
+            deny_private_ips: false,
+            timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(500),
+            ..EgressConfig::default()
+        };
+        let client = EgressClient::new_with_resolver(config, resolver)
+            .expect("refusing client should build");
+        let url = format!("http://refuse.example.test:{}/socket", addr.port());
+        let destination = client
+            .checked_destination(&url)
+            .await
+            .expect("destination should pass policy");
+
+        let response = client
+            .upgrade_request_at_checked_destination(&destination, &url, HeaderMap::new())
+            .await
+            .expect("the request itself succeeds; the upgrade is what failed");
+        assert_eq!(response.status, StatusCode::OK);
+        let error = response
+            .into_upgraded()
+            .await
+            .expect_err("a non-101 response must not yield a stream");
+        assert!(matches!(error, EgressError::InvalidPolicy(_)));
+        server.await.expect("refusing server should finish");
+    }
+
+    #[test]
+    fn the_protocol_profile_partitions_the_pinned_client_cache_key() {
+        // The pinned client cache is process-wide, so entry counts race with
+        // every other test. What actually has to hold is that the profile is
+        // part of the cache key: an upgraded connection must never be handed a
+        // pooled client that ALPN-negotiated h2, and long-lived upgraded
+        // sockets must not share a pool with ordinary requests.
+        let key_for = |profile| client_cache::PinnedClientCacheKey {
+            scheme: "http".to_owned(),
+            host: "profiles.example.test".to_owned(),
+            port: 8080,
+            pinned_addr: "127.0.0.1:8080"
+                .parse::<SocketAddr>()
+                .expect("pinned address should parse"),
+            egress_generation: [7u8; 32],
+            request_timeout: Duration::from_secs(5),
+            response_idle_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(1),
+            tls_root_set_fingerprint: [9u8; 32],
+            client_identity_fingerprint: None,
+            transport_partition: None,
+            protocol_profile: profile,
+            outbound_proxy_policy: client_cache::OutboundProxyPolicy::Disabled,
+        };
+
+        let ordinary = key_for(client_cache::ProtocolProfile::Http1AndHttp2);
+        let sse = key_for(client_cache::ProtocolProfile::Sse);
+        let upgrade = key_for(client_cache::ProtocolProfile::UpgradeHttp1);
+
+        assert_ne!(upgrade, ordinary);
+        assert_ne!(upgrade, sse);
+        assert_ne!(ordinary, sse);
+        assert_eq!(
+            upgrade,
+            key_for(client_cache::ProtocolProfile::UpgradeHttp1),
+            "one destination and profile must resolve to a single cache entry"
+        );
     }
 
     #[tokio::test]

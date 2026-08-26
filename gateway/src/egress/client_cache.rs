@@ -72,6 +72,12 @@ impl fmt::Debug for PinnedClientCacheKey {
 pub(super) enum ProtocolProfile {
     Http1AndHttp2,
     Sse,
+    /// HTTP/1.1-only transport used to originate a protocol upgrade.
+    ///
+    /// Partitioned from the other profiles so an upgraded connection can never
+    /// be handed a pooled client that ALPN-negotiated HTTP/2, and so long-lived
+    /// upgraded sockets do not share a pool with ordinary requests.
+    UpgradeHttp1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
