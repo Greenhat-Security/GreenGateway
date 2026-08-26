@@ -403,7 +403,7 @@ impl ConnectionControlPlane {
                 };
                 tracing::error!(
                     connection_id = %record.id,
-                    display_name = %record.write.display_name,
+                    display_name = ?record.write.display_name,
                     fields = ?fields,
                     reason,
                     "enabled managed connection has an unusable binding; refusing to start"
@@ -764,21 +764,6 @@ impl ConnectionControlPlane {
         )));
     }
 
-    /// Resolves every binding a candidate references that the synchronous path
-    /// had to defer, and parses the TLS material it yields.
-    ///
-    /// [`ConnectionSecretResolver::validate_enabled_candidate`] runs on a
-    /// synchronous path that cannot reach a network provider, so for aliases
-    /// owned by one it verifies only that the ID is configured. That is the
-    /// right answer at startup, before the egress client exists. It is the wrong
-    /// answer for an admin mutation: those happen long after activation, they
-    /// are already async, and `docs/configuration.md` promises that every
-    /// enabled binding is resolved for its exact purpose — and every CA bundle
-    /// and client-identity pair parsed — before persistence or runtime
-    /// publication. Without this pass a Connection whose TLS material comes from
-    /// a network provider is persisted and published unvalidated, and the
-    /// breakage first appears as a per-request data-path failure.
-    ///
     /// Cross-validates a rotated TLS client-identity half against a counterpart
     /// that lives behind a network secret provider.
     ///
@@ -844,6 +829,21 @@ impl ConnectionControlPlane {
         Ok(())
     }
 
+    /// Resolves every binding a candidate references that the synchronous path
+    /// had to defer, and parses the TLS material it yields.
+    ///
+    /// [`ConnectionSecretResolver::validate_enabled_candidate`] runs on a
+    /// synchronous path that cannot reach a network provider, so for aliases
+    /// owned by one it verifies only that the ID is configured. That is the
+    /// right answer at startup, before the egress client exists. It is the wrong
+    /// answer for an admin mutation: those happen long after activation, they
+    /// are already async, and `docs/configuration.md` promises that every
+    /// enabled binding is resolved for its exact purpose — and every CA bundle
+    /// and client-identity pair parsed — before persistence or runtime
+    /// publication. Without this pass a Connection whose TLS material comes from
+    /// a network provider is persisted and published unvalidated, and the
+    /// breakage first appears as a per-request data-path failure.
+    ///
     /// Deliberately runs before the mutation lock is taken: it performs network
     /// I/O, and the lock must not be held across it.
     pub async fn ensure_deferred_bindings_resolvable(
