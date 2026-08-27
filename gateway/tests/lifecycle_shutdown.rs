@@ -5,8 +5,8 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    process::{Command, Stdio},
-    sync::mpsc,
+    process::{Child, Command, Stdio},
+    sync::{mpsc, Mutex, MutexGuard},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -18,6 +18,94 @@ fn unused_loopback_address() -> String {
         .expect("test listener address should be available");
     drop(listener);
     address.to_string()
+}
+
+/// Serializes port allocation through child startup.
+///
+/// `unused_loopback_address` asks the OS for a free port and then releases it,
+/// so the port is unowned between that call and the child binding it. Two of
+/// these tests running concurrently can therefore be handed the SAME port. What
+/// follows is worse than a bind failure: the first gateway binds it, the second
+/// fails to bind and exits, and the second test's startup probe then connects
+/// successfully -- to the FIRST test's gateway. It leaves the gate believing its
+/// child is up. When the first test signals its gateway, the second test's real
+/// request is refused, surfacing as a bare `ConnectionRefused` with nothing to
+/// suggest that its child had died at startup.
+///
+/// Holding this across allocation and startup keeps the window closed. It is
+/// released once the child owns the port, so the slow parts of these tests still
+/// overlap.
+static STARTUP_GUARD: Mutex<()> = Mutex::new(());
+
+fn startup_guard() -> MutexGuard<'static, ()> {
+    // A panicking test must not cascade into the others; the data is `()`.
+    STARTUP_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Blocks until the child answers a request on its own listener.
+///
+/// Deliberately not a bare `TcpStream::connect`. A successful connect proves
+/// only that something is listening on that address, which is exactly the
+/// assumption that made a cross-test port collision look like a healthy start.
+/// Requiring a response to a gateway-owned probe route proves the child is
+/// serving, and re-checking `try_wait` on every iteration means a child that
+/// died reports its stderr instead of the failure surfacing later as a refused
+/// connection.
+fn wait_until_serving(child: &mut Child, listen_addr: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("gateway subprocess status should be readable")
+        {
+            let mut stderr = String::new();
+            if let Some(mut stream) = child.stderr.take() {
+                let _ = stream.read_to_string(&mut stderr);
+            }
+            panic!("gateway exited before accepting connections ({status}): {stderr}");
+        }
+
+        if gateway_answers_probe(listen_addr) {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "gateway did not begin serving before the test deadline"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn gateway_answers_probe(listen_addr: &str) -> bool {
+    let Ok(mut stream) = TcpStream::connect(listen_addr) else {
+        return false;
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
+        return false;
+    }
+    if stream
+        .write_all(
+            b"GET /livez HTTP/1.1
+Host: localhost
+Connection: close
+
+",
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = Vec::new();
+    if stream.read_to_end(&mut response).is_err() {
+        return false;
+    }
+    response.starts_with(b"HTTP/1.1 200")
 }
 
 fn temp_audit_path() -> PathBuf {
@@ -32,7 +120,33 @@ fn temp_audit_path() -> PathBuf {
 }
 
 #[test]
+fn the_startup_gate_is_not_satisfied_by_a_listener_that_is_not_this_gateway() {
+    // The precise confusion this guards against: a port collision between two
+    // of these tests leaves a DIFFERENT process listening on the address, and
+    // the old gate accepted that as its own child having started.
+    let foreign = TcpListener::bind(("127.0.0.1", 0)).expect("test listener should bind");
+    let address = foreign
+        .local_addr()
+        .expect("test listener address should be available")
+        .to_string();
+
+    // A bare connect succeeds against anything that is listening, which is
+    // exactly why it could not tell the two apart.
+    assert!(
+        TcpStream::connect(&address).is_ok(),
+        "a plain connect succeeds against any listener, which is the trap"
+    );
+
+    // Requiring a served response does tell them apart.
+    assert!(
+        !gateway_answers_probe(&address),
+        "the gate must not accept a listener that never answers the probe route"
+    );
+}
+
+#[test]
 fn sigterm_exits_cleanly_and_persists_terminal_audit_event() {
+    let startup = startup_guard();
     let listen_addr = unused_loopback_address();
     let audit_path = temp_audit_path();
     let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).expect("test upstream should bind");
@@ -98,27 +212,9 @@ fn sigterm_exits_cleanly_and_persists_terminal_audit_event() {
         .spawn()
         .expect("gateway subprocess should start");
 
-    let startup_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if TcpStream::connect(&listen_addr).is_ok() {
-            break;
-        }
-        if let Some(status) = child
-            .try_wait()
-            .expect("gateway subprocess status should be readable")
-        {
-            let mut stderr = String::new();
-            if let Some(mut stream) = child.stderr.take() {
-                let _ = stream.read_to_string(&mut stderr);
-            }
-            panic!("gateway exited before accepting connections ({status}): {stderr}");
-        }
-        assert!(
-            Instant::now() < startup_deadline,
-            "gateway did not begin accepting connections before the test deadline"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+    wait_until_serving(&mut child, &listen_addr);
+    // The child owns the port now, so the remaining work can overlap again.
+    drop(startup);
 
     let request_addr = listen_addr.clone();
     let request = thread::spawn(move || {
@@ -212,6 +308,7 @@ fn sigterm_exits_cleanly_and_persists_terminal_audit_event() {
 
 #[test]
 fn sigint_ctrl_c_path_exits_cleanly_and_persists_terminal_audit_event() {
+    let startup = startup_guard();
     let listen_addr = unused_loopback_address();
     let audit_path = temp_audit_path();
     let mut child = Command::new(env!("CARGO_BIN_EXE_gateway"))
@@ -229,27 +326,9 @@ fn sigint_ctrl_c_path_exits_cleanly_and_persists_terminal_audit_event() {
         .spawn()
         .expect("gateway subprocess should start");
 
-    let startup_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if TcpStream::connect(&listen_addr).is_ok() {
-            break;
-        }
-        if let Some(status) = child
-            .try_wait()
-            .expect("gateway subprocess status should be readable")
-        {
-            let mut stderr = String::new();
-            if let Some(mut stream) = child.stderr.take() {
-                let _ = stream.read_to_string(&mut stderr);
-            }
-            panic!("gateway exited before accepting connections ({status}): {stderr}");
-        }
-        assert!(
-            Instant::now() < startup_deadline,
-            "gateway did not begin accepting connections before the test deadline"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+    wait_until_serving(&mut child, &listen_addr);
+    // The child owns the port now, so the remaining work can overlap again.
+    drop(startup);
 
     let signal_status = Command::new("kill")
         .arg("-INT")
@@ -316,6 +395,7 @@ fn sigint_ctrl_c_path_exits_cleanly_and_persists_terminal_audit_event() {
 
 #[test]
 fn hard_shutdown_cancels_sse_before_persisted_audit_drain() {
+    let startup = startup_guard();
     let listen_addr = unused_loopback_address();
     let audit_path = temp_audit_path();
     let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).expect("test upstream should bind");
@@ -397,27 +477,9 @@ fn hard_shutdown_cancels_sse_before_persisted_audit_drain() {
         .spawn()
         .expect("gateway subprocess should start");
 
-    let startup_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if TcpStream::connect(&listen_addr).is_ok() {
-            break;
-        }
-        if let Some(status) = child
-            .try_wait()
-            .expect("gateway subprocess status should be readable")
-        {
-            let mut stderr = String::new();
-            if let Some(mut stream) = child.stderr.take() {
-                let _ = stream.read_to_string(&mut stderr);
-            }
-            panic!("gateway exited before accepting connections ({status}): {stderr}");
-        }
-        assert!(
-            Instant::now() < startup_deadline,
-            "gateway did not begin accepting connections before the test deadline"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+    wait_until_serving(&mut child, &listen_addr);
+    // The child owns the port now, so the remaining work can overlap again.
+    drop(startup);
 
     let mut client = TcpStream::connect(&listen_addr).expect("SSE gateway request should connect");
     client
