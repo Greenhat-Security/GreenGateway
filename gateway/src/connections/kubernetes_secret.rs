@@ -106,8 +106,16 @@ const MAX_KUBERNETES_TOKEN_BYTES: usize = 8 * 1024;
 /// kubelet replaces a projected token once it passes 80% of its TTL, and
 /// Kubernetes rejects an `expirationSeconds` below 600, so even the least-fresh
 /// token this provider can read still has 120s of validity left. Caching for
-/// 60s keeps a cached copy inside that window with a factor of two to spare,
-/// and costs at most one small file read per profile per minute.
+/// 60s keeps a cached copy inside that window, and costs at most one small file
+/// read per profile per minute.
+///
+/// The 120s figure is the token manager's decision point, not the moment the
+/// file changes: the projected volume is rewritten on volume re-setup, which
+/// lags pod sync by up to `--sync-frequency` (60s by default). So the residual
+/// validity of a token actually on disk can approach 60s rather than 120s, and
+/// the margin here is nearer 1x than 2x. 60s remains the right bound because
+/// the tested 401 re-read absorbs the edge -- the cost of losing the race is
+/// one extra round trip, not a failed resolution.
 const KUBERNETES_TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 const KUBERNETES_VALUE_CACHE_TTL: Duration = Duration::from_secs(60);
 const MAX_KUBERNETES_VALUE_CACHE_ENTRIES: usize = 256;

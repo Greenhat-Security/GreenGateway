@@ -139,7 +139,8 @@ pub struct SecretAliasMetadata {
     /// providers report `None` here and answer the operationally load-bearing
     /// question through `pinned` instead. Widening this to a string was weighed
     /// and rejected in issue #286: the shipped admin UI rejects the entire
-    /// metadata response unless `version` is a non-negative integer, then does
+    /// metadata response unless `version` is absent or a non-negative integer,
+    /// which is precisely why these three may report `None` at all. It then does
     /// arithmetic on it to confirm an encrypted-local rotation, and a type
     /// change to a published `connection-admin.v1` field is breaking where
     /// adding `pinned` beside it was not. The opaque identifiers also stay
