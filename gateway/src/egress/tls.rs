@@ -13,7 +13,7 @@
 //! Specifically: configured CAs are EXTRA trust anchors layered on top of the
 //! platform trust store, via
 //! `rustls_platform_verifier::Verifier::new_with_extra_roots`
-//! (`reqwest-0.13.4/src/async_impl/client.rs:754-777`). The obvious hand-written
+//! (`reqwest-0.13.4/src/async_impl/client.rs:756-783`). The obvious hand-written
 //! equivalent, `ClientConfig::builder().with_root_certificates(roots)`, does
 //! something materially different: it NARROWS trust to the configured CA and
 //! drops every platform root. Everything the private CA signs keeps working, so
@@ -30,7 +30,7 @@
 //!
 //! So instead of two configurations that agree, there is one. This module builds
 //! it, and reqwest is handed it through `ClientBuilder::tls_backend_preconfigured`
-//! (`client.rs:2192`, consumed at `client.rs:642`). A future h2 transport calls
+//! (`client.rs:2192`, consumed at `client.rs:642-685`). A future h2 transport calls
 //! [`client_config`] with a different ALPN list and nothing else changes.
 //!
 //! # What handing reqwest a finished config turns off
@@ -153,7 +153,7 @@ fn alpn_protocols(profile: ProtocolProfile) -> &'static [&'static [u8]] {
 
 /// Resolves the crypto provider this process's outbound TLS uses.
 ///
-/// Mirrors reqwest's own rule exactly (`client.rs:718-720` with
+/// Mirrors reqwest's own rule exactly (`client.rs:719-721` with
 /// `client.rs:2482-2494`): an installed process default wins, and with none
 /// installed the choice is aws-lc-rs. Preserving that rule matters more than
 /// preferring one provider: this PR is meant to make the existing configuration
@@ -189,7 +189,7 @@ fn resolve_crypto_provider(process_default: Option<Arc<CryptoProvider>>) -> Arc<
 /// Parses a PEM CA bundle into trust anchors.
 ///
 /// Two checks, because the previous path did two. The PEM decode is the parser
-/// reqwest uses (`reqwest-0.13.4/src/tls.rs:260-267`), and the trust-anchor
+/// reqwest uses (`reqwest-0.13.4/src/tls.rs:217-224` via `:262-269`), and the trust-anchor
 /// check is what `RootCertStore::add` did when reqwest built a client from the
 /// bundle -- `Certificate::from_der` itself validates nothing, so a PEM block
 /// whose body is well-formed base64 but not a certificate used to be caught at
@@ -277,7 +277,7 @@ pub(super) fn client_config(
     let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
         // reqwest offers everything rustls supports unless a min/max version is
         // configured, and nothing in this crate configures one
-        // (`client.rs:659-715`).
+        // (`client.rs:691-716`).
         .with_protocol_versions(rustls::ALL_VERSIONS)
         .map_err(|_| TlsConfigError::TrustAnchors("TLS protocol versions are unsupported"))?;
 
@@ -302,7 +302,7 @@ pub(super) fn client_config(
     };
     // `dangerous()` is rustls's entry point for ANY custom verifier, not a
     // relaxation of one: it is the only way to install the platform verifier at
-    // all, and it is the same call reqwest makes at `client.rs:756-781`.
+    // all, and it is the same call reqwest makes at `client.rs:756-783`.
     // Certificate and hostname verification both stay fully enforced -- the
     // verifier being installed is stricter than a bare root store, not weaker.
     let builder = builder
@@ -320,7 +320,7 @@ pub(super) fn client_config(
     };
 
     // Not decoration, and not inherited: `.http1_only()` pins ALPN only on the
-    // backend reqwest builds itself (`client.rs:822-826`), and the
+    // backend reqwest builds itself (`client.rs:823-827`), and the
     // `BuiltRustls` arm never touches `alpn_protocols`. Leaving this unset
     // sends no ALPN extension at all; setting it to `h2` in a build without
     // `hyper-util/http2` does not error, it panics inside hyper-util

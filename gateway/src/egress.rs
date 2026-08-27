@@ -1865,7 +1865,7 @@ fn base_client_builder_for_profile(
     //
     // This call now pins only the HTTP version reqwest will speak on the
     // connection. It no longer pins ALPN: that half applies only to the TLS
-    // backend reqwest builds itself (`client.rs:822-826`), and the config below
+    // backend reqwest builds itself (`client.rs:823-827`), and the config below
     // is built here instead. `tls::client_config` states the ALPN list per
     // profile, and `egress::tls_tests` observes the negotiated protocol rather
     // than assuming this line still covers it.
