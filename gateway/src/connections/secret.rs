@@ -33,10 +33,25 @@ const MAX_FILE_KEY_BYTES: usize = 255;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
 /// Permission policy applied to a bounded on-disk secret read.
+///
+/// These variants combine two properties that are deliberately kept apart,
+/// because conflating them is how a private key ends up read under a policy
+/// written for a public token:
+///
+/// * whether the leaf may be a symlink -- a property of *how the material is
+///   mounted*, which an operator running on Kubernetes does not choose; and
+/// * how strict the permission mask is -- a property of *what the material is*,
+///   which is the caller's to decide.
+///
+/// Anything readable by another account on the host is a different question
+/// from anything writable by one, and a variant that answers only the second
+/// cannot be reused for material where the first also matters. Add a variant
+/// rather than relaxing an existing one when a new caller needs a combination
+/// that is not here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FileSecretPermissions {
     /// Operator-provisioned material that must grant no group or other
-    /// permission at all.
+    /// permission at all, reached without following any symlink.
     Exclusive,
     /// Platform-projected workload identity material that the container runtime
     /// publishes world readable, such as a Kubernetes projected service-account
@@ -46,6 +61,19 @@ pub(crate) enum FileSecretPermissions {
     /// stays confined beneath the capability root and the opened handle must
     /// still be a regular file.
     PlatformProjected,
+    /// Material mounted the way a platform projects it -- the leaf may be a
+    /// symlink -- whose permissions must still be exclusive: no group or other
+    /// access at all, read included.
+    ///
+    /// This is the policy for a secret whose *disclosure* is the loss, not only
+    /// its substitution: a server private key, for instance. `Exclusive` cannot
+    /// serve there, because refusing a symlinked leaf would refuse the single
+    /// most common way such material is mounted, and `PlatformProjected` cannot,
+    /// because a world-readable private key is not a shape to accept quietly.
+    /// Callers using this must expect a default Kubernetes Secret volume, which
+    /// publishes `0644`, to be refused until it is mounted with
+    /// `defaultMode: 0400`, and must say so in the error they raise.
+    ProjectedExclusive,
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -509,7 +537,9 @@ fn read_file_secret(
 /// (`token -> ..data/token`); the capability root confines that resolution, so
 /// a link that escapes the root fails closed. Providers that consume
 /// platform-projected material also relax only the group/other *read* rule
-/// through `permissions`.
+/// through `permissions`; material that is projected the same way but must not
+/// be readable by another account passes
+/// [`FileSecretPermissions::ProjectedExclusive`] and relaxes neither.
 pub(crate) fn read_bounded_file_secret(
     alias_id: &str,
     root: &Dir,
@@ -524,7 +554,7 @@ pub(crate) fn read_bounded_file_secret(
         FileSecretPermissions::Exclusive => {
             initial_metadata.is_file() && !initial_metadata.is_symlink()
         }
-        FileSecretPermissions::PlatformProjected => {
+        FileSecretPermissions::PlatformProjected | FileSecretPermissions::ProjectedExclusive => {
             initial_metadata.is_file() || initial_metadata.is_symlink()
         }
     };
@@ -613,7 +643,9 @@ fn open_file_beneath(
         FileSecretPermissions::Exclusive => FollowSymlinks::No,
         // Symlink resolution is confined beneath the capability root; absolute
         // targets and traversal above the root fail instead of escaping.
-        FileSecretPermissions::PlatformProjected => FollowSymlinks::Yes,
+        FileSecretPermissions::PlatformProjected | FileSecretPermissions::ProjectedExclusive => {
+            FollowSymlinks::Yes
+        }
     });
     options.nonblock(true);
     root.open_with(key, &options).map(|file| file.into_std())
@@ -680,8 +712,11 @@ fn validate_file_permissions(
     permissions: FileSecretPermissions,
 ) -> Result<(), SecretResolveError> {
     use std::os::unix::fs::MetadataExt;
+    // Group/other *read* is the axis that separates these: `PlatformProjected`
+    // tolerates it because the runtime publishes tokens that way, and the other
+    // two do not because reading the material is itself the compromise.
     let forbidden = match permissions {
-        FileSecretPermissions::Exclusive => 0o077,
+        FileSecretPermissions::Exclusive | FileSecretPermissions::ProjectedExclusive => 0o077,
         FileSecretPermissions::PlatformProjected => 0o022,
     };
     if metadata.mode() & forbidden == 0 {

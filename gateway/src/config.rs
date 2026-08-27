@@ -112,14 +112,18 @@ pub const DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_TLS_MIN_VERSION: TlsMinVersion = TlsMinVersion::Tls12;
 /// Long enough for a hand-rolled client on a slow link, short enough that a
 /// client which never sends a ClientHello cannot hold an admission slot for a
-/// meaningful fraction of a minute.
+/// meaningful fraction of a minute. It also sets how long a saturated listener
+/// keeps refusing, since that is when the oldest slot comes back.
 pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
-/// The ceiling on TLS handshakes running at once, across both listeners.
+/// The ceiling on TLS handshakes running at once, applied per listener.
 ///
 /// Handshakes are the expensive, attacker-triggerable half of accepting a
 /// connection, so this is what stops a flood of half-open connections from
-/// becoming unbounded work. Sized well above any plausible legitimate burst so
-/// that reaching it is a signal rather than a routine event.
+/// becoming unbounded work. It does not bound accepts: a listener at the
+/// ceiling keeps accepting and closes what it cannot admit, because a stalled
+/// accept is worse than a refused connection. Sized well above any plausible
+/// legitimate burst so that reaching it is a signal rather than a routine
+/// event.
 pub const DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES: usize = 256;
 const DEFAULT_CSRF_ENABLED: bool = true;
 const DEFAULT_CSRF_COOKIE_NAME: &str = "csrf_token";

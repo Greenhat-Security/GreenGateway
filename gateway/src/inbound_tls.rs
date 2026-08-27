@@ -18,6 +18,14 @@
 //! `accept` reads. Every outcome -- established, failed, or timed out --
 //! releases its slot, so the bound is on handshakes actually in progress rather
 //! than on connections ever seen.
+//!
+//! The accept itself is never gated on that bound. Connections are accepted
+//! unconditionally and admitted or shed afterwards, because a listener that
+//! stops draining the kernel's accept queue leaves arriving clients neither
+//! served nor refused -- including the readiness and liveness probes that ride
+//! the same listener -- and parking it costs an attacker nothing but idle
+//! sockets. A connection that finds no slot is closed immediately and counted
+//! as `shed`.
 
 use std::{
     fmt, fs, io,
@@ -31,7 +39,7 @@ use std::{
 use cap_std::{ambient_authority, fs::Dir};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{mpsc, Semaphore},
+    sync::{mpsc, Semaphore, TryAcquireError},
 };
 use tokio_rustls::{
     rustls::{
@@ -184,6 +192,9 @@ pub(crate) enum InboundTlsError {
     MaterialUnsafe {
         setting: &'static str,
     },
+    PrivateKeyMaterialUnsafe {
+        setting: &'static str,
+    },
     MaterialInvalid {
         setting: &'static str,
     },
@@ -224,6 +235,10 @@ impl fmt::Display for InboundTlsError {
             Self::MaterialUnsafe { setting } => write!(
                 formatter,
                 "the file named by {setting} is not a regular file, escapes its directory, or is group- or world-writable"
+            ),
+            Self::PrivateKeyMaterialUnsafe { setting } => write!(
+                formatter,
+                "the file named by {setting} is not a regular file, escapes its directory, or is readable or writable by group or other; a server private key must grant no group or other permission at all, so mount it with `defaultMode: 0400` on a Kubernetes Secret volume -- which publishes 0644 by default and is refused -- or `chmod 0400` for a bind mount"
             ),
             Self::MaterialInvalid { setting } => write!(
                 formatter,
@@ -412,6 +427,7 @@ fn load_server_config(
         settings.certificate_setting,
         settings.certificate_file,
         SecretPurpose::TlsCertificate,
+        FileSecretPermissions::PlatformProjected,
     )?;
     // A key concatenated into the certificate file inherits the certificate's
     // permissions, and a certificate is the one piece of this pair an operator
@@ -437,6 +453,7 @@ fn load_server_config(
         settings.private_key_setting,
         settings.private_key_file,
         SecretPurpose::TlsPrivateKey,
+        FileSecretPermissions::ProjectedExclusive,
     )?;
     let mut private_key = ZeroizingKey(Some(
         PrivateKeyDer::from_pem_slice(private_key_pem.expose()).map_err(|_| {
@@ -489,20 +506,30 @@ fn load_server_config(
 /// beneath the root, and the permission rules -- rather than reimplementing any
 /// of them slightly differently.
 ///
-/// [`FileSecretPermissions::PlatformProjected`] is the policy for both files.
-/// `Exclusive` would be the tighter choice for a private key, but it refuses
-/// symlinked leaves, and every Kubernetes TLS Secret mount publishes its leaves
-/// as relative symlinks into the kubelet atomic writer's `..data` directory --
-/// so `Exclusive` would reject the single most common way this material is
-/// mounted, for a shape that is not actually unsafe. `PlatformProjected` still
-/// fails closed on the property that matters for a key an attacker could swap:
-/// group or other *write* on the leaf, and a group/other-writable directory
-/// without the sticky bit. Operators who can mount tighter should
-/// (`defaultMode: 0400`), and `docs/configuration.md` says so.
+/// The two files get different policies, because they are different material.
+///
+/// The certificate is public: it is served to every client that connects, so
+/// [`FileSecretPermissions::PlatformProjected`] is the right policy for it --
+/// group and other *read* are of no consequence, and group or other *write*
+/// still fails closed because a certificate an attacker can rewrite is a
+/// certificate an attacker chooses.
+///
+/// The private key gets [`FileSecretPermissions::ProjectedExclusive`], which
+/// permits the same symlinked leaf and forbids group and other *read* as well.
+/// Both halves of that are load-bearing. `Exclusive` refuses a symlinked leaf,
+/// and every Kubernetes TLS Secret mount publishes its leaves as relative
+/// symlinks into the kubelet atomic writer's `..data` directory, so `Exclusive`
+/// would reject the commonest way this material is mounted for a shape that is
+/// not unsafe. `PlatformProjected` would accept a world-readable private key
+/// without a word, which no other private key in this codebase does. The cost
+/// is real and deliberate: Kubernetes publishes Secret volume files `0644` by
+/// default, so a default TLS Secret mount is refused until the operator sets
+/// `defaultMode: 0400`. The error says so, and `docs/configuration.md` says so.
 fn read_material(
     setting: &'static str,
     path: &str,
     purpose: SecretPurpose,
+    permissions: FileSecretPermissions,
 ) -> Result<crate::connections::secret::ResolvedSecret, InboundTlsError> {
     let path = PathBuf::from(path);
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -510,21 +537,24 @@ fn read_material(
     };
     let directory = open_material_directory(setting, path.parent())?;
 
-    read_bounded_file_secret(
-        setting,
-        &directory,
-        file_name,
-        purpose,
-        FileSecretPermissions::PlatformProjected,
+    read_bounded_file_secret(setting, &directory, file_name, purpose, permissions).map_err(
+        |error| match error.kind() {
+            SecretResolveErrorKind::SourceUnavailable => {
+                InboundTlsError::MaterialUnavailable { setting }
+            }
+            SecretResolveErrorKind::SourceDenied => InboundTlsError::MaterialDenied { setting },
+            // The two policies fail closed on different things, so they owe the
+            // operator different instructions: only the key's rule can be
+            // tripped by a mode an orchestrator picked rather than a mistake.
+            SecretResolveErrorKind::UnsafeSource => match permissions {
+                FileSecretPermissions::ProjectedExclusive => {
+                    InboundTlsError::PrivateKeyMaterialUnsafe { setting }
+                }
+                _ => InboundTlsError::MaterialUnsafe { setting },
+            },
+            _ => InboundTlsError::MaterialInvalid { setting },
+        },
     )
-    .map_err(|error| match error.kind() {
-        SecretResolveErrorKind::SourceUnavailable => {
-            InboundTlsError::MaterialUnavailable { setting }
-        }
-        SecretResolveErrorKind::SourceDenied => InboundTlsError::MaterialDenied { setting },
-        SecretResolveErrorKind::UnsafeSource => InboundTlsError::MaterialUnsafe { setting },
-        _ => InboundTlsError::MaterialInvalid { setting },
-    })
 }
 
 fn open_material_directory(
@@ -640,19 +670,13 @@ async fn accept_loop(
     established: mpsc::Sender<(TlsStream<TcpStream>, SocketAddr)>,
     cancellation: CancellationToken,
 ) {
+    // One semaphore per accept loop, so the budget is per listener rather than
+    // per process. The admin listener is how an operator reaches a deployment
+    // that is already under load, and a flood on the data listener must not be
+    // able to spend the budget that reaches it.
     let in_flight = Arc::new(Semaphore::new(limits.max_concurrent));
 
     loop {
-        // Admission is taken before the accept, so a saturated handshake pool
-        // stops draining the kernel's accept queue instead of letting an
-        // unbounded number of half-open sockets pile up inside the process.
-        // Every slot is released by the task that holds it -- on success, on a
-        // failed handshake, and on timeout -- so the pause is bounded by
-        // `limits.timeout` rather than by client behaviour.
-        let Ok(permit) = Arc::clone(&in_flight).acquire_owned().await else {
-            return;
-        };
-
         let (stream, peer_addr) = loop {
             tokio::select! {
                 () = cancellation.cancelled() => return,
@@ -671,6 +695,37 @@ async fn accept_loop(
                     }
                 },
             }
+        };
+
+        // Admission is decided after the accept and without waiting.
+        //
+        // Waiting for a slot here -- taking the permit before the accept -- was
+        // tried and rejected: a stalled accept is worse than a refused
+        // connection. A connection the process never accepts is neither served
+        // nor told, so it sits in the kernel's backlog until somebody else's
+        // slot expires, and the gateway's own readiness and liveness probes ride
+        // this same listener. Holding a slot that way costs an attacker nothing
+        // but an idle socket -- no TLS, no crypto, no auth, no completed
+        // handshake -- because the slot would be gating "waiting for a
+        // ClientHello", which is free, rather than the handshake itself, which
+        // is not.
+        //
+        // Sockets inside the process stay bounded all the same: a connection
+        // that finds no slot is dropped right here rather than retained, and
+        // dropping it closes it, so the client learns at once and can retry or
+        // fail over. Saturation degrades to "some connections are refused
+        // promptly" and never to "the listener stopped accepting".
+        let permit = match Arc::clone(&in_flight).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                record_handshake(listener_label, "shed");
+                drop(stream);
+                continue;
+            }
+            // Nothing closes this semaphore while the loop runs, so this is the
+            // shutdown path rather than a saturation path; shedding for ever
+            // would be the wrong answer to it.
+            Err(TryAcquireError::Closed) => return,
         };
 
         let acceptor = acceptor.clone();

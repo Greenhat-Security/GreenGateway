@@ -562,13 +562,17 @@ pub mod tests {
 
     /// Minimal in-process `metrics` recorder so counter emissions can be
     /// asserted without adding a test-only dependency.
+    ///
+    /// Shared with `inbound_tls_tests` rather than duplicated: two hand-rolled
+    /// recorders would drift, and a recorder that silently stopped matching
+    /// would turn every assertion built on it into a tautology.
     #[derive(Clone, Default)]
-    struct CountingRecorder {
+    pub struct CountingRecorder {
         counts: Arc<Mutex<Vec<(String, u64)>>>,
     }
 
     impl CountingRecorder {
-        fn count(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        pub fn count(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
             let key = render_counter_key(name, labels);
             self.counts
                 .lock()

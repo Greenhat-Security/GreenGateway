@@ -49,7 +49,13 @@ Default: empty, which serves the data listener as plaintext HTTP/1.1.
 
 Format and validation: as for `TLS_CERT_FILE`, with a 256 KiB read bound, and the key must match the public key of the leaf certificate. A mismatch fails startup.
 
-Permissions: the key file must not be group- or world-writable, and its directory must not be group- or world-writable unless it carries the sticky bit. That is the same rule the gateway applies to platform-projected connection secrets: `drwxrwxrwt` is what a container runtime publishes a projected volume as, and the sticky bit is what makes it safe, because a process that does not own an entry cannot swap it. Group- and world-*read* on the key is permitted rather than rejected, because Kubernetes publishes Secret volume files as mode `0644` by default and refusing that would make the most common way to mount this material unusable; mount the key more tightly where your platform allows it, with `defaultMode: 0400` in Kubernetes or `chmod 0400` for a bind mount.
+The certificate is held to a looser permission rule than the key, deliberately: it is public material, served to every client that connects, so group and other *read* on it is normal and permitted. Group or other *write* on either file still fails startup, because material an attacker can rewrite is material an attacker chooses.
+
+Permissions: **the key file must grant no group or other permission at all -- not write, and not read.** Its directory must not be group- or world-writable unless it carries the sticky bit, which is the same rule the gateway applies to platform-projected connection secrets: `drwxrwxrwt` is what a container runtime publishes a projected volume as, and the sticky bit is what makes it safe, because a process that does not own an entry cannot swap it.
+
+**Kubernetes deployment requirement.** A Secret volume publishes its files as mode `0644` by default, which is world-readable, so a default TLS Secret mount is refused and the gateway will not start. Set `defaultMode: 0400` on the volume (or `chmod 0400` for a bind mount). This fails closed on purpose. Reading a server private key is the entire compromise -- every session it ever protected, retroactively -- so *read* is as disqualifying as *write* here, and it is the rule every other private key in this gateway is already held to.
+
+The leaf may still be a symlink, which is what makes the requirement satisfiable in the shape Kubernetes actually publishes: the kubelet's atomic writer exposes `tls.key` as a relative link into its `..data` directory, and that shape loads as long as the file it resolves to is `0400`. The two rules are independent -- whether a symlinked leaf is permitted, and who may read the file -- and only the certificate relaxes the second.
 
 Key bytes are read into zeroizing buffers, are never written to logs, audit events, metrics, error responses, or `Debug` output, and no startup error names the path the key was read from -- only the setting to fix.
 
@@ -91,17 +97,25 @@ Default: `10000`
 
 Format and validation: must parse as an unsigned integer greater than 0. Zero is rejected at startup, because a zero deadline fails every handshake.
 
-A client that connects and never sends a ClientHello is dropped when this expires, and the admission slot it held is released immediately. Handshakes do not run on the listener's accept path, so a slow client cannot stall other connections; this deadline bounds how long one can hold a slot against the `TLS_MAX_CONCURRENT_HANDSHAKES` budget.
+A client that connects and never sends a ClientHello is dropped when this expires, and the admission slot it held is released immediately. Handshakes do not run on the listener's accept path, so a slow client cannot stall other connections; this deadline bounds how long one can hold a slot against the `TLS_MAX_CONCURRENT_HANDSHAKES` budget, and therefore how long a saturated listener keeps refusing.
+
+Lowering it makes a flood of silent connections cheaper to shrug off; raising it accommodates clients on slow or lossy links. It does not bound how long a *legitimate* client waits: a connection that cannot be admitted is refused at once rather than held for this long.
 
 ### TLS_MAX_CONCURRENT_HANDSHAKES
 
-The maximum number of inbound TLS handshakes running at once, across both listeners.
+The maximum number of inbound TLS handshakes running at once, per listener.
 
 Default: `256`
 
 Format and validation: must parse as an unsigned integer greater than 0. Zero is rejected at startup, because it would admit no connections at all.
 
-Handshakes are the expensive, attacker-triggerable half of accepting a TLS connection, so this is the bound that stops a flood of half-open connections from becoming unbounded work inside the process. When the bound is reached the listener stops draining the kernel's accept queue rather than accumulating half-open sockets, and resumes as soon as a slot is released -- which happens on every outcome, including a failed or timed-out handshake. The default is set well above any plausible legitimate burst, so reaching it is a signal rather than a routine event; `inbound_tls_handshakes_in_flight` and `inbound_tls_handshakes_total` report it.
+Handshakes are the expensive, attacker-triggerable half of accepting a TLS connection, so this is the bound that stops a flood of half-open connections from becoming unbounded work inside the process.
+
+When the bound is reached the listener keeps accepting and **sheds**: a connection that finds no free slot is closed immediately, so the client learns at once and can retry or fail over, and the kernel's accept queue keeps draining. Saturation therefore degrades to "some connections are refused promptly", never to "the listener stopped accepting". Slots are released on every outcome, including a failed or timed-out handshake, so service resumes about one `TLS_HANDSHAKE_TIMEOUT_MS` after a flood stops.
+
+The budget is per listener, not per process. The data and admin listeners run separate accept loops with separate budgets, so a flood on the data listener cannot spend the budget that reaches the admin surface -- which matters, because the admin listener is how an operator reaches a deployment that is already under load.
+
+The default is set well above any plausible legitimate burst, so reaching it is a signal rather than a routine event. `inbound_tls_handshakes_in_flight` reports the slots in use and `inbound_tls_handshakes_total{listener,outcome}` counts every outcome, including `outcome="shed"`; a non-zero shed rate means real clients are being refused and is worth alerting on.
 
 ### ADMIN_PREFIX
 
