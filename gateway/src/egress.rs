@@ -32,6 +32,9 @@ pub(crate) use reqwest as rmcp_http;
 mod client_cache;
 #[cfg(test)]
 mod mtls_tests;
+mod tls;
+#[cfg(test)]
+mod tls_tests;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -229,6 +232,17 @@ impl From<reqwest::Error> for EgressError {
     }
 }
 
+impl From<tls::TlsConfigError> for EgressError {
+    fn from(error: tls::TlsConfigError) -> Self {
+        // The two kinds of TLS material a deployment supplies already have a
+        // variant each, and both are reported without echoing the material.
+        match error {
+            tls::TlsConfigError::TrustAnchors(message) => in_memory_tls_ca_bundle_error(message),
+            tls::TlsConfigError::ClientIdentity => Self::InvalidTlsClientIdentity,
+        }
+    }
+}
+
 impl EgressError {
     pub fn is_timeout(&self) -> bool {
         match self {
@@ -409,9 +423,11 @@ pub struct EgressConfig {
     pub nat64_prefixes: Vec<IpNet>,
     pub deny_private_ips: bool,
     pub tls_ca_bundle_path: Option<PathBuf>,
-    pub tls_root_certificates: Vec<reqwest::Certificate>,
+    /// Extra trust anchors, on top of the platform trust store rather than
+    /// instead of it. See [`tls`] for why that distinction is load-bearing.
+    pub(crate) tls_root_certificates: Vec<tls::CertificateDer<'static>>,
     pub(crate) tls_root_set_fingerprint: [u8; 32],
-    pub(crate) client_identity: Option<reqwest::Identity>,
+    pub(crate) client_identity: Option<tls::TlsClientIdentity>,
     pub(crate) client_identity_fingerprint: Option<[u8; 32]>,
     pub(crate) transport_partition: Option<TransportPartition>,
 }
@@ -668,8 +684,7 @@ impl EgressConfig {
                 "PEM bundle exceeds the supported size limit",
             ));
         }
-        let certificates = reqwest::Certificate::from_pem_bundle(pem_bundle)
-            .map_err(|_| in_memory_tls_ca_bundle_error("PEM bundle could not be parsed"))?;
+        let certificates = tls::parse_ca_bundle_pem(pem_bundle).map_err(EgressError::from)?;
 
         if certificates.is_empty() {
             return Err(in_memory_tls_ca_bundle_error(
@@ -704,13 +719,10 @@ impl EgressConfig {
         {
             return Err(EgressError::InvalidTlsClientIdentity);
         }
-        let identity = reqwest::Identity::from_pem(pem_identity)
-            .map_err(|_| EgressError::InvalidTlsClientIdentity)?;
-
-        reqwest::Client::builder()
-            .no_proxy()
-            .identity(identity.clone())
-            .build()
+        // `parse_client_identity_pem` runs the TLS stack's own acceptance check,
+        // so an identity that lands in the configuration is one the handshake
+        // can actually present.
+        let identity = tls::parse_client_identity_pem(pem_identity)
             .map_err(|_| EgressError::InvalidTlsClientIdentity)?;
 
         self.client_identity = Some(identity);
@@ -997,7 +1009,7 @@ impl EgressClient {
     ) -> Result<Self, EgressError> {
         // Validate the complete transport profile at construction. Actual
         // exact-pinned clients are created lazily after DNS validation.
-        base_client_builder(&config).build()?;
+        base_client_builder(&config)?.build()?;
         let config_generation = egress_config_generation(&config);
         let policy_generation = egress_policy_generation(&config);
 
@@ -1485,7 +1497,7 @@ impl EgressClient {
         };
 
         self.client_cache.get_or_build(key, || {
-            Ok(base_client_builder_for_profile(&self.config, profile)
+            Ok(base_client_builder_for_profile(&self.config, profile)?
                 .resolve(host, pinned_addr)
                 .build()?)
         })
@@ -1818,14 +1830,14 @@ fn extract_rfc6052_ipv4(ip: Ipv6Addr, prefix_len: u8) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(value as u32))
 }
 
-fn base_client_builder(config: &EgressConfig) -> reqwest::ClientBuilder {
+fn base_client_builder(config: &EgressConfig) -> Result<reqwest::ClientBuilder, EgressError> {
     base_client_builder_for_profile(config, client_cache::ProtocolProfile::Http1AndHttp2)
 }
 
 fn base_client_builder_for_profile(
     config: &EgressConfig,
     profile: client_cache::ProtocolProfile,
-) -> reqwest::ClientBuilder {
+) -> Result<reqwest::ClientBuilder, EgressError> {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(config.connect_timeout)
@@ -1843,30 +1855,44 @@ fn base_client_builder_for_profile(
     // For UpgradeHttp1 it is semantic: an upgrade is an HTTP/1.1 mechanism, and
     // ALPN selecting h2 would leave the handshake meaningless.
     //
-    // For the other two it is a blast-radius pin, and it is a no-op today only
-    // because reqwest is built without its `http2` feature, which leaves the
-    // ALPN list as `["http/1.1"]`. Turning that feature on -- for gRPC, or as a
-    // transitive consequence of some other crate -- rewrites the list to
-    // `["h2", "http/1.1"]` with h2 preferred, and every HTTPS upstream that
-    // supports h2 silently switches protocol. That is a change to how live
-    // traffic is framed, arriving with no code change and no configuration
-    // change, and hyper additionally strips hop-by-hop headers on h2 rather
-    // than erroring, so this gateway's curated header handling would change
-    // shape at the same time.
+    // For the other two it is a blast-radius pin: an h2 transport has to be an
+    // explicit new profile that opts out, rather than something existing traffic
+    // is opted into by a dependency edge. Every HTTPS upstream that supports h2
+    // would otherwise switch protocol with no code change and no configuration
+    // change, and hyper strips hop-by-hop headers on h2 rather than erroring, so
+    // this gateway's curated header handling would change shape at the same
+    // time.
     //
-    // Pinning here means an h2 transport has to be an explicit new profile that
-    // opts out, rather than something existing traffic is opted into by a
-    // dependency edge.
+    // This call now pins only the HTTP version reqwest will speak on the
+    // connection. It no longer pins ALPN: that half applies only to the TLS
+    // backend reqwest builds itself (`client.rs:823-827`), and the config below
+    // is built here instead. `tls::client_config` states the ALPN list per
+    // profile, and `egress::tls_tests` observes the negotiated protocol rather
+    // than assuming this line still covers it.
     builder = builder.http1_only();
 
-    for certificate in &config.tls_root_certificates {
-        builder = builder.add_root_certificate(certificate.clone());
-    }
-    if let Some(identity) = &config.client_identity {
-        builder = builder.identity(identity.clone());
-    }
+    // The gateway builds the TLS configuration and hands the finished thing to
+    // reqwest, rather than letting reqwest assemble one from `add_root_certificate`
+    // and `identity`. [`tls`] explains why; the consequence here is that this is
+    // the ONLY place outbound trust is configured. Under
+    // `TlsBackend::BuiltRustls` reqwest never reads `root_certs` or `identity`
+    // (`reqwest-0.13.4/src/async_impl/client.rs:642-685`), so calling those
+    // builder methods as well would be dead code that still reads as the thing
+    // establishing trust.
+    let tls_config = tls::client_config(
+        &config.tls_root_certificates,
+        config.client_identity.as_ref(),
+        profile,
+    )
+    .map_err(|error| {
+        let error = EgressError::from(error);
+        match &config.tls_ca_bundle_path {
+            Some(path) => with_tls_ca_bundle_path(error, path),
+            None => error,
+        }
+    })?;
 
-    builder
+    Ok(builder.tls_backend_preconfigured(tls_config))
 }
 
 fn empty_tls_root_set_fingerprint() -> [u8; 32] {
@@ -1918,22 +1944,16 @@ fn tls_client_identity_pem_shape_is_valid(pem_identity: &[u8]) -> bool {
     certificate_count >= 1 && private_key_count == 1
 }
 
+/// Validates a CA bundle exactly as [`EgressConfig::apply_tls_ca_bundle_pem`]
+/// will.
+///
+/// Both call the one parser, so a preflight cannot bless a bundle the transport
+/// later refuses.
 pub(crate) fn tls_ca_bundle_pem_is_valid(pem_bundle: &[u8]) -> bool {
-    let Ok(certificates) = reqwest::Certificate::from_pem_bundle(pem_bundle) else {
-        return false;
-    };
-    if certificates.is_empty() {
-        return false;
+    match tls::parse_ca_bundle_pem(pem_bundle) {
+        Ok(certificates) => !certificates.is_empty(),
+        Err(_) => false,
     }
-
-    certificates
-        .into_iter()
-        .fold(
-            reqwest::Client::builder().no_proxy(),
-            |builder, certificate| builder.add_root_certificate(certificate),
-        )
-        .build()
-        .is_ok()
 }
 
 /// Joins a client certificate and private key into the single PEM document the
@@ -2047,14 +2067,7 @@ fn tls_client_identity_pem_parses(pem_identity: &[u8]) -> bool {
     if !tls_client_identity_pem_shape_is_valid(pem_identity) {
         return false;
     }
-    let Ok(identity) = reqwest::Identity::from_pem(pem_identity) else {
-        return false;
-    };
-    reqwest::Client::builder()
-        .no_proxy()
-        .identity(identity)
-        .build()
-        .is_ok()
+    tls::parse_client_identity_pem(pem_identity).is_ok()
 }
 
 fn egress_config_generation(config: &EgressConfig) -> [u8; 32] {
@@ -4569,9 +4582,8 @@ mod tests {
         });
         let certified = rcgen::generate_simple_self_signed(vec!["egress-pinned.test".to_owned()])
             .expect("test root certificate should generate");
-        let tls_root_certificates =
-            reqwest::Certificate::from_pem_bundle(certified.cert.pem().as_bytes())
-                .expect("test root certificate should parse");
+        let tls_root_certificates = tls::parse_ca_bundle_pem(certified.cert.pem().as_bytes())
+            .expect("test root certificate should parse");
         let config = EgressConfig {
             allowed_hosts: HashSet::from(["egress-pinned.test".to_owned()]),
             max_response_bytes: 10,
@@ -4748,8 +4760,8 @@ mod tests {
                 .expect("test root certificate should generate");
         let pem = certified.cert.pem();
         let mut trust_config = base_config.clone();
-        trust_config.tls_root_certificates = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
-            .expect("test root certificate should parse");
+        trust_config.tls_root_certificates =
+            tls::parse_ca_bundle_pem(pem.as_bytes()).expect("test root certificate should parse");
         trust_config.tls_root_set_fingerprint = tls_root_set_fingerprint(pem.as_bytes());
         let trust_client = client
             .reconfigured(trust_config)
@@ -4769,7 +4781,7 @@ mod tests {
             first_identity.key_pair.serialize_pem()
         );
         first_identity_config.client_identity = Some(
-            reqwest::Identity::from_pem(first_identity_pem.as_bytes())
+            tls::parse_client_identity_pem(first_identity_pem.as_bytes())
                 .expect("first test identity should parse"),
         );
         first_identity_config.client_identity_fingerprint = Some(tls_client_identity_fingerprint(
@@ -4793,7 +4805,7 @@ mod tests {
             second_identity.key_pair.serialize_pem()
         );
         second_identity_config.client_identity = Some(
-            reqwest::Identity::from_pem(second_identity_pem.as_bytes())
+            tls::parse_client_identity_pem(second_identity_pem.as_bytes())
                 .expect("second test identity should parse"),
         );
         second_identity_config.client_identity_fingerprint = Some(tls_client_identity_fingerprint(

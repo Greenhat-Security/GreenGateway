@@ -34,6 +34,13 @@ reqwest = { version = "0.13.2", default-features = false, features = ["json", "r
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = "8"
+# Already in the graph transitively: reqwest's `rustls` feature depends on it,
+# and this is the same 0.7.x it resolves. Naming it directly adds a dependency
+# edge, not a crate, and lets `gateway/src/egress/tls.rs` build the same
+# extra-roots server verifier reqwest builds internally rather than approximating
+# it. `default-features = false` keeps the `ffi-testing` feature -- the only one
+# that would pull `rustls/ring` -- unreachable from here.
+rustls-platform-verifier = { version = "0.7.0", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["arbitrary_precision"] }
 sha2 = "0.10.9"
