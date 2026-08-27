@@ -17,9 +17,9 @@ rechecks permission and current state for every operation.
 
 | Permission | UI authority |
 |---|---|
-| `admin:connections:read` | View redacted Connection list, detail, status, and safe secret-alias metadata |
+| `admin:connections:read` | View redacted Connection list, detail, and status |
 | `admin:connections:write` | Create, update, disable, enable, or delete managed non-sensitive configuration |
-| `admin:connections:secrets:write` | Create/rotate/delete local secrets; bind, replace, clear, or redirect credential/TLS authority |
+| `admin:connections:secrets:write` | List safe secret-alias metadata; create/rotate/delete local secrets; bind, replace, clear, or redirect credential/TLS authority |
 | `admin:connections:test` | Run the saved bounded Connection test |
 | `admin:connections:refresh` | Refresh an enabled managed OpenAPI or MCP catalog |
 | `admin:tools:read` | View capability inventory and safe detail |
@@ -30,6 +30,8 @@ Use separate operator roles for routine metadata edits, secret custody,
 catalog administration, and tool execution. A connection writer without
 secrets-write cannot redirect an existing credential to a different origin,
 OAuth token URL, discovery target, or stored test target.
+
+Reading the secret inventory is gated on `admin:connections:secrets:write`, not on `admin:connections:read`: `GET /v1{ADMIN_PREFIX}/connection-secrets` returns `403` to a Connection reader, so knowing which aliases exist stays with secret custody rather than with routine Connection reads. A role that should see the **Local encrypted secrets** panel needs secrets-write even when it will never submit a value.
 
 ## Connections
 

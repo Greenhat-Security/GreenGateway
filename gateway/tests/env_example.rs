@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{btree_map::Entry, BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -248,18 +248,99 @@ fn code_env_vars(src_dir: &Path) -> BTreeSet<String> {
     collect_rs_files(src_dir, &mut files);
     files.sort();
 
+    let sources: Vec<(PathBuf, String)> = files
+        .into_iter()
+        .map(|file| {
+            let source = fs::read_to_string(&file)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.display()));
+            (file, source)
+        })
+        .collect();
+
+    env_vars_in_sources(&sources)
+}
+
+/// Resolve the variable name behind every environment read in `gateway/src`.
+///
+/// The drift tests above are only worth their assertions if this walk sees
+/// every read, so it does two things a narrower scan would not. A name that the
+/// reading file does not declare itself is resolved against the whole crate,
+/// because a `&str` constant declared in one module and read from another is a
+/// perfectly ordinary shape that used to be invisible here. And an argument the
+/// walk cannot follow to a name -- a macro, a call, a name declared with two
+/// different values in two modules -- fails the test rather than being skipped,
+/// so the only reads left out of the comparison are the ones whose key
+/// genuinely is not known until runtime.
+///
+/// The walk does not track modules, so `a::KEY` and `b::KEY` are the same name
+/// to it. That only costs precision when the reading file declares the name
+/// itself and means a different one, which no module in `gateway/src` does.
+fn env_vars_in_sources(sources: &[(PathBuf, String)]) -> BTreeSet<String> {
+    let crate_consts = crate_string_consts(sources);
     let mut vars = BTreeSet::new();
 
-    for file in files {
-        let source = fs::read_to_string(&file)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.display()));
-        let consts = string_consts(&source);
+    for (path, source) in sources {
+        let file_consts = string_consts(source);
 
-        vars.extend(env_var_calls(&source, &consts));
-        vars.extend(get_var_calls(&source, &consts));
+        for argument in env_read_arguments(source) {
+            match argument {
+                EnvReadArgument::Name(name) => {
+                    vars.insert(name);
+                }
+                EnvReadArgument::Runtime => {}
+                EnvReadArgument::Const(name) => {
+                    let resolved = file_consts
+                        .get(&name)
+                        .cloned()
+                        .or_else(|| crate_consts.get(&name).cloned().flatten());
+                    let value = resolved.unwrap_or_else(|| {
+                        panic!(
+                            "{} reads the environment as `{name}`, which does not resolve to a \
+                             single `&str` constant anywhere in gateway/src. Name the variable \
+                             with a string literal or one unambiguous `&str` constant so it \
+                             cannot be omitted from .env.example, docs/configuration.md, or \
+                             the Cloudflare forwarding list.",
+                            path.display()
+                        )
+                    });
+                    vars.insert(value);
+                }
+                EnvReadArgument::Opaque(snippet) => panic!(
+                    "{} reads the environment as `{snippet}`, a form this parity check cannot \
+                     follow to a variable name. Name the variable with a string literal or a \
+                     `&str` constant so it cannot be omitted from .env.example, \
+                     docs/configuration.md, or the Cloudflare forwarding list.",
+                    path.display()
+                ),
+            }
+        }
     }
 
     vars
+}
+
+/// A name declared with two different values anywhere in the crate resolves to
+/// neither, so an ambiguous read fails loudly instead of binding to whichever
+/// declaration the directory walk happened to reach last.
+fn crate_string_consts(sources: &[(PathBuf, String)]) -> BTreeMap<String, Option<String>> {
+    let mut consts: BTreeMap<String, Option<String>> = BTreeMap::new();
+
+    for (_, source) in sources {
+        for (name, value) in string_consts(source) {
+            match consts.entry(name) {
+                Entry::Vacant(entry) => {
+                    entry.insert(Some(value));
+                }
+                Entry::Occupied(mut entry) => {
+                    if entry.get().as_deref() != Some(value.as_str()) {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+    }
+
+    consts
 }
 
 fn collect_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
@@ -280,50 +361,45 @@ fn collect_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
 
 fn string_consts(source: &str) -> BTreeMap<String, String> {
     let mut consts = BTreeMap::new();
-    let mut index = 0;
 
-    while let Some(offset) = source[index..].find("const") {
-        let start = index + offset;
-        index = start + "const".len();
+    for keyword in ["const", "static"] {
+        let mut index = 0;
 
-        if !has_word_boundary(source, start, "const".len()) {
-            continue;
-        }
+        while let Some(offset) = source[index..].find(keyword) {
+            let start = index + offset;
+            index = start + keyword.len();
 
-        let mut cursor = skip_whitespace(source, index);
-        let Some((name, next)) = parse_identifier(source, cursor) else {
-            continue;
-        };
+            if !has_word_boundary(source, start, keyword.len()) {
+                continue;
+            }
 
-        cursor = skip_whitespace(source, next);
-        if source.as_bytes().get(cursor) != Some(&b':') {
-            continue;
-        }
+            let mut cursor = skip_whitespace(source, index);
+            let Some((name, next)) = parse_identifier(source, cursor) else {
+                continue;
+            };
 
-        let Some(equal_offset) = source[cursor..].find('=') else {
-            break;
-        };
-        let equal = cursor + equal_offset;
+            cursor = skip_whitespace(source, next);
+            if source.as_bytes().get(cursor) != Some(&b':') {
+                continue;
+            }
 
-        if !is_string_ref_type(source[cursor + 1..equal].trim()) {
-            continue;
-        }
+            let Some(equal_offset) = source[cursor..].find('=') else {
+                break;
+            };
+            let equal = cursor + equal_offset;
 
-        cursor = skip_whitespace(source, equal + 1);
-        if let Some((value, _)) = parse_string_literal(source, cursor) {
-            consts.insert(name.to_owned(), value);
+            if !is_string_ref_type(source[cursor + 1..equal].trim()) {
+                continue;
+            }
+
+            cursor = skip_whitespace(source, equal + 1);
+            if let Some((value, _)) = parse_string_literal(source, cursor) {
+                consts.insert(name.to_owned(), value);
+            }
         }
     }
 
     consts
-}
-
-fn env_var_calls(source: &str, consts: &BTreeMap<String, String>) -> BTreeSet<String> {
-    scan_calls(source, consts, &["env::var", "env::var_os"])
-}
-
-fn get_var_calls(source: &str, consts: &BTreeMap<String, String>) -> BTreeSet<String> {
-    scan_calls(source, consts, &["get_var"])
 }
 
 fn is_string_ref_type(type_text: &str) -> bool {
@@ -342,14 +418,25 @@ fn is_string_ref_type(type_text: &str) -> bool {
     cursor > lifetime_end && &lifetime_start[cursor..] == "str"
 }
 
-fn scan_calls(
-    source: &str,
-    consts: &BTreeMap<String, String>,
-    callees: &[&str],
-) -> BTreeSet<String> {
-    let mut vars = BTreeSet::new();
+/// What an environment read names, as written at the call site.
+#[derive(Debug, PartialEq, Eq)]
+enum EnvReadArgument {
+    /// A string literal: the variable name is right there.
+    Name(String),
+    /// A reference to a `&str` constant, by the final segment of its path.
+    Const(String),
+    /// A lower-case binding. `Config::from_env` and the operator secret-alias
+    /// resolver both take the key as a parameter, and no static walk can know
+    /// what a caller will pass.
+    Runtime,
+    /// A shape the walk cannot follow, kept verbatim for the failure message.
+    Opaque(String),
+}
 
-    for callee in callees {
+fn env_read_arguments(source: &str) -> Vec<EnvReadArgument> {
+    let mut arguments = Vec::new();
+
+    for callee in ["env::var", "env::var_os", "get_var"] {
         let mut index = 0;
 
         while let Some(offset) = source[index..].find(callee) {
@@ -365,18 +452,73 @@ fn scan_calls(
                 continue;
             }
 
-            let cursor = skip_whitespace(source, cursor + 1);
-            if let Some((value, _)) = parse_string_literal(source, cursor) {
-                vars.insert(value);
-            } else if let Some((identifier, _)) = parse_identifier(source, cursor) {
-                if let Some(value) = consts.get(identifier) {
-                    vars.insert(value.clone());
-                }
-            }
+            arguments.push(parse_env_read_argument(source, cursor + 1));
         }
     }
 
-    vars
+    arguments
+}
+
+fn parse_env_read_argument(source: &str, start: usize) -> EnvReadArgument {
+    let cursor = skip_whitespace(source, start);
+    let cursor = if source.as_bytes().get(cursor) == Some(&b'&') {
+        skip_whitespace(source, cursor + 1)
+    } else {
+        cursor
+    };
+
+    if let Some((value, _)) = parse_string_literal(source, cursor) {
+        return EnvReadArgument::Name(value);
+    }
+
+    let Some((segment, end)) = parse_path(source, cursor) else {
+        return EnvReadArgument::Opaque(argument_snippet(source, cursor));
+    };
+
+    // A macro expansion or a nested call builds its string somewhere this walk
+    // cannot see, so neither counts as naming a variable.
+    let next = skip_whitespace(source, end);
+    if matches!(source.as_bytes().get(next), Some(b'!' | b'(')) {
+        return EnvReadArgument::Opaque(argument_snippet(source, cursor));
+    }
+
+    if segment
+        .chars()
+        .any(|character| character.is_ascii_lowercase())
+    {
+        EnvReadArgument::Runtime
+    } else {
+        EnvReadArgument::Const(segment.to_owned())
+    }
+}
+
+fn parse_path(source: &str, start: usize) -> Option<(&str, usize)> {
+    let (mut segment, mut end) = parse_identifier(source, start)?;
+
+    loop {
+        let cursor = skip_whitespace(source, end);
+        if !source[cursor..].starts_with("::") {
+            return Some((segment, end));
+        }
+
+        let cursor = skip_whitespace(source, cursor + 2);
+        let Some((next_segment, next_end)) = parse_identifier(source, cursor) else {
+            return Some((segment, end));
+        };
+
+        segment = next_segment;
+        end = next_end;
+    }
+}
+
+fn argument_snippet(source: &str, start: usize) -> String {
+    source[start..]
+        .chars()
+        .take_while(|character| !matches!(character, ')' | ',' | '\n'))
+        .take(48)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
 }
 
 fn parse_string_literal(source: &str, start: usize) -> Option<(String, usize)> {
@@ -509,11 +651,14 @@ fn lifetime_annotated_string_consts_resolve_in_env_reads() {
         const STATIC_KEY: &'static str = "STATIC_KEY";
         const SHORT_KEY: &'a str = "SHORT_KEY";
         const BARE_KEY: &str = "BARE_KEY";
+        static STATIC_ITEM_KEY: &str = "STATIC_ITEM_KEY";
 
         fn read(get_var: impl Fn(&str)) {
             let _ = env::var(STATIC_KEY);
             get_var(SHORT_KEY);
             let _ = env::var(BARE_KEY);
+            let _ = env::var_os(STATIC_ITEM_KEY);
+            let _ = env::var("LITERAL_KEY");
         }
     "#;
     let consts = string_consts(source);
@@ -521,13 +666,90 @@ fn lifetime_annotated_string_consts_resolve_in_env_reads() {
     assert_eq!(consts.get("STATIC_KEY"), Some(&"STATIC_KEY".to_owned()));
     assert_eq!(consts.get("SHORT_KEY"), Some(&"SHORT_KEY".to_owned()));
     assert_eq!(consts.get("BARE_KEY"), Some(&"BARE_KEY".to_owned()));
+    assert_eq!(
+        consts.get("STATIC_ITEM_KEY"),
+        Some(&"STATIC_ITEM_KEY".to_owned())
+    );
 
     assert_eq!(
-        env_var_calls(source, &consts),
-        BTreeSet::from(["BARE_KEY".to_owned(), "STATIC_KEY".to_owned()])
+        env_vars_in_sources(&[(PathBuf::from("read.rs"), source.to_owned())]),
+        BTreeSet::from([
+            "BARE_KEY".to_owned(),
+            "LITERAL_KEY".to_owned(),
+            "SHORT_KEY".to_owned(),
+            "STATIC_ITEM_KEY".to_owned(),
+            "STATIC_KEY".to_owned(),
+        ])
     );
+}
+
+/// A `&str` constant declared in one module and read from another is the shape
+/// that made this test's "cannot silently be omitted" promise untrue: the walk
+/// used to resolve names only against the file it was reading, so the read
+/// resolved to nothing and the variable never entered the comparison.
+#[test]
+fn cross_module_string_consts_resolve_in_env_reads() {
+    let declaring = r#"
+        pub const CROSS_MODULE_KEY: &str = "CROSS_MODULE_KEY";
+    "#;
+    let reading = r#"
+        fn load(get_var: impl Fn(&str)) {
+            get_var(config::CROSS_MODULE_KEY);
+        }
+    "#;
+
     assert_eq!(
-        get_var_calls(source, &consts),
-        BTreeSet::from(["SHORT_KEY".to_owned()])
+        env_vars_in_sources(&[
+            (PathBuf::from("config.rs"), declaring.to_owned()),
+            (PathBuf::from("load.rs"), reading.to_owned()),
+        ]),
+        BTreeSet::from(["CROSS_MODULE_KEY".to_owned()])
     );
+}
+
+/// Reads whose key is a runtime parameter are the one gap the walk accepts, so
+/// they must stay distinguishable from a name it merely failed to follow.
+#[test]
+fn runtime_named_env_reads_are_not_mistaken_for_variables() {
+    let source = r#"
+        fn read_one(key: &str) {
+            let _ = env::var(key);
+        }
+    "#;
+
+    assert!(env_vars_in_sources(&[(PathBuf::from("read.rs"), source.to_owned())]).is_empty());
+}
+
+#[test]
+#[should_panic(expected = "cannot follow to a variable name")]
+fn macro_named_env_reads_fail_instead_of_disappearing() {
+    let source = r#"
+        fn read() {
+            let _ = env::var(concat!("PREFIX", "_SUFFIX"));
+        }
+    "#;
+
+    let _ = env_vars_in_sources(&[(PathBuf::from("read.rs"), source.to_owned())]);
+}
+
+#[test]
+#[should_panic(expected = "does not resolve to a single `&str` constant")]
+fn ambiguously_declared_env_names_fail_instead_of_binding_to_one_declaration() {
+    let first = r#"
+        const SHARED_NAME: &str = "FIRST_KEY";
+    "#;
+    let second = r#"
+        const SHARED_NAME: &str = "SECOND_KEY";
+    "#;
+    let reading = r#"
+        fn read(get_var: impl Fn(&str)) {
+            get_var(other::SHARED_NAME);
+        }
+    "#;
+
+    let _ = env_vars_in_sources(&[
+        (PathBuf::from("first.rs"), first.to_owned()),
+        (PathBuf::from("second.rs"), second.to_owned()),
+        (PathBuf::from("read.rs"), reading.to_owned()),
+    ]);
 }
