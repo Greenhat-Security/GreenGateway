@@ -7,9 +7,16 @@ useDefault = true
 # Also ignore only the known dev-only RSA signing key fixture used by the
 # compose dev profile. This is intentionally checked in under dev/jwks for
 # local token minting; the allowlist stays content-specific, not path-based.
+#
+# Also ignore the `Sec-WebSocket-Key` value from RFC 6455 section 1.3, used
+# verbatim in the WebSocket acceptance tests. It is the example nonce printed in
+# the specification -- base64 of the ASCII text "the sample nonce" -- and a
+# WebSocket key is a per-handshake nonce rather than a credential in any case.
+# It trips the generic-api-key rule purely on entropy.
 [allowlist]
-description = "Ignore only the known JWT test RSA private key and the dev-only compose signing fixture. All default gitleaks detection remains enabled."
+description = "Ignore only the known JWT test RSA private key, the dev-only compose signing fixture, and the RFC 6455 example WebSocket key. All default gitleaks detection remains enabled."
 regexes = [
   '''I5qOpk5XZ/QzJNC2ze0F2VsQ5RAGNdDG9vKHm5qeYHzgM1z9SOUMXsfPYOiXvdZP''',
   '''NdOKX5FSS9nOh0RNNdwn5b/QdCaMnt64T5f8FXI3giO4AIVCAUE8o7w5bH/1XdXd''',
+  '''dGhlIHNhbXBsZSBub25jZQ==''',
 ]
