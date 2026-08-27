@@ -41,6 +41,7 @@ The wrapper forwards non-empty string Worker variables and secrets whose names m
 
 - `LISTEN_ADDR`, because Cloudflare must reach the container on port `8080`.
 - `ADMIN_LISTEN_ADDR`, because this one-click Worker exposes a single container port. Leave the admin surface on `ADMIN_PREFIX` for Cloudflare deploys.
+- the inbound TLS settings (`TLS_CERT_FILE`, `TLS_KEY_FILE`, `ADMIN_TLS_CERT_FILE`, `ADMIN_TLS_KEY_FILE`, `TLS_MIN_VERSION`, `TLS_HANDSHAKE_TIMEOUT_MS`, `TLS_MAX_CONCURRENT_HANDSHAKES`), because Cloudflare terminates TLS at its edge and reaches the container over plain HTTP/1.1. There is also nowhere to mount a certificate and key in this deployment shape.
 
 An automated parity test compares this forwarding allowlist to GreenGateway's runtime environment reads, so a newly supported key cannot silently be omitted. `SHUTDOWN_DRAIN_DELAY_MS`, `SHUTDOWN_TIMEOUT_MS`, and `AUDIT_DRAIN_TIMEOUT_MS` are forwarded; keep their sum within the Cloudflare container termination budget used by the selected platform plan.
 
@@ -84,6 +85,7 @@ If a custom Cloudflare deployment supplies durable storage or a secure mount out
 - Cloudflare Containers use an ephemeral container filesystem by default. GreenGateway settings such as `AUDIT_SQLITE_PATH`, `DISCOVERY_SQLITE_PATH`, `PRINCIPAL_SQLITE_PATH`, `SERVICE_TOKEN_SQLITE_PATH`, and `CONNECTIONS_SQLITE_PATH` can work for evaluation, but their contents are lost on container replacement unless the deployment explicitly supplies durable storage. A redeploy must be treated as potential state loss, not as a persistence mechanism.
 - File-backed settings such as `POLICY_FILE`, `TOOLS_FILE`, `OPENAPI_SPEC_PATH`, `CONNECTION_SECRETS_ROOT`, CA bundles, and mTLS client identities must point at files that exist inside the image or are otherwise created at runtime. The one-click wrapper does not create a secure mount. A plain or secret Worker variable is not a mounted private-key file; do not put PEM key material, local encryption keys, or resolved Connection secrets in `wrangler.jsonc`, public variables, image layers, or inline route JSON.
 - The one-click wrapper does not expose `ADMIN_LISTEN_ADDR`; use the shared `ADMIN_PREFIX` surface with normal authentication/RBAC.
+- The one-click wrapper does not expose the inbound TLS settings; TLS is terminated by Cloudflare and the container is reached over HTTP/1.1.
 - Per-IP limits are inert until proxy-header trust is configured. See [Client IP attribution](#client-ip-attribution); without it a single caller can rate-limit the whole deployment.
 - This project is still alpha software. Treat the one-click deploy path as a fast evaluation path, not a production hardening guide.
 - The first container deploy may return Worker errors for several minutes while Cloudflare finishes provisioning container capacity.

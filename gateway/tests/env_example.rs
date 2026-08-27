@@ -162,6 +162,33 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
     let mut expected = code_env_vars(&gateway_root.join("src"));
     expected.remove("LISTEN_ADDR");
     expected.remove("ADMIN_LISTEN_ADDR");
+    // Inbound TLS settings are deliberately not forwardable.
+    //
+    // The Worker terminates TLS at Cloudflare's edge and reaches the container
+    // over plain HTTP/1.1 on `CONTAINER_PORT`. Forwarding these would make the
+    // container demand a TLS ClientHello on a connection the Worker will never
+    // start one on, so every request would fail while the deployment looked
+    // correctly configured. There is also nowhere for an operator to mount a
+    // certificate and key in that deployment shape.
+    //
+    // Excluded here rather than added to the allowlist because a forwarding
+    // entry that cannot work is worse than an absent one: it invites the
+    // configuration it silently breaks.
+    for excluded in [
+        "TLS_CERT_FILE",
+        "TLS_KEY_FILE",
+        "ADMIN_TLS_CERT_FILE",
+        "ADMIN_TLS_KEY_FILE",
+        "TLS_MIN_VERSION",
+        "TLS_HANDSHAKE_TIMEOUT_MS",
+        "TLS_MAX_CONCURRENT_HANDSHAKES",
+    ] {
+        assert!(
+            expected.remove(excluded),
+            "{excluded} is excluded from Cloudflare forwarding but is no longer read in \
+             gateway/src; drop the exclusion so it cannot outlive the setting"
+        );
+    }
     let forwarded = cloudflare_forwarded_env_vars(&repo_root.join("cloudflare/src/config.ts"));
 
     let missing_from_cloudflare: Vec<_> = expected.difference(&forwarded).cloned().collect();

@@ -189,6 +189,13 @@ mod tests {
                 .parse()
                 .expect("test listen address should parse"),
             admin_listen_addr: None,
+            tls_cert_file: None,
+            tls_key_file: None,
+            admin_tls_cert_file: None,
+            admin_tls_key_file: None,
+            tls_min_version: crate::config::DEFAULT_TLS_MIN_VERSION,
+            tls_handshake_timeout_ms: crate::config::DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
+            tls_max_concurrent_handshakes: crate::config::DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES,
             admin_prefix: "/admin".to_owned(),
             admin_login_provider: None,
             admin_login_pending_ttl_secs: crate::config::DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,

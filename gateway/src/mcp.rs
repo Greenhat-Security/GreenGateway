@@ -950,6 +950,13 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("test listen address should parse"),
             admin_listen_addr: None,
+            tls_cert_file: None,
+            tls_key_file: None,
+            admin_tls_cert_file: None,
+            admin_tls_key_file: None,
+            tls_min_version: config::DEFAULT_TLS_MIN_VERSION,
+            tls_handshake_timeout_ms: config::DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
+            tls_max_concurrent_handshakes: config::DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES,
             admin_prefix: config::DEFAULT_ADMIN_PREFIX.to_owned(),
             admin_login_provider: None,
             admin_login_pending_ttl_secs: config::DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,

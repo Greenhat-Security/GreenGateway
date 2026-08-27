@@ -566,6 +566,7 @@ The Cloudflare wrapper forwards non-empty string Worker variables and secrets wh
 
 - `LISTEN_ADDR`, because Cloudflare must reach the container on port `8080`
 - `ADMIN_LISTEN_ADDR`, because this one-click Worker exposes a single container port
+- the inbound TLS settings (`TLS_CERT_FILE`, `TLS_KEY_FILE`, `ADMIN_TLS_CERT_FILE`, `ADMIN_TLS_KEY_FILE`, `TLS_MIN_VERSION`, `TLS_HANDSHAKE_TIMEOUT_MS`, `TLS_MAX_CONCURRENT_HANDSHAKES`), because Cloudflare terminates TLS at its edge and reaches the container over plain HTTP/1.1
 
 Keep secrets such as OIDC client secrets in Worker secrets or inside a secret-backed `AUTH_PROVIDERS` value. Do not commit them to the repository.
 
@@ -619,6 +620,7 @@ Common configuration areas include:
 | Area | Examples |
 | --- | --- |
 | Server | `LISTEN_ADDR`, `ADMIN_PREFIX`, `ADMIN_LISTEN_ADDR` |
+| Inbound TLS | `TLS_CERT_FILE`, `TLS_KEY_FILE`, `ADMIN_TLS_CERT_FILE`, `ADMIN_TLS_KEY_FILE`, `TLS_MIN_VERSION` |
 | Auth | `AUTH_PROVIDERS`, `JWT_JWKS_URL`, `JWT_ISSUER`, `JWT_AUDIENCE`, `AUTH_MODE` |
 | RBAC | `POLICY_FILE`, `RBAC_EXEMPT_PATHS` |
 | Proxy | `UPSTREAM_URL`, `UPSTREAM_ROUTES`, pool/health/retry/circuit/SSE/mTLS settings |
@@ -655,8 +657,9 @@ docs/examples/policy.starter.README.md
 
 The `docs/configuration.md` file and `.env.example` are kept in sync with the code by automated tests.
 Cloudflare's supported environment forwarding list is checked against the same
-runtime reads, excluding only the forced `LISTEN_ADDR` and unsupported split
-`ADMIN_LISTEN_ADDR`.
+runtime reads, excluding only the forced `LISTEN_ADDR`, the unsupported split
+`ADMIN_LISTEN_ADDR`, and the inbound TLS settings that a TLS-terminating edge
+leaves nothing for the container to do.
 
 Connection setup, safe migration, and control-plane operation are documented in:
 

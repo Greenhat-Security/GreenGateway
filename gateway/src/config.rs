@@ -52,6 +52,7 @@ use crate::{
             MAX_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
         },
     },
+    inbound_tls::TlsMinVersion,
     upstream_route,
 };
 
@@ -104,6 +105,26 @@ pub const DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH: usize = 1_024;
 pub const DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY: usize = 64;
 pub const DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS: u64 = 1_000;
 pub const DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+/// TLS 1.2 rather than 1.3, because raising a floor is an operator decision
+/// with a compatibility cost attached, and a default that silently refuses a
+/// working client on upgrade is the kind of change this project would rather
+/// make explicit. `docs/configuration.md` recommends `1.3` where clients allow.
+pub const DEFAULT_TLS_MIN_VERSION: TlsMinVersion = TlsMinVersion::Tls12;
+/// Long enough for a hand-rolled client on a slow link, short enough that a
+/// client which never sends a ClientHello cannot hold an admission slot for a
+/// meaningful fraction of a minute. It also sets how long a saturated listener
+/// keeps refusing, since that is when the oldest slot comes back.
+pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+/// The ceiling on TLS handshakes running at once, applied per listener.
+///
+/// Handshakes are the expensive, attacker-triggerable half of accepting a
+/// connection, so this is what stops a flood of half-open connections from
+/// becoming unbounded work. It does not bound accepts: a listener at the
+/// ceiling keeps accepting and closes what it cannot admit, because a stalled
+/// accept is worse than a refused connection. Sized well above any plausible
+/// legitimate burst so that reaching it is a signal rather than a routine
+/// event.
+pub const DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES: usize = 256;
 const DEFAULT_CSRF_ENABLED: bool = true;
 const DEFAULT_CSRF_COOKIE_NAME: &str = "csrf_token";
 const DEFAULT_CSRF_HEADER_NAME: &str = "x-csrf-token";
@@ -127,6 +148,8 @@ const ADMIN_LOGIN_PENDING_TTL_SECS: &str = "ADMIN_LOGIN_PENDING_TTL_SECS";
 const ADMIN_LOGIN_PENDING_MAX_ENTRIES: &str = "ADMIN_LOGIN_PENDING_MAX_ENTRIES";
 const ADMIN_LOGIN_PENDING_MAX_PER_IP: &str = "ADMIN_LOGIN_PENDING_MAX_PER_IP";
 const ADMIN_PREFIX: &str = "ADMIN_PREFIX";
+const ADMIN_TLS_CERT_FILE: &str = "ADMIN_TLS_CERT_FILE";
+const ADMIN_TLS_KEY_FILE: &str = "ADMIN_TLS_KEY_FILE";
 const AUDIT_LOG_FILE: &str = "AUDIT_LOG_FILE";
 const AUDIT_SQLITE_PATH: &str = "AUDIT_SQLITE_PATH";
 const AUDIT_SQLITE_RETENTION_DAYS: &str = "AUDIT_SQLITE_RETENTION_DAYS";
@@ -195,6 +218,11 @@ const TOOL_RUNTIME_GLOBAL_CONCURRENCY: &str = "TOOL_RUNTIME_GLOBAL_CONCURRENCY";
 const TOOL_RUNTIME_QUEUE_DEPTH: &str = "TOOL_RUNTIME_QUEUE_DEPTH";
 const TOOL_RUNTIME_QUEUE_TIMEOUT_MS: &str = "TOOL_RUNTIME_QUEUE_TIMEOUT_MS";
 const TOOLS_FILE: &str = "TOOLS_FILE";
+const TLS_CERT_FILE: &str = "TLS_CERT_FILE";
+const TLS_HANDSHAKE_TIMEOUT_MS: &str = "TLS_HANDSHAKE_TIMEOUT_MS";
+const TLS_KEY_FILE: &str = "TLS_KEY_FILE";
+const TLS_MAX_CONCURRENT_HANDSHAKES: &str = "TLS_MAX_CONCURRENT_HANDSHAKES";
+const TLS_MIN_VERSION: &str = "TLS_MIN_VERSION";
 const TRUST_PROXY_HEADERS: &str = "TRUST_PROXY_HEADERS";
 const TRUSTED_PROXY_CIDRS: &str = "TRUSTED_PROXY_CIDRS";
 const UPSTREAM_CONNECT_TIMEOUT_MS: &str = "UPSTREAM_CONNECT_TIMEOUT_MS";
@@ -210,6 +238,13 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 pub struct Config {
     pub listen_addr: SocketAddr,
     pub admin_listen_addr: Option<SocketAddr>,
+    pub tls_cert_file: Option<String>,
+    pub tls_key_file: Option<String>,
+    pub admin_tls_cert_file: Option<String>,
+    pub admin_tls_key_file: Option<String>,
+    pub tls_min_version: TlsMinVersion,
+    pub tls_handshake_timeout_ms: u64,
+    pub tls_max_concurrent_handshakes: usize,
     pub admin_prefix: String,
     pub admin_login_provider: Option<String>,
     pub admin_login_pending_ttl_secs: u64,
@@ -933,6 +968,79 @@ impl Config {
                 "{ADMIN_LISTEN_ADDR} must not be the same address as {LISTEN_ADDR} (both resolved to {listen_addr}); choose a different port for the admin listener or leave {ADMIN_LISTEN_ADDR} unset"
             ));
         }
+        let tls_cert_file =
+            parse_optional_string(TLS_CERT_FILE, get_var(TLS_CERT_FILE), &mut problems);
+        let tls_key_file =
+            parse_optional_string(TLS_KEY_FILE, get_var(TLS_KEY_FILE), &mut problems);
+        let admin_tls_cert_file = parse_optional_string(
+            ADMIN_TLS_CERT_FILE,
+            get_var(ADMIN_TLS_CERT_FILE),
+            &mut problems,
+        );
+        let admin_tls_key_file = parse_optional_string(
+            ADMIN_TLS_KEY_FILE,
+            get_var(ADMIN_TLS_KEY_FILE),
+            &mut problems,
+        );
+        // Half a pair is the shape that quietly serves plaintext on a listener
+        // an operator believes is protected, so it is a startup failure rather
+        // than a warning or an implicit "TLS off".
+        require_inbound_tls_pair(
+            TLS_CERT_FILE,
+            tls_cert_file.as_deref(),
+            TLS_KEY_FILE,
+            tls_key_file.as_deref(),
+            &mut problems,
+        );
+        require_inbound_tls_pair(
+            ADMIN_TLS_CERT_FILE,
+            admin_tls_cert_file.as_deref(),
+            ADMIN_TLS_KEY_FILE,
+            admin_tls_key_file.as_deref(),
+            &mut problems,
+        );
+        // Admin TLS only has a listener to terminate on when the admin surface
+        // has its own listener. Accepting the settings without one would leave
+        // the admin surface on the data listener's scheme while its own
+        // settings say otherwise.
+        if admin_listen_addr.is_none()
+            && (admin_tls_cert_file.is_some() || admin_tls_key_file.is_some())
+        {
+            problems.push(format!(
+                "{ADMIN_TLS_CERT_FILE} and {ADMIN_TLS_KEY_FILE} require {ADMIN_LISTEN_ADDR} to be set; without a separate admin listener there is nothing for them to terminate"
+            ));
+        }
+        let tls_min_version = parse_var(
+            TLS_MIN_VERSION,
+            get_var(TLS_MIN_VERSION),
+            DEFAULT_TLS_MIN_VERSION,
+            "TLS version",
+            &mut problems,
+        );
+        let tls_handshake_timeout_ms = validate_positive_timeout_ms(
+            TLS_HANDSHAKE_TIMEOUT_MS,
+            parse_var(
+                TLS_HANDSHAKE_TIMEOUT_MS,
+                get_var(TLS_HANDSHAKE_TIMEOUT_MS),
+                DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
+            &mut problems,
+        );
+        let tls_max_concurrent_handshakes = validate_positive_usize(
+            TLS_MAX_CONCURRENT_HANDSHAKES,
+            parse_var(
+                TLS_MAX_CONCURRENT_HANDSHAKES,
+                get_var(TLS_MAX_CONCURRENT_HANDSHAKES),
+                DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES,
+                "handshake count",
+                &mut problems,
+            ),
+            DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES,
+            &mut problems,
+        );
         let admin_prefix = parse_admin_prefix(
             ADMIN_PREFIX,
             get_var(ADMIN_PREFIX),
@@ -1634,6 +1742,13 @@ impl Config {
             Ok(Self {
                 listen_addr,
                 admin_listen_addr,
+                tls_cert_file,
+                tls_key_file,
+                admin_tls_cert_file,
+                admin_tls_key_file,
+                tls_min_version,
+                tls_handshake_timeout_ms,
+                tls_max_concurrent_handshakes,
                 admin_prefix,
                 admin_login_provider,
                 admin_login_pending_ttl_secs,
@@ -1735,6 +1850,69 @@ impl Config {
         RuleSuggestionConfig {
             baseline_window_hours: self.rule_suggestion_baseline_window_hours,
         }
+    }
+
+    /// Inbound TLS for the data listener, or `None` to leave it plaintext.
+    pub(crate) fn data_inbound_tls(&self) -> Option<InboundTlsSettings<'_>> {
+        Some(InboundTlsSettings {
+            certificate_setting: TLS_CERT_FILE,
+            certificate_file: self.tls_cert_file.as_deref()?,
+            private_key_setting: TLS_KEY_FILE,
+            private_key_file: self.tls_key_file.as_deref()?,
+            min_version_setting: TLS_MIN_VERSION,
+            min_version: self.tls_min_version,
+        })
+    }
+
+    /// Inbound TLS for the admin listener, or `None` to leave it plaintext.
+    ///
+    /// Independent of [`Config::data_inbound_tls`] on purpose: the two
+    /// listeners are frequently reached over different networks, and an
+    /// operator who terminates TLS for one has not thereby said anything about
+    /// the other.
+    pub(crate) fn admin_inbound_tls(&self) -> Option<InboundTlsSettings<'_>> {
+        Some(InboundTlsSettings {
+            certificate_setting: ADMIN_TLS_CERT_FILE,
+            certificate_file: self.admin_tls_cert_file.as_deref()?,
+            private_key_setting: ADMIN_TLS_KEY_FILE,
+            private_key_file: self.admin_tls_key_file.as_deref()?,
+            min_version_setting: TLS_MIN_VERSION,
+            min_version: self.tls_min_version,
+        })
+    }
+}
+
+/// One listener's inbound TLS material, paired with the setting names that
+/// produced it.
+///
+/// The names travel with the values so a load failure can tell an operator
+/// which variable to fix without the loader having to know whether it is
+/// serving the data or the admin listener.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InboundTlsSettings<'a> {
+    pub(crate) certificate_setting: &'static str,
+    pub(crate) certificate_file: &'a str,
+    pub(crate) private_key_setting: &'static str,
+    pub(crate) private_key_file: &'a str,
+    pub(crate) min_version_setting: &'static str,
+    pub(crate) min_version: TlsMinVersion,
+}
+
+fn require_inbound_tls_pair(
+    certificate_setting: &str,
+    certificate_file: Option<&str>,
+    private_key_setting: &str,
+    private_key_file: Option<&str>,
+    problems: &mut Vec<String>,
+) {
+    match (certificate_file, private_key_file) {
+        (Some(_), None) => problems.push(format!(
+            "{certificate_setting} is set without {private_key_setting}; set both to terminate TLS on this listener, or neither to serve it in plaintext"
+        )),
+        (None, Some(_)) => problems.push(format!(
+            "{private_key_setting} is set without {certificate_setting}; set both to terminate TLS on this listener, or neither to serve it in plaintext"
+        )),
+        (Some(_), Some(_)) | (None, None) => {}
     }
 }
 
@@ -4400,6 +4578,148 @@ mod tests {
         })
         .expect("config should allow ADMIN_LISTEN_ADDR to be unset");
         assert_eq!(unified_config.admin_listen_addr, None);
+    }
+
+    #[test]
+    fn inbound_tls_is_off_by_default() {
+        let config = Config::from_env_vars(|_| Err(VarError::NotPresent))
+            .expect("an unconfigured gateway should validate");
+
+        assert_eq!(config.tls_cert_file, None);
+        assert_eq!(config.tls_key_file, None);
+        assert_eq!(config.admin_tls_cert_file, None);
+        assert_eq!(config.admin_tls_key_file, None);
+        assert!(config.data_inbound_tls().is_none());
+        assert!(config.admin_inbound_tls().is_none());
+        assert_eq!(config.tls_min_version, DEFAULT_TLS_MIN_VERSION);
+        assert_eq!(
+            config.tls_handshake_timeout_ms,
+            DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.tls_max_concurrent_handshakes,
+            DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES
+        );
+    }
+
+    /// Half a pair is the shape that silently serves plaintext on a listener an
+    /// operator believes is protected.
+    #[test]
+    fn half_configured_inbound_tls_is_rejected_on_both_listeners() {
+        let certificate_only = Config::from_env_vars(|name| match name {
+            "TLS_CERT_FILE" => Ok("/run/tls/tls.crt".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("a certificate without a key must not start");
+        assert!(
+            certificate_only
+                .to_string()
+                .contains("TLS_CERT_FILE is set without TLS_KEY_FILE"),
+            "{certificate_only}"
+        );
+
+        let key_only = Config::from_env_vars(|name| match name {
+            "TLS_KEY_FILE" => Ok("/run/tls/tls.key".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("a key without a certificate must not start");
+        assert!(
+            key_only
+                .to_string()
+                .contains("TLS_KEY_FILE is set without TLS_CERT_FILE"),
+            "{key_only}"
+        );
+
+        let admin_certificate_only = Config::from_env_vars(|name| match name {
+            "ADMIN_LISTEN_ADDR" => Ok("127.0.0.1:9091".to_owned()),
+            "ADMIN_TLS_CERT_FILE" => Ok("/run/tls/admin.crt".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("an admin certificate without a key must not start");
+        assert!(
+            admin_certificate_only
+                .to_string()
+                .contains("ADMIN_TLS_CERT_FILE is set without ADMIN_TLS_KEY_FILE"),
+            "{admin_certificate_only}"
+        );
+    }
+
+    /// Accepting admin TLS settings with no admin listener would leave the
+    /// admin surface on the data listener's scheme while its own settings claim
+    /// otherwise.
+    #[test]
+    fn admin_inbound_tls_requires_an_admin_listener() {
+        let error = Config::from_env_vars(|name| match name {
+            "ADMIN_TLS_CERT_FILE" => Ok("/run/tls/admin.crt".to_owned()),
+            "ADMIN_TLS_KEY_FILE" => Ok("/run/tls/admin.key".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("admin TLS without an admin listener must not start");
+
+        assert!(
+            error.to_string().contains(
+                "ADMIN_TLS_CERT_FILE and ADMIN_TLS_KEY_FILE require ADMIN_LISTEN_ADDR to be set"
+            ),
+            "{error}"
+        );
+
+        let configured = Config::from_env_vars(|name| match name {
+            "ADMIN_LISTEN_ADDR" => Ok("127.0.0.1:9091".to_owned()),
+            "ADMIN_TLS_CERT_FILE" => Ok("/run/tls/admin.crt".to_owned()),
+            "ADMIN_TLS_KEY_FILE" => Ok("/run/tls/admin.key".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("admin TLS with an admin listener should validate");
+        let settings = configured
+            .admin_inbound_tls()
+            .expect("admin TLS settings should resolve");
+        assert_eq!(settings.certificate_file, "/run/tls/admin.crt");
+        assert_eq!(settings.private_key_file, "/run/tls/admin.key");
+        assert!(
+            configured.data_inbound_tls().is_none(),
+            "admin TLS must not imply data TLS; the two listeners are configured independently"
+        );
+    }
+
+    #[test]
+    fn tls_min_version_accepts_only_the_two_versions_rustls_negotiates() {
+        for (value, expected) in [("1.2", TlsMinVersion::Tls12), ("1.3", TlsMinVersion::Tls13)] {
+            let config = Config::from_env_vars(|name| match name {
+                "TLS_MIN_VERSION" => Ok(value.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect("a supported TLS version should validate");
+            assert_eq!(config.tls_min_version, expected);
+        }
+
+        let error = Config::from_env_vars(|name| match name {
+            "TLS_MIN_VERSION" => Ok("1.1".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("an unsupported TLS version must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("TLS_MIN_VERSION must be a valid TLS version, got '1.1'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_handshake_bound_and_deadline_must_both_be_positive() {
+        let error = Config::from_env_vars(|name| match name {
+            "TLS_HANDSHAKE_TIMEOUT_MS" => Ok("0".to_owned()),
+            "TLS_MAX_CONCURRENT_HANDSHAKES" => Ok("0".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("a zero handshake bound leaves no way to accept a connection");
+
+        let message = error.to_string();
+        assert!(message.contains("TLS_HANDSHAKE_TIMEOUT_MS"), "{message}");
+        assert!(
+            message.contains("TLS_MAX_CONCURRENT_HANDSHAKES must be greater than 0"),
+            "{message}"
+        );
     }
 
     #[test]
