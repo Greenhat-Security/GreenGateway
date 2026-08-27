@@ -932,7 +932,7 @@ Comma-separated list of exact origins allowed by CORS.
 
 Default: empty list. With the default, cross-origin browser requests receive no CORS allow-origin response header.
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a valid HTTP header value. Configure full origins such as `http://localhost:3000` or `https://app.example.test`.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a valid HTTP header value. Configure full origins such as `http://localhost:3000` or `https://app.example.test`. A wildcard entry (`*`) is rejected at startup: the gateway answers with `Access-Control-Allow-Credentials: true`, and browsers refuse a credentialed response whose allowed origin is `*`.
 
 ### MAX_BODY_SIZE
 

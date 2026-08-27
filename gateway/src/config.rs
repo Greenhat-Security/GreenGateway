@@ -1256,10 +1256,14 @@ impl Config {
             get_var(POLICY_HISTORY_SQLITE_PATH),
             &mut problems,
         );
-        let cors_allow_origins = parse_comma_separated_header_values(
+        let cors_allow_origins = validate_cors_allow_origins(
             CORS_ALLOW_ORIGINS,
-            get_var(CORS_ALLOW_ORIGINS),
-            &[],
+            parse_comma_separated_header_values(
+                CORS_ALLOW_ORIGINS,
+                get_var(CORS_ALLOW_ORIGINS),
+                &[],
+                &mut problems,
+            ),
             &mut problems,
         );
         let max_body_size = parse_var(
@@ -2500,6 +2504,34 @@ fn parse_comma_separated_header_values(
     }
 
     values
+}
+
+/// Rejects a wildcard CORS origin at startup instead of letting it reach the
+/// router.
+///
+/// `*` is a valid HTTP header value, so it survives entry validation and then
+/// panics inside `tower-http`, which refuses a wildcard in an origin list. It
+/// could not have worked in any case: the gateway answers with
+/// `Access-Control-Allow-Credentials: true`, and browsers reject a credentialed
+/// response whose allowed origin is `*`.
+fn validate_cors_allow_origins(
+    name: &str,
+    origins: Vec<String>,
+    problems: &mut Vec<String>,
+) -> Vec<String> {
+    let mut validated = Vec::with_capacity(origins.len());
+
+    for origin in origins {
+        if origin == "*" {
+            problems.push(format!(
+                "{name} entries must be exact origins; wildcard origin '{origin}' is not allowed with credentialed CORS"
+            ));
+            continue;
+        }
+        validated.push(origin);
+    }
+
+    validated
 }
 
 fn parse_comma_separated_hostnames(
@@ -8111,6 +8143,20 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("CORS_ALLOW_ORIGINS entries must be valid HTTP header values"));
         assert!(message.contains("bad\norigin"));
+        assert_eq!(error.problems.len(), 1);
+    }
+
+    #[test]
+    fn wildcard_cors_allow_origin_is_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "CORS_ALLOW_ORIGINS" => Ok("https://app.example.test,*".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject a wildcard origin");
+
+        let message = error.to_string();
+        assert!(message.contains("CORS_ALLOW_ORIGINS entries must be exact origins"));
+        assert!(message.contains("wildcard origin '*' is not allowed with credentialed CORS"));
         assert_eq!(error.problems.len(), 1);
     }
 
