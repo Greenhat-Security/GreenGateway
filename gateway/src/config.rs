@@ -278,10 +278,25 @@ pub struct Config {
     pub grpc_listen_addr: Option<SocketAddr>,
     pub grpc_max_concurrent_streams: u32,
     pub grpc_max_metadata_bytes: u32,
-    pub tls_cert_file: Option<String>,
-    pub tls_key_file: Option<String>,
-    pub admin_tls_cert_file: Option<String>,
-    pub admin_tls_key_file: Option<String>,
+    /// Certificate chains for the data listener, or `None` for plaintext.
+    ///
+    /// Each entry is one mounted certificate file; more than one turns on SNI
+    /// selection, with the first entry the default for a client that names no
+    /// recognisable server. Splitting happens in `Config::from_env`, so the
+    /// count here always equals `tls_key_files`'s count.
+    pub tls_cert_files: Option<Vec<String>>,
+    /// Private keys for the data listener, positionally paired with
+    /// [`Config::tls_cert_files`].
+    pub tls_key_files: Option<Vec<String>>,
+    /// Certificate chains for the admin listener, or `None` for plaintext.
+    ///
+    /// Independent of the data listener's chains on purpose: one chain per
+    /// listener was the whole of #327, and this list is what makes SNI
+    /// selection per-listener rather than process-wide.
+    pub admin_tls_cert_files: Option<Vec<String>>,
+    /// Private keys for the admin listener, positionally paired with
+    /// [`Config::admin_tls_cert_files`].
+    pub admin_tls_key_files: Option<Vec<String>>,
     pub tls_min_version: TlsMinVersion,
     pub tls_handshake_timeout_ms: u64,
     pub tls_max_concurrent_handshakes: usize,
@@ -1173,16 +1188,16 @@ impl Config {
             DEFAULT_GRPC_MAX_METADATA_BYTES,
             &mut problems,
         );
-        let tls_cert_file =
-            parse_optional_string(TLS_CERT_FILE, get_var(TLS_CERT_FILE), &mut problems);
-        let tls_key_file =
-            parse_optional_string(TLS_KEY_FILE, get_var(TLS_KEY_FILE), &mut problems);
-        let admin_tls_cert_file = parse_optional_string(
+        let tls_cert_files =
+            parse_material_file_list(TLS_CERT_FILE, get_var(TLS_CERT_FILE), &mut problems);
+        let tls_key_files =
+            parse_material_file_list(TLS_KEY_FILE, get_var(TLS_KEY_FILE), &mut problems);
+        let admin_tls_cert_files = parse_material_file_list(
             ADMIN_TLS_CERT_FILE,
             get_var(ADMIN_TLS_CERT_FILE),
             &mut problems,
         );
-        let admin_tls_key_file = parse_optional_string(
+        let admin_tls_key_files = parse_material_file_list(
             ADMIN_TLS_KEY_FILE,
             get_var(ADMIN_TLS_KEY_FILE),
             &mut problems,
@@ -1192,16 +1207,16 @@ impl Config {
         // than a warning or an implicit "TLS off".
         require_inbound_tls_pair(
             TLS_CERT_FILE,
-            tls_cert_file.as_deref(),
+            tls_cert_files.as_deref(),
             TLS_KEY_FILE,
-            tls_key_file.as_deref(),
+            tls_key_files.as_deref(),
             &mut problems,
         );
         require_inbound_tls_pair(
             ADMIN_TLS_CERT_FILE,
-            admin_tls_cert_file.as_deref(),
+            admin_tls_cert_files.as_deref(),
             ADMIN_TLS_KEY_FILE,
-            admin_tls_key_file.as_deref(),
+            admin_tls_key_files.as_deref(),
             &mut problems,
         );
         // Admin TLS only has a listener to terminate on when the admin surface
@@ -1209,7 +1224,7 @@ impl Config {
         // the admin surface on the data listener's scheme while its own
         // settings say otherwise.
         if admin_listen_addr.is_none()
-            && (admin_tls_cert_file.is_some() || admin_tls_key_file.is_some())
+            && (admin_tls_cert_files.is_some() || admin_tls_key_files.is_some())
         {
             problems.push(format!(
                 "{ADMIN_TLS_CERT_FILE} and {ADMIN_TLS_KEY_FILE} require {ADMIN_LISTEN_ADDR} to be set; without a separate admin listener there is nothing for them to terminate"
@@ -1298,7 +1313,7 @@ impl Config {
                 ),
                 identity_source: client_cert_identity_source,
                 tls_certificate_setting: TLS_CERT_FILE,
-                tls_configured: tls_cert_file.is_some(),
+                tls_configured: tls_cert_files.is_some(),
             },
             &mut problems,
         );
@@ -1320,7 +1335,7 @@ impl Config {
                 ),
                 identity_source: client_cert_identity_source,
                 tls_certificate_setting: ADMIN_TLS_CERT_FILE,
-                tls_configured: admin_tls_cert_file.is_some(),
+                tls_configured: admin_tls_cert_files.is_some(),
             },
             &mut problems,
         );
@@ -2039,10 +2054,10 @@ impl Config {
                 grpc_listen_addr,
                 grpc_max_concurrent_streams,
                 grpc_max_metadata_bytes,
-                tls_cert_file,
-                tls_key_file,
-                admin_tls_cert_file,
-                admin_tls_key_file,
+                tls_cert_files,
+                tls_key_files,
+                admin_tls_cert_files,
+                admin_tls_key_files,
                 tls_min_version,
                 tls_handshake_timeout_ms,
                 tls_max_concurrent_handshakes,
@@ -2155,9 +2170,9 @@ impl Config {
     pub(crate) fn data_inbound_tls(&self) -> Option<InboundTlsSettings<'_>> {
         Some(InboundTlsSettings {
             certificate_setting: TLS_CERT_FILE,
-            certificate_file: self.tls_cert_file.as_deref()?,
+            certificate_files: self.tls_cert_files.as_deref()?,
             private_key_setting: TLS_KEY_FILE,
-            private_key_file: self.tls_key_file.as_deref()?,
+            private_key_files: self.tls_key_files.as_deref()?,
             min_version_setting: TLS_MIN_VERSION,
             min_version: self.tls_min_version,
             client_auth: self
@@ -2176,9 +2191,9 @@ impl Config {
     pub(crate) fn admin_inbound_tls(&self) -> Option<InboundTlsSettings<'_>> {
         Some(InboundTlsSettings {
             certificate_setting: ADMIN_TLS_CERT_FILE,
-            certificate_file: self.admin_tls_cert_file.as_deref()?,
+            certificate_files: self.admin_tls_cert_files.as_deref()?,
             private_key_setting: ADMIN_TLS_KEY_FILE,
-            private_key_file: self.admin_tls_key_file.as_deref()?,
+            private_key_files: self.admin_tls_key_files.as_deref()?,
             min_version_setting: TLS_MIN_VERSION,
             min_version: self.tls_min_version,
             client_auth: self
@@ -2205,13 +2220,16 @@ impl Config {
 ///
 /// The names travel with the values so a load failure can tell an operator
 /// which variable to fix without the loader having to know whether it is
-/// serving the data or the admin listener.
+/// serving the data or the admin listener. The two lists are positionally
+/// paired and equal in length -- an invariant `Config::from_env` enforces
+/// before this type is ever built, which is why the loader may zip them
+/// without a runtime count check.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InboundTlsSettings<'a> {
     pub(crate) certificate_setting: &'static str,
-    pub(crate) certificate_file: &'a str,
+    pub(crate) certificate_files: &'a [String],
     pub(crate) private_key_setting: &'static str,
-    pub(crate) private_key_file: &'a str,
+    pub(crate) private_key_files: &'a [String],
     pub(crate) min_version_setting: &'static str,
     pub(crate) min_version: TlsMinVersion,
     /// Client-certificate authentication for this listener, or `None` to
@@ -2355,20 +2373,54 @@ fn compose_inbound_client_auth(
 
 fn require_inbound_tls_pair(
     certificate_setting: &str,
-    certificate_file: Option<&str>,
+    certificate_files: Option<&[String]>,
     private_key_setting: &str,
-    private_key_file: Option<&str>,
+    private_key_files: Option<&[String]>,
     problems: &mut Vec<String>,
 ) {
-    match (certificate_file, private_key_file) {
+    match (certificate_files, private_key_files) {
         (Some(_), None) => problems.push(format!(
             "{certificate_setting} is set without {private_key_setting}; set both to terminate TLS on this listener, or neither to serve it in plaintext"
         )),
         (None, Some(_)) => problems.push(format!(
             "{private_key_setting} is set without {certificate_setting}; set both to terminate TLS on this listener, or neither to serve it in plaintext"
         )),
+        (Some(certificates), Some(keys)) if certificates.len() != keys.len() => {
+            problems.push(format!(
+                "{certificate_setting} lists {} certificate file(s) but {private_key_setting} lists {} key file(s); the two lists are paired by position, so they must name one key per certificate chain",
+                certificates.len(),
+                keys.len()
+            ));
+        }
         (Some(_), Some(_)) | (None, None) => {}
     }
+}
+
+/// Splits one of the inbound TLS material settings into its file list.
+///
+/// The value grammar is one or more comma-separated paths: a single path is the
+/// #327 shape unchanged, and additional entries turn on SNI selection in
+/// position order. An empty entry is a startup failure rather than something to
+/// skip, because a skipped entry would silently shift every later pairing by
+/// one and hand one chain another chain's key.
+fn parse_material_file_list(
+    name: &str,
+    value: Result<String, VarError>,
+    problems: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    let value = parse_optional_string(name, value, problems)?;
+    let files = value
+        .split(',')
+        .map(str::trim)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if files.iter().any(String::is_empty) {
+        problems.push(format!(
+            "{name} must be a comma-separated list of file paths with no empty entry; an empty entry would shift every later certificate/key pairing by one"
+        ));
+        return None;
+    }
+    Some(files)
 }
 
 impl fmt::Display for ConfigError {
@@ -5140,10 +5192,10 @@ mod tests {
         let config = Config::from_env_vars(|_| Err(VarError::NotPresent))
             .expect("an unconfigured gateway should validate");
 
-        assert_eq!(config.tls_cert_file, None);
-        assert_eq!(config.tls_key_file, None);
-        assert_eq!(config.admin_tls_cert_file, None);
-        assert_eq!(config.admin_tls_key_file, None);
+        assert_eq!(config.tls_cert_files, None);
+        assert_eq!(config.tls_key_files, None);
+        assert_eq!(config.admin_tls_cert_files, None);
+        assert_eq!(config.admin_tls_key_files, None);
         assert!(config.data_inbound_tls().is_none());
         assert!(config.admin_inbound_tls().is_none());
         assert_eq!(config.tls_min_version, DEFAULT_TLS_MIN_VERSION);
@@ -5200,6 +5252,66 @@ mod tests {
     }
 
     // --- client-certificate authentication ---------------------------------
+
+    /// The two lists are paired by position, so a count mismatch is a
+    /// configuration that would hand one chain another chain's key -- or
+    /// silently drop the tail -- and neither is acceptable.
+    #[test]
+    fn mismatched_inbound_tls_lists_are_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "TLS_CERT_FILE" => Ok("/run/tls/a.crt,/run/tls/b.crt,/run/tls/c.crt".to_owned()),
+            "TLS_KEY_FILE" => Ok("/run/tls/a.key,/run/tls/b.key".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("three certificates and two keys must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("TLS_CERT_FILE lists 3 certificate file(s) but TLS_KEY_FILE lists 2"),
+            "{error}"
+        );
+    }
+
+    /// An empty entry would shift every later pairing by one, so it is refused
+    /// rather than skipped.
+    #[test]
+    fn an_empty_entry_in_an_inbound_tls_list_is_rejected() {
+        let error = Config::from_env_vars(|name| match name {
+            "TLS_CERT_FILE" => Ok("/run/tls/a.crt,,/run/tls/b.crt".to_owned()),
+            "TLS_KEY_FILE" => Ok("/run/tls/a.key,/run/tls/b.key".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("an empty list entry must not start");
+        assert!(
+            error.to_string().contains(
+                "TLS_CERT_FILE must be a comma-separated list of file paths with no empty entry"
+            ),
+            "{error}"
+        );
+    }
+
+    /// A multi-path list parses in order, with each entry trimmed, and reaches
+    /// the listener settings in that order -- the order is the default.
+    #[test]
+    fn an_inbound_tls_list_parses_in_order_with_entries_trimmed() {
+        let config = Config::from_env_vars(|name| match name {
+            "TLS_CERT_FILE" => Ok(" /run/tls/a.crt , /run/tls/b.crt ".to_owned()),
+            "TLS_KEY_FILE" => Ok("/run/tls/a.key,/run/tls/b.key".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("a well-formed list should validate");
+        let settings = config
+            .data_inbound_tls()
+            .expect("listed material should reach the listener settings");
+        assert_eq!(
+            settings.certificate_files,
+            ["/run/tls/a.crt".to_owned(), "/run/tls/b.crt".to_owned()].as_slice()
+        );
+        assert_eq!(
+            settings.private_key_files,
+            ["/run/tls/a.key".to_owned(), "/run/tls/b.key".to_owned()].as_slice()
+        );
+    }
 
     /// The TLS settings a listener needs before client certificates mean
     /// anything, so a client-cert test is not also asserting about the pair.
@@ -5439,8 +5551,14 @@ mod tests {
         let settings = configured
             .admin_inbound_tls()
             .expect("admin TLS settings should resolve");
-        assert_eq!(settings.certificate_file, "/run/tls/admin.crt");
-        assert_eq!(settings.private_key_file, "/run/tls/admin.key");
+        assert_eq!(
+            settings.certificate_files,
+            ["/run/tls/admin.crt".to_owned()].as_slice()
+        );
+        assert_eq!(
+            settings.private_key_files,
+            ["/run/tls/admin.key".to_owned()].as_slice()
+        );
         assert!(
             configured.data_inbound_tls().is_none(),
             "admin TLS must not imply data TLS; the two listeners are configured independently"
