@@ -2120,6 +2120,117 @@ mod tests {
         );
     }
 
+    /// Every `auth_methods` enum in the published schema lists exactly the
+    /// names the parser accepts.
+    ///
+    /// This is a pin on a divergence that had already happened. #324 added
+    /// `client_certificate` to `valid_auth_method_name`, to the admin UI's
+    /// `AuthMethodName` union, and to the rule editor's dropdown -- and not to
+    /// `docs/schemas/policy.v0.schema.json`, which is what operators and CI
+    /// validate policy files against. The result was a name the gateway loaded,
+    /// the rule editor offered, and schema validation rejected, with nothing
+    /// anywhere failing. The schema carries the list in three separate places,
+    /// so all three are checked.
+    #[test]
+    fn the_published_schema_lists_exactly_the_auth_methods_the_parser_accepts() {
+        let repo_root = repo_root();
+        let schema_path = repo_root.join("docs/schemas/policy.v0.schema.json");
+        let schema: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&schema_path)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", schema_path.display())),
+        )
+        .unwrap_or_else(|err| panic!("failed to parse {}: {err}", schema_path.display()));
+
+        let mut found = Vec::new();
+        collect_auth_method_enums(&schema, &mut found);
+
+        assert_eq!(
+            found.len(),
+            3,
+            "the schema is expected to carry the auth-method list at three sites (role \
+             permissions, route rules, tool rules); found {}",
+            found.len()
+        );
+        for names in &found {
+            assert_eq!(
+                names.as_slice(),
+                crate::rbac::rule::ALL_AUTH_METHOD_NAMES,
+                "an auth_methods enum in the published schema disagrees with the names the \
+                 parser accepts; a policy naming one of the differences would be accepted by \
+                 one and rejected by the other"
+            );
+        }
+    }
+
+    /// Walks the schema for every `auth_methods.items.enum`.
+    ///
+    /// Recursive rather than indexed by path, so a fourth site added later is
+    /// checked automatically instead of being silently skipped.
+    fn collect_auth_method_enums(value: &serde_json::Value, found: &mut Vec<Vec<String>>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(names) = map
+                    .get("auth_methods")
+                    .and_then(|methods| methods.get("items"))
+                    .and_then(|items| items.get("enum"))
+                    .and_then(|names| names.as_array())
+                {
+                    found.push(
+                        names
+                            .iter()
+                            .filter_map(|name| name.as_str().map(str::to_owned))
+                            .collect(),
+                    );
+                }
+                for nested in map.values() {
+                    collect_auth_method_enums(nested, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for nested in items {
+                    collect_auth_method_enums(nested, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// And the same name end to end: a rule naming `client_certificate` passes
+    /// the published schema and the parser.
+    ///
+    /// The agreement test above would still pass if both lists were wrong in
+    /// the same way. This one asserts the name #324 actually introduced works.
+    #[test]
+    fn a_rule_naming_the_client_certificate_auth_method_is_accepted_by_parser_and_schema() {
+        let value = json!({
+            "schema_version": "0.1.0",
+            "rules": [
+                {
+                    "path": "/admin/**",
+                    "principal": {
+                        "auth_methods": ["client_certificate"]
+                    },
+                    "action": "allow"
+                }
+            ]
+        });
+
+        assert!(
+            policy_schema_validator().is_valid(&value),
+            "the published schema must accept the auth method the gateway and the rule editor \
+             both offer"
+        );
+
+        let document = serde_json::to_string(&value).expect("policy case should serialize");
+        let file = TempPolicyFile::new(&document);
+        let policy =
+            Policy::from_file(file.path()).expect("a rule naming client_certificate should load");
+        assert_eq!(
+            policy.rules[0].principal.auth_methods,
+            vec!["client_certificate".to_owned()]
+        );
+    }
+
     #[test]
     fn non_absolute_rule_path_is_rejected_by_parser_and_schema() {
         let value = json!({

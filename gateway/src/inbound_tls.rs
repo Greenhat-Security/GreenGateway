@@ -49,7 +49,7 @@ use tokio_rustls::{
     rustls::{
         crypto::{ring, CryptoProvider},
         pki_types::{pem::PemObject, CertificateDer, CertificateRevocationListDer, PrivateKeyDer},
-        server::{VerifierBuilderError, WebPkiClientVerifier},
+        server::{NoServerSessionStorage, VerifierBuilderError, WebPkiClientVerifier},
         version, CertificateError, RootCertStore, ServerConfig, SupportedProtocolVersion,
     },
     server::TlsStream,
@@ -628,10 +628,74 @@ fn load_server_config(settings: InboundTlsSettings<'_>) -> Result<ListenerTls, I
     // than being handed a connection nothing will parse.
     server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
+    // Only where certificates are actually being asked for. A listener with
+    // `CLIENT_CERT_MODE=off` keeps rustls' resumption exactly as #327 shipped
+    // it, so no deployment that has never heard of client certificates changes
+    // behaviour here.
+    if settings.client_auth.is_some() {
+        disable_session_resumption(&mut server_config);
+    }
+
     Ok(ListenerTls {
         server_config: Arc::new(server_config),
         identity_source,
     })
+}
+
+/// Removes every way a listener can resume an earlier TLS session.
+///
+/// rustls verifies a client certificate exactly once, during a full handshake.
+/// On a *resumed* handshake it restores the earlier connection's chain instead:
+/// `peer_certificates` is cloned out of the stored session in
+/// `rustls::server::tls13` and assigned from the resumed session data in
+/// `rustls::server::tls12`. The only thing consulted before that happens is
+/// `can_resume`, which compares the cipher suite, the extended-master-secret
+/// state, and the SNI. Nothing about the certificate is re-examined: not its
+/// validity window, not the CRL, not the trust path. So
+/// [`client_identity`] would go on minting an identity from a certificate no
+/// check had touched on this connection.
+///
+/// Under rustls' defaults that window is a day. `NeverProducesTickets` means
+/// TLS 1.3 tickets are *stateful* -- kept in a `ServerSessionMemoryCache` under
+/// a hard-coded 24-hour lifetime -- and `send_tls13_tickets` defaults to 2, and
+/// `TLS_MIN_VERSION` defaults to 1.2 so the abbreviated TLS 1.2 handshake is
+/// live as well. An expired or revoked client certificate would keep
+/// authenticating for up to 24 hours after it stopped being valid, and the
+/// fail-closed CRL handling [`load_client_verifier`] is careful about would
+/// stop applying to precisely the callers it exists to stop.
+///
+/// The alternative was to keep resumption and re-check the restored chain
+/// before minting an identity. It is not taken, for two reasons.
+///
+/// **A resumed handshake proves the wrong thing.** Neither TLS 1.2's
+/// abbreviated handshake nor TLS 1.3's PSK resumption carries a
+/// CertificateVerify. The peer proves it holds the resumption secret; it does
+/// not prove it holds the certificate's private key. Re-running the verifier
+/// over the restored chain would establish that the certificate is still valid.
+/// It could not establish that the caller still holds the key -- which is the
+/// entire proposition a client-certificate listener sells -- because there is
+/// nothing on a resumed connection for the caller to have signed. No amount of
+/// re-validation recovers that property; only a full handshake does.
+///
+/// **It would be a second copy of a trust decision.** `WebPkiClientVerifier`
+/// owns path building, validity windows, extended key usage, name constraints,
+/// and revocation including CRL expiry. Re-implementing enough of that
+/// elsewhere to match it exactly is the shape #332 has just finished removing
+/// from the outbound path, on the grounds that two copies of one decision
+/// drift.
+///
+/// The cost is a full handshake per connection, and it is charged only to
+/// listeners that asked for certificates.
+fn disable_session_resumption(server_config: &mut ServerConfig) {
+    // Both halves are load-bearing and neither is redundant. Emptying the store
+    // kills TLS 1.2 session ids *and* the stateful TLS 1.3 tickets that the
+    // default `NeverProducesTickets` implies, because both resolve the session
+    // through it. Sending no tickets stops a client being handed anything to
+    // offer back in the first place, so a later change of ticketer -- which
+    // would make tickets self-contained and stop consulting the store --
+    // cannot quietly reintroduce the path.
+    server_config.session_storage = Arc::new(NoServerSessionStorage {});
+    server_config.send_tls13_tickets = 0;
 }
 
 /// Builds the verifier that decides which client certificates are acceptable.

@@ -7,6 +7,21 @@ pub const AUTH_METHOD_SESSION_COOKIE: &str = "session_cookie";
 pub const AUTH_METHOD_SERVICE_TOKEN: &str = "service_token";
 pub const AUTH_METHOD_CLIENT_CERTIFICATE: &str = "client_certificate";
 
+/// Every auth method name a policy may name, in one place.
+///
+/// [`valid_auth_method_name`] is defined over this list rather than repeating
+/// it, and `docs/schemas/policy.v0.schema.json` is checked against it, because
+/// the three used to be three separate copies: adding
+/// `client_certificate` to the parser and the admin UI while leaving the
+/// published schema at three entries produced a name the gateway accepted, the
+/// rule editor offered, and every operator's schema validation rejected.
+pub const ALL_AUTH_METHOD_NAMES: &[&str] = &[
+    AUTH_METHOD_BEARER_TOKEN,
+    AUTH_METHOD_SESSION_COOKIE,
+    AUTH_METHOD_SERVICE_TOKEN,
+    AUTH_METHOD_CLIENT_CERTIFICATE,
+];
+
 /// Action applied by a first-match-wins firewall rule.
 ///
 /// HTTP path rules normally run before, and take precedence over, the
@@ -231,13 +246,7 @@ fn is_default_rule_enabled(value: &bool) -> bool {
 }
 
 pub fn valid_auth_method_name(value: &str) -> bool {
-    matches!(
-        value,
-        AUTH_METHOD_BEARER_TOKEN
-            | AUTH_METHOD_SESSION_COOKIE
-            | AUTH_METHOD_SERVICE_TOKEN
-            | AUTH_METHOD_CLIENT_CERTIFICATE
-    )
+    ALL_AUTH_METHOD_NAMES.contains(&value)
 }
 
 pub(crate) fn principal_identity_matches(
@@ -344,6 +353,48 @@ mod tests {
             &["admin:tokens:read"],
             AuthMethod::Bearer
         ))));
+    }
+
+    /// Both halves of the claim on `AuthMethod::ClientCertificate`: a policy
+    /// that means to name certificates can, and a policy that names
+    /// `bearer_token` does not start matching them.
+    ///
+    /// The second half is the reason the variant is separate rather than a
+    /// reuse of `Bearer`, and it had no test: every existing rule naming
+    /// `bearer_token` would have widened silently to include certificate
+    /// callers.
+    #[test]
+    fn principal_matcher_can_match_client_certificate_auth_method() {
+        let certificate_matcher = PrincipalMatcher {
+            roles: Vec::new(),
+            issuers: Vec::new(),
+            auth_methods: vec![AUTH_METHOD_CLIENT_CERTIFICATE.to_owned()],
+            principal_ids: Vec::new(),
+        };
+        let certificate_principal = test_principal(
+            "spiffe://gateway.test/ns/payments/sa/api",
+            &[],
+            AuthMethod::ClientCertificate,
+        );
+
+        assert!(certificate_matcher.matches(Some(&certificate_principal)));
+        assert!(!certificate_matcher.matches(Some(&test_principal(
+            "user-123",
+            &[],
+            AuthMethod::Bearer
+        ))));
+
+        // The direction that matters for every policy already deployed.
+        let bearer_matcher = PrincipalMatcher {
+            roles: Vec::new(),
+            issuers: Vec::new(),
+            auth_methods: vec![AUTH_METHOD_BEARER_TOKEN.to_owned()],
+            principal_ids: Vec::new(),
+        };
+        assert!(
+            !bearer_matcher.matches(Some(&certificate_principal)),
+            "a rule naming bearer_token must not widen to certificate principals"
+        );
     }
 
     #[test]

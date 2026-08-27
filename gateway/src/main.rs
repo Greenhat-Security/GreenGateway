@@ -31370,6 +31370,50 @@ paths:
             .expect("OIDC discovery test server should finish");
     }
 
+    /// A deployment whose only credential is a client certificate still gets an
+    /// auth chain.
+    ///
+    /// `auth_validator_from_config` returns `None` when nothing is configured,
+    /// and `None` means the middleware fails closed on every request. Client
+    /// certificates had to be added to that emptiness test or a listener
+    /// configured with `CLIENT_CERT_MODE=required` and no token provider at all
+    /// would answer 401 to the very callers it was set up for -- a
+    /// misconfiguration that looks exactly like a broken certificate.
+    #[tokio::test]
+    async fn a_client_certificate_only_deployment_still_builds_an_auth_chain() {
+        let mut config = test_config(Vec::new());
+        assert!(
+            config.auth_providers.is_empty(),
+            "the premise is that nothing else is configured"
+        );
+        config.client_cert_auth = Some(config::InboundClientAuthConfig {
+            mode_setting: "CLIENT_CERT_MODE",
+            requirement: crate::inbound_tls::ClientCertRequirement::Required,
+            ca_setting: "CLIENT_CERT_CA_FILE",
+            ca_file: "client-ca.crt".to_owned(),
+            crl_setting: "CLIENT_CERT_CRL_FILE",
+            crl_file: None,
+            identity_source: auth::ClientCertIdentitySource::Spiffe,
+        });
+        config.egress_deny_private_ips = false;
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::from_config(&config))
+                .expect("egress client should build"),
+        );
+
+        let validator = auth_validator_from_config(&config, egress_client, None, &HashMap::new())
+            .expect("a certificate-only configuration should build")
+            .expect(
+                "a certificate-only configuration must produce a validator, not None; None \
+                     makes the auth middleware fail closed on every request",
+            );
+
+        assert!(
+            validator.supports_client_certificate(),
+            "the chain built for a certificate-only deployment must accept certificate credentials"
+        );
+    }
+
     #[tokio::test]
     async fn auth_validator_accepts_slashless_oidc_issuer_when_config_has_trailing_slash() {
         let (issuer, document_issuer, server) =

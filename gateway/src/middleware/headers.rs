@@ -340,7 +340,8 @@ mod tests {
             let surviving = String::from_utf8_lossy(&body);
             assert!(
                 !surviving.contains(header),
-                "{header} reached the handler; a caller must not be able to assert a                  certificate identity the gateway did not verify. Surviving headers: {surviving}"
+                "{header} reached the handler; a caller must not be able to assert a \
+                 certificate identity the gateway did not verify. Surviving headers: {surviving}"
             );
         }
     }

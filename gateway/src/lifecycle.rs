@@ -1296,6 +1296,125 @@ mod tests {
         .expect("startup event should be emitted")
     }
 
+    /// A certificate identity, built the only way one can be: read out of a
+    /// certificate by the real reader.
+    ///
+    /// `VerifiedClientIdentity` has no public constructor, which is the point
+    /// of it. So this test issues a certificate rather than fabricating an
+    /// identity, and in doing so also confirms the no-constructor claim still
+    /// holds -- if a back door appeared, this helper would be unnecessary.
+    fn test_client_identity(spiffe_id: &str) -> crate::auth::VerifiedClientIdentity {
+        let mut params = rcgen::CertificateParams::default();
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            rcgen::Ia5String::try_from(spiffe_id).expect("test URI SAN should be IA5"),
+        )];
+        let key = rcgen::KeyPair::generate().expect("test key should generate");
+        let certificate = params
+            .self_signed(&key)
+            .expect("test certificate should build");
+
+        crate::auth::identity_from_certificate(
+            certificate.der(),
+            crate::auth::ClientCertIdentitySource::Spiffe,
+        )
+        .expect("the test certificate carries exactly one SPIFFE ID")
+    }
+
+    /// A certificate identity already on an inbound request never survives into
+    /// the router, and the connection's own identity is what does.
+    ///
+    /// Nothing can put a stale one there today: extensions are not parsed from
+    /// the wire and `VerifiedClientIdentity` has no public constructor. The
+    /// removal is defence in depth. It is tested because the invariant the
+    /// function's doc comment claims -- that the identity a request reaches auth
+    /// with is the one this connection's handshake produced -- holds only while
+    /// the removal is there, and a future layer that inserted one would
+    /// otherwise change who authenticates with nothing failing.
+    #[tokio::test]
+    async fn a_stale_client_identity_extension_never_reaches_the_router() {
+        use tower::ServiceExt as _;
+
+        async fn report(request: Request) -> String {
+            match request.extensions().get::<VerifiedClientIdentity>() {
+                Some(identity) => format!("identity={}", identity.identity()),
+                None => "identity=none".to_owned(),
+            }
+        }
+
+        async fn body_of(response: Response) -> String {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("test response body should read");
+            String::from_utf8(bytes.to_vec()).expect("test response body should be UTF-8")
+        }
+
+        fn router() -> Router {
+            Router::new()
+                .route("/", get(report))
+                .layer(axum::middleware::from_fn(spread_inbound_connect_info))
+        }
+
+        let stale = test_client_identity("spiffe://gateway.test/ns/payments/sa/stale");
+        let peer: SocketAddr = "203.0.113.7:44321"
+            .parse()
+            .expect("test peer address should parse");
+
+        // A connection that verified no certificate. The stale extension must
+        // not become an identity.
+        let mut request = Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .expect("test request should build");
+        request.extensions_mut().insert(stale.clone());
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(InboundConnectInfo {
+                peer_addr: peer,
+                client_identity: None,
+            }));
+
+        assert_eq!(
+            body_of(
+                router()
+                    .oneshot(request)
+                    .await
+                    .expect("test request should complete")
+            )
+            .await,
+            "identity=none",
+            "a connection that verified no certificate must reach the router with no identity, \
+             whatever the request arrived carrying"
+        );
+
+        // A connection that did verify one. The connection's identity wins over
+        // the stale extension, which is the ordering the removal exists to make
+        // unconditional.
+        let verified = test_client_identity("spiffe://gateway.test/ns/payments/sa/api");
+        let mut request = Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .expect("test request should build");
+        request.extensions_mut().insert(stale);
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(InboundConnectInfo {
+                peer_addr: peer,
+                client_identity: Some(verified),
+            }));
+
+        assert_eq!(
+            body_of(
+                router()
+                    .oneshot(request)
+                    .await
+                    .expect("test request should complete")
+            )
+            .await,
+            "identity=spiffe://gateway.test/ns/payments/sa/api",
+            "the identity the handshake produced must be the one the router sees"
+        );
+    }
+
     async fn request_peer(addr: SocketAddr) -> SocketAddr {
         tokio::time::timeout(Duration::from_secs(2), async {
             let mut stream = tokio::net::TcpStream::connect(addr)
