@@ -439,17 +439,54 @@ fn is_valid_gcp_secret_id(value: &str) -> bool {
             .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-'))
 }
 
+/// Google's rule for a workload identity pool or provider ID: 4-32 bytes drawn
+/// from `[a-z0-9-]`, starting and ending with an *alphanumeric* character. The
+/// leading byte is deliberately not narrowed to a letter, unlike the project
+/// ID, location, and service-account ID rules beside it: Google admits
+/// digit-leading pool and provider IDs, so refusing them would reject a valid
+/// audience at startup under an error that says the audience is malformed when
+/// it is not. Nothing is protected by the stricter reading — a pool component
+/// never reaches a URL, only the STS request body, where `serde_json` escapes
+/// it, and [`is_valid_gcp_audience`] destructures the resource by fixed
+/// position, so a digit-leading pool cannot be confused with the project-number
+/// segment.
 fn is_valid_gcp_pool_component(value: &str) -> bool {
-    value.len() >= MIN_GCP_POOL_COMPONENT_BYTES
-        && value.len() <= MAX_GCP_POOL_COMPONENT_BYTES
-        && value.as_bytes()[0].is_ascii_lowercase()
-        && value
-            .as_bytes()
+    let bytes = value.as_bytes();
+    bytes.len() >= MIN_GCP_POOL_COMPONENT_BYTES
+        && bytes.len() <= MAX_GCP_POOL_COMPONENT_BYTES
+        && is_gcp_lower_alphanumeric(bytes[0])
+        && bytes
             .last()
-            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        && value
-            .bytes()
+            .is_some_and(|byte| is_gcp_lower_alphanumeric(*byte))
+        && bytes
+            .iter()
             .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+}
+
+/// Google's rule for the local part of a service-account email is 6-30 bytes
+/// matching `[a-z]([-a-z0-9]*[a-z0-9])`. The leading-letter and trailing-
+/// alphanumeric constraints are kept exactly, because unlike a pool component
+/// this value is interpolated into the fixed `generateAccessToken` URL path.
+/// The length window stays at this provider's wider 4-32 bytes rather than
+/// narrowing to Google's 6-30: an account outside that window cannot exist, so
+/// the only configuration the narrower bound would newly reject is one whose
+/// impersonation exchange already fails closed, and narrowing validation on a
+/// field an operator may already have set buys nothing for that.
+fn is_valid_gcp_service_account_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= MIN_GCP_POOL_COMPONENT_BYTES
+        && bytes.len() <= MAX_GCP_POOL_COMPONENT_BYTES
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .last()
+            .is_some_and(|byte| is_gcp_lower_alphanumeric(*byte))
+        && bytes
+            .iter()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+}
+
+const fn is_gcp_lower_alphanumeric(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit()
 }
 
 /// Requires the complete workload identity pool provider resource:
@@ -494,7 +531,7 @@ fn is_valid_gcp_service_account(value: &str) -> bool {
     let Some(project) = domain.strip_suffix(GCP_SERVICE_ACCOUNT_DOMAIN_SUFFIX) else {
         return false;
     };
-    is_valid_gcp_pool_component(local) && is_gcp_project_id(project)
+    is_valid_gcp_service_account_id(local) && is_gcp_project_id(project)
 }
 
 /// One bounded provider or identity exchange.
@@ -698,6 +735,18 @@ impl GcpSecretManagerProvider {
             let version_segment = alias
                 .version
                 .map_or_else(|| "latest".to_owned(), |version| version.to_string());
+            // A configured `location` selects the regional endpoint and only
+            // the regional endpoint. A Google regional endpoint is itself an
+            // enforcement boundary — it admits a request only if the addressed
+            // resource lives in that location, and it keeps the request and the
+            // returned payload in region — so it is strictly stronger than the
+            // global endpoint for the residency requirement that is the whole
+            // reason an operator created a regional secret. It is also the
+            // narrower egress admission: a deployment with only regional
+            // aliases never has to allowlist `secretmanager.googleapis.com` at
+            // all. Admitting the global endpoint as an alternative would mean
+            // either widening every such allowlist or falling back between
+            // endpoints at runtime, and this provider never retries elsewhere.
             let access_url = match alias.location.as_deref() {
                 Some(location) => format!(
                     "https://secretmanager.{location}.rep.googleapis.com/v1/projects/{project}/locations/{location}/secrets/{secret}/versions/{version_segment}:access",
@@ -998,6 +1047,20 @@ impl GcpSecretManagerProvider {
                 // The cache lifetime is the requested bounded lifetime rather
                 // than the response `expireTime`; a token the backend shortens
                 // further is recovered by the single 401/403 re-exchange.
+                //
+                // Parsing `expireTime` would be worse, not merely larger. It is
+                // an absolute RFC3339 wall-clock instant, while this cache is
+                // keyed on the monotonic clock, so honouring it means measuring
+                // Google's wall clock against the local one: a local clock
+                // running fast would compute a *longer* remaining lifetime than
+                // the token actually has, which is the one direction that fails
+                // open. The requested lifetime is an upper bound the backend
+                // cannot exceed (600s is far under the 3600s `generateAccessToken`
+                // cap), so requested-minus-margin is never longer than the
+                // truth. Note the asymmetry with the STS exchange above is
+                // forced by the API shape, not by expedience: STS returns
+                // `expires_in` as a relative integer, which is monotonic-safe
+                // and is honoured, clamped by `MAX_GCP_TOKEN_LIFETIME`.
                 (
                     take_validated_token(&mut impersonation.access_token)?,
                     GCP_IMPERSONATION_LIFETIME,
@@ -1344,7 +1407,19 @@ fn classify_status(status: StatusCode, identity: bool) -> Option<GcpFailure> {
         400 | 401 | 403 if identity => GcpFailure::IdentityDenied,
         401 | 403 => GcpFailure::ProviderDenied,
         // Secret Manager reports disabled and destroyed versions as
-        // FAILED_PRECONDITION on access; the error body is never parsed.
+        // FAILED_PRECONDITION on access; the error body is never parsed, so the
+        // two collapse into one reason, and they stay collapsed. They are
+        // operationally the same event here: this version can never again yield
+        // material, neither state is retryable, neither may return a cached
+        // value, and this provider has no enable, rotate, or destroy path that
+        // could act on the difference — an unpinned alias picks up the next
+        // version after the bounded cache expiry either way. Telling them apart
+        // is not a matter of reading one more field: the access error carries no
+        // machine-readable discriminator, so it would mean either sniffing
+        // Google's human-readable message text, which is not a stable contract,
+        // or issuing `GetSecretVersion`, a second operation this provider
+        // deliberately does not implement. Both trade a stability or
+        // attack-surface cost for a distinction that changes no behaviour.
         400 => GcpFailure::SecretUnusable,
         404 if identity => GcpFailure::IdentityUnavailable,
         404 => GcpFailure::SecretAbsent,
@@ -1532,6 +1607,31 @@ impl AccessSecretVersionResponse {
 /// The returned resource name must match the alias binding exactly. The only
 /// tolerated variation is Google's canonicalization of a configured project ID
 /// to its numeric project number, which cannot be predicted from configuration.
+///
+/// That tolerance is deliberate and stays. This check is a consistency check
+/// over a channel the egress client has already authenticated — HTTPS with
+/// strict CA, hostname, and SNI validation, all-answer DNS validation with
+/// exact address pinning, no redirects — against a URL fixed at startup that
+/// contains no caller-supplied byte. An adversary able to make the project
+/// component wrong is an adversary able to echo the expected one, so tightening
+/// this component raises no adversarial bar; it only catches honest confusion,
+/// and canonicalization is precisely the honest case the tolerance exists for.
+///
+/// Byte-exact binding needs no new configuration surface: Secret Manager
+/// accepts a project *number* in the request path, so an operator who wants the
+/// project component pinned configures `project` as the number and this
+/// function then demands an exact match (`is_gcp_project_number(&alias.project)`
+/// makes `canonical_project_number` false). `docs/configuration.md` recommends
+/// exactly that. An optional second `project_number` field would be a second
+/// spelling of a capability that already exists, meaningful only in one of the
+/// two ways `project` can be written, and would need its own rejection rule for
+/// the other. Pinning the first observed number instead (trust on first use)
+/// would be worse still: it replaces a startup-fixed locator with runtime state
+/// learned from the provider, it anchors on whatever the first response says —
+/// including a wrong one, which is the case this check exists to catch, and
+/// which it would then defend — and it diverges per process and resets on
+/// restart, against the module invariant that every locator is fixed by trusted
+/// startup configuration.
 fn response_name_matches(alias: &GcpAliasBinding, name: &str) -> bool {
     if name.len() > MAX_GCP_RESPONSE_NAME_BYTES {
         return false;
@@ -2152,6 +2252,76 @@ mod tests {
             base(profiles, Vec::new()),
             Err(GcpProviderConfigError::TooManyProfiles { .. })
         ));
+    }
+
+    /// Pool and provider IDs follow Google's rule (4-32 bytes of `[a-z0-9-]`
+    /// starting and ending with an alphanumeric); the service-account local
+    /// part keeps Google's stricter leading-letter rule because it reaches a
+    /// URL path. The two are validated separately and must not drift together.
+    #[test]
+    fn pool_components_admit_digits_where_google_does_and_service_accounts_do_not() {
+        let root = "/var/run/secrets/tokens";
+        let with_audience = |audience: &str| {
+            let mut entry = profile("primary", root, None);
+            entry.audience = audience.to_owned();
+            validate_gcp_provider_config(
+                &GcpProviderConfig {
+                    profiles: vec![entry],
+                    aliases: Vec::new(),
+                },
+                &BTreeSet::new(),
+            )
+        };
+        for audience in [
+            "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/2024-prod-pool/providers/provider-name",
+            "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/pool-name/providers/9-provider",
+            "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/0pool/providers/0000",
+        ] {
+            assert_eq!(
+                with_audience(audience),
+                Ok(()),
+                "{audience:?} is a valid Google audience and must be accepted"
+            );
+        }
+        for audience in [
+            "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/-pool-name/providers/provider-name",
+            "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/pool-name-/providers/provider-name",
+            "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/abc/providers/provider-name",
+            "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/pool_name/providers/provider-name",
+        ] {
+            assert_eq!(
+                with_audience(audience),
+                Err(GcpProviderConfigError::InvalidAudience { index: 0 }),
+                "{audience:?} must still be rejected as an invalid audience"
+            );
+        }
+
+        let with_account = |account: &str| {
+            let mut entry = profile("primary", root, None);
+            entry.service_account = Some(account.to_owned());
+            validate_gcp_provider_config(
+                &GcpProviderConfig {
+                    profiles: vec![entry],
+                    aliases: Vec::new(),
+                },
+                &BTreeSet::new(),
+            )
+        };
+        assert_eq!(
+            with_account(SERVICE_ACCOUNT_CANARY),
+            Ok(()),
+            "a dedicated service account must still be accepted"
+        );
+        for account in [
+            "9sa-canary@project-locator-canary.iam.gserviceaccount.com",
+            "0000@project-locator-canary.iam.gserviceaccount.com",
+        ] {
+            assert_eq!(
+                with_account(account),
+                Err(GcpProviderConfigError::InvalidServiceAccount { index: 0 }),
+                "{account:?} must be rejected: a service-account ID starts with a letter"
+            );
+        }
     }
 
     #[tokio::test]
