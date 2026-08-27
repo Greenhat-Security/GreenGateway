@@ -1,7 +1,7 @@
 //! Canonical client IP extraction.
 
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
 
@@ -98,7 +98,7 @@ fn forwarded_for(headers: &HeaderMap) -> Result<Option<Vec<IpAddr>>, ()> {
             if entry.is_empty() {
                 return Err(());
             }
-            chain.push(entry.parse::<IpAddr>().map(canonical_ip).map_err(|_| ())?);
+            chain.push(forwarded_entry_ip(entry).map(canonical_ip)?);
         }
     }
 
@@ -107,6 +107,30 @@ fn forwarded_for(headers: &HeaderMap) -> Result<Option<Vec<IpAddr>>, ()> {
     } else {
         Ok(None)
     }
+}
+
+fn forwarded_entry_ip(entry: &str) -> Result<IpAddr, ()> {
+    // A bare IPv6 address is all colons and never carries a port, so it has to be
+    // recognized before any `address:port` form is considered.
+    if let Ok(ip) = entry.parse::<IpAddr>() {
+        return Ok(ip);
+    }
+
+    // Some proxies append the source port, which carries no identity. Rejecting
+    // those entries would mark the whole chain malformed and collapse every client
+    // behind such a proxy onto the peer address. `SocketAddr` supplies the port
+    // grammar so the IPv4 and bracketed-IPv6 forms are not split by hand.
+    if let Ok(addr) = entry.parse::<SocketAddr>() {
+        return Ok(addr.ip());
+    }
+
+    entry
+        .strip_prefix('[')
+        .and_then(|entry| entry.strip_suffix(']'))
+        .ok_or(())?
+        .parse::<Ipv6Addr>()
+        .map(IpAddr::V6)
+        .map_err(|_| ())
 }
 
 fn forwarded_client_ip(chain: &[IpAddr], policy: &ClientIpPolicy) -> IpAddr {
@@ -299,6 +323,168 @@ mod tests {
         assert_eq!(
             canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
             "198.51.100.10"
+        );
+    }
+
+    #[test]
+    fn forwarded_ipv4_entry_with_a_port_uses_the_client_address() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, "203.0.113.5:41234".parse().unwrap());
+        let extensions = extensions_with_peer("10.0.0.6:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "203.0.113.5"
+        );
+    }
+
+    #[test]
+    fn forwarded_bracketed_ipv6_entry_with_a_port_uses_the_client_address() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, "[2001:db8::5]:41234".parse().unwrap());
+        let extensions = extensions_with_peer("10.0.0.6:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "2001:db8::5"
+        );
+    }
+
+    #[test]
+    fn forwarded_bracketed_ipv6_entry_without_a_port_uses_the_client_address() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, "[2001:db8::5]".parse().unwrap());
+        let extensions = extensions_with_peer("10.0.0.6:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "2001:db8::5"
+        );
+    }
+
+    #[test]
+    fn forwarded_bare_ipv6_entry_is_not_split_on_its_own_colons() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, "2001:db8::5".parse().unwrap());
+        let extensions = extensions_with_peer("10.0.0.6:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "2001:db8::5"
+        );
+    }
+
+    #[test]
+    fn forwarded_bare_ipv6_loopback_entry_is_not_split_on_its_own_colons() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, "::1".parse().unwrap());
+        let extensions = extensions_with_peer("10.0.0.6:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "::1"
+        );
+    }
+
+    #[test]
+    fn ported_chain_still_skips_trusted_hops_on_the_parsed_address() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            X_FORWARDED_FOR,
+            "192.0.2.66:9000, 198.51.100.10:443, [::ffff:10.0.0.7]:8443, 10.0.0.5:80"
+                .parse()
+                .unwrap(),
+        );
+        let extensions = extensions_with_peer("10.0.0.6:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "198.51.100.10"
+        );
+    }
+
+    #[test]
+    fn forwarded_entry_with_a_non_numeric_port_falls_back_to_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, "203.0.113.5:https".parse().unwrap());
+        headers.insert(X_REAL_IP, "198.51.100.11".parse().unwrap());
+        let extensions = extensions_with_peer("10.0.0.6:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "10.0.0.6"
+        );
+    }
+
+    #[test]
+    fn forwarded_entry_with_an_out_of_range_port_falls_back_to_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, "203.0.113.5:99999".parse().unwrap());
+        let extensions = extensions_with_peer("10.0.0.6:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "10.0.0.6"
+        );
+    }
+
+    #[test]
+    fn forwarded_entry_with_an_unterminated_bracket_falls_back_to_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, "[2001:db8::5:41234".parse().unwrap());
+        let extensions = extensions_with_peer("10.0.0.6:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "10.0.0.6"
+        );
+    }
+
+    #[test]
+    fn forwarded_entry_with_trailing_junk_after_the_bracket_falls_back_to_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, "[2001:db8::5]41234".parse().unwrap());
+        let extensions = extensions_with_peer("10.0.0.6:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "10.0.0.6"
+        );
+    }
+
+    #[test]
+    fn forwarded_entry_that_is_a_bracketed_ipv4_falls_back_to_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, "[203.0.113.5]:41234".parse().unwrap());
+        let extensions = extensions_with_peer("10.0.0.6:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "10.0.0.6"
+        );
+    }
+
+    #[test]
+    fn forwarded_entry_with_an_empty_port_falls_back_to_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, "203.0.113.5:".parse().unwrap());
+        let extensions = extensions_with_peer("10.0.0.6:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "10.0.0.6"
+        );
+    }
+
+    #[test]
+    fn ported_forwarded_entry_from_an_untrusted_peer_is_still_ignored() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, "198.51.100.10:41234".parse().unwrap());
+        let extensions = extensions_with_peer("203.0.113.20:12345");
+
+        assert_eq!(
+            canonical_client_ip(&headers, &extensions, &policy(&["10.0.0.0/8"])),
+            "203.0.113.20"
         );
     }
 
