@@ -146,4 +146,32 @@ if [ -n "$problems" ]; then
     exit 1
 fi
 
+# The HTTP/2 tripwire.
+#
+# Nothing in this workspace enables HTTP/2 today, and several security
+# properties quietly depend on that. Enabling the HTTP client's `http2` feature
+# rewrites its ALPN list to prefer h2, silently changing the protocol of every
+# existing HTTPS upstream. Worse, cargo unifies features across the dependency
+# graph: that same feature turns on `hyper-util/http2`, and the server side of
+# `hyper-util` is what `axum::serve` builds on. Its `auto::Builder` sniffs the
+# HTTP/2 connection preface and serves h2c when the feature is present, so
+# every listener -- including the admin listener -- would begin accepting
+# HTTP/2 prior-knowledge connections. No code change, no configuration change,
+# no axum feature change.
+#
+# So the presence of the `h2` crate in the resolved build is the signal, and it
+# is checked here rather than trusted to review. A transport that genuinely
+# wants h2 must land this file's update in the same change, which is precisely
+# the review conversation this is meant to force.
+if command -v cargo >/dev/null 2>&1; then
+    if cargo tree --workspace --edges normal --prefix none 2>/dev/null | grep -qE '^h2 v'; then
+        echo "the h2 crate is in the resolved build, but nothing here is meant to speak HTTP/2 yet"
+        echo "if that is deliberate, update this check and the protocol pins in $EGRESS_FILE together"
+        cargo tree --workspace --edges normal --invert h2 2>/dev/null | head -20
+        exit 1
+    fi
+else
+    echo "cargo not found; skipping the HTTP/2 tripwire"
+fi
+
 echo "egress-only check passed"
