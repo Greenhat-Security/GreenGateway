@@ -52,7 +52,7 @@ use tokio_tungstenite::{
 use tokio_util::sync::CancellationToken;
 
 use super::{admission, forward, MatchedUpstream, ProxyState};
-use crate::{audit, config, middleware};
+use crate::{audit, config, egress::EgressUpgradedStream, middleware};
 
 /// RFC 6455 caps a control frame payload at 125 bytes, and a close frame spends
 /// two of them on the status code.
@@ -1123,7 +1123,7 @@ impl Termination {
 
 async fn bridge(
     mut client: WebSocket,
-    mut upstream: WebSocketStream<reqwest::Upgraded>,
+    mut upstream: WebSocketStream<EgressUpgradedStream>,
     context: BridgeContext,
     guard: ConnectionGuard,
 ) {
@@ -1163,7 +1163,7 @@ enum Incoming {
 
 async fn run_bridge(
     client: &mut WebSocket,
-    upstream: &mut WebSocketStream<reqwest::Upgraded>,
+    upstream: &mut WebSocketStream<EgressUpgradedStream>,
     context: &BridgeContext,
     counters: &mut BridgeCounters,
 ) -> Termination {
@@ -1248,7 +1248,7 @@ async fn run_bridge(
 }
 
 async fn send_to_upstream(
-    upstream: &mut WebSocketStream<reqwest::Upgraded>,
+    upstream: &mut WebSocketStream<EgressUpgradedStream>,
     message: TungsteniteMessage,
     context: &BridgeContext,
     duration_deadline: Option<tokio::time::Instant>,
