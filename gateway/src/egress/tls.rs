@@ -300,6 +300,11 @@ pub(super) fn client_config(
             .map_err(|_| TlsConfigError::TrustAnchors("CA bundle is not a usable trust anchor"))?,
         )
     };
+    // `dangerous()` is rustls's entry point for ANY custom verifier, not a
+    // relaxation of one: it is the only way to install the platform verifier at
+    // all, and it is the same call reqwest makes at `client.rs:756-781`.
+    // Certificate and hostname verification both stay fully enforced -- the
+    // verifier being installed is stricter than a bare root store, not weaker.
     let builder = builder
         .dangerous()
         .with_custom_certificate_verifier(verifier);
