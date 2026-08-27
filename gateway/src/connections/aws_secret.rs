@@ -103,6 +103,9 @@ const AWS_CURRENT_STAGE: &str = "AWSCURRENT";
 const AWS_PREVIOUS_STAGE: &str = "AWSPREVIOUS";
 const AWS_ROLE_SESSION_NAME: &str = "greengateway";
 const AWS_SECRETS_MANAGER_SERVICE: &str = "secretsmanager";
+const AWS_COMMERCIAL_PARTITION: &str = "aws";
+const AWS_GOV_PARTITION: &str = "aws-us-gov";
+const AWS_ENDPOINT_SUFFIX: &str = "amazonaws.com";
 const AMZ_DATE_HEADER: &str = "x-amz-date";
 const AMZ_TARGET_HEADER: &str = "x-amz-target";
 const AMZ_SECURITY_TOKEN_HEADER: &str = "x-amz-security-token";
@@ -256,32 +259,92 @@ impl fmt::Debug for AwsSecretAliasConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AwsProviderConfigError {
-    TooManyProfiles { maximum: usize },
-    TooManyAliases { maximum: usize },
-    InvalidProfileId { index: usize },
-    DuplicateProfileId { index: usize, previous: usize },
-    InvalidStsEndpoint { index: usize },
-    StsEndpointRequired { index: usize },
-    InvalidRoleArn { index: usize },
-    InvalidWorkloadTokenRoot { index: usize },
-    InvalidWorkloadTokenFile { index: usize },
-    WorkloadTokenRootUnavailable { index: usize },
-    WorkloadTokenRootPermissions { index: usize },
-    InvalidBootstrapAlias { index: usize },
-    BootstrapAliasCycle { index: usize },
-    BootstrapResolverRequired { index: usize },
-    UnknownBootstrapAlias { index: usize },
-    InvalidAliasId { index: usize },
-    InvalidLabel { index: usize },
-    DuplicateAliasId { index: usize, previous: usize },
-    ReservedAliasId { index: usize },
-    UnknownProfile { index: usize },
-    InvalidSecretArn { index: usize },
-    AmbiguousVersionSelection { index: usize },
-    InvalidVersionId { index: usize },
-    InvalidVersionStage { index: usize },
-    ForbiddenVersionStage { index: usize },
-    InvalidJsonMember { index: usize },
+    TooManyProfiles {
+        maximum: usize,
+    },
+    TooManyAliases {
+        maximum: usize,
+    },
+    InvalidProfileId {
+        index: usize,
+    },
+    DuplicateProfileId {
+        index: usize,
+        previous: usize,
+    },
+    InvalidStsEndpoint {
+        index: usize,
+    },
+    StsEndpointRequired {
+        index: usize,
+    },
+    InvalidRoleArn {
+        index: usize,
+    },
+    InvalidWorkloadTokenRoot {
+        index: usize,
+    },
+    InvalidWorkloadTokenFile {
+        index: usize,
+    },
+    WorkloadTokenRootUnavailable {
+        index: usize,
+    },
+    WorkloadTokenRootPermissions {
+        index: usize,
+    },
+    InvalidBootstrapAlias {
+        index: usize,
+    },
+    BootstrapAliasCycle {
+        index: usize,
+    },
+    BootstrapResolverRequired {
+        index: usize,
+    },
+    UnknownBootstrapAlias {
+        index: usize,
+    },
+    InvalidAliasId {
+        index: usize,
+    },
+    InvalidLabel {
+        index: usize,
+    },
+    DuplicateAliasId {
+        index: usize,
+        previous: usize,
+    },
+    ReservedAliasId {
+        index: usize,
+    },
+    UnknownProfile {
+        index: usize,
+    },
+    InvalidSecretArn {
+        index: usize,
+    },
+    AmbiguousVersionSelection {
+        index: usize,
+    },
+    InvalidVersionId {
+        index: usize,
+    },
+    InvalidVersionStage {
+        index: usize,
+    },
+    ForbiddenVersionStage {
+        index: usize,
+    },
+    InvalidJsonMember {
+        index: usize,
+    },
+    CrossPartitionAlias {
+        index: usize,
+        alias_partition: &'static str,
+        profile: usize,
+        profile_partition: &'static str,
+    },
     AliasesWithoutProfiles,
 }
 
@@ -392,6 +455,15 @@ impl fmt::Display for AwsProviderConfigError {
                 formatter,
                 "aws alias at index {index} has an invalid JSON member name"
             ),
+            Self::CrossPartitionAlias {
+                index,
+                alias_partition,
+                profile,
+                profile_partition,
+            } => write!(
+                formatter,
+                "aws alias at index {index} names an {alias_partition} secret but its profile at index {profile} obtains credentials from an {profile_partition} STS endpoint"
+            ),
             Self::AliasesWithoutProfiles => {
                 formatter.write_str("aws aliases require at least one configured profile")
             }
@@ -449,6 +521,9 @@ pub fn validate_aws_provider_config(
         .map(|alias| alias.id.as_str())
         .collect::<BTreeSet<_>>();
     let mut profile_ids = BTreeMap::new();
+    // Only for profiles whose STS endpoint states a partition; see
+    // `sts_endpoint_partition`.
+    let mut profile_partitions: BTreeMap<&str, (usize, &'static str)> = BTreeMap::new();
     for (index, profile) in config.profiles.iter().enumerate() {
         if !is_valid_opaque_id(&profile.id, MAX_SECRET_ID_BYTES) {
             return Err(AwsProviderConfigError::InvalidProfileId { index });
@@ -472,8 +547,17 @@ pub fn validate_aws_provider_config(
                 token_root,
                 token_file,
             } => {
-                if profile.sts_endpoint.is_none() {
+                let Some(endpoint) = profile.sts_endpoint.as_deref() else {
                     return Err(AwsProviderConfigError::StsEndpointRequired { index });
+                };
+                // Recorded for `web_identity` only. It is the sole mode that
+                // dials STS, so it is the sole mode where the endpoint decides
+                // which partition the resulting session credentials belong to.
+                // A `static_keys` profile signs with a bootstrap key pair whose
+                // partition this configuration never states, and any endpoint it
+                // still carries is never contacted, so there is nothing to bind.
+                if let Some(partition) = sts_endpoint_partition(endpoint) {
+                    profile_partitions.insert(profile.id.as_str(), (index, partition));
                 }
                 if !is_valid_role_arn(role_arn) {
                     return Err(AwsProviderConfigError::InvalidRoleArn { index });
@@ -515,8 +599,41 @@ pub fn validate_aws_provider_config(
         if !profile_ids.contains_key(alias.profile.as_str()) {
             return Err(AwsProviderConfigError::UnknownProfile { index });
         }
-        if parse_secret_arn(&alias.arn).is_none() {
+        let Some(region) = parse_secret_arn(&alias.arn) else {
             return Err(AwsProviderConfigError::InvalidSecretArn { index });
+        };
+        // `partition_matches_region` stops one *locator* naming a partition its
+        // host does not belong to. This stops the strictly worse thing: one
+        // partition's live *credential* being sent to another partition's host.
+        //
+        // The alias endpoint is derived from the alias region alone, and the
+        // session credentials are minted at whatever endpoint the profile names,
+        // so nothing else relates the two. Left unchecked, a `web_identity`
+        // profile pointed at commercial STS could serve a GovCloud alias, and
+        // every read would SigV4-sign commercial session credentials -- the
+        // access key and the `x-amz-security-token` bearer with it -- to
+        // `secretsmanager.us-gov-west-1.amazonaws.com`.
+        //
+        // This is a narrowing, and it only rejects configurations that were
+        // already broken. The partitions are separate trust domains with
+        // separate IAM: a commercial session principal does not exist in
+        // GovCloud, so GovCloud rejects the credential outright rather than
+        // authorizing anything, and the reverse holds too. That failure is
+        // permanent, not transient -- the profile mints another credential in
+        // the same partition on every refresh -- so a rejected pairing could
+        // only ever have failed on every request for the life of the process.
+        // Refusing it at startup names the misconfiguration instead of burying
+        // it in a per-request authentication error.
+        if let Some((profile, profile_partition)) = profile_partitions.get(alias.profile.as_str()) {
+            let alias_partition = partition_for_region(region);
+            if alias_partition != *profile_partition {
+                return Err(AwsProviderConfigError::CrossPartitionAlias {
+                    index,
+                    alias_partition,
+                    profile: *profile,
+                    profile_partition,
+                });
+            }
         }
         if alias.version_id.is_some() && alias.version_stage.is_some() {
             return Err(AwsProviderConfigError::AmbiguousVersionSelection { index });
@@ -684,14 +801,59 @@ fn parse_secret_arn(value: &str) -> Option<&str> {
 }
 
 /// `aws-us-gov` owns exactly the `us-gov-` regions, and `aws` owns none of
-/// them.
+/// them, so a region names its partition outright.
+fn partition_for_region(region: &str) -> &'static str {
+    if region.starts_with("us-gov-") {
+        AWS_GOV_PARTITION
+    } else {
+        AWS_COMMERCIAL_PARTITION
+    }
+}
+
+/// Whether a secret ARN's stated partition agrees with the region its endpoint
+/// is derived from.
 ///
 /// This applies to secret ARNs only. A role ARN carries no region (IAM is
 /// global) and its partition derives no host either, because the STS endpoint a
 /// role is assumed at is configured explicitly rather than computed, so there is
 /// nothing for the same check to protect there.
 fn partition_matches_region(partition: &str, region: &str) -> bool {
-    region.starts_with("us-gov-") == (partition == "aws-us-gov")
+    partition_for_region(region) == partition
+}
+
+/// The partition a configured STS endpoint issues credentials in, when its host
+/// states one.
+///
+/// AWS owns `amazonaws.com`, and every GovCloud service endpoint carries its
+/// region in the host because GovCloud publishes no regionless endpoint. So a
+/// host under that suffix either names a `us-gov-` region, and is GovCloud, or
+/// names none, and is commercial. Any region-shaped label is examined, not just
+/// the leftmost, because an interface VPC endpoint prefixes the host with a
+/// `vpce-<id>` label that is itself region-shaped.
+///
+/// A host outside `amazonaws.com` states nothing: it is a private endpoint, a
+/// corporate CNAME, or a test double, and which partition it fronts is not
+/// knowable from the name. Those are deliberately left unconstrained. The point
+/// of the check below is to refuse a pairing that provably cannot work, and
+/// guessing a partition for an opaque host would instead refuse deployments
+/// that do.
+fn sts_endpoint_partition(endpoint: &str) -> Option<&'static str> {
+    let url = Url::parse(endpoint).ok()?;
+    let host = url.host_str()?.trim_end_matches('.');
+    if host != AWS_ENDPOINT_SUFFIX
+        && !host
+            .strip_suffix(AWS_ENDPOINT_SUFFIX)
+            .is_some_and(|parent| parent.ends_with('.'))
+    {
+        return None;
+    }
+    if host
+        .split('.')
+        .any(|label| label.starts_with("us-gov-") && is_valid_aws_region(label))
+    {
+        return Some(AWS_GOV_PARTITION);
+    }
+    Some(AWS_COMMERCIAL_PARTITION)
 }
 
 fn is_valid_secret_name_byte(byte: u8) -> bool {
@@ -2334,6 +2496,8 @@ mod tests {
     const SECRET_KEY_CANARY: &str = "aws-secret-access-key-canary/EXAMPLE";
     const SESSION_TOKEN_CANARY: &str = "IQoJsession-token-canary-material==";
     const STS_ENDPOINT_CANARY: &str = "https://sts.locator-canary.example";
+    const COMMERCIAL_STS_ENDPOINT: &str = "https://sts.us-east-1.amazonaws.com";
+    const GOV_STS_ENDPOINT: &str = "https://sts.us-gov-west-1.amazonaws.com";
     const ARN_CANARY: &str =
         "arn:aws:secretsmanager:us-east-1:123456789012:secret:team-canary/billing-canary-AbC123";
     const GOV_ARN_CANARY: &str =
@@ -2893,6 +3057,106 @@ mod tests {
                 "{arn:?} mixes a partition and a region AWS never pairs"
             );
         }
+    }
+
+    /// A locator that names the wrong partition is a bad address;
+    /// `partition_matches_region` already refuses that. Binding an alias to a
+    /// profile in the *other* partition is worse: the address is right, and what
+    /// crosses the boundary is a live credential.
+    #[test]
+    fn a_profile_and_the_aliases_bound_to_it_must_share_a_partition() {
+        let config = |endpoint: Option<&str>, arn: &str, web_identity: bool| {
+            let mut profile = if web_identity {
+                web_identity_profile("primary", "/var/run/secrets/tokens")
+            } else {
+                static_profile("primary")
+            };
+            profile.sts_endpoint = endpoint.map(str::to_owned);
+            let mut entry = alias("billing");
+            entry.arn = arn.to_owned();
+            validate_aws_provider_config(
+                &AwsProviderConfig {
+                    profiles: vec![profile],
+                    aliases: vec![entry],
+                },
+                &BTreeSet::new(),
+            )
+        };
+
+        // Commercial STS session credentials signed to a GovCloud host, and the
+        // reverse. Both name the alias index and both partitions.
+        for (endpoint, arn, alias_partition, profile_partition) in [
+            (COMMERCIAL_STS_ENDPOINT, GOV_ARN_CANARY, "aws-us-gov", "aws"),
+            (GOV_STS_ENDPOINT, ARN_CANARY, "aws", "aws-us-gov"),
+        ] {
+            let outcome = config(Some(endpoint), arn, true);
+            assert!(
+                matches!(
+                    outcome,
+                    Err(AwsProviderConfigError::CrossPartitionAlias {
+                        index: 0,
+                        alias_partition: found_alias,
+                        profile: 0,
+                        profile_partition: found_profile,
+                    }) if found_alias == alias_partition && found_profile == profile_partition
+                ),
+                "{endpoint} paired with {arn} must be refused as cross-partition, got {outcome:?}"
+            );
+        }
+
+        // The same fixtures with the partitions aligned must validate, or the
+        // rejections above would prove nothing about the partition pair.
+        for (endpoint, arn) in [
+            (COMMERCIAL_STS_ENDPOINT, ARN_CANARY),
+            (GOV_STS_ENDPOINT, GOV_ARN_CANARY),
+        ] {
+            let outcome = config(Some(endpoint), arn, true);
+            assert!(
+                outcome.is_ok(),
+                "{endpoint} paired with {arn} is a partition-consistent deployment, got {outcome:?}"
+            );
+        }
+
+        // A GovCloud interface VPC endpoint prefixes the host with a `vpce-<id>`
+        // label that is itself region-shaped. Reading the leftmost region-shaped
+        // label would call this commercial and refuse a working deployment.
+        let outcome = config(
+            Some("https://vpce-0a1b2c3d4e5f01234.sts.us-gov-west-1.vpce.amazonaws.com"),
+            GOV_ARN_CANARY,
+            true,
+        );
+        assert!(
+            outcome.is_ok(),
+            "a GovCloud interface endpoint must not be read as commercial, got {outcome:?}"
+        );
+
+        // A host outside `amazonaws.com` states no partition, so it constrains
+        // nothing rather than being guessed at.
+        let outcome = config(Some(STS_ENDPOINT_CANARY), GOV_ARN_CANARY, true);
+        assert!(
+            outcome.is_ok(),
+            "an opaque STS host must not be assigned a partition, got {outcome:?}"
+        );
+
+        // `static_keys` never dials STS, so an endpoint it still carries decides
+        // nothing about which partition its bootstrap key pair belongs to.
+        let outcome = config(Some(COMMERCIAL_STS_ENDPOINT), GOV_ARN_CANARY, false);
+        assert!(
+            outcome.is_ok(),
+            "a legacy static_keys endpoint must not bind a partition, got {outcome:?}"
+        );
+
+        // The role ARN is deliberately left alone: IAM is global, the role ARN
+        // carries no region, and the endpoint a role is assumed at is configured
+        // rather than derived from it. `web_identity_profile` supplies a
+        // commercial role ARN, so the GovCloud pairing above already relies on
+        // this; assert it rather than leaving it to be rediscovered.
+        assert!(ROLE_ARN_CANARY.starts_with("arn:aws:iam::"));
+        assert_eq!(
+            sts_endpoint_partition(GOV_STS_ENDPOINT),
+            Some("aws-us-gov"),
+            "the GovCloud pairing must pass on the endpoint, not on the role ARN"
+        );
     }
 
     #[test]
