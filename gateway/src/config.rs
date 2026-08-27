@@ -15,6 +15,7 @@ use serde::Deserialize;
 
 use crate::{
     auth::principal::{canonical_issuer, provider_issuer, PROVIDER_ISSUER_PREFIX},
+    auth::ClientCertIdentitySource,
     connections::{
         aws_secret::{
             validate_aws_provider_config, AwsProviderConfig, MAX_AWS_PROVIDER_CONFIG_BYTES,
@@ -52,7 +53,7 @@ use crate::{
             MAX_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
         },
     },
-    inbound_tls::TlsMinVersion,
+    inbound_tls::{ClientCertMode, ClientCertRequirement, TlsMinVersion},
     upstream_route,
 };
 
@@ -169,6 +170,9 @@ const ADMIN_LOGIN_PENDING_TTL_SECS: &str = "ADMIN_LOGIN_PENDING_TTL_SECS";
 const ADMIN_LOGIN_PENDING_MAX_ENTRIES: &str = "ADMIN_LOGIN_PENDING_MAX_ENTRIES";
 const ADMIN_LOGIN_PENDING_MAX_PER_IP: &str = "ADMIN_LOGIN_PENDING_MAX_PER_IP";
 const ADMIN_PREFIX: &str = "ADMIN_PREFIX";
+const ADMIN_CLIENT_CERT_CA_FILE: &str = "ADMIN_CLIENT_CERT_CA_FILE";
+const ADMIN_CLIENT_CERT_CRL_FILE: &str = "ADMIN_CLIENT_CERT_CRL_FILE";
+const ADMIN_CLIENT_CERT_MODE: &str = "ADMIN_CLIENT_CERT_MODE";
 const ADMIN_TLS_CERT_FILE: &str = "ADMIN_TLS_CERT_FILE";
 const ADMIN_TLS_KEY_FILE: &str = "ADMIN_TLS_KEY_FILE";
 const AUDIT_LOG_FILE: &str = "AUDIT_LOG_FILE";
@@ -239,6 +243,10 @@ const TOOL_RUNTIME_GLOBAL_CONCURRENCY: &str = "TOOL_RUNTIME_GLOBAL_CONCURRENCY";
 const TOOL_RUNTIME_QUEUE_DEPTH: &str = "TOOL_RUNTIME_QUEUE_DEPTH";
 const TOOL_RUNTIME_QUEUE_TIMEOUT_MS: &str = "TOOL_RUNTIME_QUEUE_TIMEOUT_MS";
 const TOOLS_FILE: &str = "TOOLS_FILE";
+const CLIENT_CERT_CA_FILE: &str = "CLIENT_CERT_CA_FILE";
+const CLIENT_CERT_CRL_FILE: &str = "CLIENT_CERT_CRL_FILE";
+const CLIENT_CERT_IDENTITY_SOURCE: &str = "CLIENT_CERT_IDENTITY_SOURCE";
+const CLIENT_CERT_MODE: &str = "CLIENT_CERT_MODE";
 const TLS_CERT_FILE: &str = "TLS_CERT_FILE";
 const TLS_HANDSHAKE_TIMEOUT_MS: &str = "TLS_HANDSHAKE_TIMEOUT_MS";
 const TLS_KEY_FILE: &str = "TLS_KEY_FILE";
@@ -277,6 +285,16 @@ pub struct Config {
     pub tls_min_version: TlsMinVersion,
     pub tls_handshake_timeout_ms: u64,
     pub tls_max_concurrent_handshakes: usize,
+    /// Inbound client-certificate authentication for the data listener, or
+    /// `None` to request no certificate at all.
+    ///
+    /// Composed during parsing rather than stored as loose fields, so that
+    /// "client certificates are on" and "there is a CA to verify them against"
+    /// cannot disagree. A mode that could not be satisfied is a startup
+    /// failure, never a `Some` with a hole in it.
+    pub client_cert_auth: Option<InboundClientAuthConfig>,
+    /// The same for the admin listener, configured independently.
+    pub admin_client_cert_auth: Option<InboundClientAuthConfig>,
     pub admin_prefix: String,
     pub admin_login_provider: Option<String>,
     pub admin_login_pending_ttl_secs: u64,
@@ -1228,6 +1246,95 @@ impl Config {
             DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES,
             &mut problems,
         );
+        // Client-certificate authentication, per listener.
+        //
+        // Parsed after the certificate/key pair because it depends on it: a
+        // listener that terminates no TLS cannot ask for a client certificate,
+        // and a mode that says otherwise is a configuration an operator would
+        // reasonably read as "mutual TLS is on".
+        let client_cert_identity_source = parse_optional_string(
+            CLIENT_CERT_IDENTITY_SOURCE,
+            get_var(CLIENT_CERT_IDENTITY_SOURCE),
+            &mut problems,
+        )
+        .and_then(|value| match value.parse::<ClientCertIdentitySource>() {
+            Ok(source) => Some(source),
+            Err(expected) => {
+                problems.push(format!(
+                    "{CLIENT_CERT_IDENTITY_SOURCE} must name a supported identity source, got '{value}': {expected}"
+                ));
+                None
+            }
+        });
+        let client_cert_mode = parse_var(
+            CLIENT_CERT_MODE,
+            get_var(CLIENT_CERT_MODE),
+            ClientCertMode::Off,
+            "client certificate mode",
+            &mut problems,
+        );
+        let admin_client_cert_mode = parse_var(
+            ADMIN_CLIENT_CERT_MODE,
+            get_var(ADMIN_CLIENT_CERT_MODE),
+            ClientCertMode::Off,
+            "client certificate mode",
+            &mut problems,
+        );
+        let client_cert_auth = compose_inbound_client_auth(
+            RawInboundClientAuth {
+                mode_setting: CLIENT_CERT_MODE,
+                mode: client_cert_mode,
+                ca_setting: CLIENT_CERT_CA_FILE,
+                ca_file: parse_optional_string(
+                    CLIENT_CERT_CA_FILE,
+                    get_var(CLIENT_CERT_CA_FILE),
+                    &mut problems,
+                ),
+                crl_setting: CLIENT_CERT_CRL_FILE,
+                crl_file: parse_optional_string(
+                    CLIENT_CERT_CRL_FILE,
+                    get_var(CLIENT_CERT_CRL_FILE),
+                    &mut problems,
+                ),
+                identity_source: client_cert_identity_source,
+                tls_certificate_setting: TLS_CERT_FILE,
+                tls_configured: tls_cert_file.is_some(),
+            },
+            &mut problems,
+        );
+        let admin_client_cert_auth = compose_inbound_client_auth(
+            RawInboundClientAuth {
+                mode_setting: ADMIN_CLIENT_CERT_MODE,
+                mode: admin_client_cert_mode,
+                ca_setting: ADMIN_CLIENT_CERT_CA_FILE,
+                ca_file: parse_optional_string(
+                    ADMIN_CLIENT_CERT_CA_FILE,
+                    get_var(ADMIN_CLIENT_CERT_CA_FILE),
+                    &mut problems,
+                ),
+                crl_setting: ADMIN_CLIENT_CERT_CRL_FILE,
+                crl_file: parse_optional_string(
+                    ADMIN_CLIENT_CERT_CRL_FILE,
+                    get_var(ADMIN_CLIENT_CERT_CRL_FILE),
+                    &mut problems,
+                ),
+                identity_source: client_cert_identity_source,
+                tls_certificate_setting: ADMIN_TLS_CERT_FILE,
+                tls_configured: admin_tls_cert_file.is_some(),
+            },
+            &mut problems,
+        );
+        // An identity source with nothing to apply it to is a setting that
+        // reads as "client certificates are configured" and does nothing. Say
+        // so rather than ignoring it.
+        if client_cert_identity_source.is_some()
+            && client_cert_mode == ClientCertMode::Off
+            && admin_client_cert_mode == ClientCertMode::Off
+        {
+            problems.push(format!(
+                "{CLIENT_CERT_IDENTITY_SOURCE} is set while {CLIENT_CERT_MODE} and {ADMIN_CLIENT_CERT_MODE} are both off; set one of them to `optional` or `required`, or unset the identity source"
+            ));
+        }
         let admin_prefix = parse_admin_prefix(
             ADMIN_PREFIX,
             get_var(ADMIN_PREFIX),
@@ -1939,6 +2046,8 @@ impl Config {
                 tls_min_version,
                 tls_handshake_timeout_ms,
                 tls_max_concurrent_handshakes,
+                client_cert_auth,
+                admin_client_cert_auth,
                 admin_prefix,
                 admin_login_provider,
                 admin_login_pending_ttl_secs,
@@ -2051,6 +2160,10 @@ impl Config {
             private_key_file: self.tls_key_file.as_deref()?,
             min_version_setting: TLS_MIN_VERSION,
             min_version: self.tls_min_version,
+            client_auth: self
+                .client_cert_auth
+                .as_ref()
+                .map(InboundClientAuthConfig::settings),
         })
     }
 
@@ -2068,7 +2181,22 @@ impl Config {
             private_key_file: self.admin_tls_key_file.as_deref()?,
             min_version_setting: TLS_MIN_VERSION,
             min_version: self.tls_min_version,
+            client_auth: self
+                .admin_client_cert_auth
+                .as_ref()
+                .map(InboundClientAuthConfig::settings),
         })
+    }
+
+    /// Whether any listener authenticates callers by client certificate.
+    ///
+    /// The auth chain is process-wide while the listeners are configured
+    /// independently, so the validator is wired in when *either* listener asks
+    /// for certificates. A certificate identity can only exist on a connection
+    /// whose listener requested one, so this cannot make certificate auth
+    /// reachable on a listener that did not.
+    pub(crate) fn client_certificate_auth_enabled(&self) -> bool {
+        self.client_cert_auth.is_some() || self.admin_client_cert_auth.is_some()
     }
 }
 
@@ -2086,6 +2214,143 @@ pub(crate) struct InboundTlsSettings<'a> {
     pub(crate) private_key_file: &'a str,
     pub(crate) min_version_setting: &'static str,
     pub(crate) min_version: TlsMinVersion,
+    /// Client-certificate authentication for this listener, or `None` to
+    /// request no certificate.
+    pub(crate) client_auth: Option<InboundClientAuthSettings<'a>>,
+}
+
+/// One listener's resolved client-certificate authentication, paired with the
+/// setting names that produced it.
+///
+/// Only constructible through [`compose_inbound_client_auth`], which is what
+/// makes the invariant real rather than documented: a listener that asks for a
+/// client certificate always has a CA bundle to verify it against and an
+/// identity source to read it with, because a configuration missing either
+/// fails startup instead of reaching this type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InboundClientAuthSettings<'a> {
+    pub(crate) mode_setting: &'static str,
+    pub(crate) requirement: ClientCertRequirement,
+    pub(crate) ca_setting: &'static str,
+    pub(crate) ca_file: &'a str,
+    pub(crate) crl_setting: &'static str,
+    pub(crate) crl_file: Option<&'a str>,
+    pub(crate) identity_source: ClientCertIdentitySource,
+}
+
+/// The parsed, validated client-certificate settings for one listener.
+///
+/// See [`Config::client_cert_auth`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InboundClientAuthConfig {
+    pub mode_setting: &'static str,
+    pub requirement: ClientCertRequirement,
+    pub ca_setting: &'static str,
+    pub ca_file: String,
+    pub crl_setting: &'static str,
+    pub crl_file: Option<String>,
+    pub identity_source: ClientCertIdentitySource,
+}
+
+impl InboundClientAuthConfig {
+    fn settings(&self) -> InboundClientAuthSettings<'_> {
+        InboundClientAuthSettings {
+            mode_setting: self.mode_setting,
+            requirement: self.requirement,
+            ca_setting: self.ca_setting,
+            ca_file: &self.ca_file,
+            crl_setting: self.crl_setting,
+            crl_file: self.crl_file.as_deref(),
+            identity_source: self.identity_source,
+        }
+    }
+}
+
+/// The raw, still-unchecked client-certificate inputs for one listener.
+struct RawInboundClientAuth {
+    mode_setting: &'static str,
+    mode: ClientCertMode,
+    ca_setting: &'static str,
+    ca_file: Option<String>,
+    crl_setting: &'static str,
+    crl_file: Option<String>,
+    identity_source: Option<ClientCertIdentitySource>,
+    tls_certificate_setting: &'static str,
+    tls_configured: bool,
+}
+
+/// Turns one listener's client-certificate settings into a configuration, or
+/// into the reasons it is not one.
+///
+/// Every failure path returns `None` *and* records a problem, so a
+/// half-configured listener aborts startup rather than silently accepting
+/// anonymous connections on a listener an operator believes requires
+/// certificates.
+fn compose_inbound_client_auth(
+    raw: RawInboundClientAuth,
+    problems: &mut Vec<String>,
+) -> Option<InboundClientAuthConfig> {
+    let RawInboundClientAuth {
+        mode_setting,
+        mode,
+        ca_setting,
+        ca_file,
+        crl_setting,
+        crl_file,
+        identity_source,
+        tls_certificate_setting,
+        tls_configured,
+    } = raw;
+
+    let Some(requirement) = mode.requirement() else {
+        // Material configured against a mode that will never read it is the
+        // shape that makes an operator believe mutual TLS is on.
+        for (setting, value) in [(ca_setting, &ca_file), (crl_setting, &crl_file)] {
+            if value.is_some() {
+                problems.push(format!(
+                    "{setting} is set while {mode_setting} is `off`; set {mode_setting} to `optional` or `required`, or unset {setting}"
+                ));
+            }
+        }
+        return None;
+    };
+
+    let mut usable = true;
+    if !tls_configured {
+        problems.push(format!(
+            "{mode_setting} requires {tls_certificate_setting}; a listener that terminates no TLS never sees a client certificate"
+        ));
+        usable = false;
+    }
+    // Fail closed on the trust anchors. Falling back to the platform trust
+    // store here would mean any certificate any public CA has ever issued
+    // authenticates, which is never what configuring client certificates
+    // means.
+    let Some(ca_file) = ca_file else {
+        problems.push(format!(
+            "{mode_setting} requires {ca_setting}; client certificates are verified only against an explicitly configured CA bundle, never the platform trust store"
+        ));
+        return None;
+    };
+    let Some(identity_source) = identity_source else {
+        problems.push(format!(
+            "{mode_setting} requires CLIENT_CERT_IDENTITY_SOURCE; the certificate field that carries a caller's identity is a deployment decision the gateway will not guess"
+        ));
+        return None;
+    };
+    if !usable {
+        return None;
+    }
+
+    Some(InboundClientAuthConfig {
+        mode_setting,
+        requirement,
+        ca_setting,
+        ca_file,
+        crl_setting,
+        crl_file,
+        identity_source,
+    })
 }
 
 fn require_inbound_tls_pair(
@@ -4932,6 +5197,217 @@ mod tests {
                 .contains("ADMIN_TLS_CERT_FILE is set without ADMIN_TLS_KEY_FILE"),
             "{admin_certificate_only}"
         );
+    }
+
+    // --- client-certificate authentication ---------------------------------
+
+    /// The TLS settings a listener needs before client certificates mean
+    /// anything, so a client-cert test is not also asserting about the pair.
+    fn with_data_tls(name: &str) -> Option<Result<String, VarError>> {
+        match name {
+            "TLS_CERT_FILE" => Some(Ok("/run/tls/tls.crt".to_owned())),
+            "TLS_KEY_FILE" => Some(Ok("/run/tls/tls.key".to_owned())),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn client_certificate_auth_is_off_by_default() {
+        let config = Config::from_env_vars(|_| Err(VarError::NotPresent))
+            .expect("an unconfigured gateway should validate");
+
+        assert_eq!(config.client_cert_auth, None);
+        assert_eq!(config.admin_client_cert_auth, None);
+        assert!(!config.client_certificate_auth_enabled());
+
+        let tls_only =
+            Config::from_env_vars(|name| with_data_tls(name).unwrap_or(Err(VarError::NotPresent)))
+                .expect("terminating TLS should validate");
+
+        assert_eq!(
+            tls_only.client_cert_auth, None,
+            "terminating TLS must not by itself start requesting client certificates"
+        );
+        assert!(tls_only
+            .data_inbound_tls()
+            .expect("data TLS is configured")
+            .client_auth
+            .is_none());
+    }
+
+    /// Fail closed on the trust anchors.
+    ///
+    /// Falling back to the platform trust store would mean every certificate
+    /// every public CA has ever issued authenticates, so a mode with no bundle
+    /// is a startup failure rather than a default.
+    #[test]
+    fn requesting_client_certificates_without_a_ca_bundle_fails_startup() {
+        let error = Config::from_env_vars(|name| match name {
+            "CLIENT_CERT_MODE" => Ok("required".to_owned()),
+            "CLIENT_CERT_IDENTITY_SOURCE" => Ok("spiffe".to_owned()),
+            other => with_data_tls(other).unwrap_or(Err(VarError::NotPresent)),
+        })
+        .expect_err("client certificates with no CA bundle must not start");
+
+        assert!(
+            error
+                .to_string()
+                .contains("CLIENT_CERT_MODE requires CLIENT_CERT_CA_FILE"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("never the platform trust store"),
+            "the error must say why, not just what: {error}"
+        );
+    }
+
+    #[test]
+    fn requesting_client_certificates_without_an_identity_source_fails_startup() {
+        let error = Config::from_env_vars(|name| match name {
+            "CLIENT_CERT_MODE" => Ok("optional".to_owned()),
+            "CLIENT_CERT_CA_FILE" => Ok("/run/tls/client-ca.crt".to_owned()),
+            other => with_data_tls(other).unwrap_or(Err(VarError::NotPresent)),
+        })
+        .expect_err("client certificates with no identity source must not start");
+
+        assert!(
+            error
+                .to_string()
+                .contains("CLIENT_CERT_MODE requires CLIENT_CERT_IDENTITY_SOURCE"),
+            "{error}"
+        );
+    }
+
+    /// A listener that terminates no TLS never sees a certificate, so a mode
+    /// set on one is a configuration an operator would read as mutual TLS.
+    #[test]
+    fn requesting_client_certificates_on_a_plaintext_listener_fails_startup() {
+        let error = Config::from_env_vars(|name| match name {
+            "CLIENT_CERT_MODE" => Ok("required".to_owned()),
+            "CLIENT_CERT_CA_FILE" => Ok("/run/tls/client-ca.crt".to_owned()),
+            "CLIENT_CERT_IDENTITY_SOURCE" => Ok("spiffe".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("client certificates on a plaintext listener must not start");
+
+        assert!(
+            error
+                .to_string()
+                .contains("CLIENT_CERT_MODE requires TLS_CERT_FILE"),
+            "{error}"
+        );
+    }
+
+    /// Material configured against a mode that will never read it.
+    #[test]
+    fn client_certificate_material_without_a_mode_fails_startup() {
+        for (setting, value) in [
+            ("CLIENT_CERT_CA_FILE", "/run/tls/client-ca.crt"),
+            ("CLIENT_CERT_CRL_FILE", "/run/tls/client.crl"),
+        ] {
+            let error = Config::from_env_vars(|name| {
+                if name == setting {
+                    return Ok(value.to_owned());
+                }
+                with_data_tls(name).unwrap_or(Err(VarError::NotPresent))
+            })
+            .expect_err("material with no mode must not start");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{setting} is set while CLIENT_CERT_MODE is `off`")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_identity_source_with_no_listener_asking_for_certificates_fails_startup() {
+        let error = Config::from_env_vars(|name| match name {
+            "CLIENT_CERT_IDENTITY_SOURCE" => Ok("dns".to_owned()),
+            other => with_data_tls(other).unwrap_or(Err(VarError::NotPresent)),
+        })
+        .expect_err("an identity source with nothing to apply it to must not start");
+
+        assert!(
+            error.to_string().contains(
+                "CLIENT_CERT_IDENTITY_SOURCE is set while CLIENT_CERT_MODE and ADMIN_CLIENT_CERT_MODE are both off"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_client_certificate_mode_or_identity_source_fails_startup() {
+        let bad_mode = Config::from_env_vars(|name| match name {
+            "CLIENT_CERT_MODE" => Ok("yes".to_owned()),
+            other => with_data_tls(other).unwrap_or(Err(VarError::NotPresent)),
+        })
+        .expect_err("an unrecognised mode must not start");
+        assert!(
+            bad_mode
+                .to_string()
+                .contains("expected `off`, `optional`, or `required`"),
+            "{bad_mode}"
+        );
+
+        let bad_source = Config::from_env_vars(|name| match name {
+            "CLIENT_CERT_MODE" => Ok("required".to_owned()),
+            "CLIENT_CERT_CA_FILE" => Ok("/run/tls/client-ca.crt".to_owned()),
+            "CLIENT_CERT_IDENTITY_SOURCE" => Ok("subject-dn".to_owned()),
+            other => with_data_tls(other).unwrap_or(Err(VarError::NotPresent)),
+        })
+        .expect_err("an unsupported identity source must not start");
+        assert!(
+            bad_source
+                .to_string()
+                .contains("expected `spiffe`, `uri`, or `dns`"),
+            "the subject DN is not an available identity source: {bad_source}"
+        );
+    }
+
+    /// The two listeners are configured independently, and a fully configured
+    /// one reaches the loader with every part present.
+    #[test]
+    fn the_two_listeners_request_client_certificates_independently() {
+        let config = Config::from_env_vars(|name| match name {
+            "ADMIN_LISTEN_ADDR" => Ok("127.0.0.1:9091".to_owned()),
+            "ADMIN_TLS_CERT_FILE" => Ok("/run/tls/admin.crt".to_owned()),
+            "ADMIN_TLS_KEY_FILE" => Ok("/run/tls/admin.key".to_owned()),
+            "ADMIN_CLIENT_CERT_MODE" => Ok("required".to_owned()),
+            "ADMIN_CLIENT_CERT_CA_FILE" => Ok("/run/tls/admin-client-ca.crt".to_owned()),
+            "ADMIN_CLIENT_CERT_CRL_FILE" => Ok("/run/tls/admin-client.crl".to_owned()),
+            "CLIENT_CERT_IDENTITY_SOURCE" => Ok("spiffe".to_owned()),
+            other => with_data_tls(other).unwrap_or(Err(VarError::NotPresent)),
+        })
+        .expect("an admin-only client-certificate deployment should validate");
+
+        assert!(
+            config.client_cert_auth.is_none(),
+            "the data listener asked for nothing and must get nothing"
+        );
+        let admin = config
+            .admin_client_cert_auth
+            .as_ref()
+            .expect("the admin listener asked for client certificates");
+        assert_eq!(admin.requirement, ClientCertRequirement::Required);
+        assert_eq!(admin.ca_file, "/run/tls/admin-client-ca.crt");
+        assert_eq!(admin.crl_file.as_deref(), Some("/run/tls/admin-client.crl"));
+        assert_eq!(admin.identity_source, ClientCertIdentitySource::Spiffe);
+        assert!(config.client_certificate_auth_enabled());
+
+        let settings = config
+            .admin_inbound_tls()
+            .expect("admin TLS is configured")
+            .client_auth
+            .expect("admin client auth is configured");
+        assert_eq!(settings.requirement, ClientCertRequirement::Required);
+        assert!(config
+            .data_inbound_tls()
+            .expect("data TLS is configured")
+            .client_auth
+            .is_none());
     }
 
     /// Accepting admin TLS settings with no admin listener would leave the

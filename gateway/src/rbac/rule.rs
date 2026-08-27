@@ -5,6 +5,7 @@ use crate::auth::{AuthMethod, Principal};
 pub const AUTH_METHOD_BEARER_TOKEN: &str = "bearer_token";
 pub const AUTH_METHOD_SESSION_COOKIE: &str = "session_cookie";
 pub const AUTH_METHOD_SERVICE_TOKEN: &str = "service_token";
+pub const AUTH_METHOD_CLIENT_CERTIFICATE: &str = "client_certificate";
 
 /// Action applied by a first-match-wins firewall rule.
 ///
@@ -232,7 +233,10 @@ fn is_default_rule_enabled(value: &bool) -> bool {
 pub fn valid_auth_method_name(value: &str) -> bool {
     matches!(
         value,
-        AUTH_METHOD_BEARER_TOKEN | AUTH_METHOD_SESSION_COOKIE | AUTH_METHOD_SERVICE_TOKEN
+        AUTH_METHOD_BEARER_TOKEN
+            | AUTH_METHOD_SESSION_COOKIE
+            | AUTH_METHOD_SERVICE_TOKEN
+            | AUTH_METHOD_CLIENT_CERTIFICATE
     )
 }
 
@@ -253,6 +257,7 @@ pub(crate) fn auth_method_policy_value(auth_method: &AuthMethod) -> &'static str
         AuthMethod::Bearer => AUTH_METHOD_BEARER_TOKEN,
         AuthMethod::Cookie => AUTH_METHOD_SESSION_COOKIE,
         AuthMethod::ServiceToken => AUTH_METHOD_SERVICE_TOKEN,
+        AuthMethod::ClientCertificate => AUTH_METHOD_CLIENT_CERTIFICATE,
     }
 }
 

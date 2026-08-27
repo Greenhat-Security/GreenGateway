@@ -61,6 +61,35 @@ const SPOOFABLE_REQUEST_HEADERS: &[&str] = &[
     "x-auth-request-groups",
     "x-forwarded-client-cert",
     "x-ssl-client-cert",
+    // Client-certificate assertions, in every spelling the common TLS
+    // terminators use: nginx (`ssl-client-*`), HAProxy and Traefik
+    // (`x-forwarded-tls-client-cert*`), and the hand-rolled `x-client-*` pairs
+    // that appear in front of internal services. GreenGateway never reads any
+    // of these -- a certificate identity here can only come from a handshake
+    // this process terminated -- but an upstream behind it very well might, and
+    // an upstream that trusts its front proxy is exactly the reader these
+    // headers are aimed at. Stripping them means a caller cannot borrow the
+    // gateway's position in the topology to assert an identity it did not
+    // authenticate as.
+    "ssl-client-cert",
+    "ssl-client-verify",
+    "ssl-client-subject-dn",
+    "ssl-client-issuer-dn",
+    "x-ssl-client-verify",
+    "x-ssl-client-s-dn",
+    "x-ssl-client-i-dn",
+    "x-ssl-client-subject-dn",
+    "x-ssl-client-issuer-dn",
+    "x-ssl-client-fingerprint",
+    "x-ssl-client-serial",
+    "x-client-cert",
+    "x-client-verify",
+    "x-client-dn",
+    "x-client-subject-dn",
+    "x-client-fingerprint",
+    "x-forwarded-tls-client-cert",
+    "x-forwarded-tls-client-cert-info",
+    "x-spiffe-id",
     // Authorization scopes, groups, and tenant claims.
     "x-groups",
     "x-group",
@@ -245,6 +274,75 @@ mod tests {
             .await
             .expect("body should read");
         assert_eq!(&body[..], b"missing");
+    }
+
+    /// Every mTLS assertion header a common terminator emits, named one at a
+    /// time.
+    ///
+    /// GreenGateway does not read any of these -- a certificate identity here
+    /// comes only from a handshake this process terminated -- but an upstream
+    /// behind it may, and an upstream that trusts its front proxy is exactly
+    /// the reader they are aimed at. Each is asserted individually so that
+    /// dropping one from the list fails here rather than being masked by the
+    /// others.
+    #[tokio::test]
+    async fn strips_every_client_certificate_assertion_header() {
+        const ASSERTION_HEADERS: &[&str] = &[
+            "x-forwarded-client-cert",
+            "x-ssl-client-cert",
+            "ssl-client-cert",
+            "ssl-client-verify",
+            "ssl-client-subject-dn",
+            "ssl-client-issuer-dn",
+            "x-ssl-client-verify",
+            "x-ssl-client-s-dn",
+            "x-ssl-client-i-dn",
+            "x-ssl-client-subject-dn",
+            "x-ssl-client-issuer-dn",
+            "x-ssl-client-fingerprint",
+            "x-ssl-client-serial",
+            "x-client-cert",
+            "x-client-verify",
+            "x-client-dn",
+            "x-client-subject-dn",
+            "x-client-fingerprint",
+            "x-forwarded-tls-client-cert",
+            "x-forwarded-tls-client-cert-info",
+            "x-spiffe-id",
+        ];
+
+        async fn echo_surviving_headers(headers: http::HeaderMap) -> String {
+            headers
+                .keys()
+                .map(http::HeaderName::as_str)
+                .filter(|name| *name != "host")
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        for header in ASSERTION_HEADERS {
+            let response = Router::new()
+                .route("/", get(echo_surviving_headers))
+                .layer(from_fn(header_hardening_middleware))
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(*header, "spiffe://gateway.test/ns/payments/sa/admin")
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("request should complete");
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should read");
+            let surviving = String::from_utf8_lossy(&body);
+            assert!(
+                !surviving.contains(header),
+                "{header} reached the handler; a caller must not be able to assert a                  certificate identity the gateway did not verify. Surviving headers: {surviving}"
+            );
+        }
     }
 
     #[tokio::test]

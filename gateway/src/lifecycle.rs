@@ -9,7 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::{serve::ListenerExt as _, Extension, Router};
+use axum::{
+    extract::{ConnectInfo, Request},
+    middleware::Next,
+    response::Response,
+    Extension, Router,
+};
 use serde_json::json;
 use time::OffsetDateTime;
 use tokio_util::{
@@ -20,8 +25,10 @@ use tokio_util::{
 #[cfg(test)]
 use crate::inbound_tls::ConnectionScheme;
 use crate::{
-    audit, config,
-    inbound_tls::{BoundListener, InboundTlsBindings},
+    audit,
+    auth::VerifiedClientIdentity,
+    config,
+    inbound_tls::{BoundListener, InboundConnectInfo, InboundTlsBindings},
 };
 
 const STARTING: u8 = 0;
@@ -720,31 +727,62 @@ fn gateway_event(event_type: &'static str, payload: serde_json::Value) -> audit:
 /// `ConnectInfo<SocketAddr>` extractor `crate::client_ip` depends on, and
 /// graceful shutdown are identical whether or not the listener terminates TLS.
 /// TLS is a `Listener` implementation here, not a second serving path.
+///
+/// Both arms also go through [`spread_inbound_connect_info`], which is what
+/// keeps `ConnectInfo<SocketAddr>` meaning what it has always meant while a
+/// second, richer connect-info type carries the client-certificate identity.
+/// Applying it here rather than at each router's construction site is the point:
+/// every listener this gateway serves passes through this function, so no route
+/// can be reached with a stale identity extension or without a peer address.
 pub(crate) async fn serve_router_with_shutdown(
     listener: BoundListener,
     app: Router,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
-    let service = app.into_make_service_with_connect_info::<SocketAddr>();
+    let app = app.layer(axum::middleware::from_fn(spread_inbound_connect_info));
+    let service = app.into_make_service_with_connect_info::<InboundConnectInfo>();
     match listener {
         BoundListener::Plain(listener) => {
             axum::serve(listener, service)
                 .with_graceful_shutdown(shutdown.cancelled_owned())
                 .await
         }
-        // The tap is deliberately empty. `ConnectInfo<SocketAddr>` is how
-        // `crate::client_ip` learns the peer address, and axum only supplies
-        // the `Connected` impl that produces it for a custom listener through
-        // `TapIo`: writing that impl here is impossible, because both
-        // `Connected` and `SocketAddr` are foreign and the orphan rule refuses
-        // it. So the TLS listener goes through the hook axum provides, and
-        // reaches exactly the same connect-info wiring as the plaintext one.
         BoundListener::Tls(listener) => {
-            axum::serve(listener.tap_io(|_| {}), service)
+            axum::serve(listener, service)
                 .with_graceful_shutdown(shutdown.cancelled_owned())
                 .await
         }
     }
+}
+
+/// Splits the listener's connect info into the extensions the rest of the
+/// gateway reads.
+///
+/// Runs outermost, before authentication, RBAC, rate limiting, or header
+/// hardening, because all four read one or both of the extensions it writes.
+///
+/// The identity extension is **removed before it is written**, on every
+/// request, including requests that carry no certificate. Nothing today can put
+/// one there -- extensions are not parsed from the wire, and
+/// `VerifiedClientIdentity` has no public constructor -- so this is not
+/// defusing a live path. It is making the invariant local: whatever else a
+/// future layer or handler does, the identity a request reaches auth with is
+/// the one this connection's handshake produced, and a connection that produced
+/// none reaches auth with none.
+async fn spread_inbound_connect_info(mut request: Request, next: Next) -> Response {
+    request.extensions_mut().remove::<VerifiedClientIdentity>();
+
+    if let Some(ConnectInfo(info)) = request
+        .extensions_mut()
+        .remove::<ConnectInfo<InboundConnectInfo>>()
+    {
+        request.extensions_mut().insert(ConnectInfo(info.peer_addr));
+        if let Some(identity) = info.client_identity {
+            request.extensions_mut().insert(identity);
+        }
+    }
+
+    next.run(request).await
 }
 
 #[cfg(test)]

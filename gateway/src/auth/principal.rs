@@ -5,6 +5,13 @@ pub enum AuthMethod {
     Cookie,
     Bearer,
     ServiceToken,
+    /// A client certificate verified during the inbound TLS handshake.
+    ///
+    /// A separate variant rather than a reuse of an existing one because RBAC
+    /// rules match on it: a policy that says `auth_methods: ["bearer_token"]`
+    /// must not start matching certificate principals, and one that means to
+    /// name certificates must be able to.
+    ClientCertificate,
 }
 
 impl AuthMethod {
@@ -13,6 +20,7 @@ impl AuthMethod {
             Self::Cookie => "session_cookie",
             Self::Bearer => "bearer_token",
             Self::ServiceToken => "service_token",
+            Self::ClientCertificate => "client_certificate",
         }
     }
 }

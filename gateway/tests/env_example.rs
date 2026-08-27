@@ -189,6 +189,21 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
         "TLS_MIN_VERSION",
         "TLS_HANDSHAKE_TIMEOUT_MS",
         "TLS_MAX_CONCURRENT_HANDSHAKES",
+        // Client-certificate authentication is excluded for a sharper version
+        // of the same reason. It is not merely unusable through a Worker: the
+        // edge terminates the client's TLS connection, so the client
+        // certificate -- if the caller even sent one -- never reaches the
+        // container, and the Durable Object's own connection carries none.
+        // Forwarding CLIENT_CERT_MODE=required would therefore refuse every
+        // request in a deployment whose configuration said mutual TLS was
+        // working.
+        "CLIENT_CERT_MODE",
+        "CLIENT_CERT_CA_FILE",
+        "CLIENT_CERT_CRL_FILE",
+        "CLIENT_CERT_IDENTITY_SOURCE",
+        "ADMIN_CLIENT_CERT_MODE",
+        "ADMIN_CLIENT_CERT_CA_FILE",
+        "ADMIN_CLIENT_CERT_CRL_FILE",
         "GRPC_LISTEN_ADDR",
         "GRPC_MAX_CONCURRENT_STREAMS",
         "GRPC_MAX_METADATA_BYTES",

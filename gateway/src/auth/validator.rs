@@ -1,12 +1,20 @@
 use std::{error::Error, fmt};
 
-use super::Principal;
+use super::{client_certificate::VerifiedClientIdentity, Principal};
 
 /// Credential material extracted from an incoming request for validation.
 pub enum SessionCredential {
     #[allow(dead_code)] // Cookie validators land after the bearer JWT path.
     Cookie(String),
     Bearer(String),
+    /// An identity read out of a client certificate the TLS handshake already
+    /// verified.
+    ///
+    /// Unlike the other two this is not a secret and not caller-supplied text:
+    /// it can only be constructed by the inbound TLS listener from a chain that
+    /// passed the configured client CA bundle, so a validator that receives one
+    /// is being handed a completed authentication, not a claim to check.
+    ClientCertificate(VerifiedClientIdentity),
 }
 
 impl fmt::Debug for SessionCredential {
@@ -14,6 +22,12 @@ impl fmt::Debug for SessionCredential {
         match self {
             Self::Cookie(_) => formatter.write_str("Cookie(<redacted>)"),
             Self::Bearer(_) => formatter.write_str("Bearer(<redacted>)"),
+            // Not redacted: a certificate identity is public material, and it
+            // is bounded to printable ASCII before it can exist, so it cannot
+            // smuggle a newline into a log line the way a raw credential could.
+            Self::ClientCertificate(identity) => {
+                write!(formatter, "ClientCertificate({})", identity.identity())
+            }
         }
     }
 }
@@ -73,6 +87,18 @@ pub trait SessionValidator: Send + Sync {
     /// `validate_session`, so the default only opts into receiving this channel.
     fn supports_bearer(&self) -> bool {
         true
+    }
+
+    /// Routing hint for whether this validator should receive client-certificate
+    /// credentials.
+    ///
+    /// Defaults to `false`, unlike the other two channels. They default to true
+    /// because every validator predates them and can judge them; this channel
+    /// is new, so a validator that has not been told about certificates has not
+    /// opted into being asked about them. Opting in is what
+    /// `ClientCertificateValidator` does.
+    fn supports_client_certificate(&self) -> bool {
+        false
     }
 }
 

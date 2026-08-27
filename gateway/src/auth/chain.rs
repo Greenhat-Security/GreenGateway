@@ -72,6 +72,12 @@ impl SessionValidator for ChainValidator {
             .iter()
             .any(|validator| validator.supports_bearer())
     }
+
+    fn supports_client_certificate(&self) -> bool {
+        self.validators
+            .iter()
+            .any(|validator| validator.supports_client_certificate())
+    }
 }
 
 #[cfg(test)]

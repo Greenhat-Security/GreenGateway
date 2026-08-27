@@ -796,6 +796,7 @@ dependencies = [
  "rust-embed",
  "rustix",
  "rustls-platform-verifier",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "sha2",

@@ -151,6 +151,100 @@ The budget is per listener, not per process. The data and admin listeners run se
 
 The default is set well above any plausible legitimate burst, so reaching it is a signal rather than a routine event. `inbound_tls_handshakes_in_flight` reports the slots in use and `inbound_tls_handshakes_total{listener,outcome}` counts every outcome, including `outcome="shed"`; a non-zero shed rate means real clients are being refused and is worth alerting on.
 
+### CLIENT_CERT_MODE
+
+Whether the data listener asks callers for a client certificate, and what it does with a caller who has none.
+
+Default: `off`
+
+Format and validation: must be exactly `off`, `optional`, or `required`.
+
+- `off` requests nothing. A listener with this setting behaves exactly as one without it.
+- `optional` requests a certificate and serves callers who decline. A caller who declines has **no certificate identity at all** and must authenticate by some other method or be refused; there is no partially-trusted state.
+- `required` refuses the handshake when no certificate is offered.
+
+A certificate that *is* offered is verified identically under `optional` and `required`. `optional` softens only the anonymous case; it never means a certificate is trusted less. So presenting nothing is never worth more than presenting something invalid: an invalid certificate fails the handshake, and no certificate produces no identity.
+
+`optional` exists for migrations — a listener already serving bearer-token callers can begin accepting certificate identities before every caller has been issued one.
+
+Setting this to anything but `off` requires `TLS_CERT_FILE` (a listener that terminates no TLS never sees a certificate), `CLIENT_CERT_CA_FILE`, and `CLIENT_CERT_IDENTITY_SOURCE`. Any of them missing fails startup rather than leaving a listener that an operator believes requires certificates accepting anonymous connections.
+
+### CLIENT_CERT_CA_FILE
+
+PEM bundle of the certificate authorities permitted to issue client certificates for the data listener.
+
+Default: empty. Required when `CLIENT_CERT_MODE` is not `off`, and rejected when it is.
+
+Format and validation: read through the same bounded, capability-confined reader as `TLS_CERT_FILE`, with the same 1 MiB bound and the same directory rules. Every certificate in the file must be usable as a trust anchor; one that is not fails startup rather than being skipped, because silently trusting the remainder would mean the set of callers who can authenticate is not the set the operator wrote down. A file that also contains a `PRIVATE KEY` section is refused.
+
+Permissions: the bundle is public material, so group and other *read* is permitted. Group or other *write* fails startup — a trust bundle an attacker can rewrite is a trust bundle an attacker chooses.
+
+**The platform trust store is never consulted for client authentication, and there is no setting that opts into it.** Trusting the operating system's roots here would mean every certificate every public CA has ever issued authenticates to this gateway, which is essentially never what configuring mutual TLS means. This is the one place where the gateway's outbound behaviour and its inbound behaviour deliberately differ: an outbound connection is verifying a *server* that a public CA plausibly vouches for, and an inbound client certificate is a credential the operator issues.
+
+### CLIENT_CERT_CRL_FILE
+
+Optional PEM certificate revocation list, or concatenation of lists, for data-listener client certificates.
+
+Default: empty.
+
+**Revocation is not checked unless this is set.** rustls consults neither CRLs nor OCSP by default, and this gateway adds no other revocation source: with this setting empty, a revoked certificate authenticates until it expires. That is stated here rather than left implied, because an operator who believes revocation works when it does not is in a worse position than one who knows it does not.
+
+When it is set, revocation is enforced strictly:
+
+- **The whole verified chain** is checked, not just the end-entity certificate. A deployment with intermediate CAs needs CRLs covering them too. The trust anchor itself is excluded.
+- **An undeterminable status is a failure.** A certificate whose revocation status no configured CRL covers is refused.
+- **An expired CRL is treated as no CRL, not as a still-valid one.** A CRL whose `nextUpdate` has passed refuses every certificate in its scope.
+
+The last point is the sharp one and it is deliberate. The alternative — honouring a stale CRL — means a deployment whose CRL publishing quietly broke keeps accepting certificates revoked since the last list it managed to fetch, with nothing to show for it. Refresh the CRL on a schedule shorter than its validity window. `inbound_client_certificates_total{outcome="rejected_expired_revocation_list"}` is the counter to alert on; `outcome="rejected_revoked"` is the evidence that revocation is being consulted at all.
+
+Certificate reload without a restart is not implemented yet, for this file or for the CA bundle: both are read once at startup, so refreshing a CRL means restarting the process. That limitation is tracked with the rest of the reload work under issue #324.
+
+### CLIENT_CERT_IDENTITY_SOURCE
+
+Which field of a verified client certificate carries the caller's identity. Applies to both listeners.
+
+Default: empty. Required when either listener requests client certificates, and rejected when neither does.
+
+Format and validation: must be exactly `spiffe`, `uri`, or `dns`.
+
+| value | reads | notes |
+| --- | --- | --- |
+| `spiffe` | the URI SAN whose scheme is `spiffe` | Recommended. Exactly one per SVID by specification, canonical by specification, and stable across the certificate rotation SPIFFE expects. |
+| `uri` | the URI SAN, verbatim | For a private PKI that names workloads with URIs that are not SPIFFE IDs. |
+| `dns` | the DNS SAN, lower-cased | Weakest. DNS SANs were designed to name the server being connected *to*, so certificates commonly carry several — and a certificate with several different ones has no identity. Wildcards are never an identity. |
+
+**The rule is exactly one.** A certificate carrying no value of the configured kind has no identity. A certificate carrying two *different* values has no identity either. The gateway never takes the first of several: whoever assembles a certificate chooses the order of its SANs, so if order decided the principal, a caller who can persuade a CA to add one more SAN would choose which principal they authenticate as. Two SANs spelling the same canonical value are one identity, not two.
+
+A certificate that verifies but yields no identity does not authenticate. The connection is established — the certificate was valid — and the request is answered `401` with no principal, which is the same position a caller with no certificate is in.
+
+The identity must already be in canonical form; the gateway rejects rather than repairs. A SPIFFE ID must have a lower-case `spiffe` scheme and trust domain, no userinfo, port, query, or fragment, and no empty or dot path segments. Normalising any of these would be deciding that two different strings are the same principal. It must also be non-empty printable ASCII with no spaces and at most 255 bytes, because it becomes a `principal_id` in policy, a `user_id` in audit, and text in a log line.
+
+**Why the subject DN is not an option.** A DN is not a string but a sequence of relative distinguished names, each holding possibly several attributes in possibly several string encodings. Rendering one as text means choosing an escaping and an ordering that libraries disagree about, and the escaping is where the bugs are: a CA that lets a requester choose their own `CN` lets them choose one containing `,OU=`, and produce a rendered DN that collides with somebody else's identity. There is no canonical DN renderer in this dependency graph, and writing one to decide who an authenticated caller is would be the wrong place to hand-roll ASN.1. Email SANs are excluded for a duller reason: `rfc822Name` identifies a mailbox rather than a workload, and mailboxes get reassigned.
+
+### ADMIN_CLIENT_CERT_MODE
+
+Whether the admin listener asks callers for a client certificate.
+
+Default: `off`
+
+Format and validation: as `CLIENT_CERT_MODE`, and requires `ADMIN_TLS_CERT_FILE` rather than `TLS_CERT_FILE`. Configured independently of the data listener: the two are frequently reached over different networks, and requiring certificates on one says nothing about the other. `CLIENT_CERT_IDENTITY_SOURCE` is shared, because it describes how an organisation issues certificates rather than which listener receives them.
+
+### ADMIN_CLIENT_CERT_CA_FILE
+
+PEM bundle of the certificate authorities permitted to issue client certificates for the admin listener.
+
+Default: empty. Required when `ADMIN_CLIENT_CERT_MODE` is not `off`, and rejected when it is.
+
+Format and validation: as `CLIENT_CERT_CA_FILE`, including the permission rules and the refusal to fall back to the platform trust store.
+
+### ADMIN_CLIENT_CERT_CRL_FILE
+
+Optional PEM certificate revocation list for admin-listener client certificates.
+
+Default: empty, which means **no revocation checking on that listener**.
+
+Format and validation: as `CLIENT_CERT_CRL_FILE`, including the strict enforcement and the expired-CRL behaviour.
+
 ### ADMIN_PREFIX
 
 Path prefix for the gateway's admin UI and control-plane API surface.

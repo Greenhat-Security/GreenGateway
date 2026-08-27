@@ -53,6 +53,14 @@ rust-embed = "8"
 # it. `default-features = false` keeps the `ffi-testing` feature -- the only one
 # that would pull `rustls/ring` -- unreachable from here.
 rustls-platform-verifier = { version = "0.7.0", default-features = false }
+# Already in the graph transitively: this is the same 0.103.x `rustls` itself
+# resolves and uses to verify certificates. Naming it directly adds a dependency
+# edge, not a crate, and gives `gateway/src/auth/client_certificate.rs` the
+# already-verified certificate's SAN accessors by name -- so the identity a
+# client authenticates as is read by the same parser that verified the chain,
+# rather than by an ASN.1 walk written here. No crypto backend feature is
+# requested: nothing in this gateway asks webpki to verify a signature directly.
+rustls-webpki = { version = "0.103.13", default-features = false, features = ["std"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["arbitrary_precision"] }
 sha2 = "0.10.9"

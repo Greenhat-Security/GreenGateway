@@ -795,6 +795,7 @@ fn principal_admission_key(principal: &Principal) -> [u8; 32] {
         AuthMethod::Cookie => 1,
         AuthMethod::Bearer => 2,
         AuthMethod::ServiceToken => 3,
+        AuthMethod::ClientCertificate => 4,
     }]);
     hasher.finalize().into()
 }

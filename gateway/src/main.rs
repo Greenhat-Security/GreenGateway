@@ -2175,15 +2175,31 @@ fn auth_validator_from_config(
     service_token_validator: Option<Arc<auth::ServiceTokenValidator>>,
     discovered_oidc_jwks_urls: &HashMap<String, String>,
 ) -> Result<Option<Arc<dyn auth::SessionValidator>>, auth::AuthError> {
-    if config.auth_providers.is_empty() && service_token_validator.is_none() {
+    let client_certificate_auth = config.client_certificate_auth_enabled();
+    if config.auth_providers.is_empty()
+        && service_token_validator.is_none()
+        && !client_certificate_auth
+    {
         return Ok(None);
     }
 
     let mut validators = Vec::with_capacity(
-        config.auth_providers.len() + usize::from(service_token_validator.is_some()),
+        config.auth_providers.len()
+            + usize::from(service_token_validator.is_some())
+            + usize::from(client_certificate_auth),
     );
     if let Some(service_token_validator) = service_token_validator {
         validators.push(service_token_validator as Arc<dyn auth::SessionValidator>);
+    }
+    if client_certificate_auth {
+        // Position in the chain is not a precedence decision. Every validator
+        // is offered every credential and each rejects the kinds it does not
+        // own, so the certificate validator sits first only because it is the
+        // cheapest rejection: it does no work at all on a credential that is
+        // not a certificate, and it never returns `AuthError::Upstream`, so it
+        // cannot turn another provider's 401 into a 503.
+        validators
+            .push(Arc::new(auth::ClientCertificateValidator) as Arc<dyn auth::SessionValidator>);
     }
     for provider in &config.auth_providers {
         match provider.provider_type {
@@ -11439,6 +11455,7 @@ fn test_auth_method_label(auth_method: &auth::AuthMethod) -> &'static str {
         auth::AuthMethod::Cookie => "session_cookie",
         auth::AuthMethod::Bearer => "bearer_token",
         auth::AuthMethod::ServiceToken => "service_token",
+        auth::AuthMethod::ClientCertificate => "client_certificate",
     }
 }
 
@@ -11510,6 +11527,8 @@ mod tests {
             tls_min_version: config::DEFAULT_TLS_MIN_VERSION,
             tls_handshake_timeout_ms: config::DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
             tls_max_concurrent_handshakes: config::DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES,
+            client_cert_auth: None,
+            admin_client_cert_auth: None,
             admin_prefix: config::DEFAULT_ADMIN_PREFIX.to_owned(),
             admin_login_provider: None,
             admin_login_pending_ttl_secs: config::DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,

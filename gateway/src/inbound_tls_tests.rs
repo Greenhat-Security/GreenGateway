@@ -1250,3 +1250,866 @@ fn a_symlink_escaping_the_material_directory_fails_startup() {
         }
     );
 }
+
+// --- client-certificate authentication --------------------------------------
+//
+// Everything below drives a real handshake against a real listener. That is the
+// point: the properties being asserted -- that an untrusted, expired, revoked,
+// or wrong-purpose certificate never produces an identity -- are properties of
+// rustls' verifier as this gateway configures it, and a test that stubbed the
+// verifier out would be asserting only that the stub was called.
+//
+// Every negative case asserts *which way* the decision went, not merely that
+// something failed: either the handshake was refused, or a request was served
+// and answered 401 with no principal. "The request errored" would pass against
+// a listener that was simply broken.
+
+use axum::{extract::Request, http::StatusCode, middleware::from_fn};
+use rcgen::{
+    BasicConstraints, CertificateParams, CertificateRevocationListParams, DistinguishedName,
+    DnType, ExtendedKeyUsagePurpose, Ia5String, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose,
+    RevocationReason, RevokedCertParams, SanType, SerialNumber,
+};
+use time::{Duration as TimeDuration, OffsetDateTime};
+use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+use crate::{
+    audit::{AuditEvent, AuditLog, AuditSink},
+    auth::{
+        chain::ChainValidator, ClientCertIdentitySource, ClientCertificateValidator, Principal,
+        PrincipalDirectory, SessionValidator,
+    },
+    client_ip::ClientIpPolicy,
+    config::AuthMode,
+    inbound_tls::ClientCertRequirement,
+    middleware::{auth::AuthState, headers::header_hardening_middleware},
+};
+
+const CLIENT_SPIFFE_ID: &str = "spiffe://gateway.test/ns/payments/sa/api";
+const OTHER_SPIFFE_ID: &str = "spiffe://gateway.test/ns/payments/sa/batch";
+
+/// A throwaway client CA, kept alive so it can sign leaves and CRLs.
+struct ClientCa {
+    certificate: rcgen::Certificate,
+    key: KeyPair,
+    pem: String,
+}
+
+fn client_ca() -> ClientCa {
+    client_ca_named("GreenGateway Client Test CA")
+}
+
+fn client_ca_named(common_name: &str) -> ClientCa {
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, common_name);
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    // webpki consults key usage to decide whether an issuer may sign
+    // certificates and CRLs, so a CA that declares any usage must declare both.
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let key = KeyPair::generate().expect("test client CA key should generate");
+    let certificate = params
+        .self_signed(&key)
+        .expect("test client CA certificate should build");
+    let pem = certificate.pem();
+
+    ClientCa {
+        certificate,
+        key,
+        pem,
+    }
+}
+
+/// One issued client certificate, in the form a rustls client wants it.
+struct ClientIdentity {
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    serial: SerialNumber,
+}
+
+/// How a test wants its client certificate to differ from a good one.
+struct ClientIdentitySpec {
+    sans: Vec<SanType>,
+    extended_key_usages: Vec<ExtendedKeyUsagePurpose>,
+    not_after: OffsetDateTime,
+    serial: u64,
+}
+
+impl Default for ClientIdentitySpec {
+    fn default() -> Self {
+        Self {
+            sans: vec![uri_san(CLIENT_SPIFFE_ID)],
+            extended_key_usages: vec![ExtendedKeyUsagePurpose::ClientAuth],
+            not_after: OffsetDateTime::now_utc() + TimeDuration::days(1),
+            serial: 1,
+        }
+    }
+}
+
+fn uri_san(value: &str) -> SanType {
+    SanType::URI(Ia5String::try_from(value).expect("test URI SAN should be IA5"))
+}
+
+fn issue_client_identity(ca: &ClientCa, spec: ClientIdentitySpec) -> ClientIdentity {
+    let mut params = CertificateParams::default();
+    params.subject_alt_names = spec.sans;
+    params.extended_key_usages = spec.extended_key_usages;
+    params.not_before = OffsetDateTime::now_utc() - TimeDuration::days(1);
+    params.not_after = spec.not_after;
+    let serial = SerialNumber::from(spec.serial);
+    params.serial_number = Some(serial.clone());
+    let key = KeyPair::generate().expect("test client key should generate");
+    let certificate = params
+        .signed_by(&key, &ca.certificate, &ca.key)
+        .expect("test client certificate should build");
+
+    ClientIdentity {
+        chain: vec![certificate.der().clone()],
+        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        serial,
+    }
+}
+
+/// A CRL naming `revoked`, valid for `[now + issued, now + expires]`.
+///
+/// Both bounds are parameters so a test can produce an already-expired CRL --
+/// which is a well-formed CRL, not a malformed one, and is the fixture the
+/// expiry-enforcement test needs.
+fn client_crl(
+    ca: &ClientCa,
+    revoked: &[&SerialNumber],
+    issued: TimeDuration,
+    expires: TimeDuration,
+) -> String {
+    let now = OffsetDateTime::now_utc();
+    CertificateRevocationListParams {
+        this_update: now + issued,
+        next_update: now + expires,
+        crl_number: SerialNumber::from(1u64),
+        issuing_distribution_point: None,
+        revoked_certs: revoked
+            .iter()
+            .map(|serial| RevokedCertParams {
+                serial_number: (*serial).clone(),
+                revocation_time: now - TimeDuration::hours(1),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            })
+            .collect(),
+        key_identifier_method: KeyIdMethod::Sha256,
+    }
+    .signed_by(&ca.certificate, &ca.key)
+    .expect("test CRL should build")
+    .pem()
+    .expect("test CRL should encode as PEM")
+}
+
+/// A data-listener configuration that terminates TLS and asks for client
+/// certificates.
+fn client_auth_config(
+    material: &MaterialDir,
+    requirement: ClientCertRequirement,
+    crl_file: Option<&str>,
+) -> Config {
+    let mut config = tls_config(material);
+    config.client_cert_auth = Some(crate::config::InboundClientAuthConfig {
+        mode_setting: "CLIENT_CERT_MODE",
+        requirement,
+        ca_setting: "CLIENT_CERT_CA_FILE",
+        ca_file: material.path("client-ca.crt"),
+        crl_setting: "CLIENT_CERT_CRL_FILE",
+        crl_file: crl_file.map(|name| material.path(name)),
+        identity_source: ClientCertIdentitySource::Spiffe,
+    });
+    config
+}
+
+fn client_config_with_identity(ca_der: &[u8], identity: Option<ClientIdentity>) -> ClientConfig {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(ca_der.to_vec()))
+        .expect("test CA should be accepted as a root");
+    let builder = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+        .with_protocol_versions(&[&version::TLS12, &version::TLS13])
+        .expect("test client protocol versions should be supported")
+        .with_root_certificates(roots);
+    let mut config = match identity {
+        Some(identity) => builder
+            .with_client_auth_cert(identity.chain, identity.key)
+            .expect("test client identity should load"),
+        None => builder.with_no_client_auth(),
+    };
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config
+}
+
+struct SilentAuditSink;
+
+impl AuditSink for SilentAuditSink {
+    fn emit(&self, _event: &AuditEvent) {}
+}
+
+/// A router that runs the real authentication middleware over the real
+/// certificate validator, and reports what it decided.
+///
+/// `/whoami` answers `200` with the authenticated principal id, or the
+/// middleware answers `401` on its own. Nothing here fabricates a principal, so
+/// "no principal was produced" is observable as a 401 rather than inferred.
+fn authenticating_router() -> Router {
+    let state = AuthState {
+        validator: Some(Arc::new(ChainValidator::new(vec![
+            Arc::new(ClientCertificateValidator) as Arc<dyn SessionValidator>,
+        ])) as Arc<dyn SessionValidator>),
+        mode: AuthMode::Required,
+        cookie_name: "session".to_owned(),
+        exempt_paths: Vec::new(),
+        audit: AuditLog::new(Arc::new(SilentAuditSink) as Arc<dyn AuditSink>),
+        principal_directory: PrincipalDirectory::disabled(),
+        client_ip_policy: ClientIpPolicy::default(),
+        mcp_route_paths: Vec::new(),
+        mcp_resource: None,
+        mcp_resource_metadata_url: None,
+    };
+
+    Router::new()
+        .route(
+            "/whoami",
+            get(|request: Request| async move {
+                let principal = request.extensions().get::<Principal>().cloned();
+                let asserted = request
+                    .headers()
+                    .get("x-ssl-client-verify")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("none")
+                    .to_owned();
+                match principal {
+                    Some(principal) => {
+                        format!("principal={} asserted={asserted}", principal.user_id)
+                    }
+                    None => format!("principal=none asserted={asserted}"),
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::middleware::auth::auth_middleware,
+        ))
+        .layer(from_fn(header_hardening_middleware))
+}
+
+async fn serve_authenticating(bindings: &InboundTlsBindings) -> RunningListener {
+    let tcp = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("test listener should bind");
+    let bound = bindings
+        .bind_data(tcp)
+        .expect("test listener should wrap without error");
+    let addr = bound
+        .local_addr()
+        .expect("bound address should be readable");
+    let router = authenticating_router().layer(Extension(bound.scheme()));
+    let shutdown = CancellationToken::new();
+    let server = tokio::spawn(serve_router_with_shutdown(bound, router, shutdown.clone()));
+
+    RunningListener {
+        addr,
+        shutdown,
+        server,
+    }
+}
+
+/// Completes a handshake and asks `/whoami`, carrying the mTLS assertion
+/// headers a fronting terminator would set.
+///
+/// The headers are always sent, in every case, so that "the certificate decided
+/// this" is distinguishable from "a header decided this" in the negative cases
+/// as well as the positive ones.
+async fn whoami(addr: SocketAddr, config: ClientConfig) -> Result<String, String> {
+    let tcp = TcpStream::connect(addr)
+        .await
+        .map_err(|error| format!("connect failed: {error}"))?;
+    let server_name = ServerName::try_from(SERVER_NAME).expect("test server name should parse");
+    let mut stream = TlsConnector::from(Arc::new(config))
+        .connect(server_name, tcp)
+        .await
+        .map_err(|error| format!("handshake failed: {error}"))?;
+
+    stream
+        .write_all(
+            format!(
+                "GET /whoami HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                 x-ssl-client-verify: SUCCESS\r\n\
+                 x-ssl-client-s-dn: CN=admin\r\n\
+                 x-forwarded-client-cert: URI=spiffe://gateway.test/ns/payments/sa/admin\r\n\
+                 x-spiffe-id: spiffe://gateway.test/ns/payments/sa/admin\r\n\
+                 Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .map_err(|error| format!("request write failed: {error}"))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .map_err(|error| format!("response read failed: {error}"))?;
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+/// Writes a server identity, a client CA, and optionally a CRL into one
+/// directory.
+fn write_client_auth_material(material: &MaterialDir, ca: &ClientCa) -> ServerIdentity {
+    let identity = write_default_identity(material);
+    material.write("client-ca.crt", &ca.pem);
+    identity
+}
+
+/// Asserts that a connection was torn down by the named TLS alert.
+///
+/// Naming the alert is what keeps this from being "the request errored": the
+/// alert says which check refused the certificate, so a test for an expired
+/// certificate cannot pass because the listener was broken, misconfigured, or
+/// refusing for some entirely different reason.
+fn assert_refused_with_alert(result: Result<String, String>, alert: &str, context: &str) {
+    match result {
+        Ok(response) => panic!("{context}: the request was served instead of refused: {response}"),
+        Err(refusal) => assert!(
+            refusal.contains(alert),
+            "{context}: expected the connection to be refused with the {alert} alert, got: {refusal}"
+        ),
+    }
+}
+
+fn assert_unauthorized(response: &str, context: &str) {
+    assert!(
+        response.starts_with(&format!("HTTP/1.1 {}", StatusCode::UNAUTHORIZED.as_u16())),
+        "{context}: expected a 401, got: {response}"
+    );
+    assert!(
+        !response.contains(CLIENT_SPIFFE_ID) && !response.contains("principal=spiffe"),
+        "{context}: no principal may appear in the response: {response}"
+    );
+}
+
+#[tokio::test]
+async fn a_verified_client_certificate_authenticates_as_its_spiffe_id() {
+    let material = MaterialDir::new();
+    let ca = client_ca();
+    let server = write_client_auth_material(&material, &ca);
+    let bindings = InboundTlsBindings::load(&client_auth_config(
+        &material,
+        ClientCertRequirement::Optional,
+        None,
+    ))
+    .expect("client-auth material should load");
+    let listener = serve_authenticating(&bindings).await;
+
+    let response = whoami(
+        listener.addr,
+        client_config_with_identity(
+            &server.ca_der,
+            Some(issue_client_identity(&ca, ClientIdentitySpec::default())),
+        ),
+    )
+    .await
+    .expect("a well-formed client certificate must complete the handshake");
+
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "a verified certificate must authenticate: {response}"
+    );
+    assert!(
+        response.contains(&format!("principal={CLIENT_SPIFFE_ID}")),
+        "the principal must be the certificate's SPIFFE ID: {response}"
+    );
+    // The same request carried four different mTLS assertion headers naming a
+    // different SPIFFE ID. None of them reached the handler, and none of them
+    // decided the principal.
+    assert!(
+        response.contains("asserted=none"),
+        "client-supplied mTLS assertion headers must be stripped before any handler: {response}"
+    );
+    assert!(
+        !response.contains("sa/admin"),
+        "a header must never become an identity: {response}"
+    );
+    listener.stop().await;
+}
+
+/// The `optional` half of the mode, and the downgrade question.
+///
+/// A caller who brings no certificate is not partly authenticated: they reach
+/// the auth chain with nothing, and are refused. Presenting nothing is
+/// therefore never worth more than presenting something invalid, which is
+/// refused at the handshake.
+#[tokio::test]
+async fn an_anonymous_caller_on_an_optional_listener_authenticates_as_nobody() {
+    let material = MaterialDir::new();
+    let ca = client_ca();
+    let server = write_client_auth_material(&material, &ca);
+    let bindings = InboundTlsBindings::load(&client_auth_config(
+        &material,
+        ClientCertRequirement::Optional,
+        None,
+    ))
+    .expect("client-auth material should load");
+    let listener = serve_authenticating(&bindings).await;
+
+    let response = whoami(
+        listener.addr,
+        client_config_with_identity(&server.ca_der, None),
+    )
+    .await
+    .expect("optional mode must still complete a handshake with no client certificate");
+
+    assert_unauthorized(&response, "a caller with no certificate");
+    assert!(
+        response.contains("principal=none") || response.contains("unauthorized"),
+        "the request must be refused rather than served anonymously: {response}"
+    );
+    listener.stop().await;
+}
+
+#[tokio::test]
+async fn required_mode_refuses_a_handshake_that_carries_no_certificate() {
+    let material = MaterialDir::new();
+    let ca = client_ca();
+    let server = write_client_auth_material(&material, &ca);
+    let bindings = InboundTlsBindings::load(&client_auth_config(
+        &material,
+        ClientCertRequirement::Required,
+        None,
+    ))
+    .expect("client-auth material should load");
+    let listener = serve_authenticating(&bindings).await;
+
+    let refusal = whoami(
+        listener.addr,
+        client_config_with_identity(&server.ca_der, None),
+    )
+    .await
+    .expect_err("required mode must not serve a caller with no certificate");
+    assert!(
+        refusal.starts_with("handshake failed") || refusal.starts_with("response read failed"),
+        "the refusal must come from the handshake, not from the router: {refusal}"
+    );
+
+    // The listener is refusing that caller, not broken: a caller with a
+    // certificate is still served.
+    let response = whoami(
+        listener.addr,
+        client_config_with_identity(
+            &server.ca_der,
+            Some(issue_client_identity(&ca, ClientIdentitySpec::default())),
+        ),
+    )
+    .await
+    .expect("a caller with a certificate must still be served");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "required mode must serve a caller who brings a certificate: {response}"
+    );
+    listener.stop().await;
+}
+
+/// The trust anchors are the configured bundle and nothing else.
+///
+/// The impostor certificate here is signed by a perfectly well-formed CA that
+/// simply is not the configured one -- which is the shape a platform trust
+/// store would accept and this configuration must not.
+#[tokio::test]
+async fn a_certificate_from_an_unconfigured_ca_never_authenticates() {
+    let material = MaterialDir::new();
+    let ca = client_ca();
+    // Two impostors. The first is an ordinary unrelated CA. The second names
+    // itself exactly as the configured one, which is what an attacker who has
+    // read the deployment's configuration would mint: path building finds the
+    // configured anchor by subject name and then the signature check fails.
+    let unrelated_ca = client_ca_named("Some Other Test CA");
+    let same_name_ca = client_ca();
+    let server = write_client_auth_material(&material, &ca);
+    let bindings = InboundTlsBindings::load(&client_auth_config(
+        &material,
+        ClientCertRequirement::Optional,
+        None,
+    ))
+    .expect("client-auth material should load");
+    let listener = serve_authenticating(&bindings).await;
+
+    assert_refused_with_alert(
+        whoami(
+            listener.addr,
+            client_config_with_identity(
+                &server.ca_der,
+                Some(issue_client_identity(
+                    &unrelated_ca,
+                    ClientIdentitySpec::default(),
+                )),
+            ),
+        )
+        .await,
+        "UnknownCA",
+        "a certificate from an unconfigured CA",
+    );
+    assert_refused_with_alert(
+        whoami(
+            listener.addr,
+            client_config_with_identity(
+                &server.ca_der,
+                Some(issue_client_identity(
+                    &same_name_ca,
+                    ClientIdentitySpec::default(),
+                )),
+            ),
+        )
+        .await,
+        "DecryptError",
+        "a certificate from a CA that names itself as the configured one",
+    );
+
+    // The listener is refusing that certificate, not refusing everything: one
+    // from the configured CA is still served.
+    let response = whoami(
+        listener.addr,
+        client_config_with_identity(
+            &server.ca_der,
+            Some(issue_client_identity(&ca, ClientIdentitySpec::default())),
+        ),
+    )
+    .await
+    .expect("a certificate from the configured CA must still authenticate");
+    assert!(
+        response.contains(&format!("principal={CLIENT_SPIFFE_ID}")),
+        "the configured CA must still authenticate its own certificates: {response}"
+    );
+    listener.stop().await;
+}
+
+/// Validity windows are enforced by the verifier -- confirmed, not assumed.
+#[tokio::test]
+async fn an_expired_client_certificate_never_authenticates() {
+    let material = MaterialDir::new();
+    let ca = client_ca();
+    let server = write_client_auth_material(&material, &ca);
+    let bindings = InboundTlsBindings::load(&client_auth_config(
+        &material,
+        ClientCertRequirement::Optional,
+        None,
+    ))
+    .expect("client-auth material should load");
+    let listener = serve_authenticating(&bindings).await;
+
+    let expired = issue_client_identity(
+        &ca,
+        ClientIdentitySpec {
+            not_after: OffsetDateTime::now_utc() - TimeDuration::hours(1),
+            ..ClientIdentitySpec::default()
+        },
+    );
+
+    assert_refused_with_alert(
+        whoami(
+            listener.addr,
+            client_config_with_identity(&server.ca_der, Some(expired)),
+        )
+        .await,
+        "CertificateExpired",
+        "a certificate whose validity window has passed",
+    );
+
+    let response = whoami(
+        listener.addr,
+        client_config_with_identity(
+            &server.ca_der,
+            Some(issue_client_identity(&ca, ClientIdentitySpec::default())),
+        ),
+    )
+    .await
+    .expect("an in-date certificate from the same CA must still authenticate");
+    assert!(
+        response.contains(&format!("principal={CLIENT_SPIFFE_ID}")),
+        "only the expiry may be deciding this: {response}"
+    );
+    listener.stop().await;
+}
+
+/// A certificate valid for a different purpose is a different credential.
+///
+/// This one is a server certificate: correctly issued, correctly signed by the
+/// configured CA, in date -- and marked for server authentication only.
+#[tokio::test]
+async fn a_certificate_issued_for_server_authentication_never_authenticates_a_client() {
+    let material = MaterialDir::new();
+    let ca = client_ca();
+    let server = write_client_auth_material(&material, &ca);
+    let bindings = InboundTlsBindings::load(&client_auth_config(
+        &material,
+        ClientCertRequirement::Optional,
+        None,
+    ))
+    .expect("client-auth material should load");
+    let listener = serve_authenticating(&bindings).await;
+
+    let wrong_purpose = issue_client_identity(
+        &ca,
+        ClientIdentitySpec {
+            extended_key_usages: vec![ExtendedKeyUsagePurpose::ServerAuth],
+            ..ClientIdentitySpec::default()
+        },
+    );
+
+    assert_refused_with_alert(
+        whoami(
+            listener.addr,
+            client_config_with_identity(&server.ca_der, Some(wrong_purpose)),
+        )
+        .await,
+        "UnsupportedCertificate",
+        "a certificate marked for server authentication only",
+    );
+
+    let response = whoami(
+        listener.addr,
+        client_config_with_identity(
+            &server.ca_der,
+            Some(issue_client_identity(&ca, ClientIdentitySpec::default())),
+        ),
+    )
+    .await
+    .expect("a client-authentication certificate from the same CA must still authenticate");
+    assert!(
+        response.contains(&format!("principal={CLIENT_SPIFFE_ID}")),
+        "only the extended key usage may be deciding this: {response}"
+    );
+    listener.stop().await;
+}
+
+/// Revocation, both halves.
+///
+/// The same certificate is offered to two listeners that differ only in whether
+/// a CRL is configured. Without one it authenticates; with one it is refused.
+/// The second half is what makes the first half meaningful: it shows the
+/// refusal is the CRL doing its job rather than the certificate being broken.
+#[tokio::test]
+async fn a_revoked_certificate_is_refused_only_when_a_crl_is_configured() {
+    let material = MaterialDir::new();
+    let ca = client_ca();
+    let server = write_client_auth_material(&material, &ca);
+    let revoked = issue_client_identity(&ca, ClientIdentitySpec::default());
+    material.write(
+        "client.crl",
+        &client_crl(
+            &ca,
+            &[&revoked.serial],
+            -TimeDuration::hours(1),
+            TimeDuration::days(1),
+        ),
+    );
+
+    let without_crl = InboundTlsBindings::load(&client_auth_config(
+        &material,
+        ClientCertRequirement::Optional,
+        None,
+    ))
+    .expect("client-auth material should load");
+    let listener = serve_authenticating(&without_crl).await;
+    let response = whoami(
+        listener.addr,
+        client_config_with_identity(
+            &server.ca_der,
+            Some(issue_client_identity(&ca, ClientIdentitySpec::default())),
+        ),
+    )
+    .await
+    .expect("with no CRL configured, nothing checks revocation");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK") && response.contains(CLIENT_SPIFFE_ID),
+        "a revoked certificate authenticates when no CRL is configured -- which is exactly why \
+         the absence of one is documented rather than implied: {response}"
+    );
+    listener.stop().await;
+
+    let with_crl = InboundTlsBindings::load(&client_auth_config(
+        &material,
+        ClientCertRequirement::Optional,
+        Some("client.crl"),
+    ))
+    .expect("client-auth material with a CRL should load");
+    let listener = serve_authenticating(&with_crl).await;
+    assert_refused_with_alert(
+        whoami(
+            listener.addr,
+            client_config_with_identity(&server.ca_der, Some(revoked)),
+        )
+        .await,
+        "CertificateRevoked",
+        "a certificate named by the configured CRL",
+    );
+    listener.stop().await;
+}
+
+/// A stale CRL is not a valid one.
+///
+/// The certificate here is *not* revoked; the CRL has simply expired. Treating
+/// an expired CRL as still authoritative would mean a deployment whose CRL
+/// publishing broke keeps accepting certificates revoked after the last CRL it
+/// managed to fetch, with nothing to indicate it. Fail closed instead, and make
+/// the failure loud.
+#[tokio::test]
+async fn an_expired_crl_refuses_certificates_it_does_not_even_list() {
+    let material = MaterialDir::new();
+    let ca = client_ca();
+    let server = write_client_auth_material(&material, &ca);
+    // Well formed, correctly signed, listing nothing -- and out of date.
+    material.write(
+        "client.crl",
+        &client_crl(&ca, &[], -TimeDuration::days(2), -TimeDuration::hours(1)),
+    );
+
+    let without_crl = InboundTlsBindings::load(&client_auth_config(
+        &material,
+        ClientCertRequirement::Optional,
+        None,
+    ))
+    .expect("client-auth material should load");
+    let listener = serve_authenticating(&without_crl).await;
+    let response = whoami(
+        listener.addr,
+        client_config_with_identity(
+            &server.ca_der,
+            Some(issue_client_identity(&ca, ClientIdentitySpec::default())),
+        ),
+    )
+    .await
+    .expect("the certificate itself is perfectly valid");
+    assert!(
+        response.contains(&format!("principal={CLIENT_SPIFFE_ID}")),
+        "the control: this certificate authenticates when no CRL is configured: {response}"
+    );
+    listener.stop().await;
+
+    let with_expired_crl = InboundTlsBindings::load(&client_auth_config(
+        &material,
+        ClientCertRequirement::Optional,
+        Some("client.crl"),
+    ))
+    .expect("client-auth material with a CRL should load");
+    let listener = serve_authenticating(&with_expired_crl).await;
+    assert_refused_with_alert(
+        whoami(
+            listener.addr,
+            client_config_with_identity(
+                &server.ca_der,
+                Some(issue_client_identity(&ca, ClientIdentitySpec::default())),
+            ),
+        )
+        .await,
+        "UnknownCA",
+        "a certificate whose revocation status cannot be determined from a stale CRL",
+    );
+    listener.stop().await;
+}
+
+/// A verified certificate with nothing to read is a caller with no identity,
+/// not a caller with a blank one.
+#[tokio::test]
+async fn a_verified_certificate_with_no_identity_field_authenticates_as_nobody() {
+    let material = MaterialDir::new();
+    let ca = client_ca();
+    let server = write_client_auth_material(&material, &ca);
+    let bindings = InboundTlsBindings::load(&client_auth_config(
+        &material,
+        ClientCertRequirement::Optional,
+        None,
+    ))
+    .expect("client-auth material should load");
+    let listener = serve_authenticating(&bindings).await;
+
+    let no_identity = issue_client_identity(
+        &ca,
+        ClientIdentitySpec {
+            sans: vec![SanType::DnsName(
+                Ia5String::try_from("api.gateway.test").expect("test DNS SAN should be IA5"),
+            )],
+            ..ClientIdentitySpec::default()
+        },
+    );
+
+    let response = whoami(
+        listener.addr,
+        client_config_with_identity(&server.ca_der, Some(no_identity)),
+    )
+    .await
+    .expect("the certificate verifies, so the handshake completes");
+
+    assert_unauthorized(&response, "a certificate with no SPIFFE ID");
+    listener.stop().await;
+}
+
+/// The exactly-one rule, over a real handshake.
+///
+/// Both SPIFFE IDs here are issued by the configured CA, so this is not a
+/// verification failure: it is the gateway refusing to choose which of two
+/// identities a caller is.
+#[tokio::test]
+async fn a_verified_certificate_with_two_identities_authenticates_as_nobody() {
+    let material = MaterialDir::new();
+    let ca = client_ca();
+    let server = write_client_auth_material(&material, &ca);
+    let bindings = InboundTlsBindings::load(&client_auth_config(
+        &material,
+        ClientCertRequirement::Optional,
+        None,
+    ))
+    .expect("client-auth material should load");
+    let listener = serve_authenticating(&bindings).await;
+
+    let ambiguous = issue_client_identity(
+        &ca,
+        ClientIdentitySpec {
+            sans: vec![uri_san(CLIENT_SPIFFE_ID), uri_san(OTHER_SPIFFE_ID)],
+            ..ClientIdentitySpec::default()
+        },
+    );
+
+    let response = whoami(
+        listener.addr,
+        client_config_with_identity(&server.ca_der, Some(ambiguous)),
+    )
+    .await
+    .expect("the certificate verifies, so the handshake completes");
+
+    assert_unauthorized(&response, "a certificate carrying two SPIFFE IDs");
+    assert!(
+        !response.contains("sa/batch"),
+        "neither identity may be chosen: {response}"
+    );
+    listener.stop().await;
+}
+
+/// A listener that was never configured for client certificates cannot produce
+/// a certificate identity, no matter what the caller claims in headers.
+#[tokio::test]
+async fn assertion_headers_cannot_authenticate_on_a_listener_without_client_auth() {
+    let material = MaterialDir::new();
+    let server = write_default_identity(&material);
+    let bindings = InboundTlsBindings::load(&tls_config(&material)).expect("material should load");
+    let listener = serve_authenticating(&bindings).await;
+
+    let response = whoami(
+        listener.addr,
+        client_config_with_identity(&server.ca_der, None),
+    )
+    .await
+    .expect("a listener with no client auth still serves TLS");
+
+    assert_unauthorized(&response, "four mTLS assertion headers and no certificate");
+    assert_eq!(
+        bindings.data_identity_source(),
+        None,
+        "a listener with no client auth configured must have no identity source to read with"
+    );
+    listener.stop().await;
+}
