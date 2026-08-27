@@ -141,15 +141,26 @@ impl AwsProviderConfig {
     }
 }
 
-/// One region-independent AWS identity: an auth mode plus the explicit STS
-/// endpoint that identity requests may contact. Nothing about the profile is
-/// derived from a request, an SDK default chain, or an instance metadata
-/// service.
+/// One region-independent AWS identity: an auth mode plus, for `web_identity`,
+/// the explicit STS endpoint that identity requests may contact. Nothing about
+/// the profile is derived from a request, an SDK default chain, or an instance
+/// metadata service.
+///
+/// `sts_endpoint` is optional because only `web_identity` ever contacts STS;
+/// `static_keys` signs directly with its bootstrap key pair and issues no STS
+/// request at all. Requiring it in both modes made every `static_keys` operator
+/// invent a URL the gateway would never dial, which teaches that the field is
+/// decorative and hides the day it starts mattering. It stays at the profile
+/// level rather than moving into the `web_identity` variant because
+/// `deny_unknown_fields` would turn that move into a hard startup failure for
+/// every profile already deployed under either mode; a value supplied by such a
+/// profile is still shape-validated, and is then ignored under `static_keys`.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AwsProfileConfig {
     pub id: String,
-    pub sts_endpoint: String,
+    #[serde(default)]
+    pub sts_endpoint: Option<String>,
     pub auth: AwsAuthConfig,
 }
 
@@ -158,7 +169,10 @@ impl fmt::Debug for AwsProfileConfig {
         formatter
             .debug_struct("AwsProfileConfig")
             .field("id", &self.id)
-            .field("sts_endpoint", &REDACTED_LOCATOR)
+            .field(
+                "sts_endpoint",
+                &self.sts_endpoint.as_ref().map(|_| REDACTED_LOCATOR),
+            )
             .field("auth", &self.auth)
             .finish()
     }
@@ -247,6 +261,7 @@ pub enum AwsProviderConfigError {
     InvalidProfileId { index: usize },
     DuplicateProfileId { index: usize, previous: usize },
     InvalidStsEndpoint { index: usize },
+    StsEndpointRequired { index: usize },
     InvalidRoleArn { index: usize },
     InvalidWorkloadTokenRoot { index: usize },
     InvalidWorkloadTokenFile { index: usize },
@@ -292,6 +307,10 @@ impl fmt::Display for AwsProviderConfigError {
             Self::InvalidStsEndpoint { index } => write!(
                 formatter,
                 "aws profile at index {index} requires an absolute https STS endpoint with no credentials, path, query, or fragment"
+            ),
+            Self::StsEndpointRequired { index } => write!(
+                formatter,
+                "aws profile at index {index} authenticates with web_identity and must configure an sts_endpoint"
             ),
             Self::InvalidRoleArn { index } => write!(
                 formatter,
@@ -437,7 +456,14 @@ pub fn validate_aws_provider_config(
         if let Some(previous) = profile_ids.insert(profile.id.as_str(), index) {
             return Err(AwsProviderConfigError::DuplicateProfileId { index, previous });
         }
-        if !is_valid_https_endpoint(&profile.sts_endpoint) {
+        // A supplied endpoint is shape-checked in both modes, so a `static_keys`
+        // profile still carrying one from an earlier release neither starts with
+        // a malformed URL nor fails to start at all.
+        if profile
+            .sts_endpoint
+            .as_deref()
+            .is_some_and(|endpoint| !is_valid_https_endpoint(endpoint))
+        {
             return Err(AwsProviderConfigError::InvalidStsEndpoint { index });
         }
         match &profile.auth {
@@ -446,6 +472,9 @@ pub fn validate_aws_provider_config(
                 token_root,
                 token_file,
             } => {
+                if profile.sts_endpoint.is_none() {
+                    return Err(AwsProviderConfigError::StsEndpointRequired { index });
+                }
                 if !is_valid_role_arn(role_arn) {
                     return Err(AwsProviderConfigError::InvalidRoleArn { index });
                 }
@@ -503,6 +532,19 @@ pub fn validate_aws_provider_config(
             if !is_valid_version_stage(stage) {
                 return Err(AwsProviderConfigError::InvalidVersionStage { index });
             }
+            // Refusing an explicit `AWSPREVIOUS` pin goes further than the rule
+            // against *falling back* to it, deliberately. `AWSPREVIOUS` is a
+            // label AWS moves at every rotation, so pinning it never names a
+            // version: it stands for "whatever this secret was superseded by
+            // last", which makes the alias a standing read of material the
+            // rotation process has already retired and silently changes which
+            // value it serves each time the secret rotates. The one legitimate
+            // use of that stage is a dual-credential grace window during
+            // rotation, and this provider serves exactly one value per alias, so
+            // it has no such mode. Rolling back a bad rotation is still
+            // supported by pinning that version's `version_id`, which is a fixed
+            // selector rather than a moving pointer at whatever is currently
+            // stale.
             if stage == AWS_PREVIOUS_STAGE {
                 return Err(AwsProviderConfigError::ForbiddenVersionStage { index });
             }
@@ -594,9 +636,21 @@ fn has_full_arn_suffix(name: &str) -> bool {
 
 /// Validates one full secret ARN and returns its region.
 ///
-/// Accepted partitions are `aws` and `aws-us-gov`, the partitions whose
-/// regional Secrets Manager endpoint is deterministically
-/// `secretsmanager.<region>.amazonaws.com`.
+/// Accepted partitions are `aws` and `aws-us-gov`, the partitions whose regional
+/// Secrets Manager endpoint is deterministically
+/// `secretsmanager.<region>.amazonaws.com`. GovCloud stays in scope because it
+/// satisfies that formula exactly; `aws-cn` is refused because its endpoints
+/// live under `amazonaws.com.cn`, so admitting it would send a China-partition
+/// locator to whatever commercial host the formula happens to spell.
+///
+/// The partition must also agree with the region, because the host is derived
+/// from the region alone: the ARN travels on the wire as the `SecretId`, but its
+/// partition constrains nothing about where the request is sent. Without that
+/// check, a GovCloud ARN carrying a commercial region would egress a GovCloud
+/// locator to commercial AWS. Such a pair is an ARN AWS never issues, so it can
+/// only ever have failed at the provider or at the response ARN binding;
+/// rejecting it here turns a permanent per-request failure into a startup
+/// error.
 fn parse_secret_arn(value: &str) -> Option<&str> {
     if value.is_empty() || value.len() > MAX_AWS_ARN_BYTES {
         return None;
@@ -619,6 +673,7 @@ fn parse_secret_arn(value: &str) -> Option<&str> {
         && matches!(partition, "aws" | "aws-us-gov")
         && service == "secretsmanager"
         && is_valid_aws_region(region)
+        && partition_matches_region(partition, region)
         && account.len() == 12
         && account.bytes().all(|byte| byte.is_ascii_digit())
         && resource_kind == "secret"
@@ -626,6 +681,17 @@ fn parse_secret_arn(value: &str) -> Option<&str> {
         && name.bytes().all(is_valid_secret_name_byte)
         && has_full_arn_suffix(name))
     .then_some(region)
+}
+
+/// `aws-us-gov` owns exactly the `us-gov-` regions, and `aws` owns none of
+/// them.
+///
+/// This applies to secret ARNs only. A role ARN carries no region (IAM is
+/// global) and its partition derives no host either, because the STS endpoint a
+/// role is assumed at is configured explicitly rather than computed, so there is
+/// nothing for the same check to protect there.
+fn partition_matches_region(partition: &str, region: &str) -> bool {
+    region.starts_with("us-gov-") == (partition == "aws-us-gov")
 }
 
 fn is_valid_secret_name_byte(byte: u8) -> bool {
@@ -801,12 +867,12 @@ impl AwsClock for SystemAwsClock {
 
 struct AwsProfile {
     id: String,
-    sts_url: String,
     auth: AwsAuth,
 }
 
 enum AwsAuth {
     WebIdentity {
+        sts_url: String,
         role_arn: String,
         token_root: Arc<Dir>,
         token_file: String,
@@ -936,13 +1002,23 @@ impl AwsSecretsManagerProvider {
         validate_aws_provider_config(config, reserved_alias_ids)?;
         let mut profiles = BTreeMap::new();
         for (index, profile) in config.profiles.iter().enumerate() {
-            let sts_url = format!("{}/", profile.sts_endpoint.trim_end_matches('/'));
             let auth = match &profile.auth {
                 AwsAuthConfig::WebIdentity {
                     role_arn,
                     token_root,
                     token_file,
                 } => AwsAuth::WebIdentity {
+                    // Validation already refused a `web_identity` profile with
+                    // no endpoint, so the STS URL is built once, on the only
+                    // path that dials it, and does not exist anywhere else.
+                    sts_url: format!(
+                        "{}/",
+                        profile
+                            .sts_endpoint
+                            .as_deref()
+                            .ok_or(AwsProviderConfigError::StsEndpointRequired { index })?
+                            .trim_end_matches('/')
+                    ),
                     role_arn: role_arn.clone(),
                     token_root: open_workload_token_root(index, token_root)?,
                     token_file: token_file.clone(),
@@ -963,7 +1039,6 @@ impl AwsSecretsManagerProvider {
                 profile.id.clone(),
                 AwsProfile {
                     id: profile.id.clone(),
-                    sts_url,
                     auth,
                 },
             );
@@ -1207,7 +1282,7 @@ impl AwsSecretsManagerProvider {
         &self,
         profile: &AwsProfile,
     ) -> Result<(Arc<AwsSessionCredentials>, u64), AwsFailure> {
-        let (role_arn, token_root, token_file) = match &profile.auth {
+        let (sts_url, role_arn, token_root, token_file) = match &profile.auth {
             AwsAuth::StaticKeys {
                 access_key_id_alias,
                 secret_access_key_alias,
@@ -1227,16 +1302,30 @@ impl AwsSecretsManagerProvider {
                 return Ok((credentials, generation));
             }
             AwsAuth::WebIdentity {
+                sts_url,
                 role_arn,
                 token_root,
                 token_file,
-            } => (role_arn, token_root, token_file),
+            } => (sts_url, role_arn, token_root, token_file),
         };
 
         let token = self.workload_identity_token(token_root, token_file).await?;
         // The decoded token copy zeroizes on drop; the percent encoder streams
-        // straight into the request body, which the transport contract takes
-        // as a plain `Vec<u8>` exactly like the Vault login body.
+        // straight into the request body, which the transport contract takes as
+        // a plain `Vec<u8>`.
+        //
+        // Wrapping this one body in `Zeroizing` would not buy what it looks like
+        // it buys. `AwsTransport` is this provider's own trait, but it exists to
+        // reach the sensitive-request entry point on `EgressClient` that every
+        // secret provider shares, and that entry point takes an owned
+        // `Vec<u8>`; `Zeroizing` has no `into_inner`, so the wrapper would have
+        // to be copied back out at that boundary into a buffer nothing wipes.
+        // Downstream is worse: `reqwest` moves the body into a `Body`, and hyper
+        // and the TLS layer copy it again into write buffers this crate cannot
+        // reach. The residual is a short-lived, audience-bound, single-use
+        // assertion for one STS exchange, already redacted from every `Debug`,
+        // log, and metric, so buying an unwipeable copy in order to wipe a
+        // wipeable one is not a trade worth making.
         let token = Zeroizing::new(
             std::str::from_utf8(token.expose())
                 .map_err(|_| AwsFailure::IdentityInvalid)?
@@ -1257,13 +1346,7 @@ impl AwsSecretsManagerProvider {
             HeaderValue::from_static(AWS_FORM_CONTENT_TYPE),
         );
         let response = self
-            .send_with_bounded_retries(
-                Method::POST,
-                &profile.sts_url,
-                Ok(headers),
-                Some(body),
-                true,
-            )
+            .send_with_bounded_retries(Method::POST, sts_url, Ok(headers), Some(body), true)
             .await?;
         let body = bounded_body(&response, MAX_AWS_STS_RESPONSE_BYTES, "application/json")
             .map_err(|_| AwsFailure::IdentityInvalid)?;
@@ -1620,7 +1703,13 @@ fn provider_generation(config: &AwsProviderConfig) -> [u8; 32] {
     for profile in &config.profiles {
         digest.update(profile.id.as_bytes());
         digest.update([0]);
-        digest.update(profile.sts_endpoint.as_bytes());
+        digest.update(
+            profile
+                .sts_endpoint
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         digest.update([0]);
         match &profile.auth {
             AwsAuthConfig::WebIdentity {
@@ -2205,6 +2294,8 @@ mod tests {
     const STS_ENDPOINT_CANARY: &str = "https://sts.locator-canary.example";
     const ARN_CANARY: &str =
         "arn:aws:secretsmanager:us-east-1:123456789012:secret:team-canary/billing-canary-AbC123";
+    const GOV_ARN_CANARY: &str =
+        "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:team-canary/billing-canary-AbC123";
     const ROLE_ARN_CANARY: &str = "arn:aws:iam::123456789012:role/greengateway-role-canary";
     const VERSION_ID_CANARY: &str = "12345678-1234-1234-1234-123456789012";
     const MEMBER_CANARY: &str = "member-locator-canary";
@@ -2461,7 +2552,10 @@ mod tests {
     fn static_profile(id: &str) -> AwsProfileConfig {
         AwsProfileConfig {
             id: id.to_owned(),
-            sts_endpoint: STS_ENDPOINT_CANARY.to_owned(),
+            // static_keys never dials STS, so the default fixture omits the
+            // endpoint entirely; every static-key test below therefore exercises
+            // the shape an operator can now actually write.
+            sts_endpoint: None,
             auth: AwsAuthConfig::StaticKeys {
                 access_key_id_alias: "bootstrap-access-key-id".to_owned(),
                 secret_access_key_alias: "bootstrap-secret-access-key".to_owned(),
@@ -2472,7 +2566,7 @@ mod tests {
     fn web_identity_profile(id: &str, token_root: &str) -> AwsProfileConfig {
         AwsProfileConfig {
             id: id.to_owned(),
-            sts_endpoint: STS_ENDPOINT_CANARY.to_owned(),
+            sts_endpoint: Some(STS_ENDPOINT_CANARY.to_owned()),
             auth: AwsAuthConfig::WebIdentity {
                 role_arn: ROLE_ARN_CANARY.to_owned(),
                 token_root: token_root.to_owned(),
@@ -2590,7 +2684,7 @@ mod tests {
             "",
         ] {
             let mut profile = static_profile("primary");
-            profile.sts_endpoint = endpoint.to_owned();
+            profile.sts_endpoint = Some(endpoint.to_owned());
             assert!(
                 matches!(
                     base(vec![profile], Vec::new()),
@@ -2614,6 +2708,10 @@ mod tests {
             // Wildcards and unsafe bytes are never a fixed binding.
             "arn:aws:secretsmanager:us-east-1:123456789012:secret:team/*-AbC123",
             "arn:aws:secretsmanager:us-east-1:123456789012:secret:team/bil ling-AbC123",
+            // A partition that disagrees with its region is an ARN AWS never
+            // issues, and the endpoint is derived from the region alone.
+            "arn:aws-us-gov:secretsmanager:us-east-1:123456789012:secret:team/billing-AbC123",
+            "arn:aws:secretsmanager:us-gov-west-1:123456789012:secret:team/billing-AbC123",
         ] {
             let mut entry = alias("billing");
             entry.arn = arn.to_owned();
@@ -2657,6 +2755,9 @@ mod tests {
             Err(AwsProviderConfigError::InvalidJsonMember { .. })
         ));
         let mut bad_role = static_profile("primary");
+        // Keep the endpoint set: without it the web_identity requirement below
+        // would reject this profile first and the role-ARN check would never run.
+        bad_role.sts_endpoint = Some(STS_ENDPOINT_CANARY.to_owned());
         bad_role.auth = AwsAuthConfig::WebIdentity {
             role_arn: "arn:aws:iam::123456789012:user/not-a-role".to_owned(),
             token_root: "/var/run/secrets/tokens".to_owned(),
@@ -2666,6 +2767,16 @@ mod tests {
             base(vec![bad_role], Vec::new()),
             Err(AwsProviderConfigError::InvalidRoleArn { .. })
         ));
+        let mut missing_endpoint = web_identity_profile("primary", "/var/run/secrets/tokens");
+        missing_endpoint.sts_endpoint = None;
+        let outcome = base(vec![missing_endpoint], Vec::new());
+        assert!(
+            matches!(
+                outcome,
+                Err(AwsProviderConfigError::StsEndpointRequired { .. })
+            ),
+            "web_identity without an sts_endpoint must be refused, got {outcome:?}"
+        );
         let mut duplicate = alias("billing");
         duplicate.id = "billing".to_owned();
         assert!(matches!(
@@ -2711,6 +2822,95 @@ mod tests {
             base(profiles, Vec::new()),
             Err(AwsProviderConfigError::TooManyProfiles { .. })
         ));
+    }
+
+    #[test]
+    fn govcloud_stays_in_scope_and_its_partition_must_match_its_region() {
+        // GovCloud satisfies the deterministic
+        // `secretsmanager.<region>.amazonaws.com` formula exactly, so it stays
+        // in scope; `aws-cn` does not (its endpoints are under
+        // `amazonaws.com.cn`) and is refused in the table above.
+        let mut govcloud = alias("billing");
+        govcloud.arn = GOV_ARN_CANARY.to_owned();
+        let fixture = provider(vec![govcloud.clone()]);
+        assert_eq!(
+            fixture.provider.aliases["billing"].endpoint_url,
+            "https://secretsmanager.us-gov-west-1.amazonaws.com/"
+        );
+
+        // The endpoint is derived from the region alone, so a partition that
+        // disagrees with its region would egress a GovCloud locator to
+        // commercial AWS (or the reverse) rather than fail to name anything.
+        for arn in [
+            "arn:aws-us-gov:secretsmanager:us-east-1:123456789012:secret:team/billing-AbC123",
+            "arn:aws:secretsmanager:us-gov-west-1:123456789012:secret:team/billing-AbC123",
+        ] {
+            assert_eq!(
+                parse_secret_arn(arn),
+                None,
+                "{arn:?} mixes a partition and a region AWS never pairs"
+            );
+        }
+    }
+
+    #[test]
+    fn an_sts_endpoint_is_required_only_by_the_mode_that_dials_sts() {
+        let base = |profiles: Vec<AwsProfileConfig>| {
+            validate_aws_provider_config(
+                &AwsProviderConfig {
+                    profiles,
+                    aliases: Vec::new(),
+                },
+                &BTreeSet::new(),
+            )
+        };
+
+        // static_keys signs directly with its bootstrap key pair, so it must not
+        // be made to invent an endpoint the gateway will never dial.
+        let mut omitted = static_profile("primary");
+        omitted.sts_endpoint = None;
+        assert!(base(vec![omitted]).is_ok());
+
+        // A profile written before the field became optional keeps working, and
+        // the value it carries is still shape-checked rather than waved through.
+        let mut legacy = static_profile("primary");
+        legacy.sts_endpoint = Some(STS_ENDPOINT_CANARY.to_owned());
+        assert!(base(vec![legacy]).is_ok());
+        let mut legacy_malformed = static_profile("primary");
+        legacy_malformed.sts_endpoint = Some("http://sts.amazonaws.com".to_owned());
+        let outcome = base(vec![legacy_malformed]);
+        assert!(
+            matches!(
+                outcome,
+                Err(AwsProviderConfigError::InvalidStsEndpoint { .. })
+            ),
+            "a supplied endpoint stays shape-checked under static_keys, got {outcome:?}"
+        );
+
+        // web_identity is the only mode that reaches STS, so there it is
+        // required rather than merely validated when present.
+        let mut missing = web_identity_profile("primary", "/var/run/secrets/tokens");
+        missing.sts_endpoint = None;
+        let outcome = base(vec![missing]);
+        assert!(
+            matches!(
+                outcome,
+                Err(AwsProviderConfigError::StsEndpointRequired { .. })
+            ),
+            "web_identity without an sts_endpoint must be refused, got {outcome:?}"
+        );
+
+        // The profile shape is an operator contract under `deny_unknown_fields`:
+        // both already-deployed shapes must still deserialize, which is what
+        // rules out moving the field into the `web_identity` variant.
+        let deployed = r#"{"profiles":[{"id":"legacy-static","sts_endpoint":"https://sts.us-east-1.amazonaws.com","auth":{"type":"static_keys","access_key_id_alias":"a","secret_access_key_alias":"b"}},{"id":"legacy-web","sts_endpoint":"https://sts.us-east-1.amazonaws.com","auth":{"type":"web_identity","role_arn":"arn:aws:iam::123456789012:role/reader","token_root":"/var/run/secrets/tokens","token_file":"token"}}],"aliases":[]}"#;
+        let parsed: AwsProviderConfig = serde_json::from_str(deployed)
+            .expect("both already-deployed profile shapes must still parse");
+        assert_eq!(parsed.profiles.len(), 2);
+        assert!(parsed
+            .profiles
+            .iter()
+            .all(|profile| profile.sts_endpoint.is_some()));
     }
 
     #[tokio::test]
@@ -3566,7 +3766,7 @@ mod tests {
                 static_profile("primary"),
                 AwsProfileConfig {
                     id: "workload".to_owned(),
-                    sts_endpoint: STS_ENDPOINT_CANARY.to_owned(),
+                    sts_endpoint: Some(STS_ENDPOINT_CANARY.to_owned()),
                     auth: AwsAuthConfig::WebIdentity {
                         role_arn: ROLE_ARN_CANARY.to_owned(),
                         token_root: "/var/run/secrets/tokens-root-canary".to_owned(),
