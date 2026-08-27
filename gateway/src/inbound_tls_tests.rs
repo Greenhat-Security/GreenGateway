@@ -2113,3 +2113,94 @@ async fn assertion_headers_cannot_authenticate_on_a_listener_without_client_auth
     );
     listener.stop().await;
 }
+
+/// The two ways the verifier can refuse to build name two different files.
+///
+/// Both fixtures are well-formed PEM -- the base64 decodes -- so neither is
+/// caught by the reader, and both reach `build()`. An operator sent to the
+/// wrong file by a misattributed error is an operator who cannot fix their
+/// deployment.
+#[test]
+fn a_failed_verifier_build_names_the_file_that_caused_it() {
+    let material = MaterialDir::new();
+    let ca = client_ca();
+    write_client_auth_material(&material, &ca);
+    material.write(
+        "not-a-crl.crl",
+        "-----BEGIN X509 CRL-----\nZm9vYmFy\n-----END X509 CRL-----\n",
+    );
+
+    assert_eq!(
+        InboundTlsBindings::load(&client_auth_config(
+            &material,
+            ClientCertRequirement::Optional,
+            Some("not-a-crl.crl"),
+        ))
+        .expect_err("a PEM block that is not a CRL must not start the gateway"),
+        InboundTlsError::RevocationListUnusable {
+            setting: "CLIENT_CERT_CRL_FILE"
+        }
+    );
+
+    // A well-formed PEM CERTIFICATE block whose contents are not a certificate.
+    // `pem_slice_iter` decodes the base64 and stops there, so this is the shape
+    // that reaches the trust store and fails there.
+    //
+    // A leaf certificate, by contrast, IS accepted as a trust anchor and is not
+    // tested here: pinning one certificate as its own anchor is narrow but
+    // coherent, and refusing it would be inventing a rule.
+    material.write(
+        "client-ca.crt",
+        &pem_encode("CERTIFICATE", b"this is not a certificate"),
+    );
+
+    assert_eq!(
+        InboundTlsBindings::load(&client_auth_config(
+            &material,
+            ClientCertRequirement::Optional,
+            None,
+        ))
+        .expect_err("a bundle with no usable trust anchor must not start the gateway"),
+        InboundTlsError::ClientTrustAnchorsUnusable {
+            setting: "CLIENT_CERT_CA_FILE"
+        }
+    );
+}
+
+/// A CA bundle with a private key concatenated onto it is refused for the same
+/// reason the server certificate file is: the key inherits the permissions of a
+/// file mounted for public material.
+#[test]
+fn a_ca_bundle_containing_a_private_key_is_refused() {
+    let material = MaterialDir::new();
+    let ca = client_ca();
+    let server = write_client_auth_material(&material, &ca);
+    material.write(
+        "client-ca.crt",
+        &format!("{}{}", ca.pem, server.private_key_pem),
+    );
+
+    assert_eq!(
+        InboundTlsBindings::load(&client_auth_config(
+            &material,
+            ClientCertRequirement::Optional,
+            None,
+        ))
+        .expect_err("a CA bundle carrying a private key must not start the gateway"),
+        InboundTlsError::CertificateContainsPrivateKey {
+            setting: "CLIENT_CERT_CA_FILE"
+        }
+    );
+}
+
+fn pem_encode(label: &str, der: &[u8]) -> String {
+    use base64::Engine as _;
+    let body = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut encoded = format!("-----BEGIN {label}-----\n");
+    for chunk in body.as_bytes().chunks(64) {
+        encoded.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+        encoded.push('\n');
+    }
+    encoded.push_str(&format!("-----END {label}-----\n"));
+    encoded
+}

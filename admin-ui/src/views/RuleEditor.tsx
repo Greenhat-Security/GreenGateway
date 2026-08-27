@@ -52,6 +52,7 @@ const AUTH_METHOD_OPTIONS: Array<{
   { value: 'bearer_token', label: 'Bearer token' },
   { value: 'session_cookie', label: 'Session cookie' },
   { value: 'service_token', label: 'Service token' },
+  { value: 'client_certificate', label: 'Client certificate' },
 ];
 const ACTION_OPTIONS: Array<{
   value: PolicyRuleAction;
@@ -1245,6 +1246,8 @@ function formatAuthMethod(value: string): string {
       return 'session cookie';
     case 'service_token':
       return 'service token';
+    case 'client_certificate':
+      return 'client certificate';
     default:
       return value;
   }

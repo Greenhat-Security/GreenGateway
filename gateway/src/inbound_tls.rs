@@ -49,7 +49,7 @@ use tokio_rustls::{
     rustls::{
         crypto::{ring, CryptoProvider},
         pki_types::{pem::PemObject, CertificateDer, CertificateRevocationListDer, PrivateKeyDer},
-        server::WebPkiClientVerifier,
+        server::{VerifierBuilderError, WebPkiClientVerifier},
         version, CertificateError, RootCertStore, ServerConfig, SupportedProtocolVersion,
     },
     server::TlsStream,
@@ -724,11 +724,18 @@ fn load_client_verifier(
         builder = builder.allow_unauthenticated();
     }
 
-    builder
-        .build()
-        .map_err(|_| InboundTlsError::ClientTrustAnchorsUnusable {
+    // The two ways this can fail name two different files, so they name two
+    // different settings. A well-formed PEM block that is not a DER CRL gets
+    // this far -- `pem_slice_iter` only decoded the base64 -- and telling that
+    // operator to look at their CA bundle would send them to the wrong file.
+    builder.build().map_err(|error| match error {
+        VerifierBuilderError::InvalidCrl(_) => InboundTlsError::RevocationListUnusable {
+            setting: settings.crl_setting,
+        },
+        _ => InboundTlsError::ClientTrustAnchorsUnusable {
             setting: settings.ca_setting,
-        })
+        },
+    })
 }
 
 /// Reads one PEM file with the discipline `gateway/src/connections/secret.rs`

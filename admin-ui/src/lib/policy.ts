@@ -7,7 +7,8 @@ export type PolicyRuleAction = 'allow' | 'deny' | 'shadow';
 export type AuthMethodName =
   | 'bearer_token'
   | 'session_cookie'
-  | 'service_token';
+  | 'service_token'
+  | 'client_certificate';
 
 export type PrincipalMatcher = {
   roles?: string[];
@@ -282,7 +283,8 @@ export function isAuthMethodName(value: string): value is AuthMethodName {
   return (
     value === 'bearer_token' ||
     value === 'session_cookie' ||
-    value === 'service_token'
+    value === 'service_token' ||
+    value === 'client_certificate'
   );
 }
 
