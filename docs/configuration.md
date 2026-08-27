@@ -65,23 +65,25 @@ Raise it for callers that carry large bearer tokens or tracing metadata. The num
 
 ### TLS_CERT_FILE
 
-Optional path to the PEM certificate chain that terminates TLS on `LISTEN_ADDR`, leaf certificate first.
+Optional path to the PEM certificate chain that terminates TLS on `LISTEN_ADDR`, leaf certificate first. More than one path may be given as a comma-separated list, positionally paired with `TLS_KEY_FILE`, which turns on SNI selection on that listener.
 
 Default: empty, which serves the data listener as plaintext HTTP/1.1 exactly as it is served today.
 
-Format and validation: unset, empty, or whitespace-only values leave the listener plaintext. A non-empty value must name a readable regular file containing at least one PEM `CERTIFICATE` section, and must be set together with `TLS_KEY_FILE`; setting one without the other fails startup rather than quietly serving plaintext on a listener an operator believes is protected. The file is read once at startup with a 1 MiB bound. A certificate file that also contains a `PRIVATE KEY` section is rejected, because a key concatenated into the certificate file inherits the certificate's permissions and a certificate is the one half of the pair operators reasonably mount world-readable.
+Format and validation: unset, empty, or whitespace-only values leave the listener plaintext. A non-empty value is a comma-separated list of one or more paths with no empty entry -- an empty entry would silently shift every later certificate/key pairing by one, so it fails startup instead of being skipped. The two lists must name exactly one key per certificate chain; a count mismatch fails startup. Each entry must name a readable regular file containing at least one PEM `CERTIFICATE` section, and the pair of settings must be set together; setting one without the other fails startup rather than quietly serving plaintext on a listener an operator believes is protected. Every entry is read once at startup with a 1 MiB bound. A certificate file that also contains a `PRIVATE KEY` section is rejected, because a key concatenated into the certificate file inherits the certificate's permissions and a certificate is the one half of the pair operators reasonably mount world-readable. Paths containing commas cannot be expressed; nothing else about a single-path value changes, and a deployment that sets exactly one path gets byte-for-byte the behaviour it had before lists existed.
 
-The file's directory is opened as a capability root and the leaf is read through the same bounded reader that resolves connection secrets, so symlink resolution is confined beneath that directory and a link pointing outside it fails closed. A Kubernetes Secret volume is supported as published: the kubelet's atomic writer exposes each leaf as a relative symlink into a `..data` directory, and that shape loads.
+Each file's directory is opened as a capability root and the leaf is read through the same bounded reader that resolves connection secrets, so symlink resolution is confined beneath that directory and a link pointing outside it fails closed. A Kubernetes Secret volume is supported as published: the kubelet's atomic writer exposes each leaf as a relative symlink into a `..data` directory, and that shape loads.
+
+**SNI selection with more than one chain.** The DNS subject alternative names on each chain's leaf are the server names that chain answers to, read by the same certificate parser that verifies chains, lower-cased for ASCII, and the subject CN is deliberately not consulted: it is deprecated for name matching and can disagree with the SANs. A caller naming a server an exact name claims gets that chain; otherwise a wildcard claim (`*.example.com`) matches exactly one further label, so it serves `a.example.com` and neither `a.b.example.com` nor `example.com`; an exact claim beats a wildcard that would also cover the name; and everything else -- a client that sends no server name, a name nothing claims -- is served by the *first* chain in the list, which is therefore the listener's default. A caller whose name selects no chain it trusts simply fails its own certificate verification against the served default; the gateway does not refuse the handshake for an unrecognised name. Two chains claiming the same name, or the same wildcard, is a configuration whose selection could never be honest, so it fails startup naming the duplicated name -- as does a later chain that presents no DNS SANs at all, because no server name could ever select it (only the first chain may be nameless). IP SANs and URI SANs do not participate, because SNI carries DNS names only; a name that is neither a valid DNS name nor a valid wildcard name -- `a.*.b`, `*foo.b` -- is unclaimable and a chain carrying only such names is nameless in the same way.
 
 Certificate or key material that is missing, unreadable, malformed, mismatched, or unsafely permissioned prevents startup. There is no fallback to plaintext.
 
 ### TLS_KEY_FILE
 
-Optional path to the PEM private key matching `TLS_CERT_FILE`. PKCS#8 (`PRIVATE KEY`), PKCS#1 (`RSA PRIVATE KEY`), and SEC1 (`EC PRIVATE KEY`) encodings are all accepted.
+Optional path to the PEM private key matching `TLS_CERT_FILE`. PKCS#8 (`PRIVATE KEY`), PKCS#1 (`RSA PRIVATE KEY`), and SEC1 (`EC PRIVATE KEY`) encodings are all accepted. Like `TLS_CERT_FILE` it accepts a comma-separated list, whose entries pair positionally with the certificate list and must equal it in length.
 
 Default: empty, which serves the data listener as plaintext HTTP/1.1.
 
-Format and validation: as for `TLS_CERT_FILE`, with a 256 KiB read bound, and the key must match the public key of the leaf certificate. A mismatch fails startup.
+Format and validation: as for `TLS_CERT_FILE`, with a 256 KiB read bound per entry, and each key must match the public key of the leaf certificate it is paired with. A mismatch fails startup.
 
 The certificate is held to a looser permission rule than the key, deliberately: it is public material, served to every client that connects, so group and other *read* on it is normal and permitted. Group or other *write* on either file still fails startup, because material an attacker can rewrite is material an attacker chooses.
 
@@ -95,7 +97,7 @@ Key bytes are read into zeroizing buffers, are never written to logs, audit even
 
 ### ADMIN_TLS_CERT_FILE
 
-Optional path to the PEM certificate chain that terminates TLS on `ADMIN_LISTEN_ADDR`.
+Optional path to the PEM certificate chain that terminates TLS on `ADMIN_LISTEN_ADDR`. Like `TLS_CERT_FILE` it accepts a comma-separated list, with the same SNI selection and the first chain as the default, independently of the data listener's chains.
 
 Default: empty, which serves the admin listener as plaintext HTTP/1.1.
 
@@ -105,7 +107,7 @@ The two listeners are configured independently on purpose. They are frequently r
 
 ### ADMIN_TLS_KEY_FILE
 
-Optional path to the PEM private key matching `ADMIN_TLS_CERT_FILE`.
+Optional path to the PEM private key matching `ADMIN_TLS_CERT_FILE`. Like `TLS_KEY_FILE` it accepts a comma-separated list, positionally paired with `ADMIN_TLS_CERT_FILE`.
 
 Default: empty, which serves the admin listener as plaintext HTTP/1.1.
 

@@ -28,6 +28,7 @@
 //! as `shed`.
 
 use std::{
+    collections::HashMap,
     fmt, fs, io,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -49,7 +50,11 @@ use tokio_rustls::{
     rustls::{
         crypto::{ring, CryptoProvider},
         pki_types::{pem::PemObject, CertificateDer, CertificateRevocationListDer, PrivateKeyDer},
-        server::{NoServerSessionStorage, VerifierBuilderError, WebPkiClientVerifier},
+        server::{
+            ClientHello, NoServerSessionStorage, ResolvesServerCert, VerifierBuilderError,
+            WebPkiClientVerifier,
+        },
+        sign::CertifiedKey,
         version, CertificateError, RootCertStore, ServerConfig, SupportedProtocolVersion,
     },
     server::TlsStream,
@@ -256,12 +261,16 @@ impl HandshakeLimits {
 
 /// Why inbound TLS could not be brought up.
 ///
-/// Every variant names the setting an operator has to fix and carries nothing
-/// else: no path, no file contents, no rustls error text. A private key is the
-/// most sensitive material this process holds, and a startup error is printed
-/// to stderr and frequently scraped into a log aggregator, so the error type is
-/// the wrong place to be clever about diagnostics.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Every variant names the setting an operator has to fix, and carries nothing
+/// that is not already public: no file contents, no rustls error text. A
+/// private key is the most sensitive material this process holds, and a startup
+/// error is printed to stderr and frequently scraped into a log aggregator, so
+/// the error type is the wrong place to be clever about diagnostics. Server
+/// names from configured certificates are the one deliberate exception -- a
+/// DNS SAN is broadcast in every TLS handshake that serves the chain, and an
+/// operator resolving a name collision cannot act on an error that refuses to
+/// name the name.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InboundTlsError {
     MaterialPathInvalid {
         setting: &'static str,
@@ -302,6 +311,18 @@ pub(crate) enum InboundTlsError {
     },
     RevocationListUnusable {
         setting: &'static str,
+    },
+    ServerNameMalformed {
+        setting: &'static str,
+        name: String,
+    },
+    ServerNameClaimedTwice {
+        setting: &'static str,
+        name: String,
+    },
+    ServerNameUnselectable {
+        setting: &'static str,
+        chain: usize,
     },
 }
 
@@ -361,6 +382,19 @@ impl fmt::Display for InboundTlsError {
             Self::RevocationListUnusable { setting } => write!(
                 formatter,
                 "the file named by {setting} is not a PEM certificate revocation list this build can parse"
+            ),
+            Self::ServerNameMalformed { setting, name } => write!(
+                formatter,
+                "a certificate chain in {setting} presents the server name '{name}', which this gateway cannot match: a wildcard must be the whole first label (as in '*.example.com'), and a name must not be empty, end in a root dot, or contain an empty label"
+            ),
+            Self::ServerNameClaimedTwice { setting, name } => write!(
+                formatter,
+                "two certificate chains in {setting} both claim the server name '{name}'; a client naming it must land on exactly one chain, so name it in one chain only"
+            ),
+            Self::ServerNameUnselectable { setting, chain } => write!(
+                formatter,
+                "the certificate chain at position {} in {setting} presents no DNS subject alternative name, so no server name can ever select it; only the first chain serves callers that name no recognised server, so every later chain must carry at least one DNS name",
+                chain + 1
             ),
         }
     }
@@ -546,60 +580,94 @@ impl fmt::Debug for ZeroizingKey {
 }
 
 fn load_server_config(settings: InboundTlsSettings<'_>) -> Result<ListenerTls, InboundTlsError> {
-    let certificate_pem = read_material(
-        settings.certificate_setting,
-        settings.certificate_file,
-        SecretPurpose::TlsCertificate,
-        FileSecretPermissions::PlatformProjected,
-    )?;
-    // A key concatenated into the certificate file inherits the certificate's
-    // permissions, and a certificate is the one piece of this pair an operator
-    // reasonably mounts world-readable. Refusing the shape outright is cheaper
-    // than hoping nobody ever runs `cat key.pem >> cert.pem`.
-    if PrivateKeyDer::from_pem_slice(certificate_pem.expose()).is_ok() {
-        return Err(InboundTlsError::CertificateContainsPrivateKey {
-            setting: settings.certificate_setting,
-        });
-    }
-    let certificates = CertificateDer::pem_slice_iter(certificate_pem.expose())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| InboundTlsError::MaterialInvalid {
-            setting: settings.certificate_setting,
+    // The two lists arrive equal in length -- `Config::from_env` rejects a
+    // count mismatch as a configuration problem -- so the zip below yields
+    // exactly one key per certificate chain, in the order the operator wrote
+    // them.
+    let mut chains = Vec::with_capacity(settings.certificate_files.len());
+    for (certificate_file, private_key_file) in settings
+        .certificate_files
+        .iter()
+        .zip(settings.private_key_files)
+    {
+        let certificate_pem = read_material(
+            settings.certificate_setting,
+            certificate_file,
+            SecretPurpose::TlsCertificate,
+            FileSecretPermissions::PlatformProjected,
+        )?;
+        // A key concatenated into the certificate file inherits the
+        // certificate's permissions, and a certificate is the one piece of this
+        // pair an operator reasonably mounts world-readable. Refusing the shape
+        // outright is cheaper than hoping nobody ever runs
+        // `cat key.pem >> cert.pem`.
+        if PrivateKeyDer::from_pem_slice(certificate_pem.expose()).is_ok() {
+            return Err(InboundTlsError::CertificateContainsPrivateKey {
+                setting: settings.certificate_setting,
+            });
+        }
+        let certificates = CertificateDer::pem_slice_iter(certificate_pem.expose())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| InboundTlsError::MaterialInvalid {
+                setting: settings.certificate_setting,
+            })?;
+        if certificates.is_empty() {
+            return Err(InboundTlsError::MaterialInvalid {
+                setting: settings.certificate_setting,
+            });
+        }
+
+        let private_key_pem = read_material(
+            settings.private_key_setting,
+            private_key_file,
+            SecretPurpose::TlsPrivateKey,
+            FileSecretPermissions::ProjectedExclusive,
+        )?;
+        let mut private_key = ZeroizingKey(Some(
+            PrivateKeyDer::from_pem_slice(private_key_pem.expose()).map_err(|_| {
+                InboundTlsError::MaterialInvalid {
+                    setting: settings.private_key_setting,
+                }
+            })?,
+        ));
+        drop(private_key_pem);
+
+        // Build from an explicitly named provider rather than the process
+        // default: both `ring` and `aws-lc-rs` are in this dependency graph, so
+        // there is no unambiguous process default to inherit, and a listener's
+        // cipher suites should not depend on which module happened to install
+        // one first. The provider is shared across chains of the same listener
+        // for the same reason.
+        let provider = Arc::new(ring::default_provider());
+        let names = chain_server_names(&certificates, settings.certificate_setting)?;
+        // `CertifiedKey::from_der` is the same construction `with_single_cert`
+        // performs internally, including the key-matches-leaf check -- so a
+        // swapped key is caught here with the same error either path reports.
+        let certified_key = CertifiedKey::from_der(
+            certificates,
+            private_key
+                .take()
+                .expect("the parsed private key is taken exactly once"),
+            &provider,
+        )
+        .map_err(|_| InboundTlsError::KeyDoesNotMatchCertificate {
+            certificate_setting: settings.certificate_setting,
+            private_key_setting: settings.private_key_setting,
         })?;
-    if certificates.is_empty() {
-        return Err(InboundTlsError::MaterialInvalid {
-            setting: settings.certificate_setting,
+        chains.push(ServerCertChain {
+            names,
+            key: Arc::new(certified_key),
         });
     }
 
-    let private_key_pem = read_material(
-        settings.private_key_setting,
-        settings.private_key_file,
-        SecretPurpose::TlsPrivateKey,
-        FileSecretPermissions::ProjectedExclusive,
-    )?;
-    let mut private_key = ZeroizingKey(Some(
-        PrivateKeyDer::from_pem_slice(private_key_pem.expose()).map_err(|_| {
-            InboundTlsError::MaterialInvalid {
-                setting: settings.private_key_setting,
-            }
-        })?,
-    ));
-    drop(private_key_pem);
-
-    // Build from an explicitly named provider rather than the process default:
-    // both `ring` and `aws-lc-rs` are in this dependency graph, so there is no
-    // unambiguous process default to inherit, and a listener's cipher suites
-    // should not depend on which module happened to install one first.
-    let provider = Arc::new(ring::default_provider());
     let client_verifier = settings
         .client_auth
-        .map(|client_auth| load_client_verifier(client_auth, Arc::clone(&provider)))
+        .map(|client_auth| load_client_verifier(client_auth, Arc::new(ring::default_provider())))
         .transpose()?;
     let identity_source = settings
         .client_auth
         .map(|client_auth| client_auth.identity_source);
-    let versions = ServerConfig::builder_with_provider(provider)
+    let versions = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_protocol_versions(settings.min_version.protocol_versions())
         .map_err(|_| InboundTlsError::ProtocolVersionsUnsupported {
             setting: settings.min_version_setting,
@@ -608,16 +676,10 @@ fn load_server_config(settings: InboundTlsSettings<'_>) -> Result<ListenerTls, I
         Some(client_verifier) => versions.with_client_cert_verifier(client_verifier),
         None => versions.with_no_client_auth(),
     }
-    .with_single_cert(
-        certificates,
-        private_key
-            .take()
-            .expect("the parsed private key is taken exactly once"),
-    )
-    .map_err(|_| InboundTlsError::KeyDoesNotMatchCertificate {
-        certificate_setting: settings.certificate_setting,
-        private_key_setting: settings.private_key_setting,
-    })?;
+    .with_cert_resolver(Arc::new(SniServerCertResolver::build(
+        chains,
+        settings.certificate_setting,
+    )?));
 
     // Advertise HTTP/1.1 and nothing else. Offering `h2` here would be a
     // protocol change smuggled in through ALPN: `axum::serve` builds on
@@ -640,6 +702,183 @@ fn load_server_config(settings: InboundTlsSettings<'_>) -> Result<ListenerTls, I
         server_config: Arc::new(server_config),
         identity_source,
     })
+}
+
+/// One loaded certificate chain and the DNS names it answers to.
+struct ServerCertChain {
+    names: Vec<String>,
+    key: Arc<CertifiedKey>,
+}
+
+/// The DNS names a server certificate chain claims, validated for matching.
+///
+/// Names come from the leaf's DNS SANs, read by `rustls-webpki` -- the same
+/// parser rustls itself uses, as in the client-certificate identity work --
+/// lower-cased for ASCII because DNS matching is defined case-insensitively.
+/// The subject CN is deliberately not consulted: it is deprecated for name
+/// matching, it can disagree with the SANs, and a name that decides which chain
+/// serves a caller is exactly the wrong place for a second opinion. IP and URI
+/// SANs are ignored because SNI carries DNS names only; a certificate whose
+/// names are all IP SANs behaves as a nameless certificate, which is only
+/// acceptable for the default chain.
+///
+/// Each name is validated into a shape the resolver's matching rules can honour
+/// exactly rather than approximately: no trailing root dot, no empty labels,
+/// and a wildcard only as the entire first label. Anything looser would make
+/// `*.example.com` mean something RFC 6125 does not say it means.
+///
+/// The reader is `rustls-webpki`, and it does its own filtering: a SAN that is
+/// neither a valid DNS name nor a valid wildcard name -- `a.*.b`, `*foo.b`, a
+/// bare `*` -- never reaches this validator at all, so a chain carrying only
+/// such names behaves as a nameless chain, which only the first chain may be.
+/// That is the fail-closed direction: an unmatchable name is unclaimable
+/// rather than matched by something looser than it says. The checks below are
+/// defence in depth for the names webpki does let through -- a trailing root
+/// dot among them.
+fn chain_server_names(
+    certificates: &[CertificateDer<'_>],
+    setting: &'static str,
+) -> Result<Vec<String>, InboundTlsError> {
+    let leaf = certificates
+        .first()
+        .expect("the caller checked the chain is non-empty");
+    let parsed = webpki::EndEntityCert::try_from(leaf)
+        .map_err(|_| InboundTlsError::MaterialInvalid { setting })?;
+    let mut names = Vec::new();
+    for name in parsed.valid_dns_names() {
+        let name = name.to_ascii_lowercase();
+        validate_server_name(&name, setting)?;
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Accepts a single DNS name in the exact shape the resolver can match.
+fn validate_server_name(name: &str, setting: &'static str) -> Result<(), InboundTlsError> {
+    let malformed = |name: &str| InboundTlsError::ServerNameMalformed {
+        setting,
+        name: name.to_owned(),
+    };
+    // A wildcard is the whole first label or it is nothing this gateway
+    // promises to match: `a.*.b` and `*foo.b` are refused rather than
+    // half-supported, and a stray `*` in a later label is a name no client can
+    // legally send.
+    if let Some(suffix) = name.strip_prefix("*.") {
+        return if suffix.contains('*') || !suffix.split('.').all(|label| !label.is_empty()) {
+            Err(malformed(name))
+        } else {
+            Ok(())
+        };
+    }
+    if name.is_empty()
+        || name.contains('*')
+        || name.ends_with('.')
+        || name.split('.').any(|label| label.is_empty())
+    {
+        return Err(malformed(name));
+    }
+    Ok(())
+}
+
+/// Chooses the certificate chain for a connection from the client's server
+/// name, with the first configured chain as the default for everything the
+/// name does not select.
+///
+/// The selection rule is stated rather than implied: an exact name beats a
+/// wildcard, and a wildcard matches exactly one label, so `*.example.com`
+/// serves `a.example.com` and neither `a.b.example.com` nor `example.com`.
+/// Two facts make that rule total rather than best-effort. A name can be
+/// claimed twice only across chains, which startup rejects, so an exact lookup
+/// is never ambiguous. And two *different* wildcards can never both match one
+/// name -- a wildcard matches a name precisely when the name minus its first
+/// label equals the wildcard minus `*.`, and two distinct patterns cannot both
+/// equal that same remainder -- so wildcard resolution is never a
+/// first-match-wins accident of ordering.
+///
+/// A caller that sends no server name, or a name nothing claims, gets the
+/// first chain. That is the behaviour `with_single_cert` had when there was
+/// only one chain, carried forward deliberately: the resolver never answers
+/// `None`, because refusing the handshake is a policy decision this gateway
+/// has not been asked to make, and a mis-set SNI should fail in the client's
+/// certificate verification rather than in a connection reset the operator
+/// cannot tell from a broken listener.
+struct SniServerCertResolver {
+    exact: HashMap<String, usize>,
+    wildcards: HashMap<String, usize>,
+    chains: Vec<Arc<CertifiedKey>>,
+}
+
+impl SniServerCertResolver {
+    /// Builds the lookup tables, rejecting the two configurations whose
+    /// selection could never be honest: a name claimed by two chains, and a
+    /// non-first chain no name can ever select.
+    fn build(chains: Vec<ServerCertChain>, setting: &'static str) -> Result<Self, InboundTlsError> {
+        let mut exact = HashMap::new();
+        let mut wildcards = HashMap::new();
+        for (index, chain) in chains.iter().enumerate() {
+            if index > 0 && chain.names.is_empty() {
+                return Err(InboundTlsError::ServerNameUnselectable {
+                    setting,
+                    chain: index,
+                });
+            }
+            for name in &chain.names {
+                let (claimed, map) = match name.strip_prefix("*.") {
+                    Some(suffix) => (suffix.to_owned(), &mut wildcards),
+                    None => (name.to_owned(), &mut exact),
+                };
+                if map.insert(claimed.clone(), index).is_some() {
+                    return Err(InboundTlsError::ServerNameClaimedTwice {
+                        setting,
+                        name: claimed,
+                    });
+                }
+            }
+        }
+        let keys = chains.into_iter().map(|chain| chain.key).collect();
+        Ok(Self {
+            exact,
+            wildcards,
+            chains: keys,
+        })
+    }
+}
+
+impl ResolvesServerCert for SniServerCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        if let Some(name) = client_hello.server_name() {
+            let name = name.to_ascii_lowercase();
+            if let Some(chain) = self.exact.get(&name) {
+                return Some(Arc::clone(&self.chains[*chain]));
+            }
+            // A wildcard matches when everything after the caller's first label
+            // is exactly the wildcard's suffix -- one label consumed, no more.
+            if let Some((_, suffix)) = name.split_once('.') {
+                if let Some(chain) = self.wildcards.get(suffix) {
+                    return Some(Arc::clone(&self.chains[*chain]));
+                }
+            }
+        }
+        // No server name at all, or a name nothing claims: the first chain.
+        // Returning `None` here instead would abort the handshake, which is a
+        // policy decision this gateway has not been asked to make.
+        self.chains.first().cloned()
+    }
+}
+
+/// Hand-written because the derived form would print certificate chains, and a
+/// chain is public material attached to keys that are not.
+impl fmt::Debug for SniServerCertResolver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SniServerCertResolver")
+            .field("chains", &self.chains.len())
+            .field("exact_names", &self.exact.len())
+            .field("wildcard_names", &self.wildcards.len())
+            .finish()
+    }
 }
 
 /// Removes every way a listener can resume an earlier TLS session.
