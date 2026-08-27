@@ -146,32 +146,74 @@ if [ -n "$problems" ]; then
     exit 1
 fi
 
-# The HTTP/2 tripwire.
+# The HTTP/2 feature guard.
 #
-# Nothing in this workspace enables HTTP/2 today, and several security
-# properties quietly depend on that. Enabling the HTTP client's `http2` feature
-# rewrites its ALPN list to prefer h2, silently changing the protocol of every
-# existing HTTPS upstream. Worse, cargo unifies features across the dependency
-# graph: that same feature turns on `hyper-util/http2`, and the server side of
-# `hyper-util` is what `axum::serve` builds on. Its `auto::Builder` sniffs the
-# HTTP/2 connection preface and serves h2c when the feature is present, so
-# every listener -- including the admin listener -- would begin accepting
-# HTTP/2 prior-knowledge connections. No code change, no configuration change,
-# no axum feature change.
+# Two distinct properties depend on HTTP/2 staying off, and they are enabled by
+# different feature edges, so they are checked by name rather than by looking
+# for the `h2` crate.
 #
-# So the presence of the `h2` crate in the resolved build is the signal, and it
-# is checked here rather than trusted to review. A transport that genuinely
-# wants h2 must land this file's update in the same change, which is precisely
-# the review conversation this is meant to force.
+# Inbound: `axum::serve` builds on `hyper-util`'s `auto::Builder`, which sniffs
+# the HTTP/2 connection preface and serves h2c when hyper-util itself has
+# `http2`. If that feature is ever enabled, EVERY listener -- including the
+# admin listener -- begins accepting HTTP/2 prior-knowledge connections, with
+# no code change and nothing in the diff to notice.
+#
+# Outbound: enabling `reqwest/http2` rewrites its ALPN list to prefer h2, so
+# every existing HTTPS upstream that supports h2 silently changes protocol, and
+# hyper strips hop-by-hop headers on h2 rather than erroring.
+#
+# Note what is deliberately NOT checked: the mere presence of the `h2` crate.
+# Feature definitions are one-way -- `hyper-util/http2 = ["hyper/http2"]` --
+# so depending on `hyper` directly with `http2` does NOT enable hyper-util's,
+# and does NOT open h2c on any listener. A transport that drives its own h2
+# client is therefore compatible with both properties above, and an earlier
+# version of this check would have rejected it for the wrong reason.
 if command -v cargo >/dev/null 2>&1; then
-    if cargo tree --workspace --edges normal --prefix none 2>/dev/null | grep -qE '^h2 v'; then
-        echo "the h2 crate is in the resolved build, but nothing here is meant to speak HTTP/2 yet"
+    features="$(cargo tree -f '{p} | {f}' --edges normal 2>/dev/null || true)"
+    if [ -z "$features" ]; then
+        echo "could not resolve the dependency features; refusing to report a pass"
+        exit 1
+    fi
+
+    h2_violations=""
+    for crate in hyper-util axum reqwest; do
+        # "<crate> v1.2.3 | feat-a,feat-b" -> the feature list, for this crate only.
+        crate_features="$(
+            printf '%s
+' "$features" |
+                grep -oE "(^|[^a-z-])$crate v[0-9][^|]*\| [a-z0-9,_-]*" |
+                sed 's/.*| //' |
+                tr ',' '
+' |
+                sort -u
+        )"
+        if [ -z "$crate_features" ]; then
+            echo "$crate was not found in the resolved build; refusing to report a pass"
+            exit 1
+        fi
+        if printf '%s
+' "$crate_features" | grep -qx 'http2'; then
+            h2_violations="$h2_violations $crate"
+        fi
+    done
+
+    if [ -n "$h2_violations" ]; then
+        echo "HTTP/2 is enabled on a crate where it changes behaviour beyond the caller:"
+        for crate in $h2_violations; do
+            case "$crate" in
+                hyper-util|axum)
+                    echo "  $crate/http2 -- every listener, including the admin listener, would serve h2c"
+                    ;;
+                reqwest)
+                    echo "  $crate/http2 -- every existing HTTPS upstream would silently switch to h2"
+                    ;;
+            esac
+        done
         echo "if that is deliberate, update this check and the protocol pins in $EGRESS_FILE together"
-        cargo tree --workspace --edges normal --invert h2 2>/dev/null | head -20
         exit 1
     fi
 else
-    echo "cargo not found; skipping the HTTP/2 tripwire"
+    echo "cargo not found; skipping the HTTP/2 feature guard"
 fi
 
 echo "egress-only check passed"
