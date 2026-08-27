@@ -6,8 +6,16 @@
 //!
 //! This middleware should run near the edge so downstream layers cannot be
 //! confused by attacker-controlled identity metadata.
+//!
+//! Response headers fall into two classes. A *floor* is a guarantee the gateway
+//! makes about its own origin, so it is written even when the response already
+//! carries a value: a proxied upstream must not be able to lower it. A
+//! *default* is a policy only the application behind the route can size, so an
+//! explicit value from the route wins and the baseline covers the responses
+//! that express nothing.
 
 use axum::{extract::Request, middleware::Next, response::Response};
+use http::HeaderMap;
 
 /// Request headers that must never be trusted from untrusted clients.
 ///
@@ -75,12 +83,34 @@ pub async fn header_hardening_middleware(mut req: Request, next: Next) -> Respon
     let mut res = next.run(req).await;
     let headers = res.headers_mut();
 
-    headers
-        .entry("x-content-type-options")
-        .or_insert("nosniff".parse().expect("static header value should parse"));
-    headers
-        .entry("x-frame-options")
-        .or_insert("DENY".parse().expect("static header value should parse"));
+    // Floor: `nosniff` is the only value this header has ever meant, so a
+    // response carrying anything else is not expressing a policy, it is
+    // removing one. MIME confusion lands on the gateway's origin, not the
+    // upstream's, so the gateway keeps the decision.
+    headers.insert(
+        "x-content-type-options",
+        "nosniff".parse().expect("static header value should parse"),
+    );
+
+    // Floor: framing binds the gateway's origin, where the admin session and
+    // CSRF cookies live, so an upstream cannot hand its own responses to an
+    // attacker's frame. An upstream that restricts framing itself keeps its
+    // value, and one that genuinely wants to be framed says so with
+    // `frame-ancestors`, which browsers honour over `x-frame-options`.
+    if !restricts_framing(headers) {
+        headers.insert(
+            "x-frame-options",
+            "DENY".parse().expect("static header value should parse"),
+        );
+    }
+
+    // The rest are defaults. `referrer-policy` trades privacy against apps that
+    // need `Referer` for their own checks, `permissions-policy` gates features a
+    // proxied app may legitimately use, and `cross-origin-resource-policy`
+    // decides who may embed the route's own resources. The admin UI is the
+    // in-tree proof for `content-security-policy`: it serves its own because the
+    // baseline `default-src 'none'` would refuse to load its bundle, and every
+    // proxied app with a UI is in the same position.
     headers.entry("referrer-policy").or_insert(
         "no-referrer"
             .parse()
@@ -105,18 +135,74 @@ pub async fn header_hardening_middleware(mut req: Request, next: Next) -> Respon
     res
 }
 
+/// Whether the response already restricts framing with a directive a browser
+/// acts on.
+///
+/// Browsers honour only `DENY` and `SAMEORIGIN`, and ignore the header entirely
+/// when it repeats. Everything else -- `ALLOWALL`, the obsolete `ALLOW-FROM`, a
+/// typo -- leaves the response framable, so the gateway reads it as no policy
+/// rather than as the application's choice.
+fn restricts_framing(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all("x-frame-options").iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+
+    value.to_str().is_ok_and(|value| {
+        let value = value.trim();
+        value.eq_ignore_ascii_case("deny") || value.eq_ignore_ascii_case("sameorigin")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{
         body::Body,
-        http::{header, Request, StatusCode},
+        extract::State,
+        http::{HeaderName, HeaderValue, Request, StatusCode},
         middleware::from_fn,
         response::IntoResponse,
         routing::get,
         Router,
     };
     use tower::ServiceExt;
+
+    /// Runs the middleware over a handler that emits `upstream_headers`, the way
+    /// a proxied response carries whatever the upstream chose to send.
+    async fn hardened_response(
+        upstream_headers: &'static [(&'static str, &'static str)],
+    ) -> Response {
+        async fn handler(
+            State(upstream_headers): State<&'static [(&'static str, &'static str)]>,
+        ) -> impl IntoResponse {
+            let mut headers = HeaderMap::new();
+            for (name, value) in upstream_headers {
+                headers.append(
+                    HeaderName::from_static(name),
+                    HeaderValue::from_static(value),
+                );
+            }
+
+            (headers, "ok")
+        }
+
+        Router::new()
+            .route("/", get(handler))
+            .with_state(upstream_headers)
+            .layer(from_fn(header_hardening_middleware))
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete")
+    }
 
     #[tokio::test]
     async fn strips_spoofed_headers_before_handler() {
@@ -192,23 +278,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_overwrite_explicit_security_header() {
-        async fn explicit_frame_options() -> impl IntoResponse {
-            ([(header::X_FRAME_OPTIONS, "SAMEORIGIN")], "ok")
-        }
-
-        let response = Router::new()
-            .route("/", get(explicit_frame_options))
-            .layer(from_fn(header_hardening_middleware))
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("request should complete");
+    async fn keeps_upstream_framing_restriction() {
+        let response = hardened_response(&[("x-frame-options", "SAMEORIGIN")]).await;
 
         assert_eq!(response.headers()["x-frame-options"], "SAMEORIGIN");
+    }
+
+    #[tokio::test]
+    async fn overwrites_upstream_content_type_options() {
+        let response = hardened_response(&[("x-content-type-options", "sniff")]).await;
+
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    }
+
+    #[tokio::test]
+    async fn replaces_framing_directive_browsers_ignore() {
+        let response = hardened_response(&[("x-frame-options", "ALLOWALL")]).await;
+
+        assert_eq!(response.headers()["x-frame-options"], "DENY");
+    }
+
+    #[tokio::test]
+    async fn replaces_conflicting_framing_directives() {
+        let response = hardened_response(&[
+            ("x-frame-options", "SAMEORIGIN"),
+            ("x-frame-options", "ALLOWALL"),
+        ])
+        .await;
+
+        let framing = response
+            .headers()
+            .get_all("x-frame-options")
+            .iter()
+            .map(|value| value.to_str().expect("header value should be ASCII"))
+            .collect::<Vec<_>>();
+        assert_eq!(framing, vec!["DENY"]);
+    }
+
+    #[tokio::test]
+    async fn keeps_upstream_content_security_policy() {
+        let response =
+            hardened_response(&[("content-security-policy", "default-src 'self'")]).await;
+
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "default-src 'self'"
+        );
     }
 }
