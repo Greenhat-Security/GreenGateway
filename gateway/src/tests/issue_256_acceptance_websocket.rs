@@ -484,6 +484,7 @@ fn websocket_config(
         request_body: config::UpstreamRequestBodyConfig::default(),
         sse: None,
         websocket: Some(websocket),
+        grpc: None,
         limits: config::UpstreamPoolLimitsConfig::default(),
         health_check: None,
         retry: None,
@@ -646,7 +647,7 @@ async fn spawn_gateway(
         },
     )
     .expect("websocket acceptance app should build");
-    let router = match app {
+    let router = match app.http {
         GatewayApp::Unified(router) => router,
         GatewayApp::Split { .. } => panic!("websocket acceptance app should be unified"),
     };

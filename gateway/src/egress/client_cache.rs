@@ -78,6 +78,14 @@ pub(super) enum ProtocolProfile {
     /// be handed a pooled client that ALPN-negotiated HTTP/2, and so long-lived
     /// upgraded sockets do not share a pool with ordinary requests.
     UpgradeHttp1,
+    /// HTTP/2-only transport for the gRPC proxy (issue #257).
+    ///
+    /// This profile is the ONE place in the build where ALPN offers `h2`, and
+    /// it is served by `egress::grpc` rather than by reqwest --
+    /// `base_client_builder_for_profile` refuses it, because reqwest with an
+    /// `h2` ALPN list panics inside hyper-util in a build without
+    /// `hyper-util/http2`.
+    Grpc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

@@ -4730,6 +4730,7 @@ mod tests {
                         connection_id: None,
                         request_header_policy: RouteRequestHeaderPolicy::default(),
                         pool,
+                        grpc: None,
                         request_body_mode: options.request_body_mode,
                         sse,
                         websocket: options.websocket.clone(),

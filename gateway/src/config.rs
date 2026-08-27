@@ -142,7 +142,28 @@ const DEFAULT_EGRESS_CONNECT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_EGRESS_MAX_RESPONSE_BYTES: usize = 5_242_880;
 const DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_EGRESS_DENY_PRIVATE_IPS: bool = true;
+
+/// Default ceiling on concurrently open HTTP/2 streams per gRPC connection.
+///
+/// Half of hyper's own default of 200. One accepted TCP connection becomes this
+/// many concurrent in-flight calls, so it is the single most load-bearing
+/// inbound bound the gateway has, and it exists at all only because the gRPC
+/// listener is served by `hyper::server::conn::http2::Builder` directly --
+/// `axum::serve` exposes no builder and would run on hyper's default with no
+/// way to change it.
+pub const DEFAULT_GRPC_MAX_CONCURRENT_STREAMS: u32 = 100;
+pub const MAX_GRPC_MAX_CONCURRENT_STREAMS: u32 = 10_000;
+/// Default ceiling on the decoded size of one request's metadata.
+///
+/// Matches hyper's own `max_header_list_size` default. Raised by deployments
+/// whose callers carry large bearer tokens in metadata.
+pub const DEFAULT_GRPC_MAX_METADATA_BYTES: u32 = 16_384;
+pub const MIN_GRPC_MAX_METADATA_BYTES: u32 = 1_024;
+pub const MAX_GRPC_MAX_METADATA_BYTES: u32 = 1_048_576;
 const ADMIN_LISTEN_ADDR: &str = "ADMIN_LISTEN_ADDR";
+const GRPC_LISTEN_ADDR: &str = "GRPC_LISTEN_ADDR";
+const GRPC_MAX_CONCURRENT_STREAMS: &str = "GRPC_MAX_CONCURRENT_STREAMS";
+const GRPC_MAX_METADATA_BYTES: &str = "GRPC_MAX_METADATA_BYTES";
 const ADMIN_LOGIN_PROVIDER: &str = "ADMIN_LOGIN_PROVIDER";
 const ADMIN_LOGIN_PENDING_TTL_SECS: &str = "ADMIN_LOGIN_PENDING_TTL_SECS";
 const ADMIN_LOGIN_PENDING_MAX_ENTRIES: &str = "ADMIN_LOGIN_PENDING_MAX_ENTRIES";
@@ -238,6 +259,17 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 pub struct Config {
     pub listen_addr: SocketAddr,
     pub admin_listen_addr: Option<SocketAddr>,
+    /// Address of the opt-in gRPC listener.
+    ///
+    /// Unset means no HTTP/2 server is ever constructed. A third listener
+    /// rather than a mode on the data listener, because `axum::serve` offers no
+    /// way to configure the HTTP/2 builder it constructs internally -- so the
+    /// bounds #257 requires would be unreachable -- and because with
+    /// `ADMIN_LISTEN_ADDR` unset the admin API shares the data listener's
+    /// socket, which would put h2c on the admin surface by default.
+    pub grpc_listen_addr: Option<SocketAddr>,
+    pub grpc_max_concurrent_streams: u32,
+    pub grpc_max_metadata_bytes: u32,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
     pub admin_tls_cert_file: Option<String>,
@@ -365,6 +397,8 @@ pub struct UpstreamRouteConfig {
     #[serde(default)]
     pub websocket: Option<UpstreamWebSocketConfig>,
     #[serde(default)]
+    pub grpc: Option<UpstreamGrpcConfig>,
+    #[serde(default)]
     pub limits: UpstreamPoolLimitsConfig,
     #[serde(default)]
     pub health_check: Option<UpstreamHealthCheckConfig>,
@@ -473,6 +507,112 @@ pub const MAX_WEBSOCKET_ORIGINS: usize = 32;
 pub const MAX_WEBSOCKET_ORIGIN_BYTES: usize = 256;
 pub const MAX_WEBSOCKET_SUBPROTOCOLS: usize = 32;
 pub const MAX_WEBSOCKET_SUBPROTOCOL_BYTES: usize = 128;
+
+pub const DEFAULT_GRPC_MAX_CONCURRENT_CALLS: usize = 256;
+pub const MAX_GRPC_MAX_CONCURRENT_CALLS: usize = 100_000;
+pub const DEFAULT_GRPC_QUEUE_DEPTH: usize = 64;
+pub const MAX_GRPC_QUEUE_DEPTH: usize = 10_000;
+pub const DEFAULT_GRPC_QUEUE_TIMEOUT_MS: u64 = 100;
+pub const DEFAULT_GRPC_CONNECT_TIMEOUT_MS: u64 = 10_000;
+pub const MIN_GRPC_CONNECT_TIMEOUT_MS: u64 = 100;
+pub const MAX_GRPC_CONNECT_TIMEOUT_MS: u64 = 60_000;
+pub const DEFAULT_GRPC_IDLE_TIMEOUT_MS: u64 = 300_000;
+pub const MIN_GRPC_IDLE_TIMEOUT_MS: u64 = 1_000;
+pub const MAX_GRPC_IDLE_TIMEOUT_MS: u64 = 3_600_000;
+pub const DEFAULT_GRPC_MAX_DURATION_MS: u64 = 3_600_000;
+pub const MAX_GRPC_MAX_DURATION_MS: u64 = 604_800_000;
+pub const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MIN_GRPC_MAX_MESSAGE_BYTES: usize = 1_024;
+pub const MAX_GRPC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+pub const DEFAULT_GRPC_MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_GRPC_MAX_METADATA_ENTRIES: usize = 64;
+pub const MAX_GRPC_MAX_METADATA_ENTRIES: usize = 1_024;
+
+/// Opt-in, per-route transparent gRPC proxying.
+///
+/// Absent means the route carries no gRPC policy, and the gRPC listener refuses
+/// every call that matches it. Being absent is therefore a denial rather than a
+/// fallback: a route that has not been given gRPC limits has no limits to
+/// enforce, and a proxy with no limits is exactly what #257 forbids.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamGrpcConfig {
+    /// Concurrent CALLS, not connections.
+    ///
+    /// The WebSocket transport counts connections because each carries one
+    /// conversation. gRPC multiplexes many streams over one connection, so
+    /// counting connections here would bound nothing at all.
+    #[serde(default = "default_grpc_max_concurrent_calls")]
+    pub max_concurrent_calls: usize,
+    /// Defaults to `max_concurrent_calls`, i.e. no separate per-endpoint cap.
+    #[serde(default)]
+    pub max_concurrent_calls_per_endpoint: Option<usize>,
+    #[serde(default = "default_grpc_queue_depth")]
+    pub queue_depth: usize,
+    #[serde(default = "default_grpc_queue_timeout_ms")]
+    pub queue_timeout_ms: u64,
+    /// Budget for establishing an upstream connection and acquiring stream
+    /// capacity on an existing one.
+    #[serde(default = "default_grpc_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Zero disables. Measured on the upstream-to-client direction, which is
+    /// the one a stalled server shows up in.
+    #[serde(default = "default_grpc_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+    /// Ceiling on one call's total duration, and the cap applied to a client's
+    /// `grpc-timeout`. Zero disables the ceiling.
+    #[serde(default = "default_grpc_max_duration_ms")]
+    pub max_duration_ms: u64,
+    /// Largest single encoded gRPC message, in either direction.
+    #[serde(default = "default_grpc_max_message_bytes")]
+    pub max_message_bytes: usize,
+    /// Ceiling on total bytes in one direction of one call. Zero disables.
+    #[serde(default = "default_grpc_max_stream_bytes")]
+    pub max_request_bytes: u64,
+    #[serde(default = "default_grpc_max_stream_bytes")]
+    pub max_response_bytes: u64,
+    /// Ceiling on the NUMBER of metadata entries, in headers and in trailers
+    /// independently. The listener bounds their total size; this bounds their
+    /// count, which is the half a byte budget does not constrain.
+    #[serde(default = "default_grpc_max_metadata_entries")]
+    pub max_metadata_entries: usize,
+}
+
+fn default_grpc_max_concurrent_calls() -> usize {
+    DEFAULT_GRPC_MAX_CONCURRENT_CALLS
+}
+
+fn default_grpc_queue_depth() -> usize {
+    DEFAULT_GRPC_QUEUE_DEPTH
+}
+
+fn default_grpc_queue_timeout_ms() -> u64 {
+    DEFAULT_GRPC_QUEUE_TIMEOUT_MS
+}
+
+fn default_grpc_connect_timeout_ms() -> u64 {
+    DEFAULT_GRPC_CONNECT_TIMEOUT_MS
+}
+
+fn default_grpc_idle_timeout_ms() -> u64 {
+    DEFAULT_GRPC_IDLE_TIMEOUT_MS
+}
+
+fn default_grpc_max_duration_ms() -> u64 {
+    DEFAULT_GRPC_MAX_DURATION_MS
+}
+
+fn default_grpc_max_message_bytes() -> usize {
+    DEFAULT_GRPC_MAX_MESSAGE_BYTES
+}
+
+fn default_grpc_max_stream_bytes() -> u64 {
+    DEFAULT_GRPC_MAX_STREAM_BYTES
+}
+
+fn default_grpc_max_metadata_entries() -> usize {
+    DEFAULT_GRPC_MAX_METADATA_ENTRIES
+}
 
 /// Opt-in, per-route WebSocket proxying.
 ///
@@ -968,6 +1108,53 @@ impl Config {
                 "{ADMIN_LISTEN_ADDR} must not be the same address as {LISTEN_ADDR} (both resolved to {listen_addr}); choose a different port for the admin listener or leave {ADMIN_LISTEN_ADDR} unset"
             ));
         }
+        let grpc_listen_addr =
+            parse_optional_socket_addr(GRPC_LISTEN_ADDR, get_var(GRPC_LISTEN_ADDR), &mut problems);
+        // Sharing a socket with either existing listener is refused rather than
+        // resolved. The gRPC listener speaks HTTP/2 and nothing else, and the
+        // other two refuse an HTTP/2 preface outright, so a collision is not a
+        // preference to reconcile -- one of the two listeners would simply
+        // never answer.
+        if problems.len() == listener_problem_count && grpc_listen_addr.is_some() {
+            if grpc_listen_addr == Some(listen_addr) {
+                problems.push(format!(
+                    "{GRPC_LISTEN_ADDR} must not be the same address as {LISTEN_ADDR} (both resolved to {listen_addr}); the gRPC listener serves HTTP/2 and the data listener refuses it"
+                ));
+            }
+            if admin_listen_addr.is_some() && grpc_listen_addr == admin_listen_addr {
+                problems.push(format!(
+                    "{GRPC_LISTEN_ADDR} must not be the same address as {ADMIN_LISTEN_ADDR}; the gRPC listener serves HTTP/2 and the admin listener refuses it"
+                ));
+            }
+        }
+        let grpc_max_concurrent_streams = validate_range_u32(
+            GRPC_MAX_CONCURRENT_STREAMS,
+            parse_var(
+                GRPC_MAX_CONCURRENT_STREAMS,
+                get_var(GRPC_MAX_CONCURRENT_STREAMS),
+                DEFAULT_GRPC_MAX_CONCURRENT_STREAMS,
+                "stream count",
+                &mut problems,
+            ),
+            1,
+            MAX_GRPC_MAX_CONCURRENT_STREAMS,
+            DEFAULT_GRPC_MAX_CONCURRENT_STREAMS,
+            &mut problems,
+        );
+        let grpc_max_metadata_bytes = validate_range_u32(
+            GRPC_MAX_METADATA_BYTES,
+            parse_var(
+                GRPC_MAX_METADATA_BYTES,
+                get_var(GRPC_MAX_METADATA_BYTES),
+                DEFAULT_GRPC_MAX_METADATA_BYTES,
+                "byte count",
+                &mut problems,
+            ),
+            MIN_GRPC_MAX_METADATA_BYTES,
+            MAX_GRPC_MAX_METADATA_BYTES,
+            DEFAULT_GRPC_MAX_METADATA_BYTES,
+            &mut problems,
+        );
         let tls_cert_file =
             parse_optional_string(TLS_CERT_FILE, get_var(TLS_CERT_FILE), &mut problems);
         let tls_key_file =
@@ -1742,6 +1929,9 @@ impl Config {
             Ok(Self {
                 listen_addr,
                 admin_listen_addr,
+                grpc_listen_addr,
+                grpc_max_concurrent_streams,
+                grpc_max_metadata_bytes,
                 tls_cert_file,
                 tls_key_file,
                 admin_tls_cert_file,
@@ -1985,6 +2175,25 @@ fn zero_timeout_problem(name: &str, value: u64) -> String {
 /// already reject `0` through `validate_optional_positive_duration`; this gives
 /// the global settings that override them the same answer instead of booting
 /// clean into a permanent timeout.
+/// Clamps an inclusive numeric range, reporting rather than silently accepting.
+fn validate_range_u32(
+    name: &str,
+    value: u32,
+    minimum: u32,
+    maximum: u32,
+    default: u32,
+    problems: &mut Vec<String>,
+) -> u32 {
+    if (minimum..=maximum).contains(&value) {
+        value
+    } else {
+        problems.push(format!(
+            "{name} must be between {minimum} and {maximum}, got {value}"
+        ));
+        default
+    }
+}
+
 fn validate_positive_timeout_ms(
     name: &str,
     value: u64,
@@ -3914,6 +4123,86 @@ fn validate_upstream_routes(
             websocket
         });
 
+        let grpc = route.grpc.inspect(|grpc| {
+            if !(1..=MAX_GRPC_MAX_CONCURRENT_CALLS).contains(&grpc.max_concurrent_calls) {
+                problems.push(format!(
+                    "{route_name}.grpc.max_concurrent_calls must be between 1 and {MAX_GRPC_MAX_CONCURRENT_CALLS}"
+                ));
+            }
+            if let Some(per_endpoint) = grpc.max_concurrent_calls_per_endpoint {
+                if !(1..=grpc.max_concurrent_calls).contains(&per_endpoint) {
+                    problems.push(format!(
+                        "{route_name}.grpc.max_concurrent_calls_per_endpoint must be between 1 and grpc.max_concurrent_calls"
+                    ));
+                }
+            }
+            if grpc.queue_depth > MAX_GRPC_QUEUE_DEPTH {
+                problems.push(format!(
+                    "{route_name}.grpc.queue_depth must be at most {MAX_GRPC_QUEUE_DEPTH}"
+                ));
+            }
+            if !(MIN_GRPC_CONNECT_TIMEOUT_MS..=MAX_GRPC_CONNECT_TIMEOUT_MS)
+                .contains(&grpc.connect_timeout_ms)
+            {
+                problems.push(format!(
+                    "{route_name}.grpc.connect_timeout_ms must be between {MIN_GRPC_CONNECT_TIMEOUT_MS} and {MAX_GRPC_CONNECT_TIMEOUT_MS}"
+                ));
+            }
+            if grpc.idle_timeout_ms != 0
+                && !(MIN_GRPC_IDLE_TIMEOUT_MS..=MAX_GRPC_IDLE_TIMEOUT_MS)
+                    .contains(&grpc.idle_timeout_ms)
+            {
+                problems.push(format!(
+                    "{route_name}.grpc.idle_timeout_ms must be 0 to disable, or between {MIN_GRPC_IDLE_TIMEOUT_MS} and {MAX_GRPC_IDLE_TIMEOUT_MS}"
+                ));
+            }
+            if grpc.max_duration_ms != 0 && grpc.max_duration_ms > MAX_GRPC_MAX_DURATION_MS {
+                problems.push(format!(
+                    "{route_name}.grpc.max_duration_ms must be 0 to disable, or at most {MAX_GRPC_MAX_DURATION_MS}"
+                ));
+            }
+            if !(MIN_GRPC_MAX_MESSAGE_BYTES..=MAX_GRPC_MAX_MESSAGE_BYTES)
+                .contains(&grpc.max_message_bytes)
+            {
+                problems.push(format!(
+                    "{route_name}.grpc.max_message_bytes must be between {MIN_GRPC_MAX_MESSAGE_BYTES} and {MAX_GRPC_MAX_MESSAGE_BYTES}"
+                ));
+            }
+            // A per-direction budget below one legal message could never carry
+            // a call the route explicitly permits.
+            for (name, value) in [
+                ("max_request_bytes", grpc.max_request_bytes),
+                ("max_response_bytes", grpc.max_response_bytes),
+            ] {
+                if value != 0
+                    && value < u64::try_from(grpc.max_message_bytes).unwrap_or(u64::MAX)
+                {
+                    problems.push(format!(
+                        "{route_name}.grpc.{name} must be 0 to disable, or at least grpc.max_message_bytes"
+                    ));
+                }
+            }
+            if !(1..=MAX_GRPC_MAX_METADATA_ENTRIES).contains(&grpc.max_metadata_entries) {
+                problems.push(format!(
+                    "{route_name}.grpc.max_metadata_entries must be between 1 and {MAX_GRPC_MAX_METADATA_ENTRIES}"
+                ));
+            }
+            if has_legacy_url {
+                problems.push(format!(
+                    "{route_name}.grpc requires an upstreams pool and cannot be used with upstream_url"
+                ));
+            }
+            // Same reasoning the WebSocket transport records: a Connection-bound
+            // route injects a managed credential per request, and doing that
+            // once for a stream that then lives for an hour is a different
+            // security question, deferred rather than assumed safe.
+            if connection_id.is_some() {
+                problems.push(format!(
+                    "{route_name}.grpc cannot be combined with connection_id"
+                ));
+            }
+        });
+
         validated.push(UpstreamRouteConfig {
             id,
             connection_id,
@@ -3925,6 +4214,7 @@ fn validate_upstream_routes(
             request_body: route.request_body,
             sse: route.sse,
             websocket,
+            grpc,
             limits: route.limits,
             health_check: route.health_check,
             retry: route.retry,
@@ -7428,6 +7718,7 @@ mod tests {
                     request_body: UpstreamRequestBodyConfig::default(),
                     sse: None,
                     websocket: None,
+                    grpc: None,
                     limits: UpstreamPoolLimitsConfig::default(),
                     health_check: None,
                     retry: None,
@@ -7454,6 +7745,7 @@ mod tests {
                     request_body: UpstreamRequestBodyConfig::default(),
                     sse: None,
                     websocket: None,
+                    grpc: None,
                     limits: UpstreamPoolLimitsConfig::default(),
                     health_check: None,
                     retry: None,
@@ -7495,6 +7787,173 @@ mod tests {
             route.add_request_headers.get("x-route-label"),
             Some(&"billing".to_owned())
         );
+    }
+
+    /// The gRPC listener must not share a socket with either existing one.
+    ///
+    /// Not a preference to reconcile: this listener speaks HTTP/2 and nothing
+    /// else, and the other two refuse an HTTP/2 preface, so a shared address
+    /// would leave one of them permanently unable to answer.
+    #[test]
+    fn grpc_listen_addr_must_differ_from_the_other_listeners() {
+        let error = Config::from_env_vars(|name| match name {
+            "LISTEN_ADDR" | "GRPC_LISTEN_ADDR" => Ok("127.0.0.1:9090".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("a gRPC listener sharing the data address must fail startup");
+        assert!(
+            error
+                .to_string()
+                .contains("GRPC_LISTEN_ADDR must not be the same address as LISTEN_ADDR"),
+            "{error}"
+        );
+
+        let error = Config::from_env_vars(|name| match name {
+            "LISTEN_ADDR" => Ok("127.0.0.1:9090".to_owned()),
+            "ADMIN_LISTEN_ADDR" | "GRPC_LISTEN_ADDR" => Ok("127.0.0.1:9091".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("a gRPC listener sharing the admin address must fail startup");
+        assert!(
+            error
+                .to_string()
+                .contains("GRPC_LISTEN_ADDR must not be the same address as ADMIN_LISTEN_ADDR"),
+            "{error}"
+        );
+
+        // The control: three distinct addresses are accepted, so the two
+        // refusals above are about the collision and not about the setting.
+        let config = Config::from_env_vars(|name| match name {
+            "LISTEN_ADDR" => Ok("127.0.0.1:9090".to_owned()),
+            "ADMIN_LISTEN_ADDR" => Ok("127.0.0.1:9091".to_owned()),
+            "GRPC_LISTEN_ADDR" => Ok("127.0.0.1:9092".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("three distinct listener addresses should validate");
+        assert_eq!(
+            config.grpc_listen_addr,
+            Some(
+                "127.0.0.1:9092"
+                    .parse()
+                    .expect("test gRPC address should parse")
+            )
+        );
+    }
+
+    #[test]
+    fn grpc_listener_bounds_are_range_checked_and_default_when_unset() {
+        let config = Config::from_env_vars(|_| Err(VarError::NotPresent))
+            .expect("an unset gRPC listener should validate");
+        assert_eq!(config.grpc_listen_addr, None);
+        assert_eq!(
+            config.grpc_max_concurrent_streams,
+            DEFAULT_GRPC_MAX_CONCURRENT_STREAMS
+        );
+        assert_eq!(
+            config.grpc_max_metadata_bytes,
+            DEFAULT_GRPC_MAX_METADATA_BYTES
+        );
+
+        let error = Config::from_env_vars(|name| match name {
+            "GRPC_MAX_CONCURRENT_STREAMS" => Ok("0".to_owned()),
+            "GRPC_MAX_METADATA_BYTES" => Ok("16".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("out-of-range gRPC bounds must fail startup");
+        let message = error.to_string();
+        for expected in [
+            "GRPC_MAX_CONCURRENT_STREAMS must be between 1 and",
+            "GRPC_MAX_METADATA_BYTES must be between 1024 and",
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
+    }
+
+    /// A route's gRPC policy is validated as a whole, and every problem is
+    /// reported at once rather than one per startup attempt.
+    #[test]
+    fn grpc_routes_reject_incoherent_bounds_and_unusable_placement() {
+        let error = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[
+                {
+                    "id":"bounds",
+                    "path_prefix":"/bounds",
+                    "upstreams":[{"id":"a","url":"https://a.example.test"}],
+                    "grpc":{
+                        "max_concurrent_calls":4,
+                        "max_concurrent_calls_per_endpoint":9,
+                        "connect_timeout_ms":1,
+                        "idle_timeout_ms":10,
+                        "max_message_bytes":1048576,
+                        "max_response_bytes":1024,
+                        "max_metadata_entries":0
+                    }
+                },
+                {
+                    "id":"legacy",
+                    "path_prefix":"/legacy",
+                    "upstream_url":"https://legacy.example.test",
+                    "grpc":{}
+                }
+            ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("incoherent gRPC settings must fail startup");
+        let message = error.to_string();
+
+        for expected in [
+            // A per-endpoint cap above the route cap can never bind.
+            "[0].grpc.max_concurrent_calls_per_endpoint must be between 1 and grpc.max_concurrent_calls",
+            "[0].grpc.connect_timeout_ms must be between",
+            "[0].grpc.idle_timeout_ms must be 0 to disable",
+            // A direction budget below one legal message could carry nothing.
+            "[0].grpc.max_response_bytes must be 0 to disable, or at least grpc.max_message_bytes",
+            "[0].grpc.max_metadata_entries must be between 1 and",
+            "[1].grpc requires an upstreams pool and cannot be used with upstream_url",
+        ] {
+            assert!(
+                message.contains(expected),
+                "aggregated validation should contain '{expected}': {message}"
+            );
+        }
+    }
+
+    /// A route with no `grpc` block is not a gRPC route, and defaults fill in
+    /// for a block that is present but empty.
+    #[test]
+    fn grpc_route_policy_is_absent_by_default_and_defaults_when_empty() {
+        let config = Config::from_env_vars(|name| match name {
+            "UPSTREAM_ROUTES" => Ok(r#"[
+                {
+                    "id":"plain",
+                    "path_prefix":"/plain",
+                    "upstreams":[{"id":"a","url":"https://a.example.test"}]
+                },
+                {
+                    "id":"grpc",
+                    "path_prefix":"/grpc",
+                    "upstreams":[{"id":"b","url":"https://b.example.test"}],
+                    "grpc":{}
+                }
+            ]"#
+            .to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("routes should parse");
+
+        assert!(
+            config.upstream_routes[0].grpc.is_none(),
+            "a route without a grpc block must not become a gRPC route"
+        );
+        let grpc = config.upstream_routes[1]
+            .grpc
+            .as_ref()
+            .expect("an empty grpc block still opts the route in");
+        assert_eq!(grpc.max_concurrent_calls, DEFAULT_GRPC_MAX_CONCURRENT_CALLS);
+        assert_eq!(grpc.max_message_bytes, DEFAULT_GRPC_MAX_MESSAGE_BYTES);
+        assert_eq!(grpc.max_metadata_entries, DEFAULT_GRPC_MAX_METADATA_ENTRIES);
+        assert_eq!(grpc.max_concurrent_calls_per_endpoint, None);
     }
 
     #[test]

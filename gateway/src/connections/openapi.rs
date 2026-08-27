@@ -1235,6 +1235,8 @@ fn egress_error(error: EgressError) -> OpenApiCatalogError {
         | EgressError::InvalidTlsCaBundle { .. }
         | EgressError::InvalidTlsClientIdentity
         | EgressError::Http(_) => OpenApiCatalogError::RequestFailed,
+        // Unreachable: catalog fetches use the pinned HTTP/1.1 transport only.
+        EgressError::Grpc(_) => OpenApiCatalogError::RequestFailed,
     }
 }
 

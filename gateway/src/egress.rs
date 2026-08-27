@@ -29,7 +29,14 @@ use crate::{config::Config, rbac::EgressPolicy};
 // boundary without creating a second, independently versioned HTTP stack.
 pub(crate) use reqwest as rmcp_http;
 
+#[cfg(test)]
+pub(crate) use grpc::test_client as grpc_test_client;
+pub(crate) use grpc::{GrpcFailure, GrpcRequestBody, GrpcResponseBody};
+
 mod client_cache;
+mod grpc;
+#[cfg(test)]
+mod grpc_tests;
 #[cfg(test)]
 mod mtls_tests;
 mod tls;
@@ -156,6 +163,13 @@ pub enum EgressError {
         message: String,
     },
     InvalidTlsClientIdentity,
+    /// A bounded gRPC transport failure.
+    ///
+    /// Carries a category and nothing else, on purpose: hyper's own error text
+    /// can name the destination, the negotiated protocol, or bytes the upstream
+    /// sent, and #257 forbids any of that reaching a log, a metric label, an
+    /// audit field, or a client. The variant makes that structural.
+    Grpc(GrpcFailure),
     Http(reqwest::Error),
 }
 
@@ -212,6 +226,7 @@ impl fmt::Display for EgressError {
             Self::InvalidTlsClientIdentity => {
                 formatter.write_str("egress TLS client identity is invalid")
             }
+            Self::Grpc(failure) => write!(formatter, "egress gRPC transport error: {failure}"),
             Self::Http(err) => write!(formatter, "egress HTTP error: {err}"),
         }
     }
@@ -247,6 +262,7 @@ impl EgressError {
     pub fn is_timeout(&self) -> bool {
         match self {
             Self::ResponseIdleTimeout { .. } => true,
+            Self::Grpc(GrpcFailure::ConnectTimeout) => true,
             Self::Http(err) => err.is_timeout(),
             _ => false,
         }
@@ -272,6 +288,7 @@ impl EgressError {
             Self::ResponseIdleTimeout { .. } => "response_idle_timeout",
             Self::InvalidTlsCaBundle { .. } => "invalid_tls_ca_bundle",
             Self::InvalidTlsClientIdentity => "invalid_tls_client_identity",
+            Self::Grpc(failure) => failure.category(),
             Self::Http(err) if err.is_timeout() => "http_timeout",
             Self::Http(err) if err.is_connect() => "http_connect",
             Self::Http(err) if err.is_request() => "http_request",
@@ -285,6 +302,19 @@ impl EgressError {
     pub(crate) fn is_passive_health_failure(&self) -> bool {
         match self {
             Self::DnsResolutionFailed(_) | Self::ResponseIdleTimeout { .. } => true,
+            // Reaching the endpoint at all is what passive health measures. A
+            // connect, TLS, ALPN, or handshake failure never got there; a reset
+            // or protocol error is the upstream answering badly, which is an
+            // application fault rather than an endpoint being down.
+            Self::Grpc(
+                GrpcFailure::Connect
+                | GrpcFailure::Tls
+                | GrpcFailure::AlpnNotH2
+                | GrpcFailure::Handshake
+                | GrpcFailure::ConnectionClosed
+                | GrpcFailure::ConnectTimeout,
+            ) => true,
+            Self::Grpc(GrpcFailure::StreamReset | GrpcFailure::Protocol) => false,
             Self::Http(error) => {
                 !error.is_body() && (error.is_connect() || error.is_timeout() || error.is_request())
             }
@@ -306,6 +336,11 @@ impl EgressError {
     pub(crate) fn is_retryable_transport_failure(&self) -> bool {
         match self {
             Self::ResponseIdleTimeout { .. } => true,
+            // #257 disables retry for gRPC outright, and a streaming call is
+            // never replayable in any case. Saying so here rather than only at
+            // the call site means a future caller that consults this
+            // classification cannot accidentally opt gRPC back in.
+            Self::Grpc(_) => false,
             Self::Http(error) if error.is_timeout() => true,
             Self::Http(error) if error.is_connect() => error_chain_has_retryable_io(error),
             // A reused HTTP/1.1 connection can disappear after selection but before
@@ -1397,6 +1432,29 @@ impl EgressClient {
         url: &str,
         profile: client_cache::ProtocolProfile,
     ) -> Result<(Url, reqwest::Client), EgressError> {
+        let (parsed, host, _) = self.revalidated_destination(destination, url)?;
+        let client =
+            self.pinned_client_with_profile(&parsed, &host, destination.pinned_addr, profile)?;
+        Ok((parsed, client))
+    }
+
+    /// Revalidates an already checked destination against this client's current
+    /// configuration and the URL about to be requested.
+    ///
+    /// Factored out rather than duplicated because the gRPC transport
+    /// (`egress::grpc`) cannot go through `reqwest::ClientBuilder` and therefore
+    /// cannot reuse the pinned-client path. Two independently written
+    /// revalidations would be two things that have to keep agreeing forever;
+    /// one function is a thing that cannot disagree with itself. Everything the
+    /// pinned reqwest clients check -- configuration generation, allowed host,
+    /// allowed port, authority match against the checked destination, and the
+    /// private-IP rules applied to the pinned socket -- is checked here, for
+    /// both transports, in this order.
+    fn revalidated_destination(
+        &self,
+        destination: &CheckedEgressDestination,
+        url: &str,
+    ) -> Result<(Url, String, u16), EgressError> {
         if destination.config_generation != self.config_generation {
             return Err(EgressError::InvalidPolicy(
                 "checked destination belongs to a different egress configuration".to_owned(),
@@ -1425,9 +1483,8 @@ impl EgressClient {
             &self.config.nat64_prefixes,
             &self.config.private_ip_allow_cidrs,
         )?;
-        let client =
-            self.pinned_client_with_profile(&parsed, &host, destination.pinned_addr, profile)?;
-        Ok((parsed, client))
+
+        Ok((parsed, host, port))
     }
 
     fn checked_url(&self, url: &str) -> Result<Url, EgressError> {
@@ -1838,6 +1895,19 @@ fn base_client_builder_for_profile(
     config: &EgressConfig,
     profile: client_cache::ProtocolProfile,
 ) -> Result<reqwest::ClientBuilder, EgressError> {
+    // The gRPC profile negotiates ALPN `h2`, and this build deliberately does
+    // not enable `hyper-util/http2`. Handing that config to reqwest does not
+    // error, it PANICS at request time inside hyper-util
+    // (`hyper-util-0.1.20/src/client/legacy/client.rs:562-563`), long after the
+    // mistake was made and on whatever task happened to make the call. Refusing
+    // it here turns a panic into a configuration error at the point of
+    // construction. `egress::grpc` is the only transport for this profile.
+    if matches!(profile, client_cache::ProtocolProfile::Grpc) {
+        return Err(EgressError::InvalidPolicy(
+            "the gRPC protocol profile has no reqwest transport".to_owned(),
+        ));
+    }
+
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(config.connect_timeout)
@@ -4190,6 +4260,7 @@ mod tests {
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 sse: None,
                 websocket: None,
+                grpc: None,
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
                 retry: None,
@@ -4213,6 +4284,7 @@ mod tests {
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 sse: None,
                 websocket: None,
+                grpc: None,
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
                 retry: None,
@@ -4251,6 +4323,7 @@ mod tests {
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 sse: None,
                 websocket: None,
+                grpc: None,
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
                 retry: None,
@@ -5241,6 +5314,9 @@ mod tests {
                 .parse()
                 .expect("test listen address should parse"),
             admin_listen_addr: None,
+            grpc_listen_addr: None,
+            grpc_max_concurrent_streams: crate::config::DEFAULT_GRPC_MAX_CONCURRENT_STREAMS,
+            grpc_max_metadata_bytes: crate::config::DEFAULT_GRPC_MAX_METADATA_BYTES,
             tls_cert_file: None,
             tls_key_file: None,
             admin_tls_cert_file: None,

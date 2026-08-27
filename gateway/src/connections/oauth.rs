@@ -704,6 +704,10 @@ fn oauth_egress_error(error: &EgressError) -> OAuthError {
         | EgressError::InvalidTlsCaBundle { .. }
         | EgressError::InvalidTlsClientIdentity
         | EgressError::Http(_) => OAuthError::TokenUnavailable,
+        // Unreachable: OAuth token fetches go through the pinned HTTP/1.1
+        // transport, never through `egress::grpc`. Named rather than wildcarded
+        // so a future transport cannot land here silently.
+        EgressError::Grpc(_) => OAuthError::TokenUnavailable,
     }
 }
 

@@ -20,6 +20,18 @@ hmac = "0.12.1"
 futures-util = "0.3.31"
 getrandom = "0.3.4"
 http = "1.4.2"
+# Issue #257 needs an HTTP/2 client and server that `reqwest` and `axum::serve`
+# cannot provide. Depending on `hyper` DIRECTLY with `http2` is the whole point:
+# feature edges are one-way (`hyper-util/http2 = ["hyper/http2"]`), so this
+# enables hyper's HTTP/2 and NOT hyper-util's, which means `axum::serve` keeps
+# refusing an h2 preface on the data and admin listeners.
+# `scripts/check-egress-only.sh` asserts exactly that, by feature name.
+hyper = { version = "1.10.1", default-features = false, features = ["client", "server", "http2"] }
+# Already in the graph transitively (axum and reqwest both build on it). Naming
+# it here adds a dependency edge, not a crate, and gives `TokioIo`,
+# `TokioExecutor`, and `TowerToHyperService` by name. `http2` is deliberately
+# NOT requested: that is the feature that would make every listener serve h2c.
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio", "service"] }
 ipnet = "2.11.0"
 jsonschema = { version = "0.46.9", default-features = false }
 jsonwebtoken = "9"
@@ -45,7 +57,11 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["arbitrary_precision"] }
 sha2 = "0.10.9"
 time = { version = "0.3.53", features = ["formatting", "parsing"] }
-tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# `io-util` is named explicitly rather than inherited: `gateway/src/proxy/grpc/listen.rs`
+# reads the HTTP/2 connection preface itself, which needs `AsyncReadExt`. It has
+# always resolved into the graph through tokio-rustls and tokio-util, and a
+# transitive feature is exactly the kind of thing that disappears on a bump.
+tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = "0.29"
 tokio-util = { version = "0.7.17", features = ["rt"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
