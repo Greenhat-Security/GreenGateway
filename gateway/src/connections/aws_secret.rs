@@ -1320,12 +1320,13 @@ impl AwsSecretsManagerProvider {
         // secret provider shares, and that entry point takes an owned
         // `Vec<u8>`; `Zeroizing` has no `into_inner`, so the wrapper would have
         // to be copied back out at that boundary into a buffer nothing wipes.
-        // Downstream is worse: `reqwest` moves the body into a `Body`, and hyper
-        // and the TLS layer copy it again into write buffers this crate cannot
-        // reach. The residual is a short-lived, audience-bound, single-use
-        // assertion for one STS exchange, already redacted from every `Debug`,
-        // log, and metric, so buying an unwipeable copy in order to wipe a
-        // wipeable one is not a trade worth making.
+        // Downstream is worse: the HTTP client crate behind the egress boundary
+        // moves the body into its own request body type, and hyper and the TLS
+        // layer copy it again into write buffers this crate cannot reach. The
+        // residual is a short-lived, audience-bound, single-use assertion for one
+        // STS exchange, already redacted from every `Debug`, log, and metric, so
+        // buying an unwipeable copy in order to wipe a wipeable one is not a
+        // trade worth making.
         let token = Zeroizing::new(
             std::str::from_utf8(token.expose())
                 .map_err(|_| AwsFailure::IdentityInvalid)?
