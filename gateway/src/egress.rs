@@ -830,10 +830,15 @@ pub struct EgressStreamResponse {
 /// upgrade whose body must never reach the client, and a 101 has no body. The
 /// caller inspects `status` and `headers`, and on acceptance consumes
 /// `into_upgraded` to take the raw bidirectional stream.
-// Lands ahead of its consumer. The tests below exercise it end to end, but the
-// plain binary has no caller until the WebSocket data plane in #256 lands, so
-// the binary build alone sees it as dead.
-#[allow(dead_code)]
+/// The upgraded byte stream handed back by a successful protocol upgrade.
+///
+/// Named here so a consumer can spell the type without importing the HTTP
+/// client crate itself. That import is what `scripts/check-egress-only.sh`
+/// refuses outside this module, and the refusal is the point: a module able to
+/// name the crate is a module able to build its own client and bypass
+/// destination validation.
+pub type EgressUpgradedStream = reqwest::Upgraded;
+
 pub struct EgressUpgradeResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
@@ -850,14 +855,13 @@ impl fmt::Debug for EgressUpgradeResponse {
     }
 }
 
-#[allow(dead_code)]
 impl EgressUpgradeResponse {
     /// Takes the upgraded bidirectional stream.
     ///
     /// Only meaningful after the caller has verified the response actually
     /// switched protocols; calling it otherwise fails rather than handing back
     /// a half-open connection.
-    pub async fn into_upgraded(self) -> Result<reqwest::Upgraded, EgressError> {
+    pub async fn into_upgraded(self) -> Result<EgressUpgradedStream, EgressError> {
         if self.status != StatusCode::SWITCHING_PROTOCOLS {
             return Err(EgressError::InvalidPolicy(
                 "upstream did not switch protocols".to_owned(),
@@ -1172,7 +1176,6 @@ impl EgressClient {
     /// body must not reach the client, and a 101 has none. Deliberately does
     /// not retry: an upgrade attempt is not replayable once the upstream has
     /// begun switching protocols.
-    #[allow(dead_code)]
     pub(crate) async fn upgrade_request_at_checked_destination(
         &self,
         destination: &CheckedEgressDestination,
@@ -4158,6 +4161,7 @@ mod tests {
                 load_balancing: crate::config::UpstreamLoadBalancingConfig::default(),
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 sse: None,
+                websocket: None,
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
                 retry: None,
@@ -4180,6 +4184,7 @@ mod tests {
                 load_balancing: crate::config::UpstreamLoadBalancingConfig::default(),
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 sse: None,
+                websocket: None,
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
                 retry: None,
@@ -4217,6 +4222,7 @@ mod tests {
                 load_balancing: crate::config::UpstreamLoadBalancingConfig::default(),
                 request_body: crate::config::UpstreamRequestBodyConfig::default(),
                 sse: None,
+                websocket: None,
                 limits: crate::config::UpstreamPoolLimitsConfig::default(),
                 health_check: None,
                 retry: None,

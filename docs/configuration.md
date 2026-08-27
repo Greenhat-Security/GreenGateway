@@ -1295,6 +1295,34 @@ Unlimited duration or bytes does not remove the other resource bounds: the effec
 
 Every non-empty ordinary response stream and every SSE response emits a payload-free `upstream.stream_terminated` audit event after completion. Outcomes are bounded categories: `completed`, `client_cancelled`, `shutdown`, `upstream_error`, `size_limit`, `idle_timeout`, `duration_limit`, or `request_timeout`. The event includes only the request envelope, stable pool/endpoint IDs, response status, bytes received and handed downstream, time to headers/first byte, total duration, and attempt count. SSE contents, paths, URLs, resolved addresses, and raw transport errors are never captured. The initial HTTP observation sets `upstream_stream_terminal_pending:true` until this correlated terminal event provides the final result.
 
+`websocket` opts a route into WebSocket proxying. When omitted, an `Upgrade` request is forwarded as an ordinary HTTP request with hop-by-hop headers stripped, which is the behavior every existing route keeps. The transport is opt-in per route because it holds a connection open for as long as both peers allow, which is a different resource and exposure profile from a bounded request.
+
+The gateway terminates the client's WebSocket and originates a separate one to the upstream rather than splicing bytes. Nothing the client sends is copied into the upstream handshake: the gateway generates its own `Sec-WebSocket-Key`, strips inbound `sec-websocket-*` and `origin` headers, verifies the upstream's `Sec-WebSocket-Accept`, and refuses an upstream that answers with `Sec-WebSocket-Extensions`. A subprotocol is negotiated only if the client offered it and policy allows it.
+
+`websocket` requires an `upstreams` pool and is rejected on a legacy `upstream_url` route. It cannot be combined with `connection_id`: injecting a managed credential once into a connection that then lives for an hour is a different security question, deferred rather than assumed safe.
+
+The optional WebSocket fields are:
+
+- `max_connections`: concurrent established connections for the route. Default `64`, maximum `100000`.
+- `max_connections_per_endpoint`: additional per-endpoint ceiling. Defaults to `max_connections`, i.e. no separate cap. Must be between 1 and `max_connections`, because a per-endpoint cap above the route cap could never bind.
+- `queue_depth`: upgrades allowed to wait for capacity. Default `16`, maximum `10000`.
+- `queue_timeout_ms`: how long an upgrade waits for capacity before rejection. Default `100`.
+- `handshake_timeout_ms`: bound on completing the upstream handshake. Default `10000`, range `100`-`60000`.
+- `idle_timeout_ms`: closes a connection with no traffic in either direction. Default `300000`, range `1000`-`3600000`. Zero explicitly disables it.
+- `max_duration_ms`: ceiling on total connection lifetime. Default `3600000` (one hour). Zero explicitly disables it.
+- `max_frame_bytes`: largest single frame. Default `1048576`, range `1024`-`67108864`.
+- `max_message_bytes`: largest reassembled message. Default `4194304`, maximum `268435456`. Must be at least `max_frame_bytes`, since a message cap below the frame cap could not be satisfied by one legal frame.
+- `max_write_buffer_bytes`: write headroom beyond one in-flight message. Default `262144`, maximum `16777216`.
+- `allowed_origins`: exact origin serializations, at most 32. Scheme and host are compared case-insensitively and a default port is dropped, so `https://app.example:443` and `https://app.example` are the same entry. An entry carrying a path, query, fragment, or credentials is rejected rather than truncated. **An empty list denies every request that carries an `Origin`**: a browser-originated upgrade must be allowed explicitly, never by omission.
+- `require_origin`: also reject an upgrade that carries no `Origin` at all. Default `false`.
+- `allowed_subprotocols`: subprotocols this route may negotiate, at most 32, each a valid HTTP token. **An empty list denies any client that offers one.** The upstream can never select a subprotocol the client did not offer and policy does not allow.
+
+Setting an unlimited `idle_timeout_ms` or `max_duration_ms` does not remove the other bounds: frame, message, and connection-count ceilings continue to apply, and shutdown drains established connections until the process deadline before closing them.
+
+Control frames are relayed rather than terminated locally, so an application heartbeat reaches the upstream and keeps that connection alive rather than only the client's half. One consequence is visible to clients: a `Ping` is answered locally and also forwarded, so a pinging client can observe two `Pong` frames. RFC 6455 requires an unsolicited `Pong` to be ignored, so this is legal; the alternative, answering heartbeats locally and never forwarding them, would let an upstream idle out while the client believed the path was healthy.
+
+Authentication, RBAC, and egress validation run on the upgrade request exactly as they do for any other request on the route, before any upstream connection is opened. A rejected upgrade contacts no upstream.
+
 `retry` is an optional pool-only object. Omitting it preserves the compatibility default of exactly one total attempt. It is rejected on legacy `upstream_url` routes. Its fields are:
 
 - `max_attempts`: total attempts including the initial request, default `1`, range 1-5.
@@ -1384,6 +1412,21 @@ Example:
     "sse": {
       "max_duration_ms": 3600000,
       "max_response_bytes": 0
+    }
+  },
+  {
+    "id": "realtime",
+    "path_prefix": "/socket",
+    "upstreams": [
+      {"id": "realtime-a", "url": "https://realtime-a.internal.example"}
+    ],
+    "websocket": {
+      "max_connections": 256,
+      "max_connections_per_endpoint": 128,
+      "idle_timeout_ms": 300000,
+      "allowed_origins": ["https://app.example.test"],
+      "require_origin": true,
+      "allowed_subprotocols": ["chat"]
     }
   },
   {

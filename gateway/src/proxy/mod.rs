@@ -26,6 +26,7 @@ mod circuit;
 mod forward;
 mod health;
 mod retry;
+mod websocket;
 
 pub(crate) use health::{UpstreamHealthAdminResponse, UpstreamHealthResponse};
 
@@ -155,6 +156,7 @@ struct ProxyRoute {
     pool: Arc<UpstreamPool>,
     request_body_mode: RequestBodyMode,
     sse: Option<SseResponseConfig>,
+    websocket: Option<Arc<websocket::RouteWebSocketRuntime>>,
 }
 
 impl upstream_route::RouteMatch for ProxyRoute {
@@ -180,6 +182,7 @@ struct MatchedUpstream {
     pool: Arc<UpstreamPool>,
     request_body_mode: RequestBodyMode,
     sse: Option<SseResponseConfig>,
+    websocket: Option<Arc<websocket::RouteWebSocketRuntime>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -506,6 +509,15 @@ impl ProxyState {
                     &route.limits,
                     route.retry.as_ref(),
                 ));
+                let websocket_runtime = route.websocket.as_ref().map(|websocket| {
+                    Arc::new(websocket::RouteWebSocketRuntime::new(
+                        &route_id,
+                        websocket,
+                        pool.endpoints
+                            .iter()
+                            .map(|endpoint| Arc::clone(&endpoint.id)),
+                    ))
+                });
 
                 Ok(ProxyRoute {
                     route_id,
@@ -517,6 +529,7 @@ impl ProxyState {
                     pool,
                     request_body_mode: route.request_body.mode.into(),
                     sse: route.sse.as_ref().map(Into::into),
+                    websocket: websocket_runtime,
                 })
             })
             .collect::<Result<_, egress::EgressError>>()?;
@@ -601,6 +614,7 @@ impl ProxyState {
                 pool: Arc::clone(pool),
                 request_body_mode: RequestBodyMode::Buffered,
                 sse: None,
+                websocket: None,
             }),
             ProxyRoutes::RoutingTable { routes } => {
                 routing_route_for_request(routes, path, headers).map(|route| MatchedUpstream {
@@ -609,6 +623,7 @@ impl ProxyState {
                     pool: Arc::clone(&route.pool),
                     request_body_mode: route.request_body_mode,
                     sse: route.sse,
+                    websocket: route.websocket.clone(),
                 })
             }
         };
@@ -1201,6 +1216,7 @@ mod tests {
             load_balancing: config::UpstreamLoadBalancingConfig::default(),
             request_body: config::UpstreamRequestBodyConfig::default(),
             sse: None,
+            websocket: None,
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,
@@ -1365,6 +1381,7 @@ mod tests {
             pool: Arc::clone(&pool),
             request_body_mode: RequestBodyMode::Buffered,
             sse: None,
+            websocket: None,
         };
         let upstream_health = routing_table_health_targets(std::slice::from_ref(&connection_route));
         assert_eq!(
@@ -1453,6 +1470,7 @@ mod tests {
             load_balancing: config::UpstreamLoadBalancingConfig::default(),
             request_body: config::UpstreamRequestBodyConfig::default(),
             sse: None,
+            websocket: None,
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,
@@ -1514,6 +1532,7 @@ mod tests {
             load_balancing: config::UpstreamLoadBalancingConfig::default(),
             request_body: config::UpstreamRequestBodyConfig::default(),
             sse: None,
+            websocket: None,
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,
