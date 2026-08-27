@@ -1838,11 +1838,26 @@ fn base_client_builder_for_profile(
     if matches!(profile, client_cache::ProtocolProfile::Http1AndHttp2) {
         builder = builder.timeout(config.timeout);
     }
-    if matches!(profile, client_cache::ProtocolProfile::UpgradeHttp1) {
-        // An upgrade is an HTTP/1.1 mechanism. Forcing http1 keeps ALPN from
-        // selecting h2, where this handshake has no meaning.
-        builder = builder.http1_only();
-    }
+    // Every profile pins HTTP/1.1 explicitly, and the reason differs by profile.
+    //
+    // For UpgradeHttp1 it is semantic: an upgrade is an HTTP/1.1 mechanism, and
+    // ALPN selecting h2 would leave the handshake meaningless.
+    //
+    // For the other two it is a blast-radius pin, and it is a no-op today only
+    // because reqwest is built without its `http2` feature, which leaves the
+    // ALPN list as `["http/1.1"]`. Turning that feature on -- for gRPC, or as a
+    // transitive consequence of some other crate -- rewrites the list to
+    // `["h2", "http/1.1"]` with h2 preferred, and every HTTPS upstream that
+    // supports h2 silently switches protocol. That is a change to how live
+    // traffic is framed, arriving with no code change and no configuration
+    // change, and hyper additionally strips hop-by-hop headers on h2 rather
+    // than erroring, so this gateway's curated header handling would change
+    // shape at the same time.
+    //
+    // Pinning here means an h2 transport has to be an explicit new profile that
+    // opts out, rather than something existing traffic is opted into by a
+    // dependency edge.
+    builder = builder.http1_only();
 
     for certificate in &config.tls_root_certificates {
         builder = builder.add_root_certificate(certificate.clone());

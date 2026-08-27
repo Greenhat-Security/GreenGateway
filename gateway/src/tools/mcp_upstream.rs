@@ -1725,6 +1725,13 @@ fn mcp_http_client(
         .read_timeout(response_idle_timeout)
         .connect_timeout(connect_timeout)
         .redirect(rmcp_http::redirect::Policy::none())
+        // This client is built here rather than through
+        // `base_client_builder_for_profile`, so it does not inherit that
+        // function's protocol pin and has to carry its own. Without it, turning
+        // on the HTTP client's `http2` feature would flip every MCP upstream to
+        // h2 silently -- and because this path is outside the profile system,
+        // pinning the profiles alone would not cover it.
+        .http1_only()
         .resolve(&destination.host, destination.pinned_addr)
         .build()
         .map_err(|_| McpUpstreamCallError::ClientBuild)
