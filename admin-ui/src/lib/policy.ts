@@ -1,5 +1,5 @@
-import { AdminApiError, adminFetchJson } from './api';
-import { authHeaders, decodeJwtRolesClaim, getStoredToken } from './auth';
+import { adminFetchJson, adminFetchJsonResponse } from './api';
+import { decodeJwtRolesClaim, getStoredToken } from './auth';
 import { adminApiUrl } from './config';
 
 export type PolicyDefaultAction = 'allow' | 'deny';
@@ -318,56 +318,19 @@ function isPolicyRuleHitsListResponse(
   return Array.isArray((response as { rules?: unknown }).rules);
 }
 
+// Policy writes go through the shared admin transport rather than raw `fetch`
+// so they carry the CSRF header the gateway demands from any state-changing
+// request that is not bearer-authenticated.
 async function adminFetchJsonWithEtag<T>(
   input: string,
   options: AdminFetchWithMetaOptions = {},
 ): Promise<PolicyMutationResult<T>> {
-  const headers = {
-    Accept: 'application/json',
-    ...authHeaders(),
-    ...options.headers,
-  };
-  const response = await fetch(input, { ...options, headers });
-  const body = await parseJsonBody(response);
-
-  if (!response.ok) {
-    throw new AdminApiError(response.status, errorMessage(body, response));
-  }
+  const response = await adminFetchJsonResponse<T>(input, options);
 
   return {
-    value: body as T,
-    etag: response.headers.get('etag'),
+    value: response.body,
+    etag: response.etag,
   };
-}
-
-async function parseJsonBody(response: Response): Promise<unknown> {
-  const text = await response.text();
-  if (text.trim().length === 0) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return text;
-  }
-}
-
-function errorMessage(body: unknown, response: Response): string {
-  if (
-    body &&
-    typeof body === 'object' &&
-    'error' in body &&
-    typeof body.error === 'string'
-  ) {
-    return body.error;
-  }
-
-  if (typeof body === 'string' && body.trim().length > 0) {
-    return body;
-  }
-
-  return response.statusText || `Request failed with status ${response.status}`;
 }
 
 function isJsonObject(value: unknown): value is Record<string, unknown> {

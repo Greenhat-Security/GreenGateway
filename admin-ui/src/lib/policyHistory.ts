@@ -1,5 +1,4 @@
-import { AdminApiError, adminFetchJson } from './api';
-import { authHeaders } from './auth';
+import { adminFetchJson, adminFetchJsonResponse } from './api';
 import { adminApiUrl } from './config';
 import type { PolicyDocument } from './policy';
 
@@ -97,6 +96,8 @@ export async function rollbackPolicy(
   };
 }
 
+// Rollback is a state-changing admin write, so it goes through the shared admin
+// transport for the CSRF header instead of calling `fetch` directly.
 async function adminFetchJsonWithHeaders<T>(
   input: string,
   options: AdminFetchWithMetaOptions = {},
@@ -105,51 +106,11 @@ async function adminFetchJsonWithHeaders<T>(
   etag: string | null;
   headers: Headers;
 }> {
-  const headers = {
-    Accept: 'application/json',
-    ...authHeaders(),
-    ...options.headers,
-  };
-  const response = await fetch(input, { ...options, headers });
-  const body = await parseJsonBody(response);
-
-  if (!response.ok) {
-    throw new AdminApiError(response.status, errorMessage(body, response));
-  }
+  const response = await adminFetchJsonResponse<T>(input, options);
 
   return {
-    value: body as T,
-    etag: response.headers.get('etag'),
+    value: response.body,
+    etag: response.etag,
     headers: response.headers,
   };
-}
-
-async function parseJsonBody(response: Response): Promise<unknown> {
-  const text = await response.text();
-  if (text.trim().length === 0) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return text;
-  }
-}
-
-function errorMessage(body: unknown, response: Response): string {
-  if (
-    body &&
-    typeof body === 'object' &&
-    'error' in body &&
-    typeof body.error === 'string'
-  ) {
-    return body.error;
-  }
-
-  if (typeof body === 'string' && body.trim().length > 0) {
-    return body;
-  }
-
-  return response.statusText || `Request failed with status ${response.status}`;
 }

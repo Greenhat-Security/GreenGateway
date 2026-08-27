@@ -1188,11 +1188,13 @@ Format and validation: must parse as a `u64` millisecond duration greater than `
 
 ### CSRF_ENABLED
 
-Enables double-submit-cookie CSRF checks for the gateway's own state-changing control-plane requests.
+Enables double-submit-cookie CSRF checks on every state-changing request the gateway serves, proxied traffic included.
 
 Default: `true`
 
-Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, cookie-authenticated state-changing control-plane requests must include a valid CSRF cookie/header token pair. Bearer-authenticated requests bypass this check because CSRF is a browser cookie-auth concern. The current gateway routes are `GET` probes and are exempt, so this setting is dormant for current production traffic.
+Format and validation: must parse as a Rust boolean, `true` or `false`. The check is layered over the whole router, not just the control plane, so with the default a `POST`, `PUT`, `PATCH`, or `DELETE` on any non-exempt path -- an admin API route, an MCP route, or a path handled by the reverse-proxy fallback -- must either carry an `Authorization: Bearer` credential or present a matching CSRF cookie/header token pair. A request that presents neither is answered `403 Forbidden` with `{"error":"csrf token missing or invalid"}` and never reaches the upstream. Bearer-authenticated requests bypass the check because CSRF is a browser cookie-auth concern. Safe-method responses on non-exempt paths also acquire a `Set-Cookie` for the CSRF token when the request did not already send one, so proxied `GET` responses carry that cookie too.
+
+Deployments whose proxied clients authenticate with something other than a bearer token -- a session cookie, an API key in a custom header, mutual TLS -- and deployments running with `AUTH_ENABLED=false` are therefore blocked on writes until those clients echo the token or the paths are exempted. `CSRF_EXEMPT_PATHS` compares whole paths for equality and has no prefix or wildcard form, so exempting a proxied API with many write paths means setting `CSRF_ENABLED=false` rather than enumerating them.
 
 ### CSRF_COOKIE_NAME
 
@@ -1226,7 +1228,7 @@ Comma-separated paths that bypass CSRF checks.
 
 Default: `/health,/livez,/startupz,/readyz,/version,/metrics`
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. Exempt paths return before CSRF cookie issuance, so the default probe routes do not receive a CSRF cookie today. Exact configured MCP routes ignore matching CSRF exempt entries and remain protected; non-MCP paths are unchanged.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. Entries are compared to the request path for equality, so there is no prefix or wildcard form and a proxied path tree cannot be exempted as a whole. Exempt paths return before CSRF cookie issuance, so the default probe routes do not receive a CSRF cookie today. Exact configured MCP routes ignore matching CSRF exempt entries and remain protected; non-MCP paths are unchanged.
 
 ### UPSTREAM_URL
 

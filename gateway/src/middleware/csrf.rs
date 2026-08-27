@@ -1,12 +1,13 @@
-//! CSRF protection for GreenGateway control-plane endpoints.
+//! CSRF protection for GreenGateway state-changing requests.
 //!
-//! This middleware implements the double-submit-cookie pattern for the
-//! gateway's own state-changing admin/control-plane endpoints. Proxied
-//! passthrough traffic is out of scope here and will be governed by policy.
-//! Today the gateway exposes only `GET /health`, `GET /version`, and
-//! `GET /metrics`; those probe paths are exempt, so this layer is dormant for
-//! current production traffic. It becomes active when state-changing gateway
-//! endpoints land.
+//! This middleware implements the double-submit-cookie pattern. It is layered
+//! over the whole router rather than over the admin surface alone, so proxied
+//! passthrough traffic is in scope too: any `POST`/`PUT`/`PATCH`/`DELETE` on a
+//! non-exempt path is rejected unless it carries a bearer credential or a
+//! matching cookie/header token pair. Exempt paths are compared for equality
+//! and default to the probe routes, so a deployment whose proxied clients
+//! authenticate with anything other than a bearer token has to echo the token
+//! or turn the layer off with `CSRF_ENABLED=false`.
 
 use axum::{
     extract::{Request, State},
