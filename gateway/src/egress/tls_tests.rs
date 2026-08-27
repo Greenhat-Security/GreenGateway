@@ -23,8 +23,11 @@
 //! extra-roots construction and refused under the roots-only one. It cannot be
 //! simulated offline without lying, because a "public" CA is public precisely by
 //! being in the platform trust store, and installing one there would be
-//! manufacturing the result. So it talks to a real host and is gated behind
-//! `GG_EGRESS_TRUST_NETWORK_TEST=1`.
+//! manufacturing the result. So it talks to [`PUBLIC_TRUST_ANCHOR_HOST`] and
+//! carries `#[ignore]`, which keeps it out of offline CI without inventing a
+//! deployment setting to switch it on -- `gateway/tests/env_example.rs` treats
+//! every environment read under `gateway/src` as configuration an operator must
+//! be able to find documented, and a test knob is not that.
 //!
 //! **Run case (e) by hand on every reqwest upgrade.** It is the only test in
 //! this repository that can catch reqwest changing how configured CAs relate to
@@ -33,11 +36,8 @@
 //! start failing at whichever deployment happens to have both:
 //!
 //! ```text
-//! GG_EGRESS_TRUST_NETWORK_TEST=1 cargo test --bin gateway -- egress::tls_tests
+//! cargo test --bin gateway -- --ignored egress::tls_tests::case_e
 //! ```
-//!
-//! `GG_EGRESS_TRUST_PUBLIC_HOST` overrides the host, which defaults to
-//! `example.com`.
 //!
 //! # Part two: what the preconfigured backend turns off
 //!
@@ -112,6 +112,15 @@ enum Construction {
     /// What [`super::tls::client_config`] actually builds.
     Production,
 }
+
+/// The publicly signed host case (e) reaches.
+///
+/// Any host with a certificate chaining to a public CA works; this one is
+/// reserved by IANA for exactly this kind of use. Edit it if a network reaches
+/// the internet only through a proxy that terminates TLS with its own CA -- in
+/// that environment case (e) cannot say anything, because the "public" anchor
+/// would be the proxy's.
+const PUBLIC_TRUST_ANCHOR_HOST: &str = "example.com";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -728,29 +737,17 @@ async fn case_d2_a_client_identity_from_an_untrusted_ca_is_refused() {
 ///   roots-only    -> Reject    the platform trust store was replaced
 /// ```
 ///
-/// Run it by hand whenever reqwest is upgraded. If `egress client` ever comes
-/// back `Reject`, reqwest no longer layers configured CAs on top of the platform
-/// store and [`super::tls`] must be re-read against the new source before it is
-/// trusted again.
+/// `#[ignore]`d because it needs a real public trust anchor, not because it is
+/// optional. Run it by hand whenever reqwest is upgraded. If `egress client`
+/// ever comes back `Reject`, reqwest no longer layers configured CAs on top of
+/// the platform store and [`super::tls`] must be re-read against the new source
+/// before it is trusted again.
 #[tokio::test]
+#[ignore = "needs a real publicly signed host; run on every reqwest upgrade with --ignored"]
 async fn case_e_a_public_host_stays_trusted_when_a_private_ca_is_also_configured() {
-    if std::env::var("GG_EGRESS_TRUST_NETWORK_TEST")
-        .ok()
-        .as_deref()
-        != Some("1")
-    {
-        eprintln!(
-            "[egress-trust] case (e) SKIPPED. It is the only case that can catch reqwest \
-             changing how configured CAs relate to the platform trust store, and it needs a \
-             real public trust anchor. Run it on every reqwest upgrade with \
-             GG_EGRESS_TRUST_NETWORK_TEST=1."
-        );
-        return;
-    }
     install_test_provider();
 
-    let host =
-        std::env::var("GG_EGRESS_TRUST_PUBLIC_HOST").unwrap_or_else(|_| "example.com".to_owned());
+    let host = PUBLIC_TRUST_ANCHOR_HOST.to_owned();
     let private_ca = certificate_authority("GreenGateway Trust Test Unrelated Private CA");
     let ca_pem = private_ca.pem();
     let url = format!("https://{host}/");
