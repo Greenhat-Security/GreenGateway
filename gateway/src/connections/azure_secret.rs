@@ -577,7 +577,7 @@ fn is_valid_azure_authority_host(value: &str) -> bool {
 }
 
 /// Accepts only the 36-character hyphenated GUID that Entra uses for tenant
-/// and application object IDs.
+/// and application (client) IDs.
 ///
 /// Microsoft documents the client-credentials token endpoint as taking its
 /// tenant "in GUID or domain-name format", and the domain-name half is refused
@@ -2345,6 +2345,7 @@ mod tests {
         for tenant in [
             "common",
             "organizations",
+            "consumers",
             "contoso.onmicrosoft.com",
             "11111111-2222-3333-4444-55556666777",
             "11111111222233334444555566667777zzzz",
