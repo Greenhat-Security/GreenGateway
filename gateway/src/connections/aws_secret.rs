@@ -1310,35 +1310,50 @@ impl AwsSecretsManagerProvider {
         };
 
         let token = self.workload_identity_token(token_root, token_file).await?;
-        // The decoded token copy zeroizes on drop; the percent encoder streams
-        // straight into the request body, which the transport contract takes as
-        // a plain `Vec<u8>`.
-        //
-        // Wrapping this one body in `Zeroizing` would not buy what it looks like
-        // it buys. `AwsTransport` is this provider's own trait, but it exists to
-        // reach the sensitive-request entry point on `EgressClient` that every
-        // secret provider shares, and that entry point takes an owned
-        // `Vec<u8>`; `Zeroizing` has no `into_inner`, so the wrapper would have
-        // to be copied back out at that boundary into a buffer nothing wipes.
-        // Downstream is worse: the HTTP client crate behind the egress boundary
-        // moves the body into its own request body type, and hyper and the TLS
-        // layer copy it again into write buffers this crate cannot reach. The
-        // residual is a short-lived, audience-bound, single-use assertion for one
-        // STS exchange, already redacted from every `Debug`, log, and metric, so
-        // buying an unwipeable copy in order to wipe a wipeable one is not a
-        // trade worth making.
         let token = Zeroizing::new(
             std::str::from_utf8(token.expose())
                 .map_err(|_| AwsFailure::IdentityInvalid)?
                 .to_owned(),
         );
-        let body = format!(
-            "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={role}&RoleSessionName={session}&WebIdentityToken={token}",
+        // The raw assertion is the longest-lived secret in this exchange: it is
+        // held across every retry and backoff, not just one send. So the buffer
+        // that carries it wipes on drop, like the decoded token above it, the
+        // response body, and the canonical-request material further down.
+        //
+        // Two details make that wipe worth having rather than decorative. The
+        // form-encoded body is built at exact capacity from a prefix that
+        // contains no secret, so the assertion is written once, into the buffer
+        // that wipes, and never into a growth intermediate that gets freed
+        // unwiped. And `send_with_bounded_retries` borrows the body, so the
+        // wiping buffer is never surrendered to a plain `Vec<u8>` to get there.
+        //
+        // The per-attempt copy handed to the transport is not wiped; that
+        // boundary owns its buffer and so does everything past it. What is
+        // bought here is the whole-exchange residency, which is the part this
+        // file controls.
+        let prefix = format!(
+            "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={role}&RoleSessionName={session}&WebIdentityToken=",
             role = utf8_percent_encode(role_arn, STS_FORM_ENCODE),
             session = AWS_ROLE_SESSION_NAME,
-            token = utf8_percent_encode(&token, STS_FORM_ENCODE),
-        )
-        .into_bytes();
+        );
+        let encoded_token = utf8_percent_encode(&token, STS_FORM_ENCODE);
+        let mut body = Zeroizing::new(Vec::with_capacity(
+            prefix.len() + encoded_token.clone().map(str::len).sum::<usize>(),
+        ));
+        let reserved = body.capacity();
+        body.extend_from_slice(prefix.as_bytes());
+        for chunk in encoded_token {
+            body.extend_from_slice(chunk.as_bytes());
+        }
+        // The whole point of sizing the buffer up front is that the assertion is
+        // never written into a growth intermediate that is freed unwiped. A
+        // capacity that moved means it was, so the sizing is checked rather than
+        // assumed.
+        debug_assert_eq!(
+            body.capacity(),
+            reserved,
+            "the STS assertion body must not reallocate after it is sized"
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -1347,7 +1362,13 @@ impl AwsSecretsManagerProvider {
             HeaderValue::from_static(AWS_FORM_CONTENT_TYPE),
         );
         let response = self
-            .send_with_bounded_retries(Method::POST, sts_url, Ok(headers), Some(body), true)
+            .send_with_bounded_retries(
+                Method::POST,
+                sts_url,
+                Ok(headers),
+                Some(body.as_slice()),
+                true,
+            )
             .await?;
         let body = bounded_body(&response, MAX_AWS_STS_RESPONSE_BYTES, "application/json")
             .map_err(|_| AwsFailure::IdentityInvalid)?;
@@ -1449,7 +1470,7 @@ impl AwsSecretsManagerProvider {
                 Method::POST,
                 &alias.endpoint_url,
                 headers,
-                Some(body),
+                Some(body.as_slice()),
                 false,
             )
             .await?;
@@ -1542,20 +1563,40 @@ impl AwsSecretsManagerProvider {
         Ok(headers)
     }
 
+    /// Borrows the request body rather than taking ownership of it.
+    ///
+    /// This is a private method with two call sites in this file, so the
+    /// signature is ours to choose, and choosing `&[u8]` is what lets the STS
+    /// caller hold the raw workload identity assertion in a wiping buffer for
+    /// the whole exchange. Owning an `Option<Vec<u8>>` here would instead force
+    /// that caller to surrender it into a plain `Vec<u8>` that nothing wipes,
+    /// for the entire retry-and-backoff window, purely so this loop could clone
+    /// it.
+    ///
+    /// The copy count is unchanged. The transport boundary takes an owned
+    /// buffer, so the owned form cloned the body once per attempt and the
+    /// borrowed form copies it once per attempt, for the same reason.
     async fn send_with_bounded_retries(
         &self,
         method: Method,
         url: &str,
         headers: Result<HeaderMap, AwsFailure>,
-        body: Option<Vec<u8>>,
+        body: Option<&[u8]>,
         identity: bool,
     ) -> Result<AwsHttpResponse, AwsFailure> {
         let headers = headers?;
         let mut attempt = 0;
         loop {
+            // Copied per attempt rather than moved: a retry has to carry the
+            // same body as the first try.
             let response = self
                 .transport
-                .send(method.clone(), url, headers.clone(), body.clone())
+                .send(
+                    method.clone(),
+                    url,
+                    headers.clone(),
+                    body.map(<[u8]>::to_vec),
+                )
                 .await;
             let failure = match response {
                 Ok(response) => {
@@ -3049,6 +3090,81 @@ mod tests {
         // directory; Windows refuses to remove a directory with an open handle.
         drop(fixture);
         fs::remove_dir_all(&root).expect("workload root should remove");
+    }
+
+    /// The raw workload identity assertion lives in one wiping buffer for the
+    /// whole STS exchange. Two things have to hold for that to be true rather
+    /// than decorative, and both are observable on the wire.
+    ///
+    /// The buffer is sized up front and written once, so the assertion never
+    /// lands in a growth intermediate that is freed unwiped -- checked here by
+    /// requiring the body to be exactly the form the sizing accounts for, and in
+    /// the provider by a `debug_assert` that the capacity never moves.
+    ///
+    /// And `send_with_bounded_retries` borrows the buffer rather than consuming
+    /// it, which means a retry has to re-copy the body rather than reuse a moved
+    /// one. Sending a truncated or empty body on the second attempt is the way
+    /// that refactor goes wrong, so every attempt is compared.
+    #[tokio::test]
+    async fn every_sts_attempt_carries_the_whole_assertion_body() {
+        let root = std::env::temp_dir().join(format!(
+            "greengateway-aws-assertion-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).expect("workload root should create");
+        set_projected_permissions(&root);
+        fs::write(root.join("token"), b"projected.jwt.canary+needs/encoding")
+            .expect("token should write");
+        set_projected_file_permissions(&root.join("token"));
+        let fixture = provider_with_bootstrap(
+            AwsProviderConfig {
+                profiles: vec![web_identity_profile(
+                    "primary",
+                    root.to_str().expect("root path should be Unicode"),
+                )],
+                aliases: vec![alias("billing")],
+            },
+            None,
+        );
+        // One transient failure, so the exchange takes every attempt the bound
+        // allows and the body has to survive the backoff.
+        fixture.aws.push_identity(sts_response(
+            400,
+            r#"{"Error":{"Code":"Throttling","Message":"Rate exceeded","Type":"Sender"},"RequestId":"abc"}"#,
+        ));
+        fixture.aws.push_identity(sts_response(
+            200,
+            &sts_body(fixture.clock.wall_epoch() + 600.0),
+        ));
+        fixture
+            .aws
+            .push_read(json_response(200, &read_body(VALUE_CANARY)));
+
+        let secret = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect("the retried identity exchange should resolve");
+        assert_eq!(secret.expose(), VALUE_CANARY.as_bytes());
+
+        let identities = fixture.aws.identities();
+        assert_eq!(
+            identities.len(),
+            usize::try_from(MAX_AWS_TRANSIENT_RETRIES).expect("retry bound should fit") + 1,
+            "the fixture must actually exercise a retry"
+        );
+        let expected = format!(
+            "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={role}&RoleSessionName=greengateway&WebIdentityToken={token}",
+            role = utf8_percent_encode(ROLE_ARN_CANARY, STS_FORM_ENCODE),
+            token = utf8_percent_encode("projected.jwt.canary+needs/encoding", STS_FORM_ENCODE),
+        );
+        for (attempt, request) in identities.iter().enumerate() {
+            assert_eq!(
+                request.body.as_deref(),
+                Some(expected.as_str()),
+                "attempt {attempt} must carry the complete assertion body"
+            );
+        }
     }
 
     #[cfg(unix)]
