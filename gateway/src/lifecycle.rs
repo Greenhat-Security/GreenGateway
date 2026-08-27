@@ -256,9 +256,27 @@ pub(crate) enum GatewayApp {
     Split { data: Router, admin: Router },
 }
 
+/// The opt-in gRPC listener's router and settings.
+///
+/// Kept beside `GatewayApp` rather than inside it because the gRPC listener is
+/// orthogonal to the unified/split choice: it is a third socket either way, and
+/// folding it into the enum would have made every existing arm carry an option
+/// that has nothing to do with the distinction the enum draws.
+pub(crate) struct GrpcApp {
+    pub(crate) address: SocketAddr,
+    pub(crate) router: Router,
+    pub(crate) limits: crate::proxy::grpc::GrpcListenerLimits,
+}
+
+pub(crate) struct GatewayApps {
+    pub(crate) http: GatewayApp,
+    pub(crate) grpc: Option<GrpcApp>,
+}
+
 #[allow(clippy::too_many_arguments)] // One parameter per independently configured concern.
 pub(crate) async fn serve_gateway(
     app: GatewayApp,
+    grpc: Option<GrpcApp>,
     listen_addr: SocketAddr,
     admin_listen_addr: Option<SocketAddr>,
     inbound_tls: InboundTlsBindings,
@@ -270,6 +288,7 @@ pub(crate) async fn serve_gateway(
     let mut signals = SystemShutdownSignals::new()?;
     serve_gateway_with_signals(
         app,
+        grpc,
         listen_addr,
         admin_listen_addr,
         inbound_tls,
@@ -285,6 +304,7 @@ pub(crate) async fn serve_gateway(
 #[allow(clippy::too_many_arguments)] // Signal injection keeps shutdown tests deterministic.
 async fn serve_gateway_with_signals(
     app: GatewayApp,
+    grpc: Option<GrpcApp>,
     listen_addr: SocketAddr,
     admin_listen_addr: Option<SocketAddr>,
     inbound_tls: InboundTlsBindings,
@@ -294,6 +314,21 @@ async fn serve_gateway_with_signals(
     background_shutdown: BackgroundShutdown,
     signals: &mut dyn ShutdownSignals,
 ) -> std::io::Result<()> {
+    // Bound before `mark_ready`, and before any listener starts serving, so a
+    // gRPC bind failure aborts startup exactly as a data or admin bind failure
+    // does rather than leaving the gateway reporting itself healthy with one
+    // listener missing.
+    let grpc_listener = match grpc {
+        Some(grpc) => Some(
+            crate::proxy::grpc::GrpcListener::bind(grpc.address, grpc.router, grpc.limits).await?,
+        ),
+        None => None,
+    };
+    let grpc_bound_addr = match grpc_listener.as_ref() {
+        Some(listener) => Some(listener.local_addr()?),
+        None => None,
+    };
+
     match app {
         GatewayApp::Unified(app) => {
             let listener = tokio::net::TcpListener::bind(listen_addr).await?;
@@ -311,6 +346,7 @@ async fn serve_gateway_with_signals(
                     "version": env!("CARGO_PKG_VERSION"),
                     "listen_addr": bound_addr.to_string(),
                     "listen_scheme": scheme.as_str(),
+                    "grpc_listen_addr": grpc_bound_addr.map(|address| address.to_string()),
                     "tls_min_version": inbound_tls.min_version().map(|version| version.as_str()),
                 }),
             ));
@@ -325,7 +361,11 @@ async fn serve_gateway_with_signals(
             lifecycle.mark_ready();
             tracing::info!(listen_addr = %bound_addr, scheme = scheme.as_str(), "gateway listening");
             let cancellation = CancellationToken::new();
-            let server = serve_router_with_shutdown(listener, app, cancellation.clone());
+            let server = serve_with_grpc(
+                serve_router_with_shutdown(listener, app, cancellation.clone()),
+                grpc_listener,
+                cancellation.clone(),
+            );
             tokio::pin!(server);
             tokio::select! {
                 result = &mut server => {
@@ -376,6 +416,7 @@ async fn serve_gateway_with_signals(
                     "listen_scheme": data_scheme.as_str(),
                     "admin_listen_addr": admin_bound_addr.to_string(),
                     "admin_listen_scheme": admin_scheme.as_str(),
+                    "grpc_listen_addr": grpc_bound_addr.map(|address| address.to_string()),
                     "tls_min_version": inbound_tls.min_version().map(|version| version.as_str()),
                 }),
             ));
@@ -391,7 +432,11 @@ async fn serve_gateway_with_signals(
             tracing::info!(listen_addr = %data_bound_addr, scheme = data_scheme.as_str(), "gateway data listener listening");
             tracing::info!(admin_listen_addr = %admin_bound_addr, scheme = admin_scheme.as_str(), "gateway admin listener listening");
             let cancellation = CancellationToken::new();
-            let data_server = serve_router_with_shutdown(data_listener, data, cancellation.clone());
+            let data_server = serve_with_grpc(
+                serve_router_with_shutdown(data_listener, data, cancellation.clone()),
+                grpc_listener,
+                cancellation.clone(),
+            );
             let admin_server =
                 serve_router_with_shutdown(admin_listener, admin, cancellation.clone());
             tokio::pin!(data_server);
@@ -436,6 +481,34 @@ async fn serve_gateway_with_signals(
             .await?;
         }
     }
+
+    Ok(())
+}
+
+/// Runs an HTTP listener alongside the optional gRPC listener as one future.
+///
+/// With no gRPC listener the second half resolves only when the shutdown token
+/// fires, so it never terminates the pair early -- and it still resolves during
+/// shutdown, so the drain does not hang waiting for a listener that was never
+/// bound.
+async fn serve_with_grpc<Http>(
+    http: Http,
+    grpc: Option<crate::proxy::grpc::GrpcListener>,
+    shutdown: CancellationToken,
+) -> std::io::Result<()>
+where
+    Http: Future<Output = std::io::Result<()>>,
+{
+    let grpc = async move {
+        match grpc {
+            Some(listener) => listener.serve(shutdown).await,
+            None => {
+                shutdown.cancelled().await;
+                Ok(())
+            }
+        }
+    };
+    tokio::try_join!(http, grpc)?;
 
     Ok(())
 }
@@ -720,6 +793,7 @@ mod tests {
 
         let error = serve_gateway(
             GatewayApp::Unified(Router::new()),
+            None,
             occupied_addr,
             None,
             InboundTlsBindings::plaintext(),
@@ -760,6 +834,7 @@ mod tests {
                 data: Router::new(),
                 admin: Router::new(),
             },
+            None,
             data_addr,
             Some(admin_addr),
             InboundTlsBindings::plaintext(),
@@ -867,6 +942,7 @@ mod tests {
         let capture = CaptureSink::new();
         let server = tokio::spawn(serve_gateway(
             GatewayApp::Unified(peer_router()),
+            None,
             "127.0.0.1:0".parse().expect("listen address should parse"),
             None,
             InboundTlsBindings::plaintext(),
@@ -903,6 +979,7 @@ mod tests {
                 data: peer_router(),
                 admin: peer_router(),
             },
+            None,
             "127.0.0.1:0".parse().expect("data address should parse"),
             Some("127.0.0.1:0".parse().expect("admin address should parse")),
             InboundTlsBindings::plaintext(),
@@ -963,6 +1040,7 @@ mod tests {
             };
             serve_gateway_with_signals(
                 GatewayApp::Unified(peer_router()),
+                None,
                 "127.0.0.1:0".parse().expect("listen address should parse"),
                 None,
                 InboundTlsBindings::plaintext(),
@@ -1026,6 +1104,7 @@ mod tests {
             };
             serve_gateway_with_signals(
                 GatewayApp::Unified(Router::new()),
+                None,
                 "127.0.0.1:0".parse().expect("listen address should parse"),
                 None,
                 InboundTlsBindings::plaintext(),
@@ -1069,6 +1148,7 @@ mod tests {
             };
             serve_gateway_with_signals(
                 GatewayApp::Unified(Router::new()),
+                None,
                 "127.0.0.1:0".parse().expect("listen address should parse"),
                 None,
                 InboundTlsBindings::plaintext(),
@@ -1116,6 +1196,7 @@ mod tests {
             };
             serve_gateway_with_signals(
                 GatewayApp::Unified(Router::new()),
+                None,
                 "127.0.0.1:0".parse().expect("listen address should parse"),
                 None,
                 InboundTlsBindings::plaintext(),

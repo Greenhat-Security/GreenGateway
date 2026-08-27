@@ -494,6 +494,8 @@ Deployment probes, migration, rollback, Kubernetes, metrics, and load/soak
 guidance live in
 [docs/deployment/production-data-plane.md](docs/deployment/production-data-plane.md).
 
+Transparent gRPC proxying over HTTP/2 is available on an opt-in third listener (`GRPC_LISTEN_ADDR`, unset by default) with a per-route policy block. It supports unary, server-streaming, client-streaming, and bidirectional calls, and runs the same authentication, rate-limiting, RBAC, and egress boundaries as every other request. See [docs/deployment/grpc.md](docs/deployment/grpc.md); note that gRPC cannot work on Cloudflare Containers, for the reasons that guide states.
+
 Pool migration is additive. An existing route can keep
 `"upstream_url":"https://payments.example.test"` unchanged, or opt in one route
 at a time by assigning stable IDs:

@@ -189,6 +189,9 @@ mod tests {
                 .parse()
                 .expect("test listen address should parse"),
             admin_listen_addr: None,
+            grpc_listen_addr: None,
+            grpc_max_concurrent_streams: crate::config::DEFAULT_GRPC_MAX_CONCURRENT_STREAMS,
+            grpc_max_metadata_bytes: crate::config::DEFAULT_GRPC_MAX_METADATA_BYTES,
             tls_cert_file: None,
             tls_key_file: None,
             admin_tls_cert_file: None,

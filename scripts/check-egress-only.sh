@@ -168,6 +168,13 @@ fi
 # and does NOT open h2c on any listener. A transport that drives its own h2
 # client is therefore compatible with both properties above, and an earlier
 # version of this check would have rejected it for the wrong reason.
+#
+# As of issue #257 that is no longer hypothetical: `hyper` IS a direct
+# dependency with `http2`, the gRPC transport drives its own h2 client, and the
+# gRPC listener drives its own h2 server. Neither reaches `hyper-util/http2`, so
+# `axum::serve` still answers an h2 preface on the data and admin listeners with
+# `Error::from("HTTP/2 is not supported")`. WHERE those two h2 stacks may be
+# built is a separate invariant, checked at the bottom of this file.
 if command -v cargo >/dev/null 2>&1; then
     features="$(cargo tree -f '{p} | {f}' --edges normal 2>/dev/null || true)"
     if [ -z "$features" ]; then
@@ -214,6 +221,113 @@ if command -v cargo >/dev/null 2>&1; then
     fi
 else
     echo "cargo not found; skipping the HTTP/2 feature guard"
+fi
+
+# The HTTP/2 construction guard (issue #257).
+#
+# The feature guard above says which crates may speak HTTP/2. This says WHERE
+# in this repository an HTTP/2 client or server may be built. They are different
+# invariants: the features could stay exactly as they are while a second,
+# unreviewed h2 server appeared in some handler.
+#
+# Two files, named here so a rename has to be a deliberate edit to this script
+# rather than a silent pass -- the same discipline PINNED_CLIENT_BUILDERS uses.
+#
+# What this canNOT check, stated plainly rather than implied: that the h2 server
+# is reached only when GRPC_LISTEN_ADDR is set, that it is never handed the admin
+# router, and that it binds a socket distinct from LISTEN_ADDR and
+# ADMIN_LISTEN_ADDR. Those are facts about a call graph and a configuration
+# value, and a text search cannot express them. They are tested behaviourally in
+# gateway/src/proxy/grpc/tests.rs instead. If this grep ever has to be loosened
+# to keep CI green, delete it and keep the tests: a check that cannot state its
+# invariant is worse than no check, because it reads like one.
+H2_SERVER_FILE="gateway/src/proxy/grpc/listen.rs"
+H2_CLIENT_FILE="gateway/src/egress/grpc.rs"
+
+h2_problems=""
+
+# Confines one construction pattern to one file.
+#
+# `$3` is an extended-regexp alternation containing `::`, so it is passed as its
+# own argument rather than packed into a delimited string -- an earlier version
+# split on `:` and silently degraded the pattern to `hyper`, which matched
+# almost every file in the tree.
+check_h2_confinement() {
+    permitted="$1"
+    role="$2"
+    pattern="$3"
+
+    if [ ! -f "$permitted" ]; then
+        h2_problems="$h2_problems|$permitted is the only file permitted to build an HTTP/2 $role, but does not exist"
+        return 0
+    fi
+    if ! grep -vE '^[[:space:]]*//' "$permitted" | grep -qE "$pattern"; then
+        h2_problems="$h2_problems|$permitted no longer builds an HTTP/2 $role; update this check"
+        return 0
+    fi
+
+    # Whole-line comments are stripped before the scan. The invariant is about
+    # where an h2 stack is CONSTRUCTED; naming the type in prose is how the rest
+    # of the tree explains why it must not construct one, and a check that
+    # punished the explanation would be teaching the wrong lesson. A real
+    # construction cannot live on a line whose first token is `//`.
+    strays="$(
+        printf '%s
+' "$rust_files" |
+            while IFS= read -r file; do
+                [ "$file" = "$permitted" ] && continue
+                if grep -vE '^[[:space:]]*//' "$file" | grep -qE "$pattern"; then
+                    printf '%s\n' "$file"
+                fi
+            done
+    )"
+    for stray in $strays; do
+        h2_problems="$h2_problems|$stray builds an HTTP/2 $role outside $permitted"
+    done
+}
+
+check_h2_confinement "$H2_SERVER_FILE" server 'hyper::server::conn::http2|h2::server::'
+check_h2_confinement "$H2_CLIENT_FILE" client 'hyper::client::conn::http2|h2::client::'
+
+# The h2 server builder must state the bounds #257 requires. Under
+# `axum::serve` none of these is reachable at all, so a builder missing one is
+# not "using a sensible default" -- it is running on hyper's, which are 200
+# concurrent streams and an UNBOUNDED pending-accept-reset allowance (the
+# CVE-2023-44487 "Rapid Reset" shape).
+if [ -f "$H2_SERVER_FILE" ]; then
+    builder_body="$(
+        awk '
+            index($0, "fn build_h2_server(") { inside = 1 }
+            inside { print }
+            inside && /^\}/ { exit }
+        ' "$H2_SERVER_FILE" | grep -vE '^[[:space:]]*//'
+    )"
+    if [ -z "$builder_body" ]; then
+        h2_problems="$h2_problems|$H2_SERVER_FILE no longer defines build_h2_server(); update this check"
+    else
+        for setter in max_concurrent_streams max_header_list_size max_pending_accept_reset_streams max_frame_size; do
+            if ! printf '%s
+' "$builder_body" | grep -qE "\.$setter\("; then
+                h2_problems="$h2_problems|$H2_SERVER_FILE:build_h2_server does not set $setter"
+            fi
+        done
+        # RFC 8441 extended CONNECT is an explicit non-goal of #257, and axum
+        # turns it on unconditionally under http2. This builder must not.
+        # Comment lines are stripped above so the prohibition can be explained
+        # in the code without tripping its own check.
+        if printf '%s
+' "$builder_body" | grep -qE 'enable_connect_protocol'; then
+            h2_problems="$h2_problems|$H2_SERVER_FILE:build_h2_server enables RFC 8441 extended CONNECT, which #257 lists as a non-goal"
+        fi
+    fi
+fi
+
+if [ -n "$h2_problems" ]; then
+    echo "HTTP/2 client and server construction must stay where it can be reviewed:"
+    printf '%s
+' "$h2_problems" | tr '|' '
+' | sed '/^$/d;s/^/  /'
+    exit 1
 fi
 
 echo "egress-only check passed"

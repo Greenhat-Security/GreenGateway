@@ -174,6 +174,13 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
     // Excluded here rather than added to the allowlist because a forwarding
     // entry that cannot work is worse than an absent one: it invites the
     // configuration it silently breaks.
+    //
+    // The gRPC settings are excluded for a stronger version of the same reason:
+    // Cloudflare Containers can never carry gRPC. The edge terminates the client
+    // connection and the Durable Object opens its own over HTTP/1.1, so no
+    // HTTP/2 connection preface can arrive at the container -- there is no
+    // configuration that makes the listener reachable, only one that makes an
+    // operator believe it is.
     for excluded in [
         "TLS_CERT_FILE",
         "TLS_KEY_FILE",
@@ -182,6 +189,9 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
         "TLS_MIN_VERSION",
         "TLS_HANDSHAKE_TIMEOUT_MS",
         "TLS_MAX_CONCURRENT_HANDSHAKES",
+        "GRPC_LISTEN_ADDR",
+        "GRPC_MAX_CONCURRENT_STREAMS",
+        "GRPC_MAX_METADATA_BYTES",
     ] {
         assert!(
             expected.remove(excluded),

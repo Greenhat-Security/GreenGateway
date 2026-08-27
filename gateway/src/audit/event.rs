@@ -35,6 +35,7 @@ pub const UPSTREAM_CIRCUIT_STATE_CHANGED: &str = "upstream.circuit_state_changed
 pub const UPSTREAM_STREAM_TERMINATED: &str = "upstream.stream_terminated";
 pub const UPSTREAM_WEBSOCKET_HANDSHAKE: &str = "upstream.websocket_handshake";
 pub const UPSTREAM_WEBSOCKET_CLOSED: &str = "upstream.websocket_closed";
+pub const UPSTREAM_GRPC_CALL: &str = "upstream.grpc_call";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {

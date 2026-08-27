@@ -1753,6 +1753,7 @@ mod tests {
             request_body_mode: super::super::RequestBodyMode::Buffered,
             sse: None,
             websocket: None,
+            grpc: None,
         };
 
         let headers = upstream_handshake_headers(
@@ -1835,6 +1836,7 @@ mod tests {
             request_body_mode: super::super::RequestBodyMode::Buffered,
             sse: None,
             websocket: None,
+            grpc: None,
         };
 
         let headers = upstream_handshake_headers(

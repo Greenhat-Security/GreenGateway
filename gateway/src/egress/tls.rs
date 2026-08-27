@@ -62,14 +62,22 @@ pub(super) use tokio_rustls::rustls::pki_types::CertificateDer;
 
 use super::client_cache::ProtocolProfile;
 
-/// The ALPN list every profile negotiates in this build.
+/// The ALPN list every reqwest-backed profile negotiates.
 ///
-/// Nothing here speaks HTTP/2 yet, and `scripts/check-egress-only.sh` keeps the
-/// `http2` feature off `reqwest`, `hyper-util`, and `axum` precisely so that
-/// stays true. An h2 transport arrives as a new [`ProtocolProfile`] whose arm in
-/// [`alpn_protocols`] returns a different list, not as a silent ALPN change to
-/// the profiles that already carry live traffic.
+/// `scripts/check-egress-only.sh` keeps the `http2` feature off `reqwest`,
+/// `hyper-util`, and `axum`, so no reqwest transport in this build can speak
+/// HTTP/2 even if ALPN offered it -- it would panic rather than negotiate.
+/// Every profile reqwest serves therefore states `http/1.1` and nothing else.
 const HTTP1_ALPN: &[&[u8]] = &[b"http/1.1"];
+
+/// The ALPN list for the gRPC transport, which issue #257 added.
+///
+/// `h2` and nothing else, on purpose. A gRPC call that fell back to HTTP/1.1
+/// would have no trailers and therefore no `grpc-status`, so a server that will
+/// not speak h2 must fail the handshake rather than be spoken HTTP/1.1 at.
+/// This list is reachable only from [`ProtocolProfile::Grpc`], which
+/// `base_client_builder_for_profile` refuses to build a reqwest client for.
+const H2_ALPN: &[&[u8]] = &[b"h2"];
 
 /// Why a TLS configuration could not be built.
 ///
@@ -148,6 +156,7 @@ fn alpn_protocols(profile: ProtocolProfile) -> &'static [&'static [u8]] {
         ProtocolProfile::Http1AndHttp2 | ProtocolProfile::Sse | ProtocolProfile::UpgradeHttp1 => {
             HTTP1_ALPN
         }
+        ProtocolProfile::Grpc => H2_ALPN,
     }
 }
 
@@ -421,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn every_protocol_profile_negotiates_http1_and_nothing_else() {
+    fn every_reqwest_backed_profile_negotiates_http1_and_nothing_else() {
         for profile in [
             ProtocolProfile::Http1AndHttp2,
             ProtocolProfile::Sse,
@@ -436,6 +445,22 @@ mod tests {
                  extension at all, and an h2 entry panics hyper-util in this build"
             );
         }
+    }
+
+    /// The gRPC profile is the only one that offers `h2`, and it must offer
+    /// nothing else.
+    ///
+    /// Both halves matter. Offering `http/1.1` as well would let a server that
+    /// prefers it hand the gateway an HTTP/1.1 connection, which has no
+    /// trailers and therefore no `grpc-status` -- the call would look like it
+    /// worked while carrying no status at all. Offering nothing sends no ALPN
+    /// extension, which `rustls-0.23.41/src/server/hs.rs:100-119` treats as no
+    /// preference and lets the server pick whatever it likes.
+    #[test]
+    fn the_grpc_profile_negotiates_h2_and_nothing_else() {
+        let config = client_config(&[], None, ProtocolProfile::Grpc)
+            .expect("the gRPC profile config should build");
+        assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
     }
 
     /// A PEM block whose body decodes cleanly but is not a certificate. The PEM

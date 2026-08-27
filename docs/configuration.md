@@ -29,6 +29,40 @@ The deployment probes are exact, gateway-owned `GET`/`HEAD` routes on the data l
 
 Probe bodies contain only aggregate state and stable reason categories; they do not expose upstream URLs, endpoint topology, credentials, or internal errors. The default authentication, RBAC, and CSRF exemptions include all four probe routes. Setting an exempt-path variable explicitly replaces that default, so operators using explicit lists should retain the probes needed by their orchestrator.
 
+### GRPC_LISTEN_ADDR
+
+Optional socket address for the transparent gRPC (HTTP/2) listener added by issue #257.
+
+Default: empty, which means **no HTTP/2 server is constructed at all**. gRPC proxying is opt-in twice over: this address must be set, and each route that may carry gRPC must declare an `UPSTREAM_ROUTES[].grpc` policy block. A route without one is refused with `UNIMPLEMENTED` rather than proxied with invented limits.
+
+Format and validation: unset, empty, or whitespace-only values disable the listener. A non-empty value must parse as a Rust `SocketAddr`, and must differ from both `LISTEN_ADDR` and `ADMIN_LISTEN_ADDR`. A shared address is rejected at startup rather than resolved: this listener speaks HTTP/2 and nothing else, while `LISTEN_ADDR` and `ADMIN_LISTEN_ADDR` refuse an HTTP/2 connection preface, so one of the two would simply never answer.
+
+**Why a third listener.** `axum::serve`, which serves the data and admin listeners, constructs its HTTP/2 handling internally and exposes no way to configure it, so the resource bounds this transport requires would be unreachable. It also enables RFC 8441 extended `CONNECT` unconditionally, which is an explicit non-goal. And with `ADMIN_LISTEN_ADDR` unset — the default — the admin API shares the data listener's socket, so a mode on that listener would put h2c on the admin surface for every default deployment. The gRPC listener is therefore a separate socket with its own HTTP/2 server, and the other two listeners are unchanged: they still answer an HTTP/2 preface by closing the connection.
+
+**Deployment.** The listener speaks h2c prior knowledge over plaintext. Front it with something that terminates client TLS and re-originates h2c — nginx `grpc_pass`, Envoy, or an equivalent. See [docs/deployment/grpc.md](deployment/grpc.md), which also records the deployments where gRPC cannot work at all.
+
+The gRPC listener runs the identical middleware stack as the data listener: authentication, rate limiting, CSRF, request validation, route classification, RBAC, and direct policy, in the same order. Two things differ, and both are narrowings. Request validation is given the gRPC media types (`application/grpc`, `application/grpc+proto`, `application/grpc+json`) as its allow-list instead of `VALIDATION_ALLOWED_CONTENT_TYPES`. And the router carries no admin routes and no probe routes — its only route is the gRPC proxy.
+
+Because CSRF protection applies to the whole router, a gRPC call must carry a bearer credential in `authorization` metadata, be on a `CSRF_EXEMPT_PATHS` entry, or run with `CSRF_ENABLED=false`. This is the same rule non-browser HTTP clients already follow on the data listener.
+
+### GRPC_MAX_CONCURRENT_STREAMS
+
+Maximum concurrent HTTP/2 streams the gRPC listener will carry on one connection.
+
+Default: `100`. Range: 1 to 10000.
+
+This is the single most load-bearing inbound bound the gateway has, because it multiplies: one accepted TCP connection becomes up to this many concurrent in-flight calls, so the real inbound ceiling is this value times the connection cap. It is deliberately half of hyper's own default of 200.
+
+Per-route and per-endpoint call ceilings are configured separately in `UPSTREAM_ROUTES[].grpc`, and admission runs before any DNS resolution or connection acquisition.
+
+### GRPC_MAX_METADATA_BYTES
+
+Maximum decoded size, in bytes, of one gRPC request's metadata (its HTTP/2 header list).
+
+Default: `16384`, which matches hyper's own default. Range: 1024 to 1048576.
+
+Raise it for callers that carry large bearer tokens or tracing metadata. The number of metadata entries is bounded separately by `UPSTREAM_ROUTES[].grpc.max_metadata_entries`, because a byte budget does not constrain a count.
+
 ### TLS_CERT_FILE
 
 Optional path to the PEM certificate chain that terminates TLS on `LISTEN_ADDR`, leaf certificate first.
@@ -133,7 +167,7 @@ When `ADMIN_LOGIN_PROVIDER` is set, the admin OIDC login routes are also registe
 
 The default `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` include the effective `ADMIN_PREFIX` so the static admin UI shell can load before an operator pastes a token. When `ADMIN_LOGIN_PROVIDER` is set, they also include `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` so an unauthenticated browser can complete the login flow. Other admin APIs remain protected by authentication and endpoint-specific authorization checks.
 
-Leave `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` unset to keep these defaults synchronized with `ADMIN_PREFIX`. Setting either variable replaces its entire dynamic default with one exception: while `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` remain exempt even when either variable is set explicitly, because an unauthenticated browser has to reach both routes for the OIDC authorization-code flow to complete. There is no configuration that removes them while admin SSO login is enabled; unset `ADMIN_LOGIN_PROVIDER` to drop them. When changing `ADMIN_PREFIX`, update every explicit exempt list at the same time so a stale former admin prefix is not forwarded upstream without the corresponding security check.
+Leave `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` unset to keep these defaults synchronized with `ADMIN_PREFIX`. Setting either variable replaces its entire dynamic default with one exception: while `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` remain exempt even when either variable is set explicitly, because an unauthenticated browser has to reach both routes for the OIDC authorization-code flow to complete. There is no configuration that removes them while admin SSO login is enabled; unset `ADMIN_LOGIN_PROVIDER` to drop them. When changing `ADMIN_PREFIX`, update every explicit exempt list at the same time so a stale former admin prefix is not forwarded upstream without the corresponding security check. Neither list applies on the gRPC listener (`GRPC_LISTEN_ADDR`); see [docs/deployment/grpc.md](deployment/grpc.md#3-authentication) for why.
 
 ### ADMIN_LOGIN_PROVIDER
 
@@ -1012,7 +1046,7 @@ Comma-separated paths that bypass RBAC authorization.
 
 Default: `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX` (for example, `/admin` with the default prefix).
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it, except that the admin OIDC login pair `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` remain exempt even when this variable is set explicitly, for as long as `ADMIN_LOGIN_PROVIDER` is set; an unauthenticated browser has to reach both routes for the authorization-code flow to complete, so no explicit list can remove them while admin SSO login is enabled. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. The six fixed probe routes are the exception: an entry naming `/health`, `/livez`, `/startupz`, `/readyz`, `/version`, or `/metrics` exempts only that exact path. The gateway serves those paths exactly and reserves them from proxy fallback exactly, so a prefix exemption there would hand `/health/v1/orders` and every other path below them to the upstream with the check skipped. Exempt paths are allowed through without RBAC permission checks and do not emit authz audit events, except that an exact configured MCP route is never RBAC-exempt. Non-MCP subpaths beneath an MCP alias keep the normal prefix behavior. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without RBAC; this warning is non-fatal because exempting an upstream path may be intentional.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it, except that the admin OIDC login pair `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` remain exempt even when this variable is set explicitly, for as long as `ADMIN_LOGIN_PROVIDER` is set; an unauthenticated browser has to reach both routes for the authorization-code flow to complete, so no explicit list can remove them while admin SSO login is enabled. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. The six fixed probe routes are the exception: an entry naming `/health`, `/livez`, `/startupz`, `/readyz`, `/version`, or `/metrics` exempts only that exact path. The gateway serves those paths exactly and reserves them from proxy fallback exactly, so a prefix exemption there would hand `/health/v1/orders` and every other path below them to the upstream with the check skipped. Exempt paths are allowed through without RBAC permission checks and do not emit authz audit events, except that an exact configured MCP route is never RBAC-exempt. This list does not apply on the gRPC listener at all: that listener serves no gateway-owned surface, so an exemption matching there could only grant an unauthorized upstream call. Non-MCP subpaths beneath an MCP alias keep the normal prefix behavior. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without RBAC; this warning is non-fatal because exempting an upstream path may be intentional.
 
 ### CORS_ALLOW_ORIGINS
 
@@ -1124,7 +1158,7 @@ Comma-separated paths that bypass authentication.
 
 Default: `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX` (for example, `/admin` with the default prefix).
 
-Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it, except that the admin OIDC login pair `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` remain exempt even when this variable is set explicitly, for as long as `ADMIN_LOGIN_PROVIDER` is set; an unauthenticated browser has to reach both routes for the authorization-code flow to complete, so no explicit list can remove them while admin SSO login is enabled. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. The six fixed probe routes are the exception: an entry naming `/health`, `/livez`, `/startupz`, `/readyz`, `/version`, or `/metrics` exempts only that exact path. The gateway serves those paths exactly and reserves them from proxy fallback exactly, so a prefix exemption there would hand `/health/v1/orders` and every other path below them to the upstream with the check skipped. Exempt paths are allowed through without credential extraction and do not emit auth audit events, except that an exact configured MCP route is never authentication-exempt. Non-MCP subpaths beneath an MCP alias keep the normal prefix behavior. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without authentication; this warning is non-fatal because exempting an upstream path may be intentional.
+Format and validation: split on commas, trim whitespace, ignore empty entries, and require each entry to be a URI path starting with `/`. When unset, the default is `/health,/livez,/startupz,/readyz,/version,/metrics` plus the effective `ADMIN_PREFIX`; when `ADMIN_LOGIN_PROVIDER` is set, `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` are also added. Setting this variable replaces the entire default rather than augmenting it, except that the admin OIDC login pair `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` remain exempt even when this variable is set explicitly, for as long as `ADMIN_LOGIN_PROVIDER` is set; an unauthenticated browser has to reach both routes for the authorization-code flow to complete, so no explicit list can remove them while admin SSO login is enabled. Exempt paths are matched as segment-boundary-aware prefixes, so `/admin` covers `/admin/assets/app.js` but not `/administrator` or `/admin-panel`. The six fixed probe routes are the exception: an entry naming `/health`, `/livez`, `/startupz`, `/readyz`, `/version`, or `/metrics` exempts only that exact path. The gateway serves those paths exactly and reserves them from proxy fallback exactly, so a prefix exemption there would hand `/health/v1/orders` and every other path below them to the upstream with the check skipped. Exempt paths are allowed through without credential extraction and do not emit auth audit events, except that an exact configured MCP route is never authentication-exempt. This list does not apply on the gRPC listener at all: that listener serves no gateway-owned surface, so an exemption matching there could only grant an unauthenticated upstream call. Non-MCP subpaths beneath an MCP alias keep the normal prefix behavior. At startup, GreenGateway warns when an explicit exempt path is not gateway-owned because such a path can reach proxy fallback without authentication; this warning is non-fatal because exempting an upstream path may be intentional.
 
 ### AUTH_PROVIDERS
 
@@ -1413,6 +1447,33 @@ Control frames are relayed rather than terminated locally, so an application hea
 
 Authentication, RBAC, and egress validation run on the upgrade request exactly as they do for any other request on the route, before any upstream connection is opened. A rejected upgrade contacts no upstream.
 
+`grpc` opts a route into transparent gRPC proxying over the separate `GRPC_LISTEN_ADDR` listener. When omitted, the route carries no gRPC policy and a call matching it on the gRPC listener is refused with `UNIMPLEMENTED`. That is a denial rather than a fallback: a route that has not been given gRPC limits has no limits to enforce, and this transport must not run without them.
+
+gRPC multiplexes many concurrent streams over one HTTP/2 connection, so the unit of admission here is the **call**, not the connection. `max_concurrent_calls` is a separate admission pool from the route's `limits.max_in_flight`, for the same reason the WebSocket transport has its own: a streaming call can hold its slot for an hour, and sharing the pool would let a handful of streams starve the route's HTTP traffic.
+
+`grpc` requires an `upstreams` pool and is rejected on a legacy `upstream_url` route. It cannot be combined with `connection_id`, on the same reasoning as `websocket`.
+
+The optional gRPC fields are:
+
+- `max_concurrent_calls`: concurrent in-flight calls for the route. Default `256`, maximum `100000`.
+- `max_concurrent_calls_per_endpoint`: additional per-endpoint ceiling. Defaults to `max_concurrent_calls`. Must be between 1 and `max_concurrent_calls`.
+- `queue_depth`: calls allowed to wait for capacity. Default `64`, maximum `10000`.
+- `queue_timeout_ms`: how long a call waits for capacity before `RESOURCE_EXHAUSTED`. Default `100`.
+- `connect_timeout_ms`: one budget for establishing a *usable* HTTP/2 connection to the upstream — the TCP connect, the TLS handshake, and the peer's own connection preface, which the gateway waits for because a peer that accepts a socket and then sends nothing would otherwise pass every check hyper performs. Default `10000`, range `100`-`60000`. This is not the caller's deadline: exceeding it is `UNAVAILABLE`, not `DEADLINE_EXCEEDED`. It does not bound acquiring stream capacity on an established connection — see `max_duration_ms`.
+- `idle_timeout_ms`: terminates a stream with no upstream-to-client traffic, starting when the upstream's response HEADERS arrive. Default `300000`, range `1000`-`3600000`. Zero disables it. It deliberately does not run while the gateway waits for those HEADERS: for a client-streaming call the response direction is legitimately silent for the whole upload.
+- `max_duration_ms`: ceiling on one call's total duration measured from admission, and the cap applied to a client's `grpc-timeout`. Default `3600000` (one hour), maximum `604800000` (seven days). The effective deadline is the smaller of the two and is armed before the gateway connects, so one budget covers the admission queue, the wait for the upstream's response HEADERS, and the streaming phase. This is also the only bound on an upstream that has no stream capacity left, because `hyper`'s readiness check reports connection liveness rather than `SETTINGS_MAX_CONCURRENT_STREAMS` credit. Zero disables the ceiling, in which case an uncapped client deadline is honoured — and a call with no `grpc-timeout` on such a route has no total-duration bound at all.
+- `max_message_bytes`: largest single *encoded* gRPC message, in either direction. Default `4194304`, range `1024`-`268435456`. Enforced on the length declared in the five-byte envelope, so an oversize message is refused on its header rather than after it has been forwarded.
+- `max_request_bytes` / `max_response_bytes`: ceiling on total bytes in one direction of one call. Default `268435456` each. Zero disables. A non-zero value below `max_message_bytes` is rejected, because it could never carry a message the route explicitly permits.
+- `max_metadata_entries`: ceiling on the *number* of metadata entries, in request headers and in response trailers independently. Default `64`, maximum `1024`. `GRPC_MAX_METADATA_BYTES` bounds their size; a byte budget does not constrain a count.
+
+The canonical authorization identity is the method path `/package.Service/Method`, which is the HTTP path, so existing RBAC path rules apply to it directly. The path is held to the protobuf identifier grammar, so it has exactly one spelling: the string RBAC evaluates, the string audit records, and the string sent upstream as `:path` are the same bytes.
+
+Retries are disabled for gRPC. A route's `retry` block does not apply to its gRPC calls, and a streaming call is never replayable in any case.
+
+Authentication, rate limiting, CSRF, request validation, RBAC, direct policy, canonical method validation, and admission all complete before any DNS resolution, connection acquisition, or upstream byte. A denied call produces a protocol-correct trailers-only gRPC response and contacts no upstream.
+
+`AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` do **not** apply on the gRPC listener. Those lists exist to let gateway-owned surfaces through without a credential, and that listener serves none — so an exemption matching there could only ever grant an unauthenticated, unauthorized upstream call. `CSRF_EXEMPT_PATHS` still applies, because a CSRF exemption grants nothing on its own. Full deployment guidance, including the front-end requirement and where gRPC cannot work at all, is in [docs/deployment/grpc.md](deployment/grpc.md).
+
 `retry` is an optional pool-only object. Omitting it preserves the compatibility default of exactly one total attempt. It is rejected on legacy `upstream_url` routes. Its fields are:
 
 - `max_attempts`: total attempts including the initial request, default `1`, range 1-5.
@@ -1517,6 +1578,21 @@ Example:
       "allowed_origins": ["https://app.example.test"],
       "require_origin": true,
       "allowed_subprotocols": ["chat"]
+    }
+  },
+  {
+    "id": "greeter",
+    "path_prefix": "/helloworld.Greeter",
+    "upstreams": [
+      {"id": "greeter-a", "url": "https://greeter-a.internal.example"}
+    ],
+    "grpc": {
+      "max_concurrent_calls": 256,
+      "max_concurrent_calls_per_endpoint": 128,
+      "idle_timeout_ms": 300000,
+      "max_duration_ms": 3600000,
+      "max_message_bytes": 4194304,
+      "max_metadata_entries": 64
     }
   },
   {

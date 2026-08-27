@@ -61,7 +61,9 @@ mod upstream_route;
 
 #[cfg(test)]
 use lifecycle::serve_router;
-use lifecycle::{serve_gateway, GatewayApp, GatewayLifecycle, ShutdownConfig};
+use lifecycle::{
+    serve_gateway, GatewayApp, GatewayApps, GatewayLifecycle, GrpcApp, ShutdownConfig,
+};
 use proxy::{ProxyClassifier, ProxyState};
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
@@ -157,6 +159,7 @@ const ADMIN_MCP_USE_PERMISSION: &str = "admin:mcp:use";
 #[cfg(test)]
 const MCP_ROUTE: &str = auth::protected_resource::MCP_RESOURCE_PATH;
 const PROXY_FALLBACK_ROUTE: &str = "proxy_fallback";
+const GRPC_FALLBACK_ROUTE: &str = "grpc_fallback";
 const GATEWAY_OWNED_EXACT_PATHS: &[&str] = path_match::GATEWAY_EXACT_ROUTE_PATHS;
 const DEFAULT_AUDIT_QUERY_LIMIT: usize = 50;
 const MAX_AUDIT_QUERY_LIMIT: usize = 500;
@@ -1457,7 +1460,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let background_lifecycle = lifecycle.clone();
 
     serve_gateway(
-        app,
+        app.http,
+        app.grpc,
         listen_addr,
         admin_listen_addr,
         inbound_tls,
@@ -1512,7 +1516,9 @@ fn app_with_process_started_at(
         audit_log,
         audit_event_sender,
         process_started_at,
-    )? {
+    )?
+    .http
+    {
         GatewayApp::Unified(router) => Ok(router),
         GatewayApp::Split { .. } => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1529,7 +1535,7 @@ fn gateway_app_with_process_started_at(
     audit_log: audit::AuditLog,
     audit_event_sender: audit::AuditEventSender,
     process_started_at: Instant,
-) -> Result<GatewayApp, Box<dyn std::error::Error>> {
+) -> Result<GatewayApps, Box<dyn std::error::Error>> {
     gateway_app_with_process_started_at_and_overrides(
         config,
         metrics_handle,
@@ -1547,7 +1553,7 @@ fn gateway_app_with_process_started_at_and_overrides(
     audit_event_sender: audit::AuditEventSender,
     process_started_at: Instant,
     build_overrides: GatewayAppBuildOverrides,
-) -> Result<GatewayApp, Box<dyn std::error::Error>> {
+) -> Result<GatewayApps, Box<dyn std::error::Error>> {
     let lifecycle = build_overrides.lifecycle.clone().unwrap_or_default();
     let split_admin_listener = config.admin_listen_addr.is_some();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
@@ -1992,22 +1998,175 @@ fn gateway_app_with_process_started_at_and_overrides(
         principals: principal_admin_state,
     };
 
-    if split_admin_listener {
-        Ok(GatewayApp::Split {
+    let grpc = grpc_app(&config, &app_state, &middleware_stack);
+
+    let http = if split_admin_listener {
+        GatewayApp::Split {
             data: apply_middleware(data_router(app_state.clone()), &middleware_stack, true),
             admin: apply_middleware(
                 admin_router(&routes, app_state, admin_api_states),
                 &middleware_stack,
                 false,
             ),
-        })
+        }
     } else {
-        Ok(GatewayApp::Unified(apply_middleware(
+        GatewayApp::Unified(apply_middleware(
             unified_router(&routes, app_state, admin_api_states),
             &middleware_stack,
             true,
-        )))
+        ))
+    };
+
+    Ok(GatewayApps { http, grpc })
+}
+
+/// Builds the gRPC listener's router, or `None` when `GRPC_LISTEN_ADDR` is unset.
+///
+/// Returning `None` is what makes "no HTTP/2 server is ever constructed by
+/// default" a fact rather than a claim: `lifecycle` binds and serves a listener
+/// only when this is `Some`, and nothing else in the tree can reach
+/// `hyper::server::conn::http2`.
+///
+/// The router goes through the SAME `apply_middleware` function, over the same
+/// middleware state values, as the data listener: the same audit log, rate
+/// limiter, observation state, RBAC state, auth state, CSRF configuration, and
+/// proxy dispatch state. That is the whole structural argument for the
+/// zero-bytes invariant -- authentication, rate limiting, CSRF, request
+/// validation, route classification, RBAC and direct policy are the same
+/// layers, in the same order, so a gRPC call is subject to exactly the
+/// decisions an HTTP request is.
+///
+/// Three things differ, and all three are narrowings:
+///
+/// * Request validation is given the gRPC media types as its allow-list instead
+///   of the deployment's HTTP list. This listener serves one protocol, so
+///   `application/json` has no business being accepted on it.
+/// * The router carries NO admin routes and no gateway-owned probe routes. Its
+///   only route is a fallback into the gRPC proxy, which refuses any route
+///   without an explicit `grpc` policy block.
+/// * `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` do not apply here at all. See
+///   below -- this one is a security property, not a convenience.
+///
+/// One layer is added, outermost, so it wraps everything above: the middleware
+/// stack answers in HTTP, and a gRPC client needs a gRPC status.
+///
+/// # Why the exempt lists are dropped on this listener
+///
+/// The exempt lists exist to let gateway-owned surfaces through without a
+/// credential: the admin UI and its assets, the admin login callback, the fixed
+/// probe routes. #306 settled the rule that makes them safe -- *a gateway-owned
+/// exempt entry can only grant exemptions inside gateway-owned space* -- and
+/// the startup warning at [`GatewayRoutes::unowned_exempt_paths`] filters
+/// gateway-owned entries out on exactly that reasoning.
+///
+/// None of it holds here. This listener serves ONE thing, a fallback into the
+/// gRPC proxy; there is no gateway-owned space on it for an exemption to land
+/// in. So every exemption that matches on this listener, without exception, is
+/// an unauthenticated and unauthorized call proxied to an upstream:
+///
+/// * `default_admin_exempt_paths` puts `ADMIN_PREFIX` in both lists by default,
+///   and entries are segment-boundary prefixes, so the default configuration
+///   exempts `/admin/<Method>` -- which is a well-formed gRPC method path,
+///   because `admin` and `Method` are both valid protobuf identifiers. The
+///   operator gets no warning, because the entry IS gateway-owned and the
+///   warning's premise is that a gateway-owned entry cannot be forwarded.
+/// * An operator-added entry such as `/public`, written about HTTP paths on the
+///   data listener, silently reads on this listener as "the gRPC service named
+///   `public` needs no credential". One decision, two protocols, two listeners.
+///
+/// An exemption mechanism whose every match is a bypass is not a mechanism with
+/// a bug in it. So the lists are emptied for this router, explicitly and in one
+/// place, rather than each hole being patched as it is found. A deployment that
+/// genuinely needs an unauthenticated gRPC method -- a load balancer calling
+/// `grpc.health.v1.Health/Check`, say -- needs a setting that names canonical
+/// method paths and is matched exactly, on this listener only; that is a
+/// deliberate follow-up, not something to reach by leaving an HTTP path list
+/// applying here.
+///
+/// `CSRF_EXEMPT_PATHS` is deliberately NOT emptied. CSRF exemption grants
+/// nothing on its own -- an exempt call still has to authenticate and still has
+/// to pass policy -- so it is not the same defect class, and it is the
+/// documented way an operator relieves gRPC clients of the CSRF rule.
+fn grpc_app(
+    config: &config::Config,
+    app_state: &AppState,
+    middleware_stack: &MiddlewareStack,
+) -> Option<GrpcApp> {
+    let address = config.grpc_listen_addr?;
+    let mut grpc_config = middleware_stack.config.clone();
+    grpc_config.validation_allowed_content_types = proxy::grpc::protocol::GRPC_CONTENT_TYPES
+        .iter()
+        .map(|content_type| (*content_type).to_owned())
+        .collect();
+    let grpc_stack = MiddlewareStack {
+        config: grpc_config,
+        audit_log: middleware_stack.audit_log.clone(),
+        csrf_config: middleware_stack.csrf_config.clone(),
+        rate_limit_state: middleware_stack.rate_limit_state.clone(),
+        observation_state: middleware_stack.observation_state.clone(),
+        rbac_state: middleware_stack.rbac_state.clone().map(|mut state| {
+            state.exempt_paths = Vec::new();
+            state
+        }),
+        auth_state: middleware_stack.auth_state.clone().map(|mut state| {
+            state.exempt_paths = Vec::new();
+            state
+        }),
+        proxy_dispatch_state: middleware_stack.proxy_dispatch_state.clone(),
+    };
+
+    let router = Router::new()
+        .fallback(any(grpc_endpoint))
+        .with_state(app_state.clone());
+
+    Some(GrpcApp {
+        address,
+        router: apply_middleware(router, &grpc_stack, true)
+            .layer(axum::middleware::from_fn(proxy::grpc::shape_response)),
+        limits: proxy::grpc::GrpcListenerLimits {
+            max_concurrent_streams: config.grpc_max_concurrent_streams,
+            max_metadata_bytes: config.grpc_max_metadata_bytes,
+        },
+    })
+}
+
+async fn grpc_endpoint(State(state): State<AppState>, request: AxumRequest) -> Response {
+    record_request(GRPC_FALLBACK_ROUTE);
+
+    // The same pair of refusals `proxy_fallback` makes, for the same reasons,
+    // and stated here rather than inherited because this is a different router
+    // with a different fallback. `grpc_app` also empties the auth and RBAC
+    // exempt lists for this listener, which is the primary fix; this is the
+    // defence in depth behind it, and it holds even if some future caller
+    // reaches `handle_call` by another route.
+    //
+    // `is_gateway_owned_path` matters here for a reason that is easy to miss:
+    // a gateway-owned path on THIS listener is not gateway-owned by anything.
+    // The router serves no admin, probe or well-known routes, so without this
+    // the gateway's own reserved namespace is simply proxy space -- and
+    // `proxy_dispatch_context_middleware` skips route classification for those
+    // paths on the premise that they never reach a proxy.
+    let path = request.uri().path();
+    if path_match::is_unsafe_request_path(path) {
+        return proxy::grpc::not_proxyable_response("unsafe_path");
     }
+    if state.routes.is_gateway_owned_path(path) {
+        return proxy::grpc::not_proxyable_response("gateway_owned_path");
+    }
+
+    let Some(proxy) = state.proxy.as_ref() else {
+        // No proxy configured at all. Answered as a gRPC status rather than a
+        // 404 so the client sees a protocol-correct refusal.
+        return proxy::grpc::unimplemented_response();
+    };
+
+    let source_ip = client_ip::canonical_client_ip(
+        request.headers(),
+        request.extensions(),
+        &state.client_ip_policy,
+    );
+
+    proxy.handle_grpc_call(request, &source_ip).await
 }
 
 fn auth_validator_from_config(
@@ -11341,6 +11500,9 @@ mod tests {
                 .parse()
                 .expect("test listen address should parse"),
             admin_listen_addr: None,
+            grpc_listen_addr: None,
+            grpc_max_concurrent_streams: crate::config::DEFAULT_GRPC_MAX_CONCURRENT_STREAMS,
+            grpc_max_metadata_bytes: crate::config::DEFAULT_GRPC_MAX_METADATA_BYTES,
             tls_cert_file: None,
             tls_key_file: None,
             admin_tls_cert_file: None,
@@ -12058,7 +12220,7 @@ mod tests {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
     }
 
-    fn gateway_app_for_test(config: config::Config) -> GatewayApp {
+    fn gateway_app_for_test(config: config::Config) -> GatewayApps {
         let recorder = PrometheusBuilder::new().build_recorder();
         gateway_app_with_process_started_at(
             config,
@@ -12071,7 +12233,7 @@ mod tests {
     }
 
     fn split_gateway_routers(config: config::Config) -> (Router, Router) {
-        match gateway_app_for_test(config) {
+        match gateway_app_for_test(config).http {
             GatewayApp::Split { data, admin } => (data, admin),
             GatewayApp::Unified(_) => panic!("gateway app should build split routers"),
         }
@@ -12497,6 +12659,7 @@ mod tests {
             request_body: config::UpstreamRequestBodyConfig::default(),
             sse: None,
             websocket: None,
+            grpc: None,
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,
@@ -12537,7 +12700,7 @@ mod tests {
             },
         )
         .expect("streaming proxy app should build");
-        match app {
+        match app.http {
             GatewayApp::Unified(router) => router,
             GatewayApp::Split { .. } => panic!("streaming proxy app should be unified"),
         }
@@ -12648,7 +12811,7 @@ mod tests {
             },
         )
         .expect("instrumented proxy app should build");
-        let router = match app {
+        let router = match app.http {
             GatewayApp::Unified(router) => router,
             GatewayApp::Split { .. } => panic!("instrumented proxy app should be unified"),
         };
@@ -13256,7 +13419,7 @@ mod tests {
         config.auth_enabled = false;
         let config = status_config_with_policy(config, &policy);
 
-        let router = match gateway_app_for_test(config) {
+        let router = match gateway_app_for_test(config).http {
             GatewayApp::Unified(router) => router,
             GatewayApp::Split { .. } => panic!("ADMIN_LISTEN_ADDR unset should build one router"),
         };
@@ -18747,7 +18910,7 @@ mod tests {
             },
         )
         .expect("gateway app should build");
-        let router = match app {
+        let router = match app.http {
             GatewayApp::Unified(router) => router,
             GatewayApp::Split { .. } => panic!("test app should be unified"),
         };
@@ -34051,7 +34214,7 @@ paths:
             build_overrides,
         )
         .expect("tools admin test app should build");
-        let router = match app {
+        let router = match app.http {
             GatewayApp::Unified(router) => router,
             GatewayApp::Split { .. } => panic!("tools admin test app should be unified"),
         };
@@ -38281,4 +38444,7 @@ O2gecI9QwDJNpm29J9wJB2F8
 
     #[path = "issue_256_acceptance_websocket.rs"]
     mod issue_256_acceptance_websocket;
+
+    #[path = "issue_257_acceptance_grpc.rs"]
+    mod issue_257_acceptance_grpc;
 }

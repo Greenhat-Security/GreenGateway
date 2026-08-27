@@ -2008,6 +2008,10 @@ fn egress_error_reason(error: &EgressError) -> &'static str {
         EgressError::InvalidTlsClientIdentity => "invalid_tls_client_identity",
         EgressError::Http(err) if err.is_timeout() => "timeout",
         EgressError::Http(_) => "http_error",
+        // Unreachable for tool invocation, which uses the pinned HTTP/1.1
+        // transport. The category is already bounded, so forward it rather than
+        // flattening several distinct transport failures into one label.
+        EgressError::Grpc(failure) => failure.category(),
     }
 }
 

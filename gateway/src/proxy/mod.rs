@@ -24,6 +24,7 @@ use crate::{
 mod admission;
 mod circuit;
 mod forward;
+pub(crate) mod grpc;
 mod health;
 mod retry;
 mod websocket;
@@ -157,6 +158,7 @@ struct ProxyRoute {
     request_body_mode: RequestBodyMode,
     sse: Option<SseResponseConfig>,
     websocket: Option<Arc<websocket::RouteWebSocketRuntime>>,
+    grpc: Option<Arc<grpc::RouteGrpcRuntime>>,
 }
 
 impl upstream_route::RouteMatch for ProxyRoute {
@@ -183,6 +185,7 @@ struct MatchedUpstream {
     request_body_mode: RequestBodyMode,
     sse: Option<SseResponseConfig>,
     websocket: Option<Arc<websocket::RouteWebSocketRuntime>>,
+    grpc: Option<Arc<grpc::RouteGrpcRuntime>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -518,6 +521,15 @@ impl ProxyState {
                             .map(|endpoint| Arc::clone(&endpoint.id)),
                     ))
                 });
+                let grpc_runtime = route.grpc.as_ref().map(|grpc| {
+                    Arc::new(grpc::RouteGrpcRuntime::new(
+                        &route_id,
+                        grpc,
+                        pool.endpoints
+                            .iter()
+                            .map(|endpoint| Arc::clone(&endpoint.id)),
+                    ))
+                });
 
                 Ok(ProxyRoute {
                     route_id,
@@ -530,6 +542,7 @@ impl ProxyState {
                     request_body_mode: route.request_body.mode.into(),
                     sse: route.sse.as_ref().map(Into::into),
                     websocket: websocket_runtime,
+                    grpc: grpc_runtime,
                 })
             })
             .collect::<Result<_, egress::EgressError>>()?;
@@ -615,6 +628,7 @@ impl ProxyState {
                 request_body_mode: RequestBodyMode::Buffered,
                 sse: None,
                 websocket: None,
+                grpc: None,
             }),
             ProxyRoutes::RoutingTable { routes } => {
                 routing_route_for_request(routes, path, headers).map(|route| MatchedUpstream {
@@ -624,6 +638,7 @@ impl ProxyState {
                     request_body_mode: route.request_body_mode,
                     sse: route.sse,
                     websocket: route.websocket.clone(),
+                    grpc: route.grpc.clone(),
                 })
             }
         };
@@ -1217,6 +1232,7 @@ mod tests {
             request_body: config::UpstreamRequestBodyConfig::default(),
             sse: None,
             websocket: None,
+            grpc: None,
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,
@@ -1382,6 +1398,7 @@ mod tests {
             request_body_mode: RequestBodyMode::Buffered,
             sse: None,
             websocket: None,
+            grpc: None,
         };
         let upstream_health = routing_table_health_targets(std::slice::from_ref(&connection_route));
         assert_eq!(
@@ -1471,6 +1488,7 @@ mod tests {
             request_body: config::UpstreamRequestBodyConfig::default(),
             sse: None,
             websocket: None,
+            grpc: None,
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,
@@ -1533,6 +1551,7 @@ mod tests {
             request_body: config::UpstreamRequestBodyConfig::default(),
             sse: None,
             websocket: None,
+            grpc: None,
             limits: config::UpstreamPoolLimitsConfig::default(),
             health_check: None,
             retry: None,
