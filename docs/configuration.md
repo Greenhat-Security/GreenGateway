@@ -151,6 +151,104 @@ The budget is per listener, not per process. The data and admin listeners run se
 
 The default is set well above any plausible legitimate burst, so reaching it is a signal rather than a routine event. `inbound_tls_handshakes_in_flight` reports the slots in use and `inbound_tls_handshakes_total{listener,outcome}` counts every outcome, including `outcome="shed"`; a non-zero shed rate means real clients are being refused and is worth alerting on.
 
+### CLIENT_CERT_MODE
+
+Whether the data listener asks callers for a client certificate, and what it does with a caller who has none.
+
+Default: `off`
+
+Format and validation: must be exactly `off`, `optional`, or `required`.
+
+- `off` requests nothing. A listener with this setting behaves exactly as one without it.
+- `optional` requests a certificate and serves callers who decline. A caller who declines has **no certificate identity at all** and must authenticate by some other method or be refused; there is no partially-trusted state.
+- `required` refuses the handshake when no certificate is offered.
+
+A certificate that *is* offered is verified identically under `optional` and `required`. `optional` softens only the anonymous case; it never means a certificate is trusted less. So presenting nothing is never worth more than presenting something invalid: an invalid certificate fails the handshake, and no certificate produces no identity.
+
+`optional` exists for migrations — a listener already serving bearer-token callers can begin accepting certificate identities before every caller has been issued one.
+
+Setting this to anything but `off` requires `TLS_CERT_FILE` (a listener that terminates no TLS never sees a certificate), `CLIENT_CERT_CA_FILE`, and `CLIENT_CERT_IDENTITY_SOURCE`. Any of them missing fails startup rather than leaving a listener that an operator believes requires certificates accepting anonymous connections.
+
+**A listener that asks for client certificates does not resume TLS sessions.** Every connection to it completes a full handshake. This is a deliberate cost, and it is charged only where certificates are requested: with `CLIENT_CERT_MODE=off` resumption behaves exactly as it always has. The reason is that a resumed handshake — TLS 1.2's abbreviated form or TLS 1.3's PSK — carries no `Certificate` and no `CertificateVerify` message. rustls restores the *previous* connection's certificate chain and re-checks nothing about it: not the validity window, not the CRL, not the trust path. With resumption enabled, an expired or revoked client certificate would go on authenticating for up to 24 hours after it stopped being valid, and everything `CLIENT_CERT_CRL_FILE` says below would stop applying to the callers it exists to stop. The deeper problem is that a resumed connection proves the caller holds the *resumption secret*, not the certificate's private key, which is the proposition mutual TLS is bought for. Re-validating the restored chain would not recover it, because there is nothing on a resumed connection for the caller to have signed. 0-RTT early data is likewise never enabled on any inbound listener.
+
+**A credential the caller sends outranks the certificate their connection was established with.** On an `optional` or `required` listener, a request carrying an `Authorization: Bearer` header or a session cookie is judged on that credential; the connection's certificate is what authenticates a caller who sends nothing else. So a caller presenting a valid certificate *and* an expired, revoked, or unknown token is answered `401` — the token is not silently ignored in favour of the certificate. A caller presenting a valid certificate and a valid token authenticates as the token's subject, not the certificate's. The order is deliberate: a caller who sends a token is asking to be judged as that token's subject, and preferring the certificate would mean a bad token quietly succeeded as somebody else.
+
+### CLIENT_CERT_CA_FILE
+
+PEM bundle of the certificate authorities permitted to issue client certificates for the data listener.
+
+Default: empty. Required when `CLIENT_CERT_MODE` is not `off`, and rejected when it is.
+
+Format and validation: read through the same bounded, capability-confined reader as `TLS_CERT_FILE`, with the same 1 MiB bound and the same directory rules. Every certificate in the file must be usable as a trust anchor; one that is not fails startup rather than being skipped, because silently trusting the remainder would mean the set of callers who can authenticate is not the set the operator wrote down. A file that also contains a `PRIVATE KEY` section is refused.
+
+Permissions: the bundle is public material, so group and other *read* is permitted. Group or other *write* fails startup — a trust bundle an attacker can rewrite is a trust bundle an attacker chooses.
+
+**The platform trust store is never consulted for client authentication, and there is no setting that opts into it.** Trusting the operating system's roots here would mean every certificate every public CA has ever issued authenticates to this gateway, which is essentially never what configuring mutual TLS means. This is the one place where the gateway's outbound behaviour and its inbound behaviour deliberately differ: an outbound connection is verifying a *server* that a public CA plausibly vouches for, and an inbound client certificate is a credential the operator issues.
+
+### CLIENT_CERT_CRL_FILE
+
+Optional PEM certificate revocation list, or concatenation of lists, for data-listener client certificates.
+
+Default: empty.
+
+**Revocation is not checked unless this is set.** rustls consults neither CRLs nor OCSP by default, and this gateway adds no other revocation source: with this setting empty, a revoked certificate authenticates until it expires. That is stated here rather than left implied, because an operator who believes revocation works when it does not is in a worse position than one who knows it does not.
+
+When it is set, revocation is enforced strictly:
+
+- **The whole verified chain** is checked, not just the end-entity certificate. A deployment with intermediate CAs needs CRLs covering them too. The trust anchor itself is excluded.
+- **An undeterminable status is a failure.** A certificate whose revocation status no configured CRL covers is refused.
+- **An expired CRL is treated as no CRL, not as a still-valid one.** A CRL whose `nextUpdate` has passed refuses every certificate in its scope.
+
+The last point is the sharp one and it is deliberate. The alternative — honouring a stale CRL — means a deployment whose CRL publishing quietly broke keeps accepting certificates revoked since the last list it managed to fetch, with nothing to show for it. Refresh the CRL on a schedule shorter than its validity window. `inbound_client_certificates_total{outcome="rejected_expired_revocation_list"}` is the counter to alert on; `outcome="rejected_revoked"` is the evidence that revocation is being consulted at all.
+
+Certificate reload without a restart is not implemented yet, for this file or for the CA bundle: both are read once at startup, so refreshing a CRL means restarting the process. That limitation is tracked with the rest of the reload work under issue #324.
+
+### CLIENT_CERT_IDENTITY_SOURCE
+
+Which field of a verified client certificate carries the caller's identity. Applies to both listeners.
+
+Default: empty. Required when either listener requests client certificates, and rejected when neither does.
+
+Format and validation: must be exactly `spiffe`, `uri`, or `dns`.
+
+| value | reads | notes |
+| --- | --- | --- |
+| `spiffe` | the URI SAN whose scheme is `spiffe` | Recommended. Exactly one per SVID by specification, canonical by specification, and stable across the certificate rotation SPIFFE expects. |
+| `uri` | the URI SAN, verbatim | For a private PKI that names workloads with URIs that are not SPIFFE IDs. |
+| `dns` | the DNS SAN, lower-cased | Weakest. DNS SANs were designed to name the server being connected *to*, so certificates commonly carry several — and a certificate with several different ones has no identity. Wildcards are never an identity. |
+
+**The rule is exactly one.** A certificate carrying no value of the configured kind has no identity. A certificate carrying two *different* values has no identity either. The gateway never takes the first of several: whoever assembles a certificate chooses the order of its SANs, so if order decided the principal, a caller who can persuade a CA to add one more SAN would choose which principal they authenticate as. Two SANs spelling the same canonical value are one identity, not two.
+
+A certificate that verifies but yields no identity does not authenticate. The connection is established — the certificate was valid — and the request is answered `401` with no principal, which is the same position a caller with no certificate is in.
+
+The identity must already be in canonical form; the gateway rejects rather than repairs. A SPIFFE ID must have a lower-case `spiffe` scheme and trust domain, no userinfo, port, query, or fragment, and no empty or dot path segments. Normalising any of these would be deciding that two different strings are the same principal. It must also be non-empty printable ASCII with no spaces and at most 255 bytes, because it becomes a `principal_id` in policy, a `user_id` in audit, and text in a log line.
+
+**Why the subject DN is not an option.** A DN is not a string but a sequence of relative distinguished names, each holding possibly several attributes in possibly several string encodings. Rendering one as text means choosing an escaping and an ordering that libraries disagree about, and the escaping is where the bugs are: a CA that lets a requester choose their own `CN` lets them choose one containing `,OU=`, and produce a rendered DN that collides with somebody else's identity. There is no canonical DN renderer in this dependency graph, and writing one to decide who an authenticated caller is would be the wrong place to hand-roll ASN.1. Email SANs are excluded for a duller reason: `rfc822Name` identifies a mailbox rather than a workload, and mailboxes get reassigned.
+
+### ADMIN_CLIENT_CERT_MODE
+
+Whether the admin listener asks callers for a client certificate.
+
+Default: `off`
+
+Format and validation: as `CLIENT_CERT_MODE`, and requires `ADMIN_TLS_CERT_FILE` rather than `TLS_CERT_FILE`. Configured independently of the data listener: the two are frequently reached over different networks, and requiring certificates on one says nothing about the other. `CLIENT_CERT_IDENTITY_SOURCE` is shared, because it describes how an organisation issues certificates rather than which listener receives them.
+
+### ADMIN_CLIENT_CERT_CA_FILE
+
+PEM bundle of the certificate authorities permitted to issue client certificates for the admin listener.
+
+Default: empty. Required when `ADMIN_CLIENT_CERT_MODE` is not `off`, and rejected when it is.
+
+Format and validation: as `CLIENT_CERT_CA_FILE`, including the permission rules and the refusal to fall back to the platform trust store.
+
+### ADMIN_CLIENT_CERT_CRL_FILE
+
+Optional PEM certificate revocation list for admin-listener client certificates.
+
+Default: empty, which means **no revocation checking on that listener**.
+
+Format and validation: as `CLIENT_CERT_CRL_FILE`, including the strict enforcement and the expired-CRL behaviour.
+
 ### ADMIN_PREFIX
 
 Path prefix for the gateway's admin UI and control-plane API surface.
@@ -307,7 +405,7 @@ Default: empty, which disables principal directory persistence.
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. When set, the gateway opens or creates the database at startup, creates the `principal_directory` table if needed, and records every successfully authenticated request through a bounded asynchronous flusher rather than writing SQLite rows inline on the request path. The channel feeding that flusher is bounded (not unbounded like the audit sink's buffer): under a traffic burst large enough to fill it, or if a flush attempt itself fails, the affected observations are dropped rather than queued indefinitely, so `request_count`/`last_seen` can undercount during sustained overload. This is a deliberate trade-off — a bounded, occasionally-lossy queue is preferable to unbounded memory growth on a sink that runs on every authenticated request — and is metered (dropped-observation and flush-failure counters) rather than silent in the metrics sense, even though no individual request sees an error.
 
-Rows are keyed by `(subject, issuer, auth_method)`, where `subject` is `Principal.user_id`, `auth_method` is `bearer`, `service_token`, or `cookie`, and `issuer` uses the empty string as the documented sentinel for principals with no issuer. SQLite composite primary keys handle `NULL` surprisingly, so GreenGateway stores this sentinel instead of `NULL` for the identity key.
+Rows are keyed by `(subject, issuer, auth_method)`, where `subject` is `Principal.user_id`, `auth_method` is `bearer`, `service_token`, `cookie`, or `client_certificate`, and `issuer` uses the empty string as the documented sentinel for principals with no issuer. SQLite composite primary keys handle `NULL` surprisingly, so GreenGateway stores this sentinel instead of `NULL` for the identity key.
 
 Each upsert preserves the earliest `first_seen`, refreshes `last_seen`, increments `request_count`, and overwrites `email` and `org_id` with the latest observed values. Roles are intentionally not persisted here; RBAC evaluates fresh roles on every request.
 
@@ -856,7 +954,7 @@ Direct firewall rules in `rules` are also evaluated in document order with first
 
 HTTP direct rules also evaluate each local or OpenAPI-generated tool's fully rendered upstream method and path after argument validation and immediately before egress. A matching `deny` blocks the upstream request, `shadow` emits `authz.would_deny` and continues, and `allow` continues only after the tool's own `enabled`, `allowed_roles`, and exact `tool_name` rule checks have succeeded. Audit events include the tool name, rendered method and path, and matched rule id. Remote MCP proxy tools do not render a local HTTP operation, so HTTP path rules do not apply to them; use `tool_name` rules and `tools.<name>` policy for those tools.
 
-Identity constraints are issuer-aware. A direct rule's `principal` matcher may contain `roles`, `issuers`, `auth_methods`, and `principal_ids`. Non-empty dimensions are combined with AND semantics, while multiple values inside one dimension use OR semantics. For example, `{"roles":["operator"],"issuers":["https://idp.example/"],"auth_methods":["bearer_token"],"principal_ids":["user-123"]}` matches only a bearer-authenticated `user-123` carrying the `operator` role from that issuer. Valid auth methods are `bearer_token`, `session_cookie`, and `service_token`. Empty or omitted dimensions are unconstrained.
+Identity constraints are issuer-aware. A direct rule's `principal` matcher may contain `roles`, `issuers`, `auth_methods`, and `principal_ids`. Non-empty dimensions are combined with AND semantics, while multiple values inside one dimension use OR semantics. For example, `{"roles":["operator"],"issuers":["https://idp.example/"],"auth_methods":["bearer_token"],"principal_ids":["user-123"]}` matches only a bearer-authenticated `user-123` carrying the `operator` role from that issuer. Valid auth methods are `bearer_token`, `session_cookie`, `service_token`, and `client_certificate`. Empty or omitted dimensions are unconstrained.
 
 HTTP path rules may also carry an optional `dispatch` provenance matcher. Omitting `dispatch` preserves the historical globally scoped behavior, but explicitly setting `dispatch`, `upstream_origin`, or `route_id` to JSON `null` is invalid so a purported binding cannot silently become unbound. `"dispatch":{"kind":"contextless"}` matches only requests whose routing classification completed without selecting a proxy upstream. `"dispatch":{"kind":"legacy","upstream_origin":"https://api.example.test"}` matches only the legacy fallback at that normalized HTTP(S) origin and explicitly excludes host/path routes, including routes that select the same origin. `"dispatch":{"kind":"route","route_id":"payments"}` matches only the stable logical proxy route named `payments`; endpoint weights, ordering, health, and physical origins cannot change that authorization identity. Route IDs use the same validated 1–64 character syntax as `UPSTREAM_ROUTES[].id`. Origins containing a path, query, fragment, credentials, an uppercase or non-HTTP(S) scheme, or an invalid authority are rejected; host spelling and default ports are normalized for runtime comparison. Rendered tool HTTP egress has no trusted inbound dispatch classification, so it skips dispatch-bound rules and evaluates only unbound HTTP rules; use an unbound rule when a path policy must apply to both inbound requests and tool operations. `dispatch` is invalid on MCP `tool_name` rules. Suggestion acceptance always recomputes this field from current trusted routing state and persists it on HTTP rules; the field is intentionally omitted from the rule PATCH surface so routine edits cannot remove the provenance boundary. Requests and historical preview events without trusted `routing_context_known:true` classification fail closed for dispatch-bound rules. The admin editor preserves the binding and includes it in rule summaries and previews.
 

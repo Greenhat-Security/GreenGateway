@@ -2175,15 +2175,31 @@ fn auth_validator_from_config(
     service_token_validator: Option<Arc<auth::ServiceTokenValidator>>,
     discovered_oidc_jwks_urls: &HashMap<String, String>,
 ) -> Result<Option<Arc<dyn auth::SessionValidator>>, auth::AuthError> {
-    if config.auth_providers.is_empty() && service_token_validator.is_none() {
+    let client_certificate_auth = config.client_certificate_auth_enabled();
+    if config.auth_providers.is_empty()
+        && service_token_validator.is_none()
+        && !client_certificate_auth
+    {
         return Ok(None);
     }
 
     let mut validators = Vec::with_capacity(
-        config.auth_providers.len() + usize::from(service_token_validator.is_some()),
+        config.auth_providers.len()
+            + usize::from(service_token_validator.is_some())
+            + usize::from(client_certificate_auth),
     );
     if let Some(service_token_validator) = service_token_validator {
         validators.push(service_token_validator as Arc<dyn auth::SessionValidator>);
+    }
+    if client_certificate_auth {
+        // Position in the chain is not a precedence decision. Every validator
+        // is offered every credential and each rejects the kinds it does not
+        // own, so the certificate validator sits first only because it is the
+        // cheapest rejection: it does no work at all on a credential that is
+        // not a certificate, and it never returns `AuthError::Upstream`, so it
+        // cannot turn another provider's 401 into a 503.
+        validators
+            .push(Arc::new(auth::ClientCertificateValidator) as Arc<dyn auth::SessionValidator>);
     }
     for provider in &config.auth_providers {
         match provider.provider_type {
@@ -11439,6 +11455,7 @@ fn test_auth_method_label(auth_method: &auth::AuthMethod) -> &'static str {
         auth::AuthMethod::Cookie => "session_cookie",
         auth::AuthMethod::Bearer => "bearer_token",
         auth::AuthMethod::ServiceToken => "service_token",
+        auth::AuthMethod::ClientCertificate => "client_certificate",
     }
 }
 
@@ -11510,6 +11527,8 @@ mod tests {
             tls_min_version: config::DEFAULT_TLS_MIN_VERSION,
             tls_handshake_timeout_ms: config::DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
             tls_max_concurrent_handshakes: config::DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES,
+            client_cert_auth: None,
+            admin_client_cert_auth: None,
             admin_prefix: config::DEFAULT_ADMIN_PREFIX.to_owned(),
             admin_login_provider: None,
             admin_login_pending_ttl_secs: config::DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,
@@ -31349,6 +31368,50 @@ paths:
         server
             .join()
             .expect("OIDC discovery test server should finish");
+    }
+
+    /// A deployment whose only credential is a client certificate still gets an
+    /// auth chain.
+    ///
+    /// `auth_validator_from_config` returns `None` when nothing is configured,
+    /// and `None` means the middleware fails closed on every request. Client
+    /// certificates had to be added to that emptiness test or a listener
+    /// configured with `CLIENT_CERT_MODE=required` and no token provider at all
+    /// would answer 401 to the very callers it was set up for -- a
+    /// misconfiguration that looks exactly like a broken certificate.
+    #[tokio::test]
+    async fn a_client_certificate_only_deployment_still_builds_an_auth_chain() {
+        let mut config = test_config(Vec::new());
+        assert!(
+            config.auth_providers.is_empty(),
+            "the premise is that nothing else is configured"
+        );
+        config.client_cert_auth = Some(config::InboundClientAuthConfig {
+            mode_setting: "CLIENT_CERT_MODE",
+            requirement: crate::inbound_tls::ClientCertRequirement::Required,
+            ca_setting: "CLIENT_CERT_CA_FILE",
+            ca_file: "client-ca.crt".to_owned(),
+            crl_setting: "CLIENT_CERT_CRL_FILE",
+            crl_file: None,
+            identity_source: auth::ClientCertIdentitySource::Spiffe,
+        });
+        config.egress_deny_private_ips = false;
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::from_config(&config))
+                .expect("egress client should build"),
+        );
+
+        let validator = auth_validator_from_config(&config, egress_client, None, &HashMap::new())
+            .expect("a certificate-only configuration should build")
+            .expect(
+                "a certificate-only configuration must produce a validator, not None; None \
+                     makes the auth middleware fail closed on every request",
+            );
+
+        assert!(
+            validator.supports_client_certificate(),
+            "the chain built for a certificate-only deployment must accept certificate credentials"
+        );
     }
 
     #[tokio::test]

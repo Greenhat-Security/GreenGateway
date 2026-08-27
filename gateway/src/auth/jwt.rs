@@ -475,9 +475,9 @@ impl SessionValidator for JwtValidator {
         resource: Option<&str>,
     ) -> Result<Principal, AuthError> {
         match credential {
-            SessionCredential::Cookie(_) => Err(AuthError::InvalidSession(
-                "jwt validator only supports bearer tokens".to_owned(),
-            )),
+            SessionCredential::Cookie(_) | SessionCredential::ClientCertificate(_) => Err(
+                AuthError::InvalidSession("jwt validator only supports bearer tokens".to_owned()),
+            ),
             SessionCredential::Bearer(token) => {
                 let claims = self.decode(token).await?;
                 self.validate_resource_audience(&claims, resource)?;
@@ -1856,6 +1856,8 @@ RowSUZV5FSmOGJ7JyROZ80k=
             tls_min_version: crate::config::DEFAULT_TLS_MIN_VERSION,
             tls_handshake_timeout_ms: crate::config::DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
             tls_max_concurrent_handshakes: crate::config::DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES,
+            client_cert_auth: None,
+            admin_client_cert_auth: None,
             admin_prefix: "/admin".to_owned(),
             admin_login_provider: None,
             admin_login_pending_ttl_secs: crate::config::DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,

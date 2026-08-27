@@ -96,7 +96,8 @@
             "enum": [
               "bearer_token",
               "session_cookie",
-              "service_token"
+              "service_token",
+              "client_certificate"
             ]
           }
         }
@@ -168,7 +169,8 @@
             "enum": [
               "bearer_token",
               "session_cookie",
-              "service_token"
+              "service_token",
+              "client_certificate"
             ]
           }
         },
@@ -467,7 +469,8 @@
             "enum": [
               "bearer_token",
               "session_cookie",
-              "service_token"
+              "service_token",
+              "client_certificate"
             ]
           }
         },

@@ -647,6 +647,7 @@ fn auth_method_label(auth_method: &AuthMethod) -> &'static str {
         AuthMethod::Cookie => "cookie",
         AuthMethod::Bearer => "bearer",
         AuthMethod::ServiceToken => "service_token",
+        AuthMethod::ClientCertificate => "client_certificate",
     }
 }
 

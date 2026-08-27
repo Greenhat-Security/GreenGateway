@@ -31,21 +31,26 @@ use std::{
     fmt, fs, io,
     net::SocketAddr,
     path::{Path, PathBuf},
+    pin::Pin,
     str::FromStr,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
 
+use axum::{extract::connect_info::Connected, serve::IncomingStream};
 use cap_std::{ambient_authority, fs::Dir};
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::{mpsc, Semaphore, TryAcquireError},
 };
 use tokio_rustls::{
     rustls::{
-        crypto::ring,
-        pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
-        version, ServerConfig, SupportedProtocolVersion,
+        crypto::{ring, CryptoProvider},
+        pki_types::{pem::PemObject, CertificateDer, CertificateRevocationListDer, PrivateKeyDer},
+        server::{NoServerSessionStorage, VerifierBuilderError, WebPkiClientVerifier},
+        version, CertificateError, RootCertStore, ServerConfig, SupportedProtocolVersion,
     },
     server::TlsStream,
     TlsAcceptor,
@@ -54,12 +59,19 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use zeroize::Zeroize;
 
 use crate::{
-    config::{Config, InboundTlsSettings},
+    auth::{
+        client_certificate::identity_from_certificate, ClientCertIdentitySource,
+        VerifiedClientIdentity,
+    },
+    config::{Config, InboundClientAuthSettings, InboundTlsSettings},
     connections::secret::{
         projected_root_permissions_are_safe, read_bounded_file_secret, FileSecretPermissions,
         SecretPurpose, SecretResolveErrorKind,
     },
-    metrics::{INBOUND_TLS_HANDSHAKES_IN_FLIGHT, INBOUND_TLS_HANDSHAKES_TOTAL},
+    metrics::{
+        INBOUND_CLIENT_CERTIFICATES_TOTAL, INBOUND_TLS_HANDSHAKES_IN_FLIGHT,
+        INBOUND_TLS_HANDSHAKES_TOTAL,
+    },
 };
 
 /// How deep the completed-handshake channel runs.
@@ -149,6 +161,83 @@ impl fmt::Display for TlsMinVersion {
     }
 }
 
+/// Whether a listener asks callers for a client certificate, and what it does
+/// with a caller that has none.
+///
+/// Three states rather than a boolean, because "request a certificate" and
+/// "insist on one" are different deployments and the difference is not a
+/// degree. `Optional` exists for a migration: a listener that already serves
+/// bearer-token callers can start accepting certificate identities without
+/// locking out everything that has not been issued one yet.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ClientCertMode {
+    /// Never ask. This is what every listener does unless told otherwise, and
+    /// it is byte-for-byte the behaviour that shipped in #327.
+    #[default]
+    Off,
+    /// Ask, and serve callers who decline.
+    ///
+    /// What `optional` does NOT mean is "trust a certificate less". A caller
+    /// who presents one is held to exactly the same verification as under
+    /// `required` -- rustls verifies every certificate that is presented -- so
+    /// a certificate that fails verification fails the handshake in both modes.
+    /// The only difference is the caller who presents none, and that caller has
+    /// no certificate identity at all rather than a partial one.
+    Optional,
+    /// Ask, and refuse the handshake when the caller declines.
+    Required,
+}
+
+/// A mode with `Off` removed, for the listener that has already decided to ask.
+///
+/// Separate from [`ClientCertMode`] so that the verifier builder cannot be
+/// handed a mode it has no meaning for: a listener holding this type is asking
+/// for certificates, and the only open question is what to do about a caller
+/// that brings none.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientCertRequirement {
+    Optional,
+    Required,
+}
+
+impl ClientCertMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Optional => "optional",
+            Self::Required => "required",
+        }
+    }
+
+    /// The requirement this mode expresses, or `None` when it expresses none.
+    pub fn requirement(self) -> Option<ClientCertRequirement> {
+        match self {
+            Self::Off => None,
+            Self::Optional => Some(ClientCertRequirement::Optional),
+            Self::Required => Some(ClientCertRequirement::Required),
+        }
+    }
+}
+
+impl FromStr for ClientCertMode {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "off" => Ok(Self::Off),
+            "optional" => Ok(Self::Optional),
+            "required" => Ok(Self::Required),
+            _ => Err("expected `off`, `optional`, or `required`"),
+        }
+    }
+}
+
+impl fmt::Display for ClientCertMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// The bound and the deadline that keep a slow handshake off the accept path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HandshakeLimits {
@@ -208,6 +297,12 @@ pub(crate) enum InboundTlsError {
     ProtocolVersionsUnsupported {
         setting: &'static str,
     },
+    ClientTrustAnchorsUnusable {
+        setting: &'static str,
+    },
+    RevocationListUnusable {
+        setting: &'static str,
+    },
 }
 
 impl fmt::Display for InboundTlsError {
@@ -259,6 +354,14 @@ impl fmt::Display for InboundTlsError {
                 formatter,
                 "{setting} selects a protocol version this build of rustls does not support"
             ),
+            Self::ClientTrustAnchorsUnusable { setting } => write!(
+                formatter,
+                "the file named by {setting} contains no certificate usable as a client-authentication trust anchor"
+            ),
+            Self::RevocationListUnusable { setting } => write!(
+                formatter,
+                "the file named by {setting} is not a PEM certificate revocation list this build can parse"
+            ),
         }
     }
 }
@@ -271,10 +374,24 @@ impl std::error::Error for InboundTlsError {}
 /// state: a listener whose material failed to load never reaches this type,
 /// because [`InboundTlsBindings::load`] returns the error and startup aborts.
 pub(crate) struct InboundTlsBindings {
-    data: Option<Arc<ServerConfig>>,
-    admin: Option<Arc<ServerConfig>>,
+    data: Option<ListenerTls>,
+    admin: Option<ListenerTls>,
     min_version: Option<TlsMinVersion>,
     limits: HandshakeLimits,
+}
+
+/// One listener's resolved TLS: what rustls will serve, and how to read an
+/// identity out of whatever client certificate it verifies.
+///
+/// The two travel together because they are two halves of one decision. A
+/// listener whose `ServerConfig` requests client certificates always has an
+/// identity source, and a listener whose config does not request them never
+/// has one, so there is no state in which a certificate is verified and then
+/// read with a source nobody configured -- or requested and then ignored.
+#[derive(Clone)]
+pub(crate) struct ListenerTls {
+    server_config: Arc<ServerConfig>,
+    identity_source: Option<ClientCertIdentitySource>,
 }
 
 impl InboundTlsBindings {
@@ -300,6 +417,14 @@ impl InboundTlsBindings {
             admin,
             limits: HandshakeLimits::from_config(config),
         })
+    }
+
+    /// The identity source the data listener reads certificates with, if any.
+    #[cfg(test)]
+    pub(crate) fn data_identity_source(&self) -> Option<ClientCertIdentitySource> {
+        self.data
+            .as_ref()
+            .and_then(|listener| listener.identity_source)
     }
 
     #[cfg(test)]
@@ -346,14 +471,14 @@ pub(crate) enum BoundListener {
 impl BoundListener {
     fn bind(
         listener: TcpListener,
-        server_config: Option<Arc<ServerConfig>>,
+        tls: Option<ListenerTls>,
         limits: HandshakeLimits,
         listener_label: &'static str,
     ) -> io::Result<Self> {
-        match server_config {
-            Some(server_config) => Ok(Self::Tls(TlsListener::wrap(
+        match tls {
+            Some(tls) => Ok(Self::Tls(TlsListener::wrap(
                 listener,
-                server_config,
+                tls,
                 limits,
                 listener_label,
             )?)),
@@ -420,9 +545,7 @@ impl fmt::Debug for ZeroizingKey {
     }
 }
 
-fn load_server_config(
-    settings: InboundTlsSettings<'_>,
-) -> Result<Arc<ServerConfig>, InboundTlsError> {
+fn load_server_config(settings: InboundTlsSettings<'_>) -> Result<ListenerTls, InboundTlsError> {
     let certificate_pem = read_material(
         settings.certificate_setting,
         settings.certificate_file,
@@ -468,22 +591,33 @@ fn load_server_config(
     // both `ring` and `aws-lc-rs` are in this dependency graph, so there is no
     // unambiguous process default to inherit, and a listener's cipher suites
     // should not depend on which module happened to install one first.
-    let mut server_config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+    let provider = Arc::new(ring::default_provider());
+    let client_verifier = settings
+        .client_auth
+        .map(|client_auth| load_client_verifier(client_auth, Arc::clone(&provider)))
+        .transpose()?;
+    let identity_source = settings
+        .client_auth
+        .map(|client_auth| client_auth.identity_source);
+    let versions = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(settings.min_version.protocol_versions())
         .map_err(|_| InboundTlsError::ProtocolVersionsUnsupported {
             setting: settings.min_version_setting,
-        })?
-        .with_no_client_auth()
-        .with_single_cert(
-            certificates,
-            private_key
-                .take()
-                .expect("the parsed private key is taken exactly once"),
-        )
-        .map_err(|_| InboundTlsError::KeyDoesNotMatchCertificate {
-            certificate_setting: settings.certificate_setting,
-            private_key_setting: settings.private_key_setting,
         })?;
+    let mut server_config = match client_verifier {
+        Some(client_verifier) => versions.with_client_cert_verifier(client_verifier),
+        None => versions.with_no_client_auth(),
+    }
+    .with_single_cert(
+        certificates,
+        private_key
+            .take()
+            .expect("the parsed private key is taken exactly once"),
+    )
+    .map_err(|_| InboundTlsError::KeyDoesNotMatchCertificate {
+        certificate_setting: settings.certificate_setting,
+        private_key_setting: settings.private_key_setting,
+    })?;
 
     // Advertise HTTP/1.1 and nothing else. Offering `h2` here would be a
     // protocol change smuggled in through ALPN: `axum::serve` builds on
@@ -494,7 +628,178 @@ fn load_server_config(
     // than being handed a connection nothing will parse.
     server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
-    Ok(Arc::new(server_config))
+    // Only where certificates are actually being asked for. A listener with
+    // `CLIENT_CERT_MODE=off` keeps rustls' resumption exactly as #327 shipped
+    // it, so no deployment that has never heard of client certificates changes
+    // behaviour here.
+    if settings.client_auth.is_some() {
+        disable_session_resumption(&mut server_config);
+    }
+
+    Ok(ListenerTls {
+        server_config: Arc::new(server_config),
+        identity_source,
+    })
+}
+
+/// Removes every way a listener can resume an earlier TLS session.
+///
+/// rustls verifies a client certificate exactly once, during a full handshake.
+/// On a *resumed* handshake it restores the earlier connection's chain instead:
+/// `peer_certificates` is cloned out of the stored session in
+/// `rustls::server::tls13` and assigned from the resumed session data in
+/// `rustls::server::tls12`. The only thing consulted before that happens is
+/// `can_resume`, which compares the cipher suite, the extended-master-secret
+/// state, and the SNI. Nothing about the certificate is re-examined: not its
+/// validity window, not the CRL, not the trust path. So
+/// [`client_identity`] would go on minting an identity from a certificate no
+/// check had touched on this connection.
+///
+/// Under rustls' defaults that window is a day. `NeverProducesTickets` means
+/// TLS 1.3 tickets are *stateful* -- kept in a `ServerSessionMemoryCache` under
+/// a hard-coded 24-hour lifetime -- and `send_tls13_tickets` defaults to 2, and
+/// `TLS_MIN_VERSION` defaults to 1.2 so the abbreviated TLS 1.2 handshake is
+/// live as well. An expired or revoked client certificate would keep
+/// authenticating for up to 24 hours after it stopped being valid, and the
+/// fail-closed CRL handling [`load_client_verifier`] is careful about would
+/// stop applying to precisely the callers it exists to stop.
+///
+/// The alternative was to keep resumption and re-check the restored chain
+/// before minting an identity. It is not taken, for two reasons.
+///
+/// **A resumed handshake proves the wrong thing.** Neither TLS 1.2's
+/// abbreviated handshake nor TLS 1.3's PSK resumption carries a
+/// CertificateVerify. The peer proves it holds the resumption secret; it does
+/// not prove it holds the certificate's private key. Re-running the verifier
+/// over the restored chain would establish that the certificate is still valid.
+/// It could not establish that the caller still holds the key -- which is the
+/// entire proposition a client-certificate listener sells -- because there is
+/// nothing on a resumed connection for the caller to have signed. No amount of
+/// re-validation recovers that property; only a full handshake does.
+///
+/// **It would be a second copy of a trust decision.** `WebPkiClientVerifier`
+/// owns path building, validity windows, extended key usage, name constraints,
+/// and revocation including CRL expiry. Re-implementing enough of that
+/// elsewhere to match it exactly is the shape #332 has just finished removing
+/// from the outbound path, on the grounds that two copies of one decision
+/// drift.
+///
+/// The cost is a full handshake per connection, and it is charged only to
+/// listeners that asked for certificates.
+fn disable_session_resumption(server_config: &mut ServerConfig) {
+    // Both halves are load-bearing and neither is redundant. Emptying the store
+    // kills TLS 1.2 session ids *and* the stateful TLS 1.3 tickets that the
+    // default `NeverProducesTickets` implies, because both resolve the session
+    // through it. Sending no tickets stops a client being handed anything to
+    // offer back in the first place, so a later change of ticketer -- which
+    // would make tickets self-contained and stop consulting the store --
+    // cannot quietly reintroduce the path.
+    server_config.session_storage = Arc::new(NoServerSessionStorage {});
+    server_config.send_tls13_tickets = 0;
+}
+
+/// Builds the verifier that decides which client certificates are acceptable.
+///
+/// Three properties are load-bearing, and all three are decided here rather
+/// than inherited:
+///
+/// **The trust anchors are the operator's, and only the operator's.** There is
+/// no path here to `rustls-platform-verifier` or to any other ambient trust
+/// store. Trusting the platform roots for *client* authentication would mean
+/// every certificate every public CA has ever issued authenticates to this
+/// gateway, which is essentially never what an operator configuring mutual TLS
+/// means. A bundle that yields no usable trust anchor fails startup.
+///
+/// **Revocation is checked when, and only when, CRLs are configured.** rustls
+/// checks neither CRLs nor OCSP by default, so a deployment with no
+/// `*_CLIENT_CERT_CRL_FILE` has no revocation checking at all -- documented in
+/// `docs/configuration.md` under exactly that heading, because an operator who
+/// believes revocation works when it does not has a worse problem than one who
+/// knows it does not. When CRLs *are* configured, they are enforced the strict
+/// way: over the whole verified chain rather than the end entity alone, with an
+/// undeterminable status treated as a failure, and with an expired CRL treated
+/// as no CRL at all rather than as a still-valid one.
+///
+/// **`optional` weakens only the anonymous case.** `allow_unauthenticated`
+/// permits a caller that sends no certificate; it does not soften the
+/// verification applied to a caller that sends one.
+fn load_client_verifier(
+    settings: InboundClientAuthSettings<'_>,
+    provider: Arc<CryptoProvider>,
+) -> Result<Arc<dyn tokio_rustls::rustls::server::danger::ClientCertVerifier>, InboundTlsError> {
+    let ca_pem = read_material(
+        settings.ca_setting,
+        settings.ca_file,
+        SecretPurpose::TlsCaBundle,
+        FileSecretPermissions::PlatformProjected,
+    )?;
+    // Same rule the server certificate is held to: a key concatenated into a
+    // file mounted for public material inherits that file's permissions.
+    if PrivateKeyDer::from_pem_slice(ca_pem.expose()).is_ok() {
+        return Err(InboundTlsError::CertificateContainsPrivateKey {
+            setting: settings.ca_setting,
+        });
+    }
+
+    let anchors = CertificateDer::pem_slice_iter(ca_pem.expose())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| InboundTlsError::MaterialInvalid {
+            setting: settings.ca_setting,
+        })?;
+    if anchors.is_empty() {
+        return Err(InboundTlsError::MaterialInvalid {
+            setting: settings.ca_setting,
+        });
+    }
+    let mut roots = RootCertStore::empty();
+    for anchor in anchors {
+        // `add` rather than `add_parsable_certificates`: a bundle with one
+        // unusable entry is a bundle an operator is wrong about, and silently
+        // trusting the remainder would mean the set of callers who can
+        // authenticate is not the set the operator wrote down.
+        roots
+            .add(anchor)
+            .map_err(|_| InboundTlsError::ClientTrustAnchorsUnusable {
+                setting: settings.ca_setting,
+            })?;
+    }
+
+    let mut builder = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider);
+    if let Some(crl_file) = settings.crl_file {
+        let crl_pem = read_material(
+            settings.crl_setting,
+            crl_file,
+            SecretPurpose::TlsCaBundle,
+            FileSecretPermissions::PlatformProjected,
+        )?;
+        let crls = CertificateRevocationListDer::pem_slice_iter(crl_pem.expose())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| InboundTlsError::RevocationListUnusable {
+                setting: settings.crl_setting,
+            })?;
+        if crls.is_empty() {
+            return Err(InboundTlsError::RevocationListUnusable {
+                setting: settings.crl_setting,
+            });
+        }
+        builder = builder.with_crls(crls).enforce_revocation_expiration();
+    }
+    if settings.requirement == ClientCertRequirement::Optional {
+        builder = builder.allow_unauthenticated();
+    }
+
+    // The two ways this can fail name two different files, so they name two
+    // different settings. A well-formed PEM block that is not a DER CRL gets
+    // this far -- `pem_slice_iter` only decoded the base64 -- and telling that
+    // operator to look at their CA bundle would send them to the wrong file.
+    builder.build().map_err(|error| match error {
+        VerifierBuilderError::InvalidCrl(_) => InboundTlsError::RevocationListUnusable {
+            setting: settings.crl_setting,
+        },
+        _ => InboundTlsError::ClientTrustAnchorsUnusable {
+            setting: settings.ca_setting,
+        },
+    })
 }
 
 /// Reads one PEM file with the discipline `gateway/src/connections/secret.rs`
@@ -592,7 +897,7 @@ fn open_material_directory(
 /// belong to the serve loop by then and drain on the usual path.
 pub(crate) struct TlsListener {
     local_addr: SocketAddr,
-    established: mpsc::Receiver<(TlsStream<TcpStream>, SocketAddr)>,
+    established: mpsc::Receiver<(InboundTlsStream, SocketAddr)>,
     _accept_task: tokio_util::task::AbortOnDropHandle<()>,
     _handshake_cancellation: DropGuard,
 }
@@ -600,7 +905,7 @@ pub(crate) struct TlsListener {
 impl TlsListener {
     pub(crate) fn wrap(
         listener: TcpListener,
-        server_config: Arc<ServerConfig>,
+        tls: ListenerTls,
         limits: HandshakeLimits,
         listener_label: &'static str,
     ) -> io::Result<Self> {
@@ -609,7 +914,8 @@ impl TlsListener {
         let cancellation = CancellationToken::new();
         let accept_task = tokio::spawn(accept_loop(
             listener,
-            TlsAcceptor::from(server_config),
+            TlsAcceptor::from(tls.server_config),
+            tls.identity_source,
             limits,
             listener_label,
             established_tx,
@@ -635,7 +941,7 @@ impl fmt::Debug for TlsListener {
 }
 
 impl axum::serve::Listener for TlsListener {
-    type Io = TlsStream<TcpStream>;
+    type Io = InboundTlsStream;
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
@@ -662,12 +968,14 @@ impl axum::serve::Listener for TlsListener {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Every argument is one listener-scoped decision.
 async fn accept_loop(
     listener: TcpListener,
     acceptor: TlsAcceptor,
+    identity_source: Option<ClientCertIdentitySource>,
     limits: HandshakeLimits,
     listener_label: &'static str,
-    established: mpsc::Sender<(TlsStream<TcpStream>, SocketAddr)>,
+    established: mpsc::Sender<(InboundTlsStream, SocketAddr)>,
     cancellation: CancellationToken,
 ) {
     // One semaphore per accept loop, so the budget is per listener rather than
@@ -744,13 +1052,242 @@ async fn accept_loop(
             match outcome {
                 Ok(Ok(stream)) => {
                     record_handshake(listener_label, "established");
-                    let _ = established.send((stream, peer_addr)).await;
+                    // Read the identity here, in the handshake task, rather
+                    // than later on the serve loop: this task is already off
+                    // the accept path and already inside the admission bound,
+                    // so parsing a caller-supplied certificate is work an
+                    // attacker cannot use to stall the listener. What travels
+                    // onward is a bounded identity, not the chain.
+                    let identity = client_identity(&stream, identity_source, listener_label);
+                    let _ = established
+                        .send((InboundTlsStream::new(stream, identity), peer_addr))
+                        .await;
                 }
-                Ok(Err(_)) => record_handshake(listener_label, "failed"),
+                Ok(Err(error)) => {
+                    record_handshake(listener_label, "failed");
+                    if identity_source.is_some() {
+                        record_client_certificate(
+                            listener_label,
+                            classify_client_certificate_failure(&error),
+                        );
+                    }
+                }
                 Err(_) => record_handshake(listener_label, "timeout"),
             }
         });
     }
+}
+
+/// A TLS connection, plus whatever identity its client certificate carried.
+///
+/// The identity has to ride on something that reaches `axum::serve`, and the
+/// only two things that do are the listener's `Io` and its `Addr`. It rides on
+/// the `Io`, so that `Addr` stays `SocketAddr` and every existing
+/// `ConnectInfo<SocketAddr>` consumer -- `crate::client_ip` above all -- keeps
+/// working unchanged.
+///
+/// It is deliberately the *identity* and not the certificate chain. A chain is
+/// unbounded, caller-supplied, and would then be one careless `Debug` away from
+/// a log; the identity is bounded, canonical, and is the only part any consumer
+/// has a use for.
+pub(crate) struct InboundTlsStream {
+    inner: TlsStream<TcpStream>,
+    client_identity: Option<VerifiedClientIdentity>,
+}
+
+impl InboundTlsStream {
+    fn new(inner: TlsStream<TcpStream>, client_identity: Option<VerifiedClientIdentity>) -> Self {
+        Self {
+            inner,
+            client_identity,
+        }
+    }
+}
+
+// Straight delegation. `TlsStream<TcpStream>` is `Unpin`, so the wrapper needs
+// no projection machinery, and the vectored-write hooks are forwarded rather
+// than defaulted so that wrapping the stream does not quietly cost hyper its
+// scatter/gather writes.
+impl AsyncRead for InboundTlsStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for InboundTlsStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(context, buffers)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+/// What every listener, TLS or not, tells the router about a connection.
+///
+/// `axum::serve` allows exactly one connect-info type, and
+/// `ConnectInfo<SocketAddr>` was already spoken for. So this carries both, and
+/// `crate::lifecycle::spread_inbound_connect_info` splits it back into the
+/// `ConnectInfo<SocketAddr>` the rest of the gateway reads plus a separate
+/// identity extension. The alternative -- changing every
+/// `ConnectInfo<SocketAddr>` consumer -- would have put the peer address, which
+/// rate limiting and audit attribution depend on, in the blast radius of a
+/// client-certificate feature.
+#[derive(Clone, Debug)]
+pub(crate) struct InboundConnectInfo {
+    pub(crate) peer_addr: SocketAddr,
+    pub(crate) client_identity: Option<VerifiedClientIdentity>,
+}
+
+impl Connected<IncomingStream<'_, TcpListener>> for InboundConnectInfo {
+    fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
+        // A plaintext listener never requested a certificate and can never have
+        // verified one, so there is nothing here to make conditional.
+        Self {
+            peer_addr: *stream.remote_addr(),
+            client_identity: None,
+        }
+    }
+}
+
+impl Connected<IncomingStream<'_, TlsListener>> for InboundConnectInfo {
+    fn connect_info(stream: IncomingStream<'_, TlsListener>) -> Self {
+        Self {
+            peer_addr: *stream.remote_addr(),
+            client_identity: stream.io().client_identity.clone(),
+        }
+    }
+}
+
+/// Reads the identity out of a completed handshake, or records why there is
+/// none.
+///
+/// Returns `None` in every case that is not an unambiguous, canonical,
+/// in-bounds identity: no certificate, an unreadable one, one with no identity
+/// of the configured kind, one with several. `None` means the connection
+/// carries no certificate identity at all, which is the same position a
+/// plaintext connection is in -- never a partial or provisional one.
+fn client_identity(
+    stream: &TlsStream<TcpStream>,
+    identity_source: Option<ClientCertIdentitySource>,
+    listener_label: &'static str,
+) -> Option<VerifiedClientIdentity> {
+    let identity_source = identity_source?;
+    // Only reachable in `optional` mode: `required` refuses the handshake, so
+    // this is a caller who was asked and declined, not one who slipped past.
+    let Some(leaf) = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|chain| chain.first())
+    else {
+        record_client_certificate(listener_label, "absent");
+        return None;
+    };
+
+    match identity_from_certificate(leaf, identity_source) {
+        Ok(identity) => {
+            record_client_certificate(listener_label, "accepted");
+            Some(identity)
+        }
+        Err(error) => {
+            // The reason is a closed set of static strings, and the identity
+            // that was rejected is deliberately not recorded anywhere: it is
+            // caller-controlled text, and this is the one place where putting
+            // it in a metric label would turn a misissued certificate into a
+            // cardinality attack.
+            record_client_certificate(listener_label, error.reason());
+            tracing::warn!(
+                listener = listener_label,
+                reason = error.reason(),
+                "a verified client certificate carried no usable identity; the connection has no certificate identity"
+            );
+            None
+        }
+    }
+}
+
+/// Names why a handshake carrying a client certificate failed, as one of a
+/// closed set of labels.
+///
+/// This exists because "the handshake failed" is not an operable answer when an
+/// operator is trying to find out whether revocation is working. A
+/// `reason="rejected_revoked"` counter is the only evidence available that a
+/// CRL is being consulted at all, and `rejected_expired_revocation_list` is the
+/// only warning an operator gets that their CRL went stale and is now refusing
+/// every caller.
+///
+/// The rustls error is classified, never rendered: `CertificateError::Other`
+/// wraps an arbitrary payload, and this value is a metric label.
+fn classify_client_certificate_failure(error: &io::Error) -> &'static str {
+    use tokio_rustls::rustls::Error as TlsError;
+
+    let Some(error) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<TlsError>())
+    else {
+        return "rejected_other";
+    };
+
+    match error {
+        TlsError::NoCertificatesPresented => "rejected_absent",
+        TlsError::InvalidCertificate(certificate_error) => match certificate_error {
+            CertificateError::Revoked => "rejected_revoked",
+            CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
+                "rejected_expired"
+            }
+            CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
+                "rejected_not_yet_valid"
+            }
+            CertificateError::UnknownIssuer => "rejected_untrusted",
+            CertificateError::UnknownRevocationStatus => "rejected_unknown_revocation_status",
+            CertificateError::ExpiredRevocationList
+            | CertificateError::ExpiredRevocationListContext { .. } => {
+                "rejected_expired_revocation_list"
+            }
+            CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. } => {
+                "rejected_wrong_purpose"
+            }
+            CertificateError::BadEncoding => "rejected_bad_encoding",
+            CertificateError::BadSignature => "rejected_bad_signature",
+            _ => "rejected_other",
+        },
+        _ => "rejected_other",
+    }
+}
+
+fn record_client_certificate(listener_label: &'static str, outcome: &'static str) {
+    ::metrics::counter!(
+        INBOUND_CLIENT_CERTIFICATES_TOTAL,
+        "listener" => listener_label,
+        "outcome" => outcome
+    )
+    .increment(1);
 }
 
 /// Keeps the in-flight gauge honest across every exit from a handshake task,

@@ -1,5 +1,6 @@
 pub mod chain;
 pub mod claims;
+pub mod client_certificate;
 pub mod cookie_session_validator;
 pub mod jwt;
 pub mod oidc;
@@ -13,6 +14,11 @@ pub mod validator;
 
 #[allow(unused_imports)] // Public chain API is used by gateway startup wiring.
 pub use chain::ChainValidator;
+#[allow(unused_imports)] // Public client-certificate API is wired by gateway startup.
+pub use client_certificate::{
+    identity_from_certificate, ClientCertIdentitySource, ClientCertificateValidator,
+    VerifiedClientIdentity,
+};
 #[allow(unused_imports)] // Public cookie-session API is wired by gateway startup.
 pub use cookie_session_validator::{CookieSessionAuthConfig, CookieSessionValidator};
 #[allow(unused_imports)] // Public JWT API re-export reserved for PR 3 auth middleware.

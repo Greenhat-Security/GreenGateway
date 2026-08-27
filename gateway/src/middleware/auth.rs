@@ -22,7 +22,7 @@ use crate::{
     audit::{AuditEvent, AuditLog},
     auth::{
         actor_from_principal, protected_resource, AuthError, Principal, PrincipalDirectory,
-        SessionCredential, SessionValidator,
+        SessionCredential, SessionValidator, VerifiedClientIdentity,
     },
     client_ip::{canonical_client_ip, request_id, ClientIpPolicy},
     config::{AuthMode, Config},
@@ -153,7 +153,7 @@ pub async fn auth_middleware(
 
     let resource = state.mcp_resource_for_path(&path);
     let audit = audit_context(&req, path, &state.client_ip_policy);
-    let Some(credential) = extract_credential(req.headers(), &state.cookie_name) else {
+    let Some(credential) = request_credential(&req, &state.cookie_name) else {
         return auth_failure_response(
             &state,
             &audit,
@@ -195,6 +195,17 @@ pub async fn auth_middleware(
                 &audit,
                 AuthFailureKind::Rejected,
                 "bearer_auth_unsupported",
+                req,
+                next,
+            )
+            .await;
+        }
+        SessionCredential::ClientCertificate(_) if !validator.supports_client_certificate() => {
+            return auth_failure_response(
+                &state,
+                &audit,
+                AuthFailureKind::Rejected,
+                "client_certificate_auth_unsupported",
                 req,
                 next,
             )
@@ -245,6 +256,30 @@ fn audit_context(req: &Request, path: String, client_ip_policy: &ClientIpPolicy)
         user_agent: header_to_trimmed_string(req.headers().get(USER_AGENT)),
         path,
     }
+}
+
+/// The credential this request is judged on.
+///
+/// A credential the caller *sent* wins over the certificate their connection
+/// was established with, and that order is deliberate. A caller who presents a
+/// bearer token is asking to be judged as that token's subject; preferring the
+/// certificate would mean an expired or revoked token silently succeeded as
+/// somebody else, which is a worse surprise than a 401. The certificate is what
+/// authenticates a caller who sends no other credential.
+///
+/// This is also the only place a client-certificate credential can come from.
+/// It is read from a request extension that only the inbound TLS listener
+/// writes, never from a header, so there is no header a caller can set to
+/// produce one -- and the mTLS assertion headers a fronting proxy would use for
+/// exactly this purpose are stripped by `crate::middleware::headers` before any
+/// upstream sees them.
+fn request_credential(req: &Request, cookie_name: &str) -> Option<SessionCredential> {
+    extract_credential(req.headers(), cookie_name).or_else(|| {
+        req.extensions()
+            .get::<VerifiedClientIdentity>()
+            .cloned()
+            .map(SessionCredential::ClientCertificate)
+    })
 }
 
 pub fn extract_credential(headers: &HeaderMap, cookie_name: &str) -> Option<SessionCredential> {
@@ -356,6 +391,7 @@ fn auth_mode(credential: &SessionCredential) -> &'static str {
     match credential {
         SessionCredential::Cookie(_) => "session_cookie",
         SessionCredential::Bearer(_) => "bearer_token",
+        SessionCredential::ClientCertificate(_) => "client_certificate",
     }
 }
 
