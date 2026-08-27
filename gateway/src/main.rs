@@ -48,6 +48,7 @@ mod connection_secret_maintenance;
 mod connections;
 mod discovery;
 mod egress;
+mod inbound_tls;
 mod lifecycle;
 mod mcp;
 mod metrics;
@@ -1428,6 +1429,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metrics_handle = install_metrics_recorder()?;
     let listen_addr = config.listen_addr;
     let admin_listen_addr = config.admin_listen_addr;
+    // Loaded before any listener binds. Certificate and key problems must abort
+    // startup rather than leave a listener serving plaintext that an operator
+    // configured for TLS.
+    let inbound_tls = inbound_tls::InboundTlsBindings::load(&config)?;
     let shutdown_config = ShutdownConfig::from_config(&config);
     let lifecycle = GatewayLifecycle::new();
     let (audit_log, audit_event_sender) = audit::AuditLog::from_config(&config)?;
@@ -1455,6 +1460,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         app,
         listen_addr,
         admin_listen_addr,
+        inbound_tls,
         audit_log,
         lifecycle,
         shutdown_config,
@@ -11335,6 +11341,13 @@ mod tests {
                 .parse()
                 .expect("test listen address should parse"),
             admin_listen_addr: None,
+            tls_cert_file: None,
+            tls_key_file: None,
+            admin_tls_cert_file: None,
+            admin_tls_key_file: None,
+            tls_min_version: config::DEFAULT_TLS_MIN_VERSION,
+            tls_handshake_timeout_ms: config::DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
+            tls_max_concurrent_handshakes: config::DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES,
             admin_prefix: config::DEFAULT_ADMIN_PREFIX.to_owned(),
             admin_login_provider: None,
             admin_login_pending_ttl_secs: config::DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,

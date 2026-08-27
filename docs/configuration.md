@@ -29,6 +29,80 @@ The deployment probes are exact, gateway-owned `GET`/`HEAD` routes on the data l
 
 Probe bodies contain only aggregate state and stable reason categories; they do not expose upstream URLs, endpoint topology, credentials, or internal errors. The default authentication, RBAC, and CSRF exemptions include all four probe routes. Setting an exempt-path variable explicitly replaces that default, so operators using explicit lists should retain the probes needed by their orchestrator.
 
+### TLS_CERT_FILE
+
+Optional path to the PEM certificate chain that terminates TLS on `LISTEN_ADDR`, leaf certificate first.
+
+Default: empty, which serves the data listener as plaintext HTTP/1.1 exactly as it is served today.
+
+Format and validation: unset, empty, or whitespace-only values leave the listener plaintext. A non-empty value must name a readable regular file containing at least one PEM `CERTIFICATE` section, and must be set together with `TLS_KEY_FILE`; setting one without the other fails startup rather than quietly serving plaintext on a listener an operator believes is protected. The file is read once at startup with a 1 MiB bound. A certificate file that also contains a `PRIVATE KEY` section is rejected, because a key concatenated into the certificate file inherits the certificate's permissions and a certificate is the one half of the pair operators reasonably mount world-readable.
+
+The file's directory is opened as a capability root and the leaf is read through the same bounded reader that resolves connection secrets, so symlink resolution is confined beneath that directory and a link pointing outside it fails closed. A Kubernetes Secret volume is supported as published: the kubelet's atomic writer exposes each leaf as a relative symlink into a `..data` directory, and that shape loads.
+
+Certificate or key material that is missing, unreadable, malformed, mismatched, or unsafely permissioned prevents startup. There is no fallback to plaintext.
+
+### TLS_KEY_FILE
+
+Optional path to the PEM private key matching `TLS_CERT_FILE`. PKCS#8 (`PRIVATE KEY`), PKCS#1 (`RSA PRIVATE KEY`), and SEC1 (`EC PRIVATE KEY`) encodings are all accepted.
+
+Default: empty, which serves the data listener as plaintext HTTP/1.1.
+
+Format and validation: as for `TLS_CERT_FILE`, with a 256 KiB read bound, and the key must match the public key of the leaf certificate. A mismatch fails startup.
+
+Permissions: the key file must not be group- or world-writable, and its directory must not be group- or world-writable unless it carries the sticky bit. That is the same rule the gateway applies to platform-projected connection secrets: `drwxrwxrwt` is what a container runtime publishes a projected volume as, and the sticky bit is what makes it safe, because a process that does not own an entry cannot swap it. Group- and world-*read* on the key is permitted rather than rejected, because Kubernetes publishes Secret volume files as mode `0644` by default and refusing that would make the most common way to mount this material unusable; mount the key more tightly where your platform allows it, with `defaultMode: 0400` in Kubernetes or `chmod 0400` for a bind mount.
+
+Key bytes are read into zeroizing buffers, are never written to logs, audit events, metrics, error responses, or `Debug` output, and no startup error names the path the key was read from -- only the setting to fix.
+
+### ADMIN_TLS_CERT_FILE
+
+Optional path to the PEM certificate chain that terminates TLS on `ADMIN_LISTEN_ADDR`.
+
+Default: empty, which serves the admin listener as plaintext HTTP/1.1.
+
+Format and validation: validated exactly as `TLS_CERT_FILE`, and must be set together with `ADMIN_TLS_KEY_FILE`. Both require `ADMIN_LISTEN_ADDR`: without a separate admin listener there is nothing for them to terminate, and accepting them anyway would leave the admin surface on the data listener's scheme while its own settings claimed otherwise.
+
+The two listeners are configured independently on purpose. They are frequently reached over different networks, and terminating TLS on one says nothing about the other.
+
+### ADMIN_TLS_KEY_FILE
+
+Optional path to the PEM private key matching `ADMIN_TLS_CERT_FILE`.
+
+Default: empty, which serves the admin listener as plaintext HTTP/1.1.
+
+Format and validation: validated exactly as `TLS_KEY_FILE`, including the permission rules and the read bound.
+
+### TLS_MIN_VERSION
+
+The minimum TLS protocol version any inbound listener will negotiate.
+
+Default: `1.2`
+
+Format and validation: must be exactly `1.2` or `1.3`. Anything else fails startup. The floor is stated explicitly rather than inherited from whatever the TLS library defaults to, so that the version an operator is running on is an auditable configured value that cannot move on a dependency bump.
+
+`1.3` is the stronger choice and is recommended wherever every client can reach it; it refuses TLS 1.2 clients outright. `1.2` is the default because raising a floor has a compatibility cost, and a default that silently refuses a working client on upgrade is a change that should be made deliberately.
+
+This setting applies to both listeners. Inbound listeners advertise only `http/1.1` over ALPN; a client offering only `h2` is refused during the handshake rather than handed a connection nothing will parse.
+
+### TLS_HANDSHAKE_TIMEOUT_MS
+
+Deadline for a single inbound TLS handshake, in milliseconds.
+
+Default: `10000`
+
+Format and validation: must parse as an unsigned integer greater than 0. Zero is rejected at startup, because a zero deadline fails every handshake.
+
+A client that connects and never sends a ClientHello is dropped when this expires, and the admission slot it held is released immediately. Handshakes do not run on the listener's accept path, so a slow client cannot stall other connections; this deadline bounds how long one can hold a slot against the `TLS_MAX_CONCURRENT_HANDSHAKES` budget.
+
+### TLS_MAX_CONCURRENT_HANDSHAKES
+
+The maximum number of inbound TLS handshakes running at once, across both listeners.
+
+Default: `256`
+
+Format and validation: must parse as an unsigned integer greater than 0. Zero is rejected at startup, because it would admit no connections at all.
+
+Handshakes are the expensive, attacker-triggerable half of accepting a TLS connection, so this is the bound that stops a flood of half-open connections from becoming unbounded work inside the process. When the bound is reached the listener stops draining the kernel's accept queue rather than accumulating half-open sockets, and resumes as soon as a slot is released -- which happens on every outcome, including a failed or timed-out handshake. The default is set well above any plausible legitimate burst, so reaching it is a signal rather than a routine event; `inbound_tls_handshakes_in_flight` and `inbound_tls_handshakes_total` report it.
+
 ### ADMIN_PREFIX
 
 Path prefix for the gateway's admin UI and control-plane API surface.

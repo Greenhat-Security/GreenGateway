@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::Router;
+use axum::{serve::ListenerExt as _, Extension, Router};
 use serde_json::json;
 use time::OffsetDateTime;
 use tokio_util::{
@@ -17,7 +17,12 @@ use tokio_util::{
     task::{task_tracker::TaskTrackerToken, TaskTracker},
 };
 
-use crate::{audit, config};
+#[cfg(test)]
+use crate::inbound_tls::ConnectionScheme;
+use crate::{
+    audit, config,
+    inbound_tls::{BoundListener, InboundTlsBindings},
+};
 
 const STARTING: u8 = 0;
 const READY: u8 = 1;
@@ -251,10 +256,12 @@ pub(crate) enum GatewayApp {
     Split { data: Router, admin: Router },
 }
 
+#[allow(clippy::too_many_arguments)] // One parameter per independently configured concern.
 pub(crate) async fn serve_gateway(
     app: GatewayApp,
     listen_addr: SocketAddr,
     admin_listen_addr: Option<SocketAddr>,
+    inbound_tls: InboundTlsBindings,
     audit_log: audit::AuditLog,
     lifecycle: GatewayLifecycle,
     shutdown_config: ShutdownConfig,
@@ -265,6 +272,7 @@ pub(crate) async fn serve_gateway(
         app,
         listen_addr,
         admin_listen_addr,
+        inbound_tls,
         audit_log,
         lifecycle,
         shutdown_config,
@@ -279,6 +287,7 @@ async fn serve_gateway_with_signals(
     app: GatewayApp,
     listen_addr: SocketAddr,
     admin_listen_addr: Option<SocketAddr>,
+    inbound_tls: InboundTlsBindings,
     audit_log: audit::AuditLog,
     lifecycle: GatewayLifecycle,
     shutdown_config: ShutdownConfig,
@@ -288,7 +297,10 @@ async fn serve_gateway_with_signals(
     match app {
         GatewayApp::Unified(app) => {
             let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+            let listener = inbound_tls.bind_data(listener)?;
             let bound_addr = listener.local_addr()?;
+            let scheme = listener.scheme();
+            let app = app.layer(Extension(scheme));
 
             audit_log.emit(audit::AuditEvent::new(
                 "gateway.startup",
@@ -298,6 +310,8 @@ async fn serve_gateway_with_signals(
                 json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "listen_addr": bound_addr.to_string(),
+                    "listen_scheme": scheme.as_str(),
+                    "tls_min_version": inbound_tls.min_version().map(|version| version.as_str()),
                 }),
             ));
 
@@ -309,7 +323,7 @@ async fn serve_gateway_with_signals(
                 return Err(error);
             }
             lifecycle.mark_ready();
-            tracing::info!(listen_addr = %bound_addr, "gateway listening");
+            tracing::info!(listen_addr = %bound_addr, scheme = scheme.as_str(), "gateway listening");
             let cancellation = CancellationToken::new();
             let server = serve_router_with_shutdown(listener, app, cancellation.clone());
             tokio::pin!(server);
@@ -341,9 +355,15 @@ async fn serve_gateway_with_signals(
             let admin_listen_addr = admin_listen_addr
                 .expect("split gateway app should only be built when ADMIN_LISTEN_ADDR is set");
             let data_listener = tokio::net::TcpListener::bind(listen_addr).await?;
+            let data_listener = inbound_tls.bind_data(data_listener)?;
             let data_bound_addr = data_listener.local_addr()?;
+            let data_scheme = data_listener.scheme();
             let admin_listener = tokio::net::TcpListener::bind(admin_listen_addr).await?;
+            let admin_listener = inbound_tls.bind_admin(admin_listener)?;
             let admin_bound_addr = admin_listener.local_addr()?;
+            let admin_scheme = admin_listener.scheme();
+            let data = data.layer(Extension(data_scheme));
+            let admin = admin.layer(Extension(admin_scheme));
 
             audit_log.emit(audit::AuditEvent::new(
                 "gateway.startup",
@@ -353,7 +373,10 @@ async fn serve_gateway_with_signals(
                 json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "listen_addr": data_bound_addr.to_string(),
+                    "listen_scheme": data_scheme.as_str(),
                     "admin_listen_addr": admin_bound_addr.to_string(),
+                    "admin_listen_scheme": admin_scheme.as_str(),
+                    "tls_min_version": inbound_tls.min_version().map(|version| version.as_str()),
                 }),
             ));
 
@@ -365,8 +388,8 @@ async fn serve_gateway_with_signals(
                 return Err(error);
             }
             lifecycle.mark_ready();
-            tracing::info!(listen_addr = %data_bound_addr, "gateway data listener listening");
-            tracing::info!(admin_listen_addr = %admin_bound_addr, "gateway admin listener listening");
+            tracing::info!(listen_addr = %data_bound_addr, scheme = data_scheme.as_str(), "gateway data listener listening");
+            tracing::info!(admin_listen_addr = %admin_bound_addr, scheme = admin_scheme.as_str(), "gateway admin listener listening");
             let cancellation = CancellationToken::new();
             let data_server = serve_router_with_shutdown(data_listener, data, cancellation.clone());
             let admin_server =
@@ -618,17 +641,37 @@ fn gateway_event(event_type: &'static str, payload: serde_json::Value) -> audit:
     )
 }
 
+/// Serves `app` on `listener` until `shutdown` is cancelled.
+///
+/// The two arms are deliberately the same `axum::serve` call: the router, the
+/// `ConnectInfo<SocketAddr>` extractor `crate::client_ip` depends on, and
+/// graceful shutdown are identical whether or not the listener terminates TLS.
+/// TLS is a `Listener` implementation here, not a second serving path.
 pub(crate) async fn serve_router_with_shutdown(
-    listener: tokio::net::TcpListener,
+    listener: BoundListener,
     app: Router,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown.cancelled_owned())
-    .await
+    let service = app.into_make_service_with_connect_info::<SocketAddr>();
+    match listener {
+        BoundListener::Plain(listener) => {
+            axum::serve(listener, service)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+        }
+        // The tap is deliberately empty. `ConnectInfo<SocketAddr>` is how
+        // `crate::client_ip` learns the peer address, and axum only supplies
+        // the `Connected` impl that produces it for a custom listener through
+        // `TapIo`: writing that impl here is impossible, because both
+        // `Connected` and `SocketAddr` are foreign and the orphan rule refuses
+        // it. So the TLS listener goes through the hook axum provides, and
+        // reaches exactly the same connect-info wiring as the plaintext one.
+        BoundListener::Tls(listener) => {
+            axum::serve(listener.tap_io(|_| {}), service)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -636,7 +679,12 @@ pub(crate) async fn serve_router(
     listener: tokio::net::TcpListener,
     app: Router,
 ) -> std::io::Result<()> {
-    serve_router_with_shutdown(listener, app, CancellationToken::new()).await
+    serve_router_with_shutdown(
+        BoundListener::Plain(listener),
+        app.layer(Extension(ConnectionScheme::Http)),
+        CancellationToken::new(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -674,6 +722,7 @@ mod tests {
             GatewayApp::Unified(Router::new()),
             occupied_addr,
             None,
+            InboundTlsBindings::plaintext(),
             audit_log,
             GatewayLifecycle::new(),
             ShutdownConfig::immediate(),
@@ -713,6 +762,7 @@ mod tests {
             },
             data_addr,
             Some(admin_addr),
+            InboundTlsBindings::plaintext(),
             audit::AuditLog::new(Arc::new(capture.clone())),
             GatewayLifecycle::new(),
             ShutdownConfig::immediate(),
@@ -755,8 +805,8 @@ mod tests {
         );
         let cancellation = CancellationToken::new();
         let peer_server = tokio::spawn(serve_router_with_shutdown(
-            listener,
-            app,
+            BoundListener::Plain(listener),
+            app.layer(Extension(ConnectionScheme::Http)),
             cancellation.clone(),
         ));
         let response_task = tokio::spawn(async move {
@@ -819,6 +869,7 @@ mod tests {
             GatewayApp::Unified(peer_router()),
             "127.0.0.1:0".parse().expect("listen address should parse"),
             None,
+            InboundTlsBindings::plaintext(),
             audit::AuditLog::new(Arc::new(capture.clone())),
             GatewayLifecycle::new(),
             ShutdownConfig::immediate(),
@@ -854,6 +905,7 @@ mod tests {
             },
             "127.0.0.1:0".parse().expect("data address should parse"),
             Some("127.0.0.1:0".parse().expect("admin address should parse")),
+            InboundTlsBindings::plaintext(),
             audit::AuditLog::new(Arc::new(capture.clone())),
             GatewayLifecycle::new(),
             ShutdownConfig::immediate(),
@@ -913,6 +965,7 @@ mod tests {
                 GatewayApp::Unified(peer_router()),
                 "127.0.0.1:0".parse().expect("listen address should parse"),
                 None,
+                InboundTlsBindings::plaintext(),
                 audit_log,
                 lifecycle,
                 ShutdownConfig::immediate(),
@@ -975,6 +1028,7 @@ mod tests {
                 GatewayApp::Unified(Router::new()),
                 "127.0.0.1:0".parse().expect("listen address should parse"),
                 None,
+                InboundTlsBindings::plaintext(),
                 audit_log,
                 lifecycle,
                 ShutdownConfig::immediate(),
@@ -1017,6 +1071,7 @@ mod tests {
                 GatewayApp::Unified(Router::new()),
                 "127.0.0.1:0".parse().expect("listen address should parse"),
                 None,
+                InboundTlsBindings::plaintext(),
                 audit_log,
                 GatewayLifecycle::new(),
                 ShutdownConfig {
@@ -1063,6 +1118,7 @@ mod tests {
                 GatewayApp::Unified(Router::new()),
                 "127.0.0.1:0".parse().expect("listen address should parse"),
                 None,
+                InboundTlsBindings::plaintext(),
                 audit_log,
                 GatewayLifecycle::new(),
                 ShutdownConfig {

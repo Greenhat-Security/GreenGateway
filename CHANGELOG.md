@@ -9,6 +9,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Security
 
+- Added optional inbound TLS termination on the data listener and, independently, on the admin listener (`TLS_CERT_FILE`/`TLS_KEY_FILE`, `ADMIN_TLS_CERT_FILE`/`ADMIN_TLS_KEY_FILE`), with an explicit minimum protocol version (`TLS_MIN_VERSION`, default `1.2`). TLS is opt-in and off by default: a deployment that sets nothing binds the same plain listener it does today. Certificate and key material is read once at startup through the same bounded, capability-confined, permission-checked reader that resolves connection secrets, and anything missing, unreadable, malformed, mismatched, or unsafely permissioned fails startup with an error naming the setting rather than falling back to plaintext. Key bytes never reach logs, audit events, metrics, error responses, or `Debug` output. Handshakes run off the listener's accept path under a concurrency bound (`TLS_MAX_CONCURRENT_HANDSHAKES`) and a per-handshake deadline (`TLS_HANDSHAKE_TIMEOUT_MS`), so a client that connects and never sends a ClientHello cannot stall the listener. Listeners advertise only `http/1.1` over ALPN. The connection scheme is published as a request extension for later scheme-dependent policy. SNI with multiple certificates, hot certificate reload, and client-certificate authentication are deliberately not included.
+
 - Caller-supplied `x-request-id` headers are now removed before a request is
   dispatched to an upstream, and the gateway does not substitute one of its
   own. Previously the caller's value was forwarded verbatim, which let a client

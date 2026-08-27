@@ -41,7 +41,7 @@ time = { version = "0.3.53", features = ["formatting", "parsing"] }
 tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = "0.29"
 tokio-util = { version = "0.7.17", features = ["rt"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.6.8", features = ["cors", "request-id", "trace"] }
 tracing = "0.1.44"
