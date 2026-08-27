@@ -46,6 +46,11 @@ use super::*;
 
 struct TestBody {
     receiver: mpsc::Receiver<Frame<Bytes>>,
+    /// Held by a body that must never end. `from_frames` drops its sender, so
+    /// the channel closes and the body reports end-of-stream once the frames
+    /// run out; keeping the sender alive is what turns the same channel into an
+    /// upstream that sent some messages and then went quiet forever.
+    _open: Option<mpsc::Sender<Frame<Bytes>>>,
 }
 
 impl TestBody {
@@ -54,7 +59,22 @@ impl TestBody {
         for frame in frames {
             sender.try_send(frame).expect("test body should accept");
         }
-        Self { receiver }
+        Self {
+            receiver,
+            _open: None,
+        }
+    }
+
+    /// The given frames, and then silence: no trailers and no end of stream.
+    fn never_ending(frames: Vec<Frame<Bytes>>) -> Self {
+        let (sender, receiver) = mpsc::channel(frames.len().max(1));
+        for frame in frames {
+            sender.try_send(frame).expect("test body should accept");
+        }
+        Self {
+            receiver,
+            _open: Some(sender),
+        }
     }
 
     fn message(payload: &[u8]) -> Self {
@@ -593,7 +613,22 @@ async fn the_grpc_listener_serves_no_admin_or_probe_routes() {
     let (upstream, calls) = spawn_upstream().await;
     let harness = spawn_gateway(grpc_config(upstream, true), upstream).await;
 
-    for path in ["/health", "/metrics", "/readyz", "/v1/admin/status"] {
+    // Two refusals, deliberately told apart rather than lumped together. The
+    // gateway's own reserved namespace is refused BEFORE the method grammar
+    // runs, because a path that survives the grammar is a path the proxy would
+    // otherwise forward -- `/admin/Ping` is a well-formed method path. Anything
+    // outside that namespace is still refused by the grammar, which is what
+    // keeps the grammar covered here rather than shadowed by the new check.
+    let refusals = [
+        ("/health", "12", "gateway_owned_path"),
+        ("/metrics", "12", "gateway_owned_path"),
+        ("/readyz", "12", "gateway_owned_path"),
+        ("/v1/admin/status", "12", "gateway_owned_path"),
+        ("/admin/Ping", "12", "gateway_owned_path"),
+        ("/notamethod", "3", "method_path_shape"),
+        ("/a//b", "12", "unsafe_path"),
+    ];
+    for (path, status, reason) in refusals {
         let result = grpc_call(harness.grpc_addr(), path, TestBody::empty(), |_| {})
             .await
             .expect("the gRPC listener should answer rather than drop the connection");
@@ -604,10 +639,14 @@ async fn the_grpc_listener_serves_no_admin_or_probe_routes() {
         );
         assert_eq!(
             result.grpc_status(),
-            "3",
-            "{path} must be refused as INVALID_ARGUMENT by the method grammar, not served; \
-             grpc-message was {}",
+            status,
+            "{path} must be refused, not served; grpc-message was {}",
             result.grpc_message()
+        );
+        assert_eq!(
+            result.grpc_message(),
+            reason,
+            "{path} was refused by the wrong check"
         );
         assert!(
             result.messages.is_empty(),
@@ -632,14 +671,20 @@ async fn the_grpc_listener_serves_no_admin_or_probe_routes() {
 #[tokio::test]
 async fn an_unauthenticated_call_is_refused_as_a_grpc_status_before_any_egress() {
     let (upstream, calls) = spawn_upstream().await;
+    let store = TempDb::new("grpc-unauthenticated-control");
     let mut config = grpc_config(upstream, true);
     config.auth_enabled = true;
     config.auth_mode = config::AuthMode::Required;
-    // One exempt service, so the control call below runs through the SAME
-    // listener, the same router and the same middleware stack as the denial.
-    // A control that needed a second harness would only show that some other
+    // A real credential, so the control call below runs through the SAME
+    // listener, the same router and the same middleware stack as the denial. A
+    // control that needed a second harness would only show that some other
     // configuration works.
-    config.auth_exempt_paths = vec!["/exempt.Service".to_owned()];
+    //
+    // This was an `AUTH_EXEMPT_PATHS` entry until the #333 review. The exempt
+    // lists no longer apply on the gRPC listener -- see `grpc_app` for why --
+    // so an exempt path is no longer a way to get a call served, and a control
+    // built on one would have been testing the hole rather than the fix.
+    let token = service_token_credential(&mut config, &store);
     let harness = spawn_gateway(config, upstream).await;
 
     let denied = grpc_call(
@@ -682,13 +727,24 @@ async fn an_unauthenticated_call_is_refused_as_a_grpc_status_before_any_egress()
     // that refuses everything.
     let allowed = grpc_call(
         harness.grpc_addr(),
-        "/exempt.Service/Ping",
+        "/acceptance.Service/Ping",
         TestBody::message(b"ping"),
-        |_| {},
+        |headers| {
+            headers.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {token}"))
+                    .expect("bearer value should build"),
+            );
+        },
     )
     .await
-    .expect("a call on an exempt path should be served");
-    assert_eq!(allowed.grpc_status(), "0");
+    .expect("a call with a credential should be served");
+    assert_eq!(
+        allowed.grpc_status(),
+        "0",
+        "the control call was refused: {}",
+        allowed.grpc_message()
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(harness.dns_calls() >= 1);
 }
@@ -841,7 +897,879 @@ async fn a_served_call_is_audited_with_bounded_facts_only() {
     );
 }
 
-/// Keeps the unused-import lint honest: `HashSet` is used by `test_config`'s
+// ---------------------------------------------------------------------------
+// Deadlines that cover the wait for response HEADERS (#333 review)
+// ---------------------------------------------------------------------------
+
+/// A gRPC upstream that counts ACCEPTED CONNECTIONS as well as served calls,
+/// and stalls before answering calls to one nominated service.
+///
+/// Accepts are counted rather than only calls because "the gateway never
+/// proxied this" has to be observed where the gateway would first touch the
+/// network. A call counter is incremented by the upstream's own handler, so a
+/// gateway that connected and sent HEADERS the handler had not answered yet
+/// still reads as zero calls while having very much reached the upstream.
+struct ProbeUpstream {
+    address: SocketAddr,
+    accepts: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl ProbeUpstream {
+    fn accepts(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+/// Calls whose SERVICE NAME starts with this are answered only after the
+/// stall.
+const STALLING_SERVICE_PREFIX: &str = "/stall.";
+/// Calls whose service name contains this get HEADERS and whatever messages
+/// they were given, and then nothing ever again -- no further messages, no
+/// trailers, no end of stream.
+///
+/// A substring rather than a prefix so that the two behaviours compose: a
+/// service named `stall.quiet_Service` stalls AND never ends, which is the only
+/// way to spend part of a deadline before HEADERS and the rest after them.
+const QUIET_SERVICE_MARKER: &str = "quiet";
+
+/// Spawns an upstream that stalls `stall` before sending HEADERS for
+/// `STALLING_SERVICE_PREFIX` and answers everything else immediately.
+///
+/// The stall is placed before the response is produced AND before the request
+/// body is drained, because that is the ordinary shape of a slow unary handler:
+/// grpc-go and tonic send response HEADERS when the handler returns, so every
+/// slow unary upstream leaves the caller waiting on HEADERS with the stream
+/// already open.
+async fn spawn_probe_upstream(stall: Duration) -> ProbeUpstream {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("probe upstream should bind");
+    let address = listener
+        .local_addr()
+        .expect("probe upstream address should be available");
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let accept_counter = Arc::clone(&accepts);
+    let call_counter = Arc::clone(&calls);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            accept_counter.fetch_add(1, Ordering::SeqCst);
+            let call_counter = Arc::clone(&call_counter);
+            tokio::spawn(async move {
+                let service =
+                    hyper::service::service_fn(move |request: hyper::Request<Incoming>| {
+                        let call_counter = Arc::clone(&call_counter);
+                        let path = request.uri().path();
+                        let stalls = path.starts_with(STALLING_SERVICE_PREFIX);
+                        let quiet = path.contains(QUIET_SERVICE_MARKER);
+                        async move {
+                            if stalls {
+                                tokio::time::sleep(stall).await;
+                            }
+                            let (_, mut body) = request.into_parts();
+                            while let Some(frame) = std::future::poll_fn(|context| {
+                                Pin::new(&mut body).poll_frame(context)
+                            })
+                            .await
+                            {
+                                if frame.is_err() {
+                                    break;
+                                }
+                            }
+                            call_counter.fetch_add(1, Ordering::SeqCst);
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert("grpc-status", HeaderValue::from_static("0"));
+                            trailers.insert("grpc-message", HeaderValue::from_static("probe-ok"));
+                            let response_body = if quiet {
+                                TestBody::never_ending(vec![Frame::data(framed(b"pong"))])
+                            } else {
+                                TestBody::from_frames(vec![
+                                    Frame::data(framed(b"pong")),
+                                    Frame::trailers(trailers),
+                                ])
+                            };
+                            Ok::<_, Infallible>(
+                                hyper::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/grpc")
+                                    .body(response_body)
+                                    .expect("probe upstream response should build"),
+                            )
+                        }
+                    });
+                test_support::serve_one(stream, service).await;
+            });
+        }
+    });
+
+    ProbeUpstream {
+        address,
+        accepts,
+        calls,
+    }
+}
+
+/// A TCP peer that accepts and then never sends its HTTP/2 connection preface.
+///
+/// The accepted streams are held rather than dropped: dropping would close the
+/// socket and the gateway would see a connection error, which is not the case
+/// under test. What is under test is silence.
+async fn spawn_silent_peer() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("silent peer should bind");
+    let address = listener
+        .local_addr()
+        .expect("silent peer address should be available");
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepts);
+
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            held.push(stream);
+        }
+    });
+
+    (address, accepts)
+}
+
+/// Replaces the route's gRPC policy wholesale.
+fn with_grpc_settings(config: &mut config::Config, settings: config::UpstreamGrpcConfig) {
+    config
+        .upstream_routes
+        .first_mut()
+        .expect("the gRPC acceptance config has exactly one route")
+        .grpc = Some(settings);
+}
+
+/// The client's `grpc-timeout` bounds the wait for the upstream's HEADERS.
+///
+/// The measurement is the assertion. A test that only checked "a slow call
+/// eventually fails" would pass against a gateway with no timer at all, because
+/// the call does eventually finish -- with `grpc-status: 0`, ten seconds after a
+/// half-second deadline. So this asserts the status the deadline produces AND
+/// that the answer arrived well before the upstream's own handler could have
+/// produced one.
+#[tokio::test]
+async fn a_client_deadline_bounds_the_wait_for_response_headers() {
+    let upstream = spawn_probe_upstream(Duration::from_secs(5)).await;
+    let mut config = grpc_config(upstream.address, true);
+    with_grpc_settings(
+        &mut config,
+        config::UpstreamGrpcConfig {
+            // Deliberately far above both the client's deadline and the
+            // upstream's stall: the bound under test is the CLIENT's.
+            max_duration_ms: 30_000,
+            ..default_grpc_settings()
+        },
+    );
+    let harness = spawn_gateway(config, upstream.address).await;
+
+    let started = Instant::now();
+    let result = grpc_call(
+        harness.grpc_addr(),
+        "/stall.Service/Slow",
+        TestBody::message(b"ping"),
+        |headers| {
+            headers.insert("grpc-timeout", HeaderValue::from_static("500m"));
+        },
+    )
+    .await
+    .expect("a call whose deadline elapses must still be answered");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        result.grpc_status(),
+        "4",
+        "a 500ms deadline against a 5s upstream must be DEADLINE_EXCEEDED after {}ms; \
+         grpc-message was {}",
+        elapsed.as_millis(),
+        result.grpc_message()
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the deadline did not bound the wait for HEADERS: the call took {}ms against a 500ms \
+         deadline and a 5s upstream handler",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "the call failed in {}ms, before its own 500ms deadline: this test would pass against a \
+         gateway that refused the call for some other reason",
+        elapsed.as_millis()
+    );
+    assert!(
+        result.messages.is_empty(),
+        "an expired call must never carry a message envelope"
+    );
+}
+
+/// An expired deadline releases the route's call slot before HEADERS arrive.
+///
+/// The route admits exactly one call and queues none, so the second call is the
+/// instrument: if the first call's reservations are still held it comes back
+/// `RESOURCE_EXHAUSTED`/`queue_full`, and if they were released it is served.
+/// One idle stream taking the route's entire gRPC capacity is the exhaustion
+/// this pins -- at the default `max_concurrent_calls` of 256 it takes three
+/// connections' worth of streams to close a route to every other caller.
+#[tokio::test]
+async fn an_expired_deadline_releases_the_call_slot_before_headers_arrive() {
+    let upstream = spawn_probe_upstream(Duration::from_secs(30)).await;
+    let mut config = grpc_config(upstream.address, true);
+    with_grpc_settings(
+        &mut config,
+        config::UpstreamGrpcConfig {
+            max_concurrent_calls: 1,
+            queue_depth: 0,
+            queue_timeout_ms: 10,
+            max_duration_ms: 300,
+            idle_timeout_ms: 200,
+            ..default_grpc_settings()
+        },
+    );
+    let harness = spawn_gateway(config, upstream.address).await;
+    let grpc_addr = harness.grpc_addr();
+
+    let stalled = tokio::spawn(async move {
+        let started = Instant::now();
+        let result = grpc_call(
+            grpc_addr,
+            "/stall.Service/Hang",
+            TestBody::message(b"ping"),
+            |_| {},
+        )
+        .await;
+        (result, started.elapsed())
+    });
+
+    // Comfortably past the route's 300ms ceiling and nowhere near the 30s the
+    // upstream will take.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    let started = Instant::now();
+    let second = grpc_call(
+        grpc_addr,
+        "/acceptance.Service/Ping",
+        TestBody::message(b"ping"),
+        |_| {},
+    )
+    .await
+    .expect("the second call must be answered");
+    let second_elapsed = started.elapsed();
+
+    assert_eq!(
+        second.grpc_status(),
+        "0",
+        "a second call was refused after {}ms while the first call sat waiting for HEADERS it was \
+         no longer entitled to wait for; grpc-message was {}",
+        second_elapsed.as_millis(),
+        second.grpc_message()
+    );
+
+    let (first, first_elapsed) = stalled.await.expect("the stalled call task should finish");
+    let first = first.expect("the stalled call must be answered, not dropped");
+    assert_eq!(
+        first.grpc_status(),
+        "4",
+        "the route ceiling must end the call as DEADLINE_EXCEEDED after {}ms; grpc-message was {}",
+        first_elapsed.as_millis(),
+        first.grpc_message()
+    );
+    assert!(
+        first_elapsed < Duration::from_secs(3),
+        "the route's 300ms ceiling did not bound the wait for HEADERS: the call took {}ms",
+        first_elapsed.as_millis()
+    );
+}
+
+/// `connect_timeout_ms` bounds establishing a USABLE HTTP/2 connection.
+///
+/// Against a peer that accepts TCP and then says nothing, hyper's `handshake()`
+/// resolves as soon as the gateway's own preface is written and `ready()`
+/// resolves because a peer that has sent no SETTINGS has not constrained the
+/// stream count yet. So both complete against a peer that has not proved it
+/// speaks HTTP/2 at all, and the connect budget is spent on nothing.
+///
+/// The route's total-duration ceiling is set far above the connect budget so
+/// that the deadline cannot be what ends the call: the elapsed time and the
+/// reason together say which timer fired.
+#[tokio::test]
+async fn the_connect_budget_bounds_the_http2_handshake_not_only_the_tcp_connect() {
+    let (silent, accepts) = spawn_silent_peer().await;
+    let mut config = grpc_config(silent, true);
+    with_grpc_settings(
+        &mut config,
+        config::UpstreamGrpcConfig {
+            connect_timeout_ms: 1_000,
+            max_duration_ms: 30_000,
+            ..default_grpc_settings()
+        },
+    );
+    let harness = spawn_gateway(config, silent).await;
+
+    let started = Instant::now();
+    let result = grpc_call(
+        harness.grpc_addr(),
+        "/acceptance.Service/Ping",
+        TestBody::message(b"ping"),
+        |_| {},
+    )
+    .await
+    .expect("a call to an unusable peer must still be answered");
+    let elapsed = started.elapsed();
+
+    assert!(
+        accepts.load(Ordering::SeqCst) >= 1,
+        "the silent peer never accepted, so this test proved nothing"
+    );
+    assert_eq!(
+        result.grpc_message(),
+        "grpc_connect_timeout",
+        "a peer that never sent SETTINGS must exhaust the connect budget, not some later timer; \
+         the call took {}ms and reported grpc-status {}",
+        elapsed.as_millis(),
+        result.grpc_status()
+    );
+    assert_eq!(
+        result.grpc_status(),
+        "14",
+        "the connect budget elapsing is UNAVAILABLE, never the caller's DEADLINE_EXCEEDED"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the connect budget did not bound the handshake: 1000ms was configured and the call took \
+         {}ms",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "the call failed in {}ms, before its own 1000ms connect budget could elapse",
+        elapsed.as_millis()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Auth/RBAC exemptions on the gRPC listener (#333 review)
+// ---------------------------------------------------------------------------
+
+/// Creates a service token and points `config` at the store holding it.
+fn service_token_credential(config: &mut config::Config, store: &TempDb) -> String {
+    let token_store =
+        auth::tokens::SqliteTokenStore::open(&store.path).expect("token store should open");
+    let created = token_store
+        .create(auth::tokens::CreateTokenRequest {
+            scopes: vec!["grpc-client".to_owned()],
+            created_by: "grpc-acceptance".to_owned(),
+            expires_at: None,
+        })
+        .expect("service token should create");
+    config.service_token_sqlite_path = Some(store.path.to_string_lossy().into_owned());
+
+    created.plaintext_token
+}
+
+/// A gateway-owned exempt entry must not grant an unauthenticated upstream call
+/// on the gRPC listener.
+///
+/// `default_admin_exempt_paths` pushes `ADMIN_PREFIX` into both
+/// `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS`, exempt entries are
+/// segment-boundary prefixes, and `admin` and `Ping` are both valid protobuf
+/// identifiers -- so `/admin/Ping` passes the method grammar, matches the
+/// `/admin` exemption, and on the HTTP listener would then be refused by
+/// `is_gateway_owned_path` before the proxy. This listener has no such refusal
+/// unless it is written here.
+///
+/// Asserted by counting ACCEPTS. A status code says what the gateway told the
+/// client; only the accept count says whether it opened a connection to
+/// somebody else's server first.
+#[tokio::test]
+async fn a_gateway_owned_exempt_path_is_never_proxied_from_the_grpc_listener() {
+    let upstream = spawn_probe_upstream(Duration::ZERO).await;
+    let store = TempDb::new("grpc-exempt-upstream");
+    let mut config = grpc_config(upstream.address, true);
+    config.auth_enabled = true;
+    config.auth_mode = config::AuthMode::Required;
+    // The production defaults, restated here so this test fails if they change
+    // out from under it rather than silently stopping to cover the case.
+    assert!(
+        config.auth_exempt_paths.iter().any(|path| path == "/admin"),
+        "this test needs the default ADMIN_PREFIX exemption to be present"
+    );
+    assert!(
+        config.rbac_exempt_paths.iter().any(|path| path == "/admin"),
+        "this test needs the default ADMIN_PREFIX exemption to be present"
+    );
+    let token = service_token_credential(&mut config, &store);
+    let harness = spawn_gateway(config, upstream.address).await;
+
+    let exempt = grpc_call(
+        harness.grpc_addr(),
+        "/admin/Ping",
+        TestBody::message(b"ping"),
+        |_| {},
+    )
+    .await
+    .expect("the gRPC listener must answer rather than drop the connection");
+
+    assert_eq!(
+        upstream.accepts(),
+        0,
+        "an unauthenticated call on the default /admin exemption opened a connection to the \
+         upstream from the gRPC listener; grpc-status was {} ({})",
+        exempt.grpc_status(),
+        exempt.grpc_message()
+    );
+    assert_eq!(upstream.calls(), 0);
+    assert_eq!(harness.dns_calls(), 0);
+    assert_ne!(
+        exempt.grpc_status(),
+        "0",
+        "an unauthenticated call on an exempt path was served"
+    );
+
+    // The control, through the same listener, router and middleware stack: a
+    // real credential on a real method path does reach the upstream. Without it
+    // this test would also pass against a gateway that refused everything.
+    let allowed = grpc_call(
+        harness.grpc_addr(),
+        "/acceptance.Service/Ping",
+        TestBody::message(b"ping"),
+        |headers| {
+            headers.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {token}"))
+                    .expect("bearer value should build"),
+            );
+        },
+    )
+    .await
+    .expect("an authenticated call should be served");
+    assert_eq!(
+        allowed.grpc_status(),
+        "0",
+        "the control call was refused: {}",
+        allowed.grpc_message()
+    );
+    assert_eq!(upstream.accepts(), 1);
+    assert_eq!(upstream.calls(), 1);
+}
+
+/// An operator-added exempt entry must not become an unauthenticated gRPC
+/// service either.
+///
+/// This is the half `is_gateway_owned_path` cannot cover. `/public` is not
+/// gateway-owned, so it is exempt by the operator's deliberate choice -- a
+/// choice made about HTTP paths on the data listener. Read as a gRPC method
+/// path, the same entry exempts the whole service named `public`, on a
+/// different listener, with no second decision anywhere. The exempt lists
+/// therefore do not apply on the gRPC listener at all: nothing gateway-owned is
+/// served there, so an exemption there can only ever grant an unauthenticated
+/// upstream call.
+#[tokio::test]
+async fn an_operator_exempt_prefix_is_not_an_unauthenticated_grpc_service() {
+    let upstream = spawn_probe_upstream(Duration::ZERO).await;
+    let store = TempDb::new("grpc-exempt-operator");
+    let mut config = grpc_config(upstream.address, true);
+    config.auth_enabled = true;
+    config.auth_mode = config::AuthMode::Required;
+    config.auth_exempt_paths.push("/public".to_owned());
+    config.rbac_exempt_paths.push("/public".to_owned());
+    let token = service_token_credential(&mut config, &store);
+    let harness = spawn_gateway(config, upstream.address).await;
+
+    let exempt = grpc_call(
+        harness.grpc_addr(),
+        "/public/Ping",
+        TestBody::message(b"ping"),
+        |_| {},
+    )
+    .await
+    .expect("the gRPC listener must answer rather than drop the connection");
+
+    assert_eq!(
+        upstream.accepts(),
+        0,
+        "an HTTP path exemption became an unauthenticated gRPC service; grpc-status was {} ({})",
+        exempt.grpc_status(),
+        exempt.grpc_message()
+    );
+    assert_eq!(
+        exempt.grpc_status(),
+        "16",
+        "an unauthenticated call must be UNAUTHENTICATED; grpc-message was {}",
+        exempt.grpc_message()
+    );
+
+    // The control: the same path, with a credential, is served.
+    let allowed = grpc_call(
+        harness.grpc_addr(),
+        "/public/Ping",
+        TestBody::message(b"ping"),
+        |headers| {
+            headers.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {token}"))
+                    .expect("bearer value should build"),
+            );
+        },
+    )
+    .await
+    .expect("an authenticated call should be served");
+    assert_eq!(
+        allowed.grpc_status(),
+        "0",
+        "the control call was refused: {}",
+        allowed.grpc_message()
+    );
+    assert_eq!(upstream.accepts(), 1);
+}
+
+/// The deadline also bounds the wait for an admission slot.
+///
+/// The queue timeout bounds how long the QUEUE will hold a call. It is not the
+/// same question as how long the CALLER is still entitled to wait, and a call
+/// admitted after its own deadline has passed is a slot spent on nobody. The
+/// route here queues for five seconds and the client asks for three hundred
+/// milliseconds, so the two answers are three seconds apart and the elapsed
+/// time says which one was given.
+#[tokio::test]
+async fn a_client_deadline_bounds_the_wait_for_an_admission_slot() {
+    let upstream = spawn_probe_upstream(Duration::from_secs(30)).await;
+    let mut config = grpc_config(upstream.address, true);
+    with_grpc_settings(
+        &mut config,
+        config::UpstreamGrpcConfig {
+            max_concurrent_calls: 1,
+            queue_depth: 4,
+            queue_timeout_ms: 5_000,
+            // High enough that the ROUTE ceiling cannot be what ends either
+            // call: the bound under test is the queued caller's own.
+            max_duration_ms: 60_000,
+            idle_timeout_ms: 0,
+            ..default_grpc_settings()
+        },
+    );
+    let harness = spawn_gateway(config, upstream.address).await;
+    let grpc_addr = harness.grpc_addr();
+
+    // Takes the route's only slot and holds it: the upstream will not answer
+    // for thirty seconds and this call is entitled to wait sixty.
+    let holder = tokio::spawn(async move {
+        grpc_call(
+            grpc_addr,
+            "/stall.Service/Hold",
+            TestBody::message(b"ping"),
+            |_| {},
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let started = Instant::now();
+    let queued = grpc_call(
+        grpc_addr,
+        "/acceptance.Service/Ping",
+        TestBody::message(b"ping"),
+        |headers| {
+            headers.insert("grpc-timeout", HeaderValue::from_static("300m"));
+        },
+    )
+    .await
+    .expect("a queued call whose deadline elapses must still be answered");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        queued.grpc_status(),
+        "4",
+        "a queued call whose own deadline elapsed must be DEADLINE_EXCEEDED, not the queue's \
+         answer; it took {}ms and reported {}",
+        elapsed.as_millis(),
+        queued.grpc_message()
+    );
+    assert_eq!(
+        queued.grpc_message(),
+        "deadline_exceeded",
+        "the queued call was refused by the wrong check after {}ms",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed < Duration::from_millis(2_000),
+        "the deadline did not bound the queue wait: 300ms was asked for, the queue timeout is \
+         5000ms, and the call took {}ms",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "the call was refused in {}ms, before its own 300ms deadline",
+        elapsed.as_millis()
+    );
+
+    holder.abort();
+}
+
+/// The headers wait and the streaming phase share ONE budget.
+///
+/// The upstream answers after 500ms with HEADERS and one message and then goes
+/// quiet forever, and the client asks for 1200ms. One budget ends the call
+/// 1200ms after it started. A budget re-armed when the response body is built
+/// would end it 500ms later than that, which is what a deadline that each phase
+/// gets a fresh copy of looks like from outside.
+#[tokio::test]
+async fn the_headers_wait_and_the_streaming_phase_share_one_deadline() {
+    let upstream = spawn_probe_upstream(Duration::from_millis(500)).await;
+    let mut config = grpc_config(upstream.address, true);
+    with_grpc_settings(
+        &mut config,
+        config::UpstreamGrpcConfig {
+            max_duration_ms: 60_000,
+            idle_timeout_ms: 0,
+            ..default_grpc_settings()
+        },
+    );
+    let harness = spawn_gateway(config, upstream.address).await;
+
+    // `stall.` makes the handler wait 500ms before HEADERS; `quiet` makes the
+    // response body never end. Both, so the budget is genuinely split across
+    // the two phases: 500ms of the 1200ms is spent before HEADERS arrive, and
+    // a re-armed timer would therefore expire 500ms late.
+    let started = Instant::now();
+    let result = grpc_call(
+        harness.grpc_addr(),
+        "/stall.quiet_Service/Trickle",
+        TestBody::message(b"ping"),
+        |headers| {
+            headers.insert("grpc-timeout", HeaderValue::from_static("1200m"));
+        },
+    )
+    .await
+    .expect("a call whose deadline elapses mid-stream must still be answered");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        result.grpc_status(),
+        "4",
+        "a stream that never ends must be ended by the deadline after {}ms; grpc-message was {}",
+        elapsed.as_millis(),
+        result.grpc_message()
+    );
+    assert_eq!(
+        result.messages,
+        vec![b"pong".to_vec()],
+        "the message the upstream did send must still reach the client"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1_500),
+        "the streaming phase was given a fresh budget: one 1200ms deadline was armed, 500ms of it \
+         was spent waiting for HEADERS, and the call took {}ms",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1_100),
+        "the call ended after {}ms, before its own 1200ms deadline",
+        elapsed.as_millis()
+    );
+}
+
+/// A peer that sends SETTINGS late and then admits no streams at all.
+///
+/// `delay` passes before the SETTINGS frame is written, and the frame sets
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` to zero, so `SendRequest::ready()` has
+/// nothing to become ready for. Written by hand rather than with an h2 server
+/// because no server implementation will advertise zero.
+async fn spawn_saturated_peer(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("saturated peer should bind");
+    let address = listener
+        .local_addr()
+        .expect("saturated peer address should be available");
+
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::time::sleep(delay).await;
+            // length(3)=6 type(1)=SETTINGS flags(1)=0 stream(4)=0, then one
+            // setting: identifier 0x0003 (MAX_CONCURRENT_STREAMS), value 0.
+            let settings: [u8; 15] = [0, 0, 6, 0x04, 0x00, 0, 0, 0, 0, 0x00, 0x03, 0, 0, 0, 0];
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &settings).await;
+            let _ = tokio::io::AsyncWriteExt::flush(&mut stream).await;
+            held.push(stream);
+        }
+    });
+
+    address
+}
+
+/// A saturated upstream is bounded by the CALL DEADLINE, not by the connect
+/// budget.
+///
+/// This corrects a claim, and the correction is the reason the test exists.
+/// `hyper::client::conn::http2::SendRequest::poll_ready` (hyper 1.10.1,
+/// `src/client/conn/http2.rs:96-103`) discards its `Context` and answers
+/// `Ready(Ok(()))` whenever the connection is not closed. It never consults
+/// `SETTINGS_MAX_CONCURRENT_STREAMS`, so `ready()` cannot wait for stream
+/// capacity and `connect_timeout_ms` cannot bound acquiring it. What actually
+/// happens against an upstream admitting no streams is that the request is
+/// accepted, queued inside h2, and its response future stays pending -- the
+/// same shape as any other upstream that has not sent HEADERS.
+///
+/// So the bound is the deadline, and the connect budget is set far above it
+/// here to prove which one fired. Before the deadline covered the pre-HEADERS
+/// window this call was unbounded, ending only when the 30s keep-alive and its
+/// 10s grace closed the connection.
+#[tokio::test]
+async fn a_saturated_upstream_is_bounded_by_the_call_deadline() {
+    let saturated = spawn_saturated_peer(Duration::ZERO).await;
+    let mut config = grpc_config(saturated, true);
+    with_grpc_settings(
+        &mut config,
+        config::UpstreamGrpcConfig {
+            connect_timeout_ms: 20_000,
+            max_duration_ms: 1_000,
+            idle_timeout_ms: 0,
+            ..default_grpc_settings()
+        },
+    );
+    let harness = spawn_gateway(config, saturated).await;
+
+    let started = Instant::now();
+    let result = grpc_call(
+        harness.grpc_addr(),
+        "/acceptance.Service/Ping",
+        TestBody::message(b"ping"),
+        |_| {},
+    )
+    .await
+    .expect("a call to a saturated peer must still be answered");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        result.grpc_status(),
+        "4",
+        "an upstream admitting no streams must be ended by the route's own ceiling after {}ms; \
+         grpc-message was {}",
+        elapsed.as_millis(),
+        result.grpc_message()
+    );
+    assert_eq!(result.grpc_message(), "deadline_exceeded");
+    assert!(
+        elapsed < Duration::from_millis(3_000),
+        "a saturated upstream was not bounded: the route ceiling is 1000ms and the call took {}ms",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "the call ended after {}ms, before the route's own 1000ms ceiling",
+        elapsed.as_millis()
+    );
+}
+
+/// The RBAC exempt list does not apply on the gRPC listener either.
+///
+/// Separate from the authentication case because the two lists are consulted by
+/// different middlewares and cleared independently, so one test cannot cover
+/// both: a credential is supplied here precisely so that authentication passes
+/// and the only remaining question is whether policy was consulted.
+#[tokio::test]
+async fn an_exempt_prefix_does_not_skip_policy_on_the_grpc_listener() {
+    let upstream = spawn_probe_upstream(Duration::ZERO).await;
+    let store = TempDb::new("grpc-exempt-rbac");
+    let policy = TempPolicyFile::new(
+        &serde_json::json!({
+            "schema_version": "0.1.0",
+            "id": "grpc-exempt-rbac",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {
+                "grpc-client": { "permissions": ["grpc:call"] }
+            },
+            "routes": [
+                {
+                    "methods": ["POST"],
+                    "path_prefix": "/acceptance.Service",
+                    "permission": "grpc:call"
+                }
+            ]
+        })
+        .to_string(),
+    );
+    let mut config = grpc_config(upstream.address, true);
+    config.auth_enabled = true;
+    config.auth_mode = config::AuthMode::Required;
+    config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+    config.rbac_exempt_paths.push("/public".to_owned());
+    let token = service_token_credential(&mut config, &store);
+    let harness = spawn_gateway(config, upstream.address).await;
+
+    let authenticate = |headers: &mut HeaderMap| {
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer value should build"),
+        );
+    };
+
+    let exempt = grpc_call(
+        harness.grpc_addr(),
+        "/public/Ping",
+        TestBody::message(b"ping"),
+        authenticate,
+    )
+    .await
+    .expect("the gRPC listener must answer rather than drop the connection");
+
+    assert_eq!(
+        upstream.accepts(),
+        0,
+        "an RBAC exemption proxied an unauthorized call from the gRPC listener; grpc-status was \
+         {} ({})",
+        exempt.grpc_status(),
+        exempt.grpc_message()
+    );
+    assert_eq!(
+        exempt.grpc_status(),
+        "7",
+        "a call the policy denies must be PERMISSION_DENIED; grpc-message was {}",
+        exempt.grpc_message()
+    );
+
+    // The control: the same credential on a path the policy allows is served,
+    // so the denial above is about the exemption rather than about a policy
+    // that denies everything.
+    let allowed = grpc_call(
+        harness.grpc_addr(),
+        "/acceptance.Service/Ping",
+        TestBody::message(b"ping"),
+        authenticate,
+    )
+    .await
+    .expect("an authorized call should be served");
+    assert_eq!(
+        allowed.grpc_status(),
+        "0",
+        "the control call was refused: {}",
+        allowed.grpc_message()
+    );
+    assert_eq!(upstream.accepts(), 1);
+}
+
+// Keeps the unused-import lint honest: `HashSet` is used by `test_config`'s
 /// surrounding module rather than by this file.
 #[allow(dead_code)]
 fn _unused(_: HashSet<u8>) {}

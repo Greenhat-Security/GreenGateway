@@ -2036,7 +2036,7 @@ fn gateway_app_with_process_started_at_and_overrides(
 /// layers, in the same order, so a gRPC call is subject to exactly the
 /// decisions an HTTP request is.
 ///
-/// Two things differ, and both are narrowings:
+/// Three things differ, and all three are narrowings:
 ///
 /// * Request validation is given the gRPC media types as its allow-list instead
 ///   of the deployment's HTTP list. This listener serves one protocol, so
@@ -2044,9 +2044,49 @@ fn gateway_app_with_process_started_at_and_overrides(
 /// * The router carries NO admin routes and no gateway-owned probe routes. Its
 ///   only route is a fallback into the gRPC proxy, which refuses any route
 ///   without an explicit `grpc` policy block.
+/// * `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` do not apply here at all. See
+///   below -- this one is a security property, not a convenience.
 ///
 /// One layer is added, outermost, so it wraps everything above: the middleware
 /// stack answers in HTTP, and a gRPC client needs a gRPC status.
+///
+/// # Why the exempt lists are dropped on this listener
+///
+/// The exempt lists exist to let gateway-owned surfaces through without a
+/// credential: the admin UI and its assets, the admin login callback, the fixed
+/// probe routes. #306 settled the rule that makes them safe -- *a gateway-owned
+/// exempt entry can only grant exemptions inside gateway-owned space* -- and
+/// the startup warning at [`GatewayRoutes::unowned_exempt_paths`] filters
+/// gateway-owned entries out on exactly that reasoning.
+///
+/// None of it holds here. This listener serves ONE thing, a fallback into the
+/// gRPC proxy; there is no gateway-owned space on it for an exemption to land
+/// in. So every exemption that matches on this listener, without exception, is
+/// an unauthenticated and unauthorized call proxied to an upstream:
+///
+/// * `default_admin_exempt_paths` puts `ADMIN_PREFIX` in both lists by default,
+///   and entries are segment-boundary prefixes, so the default configuration
+///   exempts `/admin/<Method>` -- which is a well-formed gRPC method path,
+///   because `admin` and `Method` are both valid protobuf identifiers. The
+///   operator gets no warning, because the entry IS gateway-owned and the
+///   warning's premise is that a gateway-owned entry cannot be forwarded.
+/// * An operator-added entry such as `/public`, written about HTTP paths on the
+///   data listener, silently reads on this listener as "the gRPC service named
+///   `public` needs no credential". One decision, two protocols, two listeners.
+///
+/// An exemption mechanism whose every match is a bypass is not a mechanism with
+/// a bug in it. So the lists are emptied for this router, explicitly and in one
+/// place, rather than each hole being patched as it is found. A deployment that
+/// genuinely needs an unauthenticated gRPC method -- a load balancer calling
+/// `grpc.health.v1.Health/Check`, say -- needs a setting that names canonical
+/// method paths and is matched exactly, on this listener only; that is a
+/// deliberate follow-up, not something to reach by leaving an HTTP path list
+/// applying here.
+///
+/// `CSRF_EXEMPT_PATHS` is deliberately NOT emptied. CSRF exemption grants
+/// nothing on its own -- an exempt call still has to authenticate and still has
+/// to pass policy -- so it is not the same defect class, and it is the
+/// documented way an operator relieves gRPC clients of the CSRF rule.
 fn grpc_app(
     config: &config::Config,
     app_state: &AppState,
@@ -2064,8 +2104,14 @@ fn grpc_app(
         csrf_config: middleware_stack.csrf_config.clone(),
         rate_limit_state: middleware_stack.rate_limit_state.clone(),
         observation_state: middleware_stack.observation_state.clone(),
-        rbac_state: middleware_stack.rbac_state.clone(),
-        auth_state: middleware_stack.auth_state.clone(),
+        rbac_state: middleware_stack.rbac_state.clone().map(|mut state| {
+            state.exempt_paths = Vec::new();
+            state
+        }),
+        auth_state: middleware_stack.auth_state.clone().map(|mut state| {
+            state.exempt_paths = Vec::new();
+            state
+        }),
         proxy_dispatch_state: middleware_stack.proxy_dispatch_state.clone(),
     };
 
@@ -2086,6 +2132,27 @@ fn grpc_app(
 
 async fn grpc_endpoint(State(state): State<AppState>, request: AxumRequest) -> Response {
     record_request(GRPC_FALLBACK_ROUTE);
+
+    // The same pair of refusals `proxy_fallback` makes, for the same reasons,
+    // and stated here rather than inherited because this is a different router
+    // with a different fallback. `grpc_app` also empties the auth and RBAC
+    // exempt lists for this listener, which is the primary fix; this is the
+    // defence in depth behind it, and it holds even if some future caller
+    // reaches `handle_call` by another route.
+    //
+    // `is_gateway_owned_path` matters here for a reason that is easy to miss:
+    // a gateway-owned path on THIS listener is not gateway-owned by anything.
+    // The router serves no admin, probe or well-known routes, so without this
+    // the gateway's own reserved namespace is simply proxy space -- and
+    // `proxy_dispatch_context_middleware` skips route classification for those
+    // paths on the premise that they never reach a proxy.
+    let path = request.uri().path();
+    if path_match::is_unsafe_request_path(path) {
+        return proxy::grpc::not_proxyable_response("unsafe_path");
+    }
+    if state.routes.is_gateway_owned_path(path) {
+        return proxy::grpc::not_proxyable_response("gateway_owned_path");
+    }
 
     let Some(proxy) = state.proxy.as_ref() else {
         // No proxy configured at all. Answered as a gRPC status rather than a

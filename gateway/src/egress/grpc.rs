@@ -396,10 +396,15 @@ impl EgressClient {
     ///
     /// The destination is revalidated here through exactly the helper the
     /// pinned reqwest clients use, so this transport cannot be handed a
-    /// destination the ordinary path would reject. `connect_timeout` bounds
-    /// establishing a connection and acquiring stream capacity on an existing
-    /// one; it does not bound the call, because a bidirectional stream has no
-    /// total duration the transport could know. The caller owns that.
+    /// destination the ordinary path would reject.
+    ///
+    /// `connect_timeout` is ONE budget covering establishing a usable HTTP/2
+    /// connection -- TCP, TLS, and the peer's own connection preface -- rather
+    /// than one budget per step. It does NOT bound the call: a bidirectional
+    /// stream has no total duration the transport could know, and
+    /// `send_request` below resolves only when the upstream sends response
+    /// HEADERS. Nothing in this file bounds that wait, so the caller must arm
+    /// its deadline before calling here.
     pub(crate) async fn grpc_call_at_checked_destination(
         &self,
         destination: &CheckedEgressDestination,
@@ -408,6 +413,12 @@ impl EgressClient {
         body: GrpcRequestBody,
         connect_timeout: Duration,
     ) -> Result<GrpcResponse, EgressError> {
+        // One deadline, computed once, shared by connecting and by acquiring
+        // stream capacity. Two separate `timeout(connect_timeout, ..)` calls
+        // would let a single call spend the operator's budget twice, which is
+        // not what "budget for establishing a connection and acquiring stream
+        // capacity" says.
+        let connect_deadline = tokio::time::Instant::now() + connect_timeout;
         let (parsed, host, port) = self.revalidated_destination(destination, url)?;
 
         let key = ConnectionKey {
@@ -443,8 +454,8 @@ impl EgressClient {
                     sender.clone()
                 }
                 _ => {
-                    let sender = tokio::time::timeout(
-                        connect_timeout,
+                    let sender = tokio::time::timeout_at(
+                        connect_deadline,
                         self.connect_grpc(&parsed, &host, destination.pinned_addr),
                     )
                     .await
@@ -462,11 +473,24 @@ impl EgressClient {
         .increment(1);
 
         let mut sender = sender;
-        // `ready()` is where the upstream's SETTINGS_MAX_CONCURRENT_STREAMS is
-        // respected: it does not resolve until the connection can carry another
-        // stream. Bounding it with the connect budget means a saturated upstream
-        // surfaces as a bounded failure instead of an unbounded wait.
-        tokio::time::timeout(connect_timeout, sender.ready())
+        // What `ready()` actually does here, stated plainly because it is less
+        // than its name suggests: `SendRequest::poll_ready` (hyper 1.10.1,
+        // `src/client/conn/http2.rs:96-103`) discards its `Context` and returns
+        // `Ready(Ok(()))` unless the connection is closed. It does NOT consult
+        // the upstream's `SETTINGS_MAX_CONCURRENT_STREAMS`, so this is a
+        // liveness check on a pooled connection and nothing else.
+        //
+        // The consequence is worth naming: a saturated upstream is NOT bounded
+        // by the connect budget. hyper accepts the request, h2 queues it, and
+        // the response future stays pending -- the same shape as any other
+        // upstream that has not sent HEADERS, and bounded by the same thing,
+        // the caller's deadline in `proxy::grpc`.
+        //
+        // The timeout stays because it costs nothing and a future hyper that
+        // makes `poll_ready` genuinely pend must not reintroduce an unbounded
+        // wait here. It has no test, for the honest reason that hyper cannot
+        // currently trip it.
+        tokio::time::timeout_at(connect_deadline, sender.ready())
             .await
             .map_err(|_| transport_error(GrpcFailure::ConnectTimeout))?
             .map_err(|error| transport_error(classify(&error)))?;
@@ -534,22 +558,40 @@ impl EgressClient {
                 if stream.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
                     return Err(transport_error(GrpcFailure::AlpnNotH2));
                 }
-                self.handshake_grpc(TokioIo::new(stream)).await
+                self.handshake_grpc(stream).await
             }
             // h2c prior knowledge. The deployment contract for plaintext gRPC
             // is a terminator in front of the gateway, documented in
             // docs/deployment/grpc.md.
-            _ => self.handshake_grpc(TokioIo::new(tcp)).await,
+            _ => self.handshake_grpc(tcp).await,
         }
     }
 
+    /// Completes the HTTP/2 handshake in both directions.
+    ///
+    /// `hyper`'s `handshake()` resolves once the GATEWAY's connection preface
+    /// and SETTINGS have been written. It does not wait for the peer's, and
+    /// neither does `SendRequest::ready()` -- a peer that has stated no
+    /// SETTINGS_MAX_CONCURRENT_STREAMS has not constrained anything, so
+    /// `ready()` has nothing to wait for. A peer that accepts TCP and then says
+    /// nothing therefore passes both, and `connect_timeout_ms` is spent before
+    /// the peer has proved it speaks HTTP/2 at all; the call then hangs on
+    /// response HEADERS until some unrelated timer -- the 30s keep-alive plus
+    /// its 10s grace -- notices.
+    ///
+    /// So the peer's own connection preface is waited for here, inside the
+    /// caller's connect budget. RFC 9113 section 3.4 requires the server's
+    /// first frame to be a SETTINGS frame, which makes "the peer sent a
+    /// complete SETTINGS frame" the earliest checkable proof that there is an
+    /// HTTP/2 implementation on the other end.
     async fn handshake_grpc<T>(
         &self,
         io: T,
     ) -> Result<hyper::client::conn::http2::SendRequest<GrpcRequestBody>, EgressError>
     where
-        T: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        let (io, peer_preface) = PrefaceObserver::wrap(io);
         let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
         let (sender, connection) = builder
             .timer(TokioTimer::new())
@@ -560,7 +602,7 @@ impl EgressClient {
             .max_concurrent_reset_streams(CLIENT_MAX_CONCURRENT_RESET_STREAMS)
             .keep_alive_interval(Some(Duration::from_secs(30)))
             .keep_alive_timeout(Duration::from_secs(10))
-            .handshake(io)
+            .handshake(TokioIo::new(io))
             .await
             .map_err(|_| transport_error(GrpcFailure::Handshake))?;
 
@@ -569,6 +611,9 @@ impl EgressClient {
         // that waited for an idle pooled connection would never finish. It ends
         // when the last sender is dropped and the last stream completes, which
         // forced shutdown produces by cancelling the call tasks.
+        //
+        // It is also what reads, so it has to be running before the peer's
+        // preface can arrive.
         tokio::spawn(async move {
             if let Err(error) = connection.await {
                 tracing::debug!(
@@ -578,7 +623,172 @@ impl EgressClient {
             }
         });
 
+        // A closed channel means the observer was dropped without seeing a
+        // SETTINGS frame -- the connection ended, or the peer's first frame was
+        // something else. Either way there is no usable HTTP/2 connection here.
+        // A caller whose budget elapses first drops this future instead, and
+        // `sender` goes with it, so a connection that never proved itself is
+        // never pooled.
+        peer_preface
+            .await
+            .map_err(|_| transport_error(GrpcFailure::Handshake))?;
+
         Ok(sender)
+    }
+}
+
+/// Watches a connection's inbound bytes for the peer's HTTP/2 connection
+/// preface, and reports when a complete SETTINGS frame has been read.
+///
+/// It sits under `TokioIo` rather than over it so it can work in terms of
+/// `tokio::io::ReadBuf`, whose `filled()` makes the bytes just read readable
+/// without a copy and without `unsafe`. Once the frame is complete the wrapper
+/// stops inspecting and is a pass-through for the life of the connection.
+struct PrefaceObserver<T> {
+    inner: T,
+    /// `None` once the peer's preface has been seen, or once it has been
+    /// judged impossible.
+    scan: Option<PrefaceScan>,
+    /// Dropped without sending if the connection ends first, which is what
+    /// turns "the peer never proved itself" into a failure the caller can see.
+    signal: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// Progress through the peer's first frame header and payload.
+struct PrefaceScan {
+    header: [u8; FRAME_HEADER_BYTES],
+    header_filled: usize,
+    payload_remaining: usize,
+}
+
+/// An HTTP/2 frame header is nine bytes: length(3) type(1) flags(1) id(4).
+const FRAME_HEADER_BYTES: usize = 9;
+/// The `SETTINGS` frame type.
+const SETTINGS_FRAME_TYPE: u8 = 0x4;
+
+impl<T> PrefaceObserver<T> {
+    fn wrap(inner: T) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let observer = Self {
+            inner,
+            scan: Some(PrefaceScan {
+                header: [0; FRAME_HEADER_BYTES],
+                header_filled: 0,
+                payload_remaining: 0,
+            }),
+            signal: Some(sender),
+        };
+
+        (observer, receiver)
+    }
+
+    /// Feeds freshly read bytes to the scan.
+    ///
+    /// Deliberately tolerant of fragmentation: the peer's SETTINGS frame can
+    /// arrive across any number of reads, and a scan that assumed one read per
+    /// frame would report a healthy peer as a failure under a small MTU.
+    fn observe(&mut self, mut bytes: &[u8]) {
+        let Some(scan) = self.scan.as_mut() else {
+            return;
+        };
+
+        while !bytes.is_empty() {
+            if scan.header_filled < FRAME_HEADER_BYTES {
+                let wanted = FRAME_HEADER_BYTES - scan.header_filled;
+                let taken = wanted.min(bytes.len());
+                scan.header[scan.header_filled..scan.header_filled + taken]
+                    .copy_from_slice(&bytes[..taken]);
+                scan.header_filled += taken;
+                bytes = &bytes[taken..];
+                if scan.header_filled < FRAME_HEADER_BYTES {
+                    return;
+                }
+                if scan.header[3] != SETTINGS_FRAME_TYPE {
+                    // Not an HTTP/2 server preface. Dropping the sender fails
+                    // the caller rather than waiting out its budget on a peer
+                    // that has already answered the question.
+                    self.scan = None;
+                    self.signal = None;
+                    return;
+                }
+                scan.payload_remaining = usize::from(scan.header[0]) << 16
+                    | usize::from(scan.header[1]) << 8
+                    | usize::from(scan.header[2]);
+            }
+
+            let taken = scan.payload_remaining.min(bytes.len());
+            scan.payload_remaining -= taken;
+            bytes = &bytes[taken..];
+            if scan.payload_remaining == 0 {
+                self.scan = None;
+                if let Some(signal) = self.signal.take() {
+                    let _ = signal.send(());
+                }
+                return;
+            }
+        }
+    }
+}
+
+impl<T> tokio::io::AsyncRead for PrefaceObserver<T>
+where
+    T: tokio::io::AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let observing = self.scan.is_some();
+        let before = buffer.filled().len();
+        let polled = Pin::new(&mut self.inner).poll_read(context, buffer);
+        if observing && matches!(polled, Poll::Ready(Ok(()))) {
+            let read = buffer.filled()[before..].to_vec();
+            if !read.is_empty() {
+                self.observe(&read);
+            }
+        }
+
+        polled
+    }
+}
+
+impl<T> tokio::io::AsyncWrite for PrefaceObserver<T>
+where
+    T: tokio::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(context, buffers)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
     }
 }
 

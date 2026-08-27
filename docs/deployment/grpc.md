@@ -71,8 +71,11 @@ A route carries gRPC only if it declares a `grpc` policy block. A route without 
 Every field has a default; the block may be `{}`. Notable ones:
 
 - **`max_concurrent_calls` counts CALLS, not connections.** gRPC multiplexes many streams over one connection, so a connection count would bound nothing. This is a separate admission pool from the route's HTTP `limits.max_in_flight`, because a streaming call can hold its slot for an hour and sharing the pool would let a few streams starve the route's HTTP traffic.
-- **`max_duration_ms` is also the cap on a client's `grpc-timeout`.** A client asking for two hours on a route whose ceiling is five minutes gets five minutes, and the value forwarded upstream is the gateway's, never the client's bytes. `0` disables the ceiling, in which case an uncapped client deadline is honoured.
-- **`idle_timeout_ms`** is measured on the upstream-to-client direction, which is where a stalled server shows up. `0` disables it.
+- **`connect_timeout_ms` is one budget for establishing a usable HTTP/2 connection**: the TCP connect, the TLS handshake, and the peer's own connection preface. The last of those is load-bearing rather than pedantic. `hyper`'s client handshake resolves once the *gateway's* preface has been written, so a peer that accepts a socket and then says nothing passes it; the gateway therefore waits for the peer's first SETTINGS frame, which RFC 9113 §3.4 requires a server to send first, before it will call the connection usable. It is *not* a budget for acquiring stream capacity — see the note under `max_duration_ms`.
+- **`max_duration_ms` is the ceiling on one call's total duration, measured from admission, and the cap applied to a client's `grpc-timeout`.** The effective deadline is the smaller of the two, and it is armed before the gateway connects: it covers the admission queue, the wait for the upstream's response HEADERS, and the streaming phase, as ONE budget that the phases share. A client asking for two hours on a route whose ceiling is five minutes gets five minutes, both as the value forwarded upstream and as the timer the gateway itself enforces. `0` disables the ceiling, in which case an uncapped client deadline is honoured — and a call with **no** `grpc-timeout` on a route with `max_duration_ms: 0` has no total-duration bound at all, which is what disabling it means.
+
+  This is also the bound that applies when an upstream has no stream capacity left. `hyper`'s `SendRequest::ready()` reports only whether the connection is closed; it does not wait for `SETTINGS_MAX_CONCURRENT_STREAMS` credit, so a saturated upstream is not distinguishable here from a slow one, and both are bounded by the deadline rather than by `connect_timeout_ms`.
+- **`idle_timeout_ms`** is measured on the upstream-to-client direction, which is where a stalled server shows up, and it starts when the upstream's response HEADERS arrive. It deliberately does **not** run while the gateway is waiting for those HEADERS: for a client-streaming call the response direction is legitimately silent for the whole upload, and an idle timer there would cancel healthy slow uploads. `max_duration_ms` is what bounds that window. `0` disables it.
 - **`max_message_bytes`** applies to the *encoded* message — the length declared in the five-byte gRPC envelope — in both directions, and is enforced on the declaration rather than after the bytes have been forwarded.
 - **`max_metadata_entries`** bounds the *count* of metadata entries, in headers and trailers independently. `GRPC_MAX_METADATA_BYTES` bounds their size; a byte budget does not constrain a count.
 
@@ -82,9 +85,19 @@ Every field has a default; the block may be `{}`. Notable ones:
 
 The gRPC listener runs the identical middleware stack as the data listener — the same `apply_middleware` call, with the same value: authentication, rate limiting, CSRF, request validation, route classification, RBAC, and direct policy, in the same order.
 
-Two consequences worth planning for:
+Three consequences worth planning for:
 
-- **CSRF applies.** A gRPC call must carry a bearer credential in `authorization` metadata, be on a `CSRF_EXEMPT_PATHS` entry, or run with `CSRF_ENABLED=false`. This is the same rule non-browser HTTP clients already follow.
+- **`AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` do not apply on this listener.** Every gRPC call needs a credential and has to pass policy, with no exceptions and no way to configure one.
+
+  The reason is that an exemption here could not do the job it exists for. Those lists let *gateway-owned* surfaces through without a credential — the admin UI and its assets, the admin login callback, the fixed probe routes — and this listener serves none of them. Its only route is the gRPC proxy, so an exemption that matched on it would grant exactly one thing: an unauthenticated, unauthorized call forwarded to an upstream.
+
+  That is not hypothetical. `ADMIN_PREFIX` is in both lists by default, entries are segment-boundary prefixes, and `/admin/Ping` is a well-formed gRPC method path — so on the HTTP listener the default configuration exempts the admin UI, and on the gRPC listener the same entry would have exempted a service named `admin`. An operator-added entry such as `/public`, written about HTTP paths, would likewise have read here as "the gRPC service named `public` needs no credential". One decision, silently applying to two protocols on two sockets.
+
+  If you need an unauthenticated gRPC method — a load balancer calling `grpc.health.v1.Health/Check`, say — there is no setting for it today. Put the health check in front of the gateway, or expose it on a separate listener. A setting naming canonical method paths, matched exactly and scoped to this listener, is the right shape and is not yet implemented; reusing the HTTP path lists is not.
+
+  The gateway's own reserved namespace is refused on this listener too, before the method grammar runs: a call to `/admin/Ping`, `/health`, or any other gateway-owned path is answered `UNIMPLEMENTED` (12) and never forwarded, exactly as the HTTP data listener answers `404` for the same paths.
+
+- **CSRF applies**, and `CSRF_EXEMPT_PATHS` **does** still apply here. A gRPC call must carry a bearer credential in `authorization` metadata, be on a `CSRF_EXEMPT_PATHS` entry, or run with `CSRF_ENABLED=false`. This is the same rule non-browser HTTP clients already follow. CSRF exemption is left in place because it grants nothing on its own: an exempt call still has to authenticate and still has to pass policy.
 - **Authorization is by method path.** The canonical identity is `/package.Service/Method`, which is the HTTP path, so existing RBAC path rules apply to it directly:
 
 ```json
@@ -121,8 +134,9 @@ A call refused before it reached the endpoint produces a protocol-correct **trai
 | Malformed method path, content type, `TE`, `grpc-timeout`, or framing | `INVALID_ARGUMENT` (3) or `INTERNAL` (13) |
 | No route, or a route with no `grpc` policy block | `UNIMPLEMENTED` (12) |
 | Draining, no healthy endpoint, endpoint unreachable, upstream misbehaving | `UNAVAILABLE` (14) |
-| The call's own deadline elapsed | `DEADLINE_EXCEEDED` (4) |
-| A path that is not a gRPC method path at all -- every gateway-owned probe path included, since this listener serves none of them | `INVALID_ARGUMENT` (3) |
+| The call's own deadline elapsed -- in the admission queue, waiting for the upstream's response HEADERS, or mid-stream | `DEADLINE_EXCEEDED` (4) |
+| A path inside the gateway's own reserved namespace, or an unsafe raw path | `UNIMPLEMENTED` (12) |
+| A path that is not a gRPC method path at all | `INVALID_ARGUMENT` (3) |
 | The client went away mid-stream | `CANCELLED` (1) |
 
 An upstream `grpc-status` is preserved verbatim **only** after an authenticated, authorized call reached the selected endpoint and the upstream answered HTTP 200 with a gRPC content type. That holds for both shapes an upstream can use: a status in the trailers after messages, and a Trailers-Only answer with the status in the HEADERS frame. Anything else is the gateway's own status.

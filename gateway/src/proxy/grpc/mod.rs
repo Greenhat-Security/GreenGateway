@@ -321,6 +321,18 @@ async fn attempt_call(
     // 4. Deadline. The client's `grpc-timeout` is parsed strictly and then
     //    capped by the route ceiling; the value forwarded upstream is the
     //    gateway's, never the client's bytes.
+    //
+    //    The timer is ARMED HERE, and the same timer is then carried through
+    //    admission, the wait for the upstream's response HEADERS, and the
+    //    streaming phase. Arming it where the response body is built -- after
+    //    the egress call has already returned -- would leave the entire window
+    //    between admission and the upstream's first HEADERS frame with no timer
+    //    on it, while the admission permit, the endpoint slot and the
+    //    response-stream registration are all held; and it would then hand the
+    //    streaming phase a fresh full budget, so one call could outlive its own
+    //    deadline twice over. That window is not an edge case: grpc-go and
+    //    tonic send response HEADERS when the handler returns, so a unary RPC
+    //    spends essentially all of its life in it.
     // ---------------------------------------------------------------
     let deadline = match parts.headers.get(GRPC_TIMEOUT) {
         Some(value) => {
@@ -334,6 +346,7 @@ async fn attempt_call(
         None => runtime.max_duration,
     };
     trace.deadline_ms = deadline.map(crate::duration_millis);
+    let mut deadline_timer = deadline.map(|deadline| Box::pin(tokio::time::sleep(deadline)));
 
     // ---------------------------------------------------------------
     // 5. Lifecycle gate, mirroring the ordinary forwarding path.
@@ -346,12 +359,17 @@ async fn attempt_call(
     }
 
     // ---------------------------------------------------------------
-    // 6. Admission, raced against background cancellation.
+    // 6. Admission, raced against background cancellation and against the
+    //    call's own deadline. A call whose deadline has already elapsed must
+    //    not take a slot: the queue timeout bounds how long the QUEUE will hold
+    //    a call, which is a different question from how long the CALLER is
+    //    still entitled to wait.
     // ---------------------------------------------------------------
     let shutdown = proxy.lifecycle.background_cancellation();
     let admission_result = tokio::select! {
         biased;
         () = shutdown.cancelled_owned() => return Err(shutdown_denial()),
+        () = deadline_elapsed(&mut deadline_timer) => return Err(deadline_denial()),
         result = runtime.admission.acquire() => result,
     };
     let admission_permit = admission_result.map_err(|error| {
@@ -445,9 +463,23 @@ async fn attempt_call(
             )
             .await
     };
+    // `send_request` inside `call` resolves only when the upstream sends
+    // response HEADERS, and nothing inside the egress boundary bounds that: a
+    // bidirectional stream has no total duration the transport could know. The
+    // deadline armed at step 4 is what bounds it, and it is the SAME timer the
+    // streaming phase below inherits.
     let response = tokio::select! {
         biased;
         () = forced_shutdown.cancelled() => return Err(shutdown_denial()),
+        () = deadline_elapsed(&mut deadline_timer) => {
+            // The endpoint is deliberately not blamed. The circuit permit is
+            // dropped without a verdict, exactly as the streaming phase does
+            // when the same timer fires there: a caller's half-second deadline
+            // against a healthy two-second upstream is a fact about the caller,
+            // and opening the breaker on it would let one impatient client take
+            // the endpoint out for everyone.
+            return Err(deadline_denial());
+        }
         response = call => response,
     };
     let response = match response {
@@ -599,7 +631,9 @@ async fn attempt_call(
         received: 0,
         counters,
         fault,
-        deadline: deadline.map(|deadline| Box::pin(tokio::time::sleep(deadline))),
+        // The timer armed at step 4, with whatever is left of it. Not a fresh
+        // sleep: the headers wait and the streaming phase share one budget.
+        deadline: deadline_timer,
         idle: runtime
             .idle_timeout
             .map(|idle| (idle, Box::pin(tokio::time::sleep(idle)))),
@@ -634,6 +668,29 @@ async fn attempt_call(
 
 fn shutdown_denial() -> Denial {
     Denial::denied(GrpcStatus::Unavailable, "shutdown")
+}
+
+/// The call's effective deadline elapsed before the upstream answered.
+///
+/// `failed` rather than `denied`, and the same status and reason literal
+/// `ClientResponseBody::terminate` uses when the identical timer fires during
+/// the streaming phase. The two halves of one call must not be distinguishable
+/// by which side of the HEADERS frame the deadline happened to land on.
+fn deadline_denial() -> Denial {
+    Denial::failed(GrpcStatus::DeadlineExceeded, "deadline_exceeded")
+}
+
+/// Completes when `timer` elapses, and never when the call has no deadline.
+///
+/// A helper rather than an inline arm in each `select!` so that every wait is
+/// against the SAME timer. An arm that constructed its own sleep would give
+/// each phase a fresh budget, which is precisely the defect this exists to
+/// prevent.
+async fn deadline_elapsed(timer: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
+    match timer.as_mut() {
+        Some(sleep) => sleep.as_mut().await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 fn capacity_denial(saw_full_endpoint: bool) -> Denial {
@@ -1614,6 +1671,19 @@ fn record_call_outcome_with_status_label(
 /// code for "this server does not serve that method".
 pub(crate) fn unimplemented_response() -> Response {
     trailers_only_response(GrpcStatus::Unimplemented, "no_route", &None)
+}
+
+/// The gRPC answer for a request path this listener must never proxy.
+///
+/// The HTTP data listener answers the same two cases -- an unsafe raw path, and
+/// a path inside the gateway's own reserved namespace -- with `404 Not Found`.
+/// `UNIMPLEMENTED` is that answer in gRPC: this server does not serve that
+/// method, and it is not going to ask anyone else whether they do.
+///
+/// `reason` is a `&'static str` from the caller, exactly as every other bounded
+/// reason in this module is; nothing derived from the request is recorded.
+pub(crate) fn not_proxyable_response(reason: &'static str) -> Response {
+    trailers_only_response(GrpcStatus::Unimplemented, reason, &None)
 }
 
 impl ProxyState {
