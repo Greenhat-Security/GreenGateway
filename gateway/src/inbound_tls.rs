@@ -26,9 +26,24 @@
 //! the same listener -- and parking it costs an attacker nothing but idle
 //! sockets. A connection that finds no slot is closed immediately and counted
 //! as `shed`.
+//!
+//! Certificates reload while the listener serves, on the same
+//! file-watch machinery `TOOLS_FILE` and `POLICY_FILE` established. The
+//! `ServerConfig` a listener was started with is never replaced -- that object
+//! carries the client-certificate verifier (whose CA bundle and CRL are
+//! deliberately read once, at startup), the disabled session resumption of a
+//! client-certificate listener, and the ALPN list -- so a reload swaps exactly
+//! one thing: the set of certificate chains the config's resolver hands to new
+//! handshakes, through an atomic pointer read per handshake. A connection
+//! whose handshake already completed never consults the resolver again, which
+//! is what makes "reload without dropping established connections" a property
+//! of the shape rather than a promise of the timing: the reload path holds no
+//! handle that could reach an established stream, the accept loop, or the
+//! admission semaphore.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    ffi::OsString,
     fmt, fs, io,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -39,8 +54,11 @@ use std::{
     time::Duration,
 };
 
+use arc_swap::ArcSwap;
 use axum::{extract::connect_info::Connected, serve::IncomingStream};
 use cap_std::{ambient_authority, fs::Dir};
+use notify::{RecursiveMode, Watcher};
+use serde_json::json;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
@@ -64,6 +82,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use zeroize::Zeroize;
 
 use crate::{
+    audit::{self, AuditEvent, AuditLog},
     auth::{
         client_certificate::identity_from_certificate, ClientCertIdentitySource,
         VerifiedClientIdentity,
@@ -73,9 +92,10 @@ use crate::{
         projected_root_permissions_are_safe, read_bounded_file_secret, FileSecretPermissions,
         SecretPurpose, SecretResolveErrorKind,
     },
+    lifecycle::GatewayLifecycle,
     metrics::{
         INBOUND_CLIENT_CERTIFICATES_TOTAL, INBOUND_TLS_HANDSHAKES_IN_FLIGHT,
-        INBOUND_TLS_HANDSHAKES_TOTAL,
+        INBOUND_TLS_HANDSHAKES_TOTAL, INBOUND_TLS_RELOADS_TOTAL,
     },
 };
 
@@ -95,6 +115,16 @@ const ESTABLISHED_CHANNEL_DEPTH: usize = 16;
 /// retried immediately, and anything else (a descriptor limit, most often) is
 /// backed off so the loop does not spin a core while the condition clears.
 const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
+
+/// How long the material watcher waits after a filesystem event before
+/// re-reading, so a replace that surfaces as several events (write, rename,
+/// metadata) causes one reload.
+///
+/// Same value and same shape as the `TOOLS_FILE` and `POLICY_FILE` watchers;
+/// the three reload paths should not diverge on debounce discipline, because
+/// an operator reasoning about "when does my change apply" should not have to
+/// know which file they changed.
+const TLS_MATERIAL_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// The scheme the listener that carried a request terminated.
 ///
@@ -426,6 +456,35 @@ pub(crate) struct InboundTlsBindings {
 pub(crate) struct ListenerTls {
     server_config: Arc<ServerConfig>,
     identity_source: Option<ClientCertIdentitySource>,
+    /// The handle a material reload swaps chains through. Always present: a
+    /// listener that terminates TLS is a listener whose certificates can
+    /// expire, so there is no configuration in which watching its material
+    /// would be wrong.
+    reload: Arc<InboundTlsReload>,
+}
+
+/// Everything a material reload needs: the shared resolver the live
+/// `ServerConfig` consults, and the owned description of the files to
+/// re-read.
+///
+/// The material description is captured at startup, not re-parsed from the
+/// environment, so a reload re-reads exactly the files startup validated --
+/// the same lists, in the same order, under the same setting names -- and no
+/// reload can change *which* files a listener serves, only their contents.
+pub(crate) struct InboundTlsReload {
+    listener_label: &'static str,
+    resolver: Arc<ReloadableServerCertResolver>,
+    material: TlsMaterialSettings,
+}
+
+impl InboundTlsReload {
+    fn material_paths(&self) -> impl Iterator<Item = &Path> {
+        self.material
+            .certificate_files
+            .iter()
+            .chain(self.material.private_key_files.iter())
+            .map(Path::new)
+    }
 }
 
 impl InboundTlsBindings {
@@ -438,11 +497,11 @@ impl InboundTlsBindings {
     pub(crate) fn load(config: &Config) -> Result<Self, InboundTlsError> {
         let data = config
             .data_inbound_tls()
-            .map(load_server_config)
+            .map(|settings| load_server_config(settings, "data"))
             .transpose()?;
         let admin = config
             .admin_inbound_tls()
-            .map(load_server_config)
+            .map(|settings| load_server_config(settings, "admin"))
             .transpose()?;
 
         Ok(Self {
@@ -487,6 +546,52 @@ impl InboundTlsBindings {
     /// The negotiated floor, or `None` when neither listener terminates TLS.
     pub(crate) fn min_version(&self) -> Option<TlsMinVersion> {
         self.min_version
+    }
+
+    /// Starts a material watcher for every listener that terminates TLS.
+    ///
+    /// Mirrors the `TOOLS_FILE`/`POLICY_FILE` reload tasks: filesystem events
+    /// (and SIGHUP, where it exists) trigger one debounced reload per change,
+    /// each task is registered on the gateway lifecycle so shutdown cancels
+    /// it, and a watcher that cannot be installed fails startup -- a
+    /// deployment whose certificate files cannot be watched is a deployment
+    /// whose certificates silently stop being renewable, which is not a state
+    /// to run in quietly.
+    pub(crate) fn spawn_material_reload_tasks_with_lifecycle(
+        &self,
+        audit: AuditLog,
+        lifecycle: &GatewayLifecycle,
+    ) -> notify::Result<()> {
+        for listener in [self.data.as_ref(), self.admin.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            spawn_tls_material_reload_tasks_inner(
+                listener.reload.clone(),
+                audit.clone(),
+                lifecycle.background_cancellation(),
+                Some(lifecycle),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The test entry point, mirroring `spawn_policy_reload_tasks`: no
+    /// lifecycle, so a test's watchers live exactly as long as its runtime.
+    #[cfg(test)]
+    pub(crate) fn spawn_material_reload_tasks(&self, audit: AuditLog) -> notify::Result<()> {
+        for listener in [self.data.as_ref(), self.admin.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            spawn_tls_material_reload_tasks_inner(
+                listener.reload.clone(),
+                audit.clone(),
+                CancellationToken::new(),
+                None,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -579,86 +684,33 @@ impl fmt::Debug for ZeroizingKey {
     }
 }
 
-fn load_server_config(settings: InboundTlsSettings<'_>) -> Result<ListenerTls, InboundTlsError> {
-    // The two lists arrive equal in length -- `Config::from_env` rejects a
-    // count mismatch as a configuration problem -- so the zip below yields
-    // exactly one key per certificate chain, in the order the operator wrote
-    // them.
-    let mut chains = Vec::with_capacity(settings.certificate_files.len());
-    for (certificate_file, private_key_file) in settings
-        .certificate_files
-        .iter()
-        .zip(settings.private_key_files)
-    {
-        let certificate_pem = read_material(
-            settings.certificate_setting,
-            certificate_file,
-            SecretPurpose::TlsCertificate,
-            FileSecretPermissions::PlatformProjected,
-        )?;
-        // A key concatenated into the certificate file inherits the
-        // certificate's permissions, and a certificate is the one piece of this
-        // pair an operator reasonably mounts world-readable. Refusing the shape
-        // outright is cheaper than hoping nobody ever runs
-        // `cat key.pem >> cert.pem`.
-        if PrivateKeyDer::from_pem_slice(certificate_pem.expose()).is_ok() {
-            return Err(InboundTlsError::CertificateContainsPrivateKey {
-                setting: settings.certificate_setting,
-            });
-        }
-        let certificates = CertificateDer::pem_slice_iter(certificate_pem.expose())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| InboundTlsError::MaterialInvalid {
-                setting: settings.certificate_setting,
-            })?;
-        if certificates.is_empty() {
-            return Err(InboundTlsError::MaterialInvalid {
-                setting: settings.certificate_setting,
-            });
-        }
+/// The material files of one listener as an owned description, paired with
+/// the setting names that produced them.
+///
+/// This is the input both startup and reload validate against, and the reason
+/// it exists as a type: `InboundTlsSettings` borrows from `Config`, which
+/// lives on the startup stack, while a reload may run at any point in the
+/// process's life. Capturing the lists here rather than re-reading the
+/// environment keeps the two paths on literally one loader -- and keeps a
+/// reload from ever changing which files a listener serves.
+struct TlsMaterialSettings {
+    certificate_setting: &'static str,
+    certificate_files: Vec<String>,
+    private_key_setting: &'static str,
+    private_key_files: Vec<String>,
+}
 
-        let private_key_pem = read_material(
-            settings.private_key_setting,
-            private_key_file,
-            SecretPurpose::TlsPrivateKey,
-            FileSecretPermissions::ProjectedExclusive,
-        )?;
-        let mut private_key = ZeroizingKey(Some(
-            PrivateKeyDer::from_pem_slice(private_key_pem.expose()).map_err(|_| {
-                InboundTlsError::MaterialInvalid {
-                    setting: settings.private_key_setting,
-                }
-            })?,
-        ));
-        drop(private_key_pem);
-
-        // Build from an explicitly named provider rather than the process
-        // default: both `ring` and `aws-lc-rs` are in this dependency graph, so
-        // there is no unambiguous process default to inherit, and a listener's
-        // cipher suites should not depend on which module happened to install
-        // one first. The provider is shared across chains of the same listener
-        // for the same reason.
-        let provider = Arc::new(ring::default_provider());
-        let names = chain_server_names(&certificates, settings.certificate_setting)?;
-        // `CertifiedKey::from_der` is the same construction `with_single_cert`
-        // performs internally, including the key-matches-leaf check -- so a
-        // swapped key is caught here with the same error either path reports.
-        let certified_key = CertifiedKey::from_der(
-            certificates,
-            private_key
-                .take()
-                .expect("the parsed private key is taken exactly once"),
-            &provider,
-        )
-        .map_err(|_| InboundTlsError::KeyDoesNotMatchCertificate {
-            certificate_setting: settings.certificate_setting,
-            private_key_setting: settings.private_key_setting,
-        })?;
-        chains.push(ServerCertChain {
-            names,
-            key: Arc::new(certified_key),
-        });
-    }
+fn load_server_config(
+    settings: InboundTlsSettings<'_>,
+    listener_label: &'static str,
+) -> Result<ListenerTls, InboundTlsError> {
+    let material = TlsMaterialSettings {
+        certificate_setting: settings.certificate_setting,
+        certificate_files: settings.certificate_files.to_vec(),
+        private_key_setting: settings.private_key_setting,
+        private_key_files: settings.private_key_files.to_vec(),
+    };
+    let chains = load_certified_chains(&material)?;
 
     let client_verifier = settings
         .client_auth
@@ -672,14 +724,19 @@ fn load_server_config(settings: InboundTlsSettings<'_>) -> Result<ListenerTls, I
         .map_err(|_| InboundTlsError::ProtocolVersionsUnsupported {
             setting: settings.min_version_setting,
         })?;
+    let resolver = SniServerCertResolver::build(chains, settings.certificate_setting)?;
+    // The one piece of this config a reload may replace. Everything the
+    // builder assembled above -- verifier, versions, ALPN, resumption --
+    // is startup-fixed for the life of the process; see
+    // [`ReloadableServerCertResolver`].
+    let resolver = Arc::new(ReloadableServerCertResolver {
+        current: ArcSwap::from_pointee(resolver),
+    });
     let mut server_config = match client_verifier {
         Some(client_verifier) => versions.with_client_cert_verifier(client_verifier),
         None => versions.with_no_client_auth(),
     }
-    .with_cert_resolver(Arc::new(SniServerCertResolver::build(
-        chains,
-        settings.certificate_setting,
-    )?));
+    .with_cert_resolver(resolver.clone() as Arc<dyn ResolvesServerCert>);
 
     // Advertise HTTP/1.1 and nothing else. Offering `h2` here would be a
     // protocol change smuggled in through ALPN: `axum::serve` builds on
@@ -701,7 +758,110 @@ fn load_server_config(settings: InboundTlsSettings<'_>) -> Result<ListenerTls, I
     Ok(ListenerTls {
         server_config: Arc::new(server_config),
         identity_source,
+        reload: Arc::new(InboundTlsReload {
+            listener_label,
+            resolver,
+            material,
+        }),
     })
+}
+
+/// Loads and validates one listener's certificate chains from its material
+/// files.
+///
+/// This is the one loader both the startup path and the reload path run --
+/// extracted from `load_server_config` when reload landed so that the two
+/// cannot drift, for the same reason #332 collapsed the outbound TLS
+/// construction to one site: two copies of one trust decision are two
+/// opportunities to differ. Every check startup performs on certificate
+/// material happens here -- the bounded, capability-confined read, the
+/// permission rules, the refusal of a key concatenated into a public file,
+/// parse, the key-matches-leaf pairing, and the per-chain DNS name validation
+/// -- so a reload runs all of them, or none of it runs at all.
+fn load_certified_chains(
+    material: &TlsMaterialSettings,
+) -> Result<Vec<ServerCertChain>, InboundTlsError> {
+    // The two lists arrive equal in length -- `Config::from_env` rejects a
+    // count mismatch as a configuration problem, and the reload re-reads the
+    // same lists startup validated -- so the zip below yields exactly one key
+    // per certificate chain, in the order the operator wrote them.
+    let mut chains = Vec::with_capacity(material.certificate_files.len());
+    for (certificate_file, private_key_file) in material
+        .certificate_files
+        .iter()
+        .zip(material.private_key_files.iter())
+    {
+        let certificate_pem = read_material(
+            material.certificate_setting,
+            certificate_file,
+            SecretPurpose::TlsCertificate,
+            FileSecretPermissions::PlatformProjected,
+        )?;
+        // A key concatenated into the certificate file inherits the
+        // certificate's permissions, and a certificate is the one piece of this
+        // pair an operator reasonably mounts world-readable. Refusing the shape
+        // outright is cheaper than hoping nobody ever runs
+        // `cat key.pem >> cert.pem`.
+        if PrivateKeyDer::from_pem_slice(certificate_pem.expose()).is_ok() {
+            return Err(InboundTlsError::CertificateContainsPrivateKey {
+                setting: material.certificate_setting,
+            });
+        }
+        let certificates = CertificateDer::pem_slice_iter(certificate_pem.expose())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| InboundTlsError::MaterialInvalid {
+                setting: material.certificate_setting,
+            })?;
+        if certificates.is_empty() {
+            return Err(InboundTlsError::MaterialInvalid {
+                setting: material.certificate_setting,
+            });
+        }
+
+        let private_key_pem = read_material(
+            material.private_key_setting,
+            private_key_file,
+            SecretPurpose::TlsPrivateKey,
+            FileSecretPermissions::ProjectedExclusive,
+        )?;
+        let mut private_key = ZeroizingKey(Some(
+            PrivateKeyDer::from_pem_slice(private_key_pem.expose()).map_err(|_| {
+                InboundTlsError::MaterialInvalid {
+                    setting: material.private_key_setting,
+                }
+            })?,
+        ));
+        drop(private_key_pem);
+
+        // Build from an explicitly named provider rather than the process
+        // default: both `ring` and `aws-lc-rs` are in this dependency graph, so
+        // there is no unambiguous process default to inherit, and a listener's
+        // cipher suites should not depend on which module happened to install
+        // one first. The provider is shared across chains of the same listener
+        // for the same reason.
+        let provider = Arc::new(ring::default_provider());
+        let names = chain_server_names(&certificates, material.certificate_setting)?;
+        // `CertifiedKey::from_der` is the same construction `with_single_cert`
+        // performs internally, including the key-matches-leaf check -- so a
+        // swapped key is caught here with the same error either path reports.
+        let certified_key = CertifiedKey::from_der(
+            certificates,
+            private_key
+                .take()
+                .expect("the parsed private key is taken exactly once"),
+            &provider,
+        )
+        .map_err(|_| InboundTlsError::KeyDoesNotMatchCertificate {
+            certificate_setting: material.certificate_setting,
+            private_key_setting: material.private_key_setting,
+        })?;
+        chains.push(ServerCertChain {
+            names,
+            key: Arc::new(certified_key),
+        });
+    }
+
+    Ok(chains)
 }
 
 /// One loaded certificate chain and the DNS names it answers to.
@@ -877,6 +1037,49 @@ impl fmt::Debug for SniServerCertResolver {
             .field("chains", &self.chains.len())
             .field("exact_names", &self.exact.len())
             .field("wildcard_names", &self.wildcards.len())
+            .finish()
+    }
+}
+
+/// The resolver the live `ServerConfig` consults, holding the chain set
+/// behind an atomic pointer so it can be replaced while the listener serves.
+///
+/// This is the entire reload surface, and it is deliberately this narrow. A
+/// reload builds a fully validated [`SniServerCertResolver`] off the
+/// handshake path and then performs one `ArcSwap` store; each new *full*
+/// handshake performs one `load_full` -- an atomic read, never a lock -- and
+/// resolves against that single consistent snapshot. A handshake that already
+/// read a snapshot finishes against it even if the store lands mid-flight,
+/// which is the per-connection equivalent of the swap boundary a replaced
+/// whole-config design would draw at the accept loop, without the drawbacks:
+/// the accept loop, its admission semaphore, and the in-flight handshake
+/// tasks are not touched at all, and a connection whose handshake completed
+/// never calls `resolve` again.
+///
+/// Keeping the `ServerConfig` fixed and swapping only the resolver is also
+/// what preserves the startup decisions a reload must not be able to revisit:
+/// the client-certificate verifier (CA bundle and CRL, read once), the
+/// disabled session resumption of a client-certificate listener, the ALPN
+/// list, and the protocol floor are the same objects for the life of the
+/// process, because there is no code path that replaces them.
+struct ReloadableServerCertResolver {
+    current: ArcSwap<SniServerCertResolver>,
+}
+
+impl ResolvesServerCert for ReloadableServerCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.current.load_full().resolve(client_hello)
+    }
+}
+
+/// Hand-written for the same reason [`SniServerCertResolver`]'s is: the
+/// derived form would print certificate chains, and a chain is public
+/// material attached to keys that are not.
+impl fmt::Debug for ReloadableServerCertResolver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReloadableServerCertResolver")
+            .field("current", &self.current.load())
             .finish()
     }
 }
@@ -1125,6 +1328,304 @@ fn open_material_directory(
         return Err(InboundTlsError::MaterialDirectoryPermissions { setting });
     }
     Ok(directory)
+}
+
+// --- material reload ---------------------------------------------------------
+//
+// The shape is the `TOOLS_FILE`/`POLICY_FILE` machinery's, deliberately: a
+// `notify` watcher on the material's directories feeding an unbounded channel,
+// a debounce, a single reload attempt per settled change, SIGHUP alongside on
+// Unix, and registration on the gateway lifecycle so shutdown cancels the
+// tasks. An operator should not have to learn a second reload dialect because
+// the material happens to be a certificate.
+
+/// Re-reads, re-validates, and swaps one listener's certificate chains.
+///
+/// Validation is the startup path, not a copy of it: the same
+/// [`load_certified_chains`] and the same [`SniServerCertResolver::build`]
+/// run here, so every check startup applies -- bounded and confined reads,
+/// permissions, PEM parse, the key-matches-leaf pairing, the DNS name rules,
+/// duplicate-name rejection across the whole set -- decides whether the swap
+/// happens. A reload that validated less than startup would be a fail-open
+/// door wearing an operational convenience; two copies of a trust decision
+/// drift, which is the mistake #332 removed from the outbound path and the
+/// reason this function owns no validation of its own.
+///
+/// On any validation failure the listener keeps serving the last good chains
+/// and the failure is observable three ways -- an `inbound_tls.reload_failed`
+/// audit event, `inbound_tls_reloads_total{listener,outcome="rejected"}`, and
+/// an error log line -- so a rejected rotation cannot look like a completed
+/// one. The error payload carries [`InboundTlsError`]'s Display text, which
+/// names settings and (for SNI conflicts) DNS names, both already public;
+/// key bytes cannot appear in it, on the same discipline startup errors are
+/// held to.
+///
+/// There is deliberately no retry and no schedule: the next attempt happens
+/// when the files change again or SIGHUP arrives, so material that stays
+/// broken costs exactly one failed attempt, not a loop.
+fn reload_listener_material(reload: &InboundTlsReload, audit: &AuditLog) {
+    match reload_server_chains(reload) {
+        Ok(chain_count) => {
+            audit.emit(AuditEvent::new(
+                audit::event::INBOUND_TLS_RELOADED,
+                "inbound-tls",
+                "internal",
+                None,
+                json!({
+                    "listener": reload.listener_label,
+                    "certificate_setting": reload.material.certificate_setting,
+                    "chain_count": chain_count,
+                    "outcome": "success",
+                }),
+            ));
+            ::metrics::counter!(
+                INBOUND_TLS_RELOADS_TOTAL,
+                "listener" => reload.listener_label,
+                "outcome" => "accepted"
+            )
+            .increment(1);
+            tracing::info!(
+                listener = reload.listener_label,
+                chain_count,
+                "inbound TLS material reload accepted"
+            );
+        }
+        Err(error) => {
+            audit.emit(AuditEvent::new(
+                audit::event::INBOUND_TLS_RELOAD_FAILED,
+                "inbound-tls",
+                "internal",
+                None,
+                json!({
+                    "listener": reload.listener_label,
+                    "certificate_setting": reload.material.certificate_setting,
+                    "outcome": "failure",
+                    "reason": error.to_string(),
+                }),
+            ));
+            ::metrics::counter!(
+                INBOUND_TLS_RELOADS_TOTAL,
+                "listener" => reload.listener_label,
+                "outcome" => "rejected"
+            )
+            .increment(1);
+            tracing::error!(
+                listener = reload.listener_label,
+                error = %error,
+                "inbound TLS material reload rejected; the previous certificate chains remain active"
+            );
+        }
+    }
+}
+
+/// Validates the next chain set and, only if every startup check passes,
+/// swaps it in. The store and the validation are ordered so that no state
+/// other than fully-validated-new or fully-intact-old can exist.
+fn reload_server_chains(reload: &InboundTlsReload) -> Result<usize, InboundTlsError> {
+    let chains = load_certified_chains(&reload.material)?;
+    let chain_count = chains.len();
+    let resolver = SniServerCertResolver::build(chains, reload.material.certificate_setting)?;
+    reload.resolver.current.store(Arc::new(resolver));
+    Ok(chain_count)
+}
+
+fn spawn_tls_material_reload_tasks_inner(
+    reload: Arc<InboundTlsReload>,
+    audit: AuditLog,
+    cancellation: CancellationToken,
+    lifecycle: Option<&GatewayLifecycle>,
+) -> notify::Result<()> {
+    let watcher = spawn_tls_material_file_watcher(&reload, &audit, cancellation.clone())?;
+    let sighup = spawn_sighup_reload_task(reload, audit, cancellation);
+    if let Some(lifecycle) = lifecycle {
+        lifecycle.register_background_task(watcher);
+        if let Some(sighup) = sighup {
+            lifecycle.register_background_task(sighup);
+        }
+    }
+    Ok(())
+}
+
+fn spawn_tls_material_file_watcher(
+    reload: &Arc<InboundTlsReload>,
+    audit: &AuditLog,
+    cancellation: CancellationToken,
+) -> notify::Result<tokio::task::JoinHandle<()>> {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = sender.send(event);
+    })?;
+    for directory in tls_material_watch_directories(reload) {
+        watcher.watch(&directory, RecursiveMode::NonRecursive)?;
+    }
+
+    Ok(tokio::spawn(tls_material_file_watch_loop(
+        reload.clone(),
+        audit.clone(),
+        receiver,
+        watcher,
+        cancellation,
+    )))
+}
+
+async fn tls_material_file_watch_loop(
+    reload: Arc<InboundTlsReload>,
+    audit: AuditLog,
+    mut events: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
+    _watcher: notify::RecommendedWatcher,
+    cancellation: CancellationToken,
+) {
+    let names = tls_material_watch_names(&reload);
+    loop {
+        let event = tokio::select! {
+            event = events.recv() => event,
+            () = cancellation.cancelled() => return,
+        };
+        let Some(event) = event else {
+            return;
+        };
+        if !handle_tls_material_watch_event(event, &names) {
+            continue;
+        }
+
+        tokio::select! {
+            () = tokio::time::sleep(TLS_MATERIAL_RELOAD_DEBOUNCE) => {}
+            () = cancellation.cancelled() => return,
+        }
+        while let Ok(event) = events.try_recv() {
+            let _ = handle_tls_material_watch_event(event, &names);
+        }
+
+        reload_listener_material(&reload, &audit);
+    }
+}
+
+fn handle_tls_material_watch_event(
+    event: notify::Result<notify::Event>,
+    names: &HashSet<OsString>,
+) -> bool {
+    match event {
+        Ok(event) => tls_material_reload_event(&event, names),
+        Err(err) => {
+            tracing::error!(error = %err, "inbound TLS material watch error");
+            false
+        }
+    }
+}
+
+/// Whether a filesystem event could have changed the material, judged by
+/// entry *name* in the watched directories rather than by full path -- the
+/// same rule the `TOOLS_FILE`/`POLICY_FILE` watchers use, so a provider that
+/// reports the event through a differently-spelled prefix (a symlinked
+/// directory, a relative watch root) still matches. Certificate and key
+/// names are operator-chosen and rarely collide; where two watched listeners
+/// keep material in one directory, the cost of a name collision is one
+/// redundant reload of unchanged files, not a missed one.
+fn tls_material_reload_event(event: &notify::Event, names: &HashSet<OsString>) -> bool {
+    !matches!(event.kind, notify::EventKind::Access(_))
+        && event.paths.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| names.contains(&name.to_owned()))
+        })
+}
+
+/// The directory-entry names whose change can alter the material.
+///
+/// Two shapes have to be covered. A plain file answers to its own name, and
+/// an atomic replace (`write tmp; rename`) lands on that name. A Kubernetes
+/// Secret volume is different: the leaf the setting names is a relative
+/// symlink into a `..data` directory, and rotation flips the `..data`
+/// *symlink* -- the leaf's own directory entry never changes. So for a
+/// symlinked leaf, the first component of its target is a watched name too,
+/// which is what makes the kubelet flip observable. The name set is fixed at
+/// watcher start, from the same paths startup validated; a volume that
+/// switched from plain files to the projected shape mid-flight would need a
+/// restart, and the reader's confinement rules still apply to every reload.
+fn tls_material_watch_names(reload: &InboundTlsReload) -> HashSet<OsString> {
+    let mut names = HashSet::new();
+    for path in reload.material_paths() {
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
+        names.insert(file_name.to_owned());
+        let flipped_component =
+            fs::read_link(path)
+                .ok()
+                .and_then(|target| match target.components().next() {
+                    Some(std::path::Component::Normal(first)) => Some(first.to_owned()),
+                    _ => None,
+                });
+        if let Some(flipped) = flipped_component {
+            names.insert(flipped);
+        }
+    }
+    names
+}
+
+/// The distinct directories holding one listener's material, canonicalized.
+///
+/// Certificates and keys may live in different directories (and SNI lists may
+/// span several), so every distinct parent is watched, non-recursively, the
+/// way the single-file watchers watch their one parent.
+fn tls_material_watch_directories(reload: &InboundTlsReload) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    for path in reload.material_paths() {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        // Canonical so that two spellings of one directory are one watch, and
+        // so events arriving through a symlinked path still carry the prefix
+        // this watcher registered. A directory that cannot be resolved is
+        // watched by its configured name; the reload itself reads through the
+        // capability-confined reader either way.
+        let resolved = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_owned());
+        if !directories.contains(&resolved) {
+            directories.push(resolved);
+        }
+    }
+    directories
+}
+
+#[cfg(unix)]
+fn spawn_sighup_reload_task(
+    reload: Arc<InboundTlsReload>,
+    audit: AuditLog,
+    cancellation: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    Some(tokio::spawn(async move {
+        let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(signal) => signal,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "failed to register SIGHUP inbound TLS reload handler"
+                );
+                return;
+            }
+        };
+
+        loop {
+            let signal = tokio::select! {
+                signal = sighup.recv() => signal,
+                () = cancellation.cancelled() => return,
+            };
+            if signal.is_none() {
+                return;
+            }
+            reload_listener_material(&reload, &audit);
+        }
+    }))
+}
+
+#[cfg(not(unix))]
+fn spawn_sighup_reload_task(
+    _reload: Arc<InboundTlsReload>,
+    _audit: AuditLog,
+    _cancellation: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    None
 }
 
 /// An `axum::serve::Listener` that yields connections whose TLS handshake has
