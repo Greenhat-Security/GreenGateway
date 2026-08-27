@@ -134,6 +134,21 @@ pub struct SecretAliasMetadata {
     /// version stage — reports `false`, because the operationally load-bearing
     /// question is "will the gateway pick up a rotation?".
     pub pinned: bool,
+    /// Numeric only, and deliberately so. Azure and AWS version identifiers are
+    /// opaque strings and Kubernetes has no version concept, so those three
+    /// providers report `None` here and answer the operationally load-bearing
+    /// question through `pinned` instead. Widening this to a string was weighed
+    /// and rejected in issue #286: the shipped admin UI rejects the entire
+    /// metadata response unless `version` is a non-negative integer, then does
+    /// arithmetic on it to confirm an encrypted-local rotation, and a type
+    /// change to a published `connection-admin.v1` field is breaking where
+    /// adding `pinned` beside it was not. The opaque identifiers also stay
+    /// withheld on their own merit: a provider version is a path segment of a
+    /// read URL whose other segments are categorically redacted, and surfacing
+    /// one correlates an alias to an exact upstream object version while buying
+    /// an operator nothing, since network aliases always report
+    /// `can_rotate: false` / `can_delete: false`. Per-provider canary tests
+    /// enforce that absence.
     pub version: Option<u64>,
     pub rotated_at: Option<String>,
 }

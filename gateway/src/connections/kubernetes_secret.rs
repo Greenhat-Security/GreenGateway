@@ -86,13 +86,28 @@ const MAX_DNS1123_LABEL_BYTES: usize = 63;
 const MAX_DNS1123_SUBDOMAIN_BYTES: usize = 253;
 /// Kubernetes `data` key bound (apimachinery `IsConfigMapKey`).
 const MAX_KUBERNETES_DATA_KEY_BYTES: usize = 253;
-/// A Secret object may hold up to 1 MiB of decoded data; its JSON envelope with
-/// Base64 expansion stays comfortably below this bound.
+/// A Secret holds at most 1 MiB of decoded `data` (apimachinery
+/// `MaxSecretSize`, summed over values), which Base64 expands to 1,398,104
+/// bytes on the JSON read path, and its annotations are separately capped at
+/// 256 KiB (`TotalAnnotationSizeLimitB`). Both maxima at once come to 1,660,248
+/// bytes, so this bound clears a worst-case Secret with roughly 427 KiB left
+/// for names, labels, and `managedFields`. It is not raised beyond that: an
+/// oversized envelope is refused rather than truncated and misparsed, and the
+/// cap is buffered per in-flight read, so it multiplies by
+/// `MAX_CONCURRENT_KUBERNETES_RESOLUTIONS` against an API server that could be
+/// hostile.
 const MAX_KUBERNETES_READ_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_KUBERNETES_TOKEN_BYTES: usize = 8 * 1024;
 /// Bearer material is cached for at most this long, so a kubelet-rotated
 /// projected token or a rotated bootstrap alias is observed on the next
 /// resolution after expiry, and a `401` forces an immediate re-read.
+///
+/// Sized against the projected-token contract rather than picked round: the
+/// kubelet replaces a projected token once it passes 80% of its TTL, and
+/// Kubernetes rejects an `expirationSeconds` below 600, so even the least-fresh
+/// token this provider can read still has 120s of validity left. Caching for
+/// 60s keeps a cached copy inside that window with a factor of two to spare,
+/// and costs at most one small file read per profile per minute.
 const KUBERNETES_TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 const KUBERNETES_VALUE_CACHE_TTL: Duration = Duration::from_secs(60);
 const MAX_KUBERNETES_VALUE_CACHE_ENTRIES: usize = 256;
@@ -3682,6 +3697,42 @@ rotated-key
             fixture.cluster.requests().len(),
             1,
             "mutual TLS has no token re-read and must not retry"
+        );
+    }
+
+    // Both read bounds are derived from published Kubernetes limits rather than
+    // chosen round, and every other test spends them symbolically, so nothing
+    // else would notice either constant being retuned. The next two tests pin
+    // the derivations so a future edit has to redo the arithmetic. They are
+    // deliberately separate: in one test the first panicking assertion would
+    // mask the second bound entirely.
+    #[test]
+    fn the_response_cap_clears_a_maximal_secret_envelope() {
+        // apimachinery `MaxSecretSize`, summed over decoded `data` values, and
+        // `TotalAnnotationSizeLimitB`. `data` arrives Base64-encoded in JSON.
+        const MAX_SECRET_DATA_BYTES: usize = 1024 * 1024;
+        const MAX_ANNOTATION_BYTES: usize = 256 * 1024;
+        let encoded_data = MAX_SECRET_DATA_BYTES.div_ceil(3) * 4;
+        assert!(
+            MAX_KUBERNETES_READ_RESPONSE_BYTES >= encoded_data + MAX_ANNOTATION_BYTES,
+            "the response cap must admit a maximal Secret payload ({encoded_data} Base64 bytes) \
+             plus a maximal annotation set ({MAX_ANNOTATION_BYTES} bytes), but it is \
+             {MAX_KUBERNETES_READ_RESPONSE_BYTES}"
+        );
+    }
+
+    #[test]
+    fn cached_bearer_material_expires_inside_a_projected_tokens_residual_validity() {
+        // The kubelet replaces a projected token once it passes 80% of its TTL
+        // and Kubernetes rejects an `expirationSeconds` below 600, so the
+        // least-fresh token a resolution can read retains 20% of 600s.
+        const MIN_PROJECTED_TOKEN_TTL: Duration = Duration::from_secs(600);
+        let residual_validity = MIN_PROJECTED_TOKEN_TTL - MIN_PROJECTED_TOKEN_TTL * 4 / 5;
+        assert!(
+            KUBERNETES_TOKEN_LIFETIME < residual_validity,
+            "cached bearer material must expire before the least-fresh projected token could \
+             ({residual_validity:?} of validity), but it is cached for \
+             {KUBERNETES_TOKEN_LIFETIME:?}"
         );
     }
 
