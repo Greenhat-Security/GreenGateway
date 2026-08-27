@@ -175,6 +175,8 @@ impl SqliteSink {
             connection: Mutex::new(connection),
             buffer: Mutex::new(Vec::with_capacity(SQLITE_BATCH_SIZE)),
             flush_failure: Mutex::new(None),
+            #[cfg(test)]
+            mid_flush_hook: Mutex::new(None),
         });
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let flusher_shared = Arc::clone(&shared);
@@ -195,6 +197,15 @@ impl SqliteSink {
     #[cfg(test)]
     fn flush_for_test(&self) {
         self.shared.flush_buffer();
+    }
+
+    #[cfg(test)]
+    fn set_mid_flush_hook_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .shared
+            .mid_flush_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
     }
 
     #[cfg(test)]
@@ -254,6 +265,11 @@ struct SqliteSinkShared {
     connection: Mutex<Connection>,
     buffer: Mutex<Vec<AuditEvent>>,
     flush_failure: Mutex<Option<String>>,
+    // Fires once, between the drain and the INSERT, so a test can drive a
+    // second flush into exactly the window the commit-ordering bug lived in
+    // instead of waiting for the scheduler to reproduce it.
+    #[cfg(test)]
+    mid_flush_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl SqliteSinkShared {
@@ -264,6 +280,14 @@ impl SqliteSinkShared {
     }
 
     fn flush_buffer(&self) {
+        // The drain and the INSERT have to be one critical section. `id` is an
+        // autoincrement assigned at INSERT time and it is the audit query API's
+        // sort and cursor key, so when one flusher drains a batch and a later
+        // batch wins the connection first, the older batch commits with the
+        // higher ids and the log stops reading back in emission order. Taking
+        // the connection lock before the buffer lock makes drain order and
+        // commit order the same order; nothing may take these two in reverse.
+        let mut connection = self.connection_guard();
         let events = {
             let mut buffer = self.buffer_guard();
             if buffer.is_empty() {
@@ -273,7 +297,13 @@ impl SqliteSinkShared {
             buffer.drain(..).collect::<Vec<_>>()
         };
 
-        if let Err(err) = self.write_events(&events) {
+        #[cfg(test)]
+        self.run_mid_flush_hook();
+
+        let result = write_events(&mut connection, &events);
+        drop(connection);
+
+        if let Err(err) = result {
             let mut failure = self
                 .flush_failure
                 .lock()
@@ -325,50 +355,18 @@ impl SqliteSinkShared {
         }
     }
 
-    fn write_events(&self, events: &[AuditEvent]) -> Result<(), SqliteFlushError> {
-        let mut connection = self.connection_guard();
-        let transaction = connection.transaction()?;
-
-        {
-            let mut statement = transaction.prepare_cached(INSERT_EVENT_SQL)?;
-
-            for event in events {
-                let actor_user_id = event.actor.as_ref().map(|actor| actor.user_id.as_str());
-                let actor_json = event
-                    .actor
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()?;
-                let payload_method = event.payload.get("method").and_then(Value::as_str);
-                let payload_path = event.payload.get("path").and_then(Value::as_str);
-                let payload_status = payload_status(&event.payload);
-                let payload_matched_rule_id =
-                    event.payload.get("matched_rule_id").and_then(Value::as_str);
-                let payload_json = serde_json::to_string(&event.payload)?;
-                let timestamp_epoch_us = epoch_micros(event.timestamp.as_str());
-
-                statement.execute(params![
-                    event.event_id.as_str(),
-                    event.event_type.as_str(),
-                    event.timestamp.as_str(),
-                    timestamp_epoch_us,
-                    event.schema_version.as_str(),
-                    event.request_id.as_str(),
-                    event.source_ip.as_str(),
-                    event.user_agent.as_deref(),
-                    actor_user_id,
-                    actor_json.as_deref(),
-                    payload_method,
-                    payload_path,
-                    payload_status,
-                    payload_matched_rule_id,
-                    payload_json.as_str(),
-                ])?;
-            }
+    #[cfg(test)]
+    fn run_mid_flush_hook(&self) {
+        // Taken rather than borrowed so the competing flush this hook starts
+        // does not block on the hook's own lock.
+        let hook = self
+            .mid_flush_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
         }
-
-        transaction.commit()?;
-        Ok(())
     }
 
     fn buffer_guard(&self) -> MutexGuard<'_, Vec<AuditEvent>> {
@@ -569,6 +567,54 @@ fn retention_cutoff_epoch_us(retention_days: u32) -> i64 {
     }
 }
 
+fn write_events(
+    connection: &mut Connection,
+    events: &[AuditEvent],
+) -> Result<(), SqliteFlushError> {
+    let transaction = connection.transaction()?;
+
+    {
+        let mut statement = transaction.prepare_cached(INSERT_EVENT_SQL)?;
+
+        for event in events {
+            let actor_user_id = event.actor.as_ref().map(|actor| actor.user_id.as_str());
+            let actor_json = event
+                .actor
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let payload_method = event.payload.get("method").and_then(Value::as_str);
+            let payload_path = event.payload.get("path").and_then(Value::as_str);
+            let payload_status = payload_status(&event.payload);
+            let payload_matched_rule_id =
+                event.payload.get("matched_rule_id").and_then(Value::as_str);
+            let payload_json = serde_json::to_string(&event.payload)?;
+            let timestamp_epoch_us = epoch_micros(event.timestamp.as_str());
+
+            statement.execute(params![
+                event.event_id.as_str(),
+                event.event_type.as_str(),
+                event.timestamp.as_str(),
+                timestamp_epoch_us,
+                event.schema_version.as_str(),
+                event.request_id.as_str(),
+                event.source_ip.as_str(),
+                event.user_agent.as_deref(),
+                actor_user_id,
+                actor_json.as_deref(),
+                payload_method,
+                payload_path,
+                payload_status,
+                payload_matched_rule_id,
+                payload_json.as_str(),
+            ])?;
+        }
+    }
+
+    transaction.commit()?;
+    Ok(())
+}
+
 fn prune_retained_events(connection: &Connection, cutoff_epoch_us: i64) -> rusqlite::Result<usize> {
     // NULL epochs belong to malformed or externally inserted timestamps. They
     // do not match the range predicate and retain the previous prune semantics.
@@ -645,6 +691,77 @@ mod tests {
 
         let _reopened = sqlite_sink(&db.path, None);
         assert_eq!(row_count(&db.path), 10);
+    }
+
+    #[test]
+    fn concurrent_flushes_commit_batches_in_emission_order() {
+        let db = TempDb::new("flush-ordering");
+        // Long intervals keep the background flusher out of the two flushes
+        // this test sequences by hand.
+        let sink = sqlite_sink_with_intervals(
+            &db.path,
+            None,
+            StdDuration::from_secs(3_600),
+            StdDuration::from_secs(3_600),
+        );
+
+        for index in 0..3 {
+            sink.emit(&test_event(
+                &format!("audit.order.a{index}"),
+                json!({ "path": format!("/a/{index}") }),
+            ));
+        }
+
+        let shared = Arc::clone(&sink.shared);
+        let deferred = Arc::new(Mutex::new(None));
+        let deferred_slot = Arc::clone(&deferred);
+        sink.set_mid_flush_hook_for_test(move || {
+            // Batch B is emitted after batch A has left the buffer, so B has to
+            // commit second whichever flusher reaches the connection first.
+            for index in 0..3 {
+                shared.push_event(test_event(
+                    &format!("audit.order.b{index}"),
+                    json!({ "path": format!("/b/{index}") }),
+                ));
+            }
+
+            // A competing flusher can only overtake batch A while the
+            // connection sits unlocked between the drain and the INSERT.
+            // Probing the lock decides the interleaving here rather than
+            // leaving it to the scheduler.
+            let connection_unlocked = shared.connection.try_lock().is_ok();
+            let competing_shared = Arc::clone(&shared);
+            let competitor = thread::spawn(move || competing_shared.flush_buffer());
+            if connection_unlocked {
+                competitor.join().expect("competing flush should not panic");
+            } else {
+                *deferred_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(competitor);
+            }
+        });
+
+        sink.flush_for_test();
+        if let Some(competitor) = deferred
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            competitor.join().expect("competing flush should not panic");
+        }
+        drop(sink);
+
+        assert_eq!(
+            event_types_in_id_order(&db.path),
+            [
+                "audit.order.a0",
+                "audit.order.a1",
+                "audit.order.a2",
+                "audit.order.b0",
+                "audit.order.b1",
+                "audit.order.b2",
+            ]
+        );
     }
 
     #[test]
@@ -1160,6 +1277,18 @@ mod tests {
                 "#,
             )
             .expect("old schema should be created");
+    }
+
+    fn event_types_in_id_order(path: &Path) -> Vec<String> {
+        let connection = Connection::open(path).expect("test database should open");
+        let mut statement = connection
+            .prepare("SELECT event_type FROM audit_events ORDER BY id")
+            .expect("event type query should prepare");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("event type query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("event type rows should read")
     }
 
     fn event_ids(path: &Path) -> Vec<String> {
