@@ -25,8 +25,7 @@ Before enabling the first managed Connection:
 4. Configure operator-owned environment/file aliases through
    `CONNECTION_SECRET_ALIASES`; never put their locators in a Connection
    request.
-5. Explicitly allow every managed endpoint and OAuth token host in egress
-   policy. Managed destinations do not auto-authorize themselves.
+5. Explicitly allow every managed endpoint and OAuth token host in egress policy. Managed destinations do not auto-authorize themselves, and allowlisting a host is not sufficient when it resolves to a private address — see [Admitting a private API server](#admitting-a-private-api-server).
 6. Grant the narrow Connection and tool permissions each operator needs.
 7. Save new Connections disabled, test their stored profiles, refresh managed
    catalogs where applicable, inspect audit events, and enable them only after
@@ -417,3 +416,9 @@ resource each, and neither callers nor ordinary Connection mutations can choose 
 provider locator. Do not place cloud-provider locators in Connection fields
 directly — reference an alias ID instead, which is all the admin API accepts or
 returns.
+
+### Admitting a private API server
+
+Each provider is reached through the ordinary egress client, so its endpoint must be admitted as a host -- in `EGRESS_ALLOWED_HOSTS` or in policy `egress.hosts`, which are additive -- *and* survive the private-address guard. That second half is easy to miss, and it bites the Kubernetes Secrets API hardest: in-cluster the API server is a private or otherwise non-global address in nearly every deployment (`kubernetes.default.svc`, a ClusterIP, a node-local endpoint), so the default `EGRESS_DENY_PRIVATE_IPS=true` still refuses the connection after the host is allowlisted, and the refusal looks like a provider fault rather than a policy one.
+
+Admit that one range through an explicit policy-file egress CIDR rather than setting `EGRESS_DENY_PRIVATE_IPS=false`. The environment variable is a process-wide switch on the egress client every subsystem shares, so turning it off to reach one API server also opens proxy routes, managed tools, and OAuth token exchanges onto private address space — the reason that guard exists. A policy CIDR grants exactly the range the API server occupies and leaves the guard standing everywhere else. Where the egress policy also restricts ports, admit the API server's port — commonly `6443`, not `443`. Both are startup-time settings: policy hosts, CIDRs, and ports cannot be hot-reloaded, so plan the change with a restart. [`CONNECTION_KUBERNETES_PROVIDER`](../configuration.md#connection_kubernetes_provider) carries the full admission rule and the per-profile TLS trust options that go with it.
