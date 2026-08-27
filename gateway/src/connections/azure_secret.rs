@@ -74,8 +74,22 @@ pub const MAX_AZURE_SECRET_ALIASES: usize = MAX_CREDENTIALS;
 pub const MAX_AZURE_PROVIDER_CONFIG_BYTES: usize = 256 * 1024;
 pub const MAX_CONCURRENT_AZURE_RESOLUTIONS: usize = 8;
 
-/// Pinned Key Vault Secrets data-plane API version. `7.5` is the current
-/// stable (GA) version; it is never negotiated or discovered at runtime.
+/// Pinned Key Vault Secrets data-plane API version, never negotiated or
+/// discovered at runtime.
+///
+/// `7.6` and the date-based `2025-07-01` are GA as well, and the pin stays at
+/// `7.5` on purpose. The published `7.6` Secrets specification is identical to
+/// `7.5` apart from the version string, so bumping to it buys nothing for the
+/// single operation this provider issues. `2025-07-01` does differ, and in the
+/// wrong direction for us: it adds an `outContentType` parameter that converts
+/// certificate-backed secrets between PFX and PEM, and a `previousVersion`
+/// field naming the superseded version of a certificate-backed secret — the
+/// same opaque-locator-for-superseded-material shape this provider withholds
+/// everywhere else. Sovereign clouds also receive new API versions after the
+/// public cloud, and Microsoft has announced no retirement of data-plane
+/// versions, so the older stable version is the more widely reachable one at
+/// no functional cost. Revisit when a needed field or operation actually lands
+/// in a newer version, not because a newer number exists.
 const AZURE_KEY_VAULT_API_VERSION: &str = "7.5";
 const AZURE_PUBLIC_AUTHORITY_HOST: &str = "login.microsoftonline.com";
 const AZURE_PUBLIC_KEY_VAULT_SCOPE: &str = "https://vault.azure.net/.default";
@@ -172,6 +186,22 @@ impl fmt::Debug for AzureProfileConfig {
 /// from an already configured alias of another provider, never from an inline
 /// value. Interactive, device-code, CLI, managed-identity probing, and
 /// ambient credential chains are not representable.
+///
+/// Managed identity is absent by decision, and not for the reason usually
+/// given. That `EgressClient` blocks the link-local IMDS address is only half
+/// true: `169.254.0.0/16` is non-global, so the default
+/// `EGRESS_DENY_PRIVATE_IPS=true` refuses it, but that is a default an operator
+/// can lift with a scoped policy allow-CIDR — exactly how the Kubernetes
+/// provider admits an in-cluster API server. The real obstacle is that IMDS is
+/// a different protocol on a different kind of channel: an unauthenticated
+/// plaintext `http://` request carrying a `Metadata` header, answered with a
+/// bearer token, with no TLS, no certificate and no hostname to verify.
+/// Representing it would put an unverified plaintext token fetch inside a
+/// provider whose whole contract is TLS-verified egress to fixed locators, and
+/// it would do so to reach a mechanism whose supported successor on Kubernetes
+/// — Entra Workload ID, which uses the v2 token endpoint rather than the IMDS
+/// `resource` flow — is already the `WorkloadJwt` variant below. Revisit only
+/// if a managed-identity shape appears that is authenticated and routable.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AzureAuthConfig {
@@ -546,6 +576,23 @@ fn is_valid_azure_authority_host(value: &str) -> bool {
     })
 }
 
+/// Accepts only the 36-character hyphenated GUID that Entra uses for tenant
+/// and application object IDs.
+///
+/// Microsoft documents the client-credentials token endpoint as taking its
+/// tenant "in GUID or domain-name format", and the domain-name half is refused
+/// here deliberately. A GUID is the tenant's immutable identifier; a verified
+/// domain is a mutable alias whose owning tenant is settled by DNS proof,
+/// outside the configuration an operator fixes at startup — so a domain-shaped
+/// tenant would be the one locator in this provider that can come to mean a
+/// different thing without anyone editing the gateway. The failure mode if it
+/// ever did is a denial rather than a disclosure (the assertion is still sent
+/// to the same TLS-verified authority, and a client ID is globally unique, so
+/// it cannot be redeemed elsewhere), but refusing costs the operator one portal
+/// lookup and no capability at all: both forms name the same tenant. The
+/// multi-tenant meta-tenants (`common`, `organizations`, `consumers`) are not a
+/// documented shape for this grant in the first place. The configuration canary
+/// pins all of these as rejected.
 fn is_valid_azure_guid(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 36
@@ -748,6 +795,18 @@ enum AzureAuth {
         /// not re-resolved and re-decoded on every login. `EncodingKey` keeps
         /// an internal DER copy that is not zeroization-aware; that residual
         /// is accepted until a zeroize-capable RSA path is available.
+        ///
+        /// Holding it is the *smaller* residual, not just the faster path:
+        /// every `EncodingKey::from_rsa_pem` also leaves its intermediate PEM
+        /// decode — the DER buffer and the parsed ASN.1 integers of the private
+        /// key — unwiped in freed heap, so building per login would scatter a
+        /// fresh set of copies on each token acquisition rather than keeping
+        /// one. It buys no extra staleness either: `certificate_thumbprint` is
+        /// startup configuration, so rotating the certificate already means a
+        /// configuration change and a restart, and a key that outlives its
+        /// registration is refused by the authority instead of granting
+        /// anything. Logins are serialized by `login_lock`, so the slot is
+        /// initialised once and never races a second parse into existence.
         key: OnceLock<EncodingKey>,
     },
 }
@@ -2431,6 +2490,32 @@ mod tests {
             base(profiles, Vec::new()),
             Err(AzureProviderConfigError::TooManyProfiles { .. })
         ));
+    }
+
+    /// Both of these are decisions rather than accidents, so both should cost a
+    /// deliberate edit here: the data-plane version pin (see the constant) and
+    /// the absence of any ambient-credential auth shape (see `AzureAuthConfig`).
+    #[test]
+    fn the_api_version_pin_and_the_absent_ambient_auth_shapes_stay_deliberate() {
+        assert_eq!(
+            AZURE_KEY_VAULT_API_VERSION, "7.5",
+            "the data-plane version pin is a decision; read the constant's comment before moving it"
+        );
+        for shape in [
+            r#"{"type":"managed_identity"}"#,
+            r#"{"type":"imds"}"#,
+            r#"{"type":"default_azure_credential"}"#,
+            r#"{"type":"azure_cli"}"#,
+        ] {
+            let error = match serde_json::from_str::<AzureAuthConfig>(shape) {
+                Ok(parsed) => panic!("{shape} must not be representable, parsed as {parsed:?}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("unknown variant"),
+                "{shape} must be refused as an unknown auth variant, got {error}"
+            );
+        }
     }
 
     #[test]
