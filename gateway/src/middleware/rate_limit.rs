@@ -3,7 +3,10 @@
 use std::{
     collections::{hash_map::RandomState, HashMap, VecDeque},
     hash::BuildHasher,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -76,6 +79,12 @@ struct BucketStore {
     /// would give one key two buckets in the one shared map.
     hasher: RandomState,
     label: &'static str,
+    /// Live buckets summed across every store sharing this counter. The two
+    /// global lanes each have one store, so theirs equals their own size;
+    /// every policy rule's store shares one counter, because a gauge is an
+    /// absolute set -- per-store gauges under one label would report whichever
+    /// store last changed, not the lane's total.
+    live_buckets: Arc<AtomicUsize>,
 }
 
 struct TokenBucket {
@@ -113,6 +122,7 @@ impl RateLimitState {
                 config.rate_limit_max_buckets,
                 config.rate_limit_bucket_idle_ttl(),
                 "read",
+                Arc::new(AtomicUsize::new(0)),
             ),
             write: RateLimiter::new(
                 config.rate_limit_write_rps,
@@ -120,6 +130,7 @@ impl RateLimitState {
                 config.rate_limit_max_buckets,
                 config.rate_limit_bucket_idle_ttl(),
                 "write",
+                Arc::new(AtomicUsize::new(0)),
             ),
             policy: Arc::new(ArcSwap::from_pointee(RateLimitPolicyState::from_policy(
                 policy,
@@ -174,12 +185,14 @@ impl RateLimiter {
         bucket_capacity: usize,
         bucket_idle_ttl: Duration,
         label: &'static str,
+        live_buckets: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             buckets: Arc::new(Mutex::new(BucketStore::new(
                 bucket_capacity,
                 bucket_idle_ttl,
                 label,
+                live_buckets,
             ))),
             rps,
             burst: f64::from(burst),
@@ -225,29 +238,40 @@ impl RateLimiter {
             if buckets.map.len() >= buckets.capacity {
                 buckets.evict_one(now);
             }
-            buckets.map.insert(
-                hashed,
-                TokenBucket {
-                    // The first check of a fresh bucket is the first token of
-                    // its burst, spent immediately. It starts unreferenced: a
-                    // bucket earns its eviction reprieve by being checked
-                    // *again* after insertion, so a spray of one-shot
-                    // identities -- each checked exactly once -- never
-                    // protects itself, and active keys do.
-                    tokens: self.burst - 1.0,
-                    last_refill: now,
-                    referenced: false,
-                },
-            );
+            let mut bucket = TokenBucket {
+                // A fresh bucket starts full and spends its first token
+                // immediately, through the same comparison the long-lived
+                // path uses -- which keeps a misconfigured zero burst
+                // denying the very first request, exactly as the unbounded
+                // implementation did.
+                tokens: self.burst,
+                last_refill: now,
+                // Unreferenced on purpose: a bucket earns its eviction
+                // reprieve by being checked *again* after insertion, so a
+                // spray of one-shot identities -- each checked exactly once
+                // -- never protects itself, and active keys do.
+                referenced: false,
+            };
+            let allowed = bucket.tokens >= 1.0;
+            if allowed {
+                bucket.tokens -= 1.0;
+            }
+            buckets.map.insert(hashed, bucket);
             buckets.hand.push_back(hashed);
+            buckets.live_buckets.fetch_add(1, Ordering::Relaxed);
             buckets.report_gauge();
-            true
+            allowed
         }
     }
 }
 
 impl BucketStore {
-    fn new(capacity: usize, idle_ttl: Duration, label: &'static str) -> Self {
+    fn new(
+        capacity: usize,
+        idle_ttl: Duration,
+        label: &'static str,
+        live_buckets: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             map: HashMap::new(),
             hand: VecDeque::new(),
@@ -255,6 +279,7 @@ impl BucketStore {
             idle_ttl,
             hasher: RandomState::new(),
             label,
+            live_buckets,
         }
     }
 
@@ -282,6 +307,7 @@ impl BucketStore {
             let idle = now.saturating_duration_since(bucket.last_refill);
             if idle >= self.idle_ttl {
                 self.map.remove(&candidate);
+                self.live_buckets.fetch_sub(1, Ordering::Relaxed);
                 self.report_eviction("ttl");
                 return;
             }
@@ -291,12 +317,14 @@ impl BucketStore {
                 continue;
             }
             self.map.remove(&candidate);
+            self.live_buckets.fetch_sub(1, Ordering::Relaxed);
             self.report_eviction("capacity");
             return;
         }
         // Every bucket was hot within the TTL: progress beats perfect fairness.
         while let Some(candidate) = self.hand.pop_front() {
             if self.map.remove(&candidate).is_some() {
+                self.live_buckets.fetch_sub(1, Ordering::Relaxed);
                 self.report_eviction("capacity");
                 return;
             }
@@ -314,7 +342,8 @@ impl BucketStore {
     }
 
     fn report_gauge(&self) {
-        ::metrics::gauge!(RATE_LIMIT_BUCKETS, "limiter" => self.label).set(self.map.len() as f64);
+        ::metrics::gauge!(RATE_LIMIT_BUCKETS, "limiter" => self.label)
+            .set(self.live_buckets.load(Ordering::Relaxed) as f64);
     }
 }
 
@@ -324,6 +353,10 @@ impl RateLimitPolicyState {
         bucket_capacity: usize,
         bucket_idle_ttl: Duration,
     ) -> Self {
+        // One counter shared by every rule's store, so the policy lane's
+        // gauge is the sum across rules rather than whichever store happened
+        // to change last. Rebuilt on policy replace, alongside the stores.
+        let live_buckets = Arc::new(AtomicUsize::new(0));
         Self {
             overrides: policy
                 .map(|policy| {
@@ -331,7 +364,14 @@ impl RateLimitPolicyState {
                         .rate_limits
                         .iter()
                         .cloned()
-                        .map(|rule| RateLimitOverride::new(rule, bucket_capacity, bucket_idle_ttl))
+                        .map(|rule| {
+                            RateLimitOverride::new(
+                                rule,
+                                bucket_capacity,
+                                bucket_idle_ttl,
+                                Arc::clone(&live_buckets),
+                            )
+                        })
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -352,16 +392,23 @@ impl RateLimitPolicyState {
 }
 
 impl RateLimitOverride {
-    fn new(rule: RateLimitRule, bucket_capacity: usize, bucket_idle_ttl: Duration) -> Self {
+    fn new(
+        rule: RateLimitRule,
+        bucket_capacity: usize,
+        bucket_idle_ttl: Duration,
+        live_buckets: Arc<AtomicUsize>,
+    ) -> Self {
         // Every policy-rule limiter reports under the one `policy` label: rule
         // sets change across reloads, and a per-rule label would mint and
-        // abandon time series with every policy edit.
+        // abandon time series with every policy edit. The gauge is the shared
+        // counter, so it reports the lane's total, not one rule's store.
         let limiter = RateLimiter::new(
             rule.requests_per_second,
             rule.burst,
             bucket_capacity,
             bucket_idle_ttl,
             "policy",
+            live_buckets,
         );
 
         Self { rule, limiter }
@@ -519,6 +566,9 @@ mod tests {
         write_burst: u32,
         rate_limits: Vec<RateLimitRule>,
     ) -> RateLimitState {
+        let policy = policy_with_rate_limits(rate_limits);
+        let policy_state =
+            RateLimitPolicyState::from_policy(Some(&policy), TEST_BUCKET_CAPACITY, TEST_BUCKET_TTL);
         RateLimitState {
             read: RateLimiter::new(
                 read_rps,
@@ -526,6 +576,7 @@ mod tests {
                 TEST_BUCKET_CAPACITY,
                 TEST_BUCKET_TTL,
                 "read",
+                Arc::new(AtomicUsize::new(0)),
             ),
             write: RateLimiter::new(
                 write_rps,
@@ -533,13 +584,9 @@ mod tests {
                 TEST_BUCKET_CAPACITY,
                 TEST_BUCKET_TTL,
                 "write",
+                Arc::new(AtomicUsize::new(0)),
             ),
-            policy: Arc::new(ArcSwap::from_pointee(RateLimitPolicyState {
-                overrides: rate_limits
-                    .into_iter()
-                    .map(|rule| RateLimitOverride::new(rule, TEST_BUCKET_CAPACITY, TEST_BUCKET_TTL))
-                    .collect(),
-            })),
+            policy: Arc::new(ArcSwap::from_pointee(policy_state)),
             client_ip_policy: ClientIpPolicy::default(),
             bucket_capacity: TEST_BUCKET_CAPACITY,
             bucket_idle_ttl: TEST_BUCKET_TTL,
@@ -583,7 +630,14 @@ mod tests {
 
     #[test]
     fn fresh_limiter_allows_burst_then_throttles() {
-        let limiter = RateLimiter::new(0.0, 2, TEST_BUCKET_CAPACITY, TEST_BUCKET_TTL, "read");
+        let limiter = RateLimiter::new(
+            0.0,
+            2,
+            TEST_BUCKET_CAPACITY,
+            TEST_BUCKET_TTL,
+            "read",
+            Arc::new(AtomicUsize::new(0)),
+        );
 
         assert!(limiter.check("key"));
         assert!(limiter.check("key"));
@@ -592,7 +646,14 @@ mod tests {
 
     #[test]
     fn exhausted_limiter_refills_over_time() {
-        let limiter = RateLimiter::new(1000.0, 1, TEST_BUCKET_CAPACITY, TEST_BUCKET_TTL, "read");
+        let limiter = RateLimiter::new(
+            1000.0,
+            1,
+            TEST_BUCKET_CAPACITY,
+            TEST_BUCKET_TTL,
+            "read",
+            Arc::new(AtomicUsize::new(0)),
+        );
 
         assert!(limiter.check("key"));
         assert!(!limiter.check("key"));
@@ -602,7 +663,14 @@ mod tests {
 
     #[test]
     fn recovers_from_poisoned_bucket_lock() {
-        let limiter = RateLimiter::new(0.0, 1, TEST_BUCKET_CAPACITY, TEST_BUCKET_TTL, "read");
+        let limiter = RateLimiter::new(
+            0.0,
+            1,
+            TEST_BUCKET_CAPACITY,
+            TEST_BUCKET_TTL,
+            "read",
+            Arc::new(AtomicUsize::new(0)),
+        );
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let _guard = limiter
                 .buckets
@@ -624,7 +692,14 @@ mod tests {
     /// this replaces could not make.
     #[test]
     fn bucket_storage_is_bounded_at_the_configured_capacity() {
-        let limiter = RateLimiter::new(0.0, 10, 4, TEST_BUCKET_TTL, "read");
+        let limiter = RateLimiter::new(
+            0.0,
+            10,
+            4,
+            TEST_BUCKET_TTL,
+            "read",
+            Arc::new(AtomicUsize::new(0)),
+        );
 
         for index in 0..10 {
             limiter.check(&format!("attacker-identity-{index}"));
@@ -648,7 +723,14 @@ mod tests {
     /// capacity-four store; the boundary itself is pinned by the next test.
     #[test]
     fn a_hot_key_survives_a_cold_spray() {
-        let limiter = RateLimiter::new(0.0, 1, 4, TEST_BUCKET_TTL, "read");
+        let limiter = RateLimiter::new(
+            0.0,
+            1,
+            4,
+            TEST_BUCKET_TTL,
+            "read",
+            Arc::new(AtomicUsize::new(0)),
+        );
 
         assert!(limiter.check("hot"));
         assert!(!limiter.check("hot"), "the hot key starts exhausted");
@@ -673,7 +755,14 @@ mod tests {
     /// set, legitimate or not, no longer fits.
     #[test]
     fn a_spray_larger_than_the_capacity_recycles_even_active_keys() {
-        let limiter = RateLimiter::new(0.0, 1, 4, TEST_BUCKET_TTL, "read");
+        let limiter = RateLimiter::new(
+            0.0,
+            1,
+            4,
+            TEST_BUCKET_TTL,
+            "read",
+            Arc::new(AtomicUsize::new(0)),
+        );
 
         assert!(limiter.check("hot"));
         assert!(!limiter.check("hot"), "the hot key starts exhausted");
@@ -698,7 +787,14 @@ mod tests {
     /// sleeps: the TTL is a comparison, not a timer.
     #[test]
     fn idle_beyond_ttl_buckets_are_evicted_before_fresher_ones() {
-        let limiter = RateLimiter::new(0.0, 1, 2, Duration::from_millis(180), "read");
+        let limiter = RateLimiter::new(
+            0.0,
+            1,
+            2,
+            Duration::from_millis(180),
+            "read",
+            Arc::new(AtomicUsize::new(0)),
+        );
         let t0 = Instant::now();
         let t_mid = t0 + Duration::from_millis(50);
         let t_late = t0 + Duration::from_millis(200);
@@ -728,17 +824,111 @@ mod tests {
         );
     }
 
+    /// A burst of zero denies the very first request, exactly as the
+    /// unbounded implementation did. A fresh bucket starts full and spends
+    /// through the common path, so a misconfigured zero burst fails closed
+    /// rather than admitting one request per key.
+    #[test]
+    fn a_zero_burst_denies_the_first_request() {
+        let limiter = RateLimiter::new(
+            0.0,
+            0,
+            TEST_BUCKET_CAPACITY,
+            TEST_BUCKET_TTL,
+            "read",
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        assert!(
+            !limiter.check("key"),
+            "a zero burst must not admit anything"
+        );
+        assert!(!limiter.check("key"));
+    }
+
+    /// When every bucket holds the second-chance reprieve, a newcomer still
+    /// evicts exactly one and the store stays at its ceiling: the scan clears
+    /// reprieves for one full rotation and takes the first key on the second
+    /// pass. This pins the second-pass path -- and the hand/map agreement it
+    /// depends on -- which no other test reaches.
+    #[test]
+    fn an_all_referenced_store_still_evicts_exactly_one() {
+        let limiter = RateLimiter::new(
+            0.0,
+            1,
+            2,
+            TEST_BUCKET_TTL,
+            "read",
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        // Both keys earn the reprieve with a second check each.
+        assert!(limiter.check("one"));
+        assert!(!limiter.check("one"));
+        assert!(limiter.check("two"));
+        assert!(!limiter.check("two"));
+
+        // Capacity pressure against two referenced, fresh buckets.
+        assert!(limiter.check("newcomer"));
+
+        assert_eq!(
+            store_len(&limiter),
+            2,
+            "eviction must make room without exceeding the ceiling, whatever every bucket's state"
+        );
+        // Exactly one of the originals was recycled: it gets a fresh burst.
+        let recycled = limiter.check("one") || limiter.check("two");
+        assert!(
+            recycled,
+            "exactly one evicted key must be re-admitted with a fresh burst"
+        );
+    }
+
+    /// The policy lane's gauge is the sum across every rule's store, not
+    /// whichever store changed last: all policy stores share one live-bucket
+    /// counter. Without that, two rules with 2 and 3 buckets report 3.
+    #[test]
+    fn policy_lane_gauge_sums_across_rule_stores() {
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        ::metrics::with_local_recorder(&recorder, || {
+            let shared = Arc::new(AtomicUsize::new(0));
+            let first =
+                RateLimiter::new(0.0, 10, 8, TEST_BUCKET_TTL, "policy", Arc::clone(&shared));
+            let second =
+                RateLimiter::new(0.0, 10, 8, TEST_BUCKET_TTL, "policy", Arc::clone(&shared));
+
+            first.check("a");
+            first.check("b");
+            second.check("c");
+            second.check("d");
+            second.check("e");
+        });
+
+        assert_eq!(
+            recorder.gauge_value(crate::metrics::RATE_LIMIT_BUCKETS, &[("limiter", "policy")]),
+            Some(5.0),
+            "the policy gauge must report the lane total (2 + 3), not the last store to change"
+        );
+    }
+
     /// Both eviction reasons are counted on the documented counter, with the
     /// limiter as a static label.
     #[test]
     fn evictions_are_counted_by_reason_on_the_documented_metric() {
         let recorder = crate::audit::sink::tests::CountingRecorder::default();
         ::metrics::with_local_recorder(&recorder, || {
-            let limiter = RateLimiter::new(0.0, 1, 1, Duration::from_millis(100), "read");
+            let limiter = RateLimiter::new(
+                0.0,
+                1,
+                1,
+                Duration::from_millis(100),
+                "read",
+                Arc::new(AtomicUsize::new(0)),
+            );
             let t0 = Instant::now();
 
-            // Capacity eviction: the store is full with a fresh, referenced
-            // bucket; the newcomer displaces it after one demotion.
+            // Capacity eviction: the store is full; `first` was checked once,
+            // holds no reprieve, and is evicted without any demotion round.
             assert!(limiter.check_at("first", t0));
             assert!(limiter.check_at("second", t0));
 
@@ -771,7 +961,14 @@ mod tests {
     fn bucket_count_is_reported_on_the_documented_gauge() {
         let recorder = crate::audit::sink::tests::CountingRecorder::default();
         ::metrics::with_local_recorder(&recorder, || {
-            let limiter = RateLimiter::new(0.0, 10, 2, TEST_BUCKET_TTL, "read");
+            let limiter = RateLimiter::new(
+                0.0,
+                10,
+                2,
+                TEST_BUCKET_TTL,
+                "read",
+                Arc::new(AtomicUsize::new(0)),
+            );
 
             limiter.check("one");
             limiter.check("two");

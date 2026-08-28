@@ -35,9 +35,11 @@ pub const RATE_LIMIT_BUCKETS: &str = "rate_limit_buckets";
 /// `reason="capacity"` means the store was full and a bucket was recycled to
 /// admit a new key; `reason="ttl"` means an idle-beyond-`RATE_LIMIT_BUCKET_TTL_MS`
 /// bucket was preferred for eviction. Eviction resets the evicted key's
-/// allowance, so sustained `capacity` evictions under attack are callers
-/// trading bursts, and sustained `ttl` evictions are a working set larger than
-/// the ceiling allows.
+/// allowance, so sustained `capacity` evictions are the signal that the
+/// working set no longer fits and callers are being traded bursts -- raise
+/// `RATE_LIMIT_MAX_BUCKETS` or investigate the key cardinality. Sustained
+/// `ttl` evictions on a full store are the healthy steady state: newcomers
+/// arriving, idlers naturally recycled, active callers protected.
 pub const RATE_LIMIT_BUCKET_EVICTIONS_TOTAL: &str = "rate_limit_bucket_evictions_total";
 /// Client-certificate outcomes, per listener.
 ///
