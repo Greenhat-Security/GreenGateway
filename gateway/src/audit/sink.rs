@@ -569,6 +569,7 @@ pub mod tests {
     #[derive(Clone, Default)]
     pub struct CountingRecorder {
         counts: Arc<Mutex<Vec<(String, u64)>>>,
+        gauges: Arc<Mutex<Vec<(String, f64)>>>,
     }
 
     impl CountingRecorder {
@@ -581,6 +582,18 @@ pub mod tests {
                 .filter(|(recorded, _)| recorded == &key)
                 .map(|(_, value)| value)
                 .sum()
+        }
+
+        /// The last recorded value of one gauge, or `None` if never set.
+        pub fn gauge_value(&self, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+            let key = render_counter_key(name, labels);
+            self.gauges
+                .lock()
+                .expect("gauges lock")
+                .iter()
+                .rev()
+                .find(|(recorded, _)| recorded == &key)
+                .map(|(_, value)| *value)
         }
     }
 
@@ -599,6 +612,43 @@ pub mod tests {
 
         fn absolute(&self, value: u64) {
             self.increment(value);
+        }
+    }
+
+    struct RecordedGauge {
+        key: String,
+        gauges: Arc<Mutex<Vec<(String, f64)>>>,
+    }
+
+    impl ::metrics::GaugeFn for RecordedGauge {
+        fn set(&self, value: f64) {
+            self.gauges
+                .lock()
+                .expect("gauges lock")
+                .push((self.key.clone(), value));
+        }
+
+        fn increment(&self, value: f64) {
+            self.adjust(value);
+        }
+
+        fn decrement(&self, value: f64) {
+            self.adjust(-value);
+        }
+    }
+
+    impl RecordedGauge {
+        /// The `metrics` gauge interface exposes increment/decrement without a
+        /// read, so the last recorded value is the baseline for adjustments.
+        fn adjust(&self, delta: f64) {
+            let mut gauges = self.gauges.lock().expect("gauges lock");
+            let current = gauges
+                .iter()
+                .rev()
+                .find(|(recorded, _)| *recorded == self.key)
+                .map(|(_, value)| *value)
+                .unwrap_or(0.0);
+            gauges.push((self.key.clone(), current + delta));
         }
     }
 
@@ -648,10 +698,21 @@ pub mod tests {
 
         fn register_gauge(
             &self,
-            _key: &::metrics::Key,
+            key: &::metrics::Key,
             _metadata: &::metrics::Metadata<'_>,
         ) -> ::metrics::Gauge {
-            ::metrics::Gauge::noop()
+            let labels = key
+                .labels()
+                .map(|label| (label.key().to_owned(), label.value().to_owned()))
+                .collect::<Vec<_>>();
+            let borrowed = labels
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            ::metrics::Gauge::from_arc(Arc::new(RecordedGauge {
+                key: render_counter_key(key.name(), &borrowed),
+                gauges: Arc::clone(&self.gauges),
+            }))
         }
 
         fn register_histogram(

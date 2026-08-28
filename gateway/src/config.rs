@@ -73,6 +73,8 @@ const DEFAULT_RATE_LIMIT_READ_RPS: f64 = 50.0;
 const DEFAULT_RATE_LIMIT_READ_BURST: u32 = 100;
 const DEFAULT_RATE_LIMIT_WRITE_RPS: f64 = 10.0;
 const DEFAULT_RATE_LIMIT_WRITE_BURST: u32 = 20;
+pub const DEFAULT_RATE_LIMIT_MAX_BUCKETS: usize = 65_536;
+pub const DEFAULT_RATE_LIMIT_BUCKET_TTL_MS: u64 = 600_000;
 const DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES: &[&str] = &["application/json"];
 const DEFAULT_AUTH_ENABLED: bool = true;
 pub const DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE: f64 = 0.10;
@@ -232,6 +234,8 @@ const RATE_LIMIT_READ_RPS: &str = "RATE_LIMIT_READ_RPS";
 const RATE_LIMIT_READ_BURST: &str = "RATE_LIMIT_READ_BURST";
 const RATE_LIMIT_WRITE_RPS: &str = "RATE_LIMIT_WRITE_RPS";
 const RATE_LIMIT_WRITE_BURST: &str = "RATE_LIMIT_WRITE_BURST";
+const RATE_LIMIT_MAX_BUCKETS: &str = "RATE_LIMIT_MAX_BUCKETS";
+const RATE_LIMIT_BUCKET_TTL_MS: &str = "RATE_LIMIT_BUCKET_TTL_MS";
 const ROLES_CLAIM: &str = "ROLES_CLAIM";
 const SERVICE_TOKEN_CACHE_TTL_MS: &str = "SERVICE_TOKEN_CACHE_TTL_MS";
 const SERVICE_TOKEN_SQLITE_PATH: &str = "SERVICE_TOKEN_SQLITE_PATH";
@@ -351,6 +355,17 @@ pub struct Config {
     pub rate_limit_read_burst: u32,
     pub rate_limit_write_rps: f64,
     pub rate_limit_write_burst: u32,
+    /// The hard ceiling on distinct tracked rate-limit keys, per limiter (the
+    /// read lane, the write lane, and each policy rate-limit rule).
+    ///
+    /// One bucket is a fixed handful of bytes keyed by a 64-bit hash, so the
+    /// ceiling bounds memory regardless of how long an attacker's identities
+    /// are. Beyond the ceiling, second-chance eviction recycles idle buckets
+    /// first; an evicted key's next request starts a fresh burst.
+    pub rate_limit_max_buckets: usize,
+    /// How long a bucket may sit idle before it is eviction-preferred, in
+    /// milliseconds.
+    pub rate_limit_bucket_ttl_ms: u64,
     pub trust_proxy_headers: bool,
     pub trusted_proxy_cidrs: Vec<IpNet>,
     pub rbac_exempt_paths: Vec<String>,
@@ -1728,6 +1743,30 @@ impl Config {
             "request burst size",
             &mut problems,
         );
+        let rate_limit_max_buckets = validate_positive_usize(
+            RATE_LIMIT_MAX_BUCKETS,
+            parse_var(
+                RATE_LIMIT_MAX_BUCKETS,
+                get_var(RATE_LIMIT_MAX_BUCKETS),
+                DEFAULT_RATE_LIMIT_MAX_BUCKETS,
+                "bucket count",
+                &mut problems,
+            ),
+            DEFAULT_RATE_LIMIT_MAX_BUCKETS,
+            &mut problems,
+        );
+        let rate_limit_bucket_ttl_ms = validate_positive_timeout_ms(
+            RATE_LIMIT_BUCKET_TTL_MS,
+            parse_var(
+                RATE_LIMIT_BUCKET_TTL_MS,
+                get_var(RATE_LIMIT_BUCKET_TTL_MS),
+                DEFAULT_RATE_LIMIT_BUCKET_TTL_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_RATE_LIMIT_BUCKET_TTL_MS,
+            &mut problems,
+        );
         let trust_proxy_headers = parse_var(
             TRUST_PROXY_HEADERS,
             get_var(TRUST_PROXY_HEADERS),
@@ -2104,6 +2143,8 @@ impl Config {
                 rate_limit_read_burst,
                 rate_limit_write_rps,
                 rate_limit_write_burst,
+                rate_limit_max_buckets,
+                rate_limit_bucket_ttl_ms,
                 trust_proxy_headers,
                 trusted_proxy_cidrs,
                 rbac_exempt_paths,
@@ -2164,6 +2205,11 @@ impl Config {
         RuleSuggestionConfig {
             baseline_window_hours: self.rule_suggestion_baseline_window_hours,
         }
+    }
+
+    /// The bucket idle TTL as a duration, for the rate limiter's stores.
+    pub(crate) fn rate_limit_bucket_idle_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.rate_limit_bucket_ttl_ms)
     }
 
     /// Inbound TLS for the data listener, or `None` to leave it plaintext.
@@ -6666,6 +6712,8 @@ mod tests {
             "RATE_LIMIT_READ_BURST" => Ok("50".to_owned()),
             "RATE_LIMIT_WRITE_RPS" => Ok("5.25".to_owned()),
             "RATE_LIMIT_WRITE_BURST" => Ok("10".to_owned()),
+            "RATE_LIMIT_MAX_BUCKETS" => Ok("4096".to_owned()),
+            "RATE_LIMIT_BUCKET_TTL_MS" => Ok("120000".to_owned()),
             "TRUST_PROXY_HEADERS" => Ok("true".to_owned()),
             "TRUSTED_PROXY_CIDRS" => Ok("10.0.0.0/8, 2001:db8::/32".to_owned()),
             _ => Err(VarError::NotPresent),
@@ -6676,6 +6724,8 @@ mod tests {
         assert_eq!(config.rate_limit_read_burst, 50);
         assert_eq!(config.rate_limit_write_rps, 5.25);
         assert_eq!(config.rate_limit_write_burst, 10);
+        assert_eq!(config.rate_limit_max_buckets, 4096);
+        assert_eq!(config.rate_limit_bucket_ttl_ms, 120_000);
         assert!(config.trust_proxy_headers);
         assert_eq!(
             config.trusted_proxy_cidrs,
@@ -6683,6 +6733,50 @@ mod tests {
                 "10.0.0.0/8".parse::<IpNet>().unwrap(),
                 "2001:db8::/32".parse::<IpNet>().unwrap()
             ]
+        );
+    }
+
+    /// The bucket ceiling and TTL are what bound the limiter's memory, so a
+    /// value that bounds nothing is refused rather than defaulted to.
+    #[test]
+    fn rate_limit_bucket_bounds_are_validated() {
+        let zero_buckets = Config::from_env_vars(|name| match name {
+            "RATE_LIMIT_MAX_BUCKETS" => Ok("0".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("a zero bucket ceiling must not start");
+        assert!(
+            zero_buckets
+                .to_string()
+                .contains("RATE_LIMIT_MAX_BUCKETS must be greater than 0"),
+            "{zero_buckets}"
+        );
+
+        let zero_ttl = Config::from_env_vars(|name| match name {
+            "RATE_LIMIT_BUCKET_TTL_MS" => Ok("0".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("a zero bucket TTL must not start");
+        assert!(
+            zero_ttl
+                .to_string()
+                .contains("RATE_LIMIT_BUCKET_TTL_MS must be greater than 0"),
+            "{zero_ttl}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_bucket_defaults_apply() {
+        let config = Config::from_env_vars(|_| Err(VarError::NotPresent))
+            .expect("an unconfigured gateway should validate");
+
+        assert_eq!(
+            config.rate_limit_max_buckets,
+            DEFAULT_RATE_LIMIT_MAX_BUCKETS
+        );
+        assert_eq!(
+            config.rate_limit_bucket_ttl_ms,
+            DEFAULT_RATE_LIMIT_BUCKET_TTL_MS
         );
     }
 

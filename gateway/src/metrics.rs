@@ -19,6 +19,28 @@ pub const INBOUND_TLS_RELOADS_TOTAL: &str = "inbound_tls_reloads_total";
 /// with the same uninstrumented-death exposure the `TOOLS_FILE` and
 /// `POLICY_FILE` watchers have.
 pub const INBOUND_TLS_WATCH_HEARTBEATS_TOTAL: &str = "inbound_tls_watch_heartbeats_total";
+/// Live rate-limit buckets, per limiter.
+///
+/// Every label value is a compile-time constant: `read` and `write` for the
+/// two global lanes, `policy` for every policy rate-limit rule (rule sets
+/// change across reloads, and a per-rule label would mint and abandon time
+/// series with every policy edit). A rate-limit key is never a label -- keys
+/// are caller-influenced, so labelling by them would hand an attacker the
+/// time-series cardinality the bucket ceiling exists to bound. A value pinned
+/// at `RATE_LIMIT_MAX_BUCKETS` with evictions climbing is the signal that the
+/// working set no longer fits and callers are being recycled.
+pub const RATE_LIMIT_BUCKETS: &str = "rate_limit_buckets";
+/// Rate-limit bucket evictions, per limiter and reason.
+///
+/// `reason="capacity"` means the store was full and a bucket was recycled to
+/// admit a new key; `reason="ttl"` means an idle-beyond-`RATE_LIMIT_BUCKET_TTL_MS`
+/// bucket was preferred for eviction. Eviction resets the evicted key's
+/// allowance, so sustained `capacity` evictions are the signal that the
+/// working set no longer fits and callers are being traded bursts -- raise
+/// `RATE_LIMIT_MAX_BUCKETS` or investigate the key cardinality. Sustained
+/// `ttl` evictions on a full store are the healthy steady state: newcomers
+/// arriving, idlers naturally recycled, active callers protected.
+pub const RATE_LIMIT_BUCKET_EVICTIONS_TOTAL: &str = "rate_limit_bucket_evictions_total";
 /// Client-certificate outcomes, per listener.
 ///
 /// Every label value is a compile-time constant. The identity a rejected
