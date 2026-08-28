@@ -419,7 +419,7 @@ impl fmt::Display for InboundTlsError {
             ),
             Self::ServerNameClaimedTwice { setting, name } => write!(
                 formatter,
-                "two certificate chains in {setting} both claim the server name '{name}'; a client naming it must land on exactly one chain, so name it in one chain only"
+                "two certificate chains in {setting} both claim the name '{name}'; a client naming it must land on exactly one chain, so claim it in one chain only"
             ),
             Self::ServerNameUnselectable { setting, chain } => write!(
                 formatter,
@@ -784,7 +784,15 @@ fn load_certified_chains(
     // The two lists arrive equal in length -- `Config::from_env` rejects a
     // count mismatch as a configuration problem, and the reload re-reads the
     // same lists startup validated -- so the zip below yields exactly one key
-    // per certificate chain, in the order the operator wrote them.
+    // per certificate chain, in the order the operator wrote them. The assert
+    // exists for every future constructor of these settings that does not go
+    // through `from_env`: `zip` would silently drop the tail of the longer
+    // list, and a hand-built test `Config` is exactly where that would hide.
+    debug_assert_eq!(
+        material.certificate_files.len(),
+        material.private_key_files.len(),
+        "certificate and key lists pair positionally and must be equal in length"
+    );
     let mut chains = Vec::with_capacity(material.certificate_files.len());
     for (certificate_file, private_key_file) in material
         .certificate_files
@@ -989,10 +997,13 @@ impl SniServerCertResolver {
                     Some(suffix) => (suffix.to_owned(), &mut wildcards),
                     None => (name.to_owned(), &mut exact),
                 };
-                if map.insert(claimed.clone(), index).is_some() {
+                if map.insert(claimed, index).is_some() {
+                    // The whole claim, wildcard asterisk included: an operator
+                    // resolving a collision on '*.example.com' should not have
+                    // to guess which of two patterns shares a suffix.
                     return Err(InboundTlsError::ServerNameClaimedTwice {
                         setting,
-                        name: claimed,
+                        name: name.clone(),
                     });
                 }
             }

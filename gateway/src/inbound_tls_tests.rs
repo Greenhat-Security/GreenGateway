@@ -3593,7 +3593,10 @@ fn two_chains_claiming_one_name_fail_startup() {
     );
 }
 
-/// Two chains claiming the same *wildcard* is the same defect one step removed.
+/// Two chains claiming the same *wildcard* is the same defect one step
+/// removed, and the error names the whole pattern -- an operator resolving a
+/// collision on `*.dup.example.test` should not have to guess which of two
+/// patterns shares a suffix.
 #[test]
 fn two_chains_claiming_one_wildcard_fail_startup() {
     let material = MaterialDir::new();
@@ -3606,9 +3609,42 @@ fn two_chains_claiming_one_wildcard_fail_startup() {
             .expect_err("a wildcard claimed by two chains must fail startup"),
         InboundTlsError::ServerNameClaimedTwice {
             setting: "TLS_CERT_FILE",
-            name: "dup.example.test".to_owned(),
+            name: "*.dup.example.test".to_owned(),
         }
     );
+}
+
+/// A mixed-case *wire* name selects a lower-case claim. The other case test
+/// folds the certificate's side; this one exercises the wire side, which
+/// arrives pre-folded by rustls (pki-types lower-cases the SNI it parses) --
+/// defence in depth in the resolver covers it, but nothing in this suite
+/// noticed when that resolver-side fold was deleted, because the pre-fold made
+/// it unreachable. This pins the end-to-end path: if either fold ever stops
+/// happening, a mixed-case caller stops matching a name it should, and this is
+/// the test that fails.
+#[tokio::test]
+async fn a_mixed_case_wire_name_selects_the_lower_case_claim() {
+    let material = MaterialDir::new();
+    let default = server_identity_named(&["fallback.example.test"], &[]);
+    let lower = server_identity_named(&["mixed.example.test"], &[]);
+    let config = write_chains(&material, &[default.clone(), lower.clone()]);
+    let bindings = InboundTlsBindings::load(&config).expect("a lower-case claim should load");
+    let listener = serve(&bindings).await;
+
+    let served = served_leaf(
+        listener.addr,
+        &[&default, &lower],
+        ServerName::try_from("MiXeD.eXaMpLe.TeSt".to_owned())
+            .expect("a mixed-case server name should parse"),
+    )
+    .await
+    .expect("a mixed-case wire name must verify against the chain claiming its lower-case form");
+    assert_eq!(
+        served,
+        leaf_der(&lower),
+        "a mixed-case wire name must select the chain claiming its lower-case form"
+    );
+    listener.stop().await;
 }
 
 /// A later chain with no DNS names can never be selected -- SNI carries DNS
