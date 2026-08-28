@@ -45,6 +45,10 @@ export const GREEN_GATEWAY_ENV_KEYS = [
   "RATE_LIMIT_READ_BURST",
   "RATE_LIMIT_WRITE_RPS",
   "RATE_LIMIT_WRITE_BURST",
+  // Per-container bucket ceiling and idle TTL: the container rate-limits on
+  // its own, so these shape its memory and eviction like any deployment's.
+  "RATE_LIMIT_MAX_BUCKETS",
+  "RATE_LIMIT_BUCKET_TTL_MS",
   "TRUST_PROXY_HEADERS",
   "TRUSTED_PROXY_CIDRS",
   "VALIDATION_ALLOWED_CONTENT_TYPES",

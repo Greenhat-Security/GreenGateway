@@ -1,9 +1,10 @@
 //! Token-bucket rate limiting middleware.
 
 use std::{
-    collections::HashMap,
+    collections::{hash_map::RandomState, HashMap, VecDeque},
+    hash::BuildHasher,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
@@ -20,7 +21,9 @@ use crate::{
     auth,
     client_ip::{canonical_client_ip, ClientIpPolicy},
     config::Config,
-    metrics::LOCK_POISON_RECOVERIES_TOTAL,
+    metrics::{
+        LOCK_POISON_RECOVERIES_TOTAL, RATE_LIMIT_BUCKETS, RATE_LIMIT_BUCKET_EVICTIONS_TOTAL,
+    },
     rbac::{
         matcher::{method_matches, path_pattern_matches},
         Policy, RateLimitRule,
@@ -33,22 +36,52 @@ pub struct RateLimitState {
     write: RateLimiter,
     policy: Arc<ArcSwap<RateLimitPolicyState>>,
     client_ip_policy: ClientIpPolicy,
+    bucket_capacity: usize,
+    bucket_idle_ttl: Duration,
 }
 
-#[derive(Clone)]
-pub struct RateLimiter {
-    // Known limitation: buckets are never evicted, so this HashMap can grow
-    // one entry per unique key for the lifetime of the process. Future work
-    // should add TTL sweeping or an LRU/size cap. This is acceptable for now
-    // with default IP keying and the current single-node scope.
-    buckets: Arc<Mutex<HashMap<String, TokenBucket>>>,
-    rps: f64,
-    burst: f64,
+/// One rate limiter's bucket storage: bounded, and biased towards keeping the
+/// buckets of keys that are actually being used.
+///
+/// The bound is a hard ceiling on distinct tracked keys; when a new key arrives
+/// while the store is full, one existing bucket is evicted. The eviction rule
+/// is second-chance (the clock algorithm): a bucket that has been used since
+/// the last scan gets one reprieve, a bucket idle beyond the configured TTL is
+/// evicted first regardless of use, and everything else is evicted in scan
+/// order. That keeps a spray of throwaway identities from displacing the
+/// buckets of active callers, which matters because eviction resets the
+/// evicted key's allowance -- a fresh bucket is a fresh burst.
+///
+/// Keys are stored as 64-bit hashes, never as the key strings: a rate-limit
+/// key can carry caller-influenced text (a principal's `user_id` comes from a
+/// token claim with no length bound of its own), and the store's memory must
+/// be bounded by the entry count, not by the length of the longest identity an
+/// attacker can persuade an identity provider to mint. Hashing with a
+/// per-process random seed also means no offline-precomputable key collisions.
+/// A 64-bit hash collision merges two callers into one bucket -- the failure
+/// mode is two callers sharing a limit, never a caller escaping one.
+///
+/// There is deliberately no background sweep. The ceiling alone bounds memory;
+/// the clock recycles idle buckets exactly when capacity is needed, and a sweep
+/// task would add lifecycle surface to free memory that is already bounded.
+struct BucketStore {
+    map: HashMap<u64, TokenBucket>,
+    /// Second-chance scan order: insertion order, with referenced buckets
+    /// demoted to the back when they earn a reprieve.
+    hand: VecDeque<u64>,
+    capacity: usize,
+    idle_ttl: Duration,
+    /// Keys are hashed with a per-process random seed held in the shared store
+    /// so every clone of the limiter agrees on a key's hash: a per-clone seed
+    /// would give one key two buckets in the one shared map.
+    hasher: RandomState,
+    label: &'static str,
 }
 
 struct TokenBucket {
     tokens: f64,
     last_refill: Instant,
+    referenced: bool,
 }
 
 struct RateLimitPolicyState {
@@ -74,18 +107,38 @@ struct TooManyRequestsBody {
 impl RateLimitState {
     pub fn from_config_and_policy(config: &Config, policy: Option<&Policy>) -> Self {
         Self {
-            read: RateLimiter::new(config.rate_limit_read_rps, config.rate_limit_read_burst),
-            write: RateLimiter::new(config.rate_limit_write_rps, config.rate_limit_write_burst),
+            read: RateLimiter::new(
+                config.rate_limit_read_rps,
+                config.rate_limit_read_burst,
+                config.rate_limit_max_buckets,
+                config.rate_limit_bucket_idle_ttl(),
+                "read",
+            ),
+            write: RateLimiter::new(
+                config.rate_limit_write_rps,
+                config.rate_limit_write_burst,
+                config.rate_limit_max_buckets,
+                config.rate_limit_bucket_idle_ttl(),
+                "write",
+            ),
             policy: Arc::new(ArcSwap::from_pointee(RateLimitPolicyState::from_policy(
                 policy,
+                config.rate_limit_max_buckets,
+                config.rate_limit_bucket_idle_ttl(),
             ))),
             client_ip_policy: ClientIpPolicy::from_config(config),
+            bucket_capacity: config.rate_limit_max_buckets,
+            bucket_idle_ttl: config.rate_limit_bucket_idle_ttl(),
         }
     }
 
     pub(crate) fn replace_policy(&self, policy: &Policy) {
         self.policy
-            .store(Arc::new(RateLimitPolicyState::from_policy(Some(policy))));
+            .store(Arc::new(RateLimitPolicyState::from_policy(
+                Some(policy),
+                self.bucket_capacity,
+                self.bucket_idle_ttl,
+            )));
     }
 
     fn global_limiter(&self, lane: Lane) -> RateLimiter {
@@ -106,17 +159,40 @@ impl RateLimitState {
     }
 }
 
+#[derive(Clone)]
+pub struct RateLimiter {
+    buckets: Arc<Mutex<BucketStore>>,
+    rps: f64,
+    burst: f64,
+}
+
 impl RateLimiter {
-    pub fn new(rps: f64, burst: u32) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        rps: f64,
+        burst: u32,
+        bucket_capacity: usize,
+        bucket_idle_ttl: Duration,
+        label: &'static str,
+    ) -> Self {
         Self {
-            buckets: Arc::new(Mutex::new(HashMap::new())),
+            buckets: Arc::new(Mutex::new(BucketStore::new(
+                bucket_capacity,
+                bucket_idle_ttl,
+                label,
+            ))),
             rps,
             burst: f64::from(burst),
         }
     }
 
     pub fn check(&self, key: &str) -> bool {
-        let now = Instant::now();
+        self.check_at(key, Instant::now())
+    }
+
+    /// The limiter's decision for `key` at a given instant, so the store's
+    /// eviction rules can be tested against synthetic time instead of sleeps.
+    fn check_at(&self, key: &str, now: Instant) -> bool {
         let mut buckets = match self.buckets.lock() {
             Ok(buckets) => buckets,
             Err(poisoned) => {
@@ -130,27 +206,124 @@ impl RateLimiter {
                 poisoned.into_inner()
             }
         };
+        let hashed = buckets.hash_of(key);
 
-        let bucket = buckets.entry(key.to_owned()).or_insert(TokenBucket {
-            tokens: self.burst,
-            last_refill: now,
-        });
-        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        if let Some(bucket) = buckets.map.get_mut(&hashed) {
+            let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
 
-        bucket.tokens = (bucket.tokens + (elapsed * self.rps)).min(self.burst);
-        bucket.last_refill = now;
+            bucket.tokens = (bucket.tokens + (elapsed * self.rps)).min(self.burst);
+            bucket.last_refill = now;
+            bucket.referenced = true;
 
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
+            if bucket.tokens >= 1.0 {
+                bucket.tokens -= 1.0;
+                true
+            } else {
+                false
+            }
         } else {
-            false
+            if buckets.map.len() >= buckets.capacity {
+                buckets.evict_one(now);
+            }
+            buckets.map.insert(
+                hashed,
+                TokenBucket {
+                    // The first check of a fresh bucket is the first token of
+                    // its burst, spent immediately. It starts unreferenced: a
+                    // bucket earns its eviction reprieve by being checked
+                    // *again* after insertion, so a spray of one-shot
+                    // identities -- each checked exactly once -- never
+                    // protects itself, and active keys do.
+                    tokens: self.burst - 1.0,
+                    last_refill: now,
+                    referenced: false,
+                },
+            );
+            buckets.hand.push_back(hashed);
+            buckets.report_gauge();
+            true
         }
     }
 }
 
+impl BucketStore {
+    fn new(capacity: usize, idle_ttl: Duration, label: &'static str) -> Self {
+        Self {
+            map: HashMap::new(),
+            hand: VecDeque::new(),
+            capacity,
+            idle_ttl,
+            hasher: RandomState::new(),
+            label,
+        }
+    }
+
+    /// A key's bucket identity, stable for the life of the process.
+    fn hash_of(&self, key: &str) -> u64 {
+        self.hasher.hash_one(key)
+    }
+
+    /// Evicts one bucket, second-chance: idle-beyond-TTL first, then the first
+    /// not-referenced-since-the-last-scan, demoting referenced ones as it goes.
+    fn evict_one(&mut self, now: Instant) {
+        // One full rotation clears every `referenced` bit, so a second pass
+        // must find a victim; the outer bound guarantees forward progress even
+        // if that reasoning ever breaks.
+        let scans_available = self.hand.len().saturating_mul(2);
+        for _ in 0..scans_available {
+            let Some(candidate) = self.hand.pop_front() else {
+                break;
+            };
+            let Some(bucket) = self.map.get_mut(&candidate) else {
+                // Hand and map are maintained together; skip rather than panic
+                // if that invariant is ever broken.
+                continue;
+            };
+            let idle = now.saturating_duration_since(bucket.last_refill);
+            if idle >= self.idle_ttl {
+                self.map.remove(&candidate);
+                self.report_eviction("ttl");
+                return;
+            }
+            if bucket.referenced {
+                bucket.referenced = false;
+                self.hand.push_back(candidate);
+                continue;
+            }
+            self.map.remove(&candidate);
+            self.report_eviction("capacity");
+            return;
+        }
+        // Every bucket was hot within the TTL: progress beats perfect fairness.
+        while let Some(candidate) = self.hand.pop_front() {
+            if self.map.remove(&candidate).is_some() {
+                self.report_eviction("capacity");
+                return;
+            }
+        }
+    }
+
+    fn report_eviction(&self, reason: &'static str) {
+        ::metrics::counter!(
+            RATE_LIMIT_BUCKET_EVICTIONS_TOTAL,
+            "limiter" => self.label,
+            "reason" => reason
+        )
+        .increment(1);
+        self.report_gauge();
+    }
+
+    fn report_gauge(&self) {
+        ::metrics::gauge!(RATE_LIMIT_BUCKETS, "limiter" => self.label).set(self.map.len() as f64);
+    }
+}
+
 impl RateLimitPolicyState {
-    fn from_policy(policy: Option<&Policy>) -> Self {
+    fn from_policy(
+        policy: Option<&Policy>,
+        bucket_capacity: usize,
+        bucket_idle_ttl: Duration,
+    ) -> Self {
         Self {
             overrides: policy
                 .map(|policy| {
@@ -158,7 +331,7 @@ impl RateLimitPolicyState {
                         .rate_limits
                         .iter()
                         .cloned()
-                        .map(RateLimitOverride::new)
+                        .map(|rule| RateLimitOverride::new(rule, bucket_capacity, bucket_idle_ttl))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -179,8 +352,17 @@ impl RateLimitPolicyState {
 }
 
 impl RateLimitOverride {
-    fn new(rule: RateLimitRule) -> Self {
-        let limiter = RateLimiter::new(rule.requests_per_second, rule.burst);
+    fn new(rule: RateLimitRule, bucket_capacity: usize, bucket_idle_ttl: Duration) -> Self {
+        // Every policy-rule limiter reports under the one `policy` label: rule
+        // sets change across reloads, and a per-rule label would mint and
+        // abandon time series with every policy edit.
+        let limiter = RateLimiter::new(
+            rule.requests_per_second,
+            rule.burst,
+            bucket_capacity,
+            bucket_idle_ttl,
+            "policy",
+        );
 
         Self { rule, limiter }
     }
@@ -321,6 +503,11 @@ mod tests {
         },
     };
 
+    /// Bucket-store shape for behaviour tests: generous enough that ordinary
+    /// lane tests never touch it, small enough to be irrelevant to timing.
+    const TEST_BUCKET_CAPACITY: usize = 1024;
+    const TEST_BUCKET_TTL: Duration = Duration::from_secs(600);
+
     fn test_state(read_burst: u32, write_burst: u32) -> RateLimitState {
         test_state_with_rate_limits(0.0, read_burst, 0.0, write_burst, Vec::new())
     }
@@ -333,15 +520,29 @@ mod tests {
         rate_limits: Vec<RateLimitRule>,
     ) -> RateLimitState {
         RateLimitState {
-            read: RateLimiter::new(read_rps, read_burst),
-            write: RateLimiter::new(write_rps, write_burst),
+            read: RateLimiter::new(
+                read_rps,
+                read_burst,
+                TEST_BUCKET_CAPACITY,
+                TEST_BUCKET_TTL,
+                "read",
+            ),
+            write: RateLimiter::new(
+                write_rps,
+                write_burst,
+                TEST_BUCKET_CAPACITY,
+                TEST_BUCKET_TTL,
+                "write",
+            ),
             policy: Arc::new(ArcSwap::from_pointee(RateLimitPolicyState {
                 overrides: rate_limits
                     .into_iter()
-                    .map(RateLimitOverride::new)
+                    .map(|rule| RateLimitOverride::new(rule, TEST_BUCKET_CAPACITY, TEST_BUCKET_TTL))
                     .collect(),
             })),
             client_ip_policy: ClientIpPolicy::default(),
+            bucket_capacity: TEST_BUCKET_CAPACITY,
+            bucket_idle_ttl: TEST_BUCKET_TTL,
         }
     }
 
@@ -382,7 +583,7 @@ mod tests {
 
     #[test]
     fn fresh_limiter_allows_burst_then_throttles() {
-        let limiter = RateLimiter::new(0.0, 2);
+        let limiter = RateLimiter::new(0.0, 2, TEST_BUCKET_CAPACITY, TEST_BUCKET_TTL, "read");
 
         assert!(limiter.check("key"));
         assert!(limiter.check("key"));
@@ -391,7 +592,7 @@ mod tests {
 
     #[test]
     fn exhausted_limiter_refills_over_time() {
-        let limiter = RateLimiter::new(1000.0, 1);
+        let limiter = RateLimiter::new(1000.0, 1, TEST_BUCKET_CAPACITY, TEST_BUCKET_TTL, "read");
 
         assert!(limiter.check("key"));
         assert!(!limiter.check("key"));
@@ -401,7 +602,7 @@ mod tests {
 
     #[test]
     fn recovers_from_poisoned_bucket_lock() {
-        let limiter = RateLimiter::new(0.0, 1);
+        let limiter = RateLimiter::new(0.0, 1, TEST_BUCKET_CAPACITY, TEST_BUCKET_TTL, "read");
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let _guard = limiter
                 .buckets
@@ -412,6 +613,176 @@ mod tests {
 
         assert!(result.is_err());
         assert!(limiter.check("key"));
+    }
+
+    fn store_len(limiter: &RateLimiter) -> usize {
+        limiter.buckets.lock().expect("bucket lock").map.len()
+    }
+
+    /// The store's size is bounded by its capacity no matter how many distinct
+    /// keys an attacker rotates through -- the property the unbounded HashMap
+    /// this replaces could not make.
+    #[test]
+    fn bucket_storage_is_bounded_at_the_configured_capacity() {
+        let limiter = RateLimiter::new(0.0, 10, 4, TEST_BUCKET_TTL, "read");
+
+        for index in 0..10 {
+            limiter.check(&format!("attacker-identity-{index}"));
+        }
+
+        assert_eq!(
+            store_len(&limiter),
+            4,
+            "ten distinct keys must not leave more buckets than the capacity"
+        );
+    }
+
+    /// An active key's bucket survives a spray of throwaway identities, and
+    /// that survival is observable in the key's allowance: the hot key was
+    /// exhausted before the spray and is still exhausted after it. Had it been
+    /// evicted, its next check would start a fresh bucket and succeed.
+    ///
+    /// Second-chance protects a key for one full rotation of the scan hand --
+    /// which is the same protection LRU gives, for a key checked at least once
+    /// per rotation. The spray here stays within one rotation of a
+    /// capacity-four store; the boundary itself is pinned by the next test.
+    #[test]
+    fn a_hot_key_survives_a_cold_spray() {
+        let limiter = RateLimiter::new(0.0, 1, 4, TEST_BUCKET_TTL, "read");
+
+        assert!(limiter.check("hot"));
+        assert!(!limiter.check("hot"), "the hot key starts exhausted");
+
+        for index in 0..6 {
+            limiter.check(&format!("throwaway-{index}"));
+        }
+
+        assert!(
+            !limiter.check("hot"),
+            "the hot key's bucket must survive the spray; success here would mean it was evicted and given a fresh burst"
+        );
+    }
+
+    /// The honest boundary of that protection: a spray larger than the whole
+    /// capacity displaces even active keys, because every entry in any bounded
+    /// store is displaced by enough newcomers. An evicted active key's next
+    /// request starts a fresh bucket -- a fresh burst. That is the documented
+    /// approximation limit of the ceiling, and the reason
+    /// `rate_limit_buckets` pinned at capacity with `capacity` evictions
+    /// climbing is the signal to raise `RATE_LIMIT_MAX_BUCKETS`: the working
+    /// set, legitimate or not, no longer fits.
+    #[test]
+    fn a_spray_larger_than_the_capacity_recycles_even_active_keys() {
+        let limiter = RateLimiter::new(0.0, 1, 4, TEST_BUCKET_TTL, "read");
+
+        assert!(limiter.check("hot"));
+        assert!(!limiter.check("hot"), "the hot key starts exhausted");
+
+        for index in 0..12 {
+            limiter.check(&format!("throwaway-{index}"));
+        }
+
+        assert!(
+            limiter.check("hot"),
+            "beyond a full rotation the hot key is recycled and starts a fresh burst -- the documented limit, not a defect"
+        );
+    }
+
+    /// A bucket idle beyond the TTL is evicted in preference to a fresher one,
+    /// even though both carry the second-chance `referenced` bit. The scenario
+    /// is built so plain second-chance cannot produce the same outcome: `hot`
+    /// sits *ahead* of `idle` in scan order, so without the TTL rule the scan
+    /// demotes both and then evicts `hot` -- with the TTL rule, `idle` is the
+    /// victim because its last activity is older. Which key kept its bucket is
+    /// observable in whose next check succeeds. Synthetic instants rather than
+    /// sleeps: the TTL is a comparison, not a timer.
+    #[test]
+    fn idle_beyond_ttl_buckets_are_evicted_before_fresher_ones() {
+        let limiter = RateLimiter::new(0.0, 1, 2, Duration::from_millis(180), "read");
+        let t0 = Instant::now();
+        let t_mid = t0 + Duration::from_millis(50);
+        let t_late = t0 + Duration::from_millis(200);
+
+        // `hot` is created first (ahead in scan order), used again to earn the
+        // second-chance reprieve, and touched once more at t_mid so its last
+        // activity is only 150ms before t_late.
+        assert!(limiter.check_at("hot", t0));
+        assert!(!limiter.check_at("hot", t0), "hot starts exhausted");
+        assert!(!limiter.check_at("hot", t_mid));
+        // `idle` is created second and also earns the reprieve, but its last
+        // activity stays at t0 -- the full 200ms before t_late, beyond the
+        // 180ms TTL.
+        assert!(limiter.check_at("idle", t0));
+        assert!(!limiter.check_at("idle", t0), "idle starts exhausted");
+
+        // Capacity pressure with both buckets referenced.
+        assert!(limiter.check_at("newcomer", t_late));
+
+        assert!(
+            !limiter.check_at("hot", t_late),
+            "the fresher bucket must survive; success here would mean the TTL rule did not protect it"
+        );
+        assert!(
+            limiter.check_at("idle", t_late),
+            "the idle-beyond-TTL bucket must have been evicted: its next check starts a fresh one and succeeds"
+        );
+    }
+
+    /// Both eviction reasons are counted on the documented counter, with the
+    /// limiter as a static label.
+    #[test]
+    fn evictions_are_counted_by_reason_on_the_documented_metric() {
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        ::metrics::with_local_recorder(&recorder, || {
+            let limiter = RateLimiter::new(0.0, 1, 1, Duration::from_millis(100), "read");
+            let t0 = Instant::now();
+
+            // Capacity eviction: the store is full with a fresh, referenced
+            // bucket; the newcomer displaces it after one demotion.
+            assert!(limiter.check_at("first", t0));
+            assert!(limiter.check_at("second", t0));
+
+            // TTL eviction: `second` sits idle past the TTL before pressure.
+            let t1 = t0 + Duration::from_millis(200);
+            assert!(limiter.check_at("third", t1));
+        });
+
+        assert_eq!(
+            recorder.count(
+                crate::metrics::RATE_LIMIT_BUCKET_EVICTIONS_TOTAL,
+                &[("limiter", "read"), ("reason", "capacity")]
+            ),
+            1,
+            "the capacity eviction must be counted once"
+        );
+        assert_eq!(
+            recorder.count(
+                crate::metrics::RATE_LIMIT_BUCKET_EVICTIONS_TOTAL,
+                &[("limiter", "read"), ("reason", "ttl")]
+            ),
+            1,
+            "the TTL eviction must be counted once"
+        );
+    }
+
+    /// The live bucket count is reported on the documented gauge, which is
+    /// what tells an operator the ceiling is doing its job.
+    #[test]
+    fn bucket_count_is_reported_on_the_documented_gauge() {
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        ::metrics::with_local_recorder(&recorder, || {
+            let limiter = RateLimiter::new(0.0, 10, 2, TEST_BUCKET_TTL, "read");
+
+            limiter.check("one");
+            limiter.check("two");
+            limiter.check("three");
+        });
+
+        assert_eq!(
+            recorder.gauge_value(crate::metrics::RATE_LIMIT_BUCKETS, &[("limiter", "read")]),
+            Some(2.0),
+            "three keys against a capacity of two must leave exactly two buckets"
+        );
     }
 
     #[tokio::test]

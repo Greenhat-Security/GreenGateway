@@ -1198,6 +1198,28 @@ Default: `20`
 
 Format and validation: must parse as a `u32`. A fresh write-lane bucket starts full.
 
+### RATE_LIMIT_MAX_BUCKETS
+
+Hard ceiling on the number of distinct rate-limit keys each limiter tracks -- the read lane, the write lane, and each policy `rate_limits` rule each have their own store with this ceiling.
+
+Default: `65536`
+
+Format and validation: must parse as a `usize` greater than 0.
+
+The ceiling is what bounds the limiter's memory against cardinality attack: without it, every unique source IP (a single IPv6 /64 offers more than any ceiling) or every unique principal identity adds a bucket for the lifetime of the process, and a principal's `user_id` arrives from a token claim with no length bound of its own, so the memory per entry is attacker-influenced too. Buckets are keyed by a 64-bit hash of the rate-limit key rather than by the key text, so each entry is a fixed handful of bytes no matter how long an identity is. At the ceiling, one bucket is recycled to admit each new key, second-chance: a bucket idle beyond `RATE_LIMIT_BUCKET_TTL_MS` is evicted first, then buckets in scan order, with buckets that have been used since the last scan earning one reprieve -- so a spray of throwaway identities recycles itself rather than displacing active callers. Eviction resets the evicted key's allowance: its next request starts a fresh burst. A working set larger than the ceiling therefore recycles callers continuously; that is the signal to raise this setting, and it is observable as `rate_limit_buckets` pinned at the ceiling with `rate_limit_bucket_evictions_total{reason="capacity"}` climbing. The one honest limit of the approximation: a spray of more distinct keys than the whole ceiling between two requests from one caller displaces even that active caller, as it must in any bounded store.
+
+Note that the ceiling and eviction are per limiter *and per process*: each replica of a multi-replica deployment tracks independently.
+
+### RATE_LIMIT_BUCKET_TTL_MS
+
+How long a rate-limit bucket may sit idle before it is preferred for eviction when the store needs capacity, in milliseconds.
+
+Default: `600000` (10 minutes)
+
+Format and validation: must parse as a `u64` greater than 0.
+
+This does not bound memory -- `RATE_LIMIT_MAX_BUCKETS` does that on its own, and there is no background sweep -- it only chooses *which* bucket is recycled under capacity pressure, biasing eviction towards buckets a caller has stopped using. There is no retry or periodic expiry: an idle bucket is examined exactly when a new key needs its slot.
+
 ### TRUST_PROXY_HEADERS
 
 Whether direct proxy peers listed in `TRUSTED_PROXY_CIDRS` may supply `X-Forwarded-For` and `X-Real-IP` as canonical client IP inputs.

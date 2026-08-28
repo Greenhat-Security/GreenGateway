@@ -250,6 +250,8 @@ mod tests {
             rate_limit_read_burst: 100,
             rate_limit_write_rps: 10.0,
             rate_limit_write_burst: 20,
+            rate_limit_max_buckets: crate::config::DEFAULT_RATE_LIMIT_MAX_BUCKETS,
+            rate_limit_bucket_ttl_ms: crate::config::DEFAULT_RATE_LIMIT_BUCKET_TTL_MS,
             trust_proxy_headers: false,
             trusted_proxy_cidrs: Vec::new(),
             rbac_exempt_paths: vec![
