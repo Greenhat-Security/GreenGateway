@@ -4605,3 +4605,51 @@ fn reload_outcomes_are_counted_on_the_documented_metric() {
     );
     assert_eq!(accepted, 1, "the accepted reload must be counted once");
 }
+
+/// The material watcher announces liveness on the documented counter, so a
+/// task that has died is distinguishable from quiet files.
+///
+/// Without this, a dead watcher looks exactly like an unchanging certificate:
+/// no events, no reloads, no signal. The counter advancing -- here, at least
+/// twice within the wait bound, which only a running loop can do -- is the
+/// observable difference.
+#[test]
+fn the_material_watcher_heartbeat_is_counted_while_it_runs() {
+    let recorder = crate::audit::sink::tests::CountingRecorder::default();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+
+    ::metrics::with_local_recorder(&recorder, || {
+        runtime.block_on(async {
+            let material = MaterialDir::new();
+            let _first = write_default_identity(&material);
+            let bindings =
+                InboundTlsBindings::load(&tls_config(&material)).expect("material should load");
+            let capture = crate::audit::sink::tests::CaptureSink::new();
+            let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+            bindings
+                .spawn_material_reload_tasks(audit)
+                .expect("material watcher should start");
+            let listener = serve(&bindings).await;
+
+            wait_until(Duration::from_secs(15), || {
+                recorder.count(
+                    crate::metrics::INBOUND_TLS_WATCH_HEARTBEATS_TOTAL,
+                    &[("listener", "data")],
+                ) >= 2
+            })
+            .await;
+            listener.stop().await;
+            let beats = recorder.count(
+                crate::metrics::INBOUND_TLS_WATCH_HEARTBEATS_TOTAL,
+                &[("listener", "data")],
+            );
+            assert!(
+                beats >= 2,
+                "the heartbeat counter must advance while the watcher runs (saw {beats}); a flat counter is how a dead watcher is told apart from quiet files"
+            );
+        })
+    });
+}

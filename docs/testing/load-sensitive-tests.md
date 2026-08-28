@@ -30,6 +30,7 @@ Each of these has been seen to fail under parallel load and pass in isolation. N
 | `tools::definitions::tests::reload_rejects_local_tool_colliding_with_preserved_mcp_proxy_tool_name` | Depends on a registry reload being observed. |
 | `repeated_mcp_tool_calls_accumulate_into_one_inventory_row` | Depends on inventory aggregation completing. |
 | `proxied_mcp_tool_call_appears_as_per_tool_traffic_inventory_row` | Depends on inventory aggregation completing. |
+| `egress::tests::rejected_scheme_log_exposes_only_a_bounded_category` | Asserts on log output whose capture competes with parallel test output. |
 
 ## Platform coverage gaps, which are not flakiness
 

@@ -9,6 +9,16 @@ pub const INBOUND_TLS_HANDSHAKES_IN_FLIGHT: &str = "inbound_tls_handshakes_in_fl
 /// being served -- the thing to alert on when a certificate's expiry is
 /// approaching.
 pub const INBOUND_TLS_RELOADS_TOTAL: &str = "inbound_tls_reloads_total";
+/// Inbound TLS material-watcher liveness, per listener.
+///
+/// Every label value is a compile-time constant. The counter advances on a
+/// fixed interval while the file-watching task is running; a value that stops
+/// advancing means the watcher is dead and certificate reloads will silently
+/// not happen -- rotation believed working is the failure this makes
+/// observable. It does not cover the SIGHUP handler, which is a separate task
+/// with the same uninstrumented-death exposure the `TOOLS_FILE` and
+/// `POLICY_FILE` watchers have.
+pub const INBOUND_TLS_WATCH_HEARTBEATS_TOTAL: &str = "inbound_tls_watch_heartbeats_total";
 /// Client-certificate outcomes, per listener.
 ///
 /// Every label value is a compile-time constant. The identity a rejected

@@ -96,6 +96,7 @@ use crate::{
     metrics::{
         INBOUND_CLIENT_CERTIFICATES_TOTAL, INBOUND_TLS_HANDSHAKES_IN_FLIGHT,
         INBOUND_TLS_HANDSHAKES_TOTAL, INBOUND_TLS_RELOADS_TOTAL,
+        INBOUND_TLS_WATCH_HEARTBEATS_TOTAL,
     },
 };
 
@@ -125,6 +126,17 @@ const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 /// an operator reasoning about "when does my change apply" should not have to
 /// know which file they changed.
 const TLS_MATERIAL_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// How often the material watcher announces that it is still alive.
+///
+/// The reload machinery is otherwise silent when nothing changes, so a watch
+/// task that has died -- a panic, a starved runtime -- is indistinguishable
+/// from quiet files: rotation silently stops while the deployment believes it
+/// works. The heartbeat is the cheap way to tell those apart; it is a counter
+/// increment on a timer, not an event, so its cost is one metric write per
+/// listener per interval. `MissedTickBehavior::Skip` keeps a long reload from
+/// firing a catch-up burst: liveness wants steady beats, not back-fill.
+const TLS_WATCH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The scheme the listener that carried a request terminated.
 ///
@@ -658,10 +670,16 @@ impl fmt::Debug for InboundTlsBindings {
 ///
 /// `rustls_pki_types::PrivateKeyDer` implements `Zeroize` but not `Drop`, so
 /// the decoded DER would otherwise sit in freed heap after the signing key is
-/// built. Wrapping it keeps every failure path -- a mismatched key, an
-/// unsupported version -- wiping the material it already decoded, which is the
-/// same discipline `ResolvedSecret` applies to the PEM bytes it came from. The
-/// success path hands the key to rustls, which owns it from then on.
+/// built. Wrapping it keeps every failure path *before the key is taken* -- a
+/// PEM that does not parse into a usable key, an unsupported version -- wiping
+/// the material it already decoded, which is the same discipline
+/// `ResolvedSecret` applies to the PEM bytes it came from. Two paths are
+/// deliberately outside that promise: once `take()` hands the DER to
+/// `CertifiedKey::from_der`, ownership is rustls's, and if that construction
+/// fails -- a key that does not match the leaf -- rustls drops the DER
+/// un-zeroized itself; and the success path likewise hands the key to rustls,
+/// which owns it from then on. The PEM bytes those DERs were decoded from are
+/// zeroized on every path regardless.
 struct ZeroizingKey(Option<PrivateKeyDer<'static>>);
 
 impl ZeroizingKey {
@@ -1487,9 +1505,22 @@ async fn tls_material_file_watch_loop(
     cancellation: CancellationToken,
 ) {
     let names = tls_material_watch_names(&reload);
+    let mut heartbeat = tokio::time::interval(TLS_WATCH_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let event = tokio::select! {
             event = events.recv() => event,
+            // Liveness, not work: a dead watcher is otherwise indistinguishable
+            // from quiet files, and "rotation believed working" is the worst
+            // state this machinery can be in.
+            _ = heartbeat.tick() => {
+                ::metrics::counter!(
+                    INBOUND_TLS_WATCH_HEARTBEATS_TOTAL,
+                    "listener" => reload.listener_label
+                )
+                .increment(1);
+                continue;
+            }
             () = cancellation.cancelled() => return,
         };
         let Some(event) = event else {
