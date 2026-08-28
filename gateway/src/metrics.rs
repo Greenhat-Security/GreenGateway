@@ -1,6 +1,14 @@
 pub const LOCK_POISON_RECOVERIES_TOTAL: &str = "lock_poison_recoveries_total";
 pub const INBOUND_TLS_HANDSHAKES_TOTAL: &str = "inbound_tls_handshakes_total";
 pub const INBOUND_TLS_HANDSHAKES_IN_FLIGHT: &str = "inbound_tls_handshakes_in_flight";
+/// Inbound certificate material reloads, per listener.
+///
+/// Every label value is a compile-time constant. A rejected reload keeps the
+/// last good chains serving, so `outcome="rejected"` is the counter that says
+/// a rotation did *not* take effect and the previous certificate is still
+/// being served -- the thing to alert on when a certificate's expiry is
+/// approaching.
+pub const INBOUND_TLS_RELOADS_TOTAL: &str = "inbound_tls_reloads_total";
 /// Client-certificate outcomes, per listener.
 ///
 /// Every label value is a compile-time constant. The identity a rejected

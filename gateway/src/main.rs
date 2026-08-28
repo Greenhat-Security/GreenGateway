@@ -1439,6 +1439,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_config = ShutdownConfig::from_config(&config);
     let lifecycle = GatewayLifecycle::new();
     let (audit_log, audit_event_sender) = audit::AuditLog::from_config(&config)?;
+    // Started once the audit log exists, so every reload outcome -- accepted
+    // or rejected -- is observable from the first moment a listener serves.
+    // A watcher that cannot be installed aborts startup for the same reason
+    // unreadable material does: a listener whose certificate files cannot be
+    // watched is a listener whose certificates quietly stop being renewable.
+    inbound_tls.spawn_material_reload_tasks_with_lifecycle(audit_log.clone(), &lifecycle)?;
     let app = gateway_app_with_process_started_at_and_overrides(
         config,
         metrics_handle,
