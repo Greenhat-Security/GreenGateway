@@ -1029,16 +1029,18 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
     let registration_task = tokio::spawn(async move {
         registration_start.wait().await;
         registration_visible.wait().await;
-        registration_service.register(
-            &registration_id,
-            &registration_etag,
-            registration_spec_revision,
-            registration_catalog_revision,
-            &registration_digest,
-            ACCEPTANCE_OPENAPI_SPEC,
-            &["ping".to_owned()],
-            &[],
-        )
+        registration_service
+            .register(
+                &registration_id,
+                &registration_etag,
+                registration_spec_revision,
+                registration_catalog_revision,
+                &registration_digest,
+                ACCEPTANCE_OPENAPI_SPEC,
+                &["ping".to_owned()],
+                &[],
+            )
+            .await
     });
 
     let refresh_service = mcp.clone();
@@ -1130,6 +1132,7 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
             &selected,
             &confirmations,
         )
+        .await
         .expect("a fresh post-race registration should publish");
     let definition = registry
         .get("ping")
@@ -1286,6 +1289,7 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
             &selected,
             &confirmations,
         )
+        .await
         .expect("managed OpenAPI capability should publish");
 
     let mcp_catalogs = McpConnectionCatalogService::load(

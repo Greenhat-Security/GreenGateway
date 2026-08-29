@@ -56,6 +56,7 @@ mod middleware;
 mod path_match;
 mod proxy;
 mod rbac;
+mod storage;
 mod tools;
 mod upstream_route;
 
@@ -65,6 +66,7 @@ use lifecycle::{
     serve_gateway, GatewayApp, GatewayApps, GatewayLifecycle, GrpcApp, ShutdownConfig,
 };
 use proxy::{ProxyClassifier, ProxyState};
+use storage::{AuditEventStore as _, PrincipalDirectoryStore};
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -397,7 +399,7 @@ impl AdminRoutes {
 
 #[derive(Clone)]
 struct AuditAdminState {
-    query_store: Option<Arc<audit::query::AuditQueryStore>>,
+    query_store: Option<Arc<storage::SqliteAuditEventStore>>,
     event_sender: audit::AuditEventSender,
     rbac_state: Option<middleware::rbac::RbacState>,
 }
@@ -417,8 +419,8 @@ struct StatusAdminState {
 struct PolicyAdminState {
     policy_file: Option<PathBuf>,
     rbac_state: Option<middleware::rbac::RbacState>,
-    history_store: Option<Arc<rbac::PolicyHistoryStore>>,
-    query_store: Option<Arc<audit::query::AuditQueryStore>>,
+    history_store: Option<Arc<dyn storage::PolicyHistory>>,
+    query_store: Option<Arc<storage::SqliteAuditEventStore>>,
     audit: audit::AuditLog,
     client_ip_policy: client_ip::ClientIpPolicy,
     max_body_size: usize,
@@ -426,7 +428,7 @@ struct PolicyAdminState {
 
 #[derive(Clone)]
 struct TokenAdminState {
-    store: Option<Arc<dyn auth::TokenStore>>,
+    store: Option<Arc<dyn storage::ServiceTokenStore>>,
     validator: Option<Arc<auth::ServiceTokenValidator>>,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
@@ -495,7 +497,7 @@ struct SuggestionsAdminState {
 #[derive(Clone)]
 struct TrafficAdminState {
     discovery_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
-    audit_query_store: Option<Arc<audit::query::AuditQueryStore>>,
+    audit_query_store: Option<Arc<storage::SqliteAuditEventStore>>,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
     client_ip_policy: client_ip::ClientIpPolicy,
@@ -505,7 +507,7 @@ struct TrafficAdminState {
 #[derive(Clone)]
 struct PrincipalAdminState {
     directory: auth::PrincipalDirectory,
-    audit_query_store: Option<Arc<audit::query::AuditQueryStore>>,
+    audit_query_store: Option<Arc<storage::SqliteAuditEventStore>>,
     discovery_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
     rbac_state: Option<middleware::rbac::RbacState>,
 }
@@ -1566,7 +1568,7 @@ fn gateway_app_with_process_started_at_and_overrides(
     let audit_query_store = config
         .audit_sqlite_path
         .as_deref()
-        .map(audit::query::AuditQueryStore::open)
+        .map(storage::SqliteAuditEventStore::open)
         .transpose()?
         .map(Arc::new);
     let schema_coverage = discovery::openapi::SchemaCoverage::from_config(&config)?;
@@ -1627,10 +1629,11 @@ fn gateway_app_with_process_started_at_and_overrides(
         })
         .transpose()?
         .map(Arc::new);
-    let policy_history_store = policy_history_sqlite_path(&config)
-        .map(rbac::PolicyHistoryStore::open)
-        .transpose()?
-        .map(Arc::new);
+    let policy_history_store: Option<Arc<dyn storage::PolicyHistory>> =
+        policy_history_sqlite_path(&config)
+            .map(rbac::PolicyHistoryStore::open)
+            .transpose()?
+            .map(|store| Arc::new(store) as Arc<dyn storage::PolicyHistory>);
     let observation_state =
         middleware::observation::ObservationState::from_config(&config, audit_log.clone())
             .with_conformance(
@@ -1739,10 +1742,10 @@ fn gateway_app_with_process_started_at_and_overrides(
         .as_deref()
         .map(auth::SqliteTokenStore::open)
         .transpose()?
-        .map(|store| Arc::new(store) as Arc<dyn auth::TokenStore>);
+        .map(Arc::new);
     let service_token_validator = service_token_store.as_ref().map(|store| {
         Arc::new(auth::ServiceTokenValidator::new(
-            Arc::clone(store),
+            Arc::clone(store) as Arc<dyn storage::ServiceTokenStore>,
             Duration::from_millis(config.service_token_cache_ttl_ms),
         ))
     });
@@ -1876,7 +1879,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         max_body_size: config.max_body_size,
     };
     let token_admin_state = TokenAdminState {
-        store: service_token_store,
+        store: service_token_store.map(|store| store as Arc<dyn storage::ServiceTokenStore>),
         validator: service_token_validator,
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
@@ -3613,39 +3616,59 @@ async fn connection_secret_create_endpoint(
         Ok(secret) => secret,
         Err(_) => return connection_secret_validation_error(),
     };
-    let mutation_guard = match connection_secret_mutation_guard(&state) {
-        Ok(guard) => guard,
-        Err(response) => return *response,
-    };
-    let locked_metadata = state.control_plane.secret_alias_metadata();
-    let locked_collection_etag = connections::admin::secret_collection_etag(&locked_metadata);
-    if locked_collection_etag != current_collection_etag {
-        drop(mutation_guard);
-        return with_connection_secret_collection_etag(
-            precondition_failed(
-                "If-Match does not match the current connection-secret collection ETag",
-            ),
-            &locked_collection_etag,
-        );
-    }
-    let manager = match state.control_plane.local_secret_manager() {
-        Ok(manager) => manager,
-        Err(_) => {
-            drop(mutation_guard);
-            return connection_secret_store_not_configured();
+    // The precondition lock, the collection re-check, and the encrypted
+    // SQLite write run together on the blocking pool: the guard never spans
+    // an await, and the write never sits on the request executor.
+    let created = {
+        let lock = Arc::clone(&state.secret_precondition_lock);
+        let control_plane = state.control_plane.clone();
+        let current_collection_etag = current_collection_etag.clone();
+        match tokio::task::spawn_blocking(move || -> ResponseResult<_> {
+            let mutation_guard = match lock_connection_secret_mutations(&lock) {
+                Ok(guard) => guard,
+                Err(response) => return Err(response),
+            };
+            let locked_metadata = control_plane.secret_alias_metadata();
+            let locked_collection_etag =
+                connections::admin::secret_collection_etag(&locked_metadata);
+            if locked_collection_etag != current_collection_etag {
+                drop(mutation_guard);
+                return Err(Box::new(with_connection_secret_collection_etag(
+                    precondition_failed(
+                        "If-Match does not match the current connection-secret collection ETag",
+                    ),
+                    &locked_collection_etag,
+                )));
+            }
+            let manager = match control_plane.local_secret_manager() {
+                Ok(manager) => manager,
+                Err(_) => {
+                    drop(mutation_guard);
+                    return Err(Box::new(connection_secret_store_not_configured()));
+                }
+            };
+            match manager.create(&label, secret) {
+                Ok(created) => {
+                    let new_collection_etag = connections::admin::secret_collection_etag(
+                        &control_plane.secret_alias_metadata(),
+                    );
+                    Ok((created, new_collection_etag))
+                }
+                Err(error) => Err(Box::new(connection_secret_error_response(error))),
+            }
+        })
+        .await
+        {
+            Ok(Ok((created, new_collection_etag))) => (created, new_collection_etag),
+            Ok(Err(response)) => return *response,
+            Err(error) => {
+                tracing::error!(error = %error, "connection-secret mutation task failed");
+                return internal_server_error("connection-secret mutation failed");
+            }
         }
     };
-    let created = match manager.create(&label, secret) {
-        Ok(created) => created,
-        Err(error) => {
-            drop(mutation_guard);
-            return connection_secret_error_response(error);
-        }
-    };
+    let (created, new_collection_etag) = created;
     let item_etag = connections::admin::secret_metadata_etag(&created);
-    let new_collection_etag =
-        connections::admin::secret_collection_etag(&state.control_plane.secret_alias_metadata());
-    drop(mutation_guard);
     emit_connection_secret_changed(&state, &parts, &principal, "created", &created, 0);
     (
         StatusCode::CREATED,
@@ -3693,7 +3716,7 @@ async fn connection_secret_rotate_endpoint(
         };
     }
 
-    let current = match local_secret_metadata(&state, &raw_id) {
+    let current = match local_secret_metadata(&state.control_plane, &raw_id) {
         Ok(current) => current,
         Err(response) if response.status() == StatusCode::NOT_FOUND => {
             if let Err(error) =
@@ -3749,54 +3772,75 @@ async fn connection_secret_rotate_endpoint(
     {
         return connection_mutation_error_response(error);
     }
-    let mutation_guard = match connection_secret_mutation_guard(&state) {
-        Ok(guard) => guard,
-        Err(response) => return *response,
-    };
-    let locked_current = match local_secret_metadata(&state, &raw_id) {
-        Ok(current) => current,
-        Err(_) => {
-            let current_collection_etag = connections::admin::secret_collection_etag(
-                &state.control_plane.secret_alias_metadata(),
-            );
-            drop(mutation_guard);
-            return with_connection_secret_collection_etag(
-                precondition_failed("connection secret changed during rotation"),
-                &current_collection_etag,
-            );
+    // See the create handler: the guard, the re-check, and the encrypted
+    // SQLite write run together on the blocking pool.
+    let rotated = {
+        let lock = Arc::clone(&state.secret_precondition_lock);
+        let control_plane = state.control_plane.clone();
+        let raw_id_for_mutation = raw_id.clone();
+        let current_etag_for_mutation = current_etag.clone();
+        match tokio::task::spawn_blocking(move || -> ResponseResult<_> {
+            let mutation_guard = match lock_connection_secret_mutations(&lock) {
+                Ok(guard) => guard,
+                Err(response) => return Err(response),
+            };
+            let locked_current = match local_secret_metadata(&control_plane, &raw_id_for_mutation) {
+                Ok(current) => current,
+                Err(_) => {
+                    let current_collection_etag = connections::admin::secret_collection_etag(
+                        &control_plane.secret_alias_metadata(),
+                    );
+                    drop(mutation_guard);
+                    return Err(Box::new(with_connection_secret_collection_etag(
+                        precondition_failed("connection secret changed during rotation"),
+                        &current_collection_etag,
+                    )));
+                }
+            };
+            let locked_etag = connections::admin::secret_metadata_etag(&locked_current);
+            if locked_etag != current_etag_for_mutation {
+                drop(mutation_guard);
+                return Err(Box::new(with_etag(
+                    precondition_failed(
+                        "If-Match does not match the current connection-secret ETag",
+                    ),
+                    &locked_etag,
+                )));
+            }
+            let manager = match control_plane.local_secret_manager() {
+                Ok(manager) => manager,
+                Err(_) => {
+                    drop(mutation_guard);
+                    return Err(Box::new(connection_secret_store_not_configured()));
+                }
+            };
+            match manager.rotate(&raw_id_for_mutation, replacement) {
+                Ok(rotated) => {
+                    let dependency_count =
+                        connection_secret_dependency_counts(&control_plane.runtime_snapshot())
+                            .get(raw_id_for_mutation.as_str())
+                            .copied()
+                            .unwrap_or_default();
+                    let new_collection_etag = connections::admin::secret_collection_etag(
+                        &control_plane.secret_alias_metadata(),
+                    );
+                    Ok((rotated, dependency_count, new_collection_etag))
+                }
+                Err(error) => Err(Box::new(connection_secret_error_response(error))),
+            }
+        })
+        .await
+        {
+            Ok(Ok(rotation)) => rotation,
+            Ok(Err(response)) => return *response,
+            Err(error) => {
+                tracing::error!(error = %error, "connection-secret mutation task failed");
+                return internal_server_error("connection-secret mutation failed");
+            }
         }
     };
-    let locked_etag = connections::admin::secret_metadata_etag(&locked_current);
-    if locked_etag != current_etag {
-        drop(mutation_guard);
-        return with_etag(
-            precondition_failed("If-Match does not match the current connection-secret ETag"),
-            &locked_etag,
-        );
-    }
-    let manager = match state.control_plane.local_secret_manager() {
-        Ok(manager) => manager,
-        Err(_) => {
-            drop(mutation_guard);
-            return connection_secret_store_not_configured();
-        }
-    };
-    let rotated = match manager.rotate(&raw_id, replacement) {
-        Ok(rotated) => rotated,
-        Err(error) => {
-            drop(mutation_guard);
-            return connection_secret_error_response(error);
-        }
-    };
-    let dependency_count =
-        connection_secret_dependency_counts(&state.control_plane.runtime_snapshot())
-            .get(raw_id.as_str())
-            .copied()
-            .unwrap_or_default();
+    let (rotated, dependency_count, new_collection_etag) = rotated;
     let item_etag = connections::admin::secret_metadata_etag(&rotated);
-    let new_collection_etag =
-        connections::admin::secret_collection_etag(&state.control_plane.secret_alias_metadata());
-    drop(mutation_guard);
     emit_connection_secret_changed(
         &state,
         &parts,
@@ -3853,7 +3897,7 @@ async fn connection_secret_delete_endpoint(
         };
     }
 
-    let current = match local_secret_metadata(&state, &raw_id) {
+    let current = match local_secret_metadata(&state.control_plane, &raw_id) {
         Ok(current) => current,
         Err(response) if response.status() == StatusCode::NOT_FOUND => {
             if let Err(error) =
@@ -3890,45 +3934,65 @@ async fn connection_secret_delete_endpoint(
         return bad_request("connection-secret delete does not accept a request body");
     }
     drop(body);
-    let mutation_guard = match connection_secret_mutation_guard(&state) {
-        Ok(guard) => guard,
-        Err(response) => return *response,
+    // See the create handler: the guard, the re-check, and the encrypted
+    // SQLite delete run together on the blocking pool.
+    let deletion = {
+        let lock = Arc::clone(&state.secret_precondition_lock);
+        let control_plane = state.control_plane.clone();
+        let raw_id_for_mutation = raw_id.clone();
+        let current_etag_for_mutation = current_etag.clone();
+        tokio::task::spawn_blocking(move || -> ResponseResult<String> {
+            let mutation_guard = match lock_connection_secret_mutations(&lock) {
+                Ok(guard) => guard,
+                Err(response) => return Err(response),
+            };
+            let locked_current = match local_secret_metadata(&control_plane, &raw_id_for_mutation) {
+                Ok(current) => current,
+                Err(_) => {
+                    let current_collection_etag = connections::admin::secret_collection_etag(
+                        &control_plane.secret_alias_metadata(),
+                    );
+                    drop(mutation_guard);
+                    return Err(Box::new(with_connection_secret_collection_etag(
+                        precondition_failed("connection secret changed during deletion"),
+                        &current_collection_etag,
+                    )));
+                }
+            };
+            let locked_etag = connections::admin::secret_metadata_etag(&locked_current);
+            if locked_etag != current_etag_for_mutation {
+                drop(mutation_guard);
+                return Err(Box::new(with_etag(
+                    precondition_failed(
+                        "If-Match does not match the current connection-secret ETag",
+                    ),
+                    &locked_etag,
+                )));
+            }
+            let manager = match control_plane.local_secret_manager() {
+                Ok(manager) => manager,
+                Err(_) => {
+                    drop(mutation_guard);
+                    return Err(Box::new(connection_secret_store_not_configured()));
+                }
+            };
+            if let Err(error) = manager.delete(&raw_id_for_mutation) {
+                return Err(Box::new(connection_secret_error_response(error)));
+            }
+            let new_collection_etag =
+                connections::admin::secret_collection_etag(&control_plane.secret_alias_metadata());
+            Ok(new_collection_etag)
+        })
+        .await
     };
-    let locked_current = match local_secret_metadata(&state, &raw_id) {
-        Ok(current) => current,
-        Err(_) => {
-            let current_collection_etag = connections::admin::secret_collection_etag(
-                &state.control_plane.secret_alias_metadata(),
-            );
-            drop(mutation_guard);
-            return with_connection_secret_collection_etag(
-                precondition_failed("connection secret changed during deletion"),
-                &current_collection_etag,
-            );
+    let new_collection_etag = match deletion {
+        Ok(Ok(new_collection_etag)) => new_collection_etag,
+        Ok(Err(response)) => return *response,
+        Err(error) => {
+            tracing::error!(error = %error, "connection-secret mutation task failed");
+            return internal_server_error("connection-secret mutation failed");
         }
     };
-    let locked_etag = connections::admin::secret_metadata_etag(&locked_current);
-    if locked_etag != current_etag {
-        drop(mutation_guard);
-        return with_etag(
-            precondition_failed("If-Match does not match the current connection-secret ETag"),
-            &locked_etag,
-        );
-    }
-    let manager = match state.control_plane.local_secret_manager() {
-        Ok(manager) => manager,
-        Err(_) => {
-            drop(mutation_guard);
-            return connection_secret_store_not_configured();
-        }
-    };
-    if let Err(error) = manager.delete(&raw_id) {
-        drop(mutation_guard);
-        return connection_secret_error_response(error);
-    }
-    let new_collection_etag =
-        connections::admin::secret_collection_etag(&state.control_plane.secret_alias_metadata());
-    drop(mutation_guard);
     emit_connection_secret_changed(&state, &parts, &principal, "deleted", &current, 0);
     (
         StatusCode::OK,
@@ -3963,11 +4027,11 @@ async fn connection_list_endpoint(
         };
     let permissions = connection_permissions(rbac_state, principal);
     let snapshot = state.control_plane.runtime_snapshot();
-    let runtime = match connection_collection_runtime_data(&state, &snapshot, rbac_state, principal)
-    {
-        Ok(data) => data,
-        Err(response) => return *response,
-    };
+    let runtime =
+        match connection_collection_runtime_data(&state, &snapshot, rbac_state, principal).await {
+            Ok(data) => data,
+            Err(response) => return *response,
+        };
     let page = match connections::admin::build_connection_list_page(
         &snapshot,
         connections::admin::ConnectionListRuntimeData {
@@ -4040,7 +4104,7 @@ async fn connection_get_endpoint(
     let snapshot = state.control_plane.runtime_snapshot();
 
     if let Some(record) = snapshot.managed().get(&id) {
-        let (status, dependencies) = match connection_detail_runtime_data(&state, &id) {
+        let (status, dependencies) = match connection_detail_runtime_data(&state, &id).await {
             Ok(data) => data,
             Err(response) => return *response,
         };
@@ -4155,12 +4219,22 @@ async fn connection_create_endpoint(
     {
         return connection_mutation_error_response(error);
     }
-    let created = match state
-        .control_plane
-        .create_managed(snapshot.collection_etag(), candidate)
-    {
-        Ok(created) => created,
-        Err(error) => return connection_mutation_error_response(error),
+    // Managed mutations transact against SQLite inside the control plane;
+    // the transaction runs on the blocking pool off the request executor.
+    let created = {
+        let control_plane = state.control_plane.clone();
+        match tokio::task::spawn_blocking(move || {
+            control_plane.create_managed(snapshot.collection_etag(), candidate)
+        })
+        .await
+        {
+            Ok(Ok(created)) => created,
+            Ok(Err(error)) => return connection_mutation_error_response(error),
+            Err(error) => {
+                tracing::error!(error = %error, "connection mutation task failed");
+                return internal_server_error("connection mutation failed");
+            }
+        }
     };
     let permissions = connection_permissions(rbac_state, &principal);
     let changed_fields = connections::admin::changed_connection_fields(None, Some(&created.write));
@@ -4282,7 +4356,7 @@ async fn connection_put_endpoint(
 
     let changed_fields =
         connections::admin::changed_connection_fields(Some(&current.write), Some(&candidate));
-    let (current_status, dependencies) = match connection_detail_runtime_data(&state, &id) {
+    let (current_status, dependencies) = match connection_detail_runtime_data(&state, &id).await {
         Ok(data) => data,
         Err(response) => return *response,
     };
@@ -4294,12 +4368,20 @@ async fn connection_put_endpoint(
     {
         return connection_mutation_error_response(error);
     }
-    let updated = match state
-        .control_plane
-        .replace_managed(&id, &current_etag, candidate)
-    {
-        Ok(updated) => updated,
-        Err(error) => return connection_mutation_error_response(error),
+    let updated = {
+        let control_plane = state.control_plane.clone();
+        match tokio::task::spawn_blocking(move || {
+            control_plane.replace_managed(&id, &current_etag, candidate)
+        })
+        .await
+        {
+            Ok(Ok(updated)) => updated,
+            Ok(Err(error)) => return connection_mutation_error_response(error),
+            Err(error) => {
+                tracing::error!(error = %error, "connection mutation task failed");
+                return internal_server_error("connection mutation failed");
+            }
+        }
     };
     state.mcp_catalogs.reconcile_connection(&updated);
     state.openapi_catalogs.reconcile_connection(&updated);
@@ -4412,8 +4494,25 @@ async fn connection_delete_endpoint(
         Err(error) => return connection_catalog_lifecycle_error_response(error),
     };
 
-    if let Err(error) = state.control_plane.delete_managed(&id, &current_etag) {
-        return connection_mutation_error_response(error);
+    // The managed delete is a SQLite transaction; it runs on the blocking
+    // pool off the request executor, with the catalog-lifecycle guard still
+    // covering the deletion.
+    let deletion = {
+        let control_plane = state.control_plane.clone();
+        let id_for_delete = id.clone();
+        let etag_for_delete = current_etag.clone();
+        tokio::task::spawn_blocking(move || {
+            control_plane.delete_managed(&id_for_delete, &etag_for_delete)
+        })
+        .await
+    };
+    match deletion {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return connection_mutation_error_response(error),
+        Err(error) => {
+            tracing::error!(error = %error, "connection delete task failed");
+            return internal_server_error("connection delete failed");
+        }
     }
     state.mcp_catalogs.remove_connection(&id);
     state.openapi_catalogs.remove_connection(&id);
@@ -4721,12 +4820,34 @@ async fn connection_test_endpoint(
         .tests
         .execute_before(record, current_etag.as_str(), probe_deadline)
         .await;
-    let persistence = state.control_plane.append_status_before(
-        &id,
-        &current_etag,
-        execution.status_update(),
-        probe_deadline.into_std(),
-    );
+    // Status persistence is a small SQLite transaction; it runs on the
+    // blocking pool off the request executor.
+    let persistence = {
+        let control_plane = state.control_plane.clone();
+        let id_for_status = id.clone();
+        let etag_for_status = current_etag.clone();
+        let status_update = execution.status_update();
+        let deadline = probe_deadline.into_std();
+        match tokio::task::spawn_blocking(move || {
+            control_plane.append_status_before(
+                &id_for_status,
+                &etag_for_status,
+                status_update,
+                deadline,
+            )
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(error = %error, "connection status persistence task failed");
+                return with_etag(
+                    internal_server_error("connection status persistence failed"),
+                    current_etag.as_str(),
+                );
+            }
+        }
+    };
     drop(permit);
 
     if let Err(error) = persistence {
@@ -4826,8 +4947,19 @@ async fn connection_openapi_preview_endpoint(
         return bad_request("spec must not be empty");
     }
 
-    match state.openapi_catalogs.preview(&raw_id, &requested.spec) {
-        Ok(preview) => {
+    // Preview validates the candidate spec against the stored catalog; the
+    // SQLite read and spec binding run on the blocking pool.
+    let preview = {
+        let catalogs = state.openapi_catalogs.clone();
+        let raw_id_for_preview = raw_id.clone();
+        let spec_for_preview = requested.spec.clone();
+        tokio::task::spawn_blocking(move || {
+            catalogs.preview(&raw_id_for_preview, &spec_for_preview)
+        })
+        .await
+    };
+    match preview {
+        Ok(Ok(preview)) => {
             let connection_etag = preview.connection_etag.as_str().to_owned();
             (
                 StatusCode::OK,
@@ -4839,7 +4971,11 @@ async fn connection_openapi_preview_endpoint(
             )
                 .into_response()
         }
-        Err(error) => openapi_catalog_error_response(error, "preview"),
+        Ok(Err(error)) => openapi_catalog_error_response(error, "preview"),
+        Err(join_error) => {
+            tracing::error!(error = %join_error, "OpenAPI preview task failed");
+            internal_server_error("OpenAPI preview failed")
+        }
     }
 }
 
@@ -4907,16 +5043,20 @@ async fn connection_openapi_register_endpoint(
         })
         .collect::<Vec<_>>();
 
-    match state.openapi_catalogs.register(
-        id.as_str(),
-        current_etag.as_str(),
-        requested.expected_spec_revision,
-        requested.expected_catalog_revision,
-        &requested.spec_digest,
-        &requested.spec,
-        &requested.selected_tool_names,
-        &confirmations,
-    ) {
+    match state
+        .openapi_catalogs
+        .register(
+            id.as_str(),
+            current_etag.as_str(),
+            requested.expected_spec_revision,
+            requested.expected_catalog_revision,
+            &requested.spec_digest,
+            &requested.spec,
+            &requested.selected_tool_names,
+            &confirmations,
+        )
+        .await
+    {
         Ok(result) => {
             emit_managed_openapi_catalog_changed(&state, &parts, &principal, &result);
             (
@@ -5005,13 +5145,7 @@ async fn policy_put_endpoint(
         Err(errors) => return policy_validation_failed(errors),
     };
 
-    let _policy_write_guard = match rbac_state.policy_write_guard() {
-        Ok(guard) => guard,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to acquire policy write lock");
-            return internal_server_error("policy write lock failed");
-        }
-    };
+    let _policy_write_guard = rbac_state.policy_write_guard().await;
 
     let before_policy = rbac_state.current_policy();
     let current_etag = match policy_etag(&before_policy) {
@@ -5051,7 +5185,7 @@ async fn policy_put_endpoint(
         "action": "policy_replaced",
     });
     let history_append_failed =
-        append_policy_version_after_commit(&state, &principal, &after_policy, &diff_summary);
+        append_policy_version_after_commit(&state, &principal, &after_policy, &diff_summary).await;
     emit_policy_rule_changed(
         &state,
         &parts,
@@ -5099,11 +5233,13 @@ async fn policy_history_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    match history_store.list_versions(&filters) {
+    match history_store.list_versions(&filters).await {
         Ok(page) => (StatusCode::OK, Json(page)).into_response(),
-        Err(rbac::policy_history::PolicyHistoryError::InvalidCursor { parameter }) => {
-            bad_request(&format!("invalid query parameter: {parameter}"))
-        }
+        Err(err) if err.invalid_parameter_name().is_some() => bad_request(&format!(
+            "invalid query parameter: {}",
+            err.invalid_parameter_name()
+                .expect("guard ensures a parameter")
+        )),
         Err(err) => {
             tracing::error!(error = %err, "failed to query policy history");
             internal_server_error("policy history query failed")
@@ -5138,7 +5274,7 @@ async fn policy_rollback_endpoint(
         return policy_history_not_configured();
     };
 
-    let target = match history_store.get_version(target_version) {
+    let target = match history_store.get_version(target_version).await {
         Ok(Some(version)) => version,
         Ok(None) => return not_found("policy version was not found"),
         Err(err) => {
@@ -5154,13 +5290,7 @@ async fn policy_rollback_endpoint(
         return internal_server_error("policy history query failed");
     };
 
-    let _policy_write_guard = match rbac_state.policy_write_guard() {
-        Ok(guard) => guard,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to acquire policy write lock");
-            return internal_server_error("policy write lock failed");
-        }
-    };
+    let _policy_write_guard = rbac_state.policy_write_guard().await;
 
     let before_policy = rbac_state.current_policy();
     match require_matching_if_match(&parts.headers, &before_policy) {
@@ -5183,7 +5313,9 @@ async fn policy_rollback_endpoint(
         &before_policy,
         &target_policy,
         diff_summary,
-    ) {
+    )
+    .await
+    {
         Ok(result) => result,
         Err(response) => return *response,
     };
@@ -5253,7 +5385,7 @@ async fn policy_rule_post_endpoint(
     };
 
     let created =
-        match create_policy_rule(&state, &parts, &principal, rbac_state, policy_file, rule) {
+        match create_policy_rule(&state, &parts, &principal, rbac_state, policy_file, rule).await {
             Ok(result) => result,
             Err(response) => return *response,
         };
@@ -5294,13 +5426,7 @@ async fn policy_rule_patch_endpoint(
         );
     }
 
-    let _policy_write_guard = match rbac_state.policy_write_guard() {
-        Ok(guard) => guard,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to acquire policy write lock");
-            return internal_server_error("policy write lock failed");
-        }
-    };
+    let _policy_write_guard = rbac_state.policy_write_guard().await;
 
     let before_policy = rbac_state.current_policy();
     match require_matching_if_match(&parts.headers, &before_policy) {
@@ -5340,7 +5466,9 @@ async fn policy_rule_patch_endpoint(
         &before_policy,
         &candidate,
         diff_summary,
-    ) {
+    )
+    .await
+    {
         Ok(result) => result,
         Err(response) => return *response,
     };
@@ -5374,13 +5502,7 @@ async fn policy_rule_delete_endpoint(
             Err(response) => return *response,
         };
 
-    let _policy_write_guard = match rbac_state.policy_write_guard() {
-        Ok(guard) => guard,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to acquire policy write lock");
-            return internal_server_error("policy write lock failed");
-        }
-    };
+    let _policy_write_guard = rbac_state.policy_write_guard().await;
 
     let before_policy = rbac_state.current_policy();
     match require_matching_if_match(&parts.headers, &before_policy) {
@@ -5416,7 +5538,9 @@ async fn policy_rule_delete_endpoint(
         &before_policy,
         &candidate,
         diff_summary,
-    ) {
+    )
+    .await
+    {
         Ok(result) => result,
         Err(response) => return *response,
     };
@@ -5453,13 +5577,7 @@ async fn policy_rules_order_put_endpoint(
         Err(errors) => return policy_validation_failed(errors),
     };
 
-    let _policy_write_guard = match rbac_state.policy_write_guard() {
-        Ok(guard) => guard,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to acquire policy write lock");
-            return internal_server_error("policy write lock failed");
-        }
-    };
+    let _policy_write_guard = rbac_state.policy_write_guard().await;
 
     let before_policy = rbac_state.current_policy();
     match require_matching_if_match(&parts.headers, &before_policy) {
@@ -5494,7 +5612,9 @@ async fn policy_rules_order_put_endpoint(
         &before_policy,
         &candidate,
         diff_summary,
-    ) {
+    )
+    .await
+    {
         Ok(result) => result,
         Err(response) => return *response,
     };
@@ -5546,12 +5666,20 @@ async fn token_create_endpoint(
         return token_scope_authz_error_response(error);
     }
 
-    let created = match store.create(auth::tokens::CreateTokenRequest {
-        scopes: requested.scopes,
-        created_by: principal.user_id.clone(),
-        expires_at: requested.expires_at,
-    }) {
+    let created = match store
+        .create(auth::tokens::CreateTokenRequest {
+            scopes: requested.scopes,
+            created_by: principal.user_id.clone(),
+            expires_at: requested.expires_at,
+        })
+        .await
+    {
         Ok(created) => created,
+        // A malformed expires_at is the only request-reachable invalid data
+        // on create; scopes are validated before the store is called.
+        Err(error) if error.kind() == storage::RepositoryErrorKind::InvalidData => {
+            return bad_request("invalid service-token expires_at timestamp");
+        }
         Err(error) => return token_store_error_response(error),
     };
 
@@ -5583,7 +5711,7 @@ async fn token_list_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    match store.list(&filters) {
+    match store.list(&filters).await {
         Ok(page) => (StatusCode::OK, Json(page)).into_response(),
         Err(error) => token_store_error_response(error),
     }
@@ -5604,7 +5732,7 @@ async fn token_get_endpoint(
         Err(error) => return token_admin_authz_error_response(error),
     };
 
-    match store.get_by_id(&token_id) {
+    match store.get_by_id(&token_id).await {
         Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
         Ok(None) => not_found("service token was not found"),
         Err(error) => token_store_error_response(error),
@@ -5627,7 +5755,7 @@ async fn token_revoke_endpoint(
         Err(error) => return token_admin_authz_error_response(error),
     };
 
-    match store.revoke(&token_id) {
+    match store.revoke(&token_id).await {
         Ok(Some(record)) => {
             if let Some(validator) = state.validator.as_ref() {
                 validator.invalidate_token_id(&token_id);
@@ -5656,7 +5784,7 @@ async fn token_rotate_endpoint(
         Err(error) => return token_admin_authz_error_response(error),
     };
 
-    match store.rotate(&token_id) {
+    match store.rotate(&token_id).await {
         Ok(Some(created)) => {
             if let Some(validator) = state.validator.as_ref() {
                 validator.invalidate_token_id(&token_id);
@@ -5675,7 +5803,7 @@ async fn token_rotate_endpoint(
                 .into_response()
         }
         Ok(None) => not_found("service token was not found"),
-        Err(auth::tokens::TokenStoreError::RevokedToken { .. }) => {
+        Err(error) if error.kind() == storage::RepositoryErrorKind::Conflict => {
             conflict("cannot rotate revoked service token")
         }
         Err(error) => token_store_error_response(error),
@@ -6146,13 +6274,25 @@ async fn policy_rule_preview_endpoint(
         Err(errors) => return policy_validation_failed(errors),
     };
 
-    match preview_rule(query_store, preview_request) {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(err) => {
-            tracing::error!(error = %err, "failed to preview policy rule");
-            internal_server_error("policy rule preview failed")
-        }
-    }
+    // The preview scans up to 100k audit rows through a synchronous visitor;
+    // it runs on the blocking pool so the scan never sits on the executor.
+    let preview_store = Arc::clone(query_store.sqlite_query_store());
+    let previewed =
+        match tokio::task::spawn_blocking(move || preview_rule(&preview_store, preview_request))
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to preview policy rule");
+                return internal_server_error("policy rule preview failed");
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "policy rule preview task failed");
+                return internal_server_error("policy rule preview failed");
+            }
+        };
+
+    (StatusCode::OK, Json(previewed)).into_response()
 }
 
 async fn policy_rule_hits_endpoint(
@@ -6171,7 +6311,7 @@ async fn policy_rule_hits_endpoint(
     };
     let policy = rbac_state.current_policy();
     let counts = match state.query_store.as_ref() {
-        Some(query_store) => match query_store.rule_hit_counts() {
+        Some(query_store) => match query_store.rule_hit_counts().await {
             Ok(counts) => counts,
             Err(err) => {
                 tracing::error!(error = %err, "failed to query policy rule hit counts");
@@ -6236,7 +6376,10 @@ async fn policy_rule_shadow_review_endpoint(
         .collect::<Vec<_>>();
 
     let review = match state.query_store.as_ref() {
-        Some(query_store) => match query_store.shadow_rule_would_deny_summaries(&rule_ids) {
+        Some(query_store) => match query_store
+            .shadow_rule_would_deny_summaries(&rule_ids)
+            .await
+        {
             Ok(review) => review,
             Err(err) => {
                 tracing::error!(error = %err, "failed to query shadow rule review summaries");
@@ -6289,11 +6432,18 @@ async fn schema_coverage_endpoint(
         return schema_discovery_not_configured();
     };
 
-    let observed = match query_store.observed_endpoints() {
-        Ok(observed) => observed,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to query schema coverage discovery inventory");
-            return internal_server_error("schema coverage discovery query failed");
+    let observed = {
+        let query_store = Arc::clone(query_store);
+        match tokio::task::spawn_blocking(move || query_store.observed_endpoints()).await {
+            Ok(Ok(observed)) => observed,
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to query schema coverage discovery inventory");
+                return internal_server_error("schema coverage discovery query failed");
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "schema coverage discovery query task failed");
+                return internal_server_error("schema coverage discovery query failed");
+            }
         }
     };
 
@@ -6324,11 +6474,24 @@ async fn schema_inferred_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    match query_store.inferred_request_schema(&query.method, &query.endpoint_template) {
-        Ok(Some(schema)) => (StatusCode::OK, Json(schema)).into_response(),
-        Ok(None) => inferred_schema_no_samples(),
-        Err(err) => {
+    let inferred = {
+        let query_store = Arc::clone(query_store);
+        let method = query.method.clone();
+        let endpoint_template = query.endpoint_template.clone();
+        tokio::task::spawn_blocking(move || {
+            query_store.inferred_request_schema(&method, &endpoint_template)
+        })
+        .await
+    };
+    match inferred {
+        Ok(Ok(Some(schema))) => (StatusCode::OK, Json(schema)).into_response(),
+        Ok(Ok(None)) => inferred_schema_no_samples(),
+        Ok(Err(err)) => {
             tracing::error!(error = %err, "failed to query inferred request schema");
+            internal_server_error("inferred schema query failed")
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "inferred schema query task failed");
             internal_server_error("inferred schema query failed")
         }
     }
@@ -6520,7 +6683,7 @@ async fn audit_query_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    match query_store.query(&filters) {
+    match query_store.query_events(&filters).await {
         Ok(page) => (
             StatusCode::OK,
             Json(AuditQueryResponse {
@@ -6559,16 +6722,25 @@ async fn signals_list_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    match discovery_store.list_signals(&filters) {
-        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
-        Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter }) => {
-            bad_request(&format!("invalid query parameter: {parameter}"))
+    let signals_page = {
+        let discovery_store = Arc::clone(discovery_store);
+        match tokio::task::spawn_blocking(move || discovery_store.list_signals(&filters)).await {
+            Ok(Ok(page)) => page,
+            Ok(Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter })) => {
+                return bad_request(&format!("invalid query parameter: {parameter}"))
+            }
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to query discovery signals");
+                return internal_server_error("signals query failed");
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "signals query task failed");
+                return internal_server_error("signals query failed");
+            }
         }
-        Err(err) => {
-            tracing::error!(error = %err, "failed to query discovery signals");
-            internal_server_error("signals query failed")
-        }
-    }
+    };
+
+    (StatusCode::OK, Json(signals_page)).into_response()
 }
 
 async fn signal_acknowledge_endpoint(
@@ -6619,7 +6791,7 @@ async fn signal_transition_endpoint(
         return signals_admin_authz_error_response(error);
     }
 
-    let id = id.trim();
+    let id = id.trim().to_owned();
     if id.is_empty() {
         return bad_request("invalid signal id");
     }
@@ -6627,15 +6799,26 @@ async fn signal_transition_endpoint(
     let Some(discovery_store) = state.discovery_store.as_ref() else {
         return signals_discovery_not_configured();
     };
-    let signal =
-        match discovery_store.transition_signal(id, lifecycle_state, Some(&principal.user_id)) {
-            Ok(Some(signal)) => signal,
-            Ok(None) => return not_found("signal was not found"),
-            Err(err) => {
+    let signal = {
+        let discovery_store = Arc::clone(discovery_store);
+        let actor = principal.user_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            discovery_store.transition_signal(&id, lifecycle_state, Some(&actor))
+        })
+        .await
+        {
+            Ok(Ok(Some(signal))) => signal,
+            Ok(Ok(None)) => return not_found("signal was not found"),
+            Ok(Err(err)) => {
                 tracing::error!(error = %err, "failed to transition discovery signal");
                 return internal_server_error("signal transition failed");
             }
-        };
+            Err(err) => {
+                tracing::error!(error = %err, "signal transition task failed");
+                return internal_server_error("signal transition failed");
+            }
+        }
+    };
     emit_signal_lifecycle_changed(&state, &parts, &principal, &signal);
 
     (StatusCode::OK, Json(signal)).into_response()
@@ -6665,16 +6848,27 @@ async fn rule_suggestions_list_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    match suggestion_engine.list_suggestion_page(&filters) {
-        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
-        Err(discovery::suggestions::RuleSuggestionError::InvalidCursor { parameter }) => {
-            bad_request(&format!("invalid query parameter: {parameter}"))
+    let suggestions_page = {
+        let suggestion_engine = Arc::clone(suggestion_engine);
+        match tokio::task::spawn_blocking(move || suggestion_engine.list_suggestion_page(&filters))
+            .await
+        {
+            Ok(Ok(page)) => page,
+            Ok(Err(discovery::suggestions::RuleSuggestionError::InvalidCursor { parameter })) => {
+                return bad_request(&format!("invalid query parameter: {parameter}"))
+            }
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to query rule suggestions");
+                return internal_server_error("suggestions query failed");
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "suggestions query task failed");
+                return internal_server_error("suggestions query failed");
+            }
         }
-        Err(err) => {
-            tracing::error!(error = %err, "failed to query rule suggestions");
-            internal_server_error("suggestions query failed")
-        }
-    }
+    };
+
+    (StatusCode::OK, Json(suggestions_page)).into_response()
 }
 
 async fn rule_suggestions_generate_endpoint(
@@ -6701,13 +6895,24 @@ async fn rule_suggestions_generate_endpoint(
     };
     let policy = rbac_state.current_policy();
 
-    match suggestion_engine.generate(&policy) {
-        Ok(run) => (StatusCode::OK, Json(run)).into_response(),
-        Err(err) => {
-            tracing::error!(error = %err, "failed to generate rule suggestions");
-            internal_server_error("suggestion generation failed")
+    // Suggestion generation scans the audit and discovery stores; it runs on
+    // the blocking pool so those scans never sit on the executor.
+    let generation = {
+        let suggestion_engine = Arc::clone(suggestion_engine);
+        match tokio::task::spawn_blocking(move || suggestion_engine.generate(&policy)).await {
+            Ok(Ok(run)) => run,
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to generate rule suggestions");
+                return internal_server_error("suggestion generation failed");
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "suggestion generation task failed");
+                return internal_server_error("suggestion generation failed");
+            }
         }
-    }
+    };
+
+    (StatusCode::OK, Json(generation)).into_response()
 }
 
 async fn rule_suggestion_accept_endpoint(
@@ -6742,12 +6947,20 @@ async fn rule_suggestion_accept_endpoint(
     let Some(suggestion_engine) = state.suggestion_engine.as_ref() else {
         return suggestions_discovery_not_configured();
     };
-    let suggestion = match suggestion_engine.get_suggestion(id) {
-        Ok(Some(suggestion)) => suggestion,
-        Ok(None) => return not_found("suggestion was not found"),
-        Err(err) => {
-            tracing::error!(error = %err, "failed to load rule suggestion");
-            return internal_server_error("suggestion query failed");
+    let suggestion = {
+        let suggestion_engine = Arc::clone(suggestion_engine);
+        let id = id.to_owned();
+        match tokio::task::spawn_blocking(move || suggestion_engine.get_suggestion(&id)).await {
+            Ok(Ok(Some(suggestion))) => suggestion,
+            Ok(Ok(None)) => return not_found("suggestion was not found"),
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to load rule suggestion");
+                return internal_server_error("suggestion query failed");
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "suggestion query task failed");
+                return internal_server_error("suggestion query failed");
+            }
         }
     };
     if suggestion.state != discovery::suggestions::RuleSuggestionLifecycleState::Open {
@@ -6759,31 +6972,43 @@ async fn rule_suggestion_accept_endpoint(
         );
     }
 
-    let dispatch = match suggestion_engine.direct_rule_suggestion_safety(&suggestion) {
-        Ok(discovery::suggestions::DirectRuleSuggestionSafety::Safe(dispatch)) => dispatch,
-        Ok(discovery::suggestions::DirectRuleSuggestionSafety::HostRouted) => {
-            return conflict(
-                "suggestion targets host-routed traffic and cannot be accepted as a direct rule",
-            );
-        }
-        Ok(discovery::suggestions::DirectRuleSuggestionSafety::PathRouted) => {
-            return conflict(
-                "suggestion targets path-routed traffic and cannot be accepted as a direct rule",
-            );
-        }
-        Ok(discovery::suggestions::DirectRuleSuggestionSafety::AmbiguousRouting) => {
-            return conflict(
-                "suggestion spans multiple upstream routing contexts and cannot be accepted as a direct rule",
-            );
-        }
-        Ok(discovery::suggestions::DirectRuleSuggestionSafety::UnknownRoutingContext) => {
-            return conflict(
-                "suggestion predates trusted routing context and cannot be accepted; dismiss it and review newly classified traffic",
-            );
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "failed to revalidate rule suggestion routing context");
-            return internal_server_error("suggestion routing-context validation failed");
+    let dispatch = {
+        let suggestion_engine = Arc::clone(suggestion_engine);
+        let suggestion_for_check = suggestion.clone();
+        match tokio::task::spawn_blocking(move || {
+            suggestion_engine.direct_rule_suggestion_safety(&suggestion_for_check)
+        })
+        .await
+        {
+            Ok(Ok(discovery::suggestions::DirectRuleSuggestionSafety::Safe(dispatch))) => dispatch,
+            Ok(Ok(discovery::suggestions::DirectRuleSuggestionSafety::HostRouted)) => {
+                return conflict(
+                    "suggestion targets host-routed traffic and cannot be accepted as a direct rule",
+                );
+            }
+            Ok(Ok(discovery::suggestions::DirectRuleSuggestionSafety::PathRouted)) => {
+                return conflict(
+                    "suggestion targets path-routed traffic and cannot be accepted as a direct rule",
+                );
+            }
+            Ok(Ok(discovery::suggestions::DirectRuleSuggestionSafety::AmbiguousRouting)) => {
+                return conflict(
+                    "suggestion spans multiple upstream routing contexts and cannot be accepted as a direct rule",
+                );
+            }
+            Ok(Ok(discovery::suggestions::DirectRuleSuggestionSafety::UnknownRoutingContext)) => {
+                return conflict(
+                    "suggestion predates trusted routing context and cannot be accepted; dismiss it and review newly classified traffic",
+                );
+            }
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to revalidate rule suggestion routing context");
+                return internal_server_error("suggestion routing-context validation failed");
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "suggestion routing-context task failed");
+                return internal_server_error("suggestion routing-context validation failed");
+            }
         }
     };
 
@@ -6801,21 +7026,36 @@ async fn rule_suggestion_accept_endpoint(
         rbac_state,
         policy_file,
         proposed_rule,
-    ) {
+    )
+    .await
+    {
         Ok(result) => result,
         Err(response) => return *response,
     };
 
-    let suggestion = match suggestion_engine.transition_suggestion(
-        id,
-        discovery::suggestions::RuleSuggestionLifecycleState::Accepted,
-        Some(&principal.user_id),
-    ) {
-        Ok(Some(suggestion)) => suggestion,
-        Ok(None) => return not_found("suggestion was not found"),
-        Err(err) => {
-            tracing::error!(error = %err, "failed to accept rule suggestion");
-            return internal_server_error("suggestion transition failed");
+    let suggestion = {
+        let suggestion_engine = Arc::clone(suggestion_engine);
+        let id = id.to_owned();
+        let actor = principal.user_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            suggestion_engine.transition_suggestion(
+                &id,
+                discovery::suggestions::RuleSuggestionLifecycleState::Accepted,
+                Some(&actor),
+            )
+        })
+        .await
+        {
+            Ok(Ok(Some(suggestion))) => suggestion,
+            Ok(Ok(None)) => return not_found("suggestion was not found"),
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to accept rule suggestion");
+                return internal_server_error("suggestion transition failed");
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "suggestion transition task failed");
+                return internal_server_error("suggestion transition failed");
+            }
         }
     };
     emit_suggestion_lifecycle_changed(&state, &parts, &principal, &suggestion);
@@ -6874,28 +7114,49 @@ async fn rule_suggestion_transition_endpoint(
     let Some(suggestion_engine) = state.suggestion_engine.as_ref() else {
         return suggestions_discovery_not_configured();
     };
-    match suggestion_engine.get_suggestion(id) {
-        Ok(Some(suggestion)) => {
+    let loaded = {
+        let suggestion_engine = Arc::clone(suggestion_engine);
+        let id = id.to_owned();
+        match tokio::task::spawn_blocking(move || suggestion_engine.get_suggestion(&id)).await {
+            Ok(Ok(Some(suggestion))) => Some(suggestion),
+            Ok(Ok(None)) => None,
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to load rule suggestion");
+                return internal_server_error("suggestion query failed");
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "suggestion query task failed");
+                return internal_server_error("suggestion query failed");
+            }
+        }
+    };
+    match loaded {
+        Some(suggestion) => {
             if suggestion.state != discovery::suggestions::RuleSuggestionLifecycleState::Open {
                 return conflict("suggestion is not open");
             }
         }
-        Ok(None) => return not_found("suggestion was not found"),
-        Err(err) => {
-            tracing::error!(error = %err, "failed to load rule suggestion");
-            return internal_server_error("suggestion query failed");
-        }
+        None => return not_found("suggestion was not found"),
     }
-    let suggestion = match suggestion_engine.transition_suggestion(
-        id,
-        lifecycle_state,
-        Some(&principal.user_id),
-    ) {
-        Ok(Some(suggestion)) => suggestion,
-        Ok(None) => return not_found("suggestion was not found"),
-        Err(err) => {
-            tracing::error!(error = %err, "failed to transition rule suggestion");
-            return internal_server_error("suggestion transition failed");
+    let suggestion = {
+        let suggestion_engine = Arc::clone(suggestion_engine);
+        let id = id.to_owned();
+        let actor = principal.user_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            suggestion_engine.transition_suggestion(&id, lifecycle_state, Some(&actor))
+        })
+        .await
+        {
+            Ok(Ok(Some(suggestion))) => suggestion,
+            Ok(Ok(None)) => return not_found("suggestion was not found"),
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to transition rule suggestion");
+                return internal_server_error("suggestion transition failed");
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "suggestion transition task failed");
+                return internal_server_error("suggestion transition failed");
+            }
         }
     };
     emit_suggestion_lifecycle_changed(&state, &parts, &principal, &suggestion);
@@ -6927,33 +7188,36 @@ async fn principal_list_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    let directory = state.directory.clone();
-    let filters = query.filters.clone();
-    let page = match tokio::task::spawn_blocking(move || directory.list(&filters)).await {
-        Ok(Ok(page)) => page,
-        Ok(Err(auth::principal_directory::PrincipalDirectoryQueryError::InvalidCursor {
-            parameter,
-        })) => return bad_request(&format!("invalid query parameter: {parameter}")),
-        Ok(Err(err)) => {
-            tracing::error!(error = %err, "failed to query principal directory");
-            return internal_server_error("principal directory query failed");
+    let page = match PrincipalDirectoryStore::list(&state.directory, &query.filters).await {
+        Ok(page) => page,
+        Err(err) if err.invalid_parameter_name().is_some() => {
+            return bad_request(&format!(
+                "invalid query parameter: {}",
+                err.invalid_parameter_name()
+                    .expect("guard ensures a parameter")
+            ))
         }
         Err(err) => {
-            tracing::error!(error = %err, "principal directory query task failed");
+            tracing::error!(error = %err, "failed to query principal directory");
             return internal_server_error("principal directory query failed");
         }
     };
     let anonymous_request_count = match state.audit_query_store.as_ref() {
-        Some(audit_query_store) => match audit_query_store.anonymous_request_count(
-            query.filters.last_seen_after.as_deref(),
-            query.filters.last_seen_before.as_deref(),
-        ) {
-            Ok(count) => count,
-            Err(err) => {
-                tracing::error!(error = %err, "failed to query anonymous request count");
-                return internal_server_error("anonymous request count query failed");
+        Some(audit_query_store) => {
+            match audit_query_store
+                .anonymous_request_count(
+                    query.filters.last_seen_after.clone(),
+                    query.filters.last_seen_before.clone(),
+                )
+                .await
+            {
+                Ok(count) => count,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to query anonymous request count");
+                    return internal_server_error("anonymous request count query failed");
+                }
             }
-        },
+        }
         None => 0,
     };
 
@@ -6992,31 +7256,33 @@ async fn principal_detail_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    let directory = state.directory.clone();
     let key = query.key.clone();
-    let principal_record = match tokio::task::spawn_blocking(move || directory.get(&key)).await {
-        Ok(Ok(Some(principal))) => principal,
-        Ok(Ok(None)) => return not_found("principal was not found"),
-        Ok(Err(err)) => {
-            tracing::error!(error = %err, "failed to query principal detail");
-            return internal_server_error("principal detail query failed");
-        }
+    let principal_record = match PrincipalDirectoryStore::get(&state.directory, &key).await {
+        Ok(Some(principal)) => principal,
+        Ok(None) => return not_found("principal was not found"),
         Err(err) => {
-            tracing::error!(error = %err, "principal detail query task failed");
+            tracing::error!(error = %err, "failed to query principal detail");
             return internal_server_error("principal detail query failed");
         }
     };
     let (endpoints_touched, rules_hit) = match state.audit_query_store.as_ref() {
         Some(audit_query_store) => {
-            match principal_audit_summary(
-                audit_query_store,
-                principal_record.subject.as_str(),
-                principal_record.issuer.as_str(),
-                principal_record.auth_method.as_str(),
-            ) {
-                Ok(summary) => summary,
-                Err(err) => {
+            let summary_store = Arc::clone(audit_query_store.sqlite_query_store());
+            let subject = principal_record.subject.clone();
+            let issuer = principal_record.issuer.clone();
+            let auth_method = principal_record.auth_method.clone();
+            match tokio::task::spawn_blocking(move || {
+                principal_audit_summary(&summary_store, &subject, &issuer, &auth_method)
+            })
+            .await
+            {
+                Ok(Ok(summary)) => summary,
+                Ok(Err(err)) => {
                     tracing::error!(error = %err, "failed to query principal audit summary");
+                    return internal_server_error("principal audit summary query failed");
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "principal audit summary task failed");
                     return internal_server_error("principal audit summary query failed");
                 }
             }
@@ -7024,18 +7290,34 @@ async fn principal_detail_endpoint(
         None => (Vec::new(), Vec::new()),
     };
     let anomaly_history = match state.discovery_store.as_ref() {
-        Some(discovery_store) => match discovery_store.list_principal_endpoint_signals(
-            principal_record.subject.as_str(),
-            principal_record.issuer.as_str(),
-            principal_directory_audit_auth_mode(principal_record.auth_method.as_str()),
-            DEFAULT_PRINCIPAL_ANOMALY_HISTORY_LIMIT,
-        ) {
-            Ok(signals) => signals,
-            Err(err) => {
-                tracing::error!(error = %err, "failed to query principal anomaly history");
-                return internal_server_error("principal anomaly history query failed");
+        Some(discovery_store) => {
+            let anomaly_store = Arc::clone(discovery_store);
+            let subject = principal_record.subject.clone();
+            let issuer = principal_record.issuer.clone();
+            let auth_method =
+                principal_directory_audit_auth_mode(principal_record.auth_method.as_str())
+                    .to_owned();
+            match tokio::task::spawn_blocking(move || {
+                anomaly_store.list_principal_endpoint_signals(
+                    &subject,
+                    &issuer,
+                    &auth_method,
+                    DEFAULT_PRINCIPAL_ANOMALY_HISTORY_LIMIT,
+                )
+            })
+            .await
+            {
+                Ok(Ok(signals)) => signals,
+                Ok(Err(err)) => {
+                    tracing::error!(error = %err, "failed to query principal anomaly history");
+                    return internal_server_error("principal anomaly history query failed");
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "principal anomaly history task failed");
+                    return internal_server_error("principal anomaly history query failed");
+                }
             }
-        },
+        }
         None => Vec::new(),
     };
 
@@ -7064,7 +7346,7 @@ async fn traffic_endpoint_list_endpoint(
     };
     let rbac_state =
         match authorized_traffic_state(&state, &principal, ADMIN_TRAFFIC_READ_PERMISSION) {
-            Ok(rbac_state) => rbac_state,
+            Ok(rbac_state) => rbac_state.clone(),
             Err(error) => return traffic_admin_authz_error_response(error),
         };
     let include_open_signals =
@@ -7078,18 +7360,32 @@ async fn traffic_endpoint_list_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    match list_traffic_endpoint_page(
-        discovery_store,
-        &query,
-        Some(rbac_state),
-        include_open_signals,
-    ) {
-        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
-        Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter }) => {
+    // The inventory query pages the discovery store synchronously; it runs
+    // on the blocking pool so the SQLite reads never sit on the executor.
+    let inventory = {
+        let discovery_store = Arc::clone(discovery_store);
+        let rbac_state_for_query = rbac_state.clone();
+        tokio::task::spawn_blocking(move || {
+            list_traffic_endpoint_page(
+                &discovery_store,
+                &query,
+                Some(&rbac_state_for_query),
+                include_open_signals,
+            )
+        })
+        .await
+    };
+    match inventory {
+        Ok(Ok(page)) => (StatusCode::OK, Json(page)).into_response(),
+        Ok(Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter })) => {
             bad_request(&format!("invalid query parameter: {parameter}"))
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             tracing::error!(error = %err, "failed to query traffic endpoint inventory");
+            internal_server_error("traffic endpoint inventory query failed")
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "traffic endpoint inventory task failed");
             internal_server_error("traffic endpoint inventory query failed")
         }
     }
@@ -7121,34 +7417,58 @@ async fn traffic_endpoint_detail_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    let mut endpoint = match discovery_store.get_endpoint_with_open_signal_summaries(
-        &params.method,
-        &params.endpoint_template,
-        params.new_since_hours,
-        include_open_signals,
-    ) {
-        Ok(Some(endpoint)) => endpoint,
-        Ok(None) => return not_found("traffic endpoint was not found"),
-        Err(err) => {
-            tracing::error!(error = %err, "failed to query traffic endpoint detail");
-            return internal_server_error("traffic endpoint detail query failed");
+    let mut endpoint = {
+        let detail_store = Arc::clone(discovery_store);
+        let method = params.method.clone();
+        let endpoint_template = params.endpoint_template.clone();
+        let new_since_hours = params.new_since_hours;
+        match tokio::task::spawn_blocking(move || {
+            detail_store.get_endpoint_with_open_signal_summaries(
+                &method,
+                &endpoint_template,
+                new_since_hours,
+                include_open_signals,
+            )
+        })
+        .await
+        {
+            Ok(Ok(Some(endpoint))) => endpoint,
+            Ok(Ok(None)) => return not_found("traffic endpoint was not found"),
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to query traffic endpoint detail");
+                return internal_server_error("traffic endpoint detail query failed");
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "traffic endpoint detail task failed");
+                return internal_server_error("traffic endpoint detail query failed");
+            }
         }
     };
     apply_endpoint_detail_rule_coverage(&mut endpoint, Some(rbac_state));
-    let principals = match discovery_store.list_principals(
-        &params.method,
-        &params.endpoint_template,
-        &discovery::query::PrincipalPageFilters {
+    let principals = {
+        let principal_store = Arc::clone(discovery_store);
+        let method = params.method.clone();
+        let endpoint_template = params.endpoint_template.clone();
+        let principal_filters = discovery::query::PrincipalPageFilters {
             limit: params.principal_limit,
             cursor: params.principal_cursor.clone(),
-        },
-    ) {
-        Ok(page) => page,
-        Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter }) => {
+        };
+        tokio::task::spawn_blocking(move || {
+            principal_store.list_principals(&method, &endpoint_template, &principal_filters)
+        })
+        .await
+    };
+    let principals = match principals {
+        Ok(Ok(page)) => page,
+        Ok(Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter })) => {
             return bad_request(&format!("invalid query parameter: {parameter}"));
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             tracing::error!(error = %err, "failed to query traffic endpoint principals");
+            return internal_server_error("traffic endpoint principal query failed");
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "traffic endpoint principal query task failed");
             return internal_server_error("traffic endpoint principal query failed");
         }
     };
@@ -7170,7 +7490,7 @@ async fn traffic_endpoint_detail_endpoint(
                 recent_limit: params.events_limit,
                 recent_before_id: params.events_before_id,
             };
-            match audit_query_store.query_endpoint_activity(&filters) {
+            match audit_query_store.query_endpoint_activity(&filters).await {
                 Ok(activity) => TrafficEndpointAuditEnrichment {
                     available: true,
                     match_strategy: audit::query::ENDPOINT_AUDIT_MATCH_STRATEGY,
@@ -7250,17 +7570,31 @@ async fn traffic_endpoint_review_endpoint(
         return bad_request("invalid traffic endpoint review request body: endpoint_template");
     }
 
-    let review = match discovery_store.set_endpoint_review(
-        method,
-        endpoint_template,
-        request.reviewed,
-        Some(&principal.user_id),
-    ) {
-        Ok(Some(review)) => review,
-        Ok(None) => return not_found("traffic endpoint was not found"),
-        Err(err) => {
-            tracing::error!(error = %err, "failed to update traffic endpoint review state");
-            return internal_server_error("traffic endpoint review update failed");
+    let review = {
+        let review_store = Arc::clone(discovery_store);
+        let method = method.to_owned();
+        let endpoint_template = endpoint_template.to_owned();
+        let actor = principal.user_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            review_store.set_endpoint_review(
+                &method,
+                &endpoint_template,
+                request.reviewed,
+                Some(&actor),
+            )
+        })
+        .await
+        {
+            Ok(Ok(Some(review))) => review,
+            Ok(Ok(None)) => return not_found("traffic endpoint was not found"),
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to update traffic endpoint review state");
+                return internal_server_error("traffic endpoint review update failed");
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "traffic endpoint review task failed");
+                return internal_server_error("traffic endpoint review update failed");
+            }
         }
     };
     emit_traffic_endpoint_review_changed(
@@ -7834,7 +8168,7 @@ fn authorized_token_store<'a>(
     state: &'a TokenAdminState,
     principal: &auth::Principal,
     permission: &str,
-) -> Result<&'a Arc<dyn auth::TokenStore>, TokenAdminAuthzError> {
+) -> Result<&'a Arc<dyn storage::ServiceTokenStore>, TokenAdminAuthzError> {
     let Some(rbac_state) = state.rbac_state.as_ref() else {
         return Err(TokenAdminAuthzError::RbacNotConfigured);
     };
@@ -8582,12 +8916,6 @@ fn connection_secret_dependency_counts(
     counts
 }
 
-fn connection_secret_mutation_guard(
-    state: &ConnectionAdminState,
-) -> ResponseResult<std::sync::MutexGuard<'_, ()>> {
-    lock_connection_secret_mutations(state.secret_precondition_lock.as_ref())
-}
-
 fn lock_connection_secret_mutations(
     lock: &std::sync::Mutex<()>,
 ) -> ResponseResult<std::sync::MutexGuard<'_, ()>> {
@@ -8605,11 +8933,10 @@ fn lock_connection_secret_mutations(
 }
 
 fn local_secret_metadata(
-    state: &ConnectionAdminState,
+    control_plane: &connections::control_plane::ConnectionControlPlane,
     id: &str,
 ) -> ResponseResult<connections::secret::SecretAliasMetadata> {
-    let Some(metadata) = state
-        .control_plane
+    let Some(metadata) = control_plane
         .secret_alias_metadata()
         .into_iter()
         .find(|metadata| metadata.id == id)
@@ -8698,7 +9025,7 @@ struct ConnectionCollectionRuntimeData {
         BTreeMap<connections::model::ConnectionId, connections::store::ConnectionActivityTimes>,
 }
 
-fn connection_collection_runtime_data(
+async fn connection_collection_runtime_data(
     state: &ConnectionAdminState,
     snapshot: &connections::control_plane::ConnectionRuntimeSnapshot,
     rbac_state: &middleware::rbac::RbacState,
@@ -8713,31 +9040,58 @@ fn connection_collection_runtime_data(
             activity_times: BTreeMap::new(),
         });
     }
-    let store = state.control_plane.managed_store().map_err(|_| {
-        Box::new(service_unavailable(
-            "managed connection state is unavailable",
-        ))
-    })?;
-    let dependency_counts = store.dependency_counts().map_err(|error| {
-        tracing::error!(error = %error, "failed to load connection dependency counts");
-        Box::new(service_unavailable(
-            "managed connection state is unavailable",
-        ))
-    })?;
-    let activity_times = store.activity_times().map_err(|error| {
-        tracing::error!(error = %error, "failed to load connection activity timestamps");
-        Box::new(service_unavailable(
-            "managed connection state is unavailable",
-        ))
-    })?;
-    let mut statuses = BTreeMap::new();
-    for (id, record) in snapshot.managed() {
-        let stored_status = store.latest_status(id).map_err(|error| {
-            tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
+    let store = state
+        .control_plane
+        .managed_store()
+        .map_err(|_| {
             Box::new(service_unavailable(
                 "managed connection state is unavailable",
             ))
-        })?;
+        })?
+        .clone();
+    let ids = snapshot.managed().keys().cloned().collect::<Vec<_>>();
+    // The dependency, activity, and status reads are SQLite queries; they
+    // run together on the blocking pool off the request executor.
+    let (dependency_counts, activity_times, stored_statuses) =
+        match tokio::task::spawn_blocking(move || -> ResponseResult<_> {
+            let dependency_counts = store.dependency_counts().map_err(|error| {
+                tracing::error!(error = %error, "failed to load connection dependency counts");
+                Box::new(service_unavailable(
+                    "managed connection state is unavailable",
+                ))
+            })?;
+            let activity_times = store.activity_times().map_err(|error| {
+                tracing::error!(error = %error, "failed to load connection activity timestamps");
+                Box::new(service_unavailable(
+                    "managed connection state is unavailable",
+                ))
+            })?;
+            let mut stored_statuses = BTreeMap::new();
+            for id in &ids {
+                let stored_status = store.latest_status(id).map_err(|error| {
+                    tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
+                    Box::new(service_unavailable(
+                        "managed connection state is unavailable",
+                    ))
+                })?;
+                stored_statuses.insert(id.clone(), stored_status);
+            }
+            Ok((dependency_counts, activity_times, stored_statuses))
+        })
+        .await
+        {
+            Ok(Ok(queries)) => queries,
+            Ok(Err(response)) => return Err(response),
+            Err(error) => {
+                tracing::error!(error = %error, "connection collection query task failed");
+                return Err(Box::new(service_unavailable(
+                    "managed connection state is unavailable",
+                )));
+            }
+        };
+    let mut statuses = BTreeMap::new();
+    for (id, record) in snapshot.managed() {
+        let stored_status = stored_statuses.get(id).cloned().flatten();
         let status = state
             .mcp_catalogs
             .status_fallback(id, &record.etag(), stored_status);
@@ -8756,24 +9110,38 @@ fn connection_collection_runtime_data(
     })
 }
 
-fn connection_detail_runtime_data(
+async fn connection_detail_runtime_data(
     state: &ConnectionAdminState,
     id: &connections::model::ConnectionId,
 ) -> ResponseResult<(
     Option<connections::status::SafeConnectionStatus>,
     Vec<connections::store::ConnectionDependency>,
 )> {
-    let store = state.control_plane.managed_store().map_err(|_| {
-        Box::new(service_unavailable(
-            "managed connection state is unavailable",
-        ))
-    })?;
-    let stored_status = store.latest_status(id).map_err(|error| {
-        tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
-        Box::new(service_unavailable(
-            "managed connection state is unavailable",
-        ))
-    })?;
+    let store = state
+        .control_plane
+        .managed_store()
+        .map_err(|_| {
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
+            ))
+        })?
+        .clone();
+    let status_store = store.clone();
+    let status_id = id.clone();
+    let stored_status = tokio::task::spawn_blocking(move || status_store.latest_status(&status_id))
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "connection status query task failed");
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
+            ))
+        })?
+        .map_err(|error| {
+            tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
+            ))
+        })?;
     let snapshot = state.control_plane.runtime_snapshot();
     let status = snapshot.managed().get(id).and_then(|record| {
         let status = state
@@ -8783,10 +9151,20 @@ fn connection_detail_runtime_data(
             .openapi_catalogs
             .status_fallback(id, &record.etag(), status)
     });
-    let dependencies = store.dependencies(id).map_err(|error| {
-        tracing::error!(connection_id = %id, error = %error, "failed to load connection dependencies");
-        Box::new(connection_store_error_response(error))
-    })?;
+    let dependency_store = store;
+    let dependency_id = id.clone();
+    let dependencies = tokio::task::spawn_blocking(move || dependency_store.dependencies(&dependency_id))
+        .await
+        .map_err(|error| {
+            tracing::error!(connection_id = %id, error = %error, "connection dependency query task failed");
+            Box::new(internal_server_error(
+                "connection dependency query failed",
+            ))
+        })?
+        .map_err(|error| {
+            tracing::error!(connection_id = %id, error = %error, "failed to load connection dependencies");
+            Box::new(connection_store_error_response(error))
+        })?;
     Ok((status, dependencies))
 }
 
@@ -9928,7 +10306,7 @@ fn require_matching_if_match(
     }
 }
 
-fn create_policy_rule(
+async fn create_policy_rule(
     state: &PolicyAdminState,
     parts: &http::request::Parts,
     principal: &auth::Principal,
@@ -9936,13 +10314,7 @@ fn create_policy_rule(
     policy_file: &std::path::Path,
     mut rule: rbac::Rule,
 ) -> ResponseResult<PolicyRuleCreateResult> {
-    let _policy_write_guard = match rbac_state.policy_write_guard() {
-        Ok(guard) => guard,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to acquire policy write lock");
-            return Err(Box::new(internal_server_error("policy write lock failed")));
-        }
-    };
+    let _policy_write_guard = rbac_state.policy_write_guard().await;
 
     let before_policy = rbac_state.current_policy();
     let current_etag = require_matching_if_match(&parts.headers, &before_policy)?;
@@ -9986,7 +10358,8 @@ fn create_policy_rule(
         &before_policy,
         &candidate,
         diff_summary,
-    )?;
+    )
+    .await?;
 
     debug_assert_ne!(current_etag, commit.new_etag);
     let created_rule = commit
@@ -10003,7 +10376,7 @@ fn create_policy_rule(
     })
 }
 
-fn persist_policy_mutation(
+async fn persist_policy_mutation(
     context: PolicyMutationCommitContext<'_>,
     before_policy: &rbac::Policy,
     candidate: &rbac::Policy,
@@ -10037,7 +10410,8 @@ fn persist_policy_mutation(
         context.principal,
         &after_policy,
         &diff_summary,
-    );
+    )
+    .await;
     emit_policy_rule_changed(
         context.state,
         context.parts,
@@ -10064,13 +10438,13 @@ fn persist_policy_mutation(
     })
 }
 
-fn append_policy_version_after_commit(
+async fn append_policy_version_after_commit(
     state: &PolicyAdminState,
     principal: &auth::Principal,
     policy: &rbac::Policy,
     diff_summary: &Value,
 ) -> bool {
-    match append_policy_version(state, principal, policy, diff_summary) {
+    match append_policy_version(state, principal, policy, diff_summary).await {
         Ok(()) => false,
         Err(err) => {
             tracing::error!(
@@ -10082,7 +10456,7 @@ fn append_policy_version_after_commit(
     }
 }
 
-fn append_policy_version(
+async fn append_policy_version(
     state: &PolicyAdminState,
     principal: &auth::Principal,
     policy: &rbac::Policy,
@@ -10094,6 +10468,7 @@ fn append_policy_version(
 
     history_store
         .append_version(&principal.user_id, diff_summary, policy)
+        .await
         .map(|_| ())
         .map_err(|err| err.to_string())
 }
@@ -11402,22 +11777,15 @@ fn internal_server_error(error: &str) -> Response {
         .into_response()
 }
 
-fn token_store_error_response(error: auth::tokens::TokenStoreError) -> Response {
-    match error {
-        auth::tokens::TokenStoreError::InvalidCursor { parameter } => {
-            bad_request(&format!("invalid query parameter: {parameter}"))
-        }
-        auth::tokens::TokenStoreError::TimeParse { context, .. } => {
-            bad_request(&format!("invalid service-token {context} timestamp"))
-        }
-        auth::tokens::TokenStoreError::RevokedToken { .. } => {
-            conflict("cannot rotate revoked service token")
-        }
-        error => {
-            tracing::error!(error = %error, "service-token store operation failed");
-            internal_server_error("service-token store operation failed")
-        }
+fn token_store_error_response(error: storage::RepositoryError) -> Response {
+    if let Some(parameter) = error.invalid_parameter_name() {
+        return bad_request(&format!("invalid query parameter: {parameter}"));
     }
+    if error.kind() == storage::RepositoryErrorKind::Conflict {
+        return conflict("cannot rotate revoked service token");
+    }
+    tracing::error!(error = %error, "service-token store operation failed");
+    internal_server_error("service-token store operation failed")
 }
 
 fn record_request(route: &'static str) {
