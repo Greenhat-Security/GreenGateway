@@ -74,6 +74,7 @@ INSERT INTO audit_events (
     payload_matched_rule_id,
     payload_json
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+ON CONFLICT(event_id) DO NOTHING
 "#;
 
 const DELETE_RETAINED_EVENTS_SQL: &str = r#"
@@ -409,7 +410,7 @@ impl SqliteSinkShared {
 }
 
 #[derive(Debug)]
-enum SqliteFlushError {
+pub(crate) enum SqliteFlushError {
     Sqlite(rusqlite::Error),
     Json(serde_json::Error),
 }
@@ -468,7 +469,7 @@ fn flusher_loop(
     }
 }
 
-fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     // WAL plus NORMAL avoids an fsync for every commit while keeping committed
     // audit batches durable against process crashes. The tradeoff is that the
     // newest committed transaction can be lost on OS or hardware failure.
@@ -567,10 +568,14 @@ fn retention_cutoff_epoch_us(retention_days: u32) -> i64 {
     }
 }
 
-fn write_events(
+pub(crate) fn write_events(
     connection: &mut Connection,
     events: &[AuditEvent],
 ) -> Result<(), SqliteFlushError> {
+    // `event_id` is the idempotency key: an ambiguous retry may replay a
+    // batch, and the ON CONFLICT clause keeps storage exactly-once. This is
+    // the single insert path for audit events, shared by the flusher thread
+    // and the repository contract adapter.
     let transaction = connection.transaction()?;
 
     {

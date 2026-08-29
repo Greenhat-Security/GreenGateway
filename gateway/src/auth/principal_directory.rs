@@ -327,6 +327,29 @@ impl PrincipalDirectory {
 
         inner.shared.get(key)
     }
+
+    /// Record observations synchronously through the same upsert the
+    /// background flusher uses. Production traffic keeps using the queued
+    /// [`PrincipalDirectory::observe`] path; this entry point exists for the
+    /// repository contract and its tests, which must observe merged state
+    /// immediately.
+    pub fn record_observations(
+        &self,
+        observations: &[PrincipalObservation],
+    ) -> Result<(), PrincipalDirectoryQueryError> {
+        let Some(inner) = &self.inner else {
+            return Err(PrincipalDirectoryQueryError::NotConfigured);
+        };
+
+        let result = {
+            let mut connection = inner.shared.connection_guard();
+            write_observations(&mut connection, observations)
+        };
+        result.map_err(|source| PrincipalDirectoryQueryError::Sqlite {
+            path: inner.shared.path.clone(),
+            source,
+        })
+    }
 }
 
 impl PrincipalDirectoryInner {
@@ -494,13 +517,13 @@ impl Drop for PrincipalDirectoryInner {
 }
 
 #[derive(Clone, Debug)]
-struct PrincipalObservation {
-    subject: String,
-    issuer: String,
-    auth_method: String,
-    email: Option<String>,
-    org_id: Option<String>,
-    seen_at: String,
+pub struct PrincipalObservation {
+    pub subject: String,
+    pub issuer: String,
+    pub auth_method: String,
+    pub email: Option<String>,
+    pub org_id: Option<String>,
+    pub seen_at: String,
 }
 
 impl PrincipalObservation {

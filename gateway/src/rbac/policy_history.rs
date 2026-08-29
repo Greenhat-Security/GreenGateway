@@ -50,6 +50,7 @@ pub struct PolicyHistoryPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct PolicyHistoryListFilters {
     pub limit: usize,
     pub cursor: Option<String>,

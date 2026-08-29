@@ -33,6 +33,7 @@ pub struct AuditQueryStore {
     connection: Mutex<Connection>,
 }
 
+#[derive(Clone)]
 pub struct AuditQueryFilters {
     pub from: Option<String>,
     pub to: Option<String>,
@@ -151,6 +152,7 @@ pub enum EndpointAuditBucket {
     Day,
 }
 
+#[derive(Clone)]
 pub struct EndpointAuditFilters {
     pub method: String,
     pub endpoint_template: String,

@@ -9,21 +9,21 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use super::{
     protected_resource,
-    tokens::{TokenStore, TokenStoreError, TokenVerification, TokenVerificationFailure},
+    tokens::{TokenVerification, TokenVerificationFailure},
     AuthError, AuthMethod, Principal, SessionCredential, SessionValidator,
 };
-use crate::metrics::LOCK_POISON_RECOVERIES_TOTAL;
+use crate::{metrics::LOCK_POISON_RECOVERIES_TOTAL, storage::ServiceTokenStore};
 
 const SERVICE_TOKEN_PREFIX: &str = "ggw_";
 const SERVICE_TOKEN_CACHE_MAX_ENTRIES: usize = 1024;
 
 pub struct ServiceTokenValidator {
-    store: Arc<dyn TokenStore>,
+    store: Arc<dyn ServiceTokenStore>,
     cache: ServiceTokenVerificationCache,
 }
 
 impl ServiceTokenValidator {
-    pub fn new(store: Arc<dyn TokenStore>, ttl: Duration) -> Self {
+    pub fn new(store: Arc<dyn ServiceTokenStore>, ttl: Duration) -> Self {
         Self {
             store,
             cache: ServiceTokenVerificationCache::new(ttl),
@@ -58,9 +58,13 @@ impl SessionValidator for ServiceTokenValidator {
             return result.into_principal();
         }
 
+        // The store contract runs its blocking work off the request
+        // executors; awaiting here keeps request handling responsive while
+        // the verification stays authoritative.
         let verification = self
             .store
             .verify(token)
+            .await
             .map_err(service_token_store_auth_error)?;
         let cached = CachedVerification::from_verification(verification);
         self.cache.insert(cache_key, cached.clone());
@@ -234,7 +238,7 @@ fn cache_key_for_token(token: &str) -> String {
     hex::encode(digest)
 }
 
-fn service_token_store_auth_error(error: TokenStoreError) -> AuthError {
+fn service_token_store_auth_error(error: crate::storage::RepositoryError) -> AuthError {
     AuthError::Upstream(format!("service-token store error: {error}"))
 }
 
@@ -269,11 +273,11 @@ mod tests {
     use crate::auth::{
         tokens::{
             CreateTokenRequest, CreatedToken, SqliteTokenStore, TokenListFilters, TokenPage,
-            TokenRecord, TokenStore, TokenStoreError, TokenVerification, TokenVerificationFailure,
-            VerifiedToken,
+            TokenRecord, TokenVerification, TokenVerificationFailure, VerifiedToken,
         },
         AuthError, AuthMethod, ServiceTokenValidator, SessionCredential, SessionValidator,
     };
+    use crate::storage::{RepositoryError, ServiceTokenStore};
 
     #[tokio::test]
     async fn valid_service_token_authenticates_with_scopes_as_roles() {
@@ -281,6 +285,7 @@ mod tests {
         let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
         let created = store
             .create(create_request(&["admin:tokens:read", "admin:tokens:write"]))
+            .await
             .expect("token should create");
         let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
 
@@ -313,6 +318,7 @@ mod tests {
         let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
         let created = store
             .create(create_request(&["admin:tokens:read"]))
+            .await
             .expect("token should create");
         let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
 
@@ -333,6 +339,7 @@ mod tests {
         let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
         let created = store
             .create(create_request(&["admin:tokens:read", "mcp:tools"]))
+            .await
             .expect("token should create");
         let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
 
@@ -357,6 +364,7 @@ mod tests {
         let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
         let created = store
             .create(create_request(&["admin:tokens:read"]))
+            .await
             .expect("token should create");
         let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
 
@@ -378,9 +386,11 @@ mod tests {
         let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
         let revoked = store
             .create(create_request(&["admin:tokens:read"]))
+            .await
             .expect("token should create");
         store
             .revoke(&revoked.record.id)
+            .await
             .expect("token should revoke")
             .expect("token should exist");
         let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
@@ -401,7 +411,7 @@ mod tests {
     #[tokio::test]
     async fn revoked_cached_token_is_accepted_until_cache_ttl_then_rejected() {
         let store = Arc::new(RevocableStore::default());
-        let validator_store: Arc<dyn TokenStore> = store.clone();
+        let validator_store: Arc<dyn ServiceTokenStore> = store.clone();
         let validator = ServiceTokenValidator::new(validator_store, Duration::from_millis(20));
         let plaintext_token = "ggw_cached-service-token".to_owned();
 
@@ -429,7 +439,7 @@ mod tests {
     #[tokio::test]
     async fn non_service_bearer_is_rejected_without_store_lookup() {
         let store = Arc::new(SpyStore::default());
-        let validator_store: Arc<dyn TokenStore> = store.clone();
+        let validator_store: Arc<dyn ServiceTokenStore> = store.clone();
         let validator = ServiceTokenValidator::new(validator_store, Duration::from_secs(5));
 
         let error = validator
@@ -465,35 +475,42 @@ mod tests {
         verify_calls: AtomicUsize,
     }
 
-    impl TokenStore for SpyStore {
-        fn create(&self, _request: CreateTokenRequest) -> Result<CreatedToken, TokenStoreError> {
+    #[async_trait::async_trait]
+    impl ServiceTokenStore for SpyStore {
+        async fn create(
+            &self,
+            _request: CreateTokenRequest,
+        ) -> Result<CreatedToken, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        fn list(&self, _filters: &TokenListFilters) -> Result<TokenPage, TokenStoreError> {
+        async fn list(&self, _filters: &TokenListFilters) -> Result<TokenPage, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        fn get_by_id(&self, _id: &str) -> Result<Option<TokenRecord>, TokenStoreError> {
+        async fn get_by_id(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        fn revoke(&self, _id: &str) -> Result<Option<TokenRecord>, TokenStoreError> {
+        async fn revoke(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        fn rotate(&self, _id: &str) -> Result<Option<CreatedToken>, TokenStoreError> {
+        async fn rotate(&self, _id: &str) -> Result<Option<CreatedToken>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        fn verify(&self, _plaintext_token: &str) -> Result<TokenVerification, TokenStoreError> {
+        async fn verify(
+            &self,
+            _plaintext_token: &str,
+        ) -> Result<TokenVerification, RepositoryError> {
             self.verify_calls.fetch_add(1, Ordering::SeqCst);
             Ok(TokenVerification::Invalid(
                 TokenVerificationFailure::NotFound,
             ))
         }
 
-        fn touch_last_used(&self, _id: &str) -> Result<Option<TokenRecord>, TokenStoreError> {
+        async fn touch_last_used(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
     }
@@ -503,28 +520,35 @@ mod tests {
         revoked: AtomicBool,
     }
 
-    impl TokenStore for RevocableStore {
-        fn create(&self, _request: CreateTokenRequest) -> Result<CreatedToken, TokenStoreError> {
+    #[async_trait::async_trait]
+    impl ServiceTokenStore for RevocableStore {
+        async fn create(
+            &self,
+            _request: CreateTokenRequest,
+        ) -> Result<CreatedToken, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        fn list(&self, _filters: &TokenListFilters) -> Result<TokenPage, TokenStoreError> {
+        async fn list(&self, _filters: &TokenListFilters) -> Result<TokenPage, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        fn get_by_id(&self, _id: &str) -> Result<Option<TokenRecord>, TokenStoreError> {
+        async fn get_by_id(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        fn revoke(&self, _id: &str) -> Result<Option<TokenRecord>, TokenStoreError> {
+        async fn revoke(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        fn rotate(&self, _id: &str) -> Result<Option<CreatedToken>, TokenStoreError> {
+        async fn rotate(&self, _id: &str) -> Result<Option<CreatedToken>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        fn verify(&self, _plaintext_token: &str) -> Result<TokenVerification, TokenStoreError> {
+        async fn verify(
+            &self,
+            _plaintext_token: &str,
+        ) -> Result<TokenVerification, RepositoryError> {
             if self.revoked.load(Ordering::SeqCst) {
                 Ok(TokenVerification::Invalid(
                     TokenVerificationFailure::Revoked,
@@ -534,7 +558,7 @@ mod tests {
             }
         }
 
-        fn touch_last_used(&self, _id: &str) -> Result<Option<TokenRecord>, TokenStoreError> {
+        async fn touch_last_used(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
     }

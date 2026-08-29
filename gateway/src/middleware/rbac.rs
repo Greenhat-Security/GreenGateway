@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, LockResult, Mutex, MutexGuard},
+    sync::Arc,
     time::Duration,
 };
 
@@ -18,7 +18,7 @@ use http::{Method, StatusCode};
 use notify::{RecursiveMode, Watcher};
 use serde::Serialize;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex, MutexGuard};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -52,6 +52,10 @@ const POLICY_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 #[derive(Clone)]
 pub struct RbacState {
     policy: Arc<ArcSwap<RbacPolicyState>>,
+    /// Serialize policy mutations across async boundaries. The guard may be
+    /// held across `.await` points (the history-append repository call), so
+    /// the lock is Tokio's: its guard is `Send` and waiting does not block
+    /// an executor thread. Contention is limited to admin policy writes.
     policy_write_lock: Arc<Mutex<()>>,
     rate_limit: Option<RateLimitState>,
     pub exempt_paths: Vec<String>,
@@ -282,8 +286,8 @@ impl RbacState {
         self.policy.load().engine.policy().egress.clone()
     }
 
-    pub(crate) fn policy_write_guard(&self) -> LockResult<MutexGuard<'_, ()>> {
-        self.policy_write_lock.lock()
+    pub(crate) async fn policy_write_guard(&self) -> MutexGuard<'_, ()> {
+        self.policy_write_lock.lock().await
     }
 
     pub(crate) fn validate_proxy_dispatch_policy(

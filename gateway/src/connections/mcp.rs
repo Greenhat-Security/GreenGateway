@@ -371,10 +371,20 @@ impl McpConnectionCatalogService {
         let store = self
             .control_plane
             .managed_store()
-            .map_err(|_| McpCatalogRefreshError::StoreUnavailable)?;
-        let prior = store
-            .mcp_catalog(&connection_id)
-            .map_err(|_| McpCatalogRefreshError::StorageUnavailable)?;
+            .map_err(|_| McpCatalogRefreshError::StoreUnavailable)?
+            .clone();
+        // The prior-catalog read is a SQLite query; it runs on the blocking
+        // pool off the request executor.
+        let prior = {
+            let store = store.clone();
+            let connection_id_for_prior = connection_id.clone();
+            match tokio::task::spawn_blocking(move || store.mcp_catalog(&connection_id_for_prior))
+                .await
+            {
+                Ok(Ok(prior)) => prior,
+                Ok(Err(_)) | Err(_) => return Err(McpCatalogRefreshError::StorageUnavailable),
+            }
+        };
 
         let candidate = match mcp_upstream::discover_connection_catalog(
             &self.http,
@@ -392,7 +402,8 @@ impl McpConnectionCatalogService {
                     prior.as_ref(),
                     failure,
                     started.elapsed(),
-                );
+                )
+                .await;
                 drop(active);
                 return Err(failure);
             }
@@ -411,7 +422,8 @@ impl McpConnectionCatalogService {
                     prior.as_ref(),
                     failure,
                     started.elapsed(),
-                );
+                )
+                .await;
                 return Err(failure);
             }
         };
@@ -426,77 +438,144 @@ impl McpConnectionCatalogService {
             resources,
             resource_templates,
         } = candidate;
-        let mut persisted = None;
         let expected = record.etag();
-        let publish =
-            self.registry
-                .replace_mcp_connection_catalog(connection_id.as_str(), tools, || {
-                    let catalog = store.replace_mcp_catalog(
+        // The registry publish and its SQLite catalog persist run on the
+        // blocking pool: the persist callback executes a transaction and
+        // must not sit on the request executor.
+        let persisted = {
+            let registry = self.registry.clone();
+            let connection_id_for_persist = connection_id.clone();
+            let expected_for_persist = expected.clone();
+            match tokio::task::spawn_blocking(
+                move || -> Result<Option<StoredMcpCatalog>, McpCatalogPublishError<ConnectionStoreError>> {
+                    let mut persisted = None;
+                    registry.replace_mcp_connection_catalog(
+                        connection_id_for_persist.as_str(),
+                        tools,
+                        || {
+                            let catalog = store.replace_mcp_catalog(
+                                &connection_id_for_persist,
+                                &expected_for_persist,
+                                &stored_entries,
+                                &resources,
+                                &resource_templates,
+                            )?;
+                            persisted = Some(catalog);
+                            Ok::<(), ConnectionStoreError>(())
+                        },
+                    )
+                    .map(|()| persisted)
+                },
+            )
+            .await
+            {
+                Ok(Ok(persisted)) => persisted,
+                Ok(Err(error)) => {
+                    let failure = match error {
+                        McpCatalogPublishError::Registry(error) => {
+                            // The safe reason cannot carry the rejected definitions, and
+                            // without them an operator has no way to tell an upstream
+                            // schema fault from a registry capacity limit.
+                            tracing::warn!(
+                                connection_id = %connection_id,
+                                error = %error,
+                                "discovered MCP catalog was rejected by the tool registry"
+                            );
+                            McpCatalogRefreshError::InvalidResponse
+                        }
+                        McpCatalogPublishError::Persist(error) => refresh_store_error(&error),
+                    };
+                    self.record_failed_status(
                         &connection_id,
                         &expected,
-                        &stored_entries,
-                        &resources,
-                        &resource_templates,
-                    )?;
-                    persisted = Some(catalog);
-                    Ok::<(), ConnectionStoreError>(())
-                });
-        if let Err(error) = publish {
-            let failure = match error {
-                McpCatalogPublishError::Registry(error) => {
-                    // The safe reason cannot carry the rejected definitions, and
-                    // without them an operator has no way to tell an upstream
-                    // schema fault from a registry capacity limit.
-                    tracing::warn!(
-                        connection_id = %connection_id,
-                        error = %error,
-                        "discovered MCP catalog was rejected by the tool registry"
-                    );
-                    McpCatalogRefreshError::InvalidResponse
+                        prior.as_ref(),
+                        failure,
+                        started.elapsed(),
+                    )
+                    .await;
+                    drop(active);
+                    return Err(failure);
                 }
-                McpCatalogPublishError::Persist(error) => refresh_store_error(&error),
-            };
-            self.record_failed_status(
-                &connection_id,
-                &expected,
-                prior.as_ref(),
-                failure,
-                started.elapsed(),
-            );
-            drop(active);
-            return Err(failure);
-        }
+                Err(join_error) => {
+                    // The publish task died without reporting; whether the
+                    // catalog committed is unknown, so the refresh fails
+                    // closed with the storage-unavailable contract.
+                    tracing::error!(
+                        connection_id = %connection_id,
+                        error = %join_error,
+                        "MCP catalog publish task failed"
+                    );
+                    self.record_failed_status(
+                        &connection_id,
+                        &expected,
+                        prior.as_ref(),
+                        McpCatalogRefreshError::StorageUnavailable,
+                        started.elapsed(),
+                    )
+                    .await;
+                    drop(active);
+                    return Err(McpCatalogRefreshError::StorageUnavailable);
+                }
+            }
+        };
         let catalog = persisted.ok_or(McpCatalogRefreshError::StorageUnavailable)?;
         let total_count = catalog_total_count(&catalog);
         self.runtime.publish(&catalog);
-        let status = self
-            .control_plane
-            .append_status(
-                &connection_id,
-                &expected,
-                ConnectionStatusUpdate {
-                    state: ConnectionOperationalState::Healthy,
-                    reason: ConnectionStatusReason::CatalogRefreshed,
-                    latency_ms: Some(duration_millis(started.elapsed())),
-                    catalog_age_secs: Some(0),
-                    catalog_entry_count: Some(total_count),
-                },
-            )
-            .unwrap_or_else(|error| {
-                tracing::error!(
-                    connection_id = %connection_id,
-                    error = %error,
-                    "MCP catalog was published but its safe status could not be recorded"
-                );
-                SafeConnectionStatus {
-                    state: ConnectionOperationalState::Healthy,
-                    reason: ConnectionStatusReason::CatalogRefreshed,
-                    observed_at: Some(catalog.refreshed_at.clone()),
-                    latency_ms: Some(duration_millis(started.elapsed())),
-                    catalog_age_secs: Some(0),
-                    catalog_entry_count: Some(total_count),
+        // Status persistence is a small SQLite transaction; it runs on the
+        // blocking pool off the request executor.
+        let status = {
+            let control_plane = self.control_plane.clone();
+            let connection_id_for_status = connection_id.clone();
+            let expected_for_status = expected.clone();
+            let latency = duration_millis(started.elapsed());
+            match tokio::task::spawn_blocking(move || {
+                control_plane.append_status(
+                    &connection_id_for_status,
+                    &expected_for_status,
+                    ConnectionStatusUpdate {
+                        state: ConnectionOperationalState::Healthy,
+                        reason: ConnectionStatusReason::CatalogRefreshed,
+                        latency_ms: Some(latency),
+                        catalog_age_secs: Some(0),
+                        catalog_entry_count: Some(total_count),
+                    },
+                )
+            })
+            .await
+            {
+                Ok(Ok(status)) => status,
+                Ok(Err(error)) => {
+                    tracing::error!(
+                        connection_id = %connection_id,
+                        error = %error,
+                        "MCP catalog was published but its safe status could not be recorded"
+                    );
+                    SafeConnectionStatus {
+                        state: ConnectionOperationalState::Healthy,
+                        reason: ConnectionStatusReason::CatalogRefreshed,
+                        observed_at: Some(catalog.refreshed_at.clone()),
+                        latency_ms: Some(duration_millis(started.elapsed())),
+                        catalog_age_secs: Some(0),
+                        catalog_entry_count: Some(total_count),
+                    }
                 }
-            });
+                Err(join_error) => {
+                    tracing::error!(
+                        connection_id = %connection_id,
+                        error = %join_error,
+                        "MCP catalog status persistence task failed"
+                    );
+                    SafeConnectionStatus {
+                        state: ConnectionOperationalState::Healthy,
+                        reason: ConnectionStatusReason::CatalogRefreshed,
+                        observed_at: Some(catalog.refreshed_at.clone()),
+                        latency_ms: Some(duration_millis(started.elapsed())),
+                        catalog_age_secs: Some(0),
+                        catalog_entry_count: Some(total_count),
+                    }
+                }
+            }
+        };
         drop(active);
         Ok(McpCatalogRefreshResult {
             connection_id,
@@ -509,7 +588,7 @@ impl McpConnectionCatalogService {
         })
     }
 
-    fn record_failed_status(
+    async fn record_failed_status(
         &self,
         connection_id: &ConnectionId,
         expected: &ConnectionEtag,
@@ -543,22 +622,43 @@ impl McpConnectionCatalogService {
                 Some(0),
             )
         };
-        if let Err(error) = self.control_plane.append_status(
-            connection_id,
-            expected,
-            ConnectionStatusUpdate {
-                state,
-                reason,
-                latency_ms: Some(duration_millis(elapsed)),
-                catalog_age_secs: age,
-                catalog_entry_count: count,
-            },
-        ) {
-            tracing::error!(
-                connection_id = %connection_id,
-                error = %error,
-                "failed to persist bounded MCP refresh failure status"
-            );
+        // Failure-status persistence is a small SQLite transaction; it runs
+        // on the blocking pool off the request executor. Both a failed
+        // statement and a failed task only log, exactly as before.
+        let control_plane = self.control_plane.clone();
+        let connection_id_for_status = connection_id.to_owned();
+        let expected_for_status = expected.clone();
+        let latency = duration_millis(elapsed);
+        let append = tokio::task::spawn_blocking(move || {
+            control_plane.append_status(
+                &connection_id_for_status,
+                &expected_for_status,
+                ConnectionStatusUpdate {
+                    state,
+                    reason,
+                    latency_ms: Some(latency),
+                    catalog_age_secs: age,
+                    catalog_entry_count: count,
+                },
+            )
+        })
+        .await;
+        match append {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::error!(
+                    connection_id = %connection_id,
+                    error = %error,
+                    "failed to persist bounded MCP refresh failure status"
+                );
+            }
+            Err(join_error) => {
+                tracing::error!(
+                    connection_id = %connection_id,
+                    error = %join_error,
+                    "MCP refresh failure-status task failed"
+                );
+            }
         }
     }
 }
