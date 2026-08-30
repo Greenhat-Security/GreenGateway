@@ -875,6 +875,474 @@ fn event_ids(page: &AuditQueryPage) -> Vec<String> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// PostgreSQL audit store (issue #241, PR 5): the same contract, plus the
+// commit-safe stream proofs, against a real database. Gated on the test
+// harness locator (CI sets it; a checkout without a database skips).
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "postgres"))]
+mod postgres_audit_tests {
+    use super::*;
+    use crate::storage::{
+        migrations,
+        postgres::PostgresFoundation,
+        postgres_audit::{IngestIdentity, PostgresAuditEventStore},
+    };
+
+    use std::sync::LazyLock;
+    use tokio::sync::Mutex;
+
+    /// Serializes the real-database tests and gives each one its OWN
+    /// DATABASE: the audit tests reset the schema, the migration tests
+    /// reset the schema, and both share one server -- running them against
+    /// one database makes every reset a cross-test race. A dedicated
+    /// database per test (created from the locator's DSN, dropped on
+    /// release) removes the interference entirely.
+    static DATABASE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::const_new(()));
+
+    fn locator() -> Option<String> {
+        let key = "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned();
+        let file = std::env::var(&key).ok()?;
+        if file.trim().is_empty() {
+            return None;
+        }
+        let contents = std::fs::read_to_string(file).ok()?;
+        let trimmed = contents.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    }
+
+    /// One test's disposable database: created on acquisition, dropped
+    /// (forced) on release. The `dsn` rewrites only the locator DSN's
+    /// database path segment.
+    struct TestDatabase {
+        dsn: String,
+        name: String,
+        admin_pool: deadpool_postgres::Pool,
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            // Blocking drop inside a tokio test: run on a dedicated
+            // single-thread runtime so teardown cannot be skipped by an
+            // already-shutting-down test runtime.
+            let name = self.name.clone();
+            let pool = self.admin_pool.clone();
+            let _ = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                if let Ok(runtime) = runtime {
+                    runtime.block_on(async move {
+                        if let Ok(client) = pool.get().await {
+                            let _ = client
+                                .batch_execute(&format!(
+                                    "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+                                ))
+                                .await;
+                        }
+                    });
+                }
+            })
+            .join();
+        }
+    }
+
+    struct DsnFile {
+        path: String,
+        directory: std::path::PathBuf,
+    }
+
+    impl Drop for DsnFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn write_dsn_file(dsn: &str) -> DsnFile {
+        let directory = std::env::temp_dir().join(format!(
+            "greengateway-audit-contract-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp directory should create");
+        let path = directory.join("database-url");
+        std::fs::write(&path, format!("{dsn}\n")).expect("DSN file should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("DSN permissions should set");
+        }
+        DsnFile {
+            path: path.display().to_string(),
+            directory,
+        }
+    }
+
+    async fn create_test_database(admin_dsn: &str) -> TestDatabase {
+        let name = format!("ggw_audit_test_{}", uuid::Uuid::new_v4().simple());
+        let mut config = crate::config::Config::test_defaults();
+        config.state_backend = crate::config::StateBackend::Postgres;
+        config.deployment_id = Some("deploy-audit-contract".to_owned());
+        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+
+        let directory = std::env::temp_dir().join(format!(
+            "greengateway-audit-contract-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp directory should create");
+        let admin_path = directory.join("database-url");
+        std::fs::write(&admin_path, format!("{admin_dsn}\n")).expect("DSN file should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&admin_path, std::fs::Permissions::from_mode(0o600))
+                .expect("DSN permissions should set");
+        }
+        config.database.url_file = Some(admin_path.display().to_string());
+        let admin = PostgresFoundation::establish(&config)
+            .await
+            .expect("admin connection should establish");
+
+        // Single-statement simple protocol: CREATE DATABASE cannot run in a
+        // transaction block.
+        admin
+            .pool()
+            .get()
+            .await
+            .expect("admin checkout")
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap_or_else(|error| panic!("test database should create: {error}"));
+
+        let dsn_path = directory.join("database-url-test");
+        std::fs::write(&dsn_path, format!("{admin_dsn}\n")).expect("DSN file should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dsn_path, std::fs::Permissions::from_mode(0o600))
+                .expect("DSN permissions should set");
+        }
+        drop(admin);
+        let _ = std::fs::remove_dir_all(&directory);
+
+        // Rewrite ONLY the database path segment of the DSN: a plain string
+        // replace would also rewrite the username, which for these test
+        // DSNs is spelled like the database.
+        let database_start = admin_dsn
+            .rfind('/')
+            .expect("locator DSN has a database path segment");
+        let dsn = format!("{}/{}", &admin_dsn[..database_start], name);
+        let parsed = tokio_postgres::Config::from_str(&dsn).expect("test DSN should parse");
+        TestDatabase {
+            dsn,
+            name,
+            admin_pool: deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
+                parsed,
+                tokio_postgres::NoTls,
+            ))
+            .config({
+                let mut pool_config = deadpool_postgres::PoolConfig::new(4);
+                pool_config.timeouts.create = Some(std::time::Duration::from_millis(5_000));
+                pool_config
+            })
+            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .build()
+            .expect("admin pool should build"),
+        }
+    }
+
+    async fn migrated_store(database: &TestDatabase) -> PostgresAuditEventStore {
+        let mut config = crate::config::Config::test_defaults();
+        config.state_backend = crate::config::StateBackend::Postgres;
+        config.deployment_id = Some("deploy-audit-contract".to_owned());
+        let test_dsn_file = write_dsn_file(&database.dsn);
+        config.database.url_file = Some(test_dsn_file.path.clone());
+        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        let foundation = PostgresFoundation::establish(&config)
+            .await
+            .expect("the test database should establish");
+        migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+            .await
+            .expect("the audit schema should migrate");
+        PostgresAuditEventStore::new(
+            foundation.pool().clone(),
+            Some(IngestIdentity {
+                instance_id: uuid::Uuid::new_v4(),
+                boot_id: uuid::Uuid::new_v4(),
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn postgres_audit_event_store_satisfies_the_contract() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let store = migrated_store(&database).await;
+        super::audit_event_store_contract(&store).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_audit_stream_positions_are_commit_ordered() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let store = migrated_store(&database).await;
+
+        // Six concurrent batches of three events. Whatever interleaving the
+        // pool allows, the stream must come out contiguous: every position
+        // from 1 to 18 exactly once, because position assignment and commit
+        // are serialized together by the transaction-scoped advisory lock.
+        const BATCHES: usize = 6;
+        const PER_BATCH: usize = 3;
+        let batches: Vec<Vec<AuditEvent>> = (0..BATCHES)
+            .map(|batch| {
+                (0..PER_BATCH)
+                    .map(|index| {
+                        contract_event(
+                            &format!("race-{batch}-{index}"),
+                            "audit.race",
+                            json!({ "status": 200 }),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let futures: Vec<_> = batches
+            .iter()
+            .map(|events| store.insert_events(events))
+            .collect();
+        futures_util::future::try_join_all(futures)
+            .await
+            .expect("every racing batch should commit");
+
+        let head = store.stream_head().await.expect("head should read");
+        assert_eq!(head, (BATCHES * PER_BATCH) as i64);
+
+        let walked = store
+            .stream_after(0, 1000)
+            .await
+            .expect("stream should walk");
+        assert_eq!(walked.len(), BATCHES * PER_BATCH);
+        let positions: Vec<i64> = walked.iter().map(|(position, _)| *position).collect();
+        let expected: Vec<i64> = (1..=(BATCHES * PER_BATCH) as i64).collect();
+        assert_eq!(
+            positions, expected,
+            "commit-ordered positions must be contiguous with no gaps or duplicates"
+        );
+        // Each event appears exactly once in the stream.
+        let mut ids: Vec<&str> = walked
+            .iter()
+            .map(|(_, event)| event.event_id.as_str())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), BATCHES * PER_BATCH);
+    }
+
+    #[tokio::test]
+    async fn postgres_audit_aborted_batch_leaves_no_stream_hole() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let store = migrated_store(&database).await;
+
+        // A committed batch first, so the stream has a position.
+        store
+            .insert_events(&[contract_event("abort-before", "audit.abort", json!({}))])
+            .await
+            .expect("setup batch should commit");
+
+        // An aborted batch: the same statements the store runs, driven on a
+        // raw connection and rolled back. Its stream append would claim the
+        // next position; the rollback must release it leaving no row and,
+        // crucially, no hole -- the next committed batch takes the same
+        // position.
+        let test_dsn_file = write_dsn_file(&database.dsn);
+        let mut config = crate::config::Config::test_defaults();
+        config.state_backend = crate::config::StateBackend::Postgres;
+        config.deployment_id = Some("deploy-audit-contract".to_owned());
+        config.database.url_file = Some(test_dsn_file.path.clone());
+        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        let foundation = PostgresFoundation::establish(&config)
+            .await
+            .expect("raw connection should establish");
+        let client = foundation.pool().get().await.expect("raw checkout");
+        client
+            .batch_execute("BEGIN")
+            .await
+            .expect("abort batch should begin");
+        client
+            .execute(
+                "INSERT INTO greengateway.audit_events (\
+                     event_id, event_type, occurred_at, schema_version, request_id, \
+                     source_ip, payload_json\
+                 ) VALUES ('abort-mid', 'audit.abort', now(), '0.2.0', 'r', 'ip', '{}'::jsonb)",
+                &[],
+            )
+            .await
+            .expect("abort batch event insert should run");
+        client
+            .execute(
+                &format!("SELECT pg_advisory_xact_lock({})", *super_db_key()),
+                &[],
+            )
+            .await
+            .expect("abort batch lock should be taken");
+        client
+            .execute(
+                "INSERT INTO greengateway.audit_stream (position, event_id) \
+                 VALUES ((SELECT coalesce(max(position), 0) \
+                          FROM greengateway.audit_stream) + 1, 'abort-mid') \
+                 ON CONFLICT DO NOTHING",
+                &[],
+            )
+            .await
+            .expect("abort batch stream append should run");
+        client
+            .batch_execute("ROLLBACK")
+            .await
+            .expect("abort batch should roll back");
+
+        // The next committed batch continues without a hole.
+        store
+            .insert_events(&[contract_event("abort-after", "audit.abort", json!({}))])
+            .await
+            .expect("post-abort batch should commit");
+
+        let head = store.stream_head().await.expect("head should read");
+        assert_eq!(head, 2, "an aborted append must not consume a position");
+        let walked = store
+            .stream_after(0, 100)
+            .await
+            .expect("stream should walk");
+        assert_eq!(
+            walked
+                .iter()
+                .map(|(_, event)| event.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["abort-before", "abort-after"],
+            "the aborted event must be absent and the survivors contiguous"
+        );
+    }
+
+    fn super_db_key() -> &'static i64 {
+        &crate::storage::postgres_audit::AUDIT_STREAM_LOCK_KEY
+    }
+
+    /// The #11 filtered-query benchmark, against PostgreSQL: seed N events
+    /// (default 1,000,000; override with the runtime-keyed locator
+    /// GATEWAY_TEST_POSTGRES_BENCHMARK_ROWS), then assert a representative
+    /// filtered query answers under 500 ms. `#[ignore]`d because seeding is
+    /// expensive: CI and operators run it deliberately.
+    #[tokio::test]
+    #[ignore = "seeds up to a million rows; run deliberately against a disposable database"]
+    async fn postgres_audit_filtered_query_benchmark() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator");
+            return;
+        };
+        let row_key = "GATEWAY_TEST_POSTGRES_BENCHMARK_ROWS".to_owned();
+        let rows: usize = std::env::var(&row_key)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(1_000_000);
+
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let store = migrated_store(&database).await;
+        let test_dsn_file = write_dsn_file(&database.dsn);
+        let mut config = crate::config::Config::test_defaults();
+        config.state_backend = crate::config::StateBackend::Postgres;
+        config.deployment_id = Some("deploy-audit-contract".to_owned());
+        config.database.url_file = Some(test_dsn_file.path.clone());
+        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        let foundation = PostgresFoundation::establish(&config)
+            .await
+            .expect("benchmark connection should establish");
+
+        let seeded = std::time::Instant::now();
+        const BATCH: usize = 500;
+        let mut id_base = 0usize;
+        while id_base < rows {
+            let events: Vec<AuditEvent> = (0..BATCH.min(rows - id_base))
+                .map(|index| {
+                    let sequence = id_base + index;
+                    let status = 200 + sequence.is_multiple_of(4) as i64 * 203;
+                    contract_event(
+                        &format!("bench-{sequence}"),
+                        if sequence.is_multiple_of(10) {
+                            "audit.bench.rare"
+                        } else {
+                            "audit.bench.common"
+                        },
+                        json!({
+                            "status": status,
+                            "path": format!("/bench/{}", sequence % 1000),
+                            "method": if sequence.is_multiple_of(2) { "GET" } else { "POST" },
+                        }),
+                    )
+                })
+                .collect();
+            store
+                .insert_events(&events)
+                .await
+                .expect("benchmark seed batch");
+            id_base += BATCH;
+        }
+        eprintln!("seeded {rows} rows in {:?}", seeded.elapsed());
+
+        // The filters deliberately intersect: i % 10 == 0 (rare type) AND
+        // i % 1000 == 40 (path) AND i % 4 == 0 (status 403) has solutions
+        // (i = 40, 1040, 2040, ...), so the measured query does real work
+        // and returns rows -- an empty intersection would make the
+        // benchmark vacuous.
+        let start = std::time::Instant::now();
+        let page = AuditEventStore::query_events(
+            &store,
+            &AuditQueryFilters {
+                event_type: Some("audit.bench.rare".to_owned()),
+                path: Some("/bench/40".to_owned()),
+                status: Some(403),
+                limit: 100,
+                ..query_filters(None, 100)
+            },
+        )
+        .await
+        .expect("filtered benchmark query should succeed");
+        let elapsed = start.elapsed();
+        eprintln!(
+            "filtered query returned {} events in {:?}",
+            page.events.len(),
+            elapsed
+        );
+        assert!(
+            !page.events.is_empty(),
+            "the benchmark filters must match real rows at {rows} seeded rows"
+        );
+        assert!(
+            elapsed.as_millis() < 500,
+            "issue #11's budget: filtered queries under 500 ms at {rows} rows (took {elapsed:?})"
+        );
+        // The disposable database (millions of seeded rows included) is
+        // dropped by `TestDatabase`'s teardown.
+        drop(foundation);
+        drop(store);
+    }
+
+    use std::str::FromStr as _;
+}
+
 fn contract_policy(id: &str) -> Policy {
     Policy::validate_json_value(json!({
         "schema_version": "0.1.0",

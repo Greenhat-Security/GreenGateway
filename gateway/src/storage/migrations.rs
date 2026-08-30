@@ -124,13 +124,22 @@ fn hex_checksum(sql: &str) -> String {
 /// The embedded, ordered manifest: append only, never edit an applied entry,
 /// never reorder, keep the versions contiguous and increasing.
 static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
-    vec![Migration::new(
-        1,
-        "cluster_foundation",
-        include_str!("migrations/0001_cluster_foundation.sql"),
-    )
-    .finalize()
-    .with_pinned_checksum("2b8d809a08d5253a6dffb01033587ea3ad5b4152745e92044331639fd87bf13d")]
+    vec![
+        Migration::new(
+            1,
+            "cluster_foundation",
+            include_str!("migrations/0001_cluster_foundation.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("2b8d809a08d5253a6dffb01033587ea3ad5b4152745e92044331639fd87bf13d"),
+        Migration::new(
+            2,
+            "audit_events",
+            include_str!("migrations/0002_audit_events.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("b48d999c02476e18dedcd5c67d99fe0d5eebdcf5be756c88a6dd2e9bc09ac1ca"),
+    ]
 });
 
 /// What `check` (and startup validation) concluded about the schema.

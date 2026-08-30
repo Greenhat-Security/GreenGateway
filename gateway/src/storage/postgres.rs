@@ -788,7 +788,7 @@ pub(crate) async fn validate_connectivity(pool: &Pool) -> Result<(), RepositoryE
     Ok(())
 }
 
-fn classify_pool_error(error: deadpool_postgres::PoolError) -> RepositoryError {
+pub(crate) fn classify_pool_error(error: deadpool_postgres::PoolError) -> RepositoryError {
     use deadpool_postgres::TimeoutType;
 
     let kind = match &error {
