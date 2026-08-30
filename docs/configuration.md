@@ -1900,6 +1900,104 @@ Default: `true`
 
 Format and validation: must parse as a Rust boolean, `true` or `false`. With the default, the egress client blocks the non-global entries in the IANA IPv4 and IPv6 special-purpose registries, including private, shared, loopback, link-local, documentation, benchmarking, deprecated transition, discard, multicast, and reserved ranges. Registry-defined global exceptions remain allowed. IPv4-mapped IPv6 and recognized NAT64 addresses are classified by their embedded IPv4 destination. If any resolved address for a hostname is non-global, the complete request is denied before the selected address is pinned.
 
+### STATE_BACKEND
+
+Which store owns shared mutable state: `sqlite` or `postgres`. `sqlite` is standalone mode — one gateway process with local files, local SQLite stores, and process-local enforcement — and is the default, fully supported behavior. `postgres` selects cluster mode, where one PostgreSQL primary is the single authority for shared state; see [the PostgreSQL deployment guide](deployment/postgres.md) and [the HA state model](architecture/ha-state-model.md).
+
+Default: `sqlite`
+
+Format and validation: exactly `sqlite` or `postgres`; anything else fails startup. Selecting `postgres` requires `DEPLOYMENT_ID` and `DATABASE_URL_FILE`, and rejects every writable local authority (`POLICY_FILE`, `TOOLS_FILE`, and every `*_SQLITE_PATH`) by naming the setting. Selecting `sqlite` rejects `DEPLOYMENT_ID`, `DATABASE_URL_FILE`, and `DATABASE_TLS_CA_FILE` for the inverse reason: material a mode will never read invites an operator to believe something is configured that nothing consults. Mode is a startup-time setting, deliberately not hot-swappable: it participates in the security-configuration fingerprint two replicas must agree on, and moving from sqlite to postgres is a one-way verified import, not a live switch.
+
+Cluster mode is experimental and is not a supported HA configuration until the #241 release gate passes.
+
+### DEPLOYMENT_ID
+
+Stable, non-secret identifier scoping every authoritative row, unique key, lock, lease, and notification of one logical PostgreSQL-mode deployment. Two logical deployments sharing one database must carry different IDs, and two replicas of one deployment must carry the same one.
+
+Default: empty (unused, and rejected, in standalone mode)
+
+Format and validation: 1 to 64 bytes of ASCII letters, digits, `.`, `_`, or `-`, starting and ending with a letter or digit. The ID appears in logs and cluster status by design, which is exactly why its shape is pinned rather than allowing arbitrary bytes. Required when `STATE_BACKEND=postgres`; rejected when `sqlite`.
+
+### DATABASE_URL_FILE
+
+Path to the file containing the PostgreSQL connection string. The connection string itself is credential material and is only ever read from this file, never from a plain environment variable, and never enters configuration, `Debug` output, logs, metrics, status, or errors.
+
+Default: empty (unused, and rejected, in standalone mode)
+
+Format and validation: the file must be a regular file reachable beneath its parent directory (the reader accepts the relative symlinks a Kubernetes Secret volume publishes and confines resolution to that directory), must be at most 8 KiB, and must grant no group or other permission at all — a Kubernetes Secret volume needs `defaultMode: 0400`. Its contents must be a `postgresql://` URL whose query parameters are limited to `user`, `password`, `host`, `port`, `dbname`, and `application_name`: `sslmode`, `options`, and unrecognized parameters are rejected, because TLS policy comes from `DATABASE_TLS_MODE` and session timeouts from this gateway's settings, never from the DSN. The URL must name its host, user, and database explicitly — ambient defaults (the OS account, a localhost socket) are not trusted. Required when `STATE_BACKEND=postgres`.
+
+### DATABASE_TLS_MODE
+
+TLS policy for PostgreSQL connections: `verify` or `loopback-dev`.
+
+Default: `verify`
+
+Format and validation: exactly `verify` or `loopback-dev`. `verify` requires TLS with certificate and hostname verification against the platform trust store plus the optional `DATABASE_TLS_CA_FILE` bundle; a server that will not speak TLS fails the connection rather than falling back. `loopback-dev` skips TLS entirely and is the one documented exception, named for what it is: it is refused at startup for any target that is not a loopback address, the name `localhost`, or a Unix socket, so the exception cannot quietly become a production plaintext connection.
+
+### DATABASE_TLS_CA_FILE
+
+Optional path to a PEM bundle of extra trust anchors for PostgreSQL server-certificate verification, layered on top of the platform trust store exactly as egress TLS layers a configured CA — never a replacement for it.
+
+Default: empty (platform trust store only)
+
+Format and validation: a regular file of at most 1 MiB whose group and other permissions exclude write; public material may stay world-readable but must not be replaceable by another account. Only read when `STATE_BACKEND=postgres` and `DATABASE_TLS_MODE=verify`; rejected in standalone mode.
+
+### DATABASE_POOL_MAX
+
+Per-replica ceiling on concurrently open PostgreSQL connections. The documented sizing math is `replicas x DATABASE_POOL_MAX + migrator/leader headroom` against the server's `max_connections` — see [the PostgreSQL deployment guide](deployment/postgres.md).
+
+Default: `10`
+
+Format and validation: an integer between 1 and 256. The pool establishes connections lazily, so this is a ceiling, not a startup cost.
+
+### DATABASE_CONNECT_TIMEOUT_MS
+
+Bound, in milliseconds, on establishing one new PostgreSQL connection, applied both by the pool's create timeout and as the client-side connect timeout.
+
+Default: `5000`
+
+Format and validation: an integer greater than 0; a zero millisecond timeout elapses before the first poll, so every connection would fail as a timeout and the value is rejected at startup.
+
+### DATABASE_ACQUIRE_TIMEOUT_MS
+
+Bound, in milliseconds, on checking a connection out of the pool, including the wait for a free slot when the ceiling is reached.
+
+Default: `5000`
+
+Format and validation: an integer greater than 0.
+
+### DATABASE_STATEMENT_TIMEOUT_MS
+
+Server-side `statement_timeout` applied to every pooled PostgreSQL session, in milliseconds. It is sent as a startup parameter, so it applies to every statement on every connection the pool ever hands out — including recycled ones — and no code path in this gateway can `SET` it back.
+
+Default: `15000`
+
+Format and validation: an integer greater than 0.
+
+### DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS
+
+Server-side `idle_in_transaction_session_timeout` applied to every pooled PostgreSQL session, in milliseconds. A session sitting in an open transaction without running a statement is exactly the lock-holding shape the bounded-operation rule exists to prevent.
+
+Default: `30000`
+
+Format and validation: an integer greater than 0.
+
+### DATABASE_LOCK_TIMEOUT_MS
+
+Server-side `lock_timeout` applied to every pooled PostgreSQL session, in milliseconds: how long a statement waits on a lock before failing.
+
+Default: `5000`
+
+Format and validation: an integer greater than 0.
+
+### DATABASE_STARTUP_RETRY_LIMIT
+
+Bounded startup policy for a selected PostgreSQL backend: how many times to retry the connectivity check after the first failed attempt before startup fails. The wait between attempts starts at 250 ms and doubles up to an 8-second ceiling. A database that stays unreachable is a startup failure, never a silent fallback to local state.
+
+Default: `5`
+
+Format and validation: an integer between 0 and 300; `0` fails startup on the first failed attempt.
+
 ## Production Deployment And Migration
 
 Adopt pool behavior one logical route at a time. Existing `UPSTREAM_URL` and

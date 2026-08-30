@@ -3032,6 +3032,9 @@ mod tests {
             egress_max_request_body_bytes: 1_048_576,
             egress_nat64_prefixes: Vec::new(),
             egress_deny_private_ips: true,
+            state_backend: crate::config::StateBackend::Sqlite,
+            deployment_id: None,
+            database: crate::config::DatabaseSettings::default(),
         }
     }
 

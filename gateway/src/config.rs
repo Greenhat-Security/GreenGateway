@@ -145,6 +145,18 @@ const DEFAULT_EGRESS_CONNECT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_EGRESS_MAX_RESPONSE_BYTES: usize = 5_242_880;
 const DEFAULT_EGRESS_MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_EGRESS_DENY_PRIVATE_IPS: bool = true;
+// Shared-state backend selection and PostgreSQL foundation settings
+// (issue #241, PR 3). Defaults keep standalone mode exactly as it was: SQLite
+// and process-local stores, with no database configured.
+pub const DEFAULT_DATABASE_POOL_MAX: usize = 10;
+pub const MAX_DATABASE_POOL_MAX: usize = 256;
+pub const DEFAULT_DATABASE_CONNECT_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS: u64 = 15_000;
+pub const DEFAULT_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_DATABASE_LOCK_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_DATABASE_STARTUP_RETRY_LIMIT: u64 = 5;
+pub const MAX_DATABASE_STARTUP_RETRY_LIMIT: u64 = 300;
 
 /// Default ceiling on concurrently open HTTP/2 streams per gRPC connection.
 ///
@@ -201,6 +213,18 @@ const CONNECTION_LOCAL_SECRET_KEYRING: &str = "CONNECTION_LOCAL_SECRET_KEYRING";
 const CONNECTION_SECRET_ALIASES: &str = "CONNECTION_SECRET_ALIASES";
 const CONNECTION_VAULT_PROVIDER: &str = "CONNECTION_VAULT_PROVIDER";
 const CONNECTION_SECRETS_ROOT: &str = "CONNECTION_SECRETS_ROOT";
+const DATABASE_ACQUIRE_TIMEOUT_MS: &str = "DATABASE_ACQUIRE_TIMEOUT_MS";
+const DATABASE_CONNECT_TIMEOUT_MS: &str = "DATABASE_CONNECT_TIMEOUT_MS";
+const DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS: &str = "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS";
+const DATABASE_LOCK_TIMEOUT_MS: &str = "DATABASE_LOCK_TIMEOUT_MS";
+const DATABASE_POOL_MAX: &str = "DATABASE_POOL_MAX";
+const DATABASE_STARTUP_RETRY_LIMIT: &str = "DATABASE_STARTUP_RETRY_LIMIT";
+const DATABASE_STATEMENT_TIMEOUT_MS: &str = "DATABASE_STATEMENT_TIMEOUT_MS";
+const DATABASE_TLS_CA_FILE: &str = "DATABASE_TLS_CA_FILE";
+const DATABASE_TLS_MODE: &str = "DATABASE_TLS_MODE";
+const DATABASE_URL_FILE: &str = "DATABASE_URL_FILE";
+const DEPLOYMENT_ID: &str = "DEPLOYMENT_ID";
+const STATE_BACKEND: &str = "STATE_BACKEND";
 const DISCOVERY_SQLITE_PATH: &str = "DISCOVERY_SQLITE_PATH";
 const DISCOVERY_ENDPOINT_LIMIT: &str = "DISCOVERY_ENDPOINT_LIMIT";
 const ERROR_RATE_SPIKE_SIGNAL_THRESHOLD: &str = "ERROR_RATE_SPIKE_SIGNAL_THRESHOLD";
@@ -406,6 +430,221 @@ pub struct Config {
     pub egress_max_request_body_bytes: usize,
     pub egress_nat64_prefixes: Vec<IpNet>,
     pub egress_deny_private_ips: bool,
+    /// Which store owns shared mutable state (issue #241). `Sqlite` is the
+    /// default standalone mode and behaves exactly as this configuration always
+    /// has; `Postgres` selects the experimental cluster mode, whose
+    /// requirements are validated here and whose pool is built at startup.
+    ///
+    /// Part of the security-relevant static-configuration fingerprint a
+    /// cluster-mode replica must match to become ready: a replica that
+    /// disagrees with its deployment about where authority lives must never
+    /// serve (ADR-0007).
+    pub state_backend: StateBackend,
+    /// Stable, non-secret identifier scoping every authoritative row, lock, and
+    /// lease of one logical deployment. Required (and validated) in
+    /// PostgreSQL mode; unused in standalone mode.
+    pub deployment_id: Option<String>,
+    /// PostgreSQL connection and pool settings. Contains no secret material:
+    /// the connection string itself is read from `DATABASE_URL_FILE` at pool
+    /// construction and never enters this structure, so the derived `Debug` of
+    /// `Config` cannot render a DSN, database user, host, or name.
+    pub database: DatabaseSettings,
+}
+
+/// Which store owns shared mutable state (issue #241, ADR-0007).
+///
+/// Mode is a startup-time, statically-validated setting and is deliberately
+/// not hot-swappable: it is part of the static-configuration fingerprint, so a
+/// replica that disagrees with its deployment about where authority lives can
+/// never become ready.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StateBackend {
+    /// One gateway process with local files, local SQLite, and process-local
+    /// enforcement. The default, and today's behavior unchanged.
+    #[default]
+    Sqlite,
+    /// Two or more replicas behind a load balancer with one PostgreSQL primary
+    /// as the single authority for shared mutable state. Experimental and not
+    /// a supported HA configuration until the #241 release gate lands; the
+    /// foundation this mode needs (backend selection, redacted configuration,
+    /// identity, verified-TLS pool, fingerprint) is what PR 3 introduces.
+    Postgres,
+}
+
+impl FromStr for StateBackend {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "sqlite" => Ok(Self::Sqlite),
+            "postgres" => Ok(Self::Postgres),
+            _ => Err("expected 'sqlite' or 'postgres'"),
+        }
+    }
+}
+
+/// TLS policy for PostgreSQL connections (issue #241 PR 3).
+///
+/// The default requires TLS with certificate and hostname verification. The
+/// one exception is named for what it is: `loopback-dev` skips TLS entirely and
+/// is refused for any database target that is not loopback or a Unix socket,
+/// so the exception cannot quietly become a production plaintext connection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DatabaseTlsMode {
+    /// TLS is required: the handshake must succeed and the server certificate
+    /// is verified (chain and hostname) against the platform trust store plus
+    /// the optional `DATABASE_TLS_CA_FILE` bundle. A server that will not
+    /// speak TLS fails the connection rather than falling back.
+    #[default]
+    Verify,
+    /// Documented development exception: no TLS, and only when the database
+    /// target is a loopback address, the name `localhost`, or a Unix socket.
+    /// Selecting this mode with any other target fails startup naming the
+    /// setting.
+    LoopbackDev,
+}
+
+impl FromStr for DatabaseTlsMode {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "verify" => Ok(Self::Verify),
+            "loopback-dev" => Ok(Self::LoopbackDev),
+            _ => Err("expected 'verify' or 'loopback-dev'"),
+        }
+    }
+}
+
+/// PostgreSQL pool and timeout settings (issue #241 PR 3).
+///
+/// Every field is operator-configurable with a validated bound, because an
+/// unbounded statement, lock wait, or idle-in-transaction session is exactly
+/// the resource-exhaustion shape the blocking budgets in
+/// `docs/architecture/ha-state-model.md` forbid. No field carries secret
+/// material: the DSN lives in `DATABASE_URL_FILE` and is read at pool
+/// construction, never here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DatabaseSettings {
+    /// Per-replica pool ceiling. The documented connection math is
+    /// `replicas x DATABASE_POOL_MAX + migrator/leader headroom` against the
+    /// server's `max_connections`.
+    pub pool_max: usize,
+    /// Bound on establishing one new connection.
+    pub connect_timeout_ms: u64,
+    /// Bound on checking a connection out of the pool.
+    pub acquire_timeout_ms: u64,
+    /// Server-side `statement_timeout` applied to every pooled session.
+    pub statement_timeout_ms: u64,
+    /// Server-side `idle_in_transaction_session_timeout` applied to every
+    /// pooled session.
+    pub idle_in_transaction_timeout_ms: u64,
+    /// Server-side `lock_timeout` applied to every pooled session.
+    pub lock_timeout_ms: u64,
+    /// Bounded startup policy: retries after the first connect attempt before
+    /// startup fails (see `docs/configuration.md`).
+    pub startup_retry_limit: u64,
+    /// TLS policy; see [`DatabaseTlsMode`].
+    pub tls_mode: DatabaseTlsMode,
+    /// Optional PEM bundle of extra trust anchors for server-certificate
+    /// verification, layered on top of the platform trust store exactly as
+    /// egress TLS layers a configured CA. Public material.
+    pub tls_ca_file: Option<String>,
+    /// Path to the file containing the PostgreSQL connection string. The file
+    /// is read at pool construction through a bounded, permission-checked
+    /// reader and its contents never enter configuration, logs, or errors.
+    pub url_file: Option<String>,
+}
+
+impl Default for DatabaseSettings {
+    fn default() -> Self {
+        Self {
+            pool_max: DEFAULT_DATABASE_POOL_MAX,
+            connect_timeout_ms: DEFAULT_DATABASE_CONNECT_TIMEOUT_MS,
+            acquire_timeout_ms: DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS,
+            statement_timeout_ms: DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS,
+            idle_in_transaction_timeout_ms: DEFAULT_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+            lock_timeout_ms: DEFAULT_DATABASE_LOCK_TIMEOUT_MS,
+            startup_retry_limit: DEFAULT_DATABASE_STARTUP_RETRY_LIMIT,
+            tls_mode: DatabaseTlsMode::default(),
+            tls_ca_file: None,
+            url_file: None,
+        }
+    }
+}
+
+/// The longest `DEPLOYMENT_ID` accepted: long enough for any real name, short
+/// enough that identifiers built from it stay bounded in database keys,
+/// lock namespaces, and notifications.
+pub const MAX_DEPLOYMENT_ID_BYTES: usize = 64;
+
+/// Validate `DEPLOYMENT_ID` in the modes where it is read.
+///
+/// The ID is non-secret and appears in logs and status by design, which is
+/// exactly why its shape is pinned: a deployment identifier that can carry
+/// arbitrary bytes would turn every place it is rendered into a place an
+/// operator's terminal or log pipeline could be attacked from, and one that
+/// can be empty or unbounded would break the "stable, unique, named" contract
+/// every row, lock, and lease relies on.
+fn validate_deployment_id(
+    name: &str,
+    value: Option<String>,
+    problems: &mut Vec<String>,
+) -> Option<String> {
+    let value = value?;
+    let bytes = value.as_bytes();
+    let valid_shape = (1..=MAX_DEPLOYMENT_ID_BYTES).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if valid_shape {
+        Some(value)
+    } else {
+        problems.push(format!(
+            "{name} must be 1 to {MAX_DEPLOYMENT_ID_BYTES} bytes of ASCII letters, digits, '.', '_', or '-', starting and ending with a letter or digit"
+        ));
+        None
+    }
+}
+
+/// Reject authoritative writable local stores when PostgreSQL is selected.
+///
+/// In cluster mode PostgreSQL is the single authority (ADR-0007): a local
+/// `POLICY_FILE`, `TOOLS_FILE`, or `*_SQLITE_PATH` next to it is not a harmless
+/// leftover but a second authority a replica could fall back to, which is the
+/// stale-allow shape the whole mode exists to prevent. Files may return later
+/// as explicit import/bootstrap inputs; until that workflow exists, any such
+/// setting fails startup naming itself.
+fn reject_local_authority_in_postgres_mode(
+    state_backend: StateBackend,
+    deployment_id: Option<&str>,
+    database_url_file: Option<&str>,
+    local_authority_settings: &[(&str, bool)],
+    problems: &mut Vec<String>,
+) {
+    if state_backend != StateBackend::Postgres {
+        return;
+    }
+
+    if deployment_id.is_none() {
+        problems.push(format!(
+            "{DEPLOYMENT_ID} is required when {STATE_BACKEND}=postgres; it scopes every authoritative row, lock, lease, and notification of the deployment and is non-secret"
+        ));
+    }
+    if database_url_file.is_none() {
+        problems.push(format!(
+            "{DATABASE_URL_FILE} is required when {STATE_BACKEND}=postgres; the PostgreSQL connection string is supplied as a secret file, never as a raw environment variable"
+        ));
+    }
+    for (setting, set) in local_authority_settings {
+        if *set {
+            problems.push(format!(
+                "{setting} is set while {STATE_BACKEND}=postgres; in cluster mode PostgreSQL is the single authority and local stores are rejected (import/bootstrap workflows arrive in a later #241 PR) — unset {setting}"
+            ));
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1132,7 +1371,10 @@ impl Config {
             .expect("the default test configuration should validate")
     }
 
-    fn from_env_vars(
+    // pub(crate) so sibling modules' tests can build configurations from
+    // environment maps without going through process environment mutation;
+    // production reaches it only through `from_env`.
+    pub(crate) fn from_env_vars(
         mut get_var: impl FnMut(&str) -> Result<String, VarError>,
     ) -> Result<Self, ConfigError> {
         let mut problems = Vec::new();
@@ -2086,6 +2328,185 @@ impl Config {
             &mut problems,
         );
 
+        // Shared-state backend and PostgreSQL foundation (issue #241, PR 3).
+        //
+        // Everything here is validated in both modes, but nothing activates
+        // outside `STATE_BACKEND=postgres`: standalone mode must remain
+        // byte-for-byte unchanged. The mode's own requirements (deployment ID,
+        // secret-file DSN, rejection of writable local authorities) are checked
+        // below so the operator sees every problem in one pass.
+        let state_backend = parse_var(
+            STATE_BACKEND,
+            get_var(STATE_BACKEND),
+            StateBackend::Sqlite,
+            "state backend",
+            &mut problems,
+        );
+        let deployment_id = validate_deployment_id(
+            DEPLOYMENT_ID,
+            parse_optional_string(DEPLOYMENT_ID, get_var(DEPLOYMENT_ID), &mut problems),
+            &mut problems,
+        );
+        let database_url_file =
+            parse_optional_string(DATABASE_URL_FILE, get_var(DATABASE_URL_FILE), &mut problems);
+        let database_tls_mode = parse_var(
+            DATABASE_TLS_MODE,
+            get_var(DATABASE_TLS_MODE),
+            DatabaseTlsMode::Verify,
+            "database TLS mode",
+            &mut problems,
+        );
+        let database_tls_ca_file = parse_optional_string(
+            DATABASE_TLS_CA_FILE,
+            get_var(DATABASE_TLS_CA_FILE),
+            &mut problems,
+        );
+        let database_pool_max = validate_positive_bounded_u64(
+            DATABASE_POOL_MAX,
+            parse_var(
+                DATABASE_POOL_MAX,
+                get_var(DATABASE_POOL_MAX),
+                DEFAULT_DATABASE_POOL_MAX as u64,
+                "connection count",
+                &mut problems,
+            ),
+            MAX_DATABASE_POOL_MAX as u64,
+            DEFAULT_DATABASE_POOL_MAX as u64,
+            &mut problems,
+        ) as usize;
+        let database_connect_timeout_ms = validate_positive_timeout_ms(
+            DATABASE_CONNECT_TIMEOUT_MS,
+            parse_var(
+                DATABASE_CONNECT_TIMEOUT_MS,
+                get_var(DATABASE_CONNECT_TIMEOUT_MS),
+                DEFAULT_DATABASE_CONNECT_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_DATABASE_CONNECT_TIMEOUT_MS,
+            &mut problems,
+        );
+        let database_acquire_timeout_ms = validate_positive_timeout_ms(
+            DATABASE_ACQUIRE_TIMEOUT_MS,
+            parse_var(
+                DATABASE_ACQUIRE_TIMEOUT_MS,
+                get_var(DATABASE_ACQUIRE_TIMEOUT_MS),
+                DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS,
+            &mut problems,
+        );
+        let database_statement_timeout_ms = validate_positive_timeout_ms(
+            DATABASE_STATEMENT_TIMEOUT_MS,
+            parse_var(
+                DATABASE_STATEMENT_TIMEOUT_MS,
+                get_var(DATABASE_STATEMENT_TIMEOUT_MS),
+                DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS,
+            &mut problems,
+        );
+        let database_idle_in_transaction_timeout_ms = validate_positive_timeout_ms(
+            DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+            parse_var(
+                DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+                get_var(DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS),
+                DEFAULT_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+            &mut problems,
+        );
+        let database_lock_timeout_ms = validate_positive_timeout_ms(
+            DATABASE_LOCK_TIMEOUT_MS,
+            parse_var(
+                DATABASE_LOCK_TIMEOUT_MS,
+                get_var(DATABASE_LOCK_TIMEOUT_MS),
+                DEFAULT_DATABASE_LOCK_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_DATABASE_LOCK_TIMEOUT_MS,
+            &mut problems,
+        );
+        let database_startup_retry_limit = validate_maximum_u64(
+            DATABASE_STARTUP_RETRY_LIMIT,
+            parse_var(
+                DATABASE_STARTUP_RETRY_LIMIT,
+                get_var(DATABASE_STARTUP_RETRY_LIMIT),
+                DEFAULT_DATABASE_STARTUP_RETRY_LIMIT,
+                "retry count",
+                &mut problems,
+            ),
+            MAX_DATABASE_STARTUP_RETRY_LIMIT,
+            DEFAULT_DATABASE_STARTUP_RETRY_LIMIT,
+            &mut problems,
+        );
+        let database = DatabaseSettings {
+            pool_max: database_pool_max,
+            connect_timeout_ms: database_connect_timeout_ms,
+            acquire_timeout_ms: database_acquire_timeout_ms,
+            statement_timeout_ms: database_statement_timeout_ms,
+            idle_in_transaction_timeout_ms: database_idle_in_transaction_timeout_ms,
+            lock_timeout_ms: database_lock_timeout_ms,
+            startup_retry_limit: database_startup_retry_limit,
+            tls_mode: database_tls_mode,
+            tls_ca_file: database_tls_ca_file.clone(),
+            url_file: database_url_file.clone(),
+        };
+        // Postgres-mode requirements, checked after every input is parsed so
+        // one pass reports every problem.
+        reject_local_authority_in_postgres_mode(
+            state_backend,
+            deployment_id.as_deref(),
+            database_url_file.as_deref(),
+            &[
+                (POLICY_FILE, policy_file.is_some()),
+                (TOOLS_FILE, tools_file.is_some()),
+                (AUDIT_SQLITE_PATH, audit_sqlite_path.is_some()),
+                (DISCOVERY_SQLITE_PATH, discovery_sqlite_path.is_some()),
+                (PRINCIPAL_SQLITE_PATH, principal_sqlite_path.is_some()),
+                (CONNECTIONS_SQLITE_PATH, connections_sqlite_path.is_some()),
+                (
+                    POLICY_HISTORY_SQLITE_PATH,
+                    policy_history_sqlite_path.is_some(),
+                ),
+                (
+                    SERVICE_TOKEN_SQLITE_PATH,
+                    service_token_sqlite_path.is_some(),
+                ),
+            ],
+            &mut problems,
+        );
+        // PostgreSQL material configured while standalone mode is selected is
+        // the inverse gap: material a mode that will never read it invites an
+        // operator to believe a database is configured when none is consulted.
+        // The same rule the client-certificate settings apply to a CA bundle
+        // configured against an off mode, and a deployment ID names a cluster
+        // namespace that does not exist in standalone mode.
+        if state_backend == StateBackend::Sqlite {
+            if database_url_file.is_some() {
+                problems.push(format!(
+                    "{DATABASE_URL_FILE} is set while {STATE_BACKEND} is sqlite; set {STATE_BACKEND}=postgres to use PostgreSQL, or unset {DATABASE_URL_FILE}"
+                ));
+            }
+            if database_tls_ca_file.is_some() {
+                problems.push(format!(
+                    "{DATABASE_TLS_CA_FILE} is set while {STATE_BACKEND} is sqlite; set {STATE_BACKEND}=postgres to use PostgreSQL, or unset {DATABASE_TLS_CA_FILE}"
+                ));
+            }
+            if deployment_id.is_some() {
+                problems.push(format!(
+                    "{DEPLOYMENT_ID} is set while {STATE_BACKEND} is sqlite; a deployment ID scopes a cluster-mode deployment and standalone mode never reads it — set {STATE_BACKEND}=postgres or unset {DEPLOYMENT_ID}"
+                ));
+            }
+        }
+
         if problems.is_empty() {
             Ok(Self {
                 listen_addr,
@@ -2185,6 +2606,9 @@ impl Config {
                 egress_max_request_body_bytes,
                 egress_nat64_prefixes,
                 egress_deny_private_ips,
+                state_backend,
+                deployment_id,
+                database,
             })
         } else {
             Err(ConfigError { problems })
@@ -9660,5 +10084,310 @@ mod tests {
             == "PRIMARY_LISTEN_ADDR must be a valid socket address, got 'not-a-socket': invalid socket address syntax"));
         assert!(problems.iter().any(|problem| problem
             == "FEATURE_ENABLED must be a valid boolean, got 'maybe': provided string was not `true` or `false`"));
+    }
+
+    // --- shared-state backend selection (issue #241, PR 3) -------------------
+
+    #[test]
+    fn state_backend_defaults_to_sqlite() {
+        let config = Config::from_env_vars(|_| Err(VarError::NotPresent))
+            .expect("an unconfigured gateway is standalone");
+        assert_eq!(config.state_backend, StateBackend::Sqlite);
+        assert_eq!(config.deployment_id, None);
+        assert_eq!(config.database.url_file, None);
+        assert_eq!(config.database.tls_mode, DatabaseTlsMode::Verify);
+    }
+
+    fn postgres_mode_vars<'a>(
+        extra: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Result<String, VarError> + 'a {
+        move |name| {
+            let base = [
+                ("STATE_BACKEND", "postgres"),
+                ("DEPLOYMENT_ID", "deploy-prod-eu"),
+                (
+                    "DATABASE_URL_FILE",
+                    "/run/secrets/greengateway/database-url",
+                ),
+            ];
+            // Extra entries come first so a test can override a base value.
+            for (key, value) in extra.iter().chain(base.iter()) {
+                if name == *key {
+                    return Ok((*value).to_owned());
+                }
+            }
+            Err(VarError::NotPresent)
+        }
+    }
+
+    #[test]
+    fn a_valid_postgres_mode_configuration_parses() {
+        let config = Config::from_env_vars(postgres_mode_vars(&[]))
+            .expect("a complete postgres-mode configuration should validate");
+        assert_eq!(config.state_backend, StateBackend::Postgres);
+        assert_eq!(config.deployment_id.as_deref(), Some("deploy-prod-eu"));
+        assert_eq!(
+            config.database.url_file.as_deref(),
+            Some("/run/secrets/greengateway/database-url")
+        );
+        assert_eq!(config.database.pool_max, DEFAULT_DATABASE_POOL_MAX);
+        assert_eq!(
+            config.database.connect_timeout_ms,
+            DEFAULT_DATABASE_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.database.acquire_timeout_ms,
+            DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.database.statement_timeout_ms,
+            DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.database.idle_in_transaction_timeout_ms,
+            DEFAULT_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.database.lock_timeout_ms,
+            DEFAULT_DATABASE_LOCK_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.database.startup_retry_limit,
+            DEFAULT_DATABASE_STARTUP_RETRY_LIMIT
+        );
+    }
+
+    #[test]
+    fn postgres_mode_requires_a_deployment_id() {
+        let error = Config::from_env_vars(|name| match name {
+            "STATE_BACKEND" => Ok("postgres".to_owned()),
+            "DATABASE_URL_FILE" => Ok("/run/secrets/greengateway/database-url".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("postgres mode without a deployment ID must not start");
+        assert!(
+            error.to_string().contains("DEPLOYMENT_ID is required"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    fn postgres_mode_requires_a_dsn_secret_file() {
+        let error = Config::from_env_vars(|name| match name {
+            "STATE_BACKEND" => Ok("postgres".to_owned()),
+            "DEPLOYMENT_ID" => Ok("deploy-prod-eu".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("postgres mode without a DSN file must not start");
+        assert!(
+            error.to_string().contains("DATABASE_URL_FILE is required"),
+            "{}",
+            error
+        );
+    }
+
+    /// Cluster mode rejects every authoritative writable local store, naming
+    /// each: a second authority next to PostgreSQL is the stale-allow shape
+    /// the mode exists to prevent, not a leftover.
+    #[test]
+    fn postgres_mode_rejects_writable_local_authority_settings() {
+        for (setting, value) in [
+            ("POLICY_FILE", "/etc/greengateway/policy.json"),
+            ("TOOLS_FILE", "/etc/greengateway/tools.json"),
+            ("AUDIT_SQLITE_PATH", "/var/lib/greengateway/audit.sqlite3"),
+            (
+                "DISCOVERY_SQLITE_PATH",
+                "/var/lib/greengateway/discovery.sqlite3",
+            ),
+            (
+                "PRINCIPAL_SQLITE_PATH",
+                "/var/lib/greengateway/principals.sqlite3",
+            ),
+            (
+                "CONNECTIONS_SQLITE_PATH",
+                "/var/lib/greengateway/connections.sqlite3",
+            ),
+            (
+                "POLICY_HISTORY_SQLITE_PATH",
+                "/var/lib/greengateway/history.sqlite3",
+            ),
+            (
+                "SERVICE_TOKEN_SQLITE_PATH",
+                "/var/lib/greengateway/tokens.sqlite3",
+            ),
+        ] {
+            let error = Config::from_env_vars(postgres_mode_vars(&[(setting, value)]))
+                .expect_err("a writable local authority must be rejected in cluster mode");
+            let message = error.to_string();
+            assert!(
+                message.contains(setting),
+                "the rejection must name {setting}: {message}"
+            );
+            assert!(
+                message.contains("STATE_BACKEND=postgres"),
+                "the rejection must name the mode: {message}"
+            );
+        }
+    }
+
+    /// The inverse gap: PostgreSQL material while standalone mode is selected
+    /// invites an operator to believe a database is in use when nothing reads
+    /// it.
+    #[test]
+    fn sqlite_mode_rejects_postgres_material() {
+        for (setting, value) in [
+            (
+                "DATABASE_URL_FILE",
+                "/run/secrets/greengateway/database-url",
+            ),
+            (
+                "DATABASE_TLS_CA_FILE",
+                "/run/secrets/greengateway/postgres-ca.pem",
+            ),
+            ("DEPLOYMENT_ID", "deploy-prod-eu"),
+        ] {
+            let error = Config::from_env_vars(|name| match name {
+                "STATE_BACKEND" => Ok("sqlite".to_owned()),
+                other if other == setting => Ok(value.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect_err("postgres material with sqlite mode must be rejected");
+            let message = error.to_string();
+            assert!(
+                message.contains(setting),
+                "the rejection must name {setting}: {message}"
+            );
+            assert!(
+                message.contains("STATE_BACKEND is sqlite"),
+                "the rejection must name the mode: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_backend_and_database_tls_mode_reject_unknown_values() {
+        for (setting, value) in [
+            ("STATE_BACKEND", "mysql"),
+            ("STATE_BACKEND", "POSTGRES"),
+            ("DATABASE_TLS_MODE", "prefer"),
+            ("DATABASE_TLS_MODE", "verify-full"),
+        ] {
+            let mut vars: Vec<(&str, &str)> = vec![(setting, value)];
+            if setting != "DATABASE_TLS_MODE" {
+                vars.push(("DEPLOYMENT_ID", "deploy-prod-eu"));
+                vars.push((
+                    "DATABASE_URL_FILE",
+                    "/run/secrets/greengateway/database-url",
+                ));
+            }
+            let error = Config::from_env_vars(|name| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| Ok(value.to_string()))
+                    .unwrap_or(Err(VarError::NotPresent))
+            })
+            .expect_err("an unknown enum value must be rejected");
+            assert!(
+                error.to_string().contains(setting),
+                "the rejection must name {setting}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_id_shape_is_enforced() {
+        // An empty value parses as unset, which in postgres mode is the
+        // "DEPLOYMENT_ID is required" failure pinned by its own test above;
+        // this test covers the malformed-but-present shapes.
+        for bad in [
+            "-leading-dash",
+            "trailing-dash-",
+            "has spaces",
+            "has/slash",
+            &"a".repeat(MAX_DEPLOYMENT_ID_BYTES + 1),
+        ] {
+            let error = Config::from_env_vars(postgres_mode_vars(&[("DEPLOYMENT_ID", bad)]))
+                .expect_err("a malformed deployment ID must be rejected");
+            let message = error.to_string();
+            assert!(
+                message.contains("DEPLOYMENT_ID must be 1 to 64 bytes"),
+                "{message}"
+            );
+        }
+
+        let config =
+            Config::from_env_vars(postgres_mode_vars(&[("DEPLOYMENT_ID", "Deploy.1_prod-eu")]))
+                .expect("a correctly-shaped deployment ID should validate");
+        assert_eq!(config.deployment_id.as_deref(), Some("Deploy.1_prod-eu"));
+    }
+
+    #[test]
+    fn database_bounds_are_enforced() {
+        for (setting, value, expected_fragment) in [
+            ("DATABASE_POOL_MAX", "0", "must be between 1 and"),
+            (
+                "DATABASE_POOL_MAX",
+                &(MAX_DATABASE_POOL_MAX + 1).to_string(),
+                "must be between 1 and",
+            ),
+            ("DATABASE_CONNECT_TIMEOUT_MS", "0", "must be greater than 0"),
+            ("DATABASE_ACQUIRE_TIMEOUT_MS", "0", "must be greater than 0"),
+            (
+                "DATABASE_STATEMENT_TIMEOUT_MS",
+                "0",
+                "must be greater than 0",
+            ),
+            (
+                "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+                "0",
+                "must be greater than 0",
+            ),
+            ("DATABASE_LOCK_TIMEOUT_MS", "0", "must be greater than 0"),
+            (
+                "DATABASE_STARTUP_RETRY_LIMIT",
+                &(MAX_DATABASE_STARTUP_RETRY_LIMIT + 1).to_string(),
+                "must be at most",
+            ),
+        ] {
+            let error = Config::from_env_vars(postgres_mode_vars(&[(setting, value)]))
+                .expect_err("out-of-bounds database settings must be rejected");
+            let message = error.to_string();
+            assert!(
+                message.contains(setting) && message.contains(expected_fragment),
+                "expected {setting} rejection containing {expected_fragment:?}: {message}"
+            );
+        }
+
+        let config = Config::from_env_vars(postgres_mode_vars(&[
+            ("DATABASE_POOL_MAX", "2"),
+            ("DATABASE_STATEMENT_TIMEOUT_MS", "60000"),
+            ("DATABASE_STARTUP_RETRY_LIMIT", "0"),
+        ]))
+        .expect("in-bounds overrides should validate");
+        assert_eq!(config.database.pool_max, 2);
+        assert_eq!(config.database.statement_timeout_ms, 60_000);
+        assert_eq!(config.database.startup_retry_limit, 0);
+    }
+
+    /// The privacy contract of the HA state model: the DSN, database user,
+    /// host, and name never appear in `Debug`. `Config` holds the locator of
+    /// the DSN file, never its contents, and this pins that no future field
+    /// quietly starts carrying connection material.
+    #[test]
+    fn config_debug_renders_no_dsn_material() {
+        let config = Config::from_env_vars(postgres_mode_vars(&[(
+            "DATABASE_TLS_CA_FILE",
+            "/run/secrets/greengateway/postgres-ca.pem",
+        )]))
+        .expect("a full cluster-mode configuration should validate");
+
+        let rendered = format!("{config:?}");
+        for fragment in ["postgres://", "postgresql://", "canary-password", ":5432/"] {
+            assert!(
+                !rendered.contains(fragment),
+                "Config Debug must not carry DSN material ({fragment}): {rendered}"
+            );
+        }
     }
 }

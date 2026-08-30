@@ -32,6 +32,13 @@ pub(crate) use reqwest as rmcp_http;
 #[cfg(test)]
 pub(crate) use grpc::test_client as grpc_test_client;
 pub(crate) use grpc::{GrpcFailure, GrpcRequestBody, GrpcResponseBody};
+// The PostgreSQL foundation builds its TLS connector on the same explicitly
+// resolved crypto provider and the same CA-bundle parser the outbound path
+// uses, so there is exactly one trust-decision construction site in the
+// process, not two that could drift. Unused in builds without the `postgres`
+// feature, where no second TLS consumer exists.
+#[cfg(feature = "postgres")]
+pub(crate) use tls::{crypto_provider, parse_ca_bundle_pem};
 
 mod client_cache;
 mod grpc;
@@ -5429,6 +5436,9 @@ mod tests {
             egress_max_request_body_bytes: 1_048_576,
             egress_nat64_prefixes: Vec::new(),
             egress_deny_private_ips: true,
+            state_backend: crate::config::StateBackend::Sqlite,
+            deployment_id: None,
+            database: crate::config::DatabaseSettings::default(),
         }
     }
 }

@@ -122,9 +122,21 @@ fn map_token_store_error(operation: &'static str, error: TokenStoreError) -> Rep
         TokenStoreError::Open { source, .. } | TokenStoreError::Sqlite { source, .. } => {
             classify_rusqlite(operation, source)
         }
-        TokenStoreError::Json { .. }
-        | TokenStoreError::TimeFormat(_)
-        | TokenStoreError::TimeParse { .. } => {
+        TokenStoreError::Json { .. } | TokenStoreError::TimeFormat(_) => {
+            RepositoryError::new(RepositoryErrorKind::InvalidData, operation)
+        }
+        // A timestamp that failed to parse names the field it came from, which
+        // is the request-reachable invalid-data case the admin API answers
+        // with `400` rather than `500` (`context` is a `&'static str` field
+        // name like `expires_at`, never a value). Only create parses a
+        // caller-supplied timestamp; a parse failure on any other operation
+        // is a read-back of stored data and stays a plain store failure.
+        // Serialization and clock-formatting failures have no such field and
+        // stay plain `InvalidData` as well.
+        TokenStoreError::TimeParse { context, .. } if operation == "service_token_create" => {
+            RepositoryError::invalid_parameter(operation, context)
+        }
+        TokenStoreError::TimeParse { .. } => {
             RepositoryError::new(RepositoryErrorKind::InvalidData, operation)
         }
         TokenStoreError::InvalidCursor { parameter } => {

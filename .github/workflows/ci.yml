@@ -93,6 +93,68 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # PostgreSQL foundation (issue #241, PR 3): the gateway suite against a real
+  # PostgreSQL 16 service container, in both feature states.
+  #
+  # The test DSN uses the documented `loopback-dev` TLS exception because the
+  # GitHub-hosted service container is reachable only over loopback plaintext
+  # -- exactly the shape the exception exists for. Full verified-TLS coverage
+  # (server certificate + hostname verification against a configured CA) is
+  # exercised in the TLS-focused suites of later #241 PRs, which bring up
+  # their own TLS-capable database rather than sharing this one.
+  #
+  # `POSTGRES_HOST_AUTH_METHOD: trust` means the CI DSN carries no password:
+  # there is no secret to leak and nothing for gitleaks to flag. The
+  # disposable database is recreated per run.
+  postgres-foundation:
+    name: postgres-foundation
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: greengateway_ci
+          POSTGRES_DB: greengateway_ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U greengateway_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Write the test DSN file
+        run: |
+          set -eu
+          mkdir -p "${RUNNER_TEMP}/pg"
+          printf 'postgres://greengateway_ci@127.0.0.1:5432/greengateway_ci\n' \
+            > "${RUNNER_TEMP}/pg/database-url"
+          chmod 0600 "${RUNNER_TEMP}/pg/database-url"
+
+      - name: Test against a real PostgreSQL (feature on)
+        env:
+          GATEWAY_TEST_POSTGRES_URL_FILE: ${{ runner.temp }}/pg/database-url
+        run: cargo test -p gateway
+
+      - name: Test without the postgres feature
+        run: cargo test -p gateway --no-default-features
+
+      - name: Lint without the postgres feature
+        run: cargo clippy -p gateway --no-default-features --all-targets -- -D warnings
+
   admin-ui:
     name: admin-ui
     runs-on: ubuntu-latest

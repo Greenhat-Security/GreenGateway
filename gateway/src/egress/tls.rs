@@ -85,7 +85,7 @@ const H2_ALPN: &[&[u8]] = &[b"h2"];
 /// two things a deployment can fix, and `EgressError` already has a variant for
 /// each. Nothing here renders the material itself.
 #[derive(Debug)]
-pub(super) enum TlsConfigError {
+pub(crate) enum TlsConfigError {
     /// The CA bundle could not be turned into trust anchors, or the platform
     /// trust store could not be read.
     TrustAnchors(&'static str),
@@ -182,7 +182,7 @@ fn alpn_protocols(profile: ProtocolProfile) -> &'static [&'static [u8]] {
 /// place, and whichever provider wins is the provider that validates client
 /// identities, verifies server certificates, and negotiates suites, on every
 /// outbound path.
-pub(super) fn crypto_provider() -> Arc<CryptoProvider> {
+pub(crate) fn crypto_provider() -> Arc<CryptoProvider> {
     resolve_crypto_provider(CryptoProvider::get_default().cloned())
 }
 
@@ -205,7 +205,7 @@ fn resolve_crypto_provider(process_default: Option<Arc<CryptoProvider>>) -> Arc<
 /// client-build time. Doing it here keeps the rejection where the operator can
 /// act on it, and stops a bundle that adds no usable anchor from being accepted
 /// as if it had.
-pub(super) fn parse_ca_bundle_pem(
+pub(crate) fn parse_ca_bundle_pem(
     pem_bundle: &[u8],
 ) -> Result<Vec<CertificateDer<'static>>, TlsConfigError> {
     let certificates = CertificateDer::pem_slice_iter(pem_bundle)
