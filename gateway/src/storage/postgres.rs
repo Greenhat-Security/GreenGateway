@@ -899,11 +899,7 @@ mod tests {
     }
 
     mod tempdir {
-        use std::{
-            fs,
-            path::PathBuf,
-            thread,
-        };
+        use std::{fs, path::PathBuf, thread};
 
         pub(super) struct TempDir {
             pub(super) path: PathBuf,
