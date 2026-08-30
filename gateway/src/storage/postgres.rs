@@ -809,10 +809,23 @@ mod tests {
 
         #[cfg(unix)]
         {
+            // The URL authority host lands in the host list alongside the
+            // `host=` Unix path, so both must be loopback-shaped for the
+            // exception to apply -- which is the correct rule: a multi-target
+            // DSN with one non-loopback target is a non-loopback DSN.
             let unix_socket =
-                validated_dsn_config("postgres://ggw@ggw/db?host=/var/run/postgresql")
+                validated_dsn_config("postgres://ggw@localhost/db?host=/var/run/postgresql")
                     .expect("a Unix socket target parses");
             assert!(enforce_tls_policy(&unix_socket, &settings).is_ok());
+
+            let mixed = validated_dsn_config(&format!(
+                "postgres://{CANARY_USER}@{CANARY_HOST}/db?host=/var/run/postgresql"
+            ))
+            .expect("the DSN parses; the mode is what is wrong");
+            assert!(
+                enforce_tls_policy(&mixed, &settings).is_err(),
+                "a DSN naming any non-loopback TCP target must be refused under loopback-dev"
+            );
         }
 
         let remote = validated_dsn_config(&canary_dsn())
