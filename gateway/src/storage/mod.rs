@@ -17,6 +17,12 @@
 //!   contract.
 
 mod audit;
+/// Versioned migrations and the schema lifecycle (issue #241, PR 4), on the
+/// same `postgres` feature as the pool it runs on. A feature-off build
+/// refuses the `migrate` subcommand in `main` with a clear message rather
+/// than treating it as an unknown word.
+#[cfg(feature = "postgres")]
+pub mod migrations;
 mod policy_history;
 #[cfg(feature = "postgres")]
 pub mod postgres;

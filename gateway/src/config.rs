@@ -157,6 +157,11 @@ pub const DEFAULT_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_DATABASE_LOCK_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_DATABASE_STARTUP_RETRY_LIMIT: u64 = 5;
 pub const MAX_DATABASE_STARTUP_RETRY_LIMIT: u64 = 300;
+// Migration settings (issue #241, PR 4). The statement timeout for
+// migrations is its own bound, deliberately wider than a request-path
+// statement's: real DDL takes longer than a lookup, and it is still finite.
+pub const DEFAULT_DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS: u64 = 60_000;
+pub const MAX_DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS: u64 = 600_000;
 
 /// Default ceiling on concurrently open HTTP/2 streams per gRPC connection.
 ///
@@ -214,9 +219,11 @@ const CONNECTION_SECRET_ALIASES: &str = "CONNECTION_SECRET_ALIASES";
 const CONNECTION_VAULT_PROVIDER: &str = "CONNECTION_VAULT_PROVIDER";
 const CONNECTION_SECRETS_ROOT: &str = "CONNECTION_SECRETS_ROOT";
 const DATABASE_ACQUIRE_TIMEOUT_MS: &str = "DATABASE_ACQUIRE_TIMEOUT_MS";
+const DATABASE_AUTO_MIGRATE: &str = "DATABASE_AUTO_MIGRATE";
 const DATABASE_CONNECT_TIMEOUT_MS: &str = "DATABASE_CONNECT_TIMEOUT_MS";
 const DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS: &str = "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS";
 const DATABASE_LOCK_TIMEOUT_MS: &str = "DATABASE_LOCK_TIMEOUT_MS";
+const DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS: &str = "DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS";
 const DATABASE_POOL_MAX: &str = "DATABASE_POOL_MAX";
 const DATABASE_STARTUP_RETRY_LIMIT: &str = "DATABASE_STARTUP_RETRY_LIMIT";
 const DATABASE_STATEMENT_TIMEOUT_MS: &str = "DATABASE_STATEMENT_TIMEOUT_MS";
@@ -544,6 +551,15 @@ pub struct DatabaseSettings {
     /// Bounded startup policy: retries after the first connect attempt before
     /// startup fails (see `docs/configuration.md`).
     pub startup_retry_limit: u64,
+    /// Development-only auto-migration: when true, a serving process in
+    /// cluster mode applies pending migrations at startup, exactly as
+    /// `gateway migrate up` would. Production pods validate only -- the
+    /// default -- with migrations owned by a separate job and DDL role.
+    pub auto_migrate: bool,
+    /// Bound, in milliseconds, on each statement and lock wait inside a
+    /// migration transaction. Applied with `SET LOCAL`, so it never leaks
+    /// into pooled sessions.
+    pub migration_statement_timeout_ms: u64,
     /// TLS policy; see [`DatabaseTlsMode`].
     pub tls_mode: DatabaseTlsMode,
     /// Optional PEM bundle of extra trust anchors for server-certificate
@@ -566,6 +582,8 @@ impl Default for DatabaseSettings {
             idle_in_transaction_timeout_ms: DEFAULT_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
             lock_timeout_ms: DEFAULT_DATABASE_LOCK_TIMEOUT_MS,
             startup_retry_limit: DEFAULT_DATABASE_STARTUP_RETRY_LIMIT,
+            auto_migrate: false,
+            migration_statement_timeout_ms: DEFAULT_DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS,
             tls_mode: DatabaseTlsMode::default(),
             tls_ca_file: None,
             url_file: None,
@@ -2447,6 +2465,31 @@ impl Config {
             DEFAULT_DATABASE_STARTUP_RETRY_LIMIT,
             &mut problems,
         );
+        let database_auto_migrate = parse_var(
+            DATABASE_AUTO_MIGRATE,
+            get_var(DATABASE_AUTO_MIGRATE),
+            false,
+            "boolean",
+            &mut problems,
+        );
+        let database_migration_statement_timeout_ms = validate_maximum_u64(
+            DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS,
+            validate_positive_timeout_ms(
+                DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS,
+                parse_var(
+                    DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS,
+                    get_var(DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS),
+                    DEFAULT_DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS,
+                    "millisecond duration",
+                    &mut problems,
+                ),
+                DEFAULT_DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS,
+                &mut problems,
+            ),
+            MAX_DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS,
+            DEFAULT_DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS,
+            &mut problems,
+        );
         let database = DatabaseSettings {
             pool_max: database_pool_max,
             connect_timeout_ms: database_connect_timeout_ms,
@@ -2455,6 +2498,8 @@ impl Config {
             idle_in_transaction_timeout_ms: database_idle_in_transaction_timeout_ms,
             lock_timeout_ms: database_lock_timeout_ms,
             startup_retry_limit: database_startup_retry_limit,
+            auto_migrate: database_auto_migrate,
+            migration_statement_timeout_ms: database_migration_statement_timeout_ms,
             tls_mode: database_tls_mode,
             tls_ca_file: database_tls_ca_file.clone(),
             url_file: database_url_file.clone(),
@@ -2503,6 +2548,11 @@ impl Config {
             if deployment_id.is_some() {
                 problems.push(format!(
                     "{DEPLOYMENT_ID} is set while {STATE_BACKEND} is sqlite; a deployment ID scopes a cluster-mode deployment and standalone mode never reads it — set {STATE_BACKEND}=postgres or unset {DEPLOYMENT_ID}"
+                ));
+            }
+            if database_auto_migrate {
+                problems.push(format!(
+                    "{DATABASE_AUTO_MIGRATE}=true while {STATE_BACKEND} is sqlite; there is no schema to migrate in standalone mode — set {STATE_BACKEND}=postgres or unset {DATABASE_AUTO_MIGRATE}"
                 ));
             }
         }
@@ -10130,6 +10180,11 @@ mod tests {
             config.database.url_file.as_deref(),
             Some("/run/secrets/greengateway/database-url")
         );
+        assert!(!config.database.auto_migrate);
+        assert_eq!(
+            config.database.migration_statement_timeout_ms,
+            DEFAULT_DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS
+        );
         assert_eq!(config.database.pool_max, DEFAULT_DATABASE_POOL_MAX);
         assert_eq!(
             config.database.connect_timeout_ms,
@@ -10246,6 +10301,7 @@ mod tests {
                 "/run/secrets/greengateway/postgres-ca.pem",
             ),
             ("DEPLOYMENT_ID", "deploy-prod-eu"),
+            ("DATABASE_AUTO_MIGRATE", "true"),
         ] {
             let error = Config::from_env_vars(|name| match name {
                 "STATE_BACKEND" => Ok("sqlite".to_owned()),
@@ -10363,11 +10419,40 @@ mod tests {
             ("DATABASE_POOL_MAX", "2"),
             ("DATABASE_STATEMENT_TIMEOUT_MS", "60000"),
             ("DATABASE_STARTUP_RETRY_LIMIT", "0"),
+            ("DATABASE_AUTO_MIGRATE", "true"),
+            ("DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS", "120000"),
         ]))
         .expect("in-bounds overrides should validate");
         assert_eq!(config.database.pool_max, 2);
         assert_eq!(config.database.statement_timeout_ms, 60_000);
         assert_eq!(config.database.startup_retry_limit, 0);
+        assert!(config.database.auto_migrate);
+        assert_eq!(config.database.migration_statement_timeout_ms, 120_000);
+    }
+
+    #[test]
+    fn migration_settings_bounds_are_enforced() {
+        for (setting, value, expected_fragment) in [
+            (
+                "DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS",
+                "0",
+                "must be greater than 0",
+            ),
+            (
+                "DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS",
+                &(MAX_DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS + 1).to_string(),
+                "must be at most",
+            ),
+            ("DATABASE_AUTO_MIGRATE", "maybe", "must be a valid boolean"),
+        ] {
+            let error = Config::from_env_vars(postgres_mode_vars(&[(setting, value)]))
+                .expect_err("out-of-bounds migration settings must be rejected");
+            let message = error.to_string();
+            assert!(
+                message.contains(setting) && message.contains(expected_fragment),
+                "expected {setting} rejection containing {expected_fragment:?}: {message}"
+            );
+        }
     }
 
     /// The privacy contract of the HA state model: the DSN, database user,

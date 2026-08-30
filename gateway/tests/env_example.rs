@@ -232,6 +232,8 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
         "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS",
         "DATABASE_LOCK_TIMEOUT_MS",
         "DATABASE_STARTUP_RETRY_LIMIT",
+        "DATABASE_AUTO_MIGRATE",
+        "DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS",
     ] {
         assert!(
             expected.remove(excluded),

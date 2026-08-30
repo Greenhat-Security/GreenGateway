@@ -1998,6 +1998,22 @@ Default: `5`
 
 Format and validation: an integer between 0 and 300; `0` fails startup on the first failed attempt.
 
+### DATABASE_AUTO_MIGRATE
+
+Development-only auto-migration: when `true`, a serving process in postgres mode applies pending schema migrations at startup, exactly as `gateway migrate up` would, before the schema validation runs. Production pods validate only — the default and the required posture — with migrations owned by a separate job running under the DDL-capable migration role; see [the PostgreSQL deployment guide](deployment/postgres.md).
+
+Default: `false`
+
+Format and validation: a Rust boolean. Rejected when `STATE_BACKEND=sqlite`. Auto-migration does not weaken any ledger rule: a tampered or newer-than-supported schema still fails startup.
+
+### DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS
+
+Bound, in milliseconds, on each statement and each lock wait inside a migration transaction (`gateway migrate up`, and auto-migration when enabled). Applied with `SET LOCAL` inside the transaction, so it cannot leak into pooled sessions. Deliberately wider than the request-path `DATABASE_STATEMENT_TIMEOUT_MS` — real DDL takes longer than a lookup — and still finite.
+
+Default: `60000`
+
+Format and validation: an integer greater than 0 and at most 600000.
+
 ## Production Deployment And Migration
 
 Adopt pool behavior one logical route at a time. Existing `UPSTREAM_URL` and

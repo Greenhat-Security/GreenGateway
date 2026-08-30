@@ -1406,6 +1406,51 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // `gateway migrate check|up` (issue #241, PR 4): a one-shot schema
+    // command that connects, does its work, prints one line, and exits --
+    // never a serving process. It is dispatched BEFORE the connection-secret
+    // maintenance parser, because that parser rejects every argument list
+    // that is not exactly its own shape and would swallow `migrate ...` with
+    // a misleading error (an adversarial review caught exactly that). It
+    // runs after the tracing subscriber below, so a failing migration's
+    // classified diagnostics have somewhere to go.
+    #[cfg(feature = "postgres")]
+    if let Some(word) = std::env::args_os().nth(1) {
+        if word == *"migrate" {
+            initialize_tracing_for_one_shot_commands();
+            match storage::migrations::run_if_requested(
+                std::env::args_os().skip(1),
+                config::Config::from_env,
+            )
+            .await?
+            {
+                Some(output) => {
+                    println!("{output}");
+                    let exit_code = output.exit_code();
+                    if exit_code != 0 {
+                        // `check` is a gate: not-current is a printed
+                        // status plus a nonzero exit, not a panic.
+                        std::process::exit(exit_code);
+                    }
+                    return Ok(());
+                }
+                // Unreachable: the first argument is `migrate`, which the
+                // parser either executes or rejects.
+                None => return Err("gateway migrate reached an unreachable parse state".into()),
+            }
+        }
+    }
+    #[cfg(not(feature = "postgres"))]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|word| word == *"migrate")
+    {
+        return Err(
+            "this gateway binary was built without the `postgres` cargo feature and \
+                    cannot run `gateway migrate`; build with default features"
+                .into(),
+        );
+    }
     if let Some(output) = connection_secret_maintenance::run_if_requested(
         std::env::args_os().skip(1),
         config::Config::from_env,
@@ -1516,6 +1561,23 @@ fn production_tracing_filter() -> Targets {
     Targets::new()
         .with_default(LevelFilter::INFO)
         .with_target("rmcp", LevelFilter::OFF)
+}
+
+/// The one-shot maintenance commands (`gateway migrate ...`) run before the
+/// serving startup path initializes tracing, but their classified failure
+/// diagnostics are emitted through `tracing`; without a subscriber those
+/// diagnostics vanish and the operator sees only the one-line error. Give
+/// the command the same compact subscriber the server uses.
+#[cfg(feature = "postgres")]
+fn initialize_tracing_for_one_shot_commands() {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .compact()
+                .with_target(false),
+        )
+        .with(production_tracing_filter())
+        .init();
 }
 
 #[cfg(test)]
