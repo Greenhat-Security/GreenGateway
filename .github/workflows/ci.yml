@@ -150,9 +150,14 @@ jobs:
         # The privilege-boundary test migrates as the privileged role, grants
         # the runtime role read access, then proves the runtime role can
         # validate but cannot create schema. Trust auth means no password
-        # anywhere for gitleaks to flag.
+        # anywhere for gitleaks to flag. Service containers get generated
+        # names, so resolve this job's postgres container rather than
+        # guessing it.
         run: |
-          docker exec postgres psql -U greengateway_ci -d greengateway_ci \
+          set -eu
+          PG_CONTAINER="$(docker ps --filter 'name=postgres' --format '{{.Names}}' | head -n 1)"
+          test -n "$PG_CONTAINER"
+          docker exec "$PG_CONTAINER" psql -U greengateway_ci -d greengateway_ci \
             -c "CREATE ROLE ggw_runtime_noddl LOGIN;"
 
       - name: Test against a real PostgreSQL (feature on)
