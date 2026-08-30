@@ -207,6 +207,31 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
         "GRPC_LISTEN_ADDR",
         "GRPC_MAX_CONCURRENT_STREAMS",
         "GRPC_MAX_METADATA_BYTES",
+        // The PostgreSQL cluster-mode foundation is excluded for the
+        // strongest version of the reasons above, and one more that is its
+        // own: the mode's connection string may only enter the container as
+        // a permission-checked secret FILE (DATABASE_URL_FILE), and a
+        // Cloudflare Containers deployment has no volume to mount one on --
+        // the value would have to arrive as a forwarded plain environment
+        // variable, which is exactly the shape the setting exists to refuse.
+        // Forwarding any of these would let an operator write a cluster-mode
+        // configuration the platform cannot honor and the gateway must
+        // reject at startup. Cluster mode is also single-purpose multi-
+        // replica state sharing, which a one-container-per-deployment
+        // Workers + Containers shape has no use for even with a database
+        // elsewhere.
+        "STATE_BACKEND",
+        "DEPLOYMENT_ID",
+        "DATABASE_URL_FILE",
+        "DATABASE_TLS_MODE",
+        "DATABASE_TLS_CA_FILE",
+        "DATABASE_POOL_MAX",
+        "DATABASE_CONNECT_TIMEOUT_MS",
+        "DATABASE_ACQUIRE_TIMEOUT_MS",
+        "DATABASE_STATEMENT_TIMEOUT_MS",
+        "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+        "DATABASE_LOCK_TIMEOUT_MS",
+        "DATABASE_STARTUP_RETRY_LIMIT",
     ] {
         assert!(
             expected.remove(excluded),

@@ -32,6 +32,13 @@ pub(crate) use reqwest as rmcp_http;
 #[cfg(test)]
 pub(crate) use grpc::test_client as grpc_test_client;
 pub(crate) use grpc::{GrpcFailure, GrpcRequestBody, GrpcResponseBody};
+// The PostgreSQL foundation builds its TLS connector on the same explicitly
+// resolved crypto provider and the same CA-bundle parser the outbound path
+// uses, so there is exactly one trust-decision construction site in the
+// process, not two that could drift. Unused in builds without the `postgres`
+// feature, where no second TLS consumer exists.
+#[cfg(feature = "postgres")]
+pub(crate) use tls::{crypto_provider, parse_ca_bundle_pem};
 
 mod client_cache;
 mod grpc;
@@ -1212,9 +1219,9 @@ impl EgressClient {
 
     /// Sends a bodyless GET that may be answered with a protocol upgrade.
     ///
-    /// Reuses the same validated-destination path as every other egress call —
+    /// Reuses the same validated-destination path as every other egress call â€”
     /// authority, policy port, private-IP rules, and pinned socket address are
-    /// all rechecked against the current configuration generation — so exact
+    /// all rechecked against the current configuration generation â€” so exact
     /// pinning, SNI, certificate verification, route-local roots, and endpoint
     /// mTLS identity apply to an upgraded connection exactly as they do to an
     /// ordinary request.
@@ -2032,7 +2039,7 @@ pub(crate) fn tls_ca_bundle_pem_is_valid(pem_bundle: &[u8]) -> bool {
 /// PEM parsing is line-oriented: a `-----BEGIN` marker must start a line, so a
 /// certificate that does not end in a newline would run straight into the key's
 /// header and the key would silently not parse. Preflight validation and the
-/// request path must therefore build the identity the same way — validating one
+/// request path must therefore build the identity the same way â€” validating one
 /// byte sequence and then transmitting a different one means a valid pair can be
 /// rejected at write time, or an invalid one accepted. Both call this.
 pub(crate) fn join_tls_client_identity_pem(
@@ -2079,7 +2086,7 @@ pub(crate) fn tls_client_identity_half_is_valid(pem_half: &[u8], is_certificate:
         // Marker counting alone would accept a truncated or corrupt body, which
         // the transport then rejects on every request. Requiring the section to
         // close and its body to base64-decode catches that here instead. This
-        // still cannot prove the DER is a loadable key of the labelled type —
+        // still cannot prove the DER is a loadable key of the labelled type â€”
         // only pairing it with its certificate does, which the async rotation
         // preflight performs when the counterpart is reachable.
         certificate_count == 0 && private_key_count == 1 && pem_section_body_decodes(pem_half)
@@ -3066,7 +3073,7 @@ mod tests {
         ));
 
         // Garbage, and a key whose markers are intact but whose body is
-        // truncated or corrupt — marker counting alone accepted the latter.
+        // truncated or corrupt â€” marker counting alone accepted the latter.
         assert!(!tls_client_identity_half_is_valid(
             b"not-a-private-key",
             false
@@ -5429,6 +5436,9 @@ mod tests {
             egress_max_request_body_bytes: 1_048_576,
             egress_nat64_prefixes: Vec::new(),
             egress_deny_private_ips: true,
+            state_backend: crate::config::StateBackend::Sqlite,
+            deployment_id: None,
+            database: crate::config::DatabaseSettings::default(),
         }
     }
 }

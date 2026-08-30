@@ -18,6 +18,8 @@
 
 mod audit;
 mod policy_history;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 mod principal;
 mod service_token;
 

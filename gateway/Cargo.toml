@@ -13,6 +13,10 @@ bytes.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 chacha20poly1305.workspace = true
+# Optional PostgreSQL support (issue #241 PR 3). All three are enabled together
+# by the `postgres` feature; official builds get them through `default`, and a
+# `--no-default-features` build refuses `STATE_BACKEND=postgres` at startup.
+deadpool-postgres = { workspace = true, optional = true }
 futures-util.workspace = true
 getrandom.workspace = true
 hex.workspace = true
@@ -42,6 +46,8 @@ time.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
+tokio-postgres = { workspace = true, optional = true }
+tokio-postgres-rustls = { workspace = true, optional = true }
 tokio-util.workspace = true
 tower.workspace = true
 tower-http.workspace = true
@@ -56,3 +62,18 @@ zeroize.workspace = true
 proptest.workspace = true
 rcgen.workspace = true
 rustix.workspace = true
+
+[features]
+default = ["postgres"]
+# PostgreSQL-backed cluster mode foundation (issue #241 PR 3). Feature-gated so
+# a build can omit the PostgreSQL client entirely, and included in `default`
+# because official builds (the Dockerfile runs `cargo build --release` with no
+# feature flags) must ship it. Standalone mode is byte-for-byte unchanged when
+# this feature compiles in: nothing activates without
+# `STATE_BACKEND=postgres`, and a build without the feature fails startup if
+# that setting selects PostgreSQL.
+postgres = [
+    "dep:deadpool-postgres",
+    "dep:tokio-postgres",
+    "dep:tokio-postgres-rustls",
+]

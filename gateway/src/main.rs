@@ -48,6 +48,7 @@ mod connection_secret_maintenance;
 mod connections;
 mod discovery;
 mod egress;
+mod ha;
 mod inbound_tls;
 mod lifecycle;
 mod mcp;
@@ -1431,6 +1432,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    // Cluster mode's startup prerequisites, before anything binds: this build
+    // must carry the PostgreSQL client at all, and a selected
+    // STATE_BACKEND=postgres must prove the database answers within its
+    // bounded retry budget. Standalone mode runs none of this.
+    ha::ensure_backend_compiled_in(&config)?;
+    let _ha_foundation = match config.state_backend {
+        config::StateBackend::Postgres => {
+            let foundation = ha::HaFoundation::generate(&config);
+            tracing::info!(
+                deployment_id = config.deployment_id.as_deref().unwrap_or_default(),
+                instance_id = %foundation.identity().instance_id(),
+                boot_id = %foundation.identity().boot_id(),
+                fingerprint = %foundation.fingerprint(),
+                "cluster mode: identity established; every replica of this deployment \
+                 must agree on the static-configuration fingerprint to become ready"
+            );
+            Some(foundation)
+        }
+        config::StateBackend::Sqlite => None,
+    };
+    #[cfg(feature = "postgres")]
+    let _database_foundation =
+        storage::postgres::PostgresFoundation::start_if_selected(&config).await?;
     let metrics_handle = install_metrics_recorder()?;
     let listen_addr = config.listen_addr;
     let admin_listen_addr = config.admin_listen_addr;
@@ -5675,9 +5699,13 @@ async fn token_create_endpoint(
         .await
     {
         Ok(created) => created,
-        // A malformed expires_at is the only request-reachable invalid data
-        // on create; scopes are validated before the store is called.
-        Err(error) if error.kind() == storage::RepositoryErrorKind::InvalidData => {
+        // The one request-reachable invalid input on create: a malformed
+        // `expires_at` (scopes are validated before the store is called, and
+        // the adapter marks exactly this parse failure with its field name).
+        // Every other store failure -- including other `InvalidData` such as a
+        // serialization error -- is the shared `500` path, restoring the
+        // pre-#340 mapping the async-contract refactor broadened.
+        Err(error) if error.invalid_parameter_name() == Some("expires_at") => {
             return bad_request("invalid service-token expires_at timestamp");
         }
         Err(error) => return token_store_error_response(error),
@@ -5803,6 +5831,12 @@ async fn token_rotate_endpoint(
                 .into_response()
         }
         Ok(None) => not_found("service token was not found"),
+        // The revoked-token rejection is the only conflict this store's
+        // rotate path produces (the adapter maps `RevokedToken` to exactly
+        // this kind, and the statement it guards updates no unique column),
+        // so the `409` here means "cannot rotate a revoked token" and nothing
+        // else; conflicts from every other operation stay on the shared
+        // responder's `500` path.
         Err(error) if error.kind() == storage::RepositoryErrorKind::Conflict => {
             conflict("cannot rotate revoked service token")
         }
@@ -11781,9 +11815,13 @@ fn token_store_error_response(error: storage::RepositoryError) -> Response {
     if let Some(parameter) = error.invalid_parameter_name() {
         return bad_request(&format!("invalid query parameter: {parameter}"));
     }
-    if error.kind() == storage::RepositoryErrorKind::Conflict {
-        return conflict("cannot rotate revoked service token");
-    }
+    // A `Conflict` is not translated here. The only store conflict an
+    // endpoint can reach is the rotate endpoint's revoked-token case, and
+    // that endpoint answers it with its own `409` before falling through to
+    // this shared mapping; any other conflict (a store-level uniqueness
+    // violation, for instance) is a store failure this responder logs and
+    // answers `500`, which is the pre-#340 behavior the async-contract
+    // refactor's blanket translation had broadened to every operation.
     tracing::error!(error = %error, "service-token store operation failed");
     internal_server_error("service-token store operation failed")
 }
@@ -12017,6 +12055,9 @@ mod tests {
             egress_max_request_body_bytes: 1_048_576,
             egress_nat64_prefixes: Vec::new(),
             egress_deny_private_ips: true,
+            state_backend: crate::config::StateBackend::Sqlite,
+            deployment_id: None,
+            database: crate::config::DatabaseSettings::default(),
         }
     }
 
@@ -24950,6 +24991,108 @@ mod tests {
         assert_eq!(
             json_body(response).await["token"]["scopes"],
             json!(["probe-reader"])
+        );
+    }
+
+    /// Pins the narrowed create mapping restored from the #340 review: a
+    /// malformed `expires_at` is a `400` naming the field, because it is the
+    /// one invalid-input case the caller controls on create.
+    #[tokio::test]
+    async fn token_create_with_malformed_expires_at_is_a_bad_request() {
+        let token_db = TempDb::new("token-create-malformed-expires-at");
+        let policy = TempPolicyFile::new(&token_policy_document_string());
+        let router = token_admin_router(&token_db, &policy, test_audit_log());
+
+        let response = router
+            .oneshot(token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-writer", "probe-reader"])),
+                Some(
+                    json!({ "scopes": ["probe-reader"], "expires_at": "not-a-timestamp" })
+                        .to_string(),
+                ),
+            ))
+            .await
+            .expect("malformed-expires-at create request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"invalid service-token expires_at timestamp"}"#
+        );
+    }
+
+    /// Pins the one `409` the token store can reach: rotating a revoked
+    /// token. Every other conflict must fall through to the shared responder.
+    #[tokio::test]
+    async fn token_rotate_of_a_revoked_token_is_a_conflict() {
+        let token_db = TempDb::new("token-rotate-revoked-conflict");
+        let policy = TempPolicyFile::new(&token_policy_document_string());
+        let router = token_admin_router(&token_db, &policy, test_audit_log());
+
+        let created = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-writer", "probe-reader"])),
+                Some(json!({ "scopes": ["probe-reader"] }).to_string()),
+            ))
+            .await
+            .expect("token create request should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let token = json_body(created).await["token"].clone();
+        let token_id = token["id"]
+            .as_str()
+            .expect("created token record carries an id")
+            .to_owned();
+
+        let revoked = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::DELETE,
+                &format!("{TOKENS_ADMIN_ROUTE}/{token_id}"),
+                Some(test_principal(&["tokens-writer"])),
+                None,
+            ))
+            .await
+            .expect("token revoke request should complete");
+        assert_eq!(revoked.status(), StatusCode::OK);
+
+        let rotated = router
+            .oneshot(token_admin_request(
+                Method::POST,
+                &format!("{TOKENS_ADMIN_ROUTE}/{token_id}/rotate"),
+                Some(test_principal(&["tokens-writer"])),
+                None,
+            ))
+            .await
+            .expect("rotate-of-revoked request should complete");
+        assert_eq!(rotated.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_string(rotated).await,
+            r#"{"error":"cannot rotate revoked service token"}"#
+        );
+    }
+
+    /// The shared responder must not translate a `Conflict` from a non-rotate
+    /// operation into `409`: before #340 only the revoked-token rejection of
+    /// rotate answered `409`, and the blanket translation the async-contract
+    /// refactor introduced would have answered a store-level uniqueness
+    /// violation with "cannot rotate revoked service token" on an endpoint
+    /// that never rotated anything.
+    #[test]
+    fn non_rotate_store_conflicts_are_internal_errors() {
+        let response = token_store_error_response(storage::RepositoryError::new(
+            storage::RepositoryErrorKind::Conflict,
+            "service_token_create",
+        ));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a create-path conflict is a store failure, not a rotate-revoked 409"
         );
     }
 

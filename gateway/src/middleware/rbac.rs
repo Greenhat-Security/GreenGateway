@@ -56,6 +56,19 @@ pub struct RbacState {
     /// held across `.await` points (the history-append repository call), so
     /// the lock is Tokio's: its guard is `Send` and waiting does not block
     /// an executor thread. Contention is limited to admin policy writes.
+    ///
+    /// Swapping from `std::sync::Mutex` deliberately drops lock-poisoning
+    /// semantics, and that is an improvement rather than a loss here. The
+    /// `std` lock poisoned when a panic unwound through a policy write, and
+    /// the pre-#340 acquisition sites answered poisoning with a 500 — but a
+    /// poisoned lock said nothing about the store or the shared state, only
+    /// that some *earlier* write panicked, and the write path's mutations are
+    /// applied through swap-on-success `ArcSwap`: a panicked write leaves the
+    /// last fully validated policy active, so blocking all future writes
+    /// added an availability cost without a safety gain. Tokio's lock simply
+    /// hands the next writer the mutex; that writer re-reads current state
+    /// (`current_policy()`) under the lock rather than trusting anything the
+    /// panicked writer left behind.
     policy_write_lock: Arc<Mutex<()>>,
     rate_limit: Option<RateLimitState>,
     pub exempt_paths: Vec<String>,

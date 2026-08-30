@@ -11,6 +11,13 @@ arc-swap = "1.7.1"
 async-trait = "0.1.89"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.22.1"
+# The PostgreSQL foundation of issue #241 PR 3 uses the protocol crate plus a
+# bounded pool rather than sqlx: sqlx would add its own runtime abstraction and
+# TLS stack (and a large dependency tree) to satisfy a need this repo already
+# meets with tokio + rustls. `deadpool-postgres` defaults include
+# `rt_tokio_1`, which is what makes its create/wait/recycle timeouts real
+# rather than silently ignored; dropping default features would drop them.
+deadpool-postgres = "0.14.2"
 bytes = "1.11.0"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
@@ -71,6 +78,16 @@ time = { version = "0.3.53", features = ["formatting", "parsing"] }
 # transitive feature is exactly the kind of thing that disappears on a bump.
 tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = "0.29"
+# Same tokio-postgres 0.7.x the pool and the rustls adapter build on. Default
+# features keep `runtime` (tokio-based connect); the DSN is always a
+# `postgres://` URL because that is the only form `Config::from_str` parses.
+tokio-postgres = "0.7.18"
+# `default-features = false`: the ring/aws-lc-rs features only toggle backend
+# features on rustls itself, and this build already has both backends enabled
+# through tokio-rustls and reqwest. The connector we hand it is built with an
+# explicitly resolved provider (see `gateway/src/egress/tls.rs`), so nothing is
+# inherited from this crate.
+tokio-postgres-rustls = { version = "0.14.0", default-features = false }
 tokio-util = { version = "0.7.17", features = ["rt"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5.3", features = ["util"] }

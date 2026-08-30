@@ -35,9 +35,9 @@ const MIN_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// `decode` only refreshes on a kid *miss*, so a key the issuer has withdrawn is
 /// never evicted as long as callers keep presenting it. Revoking a compromised
 /// signing key at the IdP would then have no effect on this gateway until it
-/// restarts. This is the same shape as caching a secret past its expiry — the
+/// restarts. This is the same shape as caching a secret past its expiry â€” the
 /// artifact's validity must survive into the cache rather than being discarded
-/// at fetch time — so the key set carries the instant it was fetched and is
+/// at fetch time â€” so the key set carries the instant it was fetched and is
 /// re-fetched once it ages out.
 const MAX_JWKS_KEY_AGE: Duration = Duration::from_secs(300);
 
@@ -270,7 +270,7 @@ impl JwtValidator {
         // A document that parses but yields no usable key is an IdP fault, not a
         // successful fetch: committing it would replace a working key set with an
         // empty one and stamp it fresh, so every token would then be rejected as
-        // an unknown kid — an outage reported as bad credentials. Refusing to
+        // an unknown kid â€” an outage reported as bad credentials. Refusing to
         // commit keeps the previous keys inside their remaining trust window and
         // leaves the set stale, so the next request retries rather than settling
         // into the failure. Classified like an unparseable body.
@@ -300,7 +300,7 @@ impl JwtValidator {
         // A cached kid is only trusted while the key set it came from is inside
         // its trust window. Past that, the issuer may have withdrawn the key, so
         // re-fetch before honoring it rather than trusting it for the process
-        // lifetime — a kid hit alone would otherwise never trigger a refresh.
+        // lifetime â€” a kid hit alone would otherwise never trigger a refresh.
         if self.keys_are_fresh().await {
             if let Some(key) = self.keys.read().await.get(&kid).cloned() {
                 return self.decode_with_key(token, &key);
@@ -1961,6 +1961,9 @@ RowSUZV5FSmOGJ7JyROZ80k=
             egress_max_request_body_bytes: 1_048_576,
             egress_nat64_prefixes: Vec::new(),
             egress_deny_private_ips: true,
+            state_backend: crate::config::StateBackend::Sqlite,
+            deployment_id: None,
+            database: crate::config::DatabaseSettings::default(),
         }
     }
 
