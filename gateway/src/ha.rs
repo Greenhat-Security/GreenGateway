@@ -166,6 +166,7 @@ pub fn static_config_fingerprint(config: &Config) -> StaticConfigFingerprint {
     insert_mode(&mut input, config);
     insert_public_and_cookie_settings(&mut input, config);
     insert_auth_settings(&mut input, config);
+    insert_inbound_client_certificate_authentication(&mut input, config);
     insert_trusted_proxies(&mut input, config);
     insert_exempt_paths(&mut input, config);
     insert_routes(&mut input, config);
@@ -219,6 +220,15 @@ fn insert_public_and_cookie_settings(input: &mut BTreeMap<String, String>, confi
     input.insert(
         "csrf_cookie_domain".into(),
         config.csrf_cookie_domain.clone().unwrap_or_default(),
+    );
+    let mut cors_origins = config.cors_allow_origins.clone();
+    cors_origins.sort();
+    input.insert("cors_allow_origins".into(), cors_origins.join(","));
+    let mut allowed_content_types = config.validation_allowed_content_types.clone();
+    allowed_content_types.sort();
+    input.insert(
+        "validation_allowed_content_types".into(),
+        allowed_content_types.join(","),
     );
 }
 
@@ -335,6 +345,47 @@ fn insert_auth_settings(input: &mut BTreeMap<String, String>, config: &Config) {
             provider.client_secret.is_some().to_string(),
         );
     }
+}
+
+/// Inbound client-certificate authentication, per listener: which callers
+/// authenticate with a certificate at all, against which trust anchors, with
+/// which revocation list and identity extraction. A replica requiring client
+/// certificates and one that requests none enforce different authentication
+/// policies and must never match. The settings carry public locators and
+/// enum shapes only -- no certificate material.
+fn insert_inbound_client_certificate_authentication(
+    input: &mut BTreeMap<String, String>,
+    config: &Config,
+) {
+    let mut insert_listener =
+        |label: &'static str, settings: &Option<crate::config::InboundClientAuthConfig>| {
+            let Some(settings) = settings else {
+                input.insert(format!("{label}.client_cert_mode"), "off".into());
+                return;
+            };
+            input.insert(
+                format!("{label}.client_cert_mode"),
+                settings.mode_setting.into(),
+            );
+            input.insert(
+                format!("{label}.client_cert_requirement"),
+                format!("{:?}", settings.requirement),
+            );
+            input.insert(
+                format!("{label}.client_cert_ca_file"),
+                settings.ca_file.clone(),
+            );
+            input.insert(
+                format!("{label}.client_cert_crl_file"),
+                settings.crl_file.clone().unwrap_or_default(),
+            );
+            input.insert(
+                format!("{label}.client_cert_identity_source"),
+                format!("{:?}", settings.identity_source),
+            );
+        };
+    insert_listener("data_listener", &config.client_cert_auth);
+    insert_listener("admin_listener", &config.admin_client_cert_auth);
 }
 
 fn insert_trusted_proxies(input: &mut BTreeMap<String, String>, config: &Config) {
@@ -815,6 +866,55 @@ mod tests {
         assert_ne!(
             static_config_fingerprint(&base),
             static_config_fingerprint(&changed)
+        );
+    }
+
+    /// Client-certificate authentication is an authentication policy: two
+    /// replicas, one requiring certificates and one not, must never match.
+    /// Added after an adversarial review found these settings missing from
+    /// the input list.
+    #[test]
+    fn fingerprint_flips_when_client_certificate_authentication_changes() {
+        for mode in ["required", "optional"] {
+            let base = config_from(&[]);
+            let with_client_certs = config_from(&[
+                ("CLIENT_CERT_MODE", mode),
+                ("CLIENT_CERT_CA_FILE", "/run/tls/client-ca.crt"),
+                ("CLIENT_CERT_IDENTITY_SOURCE", "spiffe"),
+                // A mode requires a TLS listener to serve on; give it one
+                // with inert placeholder paths the config validator accepts.
+                ("TLS_CERT_FILE", "cert.pem"),
+                ("TLS_KEY_FILE", "key.pem"),
+            ]);
+            assert_ne!(
+                static_config_fingerprint(&base),
+                static_config_fingerprint(&with_client_certs),
+                "a listener requiring client certificates must not match one that does not"
+            );
+        }
+    }
+
+    /// CORS origins and the validated content-type allowlist are boundary
+    /// policies a replica pair must agree on; they were missing from the
+    /// input list until the same review.
+    #[test]
+    fn fingerprint_flips_when_boundary_policies_change() {
+        let base = config_from(&[]);
+        let with_cors = config_from(&[("CORS_ALLOW_ORIGINS", "https://app.example.test")]);
+        assert_ne!(
+            static_config_fingerprint(&base),
+            static_config_fingerprint(&with_cors),
+            "different CORS origins must not match"
+        );
+
+        let with_content_types = config_from(&[(
+            "VALIDATION_ALLOWED_CONTENT_TYPES",
+            "application/json,text/plain",
+        )]);
+        assert_ne!(
+            static_config_fingerprint(&base),
+            static_config_fingerprint(&with_content_types),
+            "different content-type validation must not match"
         );
     }
 

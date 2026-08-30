@@ -150,7 +150,7 @@ jobs:
         run: cargo test -p gateway
 
       - name: Test without the postgres feature
-        run: cargo test -p gateway --no-default-features --bin gateway
+        run: cargo test -p gateway --no-default-features
 
       - name: Lint without the postgres feature
         run: cargo clippy -p gateway --no-default-features --all-targets -- -D warnings

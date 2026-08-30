@@ -47,7 +47,9 @@ use cap_std::{
 };
 use deadpool_postgres::{Manager, Pool, PoolConfig, Runtime};
 use tokio_postgres::{
-    config::Host, tls::MakeTlsConnect, Config as PgConfig, Error as PgError, NoTls,
+    config::{Host, SslMode},
+    tls::MakeTlsConnect,
+    Config as PgConfig, Error as PgError, NoTls,
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
 use url::Url;
@@ -200,6 +202,17 @@ impl PostgresFoundation {
         enforce_tls_policy(&pg_config, settings)?;
 
         apply_session_settings(&mut pg_config, settings);
+        // The ssl_mode is the gateway's decision, never the DSN's: `verify`
+        // must REQUIRE TLS (tokio-postgres defaults to `Prefer`, which
+        // silently returns a plaintext stream when a server answers the
+        // SSLRequest with 'N' -- the connector would never run), and
+        // `loopback-dev` DISABLES the negotiation entirely (NoTls has no
+        // handshake to offer). `verified_dsn_config` already rejected any
+        // DSN parameter that tried to state its own.
+        match settings.tls_mode {
+            DatabaseTlsMode::Verify => pg_config.ssl_mode(SslMode::Require),
+            DatabaseTlsMode::LoopbackDev => pg_config.ssl_mode(SslMode::Disable),
+        };
 
         let foundation = match settings.tls_mode {
             DatabaseTlsMode::Verify => {
@@ -352,13 +365,22 @@ fn file_error(setting: &'static str, reason: &'static str) -> PostgresFoundation
 /// never significant in a connection URL, so trimming cannot change which
 /// database a DSN names.
 fn read_dsn_file(path: &str) -> Result<Zeroizing<String>, PostgresFoundationError> {
-    let bytes = read_setting_file(path, "DATABASE_URL_FILE", MAX_DATABASE_URL_BYTES, 0o077)?;
-    let mut text = String::from_utf8(bytes.to_vec())
-        .map(Zeroizing::new)
-        .map_err(|_| PostgresFoundationError::SettingFile {
-            setting: "DATABASE_URL_FILE",
-            reason: "the file is not valid UTF-8",
-        })?;
+    let mut bytes = read_setting_file(path, "DATABASE_URL_FILE", MAX_DATABASE_URL_BYTES, 0o077)?;
+    // Move the buffer out of its zeroizing wrapper for the UTF-8 conversion
+    // (which takes the Vec by value), and scrub whatever the conversion
+    // returns on failure -- the `FromUtf8Error` owns its input bytes until
+    // it is consumed.
+    let raw = std::mem::take(&mut *bytes);
+    let mut text = match String::from_utf8(raw) {
+        Ok(text) => Zeroizing::new(text),
+        Err(invalid) => {
+            let _scrubbed = Zeroizing::new(invalid.into_bytes());
+            return Err(PostgresFoundationError::SettingFile {
+                setting: "DATABASE_URL_FILE",
+                reason: "the file is not valid UTF-8",
+            });
+        }
+    };
     while text.chars().last().is_some_and(char::is_whitespace) {
         text.pop();
     }
@@ -410,6 +432,18 @@ fn validated_dsn_config(dsn: &str) -> Result<PgConfig, PostgresFoundationError> 
         return Err(PostgresFoundationError::DsnRejected {
             reason: "the connection string must be a postgresql:// URL (key=value forms are \
                      not accepted)",
+        });
+    }
+    // A connection URL has no fragment, and a '#' anywhere is not parsed the
+    // same way by the two parsers involved: `url::Url` ends the query at '#'
+    // while tokio-postgres's URL parser keeps scanning, so a fragment could
+    // smuggle parameters past the allowlist below. No legitimate DSN carries
+    // one (a password containing '#' is percent-encoded per RFC 3986), so the
+    // character is refused outright rather than trying to reconcile the two
+    // parsers.
+    if trimmed.contains('#') {
+        return Err(PostgresFoundationError::DsnRejected {
+            reason: "the connection string must not contain a URL fragment",
         });
     }
     let url = Url::parse(trimmed).map_err(|_| PostgresFoundationError::DsnRejected {
@@ -670,12 +704,14 @@ fn classify_pool_error(error: deadpool_postgres::PoolError) -> RepositoryError {
     )
 }
 
-/// Classify a PostgreSQL failure by its SQLSTATE semantics, mirroring the
-/// rusqlite classifier's decisions (busy/locked to timeout, constraint to
-/// conflict, io/corrupt/open to unavailable). Class 57 admin shutdowns and
-/// class 53 resource exhaustion mean "the store cannot be used right now";
-/// class 58 means the server itself failed; neither carries anything about
-/// this gateway's query values.
+/// Classify a PostgreSQL failure by its SQLSTATE semantics: query-canceled
+/// and lock-acquisition timeouts to timeout, the write races and uniqueness
+/// violations a caller can retry or surface as a conflict, data exceptions
+/// to invalid data, and the "cannot be used right now" classes to
+/// unavailable. The rusqlite classifier makes the same *kind* of decision on
+/// SQLite's coarser codes (all constraint failures are conflicts there);
+/// PostgreSQL distinguishes them, so constraint codes outside the
+/// conflict-shaped set land in `Internal` rather than being guessed at.
 pub(crate) fn classify_postgres_error(error: &PgError) -> RepositoryErrorKind {
     if error.is_closed() {
         return RepositoryErrorKind::Unavailable;
@@ -771,6 +807,89 @@ mod tests {
 
         validated_dsn_config(&format!("{dsn}?application_name=replica-1&port=5432"))
             .expect("permitted parameters must be accepted");
+    }
+
+    /// A URL fragment is parsed differently by `url::Url` (query ends at
+    /// '#') and tokio-postgres's URL parser (keeps scanning), so a fragment
+    /// could smuggle parameters past the allowlist. Pinned after an
+    /// adversarial review demonstrated exactly that with
+    /// `#?sslmode=disable`: the allowlist saw one innocent parameter while
+    /// the parsed config carried a plaintext downgrade.
+    #[test]
+    fn dsn_fragments_are_rejected_wholesale() {
+        let dsn = canary_dsn();
+        let error = validated_dsn_config(&format!("{dsn}?application_name=probe#?sslmode=disable"))
+            .expect_err("a fragment must be rejected, not parsed around");
+        assert!(error.to_string().contains("fragment"), "{error}");
+        assert_no_dsn_material(&error.to_string());
+    }
+
+    /// `verify` mode must REQUIRE TLS: tokio-postgres's default `Prefer`
+    /// answers a server's plaintext 'N' with a raw stream, and the rustls
+    /// connector never runs. Pinned after an adversarial review connected
+    /// successfully, in plaintext, under verify mode against a TLS-off
+    /// server.
+    #[test]
+    fn verify_mode_sets_ssl_mode_require() {
+        let mut pg_config = validated_dsn_config("postgres://ggw@db.example.test:5432/ggw")
+            .expect("the DSN parses");
+        apply_session_settings(&mut pg_config, &tls_settings(DatabaseTlsMode::Verify));
+        pg_config.ssl_mode(SslMode::Require);
+        assert_eq!(pg_config.get_ssl_mode(), SslMode::Require);
+    }
+
+    /// End-to-end form of the same pin: a plaintext server that answers the
+    /// SSLRequest with 'N' must be refused under verify mode, not connected.
+    /// The stub never speaks TLS, so any successful connection here would be
+    /// a plaintext downgrade.
+    #[tokio::test]
+    async fn verify_mode_refuses_a_plaintext_server() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral listener should bind");
+        let address = listener.local_addr().expect("local address");
+        let server = tokio::spawn(async move {
+            // One round: accept, read the 8-byte SSLRequest, answer 'N',
+            // then hold the socket open so a downgrade would have room to
+            // proceed -- and record that the client went away instead.
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0_u8; 8];
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                if read == 8 && request == [0, 0, 0, 8, 4, 210, 22, 2] {
+                    let _ = socket.write_all(b"N").await;
+                    // Wait for the client to give up; a successful downgrade
+                    // would keep reading here instead.
+                    let mut sink = [0_u8; 1];
+                    let _ = socket.read(&mut sink).await;
+                }
+            }
+        });
+
+        let dsn = format!("postgres://ggw@{}/ggw", address);
+        let mut pg_config = validated_dsn_config(&dsn).expect("the stub DSN parses");
+        let settings = tls_settings(DatabaseTlsMode::Verify);
+        apply_session_settings(&mut pg_config, &settings);
+        pg_config.ssl_mode(SslMode::Require);
+        let connector = verified_tls_connector(&settings).expect("the connector builds");
+        let foundation = build_pool(pg_config, connector, &settings).expect("the pool builds");
+
+        let error = foundation
+            .pool()
+            .get()
+            .await
+            .expect_err("a plaintext server must be refused under verify mode");
+        // deadpool wraps the backend failure generically ("error
+        // communicating with the server"); the refusal itself is the
+        // property under test. The ssl-mode plumbing is pinned directly by
+        // `verify_mode_sets_ssl_mode_require`, and the stub holds the socket
+        // open, so a downgrade would surface as a successful `get()`.
+        assert!(
+            error.to_string().contains("creating a new object"),
+            "expected a connection-create failure, got: {error}"
+        );
+        let _ = server.await;
     }
 
     #[test]
