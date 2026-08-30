@@ -881,11 +881,13 @@ mod tests {
     #[test]
     fn foundation_debug_renders_no_dsn_material() {
         // Building a pool does not connect: deadpool establishes connections
-        // lazily, so a foundation can be constructed against a canary DSN and
-        // its Debug rendering inspected without any database.
+        // lazily, so a foundation can be constructed against the canary DSN
+        // and its Debug rendering inspected without any database. The canary
+        // user/host/database are what a leak would carry; an innocuous DSN
+        // here would make this test vacuous, which an earlier revision's
+        // falsification round caught it being.
         let settings = tls_settings(DatabaseTlsMode::LoopbackDev);
-        let mut pg_config =
-            validated_dsn_config("postgres://ggw@localhost:5432/ggw").expect("parses");
+        let mut pg_config = validated_dsn_config(&canary_dsn()).expect("the canary DSN parses");
         apply_session_settings(&mut pg_config, &settings);
         let foundation =
             build_pool(pg_config, NoTls, &settings).expect("the pool should construct");
