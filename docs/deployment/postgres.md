@@ -68,7 +68,7 @@ Full TLS in practice:
 
 ## Database roles: least privilege
 
-Provision two roles. The runtime role holds only what the gateway's operations need; the migration role holds DDL and exists for the migration workflow of a later #241 PR. Separating them means the credentials a replica runs with every day cannot change the schema.
+Provision two roles. The runtime role holds only what the gateway's operations need; the migration role holds DDL and exists for the migration job. Separating them means the credentials a replica runs with every day cannot change the schema.
 
 ```sql
 -- One-time, as a superuser or the database owner.
@@ -77,27 +77,50 @@ Provision two roles. The runtime role holds only what the gateway's operations n
 CREATE ROLE greengateway LOGIN PASSWORD '<set-by-your-secret-manager>';
 GRANT CONNECT ON DATABASE greengateway TO greengateway;
 
--- The schema lands with the migration CLI (#241 PR 4). When it exists:
+-- `gateway migrate up` (below) creates the greengateway schema and its
+-- ledger. After the first migration, grant the runtime role exactly what
+-- validate-only pods need:
 --   GRANT USAGE ON SCHEMA greengateway TO greengateway;
---   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA greengateway TO greengateway;
---   GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA greengateway TO greengateway;
---   ALTER DEFAULT PRIVILEGES IN SCHEMA greengateway
---     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO greengateway;
---   ALTER DEFAULT PRIVILEGES IN SCHEMA greengateway
---     GRANT USAGE, SELECT ON SEQUENCES TO greengateway;
+--   GRANT SELECT ON greengateway.schema_migrations TO greengateway;
+-- plus the table privileges as the shared-state PRs land their tables
+-- (SELECT/INSERT/UPDATE/DELETE ON ALL TABLES IN SCHEMA greengateway, and
+-- USAGE/SELECT on its sequences).
 
 -- The migration role: DDL, used only by the migration job/CLI.
 CREATE ROLE greengateway_migrator LOGIN PASSWORD '<set-by-your-secret-manager>';
---   GRANT USAGE, CREATE ON SCHEMA greengateway TO greengateway_migrator;
---   GRANT greengateway TO greengateway_migrator;  -- so migrated tables stay usable by the runtime role
+GRANT greengateway TO greengateway_migrator;
 ```
 
 Notes:
 
 - The runtime role needs no advisory-lock privileges beyond connection — PostgreSQL advisory locks need none — and no role in `pg_write_all_data` or anything administrative.
-- Runtime-role connections are what the gateway opens; point `DATABASE_URL_FILE` at the runtime role's DSN.
-- The lines about schema grants are commented because the schema arrives with PR 4's migrations; the roles can be created ahead of it. CI's PostgreSQL foundation job runs today against a database with no gateway schema at all: PR 3 proves connectivity, not tables.
-- Rotate both passwords through the operator's secret manager; updating the DSN file and restarting a replica picks up the new value.
+- Runtime-role connections are what serving replicas open; point their `DATABASE_URL_FILE` at the runtime role's DSN. The migration job's DSN points at the migration role.
+- The grants above are commented because they can only run after the schema exists; the migration job runs them (or an operator does) once, after the first `migrate up`.
+- CI proves the boundary from the other side: a role with nothing but `LOGIN` can run the validate-only check against a migrated schema and cannot bootstrap or migrate a clean one.
+- Rotate both passwords through the operator's secret manager; updating the DSN file and restarting picks up the new value.
+
+## Schema migrations
+
+The schema lives in one `greengateway` schema, built by checked-in, ordered, checksummed migrations and recorded in a ledger table (`greengateway.schema_migrations`: one row per applied migration, with its checksum). Pooled sessions pin `search_path` to that schema and `pg_catalog`, so nothing resolves objects through ambient defaults.
+
+Two one-shot commands, run from a migration job or an operator shell (they connect, print one line, and exit — they never serve):
+
+```sh
+STATE_BACKEND=postgres DEPLOYMENT_ID=... DATABASE_URL_FILE=... \
+  gateway migrate check   # validate only: current / unapplied / not initialized / refused
+STATE_BACKEND=postgres DEPLOYMENT_ID=... DATABASE_URL_FILE=... \
+  gateway migrate up      # apply pending migrations under the advisory lock
+```
+
+The rules, enforced by `check`, by `up`, and by every serving replica's startup:
+
+- **Every migration is one transaction with its ledger row.** A failed migration rolls back completely; there is no dirty half-applied state and no automatic downgrade.
+- **The ledger must be a checksum-matching, gap-free prefix of the binary's manifest.** An unknown version (written by a newer gateway), a checksum mismatch (edited migration files), or a deleted/reordered row is refused — by `check` with the reason, and by startup, fail closed.
+- **Serving pods validate only.** A replica that finds the schema behind the binary fails startup naming `gateway migrate up`; it never migrates by itself. `DATABASE_AUTO_MIGRATE=true` opts a development deployment into auto-migration at startup and changes nothing else: a tampered ledger still refuses.
+- **Concurrent migrators are safe.** `migrate up` serializes on a stable advisory lock (released by closing the migrator's connection, on every code path); simultaneous jobs produce exactly one applier and one no-op observer. Migration statements and lock waits run under `DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS`, bounded per transaction.
+- **Rolling upgrades coexist.** Migrations are additive (expand first; destructive cleanup is a later, explicit step), so version N and N+1 binaries can serve against one schema during a rollout. A binary never activates a document version it cannot parse — those rules land with the control-plane PRs, on this ledger.
+
+Rollback boundary: there is no schema downgrade. Rolling back an application release means redeploying the previous binary against the still-compatible schema (additive migrations keep it readable); recovering a damaged ledger or an unwanted migration state means restoring the database from backup — PITR to a point before the migration, verified with `gateway migrate check` before replicas restart. Take a backup or snapshot before every `migrate up`; that snapshot is also the pre-cutover restore point for the standalone-to-cluster import workflow of a later #241 PR.
 
 ## Pool sizing and timeouts
 
@@ -119,8 +142,8 @@ Every pooled session carries server-side bounds set at connection time, so no st
 
 Client-side bounds: `DATABASE_CONNECT_TIMEOUT_MS` (default 5000) caps establishing one connection, and `DATABASE_ACQUIRE_TIMEOUT_MS` (default 5000) caps checking one out of the pool.
 
-## What PR 3 does and does not provide
+## What PRs 3-4 provide and do not
 
-Provided here: mode selection with fail-closed validation, the redacted secret-file DSN, the verified-TLS bounded pool, deployment/instance identity, the static-configuration fingerprint, least-privilege role guidance, and CI against a real PostgreSQL 16.
+Provided: mode selection with fail-closed validation, the redacted secret-file DSN, the verified-TLS bounded pool, deployment/instance identity, the static-configuration fingerprint, least-privilege role guidance, the versioned migration system with its CLI and startup validation, and CI against a real PostgreSQL 16 including the no-DDL privilege boundary.
 
-Deliberately not yet present — arriving with the later PRs of #241: repositories and migrations (PR 4 onward), shared audit (PR 5), versioned control plane (PR 7-8), shared authentication state (PR 9), distributed rate limiting and leases (PR 10), global discovery (PR 11-12), membership and readiness (PR 13-14), and the import workflow (PR 15). Until the release gate (PR 16) passes, do not deploy this mode expecting HA, and expect that a postgres-mode replica serves with its local-only features unconfigured (any `*_SQLITE_PATH` is rejected), with the shared features arriving as the PRs land.
+Deliberately not yet present — arriving with the later PRs of #241: shared audit (PR 5), versioned control plane (PR 7-8), shared authentication state (PR 9), distributed rate limiting and leases (PR 10), global discovery (PR 11-12), membership and readiness (PR 13-14), and the import workflow (PR 15). Until the release gate (PR 16) passes, do not deploy this mode expecting HA, and expect that a postgres-mode replica serves with its local-only features unconfigured (any `*_SQLITE_PATH` is rejected), with the shared features arriving as the PRs land.

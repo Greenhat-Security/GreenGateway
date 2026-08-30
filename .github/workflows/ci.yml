@@ -136,17 +136,29 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Write the test DSN file
+      - name: Write the test DSN files
         run: |
           set -eu
           mkdir -p "${RUNNER_TEMP}/pg"
           printf 'postgres://greengateway_ci@127.0.0.1:5432/greengateway_ci\n' \
             > "${RUNNER_TEMP}/pg/database-url"
-          chmod 0600 "${RUNNER_TEMP}/pg/database-url"
+          printf 'postgres://ggw_runtime_noddl@127.0.0.1:5432/greengateway_ci\n' \
+            > "${RUNNER_TEMP}/pg/database-url-noddl"
+          chmod 0600 "${RUNNER_TEMP}/pg/database-url" "${RUNNER_TEMP}/pg/database-url-noddl"
+
+      - name: Create the no-DDL runtime role
+        # The privilege-boundary test migrates as the privileged role, grants
+        # the runtime role read access, then proves the runtime role can
+        # validate but cannot create schema. Trust auth means no password
+        # anywhere for gitleaks to flag.
+        run: |
+          docker exec postgres psql -U greengateway_ci -d greengateway_ci \
+            -c "CREATE ROLE ggw_runtime_noddl LOGIN;"
 
       - name: Test against a real PostgreSQL (feature on)
         env:
           GATEWAY_TEST_POSTGRES_URL_FILE: ${{ runner.temp }}/pg/database-url
+          GATEWAY_TEST_POSTGRES_NODDL_URL_FILE: ${{ runner.temp }}/pg/database-url-noddl
         run: cargo test -p gateway
 
       - name: Test without the postgres feature

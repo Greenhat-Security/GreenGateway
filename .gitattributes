@@ -1,0 +1,5 @@
+# Embedded migration SQL is checksummed byte-for-byte and recorded in every
+# deployment's schema ledger; line-ending normalization would make those
+# checksums platform-dependent, so these files are committed and checked out
+# with their bytes exactly as authored.
+gateway/src/storage/migrations/*.sql -text

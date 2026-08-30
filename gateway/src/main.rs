@@ -1413,6 +1413,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("{output}");
         return Ok(());
     }
+    // `gateway migrate check|up` (issue #241, PR 4): a one-shot schema
+    // command that connects, does its work, prints one line, and exits --
+    // never a serving process. Checked before anything binds, and before
+    // the tracing subscriber so a plain `migrate` invocation stays quiet
+    // except for its own output and errors. A build without the `postgres`
+    // feature refuses the subcommand by name rather than treating it as an
+    // unknown word, because "migrate" that silently serves instead would be
+    // a footgun in a deployment script.
+    #[cfg(feature = "postgres")]
+    if let Some(output) =
+        storage::migrations::run_if_requested(std::env::args_os().skip(1), config::Config::from_env)
+            .await?
+    {
+        println!("{output}");
+        return Ok(());
+    }
+    #[cfg(not(feature = "postgres"))]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|word| word == *"migrate")
+    {
+        return Err(
+            "this gateway binary was built without the `postgres` cargo feature and \
+                    cannot run `gateway migrate`; build with default features"
+                .into(),
+        );
+    }
 
     let process_started_at = Instant::now();
 

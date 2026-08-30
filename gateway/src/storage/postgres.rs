@@ -118,6 +118,23 @@ pub(crate) enum PostgresFoundationError {
     StartupExhausted { attempts: u64 },
     /// The pool itself could not be constructed.
     PoolUnbuildable,
+    /// The database answers but the schema is not one this process may run
+    /// on: migrations are unapplied (or the database was never migrated),
+    /// and development auto-migration is not enabled.
+    SchemaNotReady {
+        applied: usize,
+        missing: usize,
+        auto_migrate: bool,
+    },
+    /// The schema ledger disagrees with this build's migration manifest.
+    /// Fail closed: serving on a tampered or newer-than-supported schema is
+    /// exactly what the validation exists to prevent.
+    SchemaInvalid {
+        problem: super::migrations::LedgerProblem,
+    },
+    /// The ledger could not be read at all while validating. An authority
+    /// that cannot be consulted is a fail-closed condition.
+    SchemaCheckFailed,
     /// Cluster mode was selected but the configuration this build validated
     /// did not carry the settings the mode requires. Unreachable through
     /// `Config::from_env`; a defensive fail-closed arm.
@@ -148,6 +165,32 @@ impl fmt::Display for PostgresFoundationError {
                     "the PostgreSQL connection pool could not be constructed"
                 )
             }
+            Self::SchemaNotReady {
+                applied,
+                missing,
+                auto_migrate,
+            } => {
+                let head = if *auto_migrate {
+                    "development auto-migration ran but the schema is still not current"
+                } else {
+                    "the PostgreSQL schema is not ready for this gateway build"
+                };
+                write!(
+                    formatter,
+                    "{head}: {missing} migration(s) unapplied after {applied} applied; \
+                     run `gateway migrate up` from a migration job (pods validate only), \
+                     or set DATABASE_AUTO_MIGRATE=true in development"
+                )
+            }
+            Self::SchemaInvalid { problem } => {
+                write!(formatter, "the schema ledger is invalid: {problem}")
+            }
+            Self::SchemaCheckFailed => write!(
+                formatter,
+                "the PostgreSQL schema could not be validated; an authority that cannot be \
+                 consulted is a fail-closed condition -- check the database and the migration \
+                 job before restarting this gateway"
+            ),
             Self::NotConfigured => write!(
                 formatter,
                 "STATE_BACKEND=postgres was selected without the settings cluster mode requires; \
@@ -186,12 +229,57 @@ impl fmt::Debug for PostgresFoundation {
 impl PostgresFoundation {
     /// Build and prove the foundation when cluster mode is selected; `Ok(None)`
     /// in standalone mode, where nothing here may so much as read a file.
+    ///
+    /// Serving requires a schema this build can run on, so after the pool is
+    /// proven reachable the schema ledger is validated (`migrate check`
+    /// semantics): behind or uninitialized fails startup naming the
+    /// migration job unless development auto-migration is enabled, and any
+    /// tamper or newer-than-supported state fails startup outright. The
+    /// `gateway migrate` CLI reaches the same machinery through
+    /// [`PostgresFoundation::establish`] without the serving validation.
     pub(crate) async fn start_if_selected(
         config: &Config,
     ) -> Result<Option<Self>, PostgresFoundationError> {
         if config.state_backend != crate::config::StateBackend::Postgres {
             return Ok(None);
         }
+        let foundation = Self::establish(config).await?;
+
+        if config.database.auto_migrate {
+            super::migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+                .await
+                .map_err(super::migrations::startup_migration_failure)?;
+        }
+        match super::migrations::read_and_validate(foundation.pool()).await {
+            Ok(super::migrations::SchemaStatus::Current) => {}
+            Ok(super::migrations::SchemaStatus::NeedsUpgrade { applied, missing }) => {
+                return Err(PostgresFoundationError::SchemaNotReady {
+                    applied,
+                    missing,
+                    auto_migrate: config.database.auto_migrate,
+                });
+            }
+            Ok(super::migrations::SchemaStatus::NotInitialized) => {
+                return Err(PostgresFoundationError::SchemaNotReady {
+                    applied: 0,
+                    missing: super::migrations::manifest_len(),
+                    auto_migrate: config.database.auto_migrate,
+                });
+            }
+            Err(super::migrations::MigrateError::LedgerInvalid(problem)) => {
+                return Err(PostgresFoundationError::SchemaInvalid { problem });
+            }
+            // The ledger could not be read at all: an authority that cannot
+            // be consulted is a fail-closed condition, never a serve-anyway.
+            Err(_) => return Err(PostgresFoundationError::SchemaCheckFailed),
+        }
+        Ok(Some(foundation))
+    }
+
+    /// Read the DSN, build the pool, and prove the database answers within
+    /// the bounded retry budget -- no schema validation, because the
+    /// migration CLI must be able to reach a not-yet-migrated database.
+    pub(crate) async fn establish(config: &Config) -> Result<Self, PostgresFoundationError> {
         let settings = &config.database;
         let Some(url_file) = settings.url_file.as_deref() else {
             return Err(PostgresFoundationError::NotConfigured);
@@ -228,7 +316,7 @@ impl PostgresFoundation {
             tls_mode = settings.tls_mode.as_str(),
             "PostgreSQL foundation established for cluster mode"
         );
-        Ok(Some(foundation))
+        Ok(foundation)
     }
 
     /// The pool later PRs' repositories acquire connections from. Unused in
@@ -591,10 +679,12 @@ fn verified_tls_connector(
 /// code path in this crate can `SET` them back.
 fn apply_session_settings(config: &mut PgConfig, settings: &DatabaseSettings) {
     config.options(format!(
-        "-c statement_timeout={} -c idle_in_transaction_session_timeout={} -c lock_timeout={}",
+        "-c statement_timeout={} -c idle_in_transaction_session_timeout={} -c lock_timeout={} \
+         -c search_path={},pg_catalog",
         settings.statement_timeout_ms,
         settings.idle_in_transaction_timeout_ms,
         settings.lock_timeout_ms,
+        super::migrations::SCHEMA_NAME,
     ));
     if config.get_application_name().is_none() {
         config.application_name(DEFAULT_APPLICATION_NAME);
@@ -724,6 +814,10 @@ pub(crate) fn classify_postgres_error(error: &PgError) -> RepositoryErrorKind {
         "57014" => RepositoryErrorKind::Timeout,
         // Lock acquisition timed out (lock_timeout on a lock request).
         "55P03" => RepositoryErrorKind::Timeout,
+        // A privilege failure on the migration path means the role cannot
+        // use this store the way it was asked to (a runtime role asked to
+        // run DDL, most commonly): unusable, not internal.
+        "42501" => RepositoryErrorKind::Unavailable,
         "40001" | "40P01" | "23505" | "23P01" => RepositoryErrorKind::Conflict,
         _ if code.starts_with("22") => RepositoryErrorKind::InvalidData,
         // Authentication/authorization failure (28), a database that does
