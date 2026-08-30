@@ -135,6 +135,10 @@ pub(crate) enum PostgresFoundationError {
     /// The ledger could not be read at all while validating. An authority
     /// that cannot be consulted is a fail-closed condition.
     SchemaCheckFailed,
+    /// Development auto-migration attempted and failed its writes. Distinct
+    /// from the validation failures so the operator reads "the migration
+    /// job failed", not "the schema could not be validated".
+    SchemaMigrationFailed,
     /// Cluster mode was selected but the configuration this build validated
     /// did not carry the settings the mode requires. Unreachable through
     /// `Config::from_env`; a defensive fail-closed arm.
@@ -190,6 +194,12 @@ impl fmt::Display for PostgresFoundationError {
                 "the PostgreSQL schema could not be validated; an authority that cannot be \
                  consulted is a fail-closed condition -- check the database and the migration \
                  job before restarting this gateway"
+            ),
+            Self::SchemaMigrationFailed => write!(
+                formatter,
+                "development auto-migration (DATABASE_AUTO_MIGRATE) attempted and failed; the \
+                 database is left at its previous schema version -- run `gateway migrate up` \
+                 from a migration job and address its diagnostics before restarting"
             ),
             Self::NotConfigured => write!(
                 formatter,
@@ -678,9 +688,14 @@ fn verified_tls_connector(
 /// connection the pool ever hands out -- including a recycled one -- and no
 /// code path in this crate can `SET` them back.
 fn apply_session_settings(config: &mut PgConfig, settings: &DatabaseSettings) {
+    // `pg_catalog` leads the search path on purpose: naming it explicitly
+    // after a user schema would disable PostgreSQL's implicit catalog-first
+    // resolution and let schema objects shadow built-ins (the CVE-2018-1058
+    // hardening rule). The gateway schema follows it for unqualified
+    // convenience; migration and ledger SQL are fully qualified regardless.
     config.options(format!(
         "-c statement_timeout={} -c idle_in_transaction_session_timeout={} -c lock_timeout={} \
-         -c search_path={},pg_catalog",
+         -c search_path=pg_catalog,{}",
         settings.statement_timeout_ms,
         settings.idle_in_transaction_timeout_ms,
         settings.lock_timeout_ms,

@@ -166,16 +166,16 @@ impl fmt::Display for LedgerProblem {
         match self {
             Self::UnknownVersion => formatter.write_str(
                 "the schema ledger contains a migration this gateway build does not carry; \
-                 it was written by a newer gateway â€” upgrade this gateway before serving",
+                 it was written by a newer gateway — upgrade this gateway before serving",
             ),
             Self::ChecksumMismatch => formatter.write_str(
                 "a recorded migration checksum does not match this build's migration SQL; \
-                 applied migrations are immutable â€” restore the original migration files \
+                 applied migrations are immutable — restore the original migration files \
                  or restore the database from backup",
             ),
             Self::NotAPrefix => formatter.write_str(
                 "the schema ledger is not an ordered, gap-free prefix of this build's \
-                 migrations; it was modified outside the migrator â€” restore it from backup",
+                 migrations; it was modified outside the migrator — restore it from backup",
             ),
         }
     }
@@ -254,6 +254,21 @@ impl fmt::Display for MigrateOutput {
     }
 }
 
+impl MigrateOutput {
+    /// The process exit status for a completed command. `check` is a gate:
+    /// it exits zero only when the schema is current, so deployment scripts
+    /// and CI can chain on it; the not-current outcomes print their status
+    /// line and exit nonzero. `up` succeeds on every clean outcome
+    /// (including "nothing to do"), because a no-op migration job is a
+    /// successful one.
+    pub(crate) fn exit_code(&self) -> i32 {
+        match self {
+            Self::CheckCurrent | Self::UpToDate { .. } | Self::Applied { .. } => 0,
+            Self::CheckNotInitialized | Self::CheckNeedsUpgrade { .. } => 1,
+        }
+    }
+}
+
 /// A migration CLI or validation failure. Display names commands, settings,
 /// and reasons -- never SQL text, identifiers beyond the schema name, or
 /// query values.
@@ -262,6 +277,10 @@ pub(crate) enum MigrateError {
     InvalidArguments,
     /// `migrate` was used while standalone mode is selected.
     ModeNotSelected,
+    /// The configuration did not validate; carries the rendered problems
+    /// (setting names and bounds only -- the same text a serving startup
+    /// prints).
+    ConfigurationInvalid(String),
     /// The database could not be reached within the bounded retry budget.
     DatabaseUnavailable,
     /// The ledger disagrees with this binary's manifest.
@@ -281,6 +300,9 @@ impl fmt::Display for MigrateError {
                 "`gateway migrate` requires STATE_BACKEND=postgres with DEPLOYMENT_ID and \
                  DATABASE_URL_FILE configured",
             ),
+            Self::ConfigurationInvalid(problems) => {
+                write!(formatter, "configuration is invalid:\n{problems}")
+            }
             Self::DatabaseUnavailable => formatter.write_str(
                 "the PostgreSQL database did not become reachable within the bounded retry \
                  budget; see DATABASE_STARTUP_RETRY_LIMIT",
@@ -332,11 +354,17 @@ pub(crate) async fn run_if_requested<I, F, E>(
 where
     I: IntoIterator<Item = std::ffi::OsString>,
     F: FnOnce() -> Result<Config, E>,
+    E: fmt::Display,
 {
     let Some(check_only) = parse_migrate_command(arguments)? else {
         return Ok(None);
     };
-    let config = load_config().map_err(|_| MigrateError::ModeNotSelected)?;
+    let config = load_config().map_err(|error| {
+        // Surface the real validation problems: a bounded-out
+        // DATABASE_* setting misreported as "standalone mode selected"
+        // would send an operator hunting the wrong setting.
+        MigrateError::ConfigurationInvalid(error.to_string())
+    })?;
     execute(&config, check_only).await.map(Some)
 }
 
@@ -439,6 +467,24 @@ async fn apply_missing(
     let connection = acquire(pool).await?;
 
     // Method calls auto-deref the pooled object to the underlying client.
+    // This session is about to be detached from the pool, so widening its
+    // budgets is safe: they die with the connection. The advisory lock
+    // wait and the bootstrap DDL run under the migration budget
+    // (N migrations could legitimately hold the lock for N times the
+    // per-migration timeout), not the pooled session's request-path
+    // lock_timeout -- a second migrator waiting behind a slow first one
+    // must observe, not spuriously fail.
+    connection
+        .simple_query(&format!(
+            "SET lock_timeout = {}; SET statement_timeout = {};",
+            settings.migration_statement_timeout_ms * (MANIFEST.len() as u64),
+            settings.migration_statement_timeout_ms,
+        ))
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "migration session budget setup failed");
+            MigrateError::ApplyFailed
+        })?;
     connection
         .simple_query(&format!("SELECT pg_advisory_lock({})", *MIGRATION_LOCK_KEY))
         .await
@@ -594,8 +640,9 @@ pub(crate) async fn apply_missing_for_startup(
 }
 
 /// Translate an auto-migration failure into the foundation's startup error.
-/// Ledger problems keep their specific text; anything else was a store
-/// failure, already logged at its site.
+/// Ledger problems keep their specific text; an apply failure is its own
+/// condition (it was a write attempt, not a validation), and anything else
+/// was a store failure, already logged at its site.
 #[cfg(feature = "postgres")]
 pub(crate) fn startup_migration_failure(
     error: MigrateError,
@@ -603,6 +650,9 @@ pub(crate) fn startup_migration_failure(
     match error {
         MigrateError::LedgerInvalid(problem) => {
             super::postgres::PostgresFoundationError::SchemaInvalid { problem }
+        }
+        MigrateError::ApplyFailed => {
+            super::postgres::PostgresFoundationError::SchemaMigrationFailed
         }
         _ => super::postgres::PostgresFoundationError::SchemaCheckFailed,
     }
@@ -1213,5 +1263,20 @@ mod tests {
             .await
             .expect_err("a no-DDL role must not be able to migrate");
         assert_eq!(error, MigrateError::ApplyFailed);
+
+        // The classification table entry that failure exercises, pinned
+        // directly: 42501 (insufficient_privilege) is `Unavailable`, not
+        // `Internal`, so a privilege boundary reads as "cannot use this
+        // store" in every consumer of PR 2's error kinds.
+        let runtime_client = runtime.pool().get().await.expect("checkout");
+        let privilege_error = runtime_client
+            .batch_execute("CREATE SCHEMA greengateway_attempted")
+            .await
+            .expect_err("DDL must be refused for this role");
+        assert_eq!(
+            super::super::postgres::classify_postgres_error(&privilege_error),
+            super::super::RepositoryErrorKind::Unavailable,
+            "42501 must classify as unavailable"
+        );
     }
 }

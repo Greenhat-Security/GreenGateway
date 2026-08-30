@@ -107,10 +107,12 @@ Two one-shot commands, run from a migration job or an operator shell (they conne
 
 ```sh
 STATE_BACKEND=postgres DEPLOYMENT_ID=... DATABASE_URL_FILE=... \
-  gateway migrate check   # validate only: current / unapplied / not initialized / refused
+  gateway migrate check   # validate only; exits nonzero when not current
 STATE_BACKEND=postgres DEPLOYMENT_ID=... DATABASE_URL_FILE=... \
   gateway migrate up      # apply pending migrations under the advisory lock
 ```
+
+`migrate check` is a gate for scripts and CI: it exits `0` only when the schema is current, printing its status line (`not initialized`, or `N migration(s) unapplied after M applied`) and exiting `1` otherwise — refusals (tamper, newer gateway) print their reason and exit `1` as errors. `migrate up` exits `0` on every clean outcome, including a no-op run.
 
 The rules, enforced by `check`, by `up`, and by every serving replica's startup:
 
