@@ -391,18 +391,24 @@ impl RbacState {
     /// only guard.
     #[cfg(feature = "postgres")]
     pub(crate) fn install_revision_snapshot(&self, policy: Policy, security_revision: i64) {
+        // One candidate Arc built up front: `Arc::ptr_eq` against the rcu's
+        // result then distinguishes "this call installed the snapshot" from
+        // "another install already held this revision", so a duplicate
+        // install does not re-run `replace_policy` and gratuitously reset
+        // the policy-lane rate-limit buckets.
+        let candidate = Arc::new(RbacPolicyState::from_policy_at_revision(
+            policy.clone(),
+            security_revision,
+        ));
         let installed = self.policy.rcu(|current| {
             if security_revision <= current.security_revision {
                 // Already at or past this revision (another install won the
                 // race, or this is a duplicate): keep what is installed.
                 return current.clone();
             }
-            Arc::new(RbacPolicyState::from_policy_at_revision(
-                policy.clone(),
-                security_revision,
-            ))
+            candidate.clone()
         });
-        if installed.security_revision == security_revision {
+        if Arc::ptr_eq(&installed, &candidate) {
             if let Some(rate_limit) = &self.rate_limit {
                 rate_limit.replace_policy(&policy);
             }

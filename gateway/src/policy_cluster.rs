@@ -159,10 +159,16 @@ impl SecurityRevisionGate for ClusterPolicyRuntime {
         loop {
             // The one authoritative read the strict rule requires. A
             // revision is only visible here once its transaction committed.
-            let current = self
-                .store
-                .current_security_revision()
+            // The read is inside the deadline budget too: pool acquisition
+            // and a stalled primary must fail closed within the bounded
+            // wait, not after the pool's own multi-second timeouts.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(SecurityRevisionCheckError::ReconcileDeadlineExceeded);
+            }
+            let current = tokio::time::timeout(remaining, self.store.current_security_revision())
                 .await
+                .map_err(|_| SecurityRevisionCheckError::ReconcileDeadlineExceeded)?
                 .map_err(|error| {
                     tracing::error!(
                         error = %error,

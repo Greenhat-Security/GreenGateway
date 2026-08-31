@@ -254,6 +254,15 @@ impl PolicyControlPlane for PostgresPolicyStore {
             .map_err(|_| invalid_data(OPERATION_COMMIT))
             .map_err(store_error)?;
 
+        // The transaction is driven explicitly over the simple protocol
+        // (the audit store's and the migrator's pattern). A request
+        // abandoned between BEGIN and COMMIT returns its connection to the
+        // pool with the transaction open; the row locks it holds are
+        // reclaimed by the session's server-side bounds (`lock_timeout`
+        // bounds other writers' waits, `idle_in_transaction_session_timeout`
+        // closes the session), so the failure mode is bounded 503s, never
+        // corruption. A drop-guarded interactive transaction can harden
+        // this and the audit append together if abandonment proves real.
         client
             .batch_execute("BEGIN")
             .await

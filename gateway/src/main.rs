@@ -542,6 +542,13 @@ struct AdminApiStates {
     suggestions: SuggestionsAdminState,
     traffic: TrafficAdminState,
     principals: PrincipalAdminState,
+    /// Cluster mode's revision gate, layered over every admin API route
+    /// except the (pre-authorization) auth routes: an admin endpoint's
+    /// permission check consults the compiled policy snapshot, so it is a
+    /// protected request under the HA state model's strict rule and must
+    /// never authorize against a stale revision.
+    #[cfg(feature = "postgres")]
+    revision_gate: Option<Arc<dyn middleware::rbac::SecurityRevisionGate>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2029,6 +2036,8 @@ fn gateway_app_with_process_started_at_and_overrides(
     #[cfg(feature = "postgres")]
     let mut policy_control_plane: Option<Arc<dyn storage::PolicyControlPlane>> = None;
     #[cfg(feature = "postgres")]
+    let mut cluster_revision_gate: Option<Arc<dyn middleware::rbac::SecurityRevisionGate>> = None;
+    #[cfg(feature = "postgres")]
     let rbac_state = match (build_overrides.pg_policy.as_ref(), rbac_state) {
         (Some(seed), Some(state)) => {
             state.install_revision_snapshot(
@@ -2039,6 +2048,8 @@ fn gateway_app_with_process_started_at_and_overrides(
                 policy_cluster::ClusterPolicyRuntime::new(seed.store.clone(), state.clone());
             runtime.spawn_poller(&lifecycle);
             policy_control_plane = Some(seed.store.clone());
+            cluster_revision_gate =
+                Some(runtime.clone() as Arc<dyn middleware::rbac::SecurityRevisionGate>);
             Some(state.with_revision_gate(runtime))
         }
         (_, state) => state,
@@ -2273,6 +2284,8 @@ fn gateway_app_with_process_started_at_and_overrides(
         suggestions: suggestions_admin_state,
         traffic: traffic_admin_state,
         principals: principal_admin_state,
+        #[cfg(feature = "postgres")]
+        revision_gate: cluster_revision_gate,
     };
 
     let grpc = grpc_app(&config, &app_state, &middleware_stack);
@@ -2937,7 +2950,12 @@ fn add_admin_api_routes(
     routes: &GatewayRoutes,
     admin_api_states: AdminApiStates,
 ) -> Router {
-    router
+    // The admin API (minus the pre-authorization auth routes, merged
+    // separately below) is one router so cluster mode can gate all of it
+    // with one layer: every endpoint here authorizes against the compiled
+    // policy snapshot, and that check must never see a stale revision.
+    #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
+    let mut api = Router::new()
         .merge(
             Router::new()
                 .route(routes.admin.audit_route.as_str(), get(audit_query_endpoint))
@@ -2952,7 +2970,6 @@ fn add_admin_api_routes(
                 .route(routes.admin.status_route.as_str(), get(status_endpoint))
                 .with_state(admin_api_states.status),
         )
-        .merge(admin_auth_router(routes, admin_api_states.auth))
         .merge(
             Router::new()
                 .route(
@@ -3151,7 +3168,40 @@ fn add_admin_api_routes(
                     post(traffic_endpoint_review_endpoint),
                 )
                 .with_state(admin_api_states.traffic),
-        )
+        );
+
+    // Cluster mode's strict revision check for the admin plane: an admin
+    // request whose replica cannot prove a current compiled snapshot fails
+    // closed with 503, exactly like a protected data-plane request, and is
+    // never authorized under a stale allow.
+    #[cfg(feature = "postgres")]
+    if let Some(gate) = admin_api_states.revision_gate.clone() {
+        api = api.layer(axum::middleware::from_fn_with_state(
+            gate,
+            admin_revision_gate_middleware,
+        ));
+    }
+
+    router
+        .merge(api)
+        .merge(admin_auth_router(routes, admin_api_states.auth))
+}
+
+/// The admin API's revision gate (issue #241, PR 7): one bound-checked read
+/// of the authority before any admin endpoint runs. Without this layer the
+/// admin routes -- which the RBAC middleware exempts and which authorize
+/// through `RbacState`'s local snapshot -- would accept `admin:*` decisions
+/// from a stale revision for as long as the replica lags the authority.
+#[cfg(feature = "postgres")]
+async fn admin_revision_gate_middleware(
+    State(gate): State<Arc<dyn middleware::rbac::SecurityRevisionGate>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match gate.ensure_current_revision().await {
+        Ok(_) => next.run(request).await,
+        Err(_) => service_unavailable("policy state unavailable"),
+    }
 }
 
 fn admin_auth_router(routes: &GatewayRoutes, state: Option<AdminAuthState>) -> Router {
@@ -40323,7 +40373,8 @@ O2gecI9QwDJNpm29J9wJB2F8
 
         /// A minimal admin router wired like production's cluster mode:
         /// no policy file, the PostgreSQL control plane as the authority,
-        /// and the PG store as the history store.
+        /// the PG store as the history store, and the revision gate layered
+        /// over the admin routes exactly as `add_admin_api_routes` does.
         fn cluster_policy_router(
             store: Arc<PostgresPolicyStore>,
         ) -> (Router, middleware::rbac::RbacState) {
@@ -40333,6 +40384,8 @@ O2gecI9QwDJNpm29J9wJB2F8
                 false,
                 test_audit_log(),
             );
+            let runtime = ClusterPolicyRuntime::new(store.clone(), rbac_state.clone());
+            let gate: Arc<dyn middleware::rbac::SecurityRevisionGate> = runtime;
             let router = Router::new()
                 .route(
                     POLICY_ADMIN_ROUTE,
@@ -40342,14 +40395,18 @@ O2gecI9QwDJNpm29J9wJB2F8
                 .route(POLICY_ROLLBACK_ADMIN_ROUTE, post(policy_rollback_endpoint))
                 .with_state(PolicyAdminState {
                     policy_file: None,
-                    rbac_state: Some(rbac_state.clone()),
+                    rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
                     history_store: Some(store.clone() as Arc<dyn storage::PolicyHistory>),
                     control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
                     query_store: None,
                     audit: test_audit_log(),
                     client_ip_policy: client_ip::ClientIpPolicy::default(),
                     max_body_size: 1024 * 1024,
-                });
+                })
+                .layer(axum::middleware::from_fn_with_state(
+                    gate,
+                    admin_revision_gate_middleware,
+                ));
             (router, rbac_state)
         }
 
@@ -40560,6 +40617,93 @@ O2gecI9QwDJNpm29J9wJB2F8
                 let count: i64 = row.get(0);
                 assert_eq!(count, expected, "{table}");
             }
+        }
+
+        #[tokio::test]
+        async fn admin_authorization_never_serves_under_a_stale_revision() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (store, _pool) = migrated_policy_foundation(&database.dsn).await;
+            let active = initialize(&store, "stale-init").await;
+            let (router, rbac_state) = cluster_policy_router(store.clone());
+            // Production startup: the snapshot is keyed to the revision the
+            // replica booted against.
+            rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
+
+            // Sanity: the granted admin principal is authorized while the
+            // snapshot is current.
+            let response = router
+                .clone()
+                .oneshot(admin_request(Method::GET, POLICY_ADMIN_ROUTE, None))
+                .await
+                .expect("GET should complete");
+            assert_eq!(response.status(), StatusCode::OK);
+
+            // Another replica commits a revision that revokes every admin
+            // permission. The local snapshot is now stale. Without the
+            // admin-plane revision gate, this replica would keep
+            // authorizing `admin:policy:*` under the old snapshot (an
+            // RBAC-exempt route never reaches the data-plane gate) and the
+            // PUT below would COMMIT at the authority, holding a correct
+            // ETag against a stale authorization. The gate must reconcile
+            // first and refuse.
+            let revoked = rbac::Policy::validate_json_value(json!({
+                "schema_version": "0.1.0",
+                "id": "stale-revoked",
+                "default_action": "deny",
+                "roles": {
+                    "nobody": { "permissions": ["data:read"] }
+                }
+            }))
+            .expect("revocation policy should validate");
+            let current = PolicyControlPlane::active(&*store)
+                .await
+                .expect("active read");
+            PolicyControlPlane::commit(
+                &*store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Expected {
+                        etag: current.expect("active").etag,
+                    },
+                    candidate: &revoked,
+                    actor_user_id: "other-replica",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("revocation should commit");
+
+            let fresh = PolicyControlPlane::active(&*store)
+                .await
+                .expect("active read after revoke")
+                .expect("active row");
+            let put = router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((
+                        &fresh.etag,
+                        &serde_json::to_string(&fresh.policy).expect("policy JSON"),
+                    )),
+                ))
+                .await
+                .expect("PUT should complete");
+            assert_eq!(
+                put.status(),
+                StatusCode::FORBIDDEN,
+                "a revoked principal must not be authorized under the stale snapshot"
+            );
+
+            let get = router
+                .clone()
+                .oneshot(admin_request(Method::GET, POLICY_ADMIN_ROUTE, None))
+                .await
+                .expect("GET should complete");
+            assert_eq!(get.status(), StatusCode::FORBIDDEN);
         }
 
         #[tokio::test]
