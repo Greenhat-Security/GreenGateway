@@ -22,6 +22,8 @@ pub mod model;
 pub mod oauth;
 pub mod openapi;
 pub mod permissions;
+#[cfg(feature = "postgres")]
+pub mod pg_store;
 pub mod projection;
 pub mod secret;
 pub mod status;

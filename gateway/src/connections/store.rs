@@ -576,7 +576,7 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
-const SOURCE_MANAGED: &str = "managed";
+pub(crate) const SOURCE_MANAGED: &str = "managed";
 const MAX_DEPENDENCY_FIELD_BYTES: usize = 256;
 pub const MAX_CONNECTION_DEPENDENCIES: usize = 4_096;
 const MAX_MCP_CATALOG_ENTRY_BYTES: usize = 262_144;
@@ -638,7 +638,7 @@ impl ConnectionEtag {
         &self.0
     }
 
-    fn for_record(id: &ConnectionId, revisions: &ConnectionRevisions) -> Self {
+    pub(crate) fn for_record(id: &ConnectionId, revisions: &ConnectionRevisions) -> Self {
         Self(format!(
             "\"connection:{}:c{}:k{}:t{}:d{}\"",
             id.as_str(),
@@ -879,6 +879,13 @@ pub enum ConnectionStoreError {
     DeadlineExceeded {
         operation: &'static str,
     },
+    /// The PostgreSQL authority could not be consulted or rejected the
+    /// operation (cluster mode's store). Carries a stable operation label
+    /// only -- no SQL text, no query values, no DSN material; the detail
+    /// is logged where the failure occurs.
+    Postgres {
+        operation: &'static str,
+    },
 }
 
 impl fmt::Display for ConnectionStoreError {
@@ -942,6 +949,9 @@ impl fmt::Display for ConnectionStoreError {
             }
             Self::DeadlineExceeded { operation } => {
                 write!(formatter, "{operation} exceeded its deadline")
+            }
+            Self::Postgres { operation } => {
+                write!(formatter, "connection PostgreSQL {operation} failed")
             }
         }
     }
@@ -4598,7 +4608,7 @@ fn validate_record_bindings(
     Ok(())
 }
 
-fn expected_bindings<'a>(
+pub(crate) fn expected_bindings<'a>(
     write: &'a ConnectionWrite,
     revisions: &ConnectionRevisions,
 ) -> Vec<(&'static str, &'a str, u64)> {
@@ -4645,7 +4655,7 @@ fn expected_bindings<'a>(
     bindings
 }
 
-fn binding_count(write: &ConnectionWrite) -> usize {
+pub(crate) fn binding_count(write: &ConnectionWrite) -> usize {
     let authentication = match &write.authentication {
         ConnectionAuthentication::None
         | ConnectionAuthentication::HeaderApiKey {
@@ -4751,7 +4761,9 @@ fn ensure_binding_capacity(
     Ok(())
 }
 
-fn validate_candidate(candidate: ConnectionWrite) -> Result<ConnectionWrite, ConnectionStoreError> {
+pub(crate) fn validate_candidate(
+    candidate: ConnectionWrite,
+) -> Result<ConnectionWrite, ConnectionStoreError> {
     candidate
         .validated()
         .map_err(|errors| ConnectionStoreError::Validation {
@@ -4762,7 +4774,7 @@ fn validate_candidate(candidate: ConnectionWrite) -> Result<ConnectionWrite, Con
         })
 }
 
-fn initial_revisions(write: &ConnectionWrite) -> ConnectionRevisions {
+pub(crate) fn initial_revisions(write: &ConnectionWrite) -> ConnectionRevisions {
     ConnectionRevisions {
         connection: 1,
         credential: u64::from(has_credential_binding(write)),
@@ -4772,7 +4784,7 @@ fn initial_revisions(write: &ConnectionWrite) -> ConnectionRevisions {
     }
 }
 
-fn replacement_revisions(
+pub(crate) fn replacement_revisions(
     id: &ConnectionId,
     current: &StoredConnection,
     candidate: &ConnectionWrite,
@@ -4814,7 +4826,7 @@ fn safe_authentication_kind(authentication: &ConnectionAuthentication) -> SafeAu
     }
 }
 
-fn ensure_etag(
+pub(crate) fn ensure_etag(
     id: &ConnectionId,
     expected: &ConnectionEtag,
     current: &StoredConnection,
@@ -4856,7 +4868,7 @@ fn increment_revision(id: &ConnectionId, revision: u64) -> Result<u64, Connectio
         .ok_or_else(|| ConnectionStoreError::RevisionOverflow { id: id.to_string() })
 }
 
-fn revision_from_i64(
+pub(crate) fn revision_from_i64(
     id: &ConnectionId,
     value: i64,
     zero_allowed: bool,
@@ -4892,7 +4904,7 @@ fn persisted_revision(
     Ok(value)
 }
 
-fn u64_to_i64(id: &ConnectionId, value: u64) -> Result<i64, ConnectionStoreError> {
+pub(crate) fn u64_to_i64(id: &ConnectionId, value: u64) -> Result<i64, ConnectionStoreError> {
     i64::try_from(value).map_err(|_| ConnectionStoreError::RevisionOverflow { id: id.to_string() })
 }
 
@@ -4977,7 +4989,7 @@ fn parse_reason(value: &str) -> Option<ConnectionStatusReason> {
     }
 }
 
-fn utc_timestamp() -> Result<String, ConnectionStoreError> {
+pub(crate) fn utc_timestamp() -> Result<String, ConnectionStoreError> {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .map_err(|_| ConnectionStoreError::CorruptRecord {

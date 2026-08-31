@@ -160,6 +160,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("5d6d2149e7dd714bf4dfeb5537d5b1d048170c8cffbc11a428e5890ed3ba4cd7"),
+        Migration::new(
+            6,
+            "connections_control_plane",
+            include_str!("migrations/0006_connections_control_plane.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("cebde43215a2fc230385de0c57a1c0112034183edf5d7068699e1aa1b7849624"),
     ]
 });
 
