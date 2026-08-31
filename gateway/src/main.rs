@@ -55,10 +55,10 @@ mod mcp;
 mod metrics;
 mod middleware;
 mod path_match;
-#[cfg(feature = "postgres")]
-mod policy_cluster;
 mod proxy;
 mod rbac;
+#[cfg(feature = "postgres")]
+mod security_cluster;
 mod storage;
 mod tools;
 mod upstream_route;
@@ -2036,7 +2036,7 @@ fn gateway_app_with_process_started_at_and_overrides(
     #[cfg(feature = "postgres")]
     let mut policy_control_plane: Option<Arc<dyn storage::PolicyControlPlane>> = None;
     #[cfg(feature = "postgres")]
-    let mut cluster_revision_gate: Option<Arc<dyn middleware::rbac::SecurityRevisionGate>> = None;
+    let mut cluster_security_runtime: Option<Arc<security_cluster::ClusterSecurityRuntime>> = None;
     #[cfg(feature = "postgres")]
     let rbac_state = match (build_overrides.pg_policy.as_ref(), rbac_state) {
         (Some(seed), Some(state)) => {
@@ -2044,13 +2044,19 @@ fn gateway_app_with_process_started_at_and_overrides(
                 seed.active.policy.clone(),
                 seed.active.security_revision,
             );
-            let runtime =
-                policy_cluster::ClusterPolicyRuntime::new(seed.store.clone(), state.clone());
+            let policy_resource =
+                security_cluster::PolicyResource::new(seed.store.clone(), state.clone());
+            let runtime = security_cluster::ClusterSecurityRuntime::new(
+                seed.store.revision_source(),
+                policy_resource,
+            );
             runtime.spawn_poller(&lifecycle);
             policy_control_plane = Some(seed.store.clone());
-            cluster_revision_gate =
-                Some(runtime.clone() as Arc<dyn middleware::rbac::SecurityRevisionGate>);
-            Some(state.with_revision_gate(runtime))
+            cluster_security_runtime = Some(runtime.clone());
+            Some(
+                state
+                    .with_revision_gate(runtime as Arc<dyn middleware::rbac::SecurityRevisionGate>),
+            )
         }
         (_, state) => state,
     };
@@ -2285,7 +2291,8 @@ fn gateway_app_with_process_started_at_and_overrides(
         traffic: traffic_admin_state,
         principals: principal_admin_state,
         #[cfg(feature = "postgres")]
-        revision_gate: cluster_revision_gate,
+        revision_gate: cluster_security_runtime
+            .map(|runtime| runtime as Arc<dyn middleware::rbac::SecurityRevisionGate>),
     };
 
     let grpc = grpc_app(&config, &app_state, &middleware_stack);
@@ -40211,8 +40218,8 @@ O2gecI9QwDJNpm29J9wJB2F8
     #[cfg(feature = "postgres")]
     mod cluster_policy_tests {
         use super::*;
-        use crate::policy_cluster::ClusterPolicyRuntime;
         use crate::rbac::PolicyHistoryListFilters;
+        use crate::security_cluster::{ClusterSecurityRuntime, PolicyResource};
         use crate::storage::postgres::PostgresFoundation;
         use crate::storage::postgres_policy::PostgresPolicyStore;
         use crate::storage::{
@@ -40394,7 +40401,10 @@ O2gecI9QwDJNpm29J9wJB2F8
                 false,
                 test_audit_log(),
             );
-            let runtime = ClusterPolicyRuntime::new(store.clone(), rbac_state.clone());
+            let runtime = ClusterSecurityRuntime::new(
+                store.revision_source(),
+                PolicyResource::new(store.clone(), rbac_state.clone()),
+            );
             let gate: Arc<dyn middleware::rbac::SecurityRevisionGate> = runtime;
             let router = Router::new()
                 .route(
@@ -40735,7 +40745,10 @@ O2gecI9QwDJNpm29J9wJB2F8
                 test_audit_log(),
             );
             rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
-            let runtime = ClusterPolicyRuntime::new(store.clone(), rbac_state.clone());
+            let runtime = ClusterSecurityRuntime::new(
+                store.revision_source(),
+                PolicyResource::new(store.clone(), rbac_state.clone()),
+            );
 
             // Current: the gate passes and reports the served revision.
             let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)

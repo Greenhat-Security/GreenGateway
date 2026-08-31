@@ -1172,7 +1172,9 @@ mod postgres_audit_tests {
         let (store, pool) = migrated_policy_store(&database).await;
 
         assert_eq!(
-            PolicyControlPlane::current_security_revision(&*store)
+            store
+                .revision_source()
+                .current()
                 .await
                 .expect("initial revision read"),
             0
@@ -1239,7 +1241,9 @@ mod postgres_audit_tests {
         assert_eq!(count_rows(&pool, "policy_documents").await, 1);
         assert_eq!(count_rows(&pool, "security_outbox").await, 1);
         assert_eq!(
-            PolicyControlPlane::current_security_revision(&*store)
+            store
+                .revision_source()
+                .current()
                 .await
                 .expect("revision after rejects"),
             1,
@@ -1327,7 +1331,9 @@ mod postgres_audit_tests {
         assert_eq!(count_rows(&pool_b, "policy_documents").await, 2);
         assert_eq!(count_rows(&pool_b, "security_outbox").await, 2);
         assert_eq!(
-            PolicyControlPlane::current_security_revision(&*store_a)
+            store_a
+                .revision_source()
+                .current()
                 .await
                 .expect("revision after race"),
             2
@@ -1444,7 +1450,9 @@ mod postgres_audit_tests {
         );
         assert_eq!(count_rows(&pool, "security_outbox").await, 1);
         assert_eq!(
-            PolicyControlPlane::current_security_revision(&*store)
+            store
+                .revision_source()
+                .current()
                 .await
                 .expect("revision after abort"),
             active.security_revision,

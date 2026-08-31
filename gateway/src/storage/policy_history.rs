@@ -133,10 +133,6 @@ pub trait PolicyControlPlane: PolicyHistory {
     /// control plane has never been initialized.
     async fn active(&self) -> Result<Option<ActivePolicy>, RepositoryError>;
 
-    /// The current monotonic security revision. Reading it is the strict
-    /// per-request currency check's one round statement.
-    async fn current_security_revision(&self) -> Result<i64, RepositoryError>;
-
     /// Commit a mutation under a compare-and-swap precondition.
     async fn commit(
         &self,

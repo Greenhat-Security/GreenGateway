@@ -42,11 +42,20 @@ use crate::rbac::{
 use super::{
     log_classified,
     policy_history::{
-        ActivePolicy, PolicyCommitError, PolicyCommitPrecondition, PolicyCommitRequest,
-        PolicyControlPlane, PolicyHistory,
+        ActivePolicy, PolicyCommitError, PolicyCommitRequest, PolicyControlPlane, PolicyHistory,
     },
     postgres::classify_pool_error,
+    postgres_documents::{self, DocumentResource},
     RepositoryError, RepositoryErrorKind,
+};
+
+/// The policy document's tables and outbox identity in the shared
+/// versioned-document core.
+const POLICY_DOCUMENT_RESOURCE: DocumentResource = DocumentResource {
+    documents_table: "greengateway.policy_documents",
+    active_table: "greengateway.policy_active",
+    resource_type: "policy",
+    operation: "policy_commit",
 };
 
 /// The operation labels the classified errors of this module carry. Static
@@ -57,60 +66,6 @@ const OPERATION_COMMIT: &str = "policy_commit";
 const OPERATION_HISTORY_LIST: &str = "policy_history_list";
 const OPERATION_HISTORY_GET: &str = "policy_history_get";
 const OPERATION_OUTBOX: &str = "policy_outbox_read";
-
-/// Locks only the pointer row (`FOR UPDATE OF a`): the immutable document
-/// needs no lock, but joining it lets the transaction verify the pointer's
-/// recorded ETag against the document it names -- the same self-consistency
-/// check `active()` performs, so a pointer edited out-of-band fails closed
-/// on the commit path too instead of being silently "healed" by the next
-/// writer.
-const LOCK_ACTIVE_SQL: &str = r#"
-SELECT a.active_version, a.document_etag, d.document_etag
-FROM greengateway.policy_active a
-JOIN greengateway.policy_documents d ON d.version = a.active_version
-WHERE a.singleton
-FOR UPDATE OF a
-"#;
-
-const INSERT_DOCUMENT_SQL: &str = r#"
-INSERT INTO greengateway.policy_documents (
-    actor_user_id, diff_summary, document, document_etag
-)
-VALUES ($1, $2::text::jsonb, $3::text::jsonb, $4)
-RETURNING version
-"#;
-
-const RESERVE_REVISION_SQL: &str = r#"
-UPDATE greengateway.security_revision_state
-SET last_revision = last_revision + 1
-WHERE singleton
-RETURNING last_revision
-"#;
-
-const ADVANCE_POINTER_SQL: &str = r#"
-UPDATE greengateway.policy_active
-SET active_version = $1, document_etag = $2, security_revision = $3,
-    activated_at = now()
-WHERE singleton
-"#;
-
-/// `ON CONFLICT DO NOTHING` turns the initialize race into a row count: a
-/// concurrent initializer that committed first leaves this insert at zero
-/// rows, which the caller-side check maps to `PreconditionFailed`.
-const INITIALIZE_POINTER_SQL: &str = r#"
-INSERT INTO greengateway.policy_active (
-    singleton, active_version, document_etag, security_revision
-)
-VALUES (true, $1, $2, $3)
-ON CONFLICT (singleton) DO NOTHING
-"#;
-
-const APPEND_OUTBOX_SQL: &str = r#"
-INSERT INTO greengateway.security_outbox (
-    revision, resource_type, from_version, to_version
-)
-VALUES ($1, 'policy', $2, $3)
-"#;
 
 /// One durable change record from `security_outbox`. Reconciliation and
 /// (later) notification consumers read these; the payload is identifiers
@@ -125,6 +80,37 @@ pub struct SecurityOutboxEntry {
     pub to_version: i64,
 }
 
+/// The read-only view of the global security-revision counter that the
+/// cluster runtime gates on. Every control-plane commit -- policy since
+/// PR 7, tools since PR 8, and the later #241 resources -- advances the
+/// same `security_revision_state` counter inside its transaction, so one
+/// read answers "is my compiled snapshot of ALL shared security state
+/// current?".
+pub struct SecurityRevisionSource {
+    pool: deadpool_postgres::Pool,
+}
+
+impl SecurityRevisionSource {
+    pub fn new(pool: deadpool_postgres::Pool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn current(&self) -> Result<i64, RepositoryError> {
+        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let row = client
+            .query_opt(
+                "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton",
+                &[],
+            )
+            .await
+            .map_err(|error| classify_query(error, OPERATION_REVISION))?;
+        // The counter row is seeded by migration 4 and never deleted; its
+        // absence means the schema is not what this build expects.
+        row.map(|row| row.get::<_, i64>(0))
+            .ok_or_else(|| invalid_data(OPERATION_REVISION))
+    }
+}
+
 /// The authoritative PostgreSQL policy control plane. Cheap to construct:
 /// it borrows the foundation's pool and holds no per-instance state.
 pub struct PostgresPolicyStore {
@@ -134,6 +120,13 @@ pub struct PostgresPolicyStore {
 impl PostgresPolicyStore {
     pub fn new(pool: deadpool_postgres::Pool) -> Self {
         Self { pool }
+    }
+
+    /// The shared revision-counter view over this store's pool, for the
+    /// cluster runtime's gate. Read-only; commits advance the counter
+    /// inside their own transactions.
+    pub fn revision_source(&self) -> SecurityRevisionSource {
+        SecurityRevisionSource::new(self.pool.clone())
     }
 
     /// Outbox entries after a revision, oldest-first. The durable half of
@@ -176,28 +169,16 @@ impl PostgresPolicyStore {
 impl PolicyControlPlane for PostgresPolicyStore {
     async fn active(&self) -> Result<Option<ActivePolicy>, RepositoryError> {
         let client = self.pool.get().await.map_err(classify_pool_error)?;
-        let row = client
-            .query_opt(
-                r#"
-                SELECT a.active_version,
-                    a.document_etag,
-                    a.security_revision,
-                    to_char(d.created_at AT TIME ZONE 'UTC',
-                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
-                    d.document::text
-                FROM greengateway.policy_active a
-                JOIN greengateway.policy_documents d ON d.version = a.active_version
-                WHERE a.singleton
-                "#,
-                &[],
-            )
-            .await
-            .map_err(|error| classify_query(error, OPERATION_ACTIVE))?;
-        let Some(row) = row else {
+        let row = postgres_documents::read_active(&client, POLICY_DOCUMENT_RESOURCE)
+            .await?
+            .map(
+                |(version, stored_etag, security_revision, _created_at, document_json)| {
+                    (version, stored_etag, security_revision, document_json)
+                },
+            );
+        let Some((version, stored_etag, security_revision, document_json)) = row else {
             return Ok(None);
         };
-        let stored_etag: String = row.get(1);
-        let document_json: String = row.get(4);
         let policy = policy_from_json(&document_json, OPERATION_ACTIVE)?;
         let etag = crate::policy_etag(&policy).map_err(|_| invalid_data(OPERATION_ACTIVE))?;
         if etag != stored_etag {
@@ -213,37 +194,16 @@ impl PolicyControlPlane for PostgresPolicyStore {
         }
         Ok(Some(ActivePolicy {
             policy,
-            version: row.get(0),
+            version,
             etag,
-            security_revision: row.get(2),
+            security_revision,
         }))
-    }
-
-    async fn current_security_revision(&self) -> Result<i64, RepositoryError> {
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
-        let row = client
-            .query_opt(
-                "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton",
-                &[],
-            )
-            .await
-            .map_err(|error| classify_query(error, OPERATION_REVISION))?;
-        // The counter row is seeded by migration 4 and never deleted; its
-        // absence means the schema is not what this build expects.
-        row.map(|row| row.get::<_, i64>(0))
-            .ok_or_else(|| invalid_data(OPERATION_REVISION))
     }
 
     async fn commit(
         &self,
         request: PolicyCommitRequest<'_>,
     ) -> Result<ActivePolicy, PolicyCommitError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(classify_pool_error)
-            .map_err(store_error)?;
         let document_json = serde_json::to_string(request.candidate)
             .map_err(|_| invalid_data(OPERATION_COMMIT))
             .map_err(store_error)?;
@@ -254,145 +214,29 @@ impl PolicyControlPlane for PostgresPolicyStore {
             .map_err(|_| invalid_data(OPERATION_COMMIT))
             .map_err(store_error)?;
 
-        // The transaction is driven explicitly over the simple protocol
-        // (the audit store's and the migrator's pattern). A request
-        // abandoned between BEGIN and COMMIT returns its connection to the
-        // pool with the transaction open; the row locks it holds are
-        // reclaimed by the session's server-side bounds (`lock_timeout`
-        // bounds other writers' waits, `idle_in_transaction_session_timeout`
-        // closes the session), so the failure mode is bounded 503s, never
-        // corruption. A drop-guarded interactive transaction can harden
-        // this and the audit append together if abandonment proves real.
-        client
-            .batch_execute("BEGIN")
-            .await
-            .map_err(|error| classify_query(error, OPERATION_COMMIT))
-            .map_err(store_error)?;
-        let outcome: Result<ActivePolicy, PolicyCommitError> = async {
-            // 1. Lock and read the expected active state, verifying the
-            //    pointer's recorded ETag against the document it names.
-            let active_row = client
-                .query_opt(LOCK_ACTIVE_SQL, &[])
-                .await
-                .map_err(|error| classify_query(error, OPERATION_COMMIT))
-                .map_err(store_error)?;
-            let current = active_row.map(|row| {
-                let recorded_etag: String = row.get(1);
-                let document_etag: String = row.get(2);
-                (row.get::<_, i64>(0), recorded_etag, document_etag)
-            });
+        // The shared section-2 transaction (postgres_documents): lock and
+        // self-verify the pointer, re-check the precondition, write the
+        // immutable version, reserve the revision, advance the pointer,
+        // append the outbox row, commit once.
+        let committed = postgres_documents::commit(
+            &self.pool,
+            POLICY_DOCUMENT_RESOURCE,
+            request.precondition.clone(),
+            postgres_documents::DocumentCommit {
+                document_json: &document_json,
+                document_etag: &etag,
+                actor_user_id: request.actor_user_id,
+                diff_summary_json: &diff_summary_json,
+            },
+        )
+        .await?;
 
-            if let Some((_, recorded_etag, document_etag)) = &current {
-                if recorded_etag != document_etag {
-                    tracing::error!(
-                        "the active policy pointer's recorded ETag does not match the \
-                         document it names; refusing to commit over an inconsistent authority"
-                    );
-                    return Err(PolicyCommitError::Store(invalid_data(OPERATION_COMMIT)));
-                }
-            }
-
-            // 2. Re-verify the precondition against the authority.
-            match (&request.precondition, &current) {
-                (
-                    PolicyCommitPrecondition::Expected { etag: expected },
-                    Some((_, current_etag, _)),
-                ) if current_etag == expected => {}
-                (PolicyCommitPrecondition::Initialize, None) => {}
-                _ => return Err(PolicyCommitError::PreconditionFailed),
-            }
-
-            // 3. The new immutable version (also the history row).
-            let document_row = client
-                .query_one(
-                    INSERT_DOCUMENT_SQL,
-                    &[
-                        &request.actor_user_id,
-                        &diff_summary_json,
-                        &document_json,
-                        &etag,
-                    ],
-                )
-                .await
-                .map_err(|error| classify_query(error, OPERATION_COMMIT))
-                .map_err(store_error)?;
-            let new_version: i64 = document_row.get(0);
-
-            // 4. Reserve the next security revision (rollback-safe).
-            let revision_row = client
-                .query_opt(RESERVE_REVISION_SQL, &[])
-                .await
-                .map_err(|error| classify_query(error, OPERATION_COMMIT))
-                .map_err(store_error)?;
-            let new_revision: i64 = revision_row
-                .map(|row| row.get(0))
-                .ok_or_else(|| invalid_data(OPERATION_COMMIT))
-                .map_err(store_error)?;
-
-            // 5. Advance the active pointer.
-            match current {
-                Some((previous_version, _, _)) => {
-                    client
-                        .execute(ADVANCE_POINTER_SQL, &[&new_version, &etag, &new_revision])
-                        .await
-                        .map_err(|error| classify_query(error, OPERATION_COMMIT))
-                        .map_err(store_error)?;
-                    client
-                        .execute(
-                            APPEND_OUTBOX_SQL,
-                            &[&new_revision, &previous_version, &new_version],
-                        )
-                        .await
-                        .map_err(|error| classify_query(error, OPERATION_COMMIT))
-                        .map_err(store_error)?;
-                }
-                None => {
-                    let inserted = client
-                        .execute(
-                            INITIALIZE_POINTER_SQL,
-                            &[&new_version, &etag, &new_revision],
-                        )
-                        .await
-                        .map_err(|error| classify_query(error, OPERATION_COMMIT))
-                        .map_err(store_error)?;
-                    if inserted == 0 {
-                        // Another initializer won the race; the lock on a
-                        // not-yet-existing row protected nothing, so this
-                        // insert's conflict clause is the serialization
-                        // point. Nothing of ours committed.
-                        return Err(PolicyCommitError::PreconditionFailed);
-                    }
-                    client
-                        .execute(
-                            APPEND_OUTBOX_SQL,
-                            &[&new_revision, &None::<i64>, &new_version],
-                        )
-                        .await
-                        .map_err(|error| classify_query(error, OPERATION_COMMIT))
-                        .map_err(store_error)?;
-                }
-            }
-
-            Ok(ActivePolicy {
-                policy: request.candidate.clone(),
-                version: new_version,
-                etag,
-                security_revision: new_revision,
-            })
-        }
-        .await;
-        match outcome {
-            Ok(active) => client
-                .batch_execute("COMMIT")
-                .await
-                .map_err(|error| classify_query(error, OPERATION_COMMIT))
-                .map_err(store_error)
-                .map(|_| active),
-            Err(error) => {
-                let _ = client.batch_execute("ROLLBACK").await;
-                Err(error)
-            }
-        }
+        Ok(ActivePolicy {
+            policy: request.candidate.clone(),
+            version: committed.version,
+            etag,
+            security_revision: committed.security_revision,
+        })
     }
 }
 

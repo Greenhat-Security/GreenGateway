@@ -29,7 +29,11 @@ pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod postgres_audit;
 #[cfg(feature = "postgres")]
+pub(crate) mod postgres_documents;
+#[cfg(feature = "postgres")]
 pub mod postgres_policy;
+#[cfg(feature = "postgres")]
+pub mod postgres_tools;
 mod principal;
 mod service_token;
 
@@ -44,7 +48,9 @@ pub use policy_history::{
     PolicyControlPlane,
 };
 #[cfg(feature = "postgres")]
-pub use postgres_policy::PostgresPolicyStore;
+pub use postgres_policy::{PostgresPolicyStore, SecurityRevisionSource};
+#[cfg(feature = "postgres")]
+pub use postgres_tools::{ActiveToolDocument, PostgresToolStore, ToolControlPlane};
 pub use principal::PrincipalDirectoryStore;
 pub use service_token::ServiceTokenStore;
 

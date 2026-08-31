@@ -947,28 +947,35 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     // zero upstream attempts -- never a `401`/`403` (a dependency failure
     // is not a policy decision), and never a stale allow.
     #[cfg(feature = "postgres")]
+    let mut served_security_revision: Option<i64> = None;
+    #[cfg(feature = "postgres")]
     if let Some(gate) = state.revision_gate.as_ref() {
-        if let Err(error) = gate.ensure_current_revision().await {
-            emit_revision_check_failed(&state, &context, principal.as_ref(), error);
-            return with_policy_decision(
-                service_unavailable_response(),
-                PolicyDecision {
-                    outcome: PolicyDecisionOutcome::Denied,
-                    reason: error.as_str(),
-                    permission: None,
-                    path_prefix: None,
-                    matched_rule_id: None,
-                },
-            );
+        match gate.ensure_current_revision().await {
+            Ok(revision) => served_security_revision = Some(revision),
+            Err(error) => {
+                emit_revision_check_failed(&state, &context, principal.as_ref(), error);
+                return with_policy_decision(
+                    service_unavailable_response(),
+                    PolicyDecision {
+                        outcome: PolicyDecisionOutcome::Denied,
+                        reason: error.as_str(),
+                        permission: None,
+                        path_prefix: None,
+                        matched_rule_id: None,
+                    },
+                );
+            }
         }
     }
 
     let policy = state.policy.load();
-    // Record the revision this request actually serves under: the snapshot
-    // guard is the exact compiled state every decision below consults.
+    // Record the revision this request actually serves under: the compiled
+    // watermark the gate proved current for this request, covering every
+    // shared-security resource (policy, tools, ...), not just this
+    // snapshot's own key.
     #[cfg(feature = "postgres")]
-    if state.revision_gate.is_some() {
-        context.security_revision = Some(policy.security_revision);
+    {
+        context.security_revision = served_security_revision;
     }
     // Direct firewall rules run before route-to-permission rules. A direct deny
     // remains global, but host-qualified upstreams require an explicit host-bound
