@@ -403,6 +403,12 @@ struct AuditAdminState {
     query_store: Option<Arc<storage::SqliteAuditEventStore>>,
     event_sender: audit::AuditEventSender,
     rbac_state: Option<middleware::rbac::RbacState>,
+    /// The durable PostgreSQL audit store, present only in cluster mode.
+    /// Its stream cursor is what the SSE endpoint serves: committed events
+    /// from every replica, replayable from a client's `Last-Event-ID`,
+    /// with the broadcast channel demoted to a wake-up for latency.
+    #[cfg(feature = "postgres")]
+    pg_audit: Option<Arc<storage::postgres_audit::PostgresAuditEventStore>>,
 }
 
 #[derive(Clone)]
@@ -1362,6 +1368,11 @@ struct ManagedAdminCacheControlState {
 #[derive(Default)]
 struct GatewayAppBuildOverrides {
     lifecycle: Option<GatewayLifecycle>,
+    /// The durable PostgreSQL audit store for cluster mode's SSE endpoint;
+    /// None in standalone mode and in tests that exercise the broadcast
+    /// path.
+    #[cfg(feature = "postgres")]
+    pg_audit: Option<Arc<storage::postgres_audit::PostgresAuditEventStore>>,
     #[cfg(test)]
     egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
     #[cfg(test)]
@@ -1500,6 +1511,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "postgres")]
     let _database_foundation =
         storage::postgres::PostgresFoundation::start_if_selected(&config).await?;
+    // The durable audit store rides the foundation's pool; the SSE
+    // endpoint reads committed events through it in cluster mode. Built
+    // here, where both the pool and the replica identity exist, and handed
+    // to the app builder; standalone mode passes None.
+    #[cfg(feature = "postgres")]
+    let pg_audit_store = match (&_database_foundation, &_ha_foundation) {
+        (Some(foundation), Some(ha_foundation)) => Some(Arc::new(
+            storage::postgres_audit::PostgresAuditEventStore::new(
+                foundation.pool().clone(),
+                Some(storage::postgres_audit::IngestIdentity {
+                    instance_id: ha_foundation.identity().instance_id(),
+                    boot_id: ha_foundation.identity().boot_id(),
+                }),
+            ),
+        )),
+        _ => None,
+    };
     let metrics_handle = install_metrics_recorder()?;
     let listen_addr = config.listen_addr;
     let admin_listen_addr = config.admin_listen_addr;
@@ -1524,6 +1552,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         process_started_at,
         GatewayAppBuildOverrides {
             lifecycle: Some(lifecycle.clone()),
+            #[cfg(feature = "postgres")]
+            pg_audit: pg_audit_store,
             #[cfg(test)]
             egress_resolver: None,
             #[cfg(test)]
@@ -2053,6 +2083,8 @@ fn gateway_app_with_process_started_at_and_overrides(
         query_store: audit_query_store,
         event_sender: audit_event_sender,
         rbac_state: rbac_state.clone(),
+        #[cfg(feature = "postgres")]
+        pg_audit: build_overrides.pg_audit,
     };
     let signals_admin_state = SignalsAdminState {
         discovery_store: discovery_query_store.clone(),
@@ -7709,6 +7741,7 @@ async fn audit_events_stream_endpoint(
     State(state): State<AuditAdminState>,
     principal: Option<Extension<auth::Principal>>,
     Query(params): Query<AuditEventStreamParams>,
+    #[cfg(feature = "postgres")] headers: http::HeaderMap,
 ) -> Response {
     record_request(AUDIT_EVENTS_STREAM_ROUTE);
 
@@ -7720,12 +7753,243 @@ async fn audit_events_stream_endpoint(
         return audit_admin_authz_error_response(error);
     }
 
+    // Cluster mode: the durable stream. Committed events from every
+    // replica, replayable from a reconnecting client's Last-Event-ID (the
+    // SSE standard's resume mechanism, carried on every frame's `id:`
+    // field), with the in-process broadcast demoted to a wake-up between
+    // polls. Standalone mode keeps the broadcast-only stream unchanged:
+    // there is no durable store to replay from, and the frames carry no
+    // positions.
+    #[cfg(feature = "postgres")]
+    if let Some(store) = state.pg_audit.clone() {
+        return match durable_audit_stream_start(
+            store,
+            &headers,
+            params,
+            state.event_sender.subscribe(),
+        )
+        .await
+        {
+            Ok(stream) => Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response(),
+            Err(DurableStreamStartError::BadCursor) => {
+                bad_request("Last-Event-ID must be a stream position (an integer)")
+            }
+            Err(DurableStreamStartError::ExpiredCursor {
+                cursor,
+                first_available,
+            }) => {
+                tracing::info!(
+                    cursor,
+                    first_available,
+                    "audit stream reconnect cursor expired; client must resynchronize"
+                );
+                (
+                    StatusCode::GONE,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "audit stream cursor {cursor} is older than the earliest \
+                             retained event ({first_available}); reconnect without \
+                             Last-Event-ID to stream new events, or use the audit \
+                             query API to read the retained window"
+                        ),
+                    }),
+                )
+                    .into_response()
+            }
+            Err(DurableStreamStartError::Unavailable) => {
+                service_unavailable("the durable audit stream is unavailable; retry")
+            }
+        };
+    }
+
     Sse::new(audit_event_sse_stream(
         state.event_sender.subscribe(),
         params,
     ))
     .keep_alive(KeepAlive::default())
     .into_response()
+}
+
+/// How many stream rows one durable poll fetches: large enough that a
+/// replay catches up in few round trips, small enough that a slow client
+/// buffers only a bounded slice.
+#[cfg(feature = "postgres")]
+const DURABLE_STREAM_BATCH: usize = 64;
+
+/// How long the durable stream sleeps between polls when the broadcast
+/// wake-up is idle. Cross-replica events arrive without any local
+/// notification, so polling -- not the broadcast channel -- is what makes
+/// the stream correct; the wake-up only sharpens local-event latency.
+#[cfg(feature = "postgres")]
+const DURABLE_STREAM_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[cfg(feature = "postgres")]
+enum DurableStreamStartError {
+    /// The Last-Event-ID header was present but not an integer position.
+    BadCursor,
+    /// The client's cursor predates the retained window: events it has
+    /// not seen were deleted, and replay can no longer be gapless.
+    ExpiredCursor { cursor: i64, first_available: i64 },
+    /// The store could not be consulted. An authority that cannot be
+    /// consulted is a fail-closed condition, never a silent fallback to
+    /// the broadcast-only stream (which would silently hide other
+    /// replicas' committed events).
+    Unavailable,
+}
+
+/// Resolve where the durable stream starts and whether it can.
+#[cfg(feature = "postgres")]
+async fn durable_audit_stream_start(
+    store: Arc<storage::postgres_audit::PostgresAuditEventStore>,
+    headers: &http::HeaderMap,
+    params: AuditEventStreamParams,
+    wake: tokio::sync::broadcast::Receiver<audit::AuditEvent>,
+) -> Result<impl Stream<Item = Result<Event, Infallible>> + Send + 'static, DurableStreamStartError>
+{
+    let cursor = match headers.get("last-event-id").map(http::HeaderValue::to_str) {
+        None => None,
+        Some(Ok(value)) => match value.trim().parse::<i64>() {
+            Ok(position) => Some(position),
+            Err(_) => return Err(DurableStreamStartError::BadCursor),
+        },
+        Some(Err(_)) => return Err(DurableStreamStartError::BadCursor),
+    };
+
+    match cursor {
+        Some(last_seen) => {
+            let first_available = store
+                .stream_first_available()
+                .await
+                .map_err(|_| DurableStreamStartError::Unavailable)?;
+            // Overflow-safe form of `last_seen + 1 < first_available`:
+            // subtracting from first_available (always >= 1) cannot
+            // underflow, while adding to last_seen could overflow at
+            // i64::MAX -- a caller-reachable value via the header.
+            if last_seen < first_available - 1 {
+                return Err(DurableStreamStartError::ExpiredCursor {
+                    cursor: last_seen,
+                    first_available,
+                });
+            }
+            Ok(durable_audit_stream(store, last_seen, params, wake))
+        }
+        None => {
+            // No resume cursor: start at the committed head. The stream
+            // delivers events that commit from now on, matching the
+            // broadcast path's live-tail semantics.
+            let head = store
+                .stream_head()
+                .await
+                .map_err(|_| DurableStreamStartError::Unavailable)?;
+            Ok(durable_audit_stream(store, head, params, wake))
+        }
+    }
+}
+
+/// The durable stream loop: poll `stream_after` in bounded batches and
+/// emit every retained event with its position as the SSE `id:` (so
+/// reconnects resume exactly after it), applying the endpoint's filters
+/// the same way the broadcast path does. While caught up, the loop waits
+/// on the local broadcast channel or the idle-poll deadline, whichever
+/// comes first -- the wake-up only sharpens same-replica latency; the
+/// poll is what makes cross-replica events arrive. Backpressure is
+/// inherent: each unfold step emits at most one event and polls at most
+/// one bounded batch, and the HTTP sink pulls steps only as fast as the
+/// client reads.
+#[cfg(feature = "postgres")]
+fn durable_audit_stream(
+    store: Arc<storage::postgres_audit::PostgresAuditEventStore>,
+    start_after: i64,
+    params: AuditEventStreamParams,
+    wake: tokio::sync::broadcast::Receiver<audit::AuditEvent>,
+) -> impl Stream<Item = Result<Event, Infallible>> + Send + 'static {
+    stream::unfold(
+        (
+            store,
+            start_after,
+            params,
+            wake,
+            std::collections::VecDeque::<(i64, audit::AuditEvent)>::new(),
+        ),
+        |(store, mut cursor, params, mut wake, mut pending)| async move {
+            loop {
+                // Emit one already-fetched event per step, in position
+                // order, skipping events the filters exclude (the client's
+                // cursor tracks positions it received; filtered-out
+                // positions simply never become frames).
+                while let Some((position, event)) = pending.pop_front() {
+                    if !params.matches(&event) {
+                        continue;
+                    }
+                    let event_type = event.event_type.clone();
+                    let data = match serde_json::to_string(&event) {
+                        Ok(data) => data,
+                        Err(error) => {
+                            tracing::error!(
+                                error = %error,
+                                "failed to serialize audit event for durable SSE stream"
+                            );
+                            continue;
+                        }
+                    };
+                    return Some((
+                        Ok(Event::default()
+                            .event(event_type)
+                            .data(data)
+                            .id(position.to_string())),
+                        (store, cursor, params, wake, pending),
+                    ));
+                }
+
+                match store.stream_after(cursor, DURABLE_STREAM_BATCH).await {
+                    Ok(batch) if batch.is_empty() => {
+                        // Caught up: wait for a local wake-up or the idle
+                        // poll deadline, then poll again. A lagged or
+                        // closed broadcast channel is harmless -- the poll
+                        // remains the source of truth.
+                        tokio::select! {
+                            result = wake.recv() => {
+                                if result.is_err() {
+                                    tokio::time::sleep(DURABLE_STREAM_IDLE_POLL).await;
+                                }
+                            }
+                            _ = tokio::time::sleep(DURABLE_STREAM_IDLE_POLL) => {}
+                        }
+                        continue;
+                    }
+                    Ok(batch) => {
+                        // The batch is ordered by position; the cursor
+                        // advances past everything fetched, whether or not
+                        // the filters emit it -- otherwise a fully
+                        // filtered batch would be re-fetched forever.
+                        // (Assignment, not shadowing: the outer `cursor`
+                        // must carry into the next poll AND into the
+                        // unfold state on the next emit.)
+                        cursor = batch
+                            .last()
+                            .map(|(position, _)| *position)
+                            .unwrap_or(cursor);
+                        pending = batch.into();
+                        continue;
+                    }
+                    Err(error) => {
+                        // A store failure mid-stream is fail-closed: end
+                        // the stream so the client reconnects (its
+                        // Last-Event-ID resumes exactly where it stopped).
+                        // Silently continuing on the broadcast path would
+                        // hide the gap.
+                        tracing::error!(
+                            error = %error,
+                            "durable audit stream poll failed; ending stream for reconnect"
+                        );
+                        return None;
+                    }
+                }
+            }
+        },
+    )
 }
 
 fn audit_event_sse_stream(
@@ -28684,6 +28948,529 @@ paths:
         assert_eq!(event["payload"]["path_prefix"], json!("/__test"));
         assert_eq!(event["payload"]["permission"], json!("test:read"));
         assert_eq!(event["payload"]["reason"], json!("missing_principal"));
+    }
+
+    // ------------------------------------------------------------------
+    // Durable audit SSE (issue #241, PR 6): the endpoint reads committed
+    // events from the stream cursor in cluster mode. Docker-gated on the
+    // same locator as the storage suites.
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "postgres")]
+    mod durable_sse_tests {
+        use super::*;
+        use crate::storage::{
+            migrations,
+            postgres::PostgresFoundation,
+            postgres_audit::{IngestIdentity, PostgresAuditEventStore},
+        };
+
+        fn locator() -> Option<String> {
+            let key = "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned();
+            let file = std::env::var(&key).ok()?;
+            if file.trim().is_empty() {
+                return None;
+            }
+            let contents = std::fs::read_to_string(file).ok()?;
+            let trimmed = contents.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        }
+
+        struct DsnFile {
+            path: String,
+            directory: std::path::PathBuf,
+        }
+
+        impl Drop for DsnFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.directory);
+            }
+        }
+
+        fn write_dsn_file(dsn: &str) -> DsnFile {
+            let directory = std::env::temp_dir()
+                .join(format!("greengateway-durable-sse-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).expect("temp directory should create");
+            let path = directory.join("database-url");
+            std::fs::write(&path, format!("{dsn}\n")).expect("DSN file should write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .expect("DSN permissions should set");
+            }
+            DsnFile {
+                path: path.display().to_string(),
+                directory,
+            }
+        }
+
+        /// One test's disposable database: each SSE test streams from its
+        /// own database because an abandoned stream's background polls can
+        /// hold table locks that a sibling test's TRUNCATE would deadlock
+        /// against (a real failure under shared-database testing).
+        struct TestDatabase {
+            dsn: String,
+            admin_dsn: String,
+            name: String,
+        }
+
+        impl Drop for TestDatabase {
+            fn drop(&mut self) {
+                let admin_dsn = self.admin_dsn.clone();
+                let name = self.name.clone();
+                // Fire-and-forget: joining here deadlocks under some
+                // runtimes (the drop thread's own runtime can stall on
+                // socket wakeup once the test runtime is gone), and a
+                // leaked per-test database costs nothing on a disposable
+                // test server. Each run sweeps stale databases first, so
+                // nothing accumulates across runs.
+                std::thread::spawn(move || {
+                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        return;
+                    };
+                    runtime.block_on(async move {
+                        let Ok((client, connection)) =
+                            tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls).await
+                        else {
+                            return;
+                        };
+                        let connection = tokio::spawn(connection);
+                        let _ = client
+                            .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                            .await;
+                        let _ = connection.await;
+                    });
+                });
+            }
+        }
+
+        /// Drop any databases leaked by earlier runs of these tests, so a
+        /// long-lived development database server does not accumulate them.
+        /// Only databases with NO active connections are swept: under
+        /// parallel test execution a sibling test's in-flight database has
+        /// live connections, and dropping it out from under the sibling
+        /// (WITH FORCE) is exactly the flake this guard prevents.
+        async fn sweep_stale_test_databases(admin_dsn: &str) {
+            let Ok((client, connection)) =
+                tokio_postgres::connect(admin_dsn, tokio_postgres::NoTls).await
+            else {
+                return;
+            };
+            let connection = tokio::spawn(connection);
+            let rows = client
+                .query(
+                    r#"
+                    SELECT datname FROM pg_database
+                    WHERE datname LIKE 'ggw_sse_test_%'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM pg_stat_activity
+                          WHERE pg_stat_activity.datname = pg_database.datname
+                      )
+                    "#,
+                    &[],
+                )
+                .await;
+            if let Ok(rows) = rows {
+                for row in rows {
+                    let name: String = row.get(0);
+                    let _ = client
+                        .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                        .await;
+                }
+            }
+            drop(client);
+            let _ = connection.await;
+        }
+
+        async fn create_test_database(admin_dsn: &str) -> TestDatabase {
+            use std::str::FromStr as _;
+            sweep_stale_test_databases(admin_dsn).await;
+            let name = format!("ggw_sse_test_{}", uuid::Uuid::new_v4().simple());
+            let parsed =
+                tokio_postgres::Config::from_str(admin_dsn).expect("admin DSN should parse");
+            let admin_pool = deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
+                parsed,
+                tokio_postgres::NoTls,
+            ))
+            .config({
+                let mut pool_config = deadpool_postgres::PoolConfig::new(2);
+                pool_config.timeouts.create = Some(std::time::Duration::from_millis(5_000));
+                pool_config
+            })
+            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .build()
+            .expect("admin pool should build");
+            admin_pool
+                .get()
+                .await
+                .expect("admin checkout")
+                .batch_execute(&format!("CREATE DATABASE {name}"))
+                .await
+                .unwrap_or_else(|error| panic!("test database should create: {error}"));
+            let database_start = admin_dsn
+                .rfind('/')
+                .expect("locator DSN has a database path segment");
+            let dsn = format!("{}/{}", &admin_dsn[..database_start], name);
+            TestDatabase {
+                dsn,
+                admin_dsn: admin_dsn.to_owned(),
+                name,
+            }
+        }
+
+        async fn migrated_store(dsn: &str) -> PostgresAuditEventStore {
+            let dsn_file = write_dsn_file(dsn);
+            let mut config = test_config(Vec::new());
+            config.state_backend = config::StateBackend::Postgres;
+            config.deployment_id = Some("deploy-durable-sse".to_owned());
+            config.database.url_file = Some(dsn_file.path.clone());
+            config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+            let foundation = PostgresFoundation::establish(&config)
+                .await
+                .expect("test database should establish");
+            migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+                .await
+                .expect("schema should migrate");
+            foundation
+                .pool()
+                .get()
+                .await
+                .expect("cleanup checkout")
+                .batch_execute(
+                    "TRUNCATE greengateway.audit_stream, greengateway.audit_events \
+                     RESTART IDENTITY CASCADE; \
+                     UPDATE greengateway.audit_stream_state SET last_position = 0;",
+                )
+                .await
+                .expect("audit tables should reset");
+            PostgresAuditEventStore::new(
+                foundation.pool().clone(),
+                Some(IngestIdentity {
+                    instance_id: uuid::Uuid::new_v4(),
+                    boot_id: uuid::Uuid::new_v4(),
+                }),
+            )
+        }
+
+        fn durable_stream_router(
+            store: PostgresAuditEventStore,
+        ) -> (Router, audit::AuditEventSender) {
+            let policy = middleware::rbac::RbacState::new(
+                parse_policy_body(&Bytes::from(
+                    r#"{
+                        "schema_version": "0.1.0",
+                        "default_action": "deny",
+                        "roles": {
+                            "streamer": { "permissions": ["admin:audit:stream"] },
+                            "other": { "permissions": ["admin:audit:read"] }
+                        }
+                    }"#,
+                ))
+                .expect("stream policy should parse"),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            let (event_sender, _) = tokio::sync::broadcast::channel(8);
+            let router = Router::new()
+                .route(AUDIT_EVENTS_STREAM_ROUTE, get(audit_events_stream_endpoint))
+                .with_state(AuditAdminState {
+                    query_store: None,
+                    event_sender: event_sender.clone(),
+                    rbac_state: Some(policy),
+                    pg_audit: Some(std::sync::Arc::new(store)),
+                });
+            (router, event_sender)
+        }
+
+        fn stream_request(
+            last_event_id: Option<&str>,
+            principal: Option<auth::Principal>,
+        ) -> Request<Body> {
+            stream_request_filtered(last_event_id, principal, None)
+        }
+
+        fn stream_request_filtered(
+            last_event_id: Option<&str>,
+            principal: Option<auth::Principal>,
+            event_type: Option<&str>,
+        ) -> Request<Body> {
+            let uri = match event_type {
+                Some(event_type) => format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type={event_type}"),
+                None => AUDIT_EVENTS_STREAM_ROUTE.to_owned(),
+            };
+            let mut builder = Request::builder().uri(uri);
+            if let Some(last_event_id) = last_event_id {
+                builder = builder.header("last-event-id", last_event_id);
+            }
+            let mut request = builder
+                .body(Body::empty())
+                .expect("stream request should build");
+            if let Some(principal) = principal {
+                request.extensions_mut().insert(principal);
+            }
+            request
+        }
+
+        fn streamer_principal(role: &str) -> auth::Principal {
+            test_principal(&[role])
+        }
+
+        fn sse_event(event_type: &str, path: &str) -> audit::AuditEvent {
+            audit::AuditEvent::new(
+                event_type,
+                "request-sse",
+                "127.0.0.1",
+                None,
+                json!({ "path": path, "status": 200 }),
+            )
+        }
+
+        #[tokio::test]
+        async fn durable_sse_replays_filtered_events_without_repeating_frames() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let store = migrated_store(&database.dsn).await;
+            // Alternating event types: the filter excludes half. An
+            // adversarial review reintroduced the shadowed-cursor defect
+            // (a fully filtered batch never advancing the poll cursor) and
+            // the shipped suite stayed green; this test pins both the
+            // filter and the no-repeat/no-stall behavior.
+            for index in 0..6 {
+                let event_type = if index % 2 == 0 {
+                    "audit.sse.wanted"
+                } else {
+                    "audit.sse.excluded"
+                };
+                store
+                    .insert_events(&[sse_event(event_type, &format!("/filtered/{index}"))])
+                    .await
+                    .expect("seed event should commit");
+            }
+            let (router, _sender) = durable_stream_router(store);
+
+            let response = router
+                .clone()
+                .oneshot(stream_request_filtered(
+                    Some("0"),
+                    Some(streamer_principal("streamer")),
+                    Some("audit.sse.wanted"),
+                ))
+                .await
+                .expect("filtered replay should start");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = read_sse_until(response.into_body(), |body| {
+                // Count the frame lines, not the JSON payloads: each framed
+                // event carries the type twice (event: line + data JSON),
+                // so matching the bare type would stop after two frames.
+                body.matches("event: audit.sse.wanted").count() >= 3
+            })
+            .await;
+
+            assert_eq!(
+                body.matches("event: audit.sse.wanted").count(),
+                3,
+                "exactly the wanted events must be framed: {body}"
+            );
+            assert_eq!(
+                body.matches("event: audit.sse.excluded").count(),
+                0,
+                "filtered events must never be framed: {body}"
+            );
+            // Each framed position appears exactly once: the cursor
+            // advanced past the excluded positions rather than re-fetching
+            // them.
+            for position in [1, 3, 5] {
+                assert_eq!(
+                    body.matches(&format!("id: {position}")).count(),
+                    1,
+                    "position {position} must be framed exactly once: {body}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn durable_sse_boundary_cursors_do_not_panic() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let store = migrated_store(&database.dsn).await;
+            store
+                .insert_events(&[sse_event("audit.sse.boundary", "/boundary")])
+                .await
+                .expect("seed event should commit");
+            let (router, _sender) = durable_stream_router(store);
+
+            // i64::MAX once overflowed the expiry comparison and panicked
+            // the request task; it must answer like any other not-expired
+            // cursor (a live tail from an absurd position).
+            let response = router
+                .clone()
+                .oneshot(stream_request(
+                    Some("9223372036854775807"),
+                    Some(streamer_principal("streamer")),
+                ))
+                .await
+                .expect("i64::MAX cursor must not panic");
+            assert_eq!(response.status(), StatusCode::OK);
+            drop(response.into_body());
+
+            // The head itself: replay from head delivers nothing (live
+            // tail), not an error.
+            let response = router
+                .oneshot(stream_request(
+                    Some("1"),
+                    Some(streamer_principal("streamer")),
+                ))
+                .await
+                .expect("head cursor should start");
+            assert_eq!(response.status(), StatusCode::OK);
+            drop(response.into_body());
+        }
+
+        #[tokio::test]
+        async fn durable_sse_replays_from_last_event_id_with_position_ids() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let store = migrated_store(&database.dsn).await;
+            for path in ["/one", "/two", "/three"] {
+                store
+                    .insert_events(&[sse_event("audit.sse.replay", path)])
+                    .await
+                    .expect("seed event should commit");
+            }
+            let (router, _sender) = durable_stream_router(store);
+
+            // The client saw position 1 (/one); replay must deliver
+            // exactly positions 2 and 3, each framed with id: so a further
+            // reconnect resumes after the last one received.
+            let response = router
+                .oneshot(stream_request(
+                    Some("1"),
+                    Some(streamer_principal("streamer")),
+                ))
+                .await
+                .expect("replay request should complete");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = read_sse_until(response.into_body(), |body| body.contains("/three")).await;
+            assert!(body.contains("/two"), "{body}");
+            assert!(body.contains("/three"), "{body}");
+            assert!(
+                !body.contains("/one"),
+                "replay must start after the cursor: {body}"
+            );
+            assert!(
+                body.contains("id: 2"),
+                "frames must carry stream positions for reconnect: {body}"
+            );
+            assert!(body.contains("id: 3"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn durable_sse_expired_cursor_returns_410() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let store = migrated_store(&database.dsn).await;
+            for path in ["/kept-a", "/kept-b"] {
+                store
+                    .insert_events(&[sse_event("audit.sse.expiry", path)])
+                    .await
+                    .expect("seed event should commit");
+            }
+            // Simulate retention removing the oldest row: a client at
+            // cursor 0 has missed position 1 forever (first_available
+            // becomes 2).
+            {
+                let dsn_file = write_dsn_file(&database.dsn);
+                let mut config = test_config(Vec::new());
+                config.state_backend = config::StateBackend::Postgres;
+                config.deployment_id = Some("deploy-durable-sse".to_owned());
+                config.database.url_file = Some(dsn_file.path.clone());
+                config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+                let foundation = PostgresFoundation::establish(&config)
+                    .await
+                    .expect("expiry connection should establish");
+                foundation
+                    .pool()
+                    .get()
+                    .await
+                    .expect("expiry checkout")
+                    .batch_execute("DELETE FROM greengateway.audit_stream WHERE position = 1")
+                    .await
+                    .expect("expiry delete should run");
+            }
+
+            let (router, _sender) = durable_stream_router(store);
+            let response = router
+                .oneshot(stream_request(
+                    Some("0"),
+                    Some(streamer_principal("streamer")),
+                ))
+                .await
+                .expect("expired request should complete");
+            assert_eq!(response.status(), StatusCode::GONE);
+            let body = body_string(response).await;
+            assert!(
+                body.contains("older than the earliest retained event"),
+                "{body}"
+            );
+            assert!(
+                body.contains("reconnect without Last-Event-ID"),
+                "the response must say how to resynchronize: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn durable_sse_invalid_last_event_id_returns_400() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let store = migrated_store(&database.dsn).await;
+            let (router, _sender) = durable_stream_router(store);
+            let response = router
+                .oneshot(stream_request(
+                    Some("not-a-position"),
+                    Some(streamer_principal("streamer")),
+                ))
+                .await
+                .expect("invalid request should complete");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn durable_sse_requires_the_stream_permission() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let store = migrated_store(&database.dsn).await;
+            let (router, _sender) = durable_stream_router(store);
+            // A principal whose role lacks admin:audit:stream is refused
+            // before any stream work happens.
+            let response = router
+                .oneshot(stream_request(None, Some(streamer_principal("other"))))
+                .await
+                .expect("unauthorized request should complete");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
     }
 
     #[test]
