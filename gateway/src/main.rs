@@ -40250,6 +40250,16 @@ O2gecI9QwDJNpm29J9wJB2F8
             std::fs::create_dir_all(&directory).expect("temp directory should create");
             let path = directory.join("database-url");
             std::fs::write(&path, format!("{dsn}\n")).expect("DSN file should write");
+            // The foundation's permission check is part of the contract:
+            // credential material grants group/other nothing. On Unix CI
+            // the default mode would be 0644, which the check (correctly)
+            // refuses.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .expect("DSN permissions should set");
+            }
             DsnFile {
                 path: path.display().to_string(),
                 directory,
